@@ -42,6 +42,10 @@ import {
 } from "lucide-react";
 import DirectoryPicker from "./DirectoryPicker";
 import ToolPicker from "@/components/ToolPicker";
+import ToolPermissionGrid, {
+  type ToolPermissionGridValue,
+} from "@/components/ToolPermissionGrid";
+import { profileLevelFromDraft } from "@/components/ToolPermissionGrid.logic";
 import { Badge, Button, ComboBox, Select } from "@/components/ui";
 import type { BadgeTone } from "@/components/ui";
 import { t } from "@/lib/i18n";
@@ -53,6 +57,7 @@ import {
   getCatalogModels,
   getChannels,
   listProps,
+  mcpRequiredByTransport,
   objectArrayElementProps,
   patchConfig,
   resolveAliasSource,
@@ -273,6 +278,8 @@ function setupFieldPriority(entry: ListResponseEntry): number {
 
 function setupRequirement(
   entry: ListResponseEntry,
+  mcpTransport?: string | null,
+  requiredByTransport?: Record<string, string> | null,
 ): { label: string; tone: "required" | "choice" | "optional" } | null {
   const leaf = entry.path.split(".").pop() ?? "";
   if (/^providers\.models\.[^.]+\.[^.]+\./.test(entry.path)) {
@@ -308,6 +315,33 @@ function setupRequirement(
   }
   if (entry.path === "memory.backend")
     return { label: t("fieldform.badge_recommended"), tone: "choice" };
+  // MCP server command/url: required-ness tracks the chosen transport, not the
+  // Rust type (see mcpFieldRequired). Badge names the transport it's for so the
+  // operator knows why `command` is optional under http/sse (and vice versa).
+  const mcpRequired = mcpFieldRequired(
+    entry.path,
+    mcpTransport,
+    requiredByTransport,
+  );
+  if (mcpRequired !== null) {
+    // `leaf` (declared at the top of this fn) is `command` | `url` here.
+    if (mcpRequired) {
+      return {
+        label:
+          leaf === "command"
+            ? t("fieldform.badge_required_for_stdio")
+            : t("fieldform.badge_required_for_http_sse"),
+        tone: "required",
+      };
+    }
+    return {
+      label:
+        leaf === "command"
+          ? t("fieldform.badge_stdio_only")
+          : t("fieldform.badge_http_sse_only"),
+      tone: "optional",
+    };
+  }
   return null;
 }
 
@@ -448,6 +482,61 @@ function isRequiredField(typeHint: string): boolean {
   return !typeHint.replace(/\s+/g, "").startsWith("Option<");
 }
 
+// MCP server entries (`mcp.servers.<name>.<leaf>`) carry a transport-conditional
+// requirement the bare Rust type can't express: `command` is a non-optional
+// `String` (so the generic rule would always read it "required") yet is ONLY
+// needed for the stdio transport, while `url` is `Option<String>` (never
+// client-required) yet IS mandatory for the http/sse transports. Mirror the
+// server-side `validate_mcp_config` contract here so the badge + empty hint
+// follow the chosen transport instead of the type. Returns null for any field
+// that isn't one of these two transport-gated leaves (transport itself, args,
+// headers, ...), leaving the generic `Option<...>` rule in charge.
+// Which leaf each transport makes mandatory comes from the backend, not from a
+// map kept here: `mcpRequiredByTransport` reads the `x-required-by-transport`
+// metadata the server stamps onto the `McpServerConfig` schema, derived from
+// `McpTransport::required_leaf` (the same relationship `validate_mcp_config`
+// enforces). The form reads what the backend hands it, so a transport variant
+// added backend-side classifies correctly with no change here. When the metadata
+// is absent (a backend predating it) the map is null and required-ness is left
+// UNCLASSIFIED rather than re-encoding the enum, so the generic `Option<...>`
+// rule stays in charge.
+function mcpFieldRequired(
+  path: string,
+  transport: string | null | undefined,
+  requiredByTransport: Record<string, string> | null | undefined,
+): boolean | null {
+  const leaf = path.match(/^mcp\.servers\.[^.]+\.([^.]+)$/)?.[1];
+  if (leaf !== "command" && leaf !== "url") return null;
+  // Backend predates the x-required-by-transport metadata: do not assert
+  // required-ness rather than guessing it from a hand-kept map.
+  if (!requiredByTransport) return null;
+  // Empty / unset transport defaults to stdio (the schema default).
+  const t = (transport ?? "").trim().toLowerCase() || "stdio";
+  const requiredLeaf = requiredByTransport[t];
+  // Unknown transport (a variant the metadata has no rule for): do not assert
+  // required-ness, so a new variant cannot be silently misclassified.
+  if (!requiredLeaf) return null;
+  return leaf === requiredLeaf;
+}
+
+// Resolve the live transport draft value for the `mcp.servers.<name>` group a
+// given field belongs to, so the transport-conditional badge/hint update
+// reactively when the operator flips the transport <select>. Falls back to the
+// entry's saved/default value, then null when the field isn't an MCP server row.
+function resolveMcpTransport(
+  path: string,
+  entries: ListResponseEntry[],
+  draft: Record<string, string>,
+): string | null {
+  const name = path.match(/^mcp\.servers\.([^.]+)\./)?.[1];
+  if (!name) return null;
+  const transportPath = `mcp.servers.${name}.transport`;
+  const drafted = draft[transportPath];
+  if (drafted !== undefined && drafted.length > 0) return drafted;
+  const entry = entries.find((e) => e.path === transportPath);
+  return entry ? defaultInputValue(entry) : null;
+}
+
 // Display-only, pre-save validation derived entirely from the entry's own
 // metadata (`kind` + `type_hint`). Returns a short message to show under the
 // input (red), or null when the current draft value looks fine. This NEVER
@@ -466,6 +555,13 @@ function validationHint(
   // "Optional" badge and a red "required" hint. The server's
   // `Config::validate()` stays authoritative.
   treatAsOptional = false,
+  // Live transport draft value for the enclosing `mcp.servers.<name>` group, so
+  // the empty-required check on `command` / `url` tracks the chosen transport
+  // rather than the bare Rust type. Null for non-MCP rows.
+  mcpTransport?: string | null,
+  // Backend-emitted transport->required-leaf map (see mcpRequiredByTransport);
+  // null when the backend predates the metadata.
+  requiredByTransport?: Record<string, string> | null,
 ): string | null {
   // Secrets: an empty box means "keep the stored value", never "cleared" —
   // so emptiness is never an error here.
@@ -483,6 +579,22 @@ function validationHint(
     if (entry.kind === "integer" && !Number.isInteger(n)) {
       return t("cfg.field.validation.noDecimals");
     }
+  }
+
+  // MCP transport-gated fields own their own required decision (command-for-
+  // stdio / url-for-http-sse), overriding the generic Option<...> rule - `url` is
+  // optional at the type level yet client-required under http/sse, and `command`
+  // is type-required yet optional under http/sse.
+  const mcpRequired = mcpFieldRequired(
+    entry.path,
+    mcpTransport,
+    requiredByTransport,
+  );
+  if (mcpRequired !== null) {
+    if (mcpRequired && renderer !== "bool" && trimmed.length === 0) {
+      return t("cfg.field.validation.required");
+    }
+    return null;
   }
 
   // Required scalar left empty. Arrays/object-arrays carry their own three-state
@@ -736,11 +848,13 @@ function SecretField({
   populated,
   value,
   onChange,
+  multiline = false,
 }: {
   inputId: string;
   populated: boolean;
   value: string;
   onChange: (next: string) => void;
+  multiline?: boolean;
 }) {
   // Start in change mode when a populated field already carries a staged draft
   // value (operator typed a replacement, navigated away, came back). Otherwise
@@ -769,22 +883,40 @@ function SecretField({
   return (
     <div className="flex items-center gap-2">
       <div className="relative flex-1">
-        <input
-          id={inputId}
-          type={revealed ? "text" : "password"}
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-          className="input-electric w-full px-3 py-2 pr-10 text-sm"
-          placeholder={t("fieldform.secret_enter_placeholder")}
-          autoComplete="off"
-        />
+        {multiline ? (
+          <textarea
+            id={inputId}
+            value={value}
+            onChange={(e) => onChange(e.target.value)}
+            className={`input-electric w-full px-3 py-2 pr-10 text-sm font-mono min-h-[10rem] resize-y${
+              revealed ? "" : " secret-mask"
+            }`}
+            placeholder={t("fieldform.secret_enter_placeholder")}
+            autoComplete="off"
+            spellCheck={false}
+          />
+        ) : (
+          <input
+            id={inputId}
+            type={revealed ? "text" : "password"}
+            value={value}
+            onChange={(e) => onChange(e.target.value)}
+            className="input-electric w-full px-3 py-2 pr-10 text-sm"
+            placeholder={t("fieldform.secret_enter_placeholder")}
+            autoComplete="off"
+          />
+        )}
         <button
           type="button"
           onClick={() => setRevealed((r) => !r)}
           title={revealed ? t("fieldform.secret_hide") : t("fieldform.secret_reveal")}
           aria-label={revealed ? t("fieldform.secret_hide") : t("fieldform.secret_reveal")}
           aria-pressed={revealed}
-          className="btn-icon absolute right-1.5 top-1/2 -translate-y-1/2"
+          className={
+            multiline
+              ? "btn-icon absolute right-1.5 top-2"
+              : "btn-icon absolute right-1.5 top-1/2 -translate-y-1/2"
+          }
         >
           {revealed ? (
             <EyeOff className="h-4 w-4" />
@@ -884,6 +1016,15 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
         cancelled = true;
       };
     }, []);
+
+    // Transport->required-leaf map, read once from the cached schema so every
+    // MCP server row classifies command/url required-ness from the registry
+    // (`x-required-by-transport`) instead of a hardcoded map. Null on backends
+    // that predate the metadata; rows then leave required-ness unclassified.
+    const requiredByTransport = useMemo(
+      () => mcpRequiredByTransport(schema),
+      [schema],
+    );
 
     const reload = async () => {
       setLoading(true);
@@ -1045,6 +1186,94 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
       configDraft.stageTombstone(path);
     };
 
+    // Shared by every string-array-ish field's onChange, including the
+    // grouped ToolPermissionGrid below — same draft representation, so the
+    // save path (parseInput → parseStringArrayValue) never sees a difference
+    // between a field edited via its own row and one edited via the grid.
+    const applyFieldValue = (f: ListResponseEntry, v: string) => {
+      setDraft((d) => ({ ...d, [f.path]: v }));
+      const baseline = defaultInputValue(f);
+      if (v === baseline || (f.is_secret && v.length === 0)) {
+        configDraft.clearDraft(f.path);
+      } else {
+        let parsed: unknown;
+        try {
+          parsed = parseInput(f, v);
+        } catch {
+          parsed = v;
+        }
+        if (
+          f.kind === "string-array" &&
+          Array.isArray(parsed) &&
+          parsed.length === 0 &&
+          isOptionalArray(f.type_hint)
+        ) {
+          parsed = null;
+        }
+        configDraft.setDraft(f.path, v, parsed);
+      }
+    };
+
+    // Group sibling `*.allowed_tools` / `*.excluded_tools` / `*.auto_approve`
+    // / `*.always_ask` entries into one ToolPermissionGrid instead of four
+    // independent FieldRows. Matched by parent prefix + leaf name — today
+    // only `risk_profiles.<alias>` has all four as direct siblings, but
+    // nothing here hardcodes that section, same spirit as the single-leaf
+    // `isAllowedToolsField` hook below.
+    const permissionGroups = useMemo(() => {
+      const leaves = [
+        "allowed_tools",
+        "excluded_tools",
+        "auto_approve",
+        "always_ask",
+      ] as const;
+      type Leaf = (typeof leaves)[number];
+      const byParent = new Map<string, Partial<Record<Leaf, ListResponseEntry>>>();
+      for (const e of entries) {
+        if (e.kind !== "string-array") continue;
+        const idx = e.path.lastIndexOf(".");
+        if (idx === -1) continue;
+        const parent = e.path.slice(0, idx);
+        const leaf = e.path.slice(idx + 1) as Leaf;
+        if (!(leaves as readonly string[]).includes(leaf)) continue;
+        const bucket = byParent.get(parent) ?? {};
+        bucket[leaf] = e;
+        byParent.set(parent, bucket);
+      }
+      const groups: { parent: string; fields: Record<Leaf, ListResponseEntry> }[] = [];
+      for (const [parent, bucket] of byParent) {
+        if (bucket.allowed_tools && bucket.excluded_tools && bucket.auto_approve && bucket.always_ask) {
+          groups.push({
+            parent,
+            fields: {
+              allowed_tools: bucket.allowed_tools,
+              excluded_tools: bucket.excluded_tools,
+              auto_approve: bucket.auto_approve,
+              always_ask: bucket.always_ask,
+            },
+          });
+        }
+      }
+      return groups;
+    }, [entries]);
+
+    // Paths consumed by a permission group — excluded from the normal
+    // per-field row list (see `visibleEntries` below). Deliberately NOT
+    // filtered by the field-name search box: that box searches config field
+    // names, the grid has its own tool-name search over a different set of
+    // things (individual tool rows), and conflating the two would make the
+    // grid flicker in and out as the operator types.
+    const groupedPaths = useMemo(() => {
+      const s = new Set<string>();
+      for (const g of permissionGroups) {
+        s.add(g.fields.allowed_tools.path);
+        s.add(g.fields.excluded_tools.path);
+        s.add(g.fields.auto_approve.path);
+        s.add(g.fields.always_ask.path);
+      }
+      return s;
+    }, [permissionGroups]);
+
     const sortedEntries = useMemo(() => {
       // Stable order: `enabled` first (drives whether anything below it
       // matters), then first-run required fields, then secrets, then
@@ -1076,9 +1305,11 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
     );
 
     const visibleEntries = useMemo(() => {
-      const base = enabledEntry
-        ? sortedEntries.filter((e) => e.path !== enabledEntry.path)
-        : sortedEntries;
+      const base = (
+        enabledEntry
+          ? sortedEntries.filter((e) => e.path !== enabledEntry.path)
+          : sortedEntries
+      ).filter((e) => !groupedPaths.has(e.path));
       const filtered = includePath
         ? base.filter((e) => includePath(e.path))
         : base;
@@ -1088,7 +1319,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
         filter,
         (e) => `${fieldShortLabel(e)} ${e.path}`,
       );
-    }, [sortedEntries, filter, includePath, enabledEntry]);
+    }, [sortedEntries, filter, includePath, enabledEntry, groupedPaths]);
 
     // Count of fields whose draft value differs from the saved display value.
     // Drives the unsaved-changes counter in the sticky save bar. Must be
@@ -1247,30 +1478,10 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
                 key={f.path}
                 entry={f}
                 toolAgent={toolAgent}
+                mcpTransport={resolveMcpTransport(f.path, entries, draft)}
+                requiredByTransport={requiredByTransport}
                 value={draft[f.path] ?? ""}
-                onChange={(v) => {
-                  setDraft((d) => ({ ...d, [f.path]: v }));
-                  const baseline = defaultInputValue(f);
-                  if (v === baseline || (f.is_secret && v.length === 0)) {
-                    configDraft.clearDraft(f.path);
-                  } else {
-                    let parsed: unknown;
-                    try {
-                      parsed = parseInput(f, v);
-                    } catch {
-                      parsed = v;
-                    }
-                    if (
-                      f.kind === "string-array" &&
-                      Array.isArray(parsed) &&
-                      parsed.length === 0 &&
-                      isOptionalArray(f.type_hint)
-                    ) {
-                      parsed = null;
-                    }
-                    configDraft.setDraft(f.path, v, parsed);
-                  }
-                }}
+                onChange={(v) => applyFieldValue(f, v)}
                 comment={comments[f.path] ?? ""}
                 onCommentChange={(v) => {
                   setComments((c) => ({ ...c, [f.path]: v }));
@@ -1295,6 +1506,43 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
             ))}
           </form>
         )}
+
+        {/* One grid per detected `allowed_tools`/`excluded_tools`/
+          `auto_approve`/`always_ask` sibling group, rendered outside the
+          filterable field list (see `groupedPaths` / `visibleEntries`
+          above) so the tool-name search inside the grid never fights the
+          field-name search box above it. */}
+        {permissionGroups.map((g) => (
+          <div
+            key={g.parent}
+            className="surface-panel p-4"
+            style={{ borderColor: "var(--pc-border)" }}
+          >
+            <h3
+              className="text-sm font-semibold mb-3"
+              style={{ color: "var(--pc-text-primary)" }}
+            >
+              {t("fieldform.tool_permissions_title")}
+            </h3>
+            <ToolPermissionGrid
+              id={g.parent}
+              agent={toolAgent}
+              level={profileLevelFromDraft(draft, g.parent)}
+              value={{
+                allowedTools: parseArrayRows(draft[g.fields.allowed_tools.path] ?? ""),
+                excludedTools: parseArrayRows(draft[g.fields.excluded_tools.path] ?? ""),
+                autoApprove: parseArrayRows(draft[g.fields.auto_approve.path] ?? ""),
+                alwaysAsk: parseArrayRows(draft[g.fields.always_ask.path] ?? ""),
+              }}
+              onChange={(next: ToolPermissionGridValue) => {
+                applyFieldValue(g.fields.allowed_tools, JSON.stringify(next.allowedTools));
+                applyFieldValue(g.fields.excluded_tools, JSON.stringify(next.excludedTools));
+                applyFieldValue(g.fields.auto_approve, JSON.stringify(next.autoApprove));
+                applyFieldValue(g.fields.always_ask, JSON.stringify(next.alwaysAsk));
+              }}
+            />
+          </div>
+        ))}
 
         {/* Sticky footer bar — pinned to the bottom of the scrolling form
           area so Save is always visible without scrolling. Status (unsaved
@@ -1381,6 +1629,13 @@ interface FieldRowProps {
    *  section (e.g. a channel's `owning_agent`), so the picker lists that
    *  agent's scoped tools. `undefined` keeps the default-agent catalog. */
   toolAgent?: string;
+  /** Live transport draft value for the enclosing `mcp.servers.<name>` group
+   *  (null when this row isn't an MCP server field). Drives the
+   *  transport-conditional required badge/hint on `command` and `url`. */
+  mcpTransport?: string | null;
+  /** Backend transport->required-leaf map for MCP rows (null on older
+   *  backends); drives the required badge/hint without a hardcoded map. */
+  requiredByTransport?: Record<string, string> | null;
 }
 
 function FieldRow({
@@ -1397,9 +1652,11 @@ function FieldRow({
   tombstoned,
   onUndoTombstone,
   toolAgent,
+  mcpTransport,
+  requiredByTransport,
 }: FieldRowProps) {
   const renderer = rendererFor(entry);
-  const requirement = setupRequirement(entry);
+  const requirement = setupRequirement(entry, mcpTransport, requiredByTransport);
   // Display-only inline validation derived from this entry's schema metadata.
   // Pure read of `value` — it does not feed the save/PATCH path in any way.
   // If the badge marks the field optional, don't also flag empty as required
@@ -1414,6 +1671,8 @@ function FieldRow({
     // model_provider) still gets its hint.
     (requirement != null && requirement.tone !== "required") ||
       (requirement?.tone !== "required" && isReferenceField(entry.type_hint)),
+    mcpTransport,
+    requiredByTransport,
   );
   // Suppress the local hint while a server-side error is already bound to this
   // field so the two don't stack; the authoritative server message wins.
@@ -1929,6 +2188,7 @@ function FieldRow({
             populated={entry.populated}
             value={value}
             onChange={onChange}
+            multiline={entry.multiline ?? false}
           />
         ) : (
           <input

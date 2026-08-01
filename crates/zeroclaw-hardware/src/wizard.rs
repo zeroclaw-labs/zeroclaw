@@ -1,8 +1,4 @@
 //! Interactive hardware onboarding wizard UI.
-//!
-//! Provides [`run_setup`] — the hardware step of the ZeroClaw onboarding
-//! wizard. The function is intended to be registered as
-//! `WizardCallbacks::hardware_setup` from the binary crate.
 
 use anyhow::Result;
 use console::style;
@@ -12,11 +8,6 @@ use zeroclaw_config::schema::{HardwareConfig, HardwareTransport};
 use crate::discover_hardware;
 use crate::{config_from_wizard_choice, recommended_wizard_default};
 
-/// Run the interactive hardware setup step of the onboarding wizard.
-///
-/// Discovers connected devices, presents selection prompts for transport mode,
-/// port, baud rate, probe target, and datasheet RAG, then returns the resulting
-/// [`HardwareConfig`].
 pub fn run_setup() -> Result<HardwareConfig> {
     println!(
         "  {} {}",
@@ -164,7 +155,7 @@ pub fn run_setup() -> Result<HardwareConfig> {
     // Datasheet RAG
     if hw_config.enabled {
         let datasheets = Confirm::new()
-            .with_prompt("  Enable datasheet RAG? (index PDF schematics for AI pin lookups)")
+            .with_prompt("  Enable datasheet RAG? (index .md/.txt datasheets for AI pin lookups; PDFs must be converted to text first)")
             .default(true)
             .interact()?;
         hw_config.workspace_datasheets = datasheets;

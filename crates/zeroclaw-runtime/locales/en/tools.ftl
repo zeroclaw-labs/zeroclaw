@@ -86,12 +86,24 @@ tool-file-download-error-flush = Failed to flush downloaded file: { $err }
 tool-file-download-error-move = Failed to move downloaded file into place: { $err }
 tool-file-download-success = Downloaded { $written } bytes to { $dest_path } ({ $status })
 
-tool-file-read = Read file contents with line numbers. Supports partial reading via offset and limit. Extracts text from PDF; other binary files are read with lossy UTF-8 conversion.
+tool-file-read = Read file contents with line numbers. Supports partial reading via offset and limit. Binary and image files are rejected (use the image_info tool for images). Set encoding="base64" to return raw bytes base64-encoded (for binary files such as .pdf/.xlsx/.docx); offset/limit are ignored in that mode.
 
 tool-file-write = Write contents to a file in the workspace
 
 tool-git-operations = Perform structured Git operations (status, diff, log, branch, commit, add, checkout, stash). Provides parsed JSON output and integrates with security policy for autonomy controls.
 tool-git-operations-error-not-in-repo = Not in a Git repository at '{ $path }'. Choose a path inside a Git worktree, pass 'path' for a repository subdirectory, or initialize a repository before running git_operations.
+
+tool-git-forge-error-requires-field = { $resource }.{ $action } requires '{ $field }'.
+tool-git-forge-error-requires-number = { $resource }.{ $action } requires 'number'.
+tool-git-forge-error-issue-close-reason = issue.close 'reason' must be 'completed' or 'not_planned'.
+tool-git-forge-error-pull-merge-method = pull.merge 'method' must be 'merge', 'squash', or 'rebase'.
+tool-git-forge-error-review-verdict = review.create 'verdict' must be approve|request_changes|comment, got '{ $verdict }'.
+tool-git-forge-error-unknown-cell = unknown or unsupported resource/action '{ $resource }.{ $action }'. Call action 'describe' for the supported grid, or use 'raw' for anything unlisted.
+tool-git-forge-error-no-channels = No channels available yet (channels not initialized).
+tool-git-forge-error-raw-requires-method = 'raw' requires 'method'.
+tool-git-forge-error-raw-requires-path = 'raw' requires 'path'.
+tool-git-forge-error-requires-resource = a typed call requires 'resource' (or use action 'raw'/'describe').
+tool-git-forge-error-missing-repo = Missing 'repo' (expected 'owner/repo').
 
 tool-glob-search = Search for files matching a glob pattern within the workspace. Returns a sorted list of matching file paths relative to the workspace root. Examples: '**/*.rs' (all Rust files), 'src/**/mod.rs' (all mod.rs in src).
 
@@ -127,7 +139,6 @@ tool-model-routing-config = Manage default model settings, scenario-based provid
 
 tool-notion = Interact with Notion: query databases, read/create/update pages, and search the workspace.
 
-tool-pdf-read = Extract plain text from a PDF file in the workspace. Returns all readable text. Image-only or encrypted PDFs return an empty result. Requires the 'rag-pdf' build feature.
 
 tool-project-intel = Project delivery intelligence: generate status reports, detect risks, draft client updates, summarize sprints, and estimate effort. Read-only analysis tool.
 

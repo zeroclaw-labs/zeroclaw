@@ -195,14 +195,25 @@ export default function SectionPicker({
   );
 }
 
-function badgeIsGood(badge: string | undefined): boolean {
-  return badge === "configured" || badge === "active" || badge === "set";
+// Shared "this option is configured/good" predicate, exported so every
+// badge-filtered surface (section nav, config item list, command-palette
+// search) reads one accept set instead of re-listing the literals. Storage
+// backends badge as "created" (see storage_picker in api_sections.rs); keeping
+// the set in one place means a badge rename can no longer half-land across
+// surfaces.
+export function badgeIsGood(badge: string | undefined): boolean {
+  return (
+    badge === "configured" ||
+    badge === "active" ||
+    badge === "set" ||
+    badge === "created"
+  );
 }
 
 // Map a schema-driven badge string to a calm Badge tone. The badge text
 // itself is rendered verbatim — only the tint is chosen here, so no
 // section/option names are hardcoded.
-function badgeTone(badge: string): BadgeTone {
+export function badgeTone(badge: string): BadgeTone {
   if (badgeIsGood(badge)) return "ok";
   if (badge === "needs setup") return "warn";
   return "neutral";

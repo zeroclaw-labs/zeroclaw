@@ -1,22 +1,31 @@
-import { NavLink } from 'react-router-dom';
+import { useLocation } from 'react-router-dom';
 import { basePath } from '../../lib/basePath';
+import { findActiveNavPath } from './sidebarNav';
+import { SidebarNavLink } from './SidebarNavLink';
 import {
   Activity,
+  ArrowDownToLine,
   Bot,
   Clock,
   LayoutDashboard,
+  ListChecks,
   MessageSquare,
   Monitor,
   Puzzle,
   Settings,
   Smartphone,
+  Sparkles,
   Stethoscope,
   Terminal,
+  Workflow,
   Wrench,
 } from 'lucide-react';
 import { t } from '@/lib/i18n';
 import { useEffect, useState } from 'react';
 import { getStatus } from '@/lib/api';
+import { useVersionCheck } from '@/hooks/useVersionCheck';
+import { UpgradeDialog } from '@/components/UpgradeDialog';
+import type { StatusResponse } from '@/types/api';
 
 interface NavItem {
   to: string;
@@ -49,6 +58,9 @@ const navGroups: NavGroup[] = [
       { to: '/config', icon: Settings, labelKey: 'nav.config' },
       { to: '/config/agents', icon: Bot, labelKey: 'nav.agent' },
       { to: '/tools', icon: Wrench, labelKey: 'nav.tools' },
+      { to: '/skills', icon: Sparkles, labelKey: 'nav.skills' },
+      { to: '/sops', icon: Workflow, labelKey: 'nav.sops' },
+      { to: '/runs', icon: ListChecks, labelKey: 'nav.runs' },
       { to: '/integrations', icon: Puzzle, labelKey: 'nav.integrations' },
       { to: '/cron', icon: Clock, labelKey: 'nav.cron' },
     ],
@@ -65,6 +77,10 @@ const navGroups: NavGroup[] = [
   },
 ];
 
+// NavLink matches path prefixes by default. Resolve the longest registered
+// destination so a specific item can suppress its otherwise-active ancestors.
+const navPaths = navGroups.flatMap((group) => group.items.map((item) => item.to));
+
 // The 6 Quickstart sections (Workspace, Providers, Channels, Memory,
 // Hardware, Tunnel) live under /config now — they're the first group
 // inside the Config explorer's sidebar. The /setup/<section> deep-link
@@ -77,13 +93,21 @@ const navGroups: NavGroup[] = [
 // and a token-styled popover to the right shown on hover OR keyboard focus.
 // Active state = accent icon + a 2px left accent bar + subtle accent tint, with
 // aria-current="page" so assistive tech announces the current section.
-function RailNavItem({ item, onClick }: { item: NavItem; onClick: () => void }) {
+function RailNavItem({
+  item,
+  activePath,
+  onClick,
+}: {
+  item: NavItem;
+  activePath: string | null;
+  onClick: () => void;
+}) {
   const { to, icon: Icon, labelKey } = item;
   const text = t(labelKey);
   return (
-    <NavLink
+    <SidebarNavLink
       to={to}
-      end={to === '/'}
+      activePath={activePath}
       onClick={onClick}
       title={text}
       aria-label={text}
@@ -128,7 +152,7 @@ function RailNavItem({ item, onClick }: { item: NavItem; onClick: () => void }) 
           </span>
         </>
       )}
-    </NavLink>
+    </SidebarNavLink>
   );
 }
 
@@ -136,13 +160,21 @@ function RailNavItem({ item, onClick }: { item: NavItem; onClick: () => void }) 
 // Full labelled row (icon + text) for the mobile drawer, with the same calm
 // active treatment as before: subtle accent tint, 2px left accent bar, accent
 // icon, and aria-current via NavLink.
-function DrawerNavItem({ item, onClick }: { item: NavItem; onClick: () => void }) {
+function DrawerNavItem({
+  item,
+  activePath,
+  onClick,
+}: {
+  item: NavItem;
+  activePath: string | null;
+  onClick: () => void;
+}) {
   const { to, icon: Icon, labelKey } = item;
   const text = t(labelKey);
   return (
-    <NavLink
+    <SidebarNavLink
       to={to}
-      end={to === '/'}
+      activePath={activePath}
       onClick={onClick}
       className={({ isActive }) =>
         [
@@ -170,16 +202,17 @@ function DrawerNavItem({ item, onClick }: { item: NavItem; onClick: () => void }
           <span className="whitespace-nowrap">{text}</span>
         </>
       )}
-    </NavLink>
+    </SidebarNavLink>
   );
 }
 
 // ── Mobile drawer group ─────────────────────────────────────────────────────
 // One labelled cluster: a faint uppercase heading associated with its <ul> via
 // aria-labelledby so screen readers announce the group name.
-function DrawerGroup({ group, index, onClick }: {
+function DrawerGroup({ group, index, activePath, onClick }: {
   group: NavGroup;
   index: number;
+  activePath: string | null;
   onClick: () => void;
 }) {
   const heading = t(group.headingKey);
@@ -194,7 +227,12 @@ function DrawerGroup({ group, index, onClick }: {
         {heading}
       </h2>
       {group.items.map((item) => (
-        <DrawerNavItem key={item.to} item={item} onClick={onClick} />
+        <DrawerNavItem
+          key={item.to}
+          item={item}
+          activePath={activePath}
+          onClick={onClick}
+        />
       ))}
     </div>
   );
@@ -206,6 +244,22 @@ interface SidebarProps {
 }
 
 export default function Sidebar({ open, onClose }: SidebarProps) {
+  const { pathname } = useLocation();
+  const activePath = findActiveNavPath(pathname, navPaths);
+  const [status, setStatus] = useState<StatusResponse | null>(null);
+  useEffect(() => {
+    getStatus()
+      .then(setStatus)
+      .catch(() => { /* silently ignore */ });
+  }, []);
+  // `check_updates` is undefined on older gateways → treat as enabled.
+  const checkUpdates = status?.check_updates !== false;
+  const { info, loading, refetch } = useVersionCheck(checkUpdates);
+  const hasUpdate = info?.is_newer === true;
+  const version = status?.version ?? null;
+  const [upgradeOpen, setUpgradeOpen] = useState(false);
+  const openUpgrade = () => setUpgradeOpen(true);
+
   return (
     <>
       {/* Backdrop — mobile only */}
@@ -241,12 +295,17 @@ export default function Sidebar({ open, onClose }: SidebarProps) {
                 />
               )}
               {group.items.map((item) => (
-                <RailNavItem key={item.to} item={item} onClick={onClose} />
+                <RailNavItem
+                  key={item.to}
+                  item={item}
+                  activePath={activePath}
+                  onClick={onClose}
+                />
               ))}
             </div>
           ))}
         </nav>
-        <RailFooter />
+        <RailFooter version={version} hasUpdate={hasUpdate} onOpen={openUpgrade} />
       </aside>
 
       {/* Mobile drawer — labelled full version (icons + labels), slides in/out. */}
@@ -261,11 +320,29 @@ export default function Sidebar({ open, onClose }: SidebarProps) {
         <DrawerLogo />
         <nav className="flex-1 overflow-y-auto py-3 px-2 space-y-0.5" aria-label={t('nav.aria.primary')}>
           {navGroups.map((group, index) => (
-            <DrawerGroup key={group.headingKey} group={group} index={index} onClick={onClose} />
+            <DrawerGroup
+              key={group.headingKey}
+              group={group}
+              index={index}
+              activePath={activePath}
+              onClick={onClose}
+            />
           ))}
         </nav>
-        <DrawerFooter />
+        <DrawerFooter version={version} hasUpdate={hasUpdate} onOpen={openUpgrade} />
       </aside>
+
+      <UpgradeDialog
+        open={upgradeOpen}
+        info={info}
+        loading={loading}
+        checkUpdatesEnabled={checkUpdates}
+        allowSelfUpgrade={status?.allow_self_upgrade === true}
+        restartMode={status?.restart_mode}
+        restartHint={status?.restart_hint}
+        onRefetch={refetch}
+        onClose={() => setUpgradeOpen(false)}
+      />
     </>
   );
 }
@@ -285,7 +362,7 @@ function RailLogo() {
           style={{ background: 'linear-gradient(135deg, rgba(var(--pc-accent-rgb), 0.15), rgba(var(--pc-accent-rgb), 0.05))' }}
         />
         <img
-          src={`${basePath}/_app/zeroclaw-trans.png`}
+          src={`${basePath}/_app/logo.png`}
           alt={t('sidebar.logo_alt')}
           className="relative h-8 w-8 rounded-xl object-cover"
           onError={(e) => {
@@ -310,7 +387,7 @@ function DrawerLogo() {
           style={{ background: 'linear-gradient(135deg, rgba(var(--pc-accent-rgb), 0.15), rgba(var(--pc-accent-rgb), 0.05))' }}
         />
         <img
-          src={`${basePath}/_app/zeroclaw-trans.png`}
+          src={`${basePath}/_app/logo.png`}
           alt={t('sidebar.logo_alt')}
           className="relative h-9 w-9 rounded-xl object-cover"
           onError={(e) => {
@@ -330,44 +407,110 @@ function DrawerLogo() {
 
 // ── Footers ─────────────────────────────────────────────────────────────────
 
-function useVersion() {
-  const [version, setVersion] = useState<string | null>(null);
-  useEffect(() => {
-    getStatus()
-      .then((s) => { if (s.version) setVersion(s.version); })
-      .catch(() => { /* silently ignore */ });
-  }, []);
-  return version;
+interface FooterProps {
+  version: string | null;
+  /** A newer release is available — render an accent dot. */
+  hasUpdate: boolean;
+  /** Open the upgrade dialog. */
+  onOpen: () => void;
 }
 
-// Rail footer — version tag only, centered, with a native tooltip carrying the
-// full "ZeroClaw Gateway vX" string since the rail has no room for the label.
-function RailFooter() {
-  const version = useVersion();
+// Rail footer — version tag as a button, centered, with a native tooltip
+// carrying the full "ZeroClaw Gateway vX" string since the rail has no room for
+// the label. When an update is available the version row is replaced by a
+// pulsing download-arrow icon stacked above the version text — the dot was
+// too easy to miss against the muted `text-faint` colour.
+function RailFooter({ version, hasUpdate, onOpen }: FooterProps) {
+  const title = hasUpdate
+    ? t('sidebar.update_available')
+    : version
+      ? `${t('sidebar.gateway')} v${version}`
+      : t('sidebar.gateway');
   return (
     <div
       className="border-t shrink-0 flex items-center justify-center"
       style={{ borderColor: 'var(--pc-border)', padding: '10px 0' }}
-      title={version ? `${t('sidebar.gateway')} v${version}` : t('sidebar.gateway')}
     >
-      {version && (
-        <span style={{ fontSize: '9px', color: 'var(--pc-text-faint)' }}>
-          v{version}
-        </span>
+      {(version || hasUpdate) && (
+        <button
+          type="button"
+          onClick={onOpen}
+          title={title}
+          aria-label={title}
+          className={[
+            'relative flex flex-col items-center justify-center gap-0.5 rounded px-1.5 py-1 cursor-pointer transition-colors',
+            hasUpdate
+              ? 'bg-pc-accent/10 hover:bg-pc-accent/20'
+              : 'hover:bg-pc-surface',
+          ].join(' ')}
+        >
+          {hasUpdate && (
+            <ArrowDownToLine
+              aria-hidden="true"
+              className="h-3.5 w-3.5 animate-bounce-soft"
+              style={{ color: 'var(--pc-accent)' }}
+            />
+          )}
+          {/* Red badge dot — an unmistakable attention-grabber layered atop the
+              pulsing arrow so an available update is never missed at a glance. */}
+          {hasUpdate && (
+            <span
+              aria-hidden="true"
+              className="absolute rounded-full"
+              style={{
+                top: '2px',
+                right: '2px',
+                width: '7px',
+                height: '7px',
+                backgroundColor: 'var(--color-status-error)',
+                boxShadow: '0 0 0 1.5px var(--pc-bg-surface)',
+              }}
+            />
+          )}
+          <span
+            style={{
+              fontSize: '9px',
+              color: hasUpdate ? 'var(--pc-accent)' : 'var(--pc-text-faint)',
+              fontWeight: hasUpdate ? 600 : undefined,
+            }}
+          >
+            {version ? `v${version}` : t('upgrade.title')}
+          </span>
+        </button>
       )}
     </div>
   );
 }
 
-// Drawer footer — full labelled gateway line for mobile.
-function DrawerFooter() {
-  const version = useVersion();
+// Drawer footer — full labelled gateway line for mobile, clickable to upgrade.
+// When an update is available the dot is replaced by a soft-bouncing download
+// arrow rendered at body-text size so the affordance is unmistakable.
+function DrawerFooter({ version, hasUpdate, onOpen }: FooterProps) {
   return (
     <div
       className="px-5 py-4 border-t text-[10px] uppercase tracking-wider"
       style={{ borderColor: 'var(--pc-border)', color: 'var(--pc-text-faint)' }}
     >
-      {t('sidebar.gateway')}
+      <button
+        type="button"
+        onClick={onOpen}
+        title={hasUpdate ? t('sidebar.update_available') : undefined}
+        className={[
+          'flex items-center gap-1.5 cursor-pointer transition-opacity uppercase tracking-wider',
+          hasUpdate ? 'opacity-100' : 'hover:opacity-80',
+        ].join(' ')}
+        style={hasUpdate ? { color: 'var(--pc-accent)' } : undefined}
+      >
+        {hasUpdate && (
+          <ArrowDownToLine
+            aria-hidden="true"
+            className="h-3.5 w-3.5 animate-bounce-soft"
+          />
+        )}
+        <span>
+          {hasUpdate ? t('sidebar.update_available') : t('sidebar.gateway')}
+        </span>
+      </button>
       {version && (
         <div className="mt-0.5 normal-case tracking-normal" style={{ fontSize: '9px' }}>
           v{version}

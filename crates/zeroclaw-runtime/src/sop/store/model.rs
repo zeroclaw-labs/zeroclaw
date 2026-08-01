@@ -1,13 +1,4 @@
 //! Durable run-state store — versioned wire shapes (EPIC B).
-//!
-//! [`SopRun`] is the runtime FSM state; for durability it is wrapped in a
-//! forward-compatible [`PersistedRun`] envelope (version + monotonic revision +
-//! stall timestamp + redaction marker). The CAS [`ClaimToken`], append-only
-//! [`SopEventRecord`], and procedural-memory [`ProposalRecord`] share the same
-//! store so concurrency-control, audit-trail, and procedural-memory ride one
-//! abstraction rather than three.
-//!
-//! Design: `epics/B-run-state-store/03-architecture.md` (SOP path-to-5).
 
 use serde::{Deserialize, Serialize};
 
@@ -17,11 +8,6 @@ use crate::sop::types::{SopRun, SopTriggerSource};
 /// skips + logs unknown major versions rather than panicking on boot.
 pub const SOP_STORE_VERSION: u32 = 1;
 
-/// Forward-compatible durable envelope around a [`SopRun`].
-///
-/// `SopRun` is not persisted directly: this envelope adds the durability
-/// metadata (`version`, monotonic `revision`, stall `last_progress_at`,
-/// `redacted` marker, `trigger_source`) the raw run lacks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedRun {
     /// = [`SOP_STORE_VERSION`] at write time.
@@ -70,8 +56,6 @@ pub struct ClaimToken {
     pub holder: String,
 }
 
-/// One append-only audit/observability event. Never overwritten (the primitive
-/// the keyed `Memory` backend lacks).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SopEventRecord {
     pub run_id: String,
@@ -98,19 +82,49 @@ pub enum ProposalStatus {
     Stale,
 }
 
+/// Whether a proposal creates a new SOP or updates an existing one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProposalKind {
+    Create,
+    Update,
+}
+
 /// A captured-and-distilled SOP refinement awaiting approval + write-back.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProposalRecord {
     pub id: String,
+    #[serde(default = "default_proposal_kind")]
+    pub kind: ProposalKind,
     pub status: ProposalStatus,
     pub source_run_id: Option<String>,
     pub sop_name: String,
     /// For stale detection against the on-disk SOP.
     pub target_content_hash: Option<String>,
+    /// Proposed `SOP.toml` bytes. Kept in the shared store so inspect/apply do
+    /// not depend on transient files.
+    #[serde(default)]
+    pub manifest_toml: String,
+    /// Proposed `SOP.md` bytes. Scanned before write-back and written atomically
+    /// only after an explicit apply action.
+    #[serde(default)]
+    pub procedure_markdown: String,
     /// Distiller model, session, timestamp, …
     pub provenance: serde_json::Value,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(default)]
+    pub status_reason: Option<String>,
+    #[serde(default)]
+    pub applied_at: Option<String>,
+    #[serde(default)]
+    pub applied_by: Option<String>,
+    #[serde(default)]
+    pub rollback_path: Option<String>,
+}
+
+fn default_proposal_kind() -> ProposalKind {
+    ProposalKind::Update
 }
 
 /// Retention bound for terminal runs + their events.

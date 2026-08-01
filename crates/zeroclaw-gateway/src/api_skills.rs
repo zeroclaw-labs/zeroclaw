@@ -1,10 +1,4 @@
 //! HTTP adapter over `zeroclaw_runtime::skills::SkillsService`.
-//!
-//! Thin handlers — every endpoint translates request shape → `SkillsService`
-//! call → response shape. No filesystem logic, no validation, no error
-//! mapping that isn't already encoded in `SkillsService`. The dashboard,
-//! the CLI (`zeroclaw skills add/edit/bundle ...`), and the future TUI all
-//! reach the same canonical implementation through their respective surface.
 
 use axum::{
     Json,
@@ -12,20 +6,28 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use zeroclaw_runtime::rpc::types::{
     AgentSkillEntry, AgentSkillsResult, DroppedSkillEntry, ShadowedSkillEntry, SkillBundleEntry,
     SkillListEntry, SkillsBundlesResult, SkillsListResult, SkillsReadResult,
 };
 use zeroclaw_runtime::skills::{
     DroppedSkill, EffectiveSkill, RemoveMode, ScaffoldOptions, ServiceError, SkillDropReason,
-    SkillFrontmatter, SkillOrigin, SkillsService,
+    SkillFrontmatter, SkillOrigin, SkillsService, SlashOptionKindDescriptor,
 };
 
 use super::AppState;
 use super::api::require_auth;
 
 // ── HTTP-specific request shapes (not shared) ───────────────────────
+
+/// Response for `GET /api/skills/slash-option-kinds`: the canonical registry,
+/// built by walking `SlashOptionKind::ALL`.
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct SlashOptionKindsResult {
+    pub kinds: Vec<SlashOptionKindDescriptor>,
+}
 
 #[derive(Debug, Deserialize)]
 pub struct SkillCreateBody {
@@ -57,6 +59,22 @@ pub struct DeleteQuery {
 }
 
 // ── Handlers ────────────────────────────────────────────────────────
+
+/// `GET /api/skills/slash-option-kinds` — the canonical typed-slash-option kind
+/// registry (kind list + per-kind constraint capabilities), built by walking
+/// `SlashOptionKind::ALL`. Surfaces read this instead of restating the kind set.
+pub async fn handle_slash_option_kinds(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    Json(SlashOptionKindsResult {
+        kinds: zeroclaw_runtime::skills::slash_option_kinds(),
+    })
+    .into_response()
+}
 
 /// `GET /api/skills/bundles`
 pub async fn handle_list_bundles(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -114,11 +132,6 @@ pub async fn handle_list_skills(
     }
 }
 
-/// `GET /api/agents/:alias/skills` — the agent's *effective* resolved skill set
-/// (workspace / open-skills / plugin / bundle), with provenance (#7757). Unlike
-/// `/api/skills/bundles/:alias/skills` (bundle-only), this mirrors what the
-/// runtime actually loads for the agent, so the dashboard stops rendering an
-/// empty page when an agent has workspace/open-skills/plugin skills.
 pub async fn handle_agent_skills(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -173,18 +186,22 @@ fn agent_skill_entry(s: EffectiveSkill) -> AgentSkillEntry {
 
 /// Map a runtime [`DroppedSkill`] to its flat wire shape, splitting the
 /// [`SkillDropReason`] enum into a `(reason_kind, reason)` string pair the
-/// dashboard can group on without knowing the Rust enum. (#7963)
+/// dashboard can group on without knowing the Rust enum.
 fn dropped_skill_entry(d: DroppedSkill) -> DroppedSkillEntry {
-    let (reason_kind, reason) = match d.reason {
-        SkillDropReason::AuditFindings(s) => ("audit_findings", s),
-        SkillDropReason::AuditError(s) => ("audit_error", s),
-        SkillDropReason::ManifestParseError(s) => ("manifest_parse_error", s),
+    let (reason_kind, reason, scripts_blocked) = match d.reason {
+        SkillDropReason::AuditFindings {
+            summary,
+            scripts_blocked,
+        } => ("audit_findings", summary, scripts_blocked),
+        SkillDropReason::AuditError(s) => ("audit_error", s, false),
+        SkillDropReason::ManifestParseError(s) => ("manifest_parse_error", s, false),
     };
     DroppedSkillEntry {
         name: d.name,
         origin: d.origin_hint,
         reason_kind: reason_kind.to_string(),
         reason,
+        scripts_blocked,
         directory: d.location.map(|p| p.display().to_string()),
     }
 }
@@ -341,7 +358,7 @@ mod tests {
     use std::path::PathBuf;
     use zeroclaw_runtime::skills::{ShadowedSkill, SkillOrigin};
 
-    // #7963: the write-guard error maps to 403, distinct from 404/400.
+    // the write-guard error maps to 403, distinct from 404/400.
     #[test]
     fn not_editable_maps_to_forbidden() {
         let resp = service_error_response(ServiceError::NotEditable {
@@ -351,7 +368,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
-    // #7963: shadowed records ride through to the wire entry.
+    // shadowed records ride through to the wire entry.
     #[test]
     fn agent_skill_entry_maps_shadowed() {
         let s = EffectiveSkill {
@@ -373,7 +390,7 @@ mod tests {
         assert_eq!(entry.shadowed[0].origin, "bundle");
     }
 
-    // #7963: each SkillDropReason arm maps to the right reason_kind tag.
+    // each SkillDropReason arm maps to the right reason_kind tag.
     #[test]
     fn dropped_skill_entry_maps_each_reason_kind() {
         let mk = |reason| DroppedSkill {
@@ -383,8 +400,20 @@ mod tests {
             location: Some(PathBuf::from("/x/n")),
         };
         assert_eq!(
-            dropped_skill_entry(mk(SkillDropReason::AuditFindings("a".into()))).reason_kind,
+            dropped_skill_entry(mk(SkillDropReason::AuditFindings {
+                summary: "a".into(),
+                scripts_blocked: true,
+            }))
+            .reason_kind,
             "audit_findings"
+        );
+        assert!(
+            dropped_skill_entry(mk(SkillDropReason::AuditFindings {
+                summary: "a".into(),
+                scripts_blocked: true,
+            }))
+            .scripts_blocked,
+            "scripts_blocked flag must pass through to the wire entry"
         );
         assert_eq!(
             dropped_skill_entry(mk(SkillDropReason::AuditError("b".into()))).reason_kind,

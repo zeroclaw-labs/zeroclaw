@@ -1,0 +1,97 @@
+name: Trivy Scheduled Image Scan
+
+# Weekly Trivy scan of the published GHCR images. Runs as a report-first
+# job (exit-code: 0) until the baseline is understood and thresholds are
+# agreed. Findings upload to the GitHub Security tab via SARIF.
+#
+# Scanning on a schedule catches new CVEs that emerge between releases
+# without requiring a new tag to trigger docker-publish.yml.
+#
+# The image matrix is intentionally a subset of docker-tags.toml — dist
+# and default-features cover the two most common deployment targets.
+# Update this matrix when docker-tags.toml adds a new major variant.
+
+on:
+  schedule:
+    - cron: '15 8 * * 6'   # Saturdays at 08:15 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: trivy-scheduled
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: read
+  security-events: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ${{ github.repository }}
+
+jobs:
+  scan:
+    name: Trivy (${{ matrix.stem }})
+    if: github.repository == 'zeroclaw-labs/zeroclaw'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - stem: dist
+            floating_tag: dist
+          - stem: default-features
+            floating_tag: default-features
+
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify published image exists
+        env:
+          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE }}:${{ matrix.floating_tag }}
+        run: |
+          set -euo pipefail
+          error_log="$(mktemp)"
+          trap 'rm -f "$error_log"' EXIT
+          if docker manifest inspect "$IMAGE_REF" >/dev/null 2>"$error_log"; then
+            exit 0
+          fi
+          cat "$error_log" >&2
+          if grep -Eiq 'manifest unknown|no such manifest|not found' "$error_log"; then
+            echo "::error title=Published image missing::Expected published image $IMAGE_REF. Check the Docker Publish release job before retrying this scan."
+          else
+            echo "::error title=Image inspection failed::Could not inspect $IMAGE_REF. Check GHCR authentication and availability before retrying this scan."
+          fi
+          exit 1
+
+      - name: Scan ${{ matrix.stem }} with Trivy
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          skip-dirs: /usr/share/zoneinfo
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE }}:${{ matrix.floating_tag }}
+          format: sarif
+          output: trivy-results.sarif
+          exit-code: 0
+          severity: HIGH,CRITICAL
+
+      - name: Upload Trivy SARIF artifact
+        if: always() && hashFiles('trivy-results.sarif') != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: trivy-results-${{ matrix.stem }}
+          path: trivy-results.sarif
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload Trivy SARIF to GitHub Security tab
+        if: always() && hashFiles('trivy-results.sarif') != ''
+        uses: github/codeql-action/upload-sarif@dd903d2e4f5405488e5ef1422510ee31c8b32357 # v3.36.2
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy-${{ matrix.stem }}

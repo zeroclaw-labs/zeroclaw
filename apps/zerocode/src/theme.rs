@@ -1,5 +1,4 @@
 //! ZeroClaw TUI colour palette and style helpers.
-//!
 //! Shared between the onboarding UI (lib target) and the main chat TUI (binary
 //! target). Not every helper is used by both targets.
 #![allow(dead_code)]
@@ -37,11 +36,6 @@ const TERMINAL: Theme = Theme {
     background: Color::Reset,
 };
 
-// The named preset palettes are generated at build time from
-// `web/src/contexts/themes.json`, the single source of truth shared with the
-// React dashboard and mdBook docs. See `build.rs` for the var→role mapping.
-// `TERMINAL` is authored here because it is the inherit-shell sentinel, not a
-// real palette.
 include!(concat!(env!("OUT_DIR"), "/theme_presets.rs"));
 
 pub(crate) const DEFAULT_THEME_NAME: &str = "icy_blue";
@@ -275,12 +269,6 @@ pub(crate) fn selected_inactive_bg_style() -> Style {
     Style::default().bg(active().selection_bg)
 }
 
-/// Canonical selection highlight resolver for every split-pane detail list.
-///
-/// `focused` is true when the cursor lives in the pane being drawn (active
-/// selection); false renders the dim "you are here" marker for the pane that
-/// has stepped back. `preserve_fg` is true for rows whose own span colours must
-/// survive (theme swatches), suppressing the foreground override.
 pub(crate) fn selection_highlight(focused: bool, preserve_fg: bool) -> Style {
     match (focused, preserve_fg) {
         (true, false) => selected_style(),
@@ -330,12 +318,6 @@ pub(crate) fn code_block_style() -> Style {
     Style::default().fg(active().body)
 }
 
-/// A syntax-highlight token category. Tree-sitter emits dotted scope strings
-/// (`keyword.function`, `string.special`, …); [`SyntaxScope::classify`] folds
-/// those into this fixed set so every colour decision keys off a typed variant,
-/// and the colours themselves come from the active [`Theme`] rather than a
-/// hardcoded palette — so highlighting tracks the theme (and per-agent
-/// overrides) live.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SyntaxScope {
     Keyword,

@@ -76,11 +76,15 @@ The pipeline from `[cost.rates.*]` to a recorded `cost_usd` value is:
    model)`, multiplies by token counts, and stores a `CostRecord` via
    the global `CostTracker`.
 
-3. **resolve_rates** tries the model id first, then the path-suffix
+3. **resolve_rates_opt** tries the model id first, then the path-suffix
    form for `provider/model` strings (so `anthropic/claude-opus-4-7`
    degrades to `claude-opus-4-7` if the operator stored only the
-   short form). Returns `(0.0, 0.0)` on miss and triggers a one-shot
-   `missing_pricing` warn so silent zero-cost records show up in logs.
+   short form). It returns one `Option` per dimension so any dimension
+   the operator left unconfigured can be filled from the live-pricing
+   fallback (see below) before billing. Only when *both* config and the
+   live fallback leave input and output at `0.0` does the one-shot
+   `missing_pricing` warn fire, so genuine "we couldn't price this"
+   records still surface in logs.
 
 4. **CostTracker is a process-global singleton** (`OnceLock` in
    `crates/zeroclaw-config/src/cost/tracker.rs`). Reload applies the
@@ -89,6 +93,53 @@ The pipeline from `[cost.rates.*]` to a recorded `cost_usd` value is:
    constructs the tracker on demand. The orchestrator's pricing map is
    also rebuilt on every daemon reload from the live config, so rate
    edits take effect on the next request after reload.
+
+## Live pricing from gateways
+
+Operators don't have to hand-maintain a rate for every model. A provider can
+opt into pulling token prices straight from its own gateway by setting
+`live_pricing = true` on that provider block (alongside its existing `api_key`
+and model settings); the prices come from the gateway's own `/models` listing.
+
+Behavior:
+
+- **Gateway is the primary source.** The provider's existing `/models` endpoint
+  (the same one onboarding uses to list models) is parsed for per-model pricing.
+  Gateways that publish prices there report them as per-token decimal strings
+  (OpenRouter's and Kilo's `pricing{prompt,completion,...}`), which are scaled
+  to USD per 1M tokens. A gateway whose `/models` listing carries no pricing at
+  all (such as opencode zen, which lists model ids only) is covered by the
+  models.dev fallback below. No second copy of the endpoint URL or credentials:
+  they are read from the provider's existing config.
+- **models.dev fallback.** A model the gateway doesn't price (or a provider
+  with no HTTP `/models` listing at all, such as a subprocess gateway like
+  `kilocli`) falls back to the public [models.dev](https://models.dev)
+  catalog (`api.json`), keyed by the family's models.dev name (see
+  `catalog_source_for` in `crates/zeroclaw-providers/src/catalog.rs`). The
+  fallback catalog is fetched fresh on each refresh cycle, so both sources
+  track upstream price changes on the same hourly cadence.
+- **Config always wins.** Live prices fill *only* the dimensions a model has
+  no `[cost.rates]` / `pricing` entry for. A configured rate (including a
+  deliberate `0.0`) is never overridden. This is a gap-filler, not a
+  replacement.
+- **One call per gateway, only flagged models.** Aliases sharing a gateway are
+  deduped to a single `/models` fetch; from that response only each opted-in
+  alias's own configured `model` is filled, not every model the gateway lists.
+- **Background refresh, never blocks.** A single task refreshes a process-wide
+  price snapshot hourly. The cost-recording path reads the cached snapshot
+  synchronously and never makes a network call inline, so a slow gateway can't
+  stall request accounting.
+- **Default off.** With no provider setting `live_pricing = true` there is no
+  refresher task and no network traffic; behavior is identical to a build
+  without the feature. Turning the last flagged provider off at runtime
+  (config reload) clears the snapshot on the next refresh cycle, so live
+  prices stop filling without a restart. The snapshot lives only in
+  `zeroclaw_providers::pricing` (see `crates/zeroclaw-providers/src/pricing.rs`);
+  it is read by `record_tool_loop_cost_usage` and spawned once from the
+  channels supervisor and the gateway startup.
+
+Like `[cost.rates]`, a live price only affects requests made after the snapshot
+is populated; there's no retroactive repricing of past records.
 
 ## Persistence
 

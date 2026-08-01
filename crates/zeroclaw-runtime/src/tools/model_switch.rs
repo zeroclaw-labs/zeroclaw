@@ -1,10 +1,10 @@
-use crate::agent::loop_::get_model_switch_state;
+use crate::agent::turn::current_model_switch_state;
 use crate::security::SecurityPolicy;
 use crate::security::policy::ToolOperation;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::Config;
 
 #[cfg(test)]
@@ -121,7 +121,7 @@ impl Tool for ModelSwitchTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(error),
             });
         }
@@ -133,7 +133,7 @@ impl Tool for ModelSwitchTool {
             "list_models" => self.handle_list_models(&args).await,
             _ => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Unknown action: {}. Valid actions: get, set, list_model_providers, list_models",
                     action
@@ -145,7 +145,7 @@ impl Tool for ModelSwitchTool {
 
 impl ModelSwitchTool {
     fn handle_get(&self) -> anyhow::Result<ToolResult> {
-        let switch_state = get_model_switch_state();
+        let switch_state = current_model_switch_state()?;
         let pending = switch_state.lock().unwrap().clone();
 
         Ok(ToolResult {
@@ -153,7 +153,7 @@ impl ModelSwitchTool {
             output: serde_json::to_string_pretty(&json!({
                 "pending_switch": pending,
                 "note": "To switch models, use action 'set' with dotted <type>.<alias> model_provider and model parameters"
-            }))?,
+            }))?.into(),
             error: None,
         })
     }
@@ -166,7 +166,7 @@ impl ModelSwitchTool {
             None => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some("Missing 'model_provider' parameter for 'set' action".to_string()),
                 });
             }
@@ -179,7 +179,7 @@ impl ModelSwitchTool {
             None => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some("Missing 'model' parameter for 'set' action".to_string()),
                 });
             }
@@ -197,7 +197,7 @@ impl ModelSwitchTool {
                         "provider_ref_shape": "<type>.<alias>",
                         "available_provider_families": known_model_providers.iter().map(|p| p.name).collect::<Vec<_>>(),
                         "configured_provider_profiles": configured_profiles
-                    }))?,
+                    }))?.into(),
                     error: Some(error),
                 });
             }
@@ -207,13 +207,12 @@ impl ModelSwitchTool {
         if model.is_empty() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Model ID cannot be empty".to_string()),
             });
         }
 
-        // Set the global model switch request
-        let switch_state = get_model_switch_state();
+        let switch_state = current_model_switch_state()?;
         *switch_state.lock().unwrap() = Some((model_provider.clone(), model.to_string()));
 
         Ok(ToolResult {
@@ -223,7 +222,7 @@ impl ModelSwitchTool {
                 "model_provider": model_provider,
                 "model": model,
                 "note": "The active runtime path will consume this provider-profile/model switch where model_switch is supported. This does not write persisted config."
-            }))?,
+            }))?.into(),
             error: None,
         })
     }
@@ -253,7 +252,7 @@ impl ModelSwitchTool {
                 "configured_count": configured_count,
                 "provider_ref_shape": "<type>.<alias>",
                 "example": "Use action 'set' with a dotted provider profile ref such as 'openai.default'"
-            }))?,
+            }))?.into(),
             error: None,
         })
     }
@@ -274,7 +273,7 @@ impl ModelSwitchTool {
             None => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(
                         "Missing 'model_provider' parameter for 'list_models' action".to_string(),
                     ),
@@ -291,7 +290,7 @@ impl ModelSwitchTool {
                     output: serde_json::to_string_pretty(&json!({
                         "provider_ref_shape": "<type>.<alias>",
                         "configured_provider_profiles": configured_model_provider_profiles(&self.config)
-                    }))?,
+                    }))?.into(),
                     error: Some(error),
                 });
             }
@@ -302,12 +301,6 @@ impl ModelSwitchTool {
             .unwrap_or(model_provider.as_str());
         let provider_family = provider_family.to_lowercase();
 
-        // Prefer the live, in-tree model catalog (models.dev, then the
-        // OpenRouter vendor index) resolved by `list_models_for_family`,
-        // which also maps the family to its catalog key (e.g. `gemini` ->
-        // `google`). Fall back to the hardcoded list below only when the
-        // catalog is unreachable (offline / fetch failure) or empty, so the
-        // offline path stays deterministic. See issue #8088.
         let models: Vec<String> = match self.resolve_catalog(&provider_family).await {
             Ok(live) if !live.is_empty() => live,
             Ok(_) => hardcoded_models_for(&provider_family),
@@ -334,7 +327,7 @@ impl ModelSwitchTool {
                     "model_provider": model_provider,
                     "models": [],
                     "note": "No common models listed for this model_provider family. Check model_provider documentation for available models."
-                }))?,
+                }))?.into(),
                 error: None,
             });
         }
@@ -345,7 +338,8 @@ impl ModelSwitchTool {
                 "model_provider": model_provider,
                 "models": models,
                 "example": "Use action 'set' with this model_provider and a model ID to switch"
-            }))?,
+            }))?
+            .into(),
             error: None,
         })
     }
@@ -366,7 +360,7 @@ impl ModelSwitchTool {
 /// Offline fallback catalog for known provider families. Used only when the
 /// live `list_models_for_family` catalog is unreachable or empty. Kept in
 /// sync with the families in `list_model_providers`; intentionally minimal —
-/// the live catalog is authoritative when reachable (issue #8088).
+/// the live catalog is authoritative when reachable
 fn hardcoded_models_for(provider_family: &str) -> Vec<String> {
     let models: Vec<&'static str> = match provider_family {
         "openai" => vec![
@@ -411,9 +405,9 @@ fn hardcoded_models_for(provider_family: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::loop_::{clear_model_switch_request, get_model_switch_state};
-
-    static MODEL_SWITCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use crate::agent::turn::{
+        ModelSwitchCallback, current_model_switch_state, scope_model_switch_state,
+    };
 
     fn test_config() -> Config {
         let mut config = Config::default();
@@ -426,100 +420,158 @@ mod tests {
         ModelSwitchTool::new(Arc::new(SecurityPolicy::default()), Arc::new(test_config()))
     }
 
-    fn pending_switch() -> Option<(String, String)> {
-        get_model_switch_state().lock().unwrap().clone()
+    fn pending_switch(state: &ModelSwitchCallback) -> Option<(String, String)> {
+        state.lock().unwrap().clone()
+    }
+
+    async fn with_switch_state<T>(f: impl FnOnce(ModelSwitchCallback) -> T) -> T {
+        let state = Arc::new(std::sync::Mutex::new(None));
+        scope_model_switch_state(Arc::clone(&state), async move { f(state) }).await
     }
 
     #[test]
-    fn set_rejects_bare_provider_family() {
-        let _guard = MODEL_SWITCH_TEST_LOCK.lock().unwrap();
-        clear_model_switch_request();
-
-        let result = tool()
-            .handle_set(&json!({
-                "model_provider": "openai",
-                "model": "gpt-4o"
-            }))
-            .expect("set should return a tool result");
-
-        assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or_default()
-                .contains("dotted `<type>.<alias>`"),
-            "unexpected error: {:?}",
-            result.error
-        );
-        assert_eq!(pending_switch(), None);
-    }
-
-    #[test]
-    fn set_accepts_dotted_provider_profile_ref() {
-        let _guard = MODEL_SWITCH_TEST_LOCK.lock().unwrap();
-        clear_model_switch_request();
-
-        let result = tool()
+    fn set_fails_closed_outside_an_active_turn() {
+        let error = tool()
             .handle_set(&json!({
                 "model_provider": "openai.default",
                 "model": "gpt-4o"
             }))
-            .expect("set should return a tool result");
+            .expect_err("set must not fall back to process-global state");
 
-        assert!(result.success, "unexpected error: {:?}", result.error);
+        assert!(
+            error.to_string().contains("active agent turn"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_rejects_bare_provider_family() {
+        with_switch_state(|state| {
+            let result = tool()
+                .handle_set(&json!({
+                    "model_provider": "openai",
+                    "model": "gpt-4o"
+                }))
+                .expect("set should return a tool result");
+
+            assert!(!result.success);
+            assert!(
+                result
+                    .error
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("dotted `<type>.<alias>`"),
+                "unexpected error: {:?}",
+                result.error
+            );
+            assert_eq!(pending_switch(&state), None);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn set_accepts_dotted_provider_profile_ref() {
+        with_switch_state(|state| {
+            let result = tool()
+                .handle_set(&json!({
+                    "model_provider": "openai.default",
+                    "model": "gpt-4o"
+                }))
+                .expect("set should return a tool result");
+
+            assert!(result.success, "unexpected error: {:?}", result.error);
+            assert_eq!(
+                pending_switch(&state),
+                Some(("openai.default".to_string(), "gpt-4o".to_string()))
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn set_rejects_unconfigured_provider_profile_ref() {
+        with_switch_state(|state| {
+            let result = tool()
+                .handle_set(&json!({
+                    "model_provider": "openai.missing",
+                    "model": "gpt-4o"
+                }))
+                .expect("set should return a tool result");
+
+            assert!(!result.success);
+            assert!(
+                result
+                    .error
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("configured provider profile"),
+                "unexpected error: {:?}",
+                result.error
+            );
+            assert_eq!(pending_switch(&state), None);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn set_accepts_configured_custom_provider_profile_ref() {
+        with_switch_state(|state| {
+            let result = tool()
+                .handle_set(&json!({
+                    "model_provider": "custom.local",
+                    "model": "local-model"
+                }))
+                .expect("set should return a tool result");
+
+            assert!(result.success, "unexpected error: {:?}", result.error);
+            assert_eq!(
+                pending_switch(&state),
+                Some(("custom.local".to_string(), "local-model".to_string()))
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn set_requests_are_isolated_across_concurrent_turn_scopes() {
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let run_turn = |model_provider: &'static str, model: &'static str| {
+            let barrier = Arc::clone(&barrier);
+            async move {
+                let state = Arc::new(std::sync::Mutex::new(None));
+                scope_model_switch_state(Arc::clone(&state), async move {
+                    let result = tool()
+                        .handle_set(&json!({
+                            "model_provider": model_provider,
+                            "model": model
+                        }))
+                        .expect("set should return a tool result");
+                    assert!(result.success, "unexpected error: {:?}", result.error);
+
+                    barrier.wait().await;
+                    current_model_switch_state()
+                        .expect("turn scope should remain active")
+                        .lock()
+                        .unwrap()
+                        .clone()
+                })
+                .await
+            }
+        };
+
+        let (openai, custom) = tokio::join!(
+            run_turn("openai.default", "gpt-4o"),
+            run_turn("custom.local", "local-model")
+        );
+
         assert_eq!(
-            pending_switch(),
+            openai,
             Some(("openai.default".to_string(), "gpt-4o".to_string()))
         );
-
-        clear_model_switch_request();
-    }
-
-    #[test]
-    fn set_rejects_unconfigured_provider_profile_ref() {
-        let _guard = MODEL_SWITCH_TEST_LOCK.lock().unwrap();
-        clear_model_switch_request();
-
-        let result = tool()
-            .handle_set(&json!({
-                "model_provider": "openai.missing",
-                "model": "gpt-4o"
-            }))
-            .expect("set should return a tool result");
-
-        assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or_default()
-                .contains("configured provider profile"),
-            "unexpected error: {:?}",
-            result.error
-        );
-        assert_eq!(pending_switch(), None);
-    }
-
-    #[test]
-    fn set_accepts_configured_custom_provider_profile_ref() {
-        let _guard = MODEL_SWITCH_TEST_LOCK.lock().unwrap();
-        clear_model_switch_request();
-
-        let result = tool()
-            .handle_set(&json!({
-                "model_provider": "custom.local",
-                "model": "local-model"
-            }))
-            .expect("set should return a tool result");
-
-        assert!(result.success, "unexpected error: {:?}", result.error);
         assert_eq!(
-            pending_switch(),
+            custom,
             Some(("custom.local".to_string(), "local-model".to_string()))
         );
-
-        clear_model_switch_request();
     }
 
     #[tokio::test]
@@ -548,10 +600,6 @@ mod tests {
         );
     }
 
-    /// Offline fallback (issue #8088): when the live catalog is unreachable,
-    /// `handle_list_models` must fall back to the hardcoded per-family list
-    /// rather than returning an empty set. We assert the fallback table
-    /// directly so the test is deterministic regardless of network access.
     #[test]
     fn hardcoded_fallback_covers_known_families() {
         // The nine families that have hardcoded fallback arms.
@@ -577,10 +625,6 @@ mod tests {
         assert!(hardcoded_models_for("not_a_real_family").is_empty());
     }
 
-    /// When the live models.dev catalog IS reachable, `list_models` must
-    /// return the live catalog (which, unlike the stale hardcoded set,
-    /// surfaces current models such as the gpt-5 / o-series). Network-gated:
-    /// skipped automatically when offline so CI stays deterministic.
     #[tokio::test]
     async fn list_models_prefers_live_catalog_when_reachable() {
         let live = match zeroclaw_providers::catalog::list_models_for_family("openai").await {
@@ -708,10 +752,6 @@ mod tests {
                         .and_then(|v| v.as_str())
                         .map(|s| s.contains("live catalog unavailable, using hardcoded fallback"))
                         .unwrap_or(false);
-                    // Sibling tests (e.g. the `custom.local` short-circuit test)
-                    // emit the SAME fallback message on the shared process-global
-                    // broadcast bus, so match on the ollama family too to pin OUR
-                    // event rather than latching the first fallback WARN seen.
                     let is_ollama = value
                         .get("attributes")
                         .and_then(|a| a.get("provider_family"))

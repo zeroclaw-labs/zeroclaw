@@ -1,0 +1,73 @@
+name: Desktop App Check
+
+# Compiles + lints `zeroclaw-desktop` (the Tauri app) on macOS, Linux, and
+# Windows. The workspace-wide cross-platform-clippy job intentionally
+# `--exclude`s this crate (it needs the platform GUI toolchains), so without
+# this job the desktop app is never type-checked off the author's machine.
+#
+# Kept off the default required PR gate to avoid adding macOS/Windows latency
+# to every PR — it runs on demand, weekly, and on PRs that actually touch the
+# desktop app.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 10 * * 1"
+  pull_request:
+    paths:
+      - "apps/tauri/**"
+      - ".github/workflows/desktop-check.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  build:
+    name: zeroclaw-desktop (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, ubuntu-22.04, windows-latest]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # Tauri v2 needs WebKitGTK + libsoup + GTK on Linux.
+      - name: Install Linux desktop toolchain
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libsoup-3.0-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            libayatana-appindicator3-dev
+
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.96.1
+          components: clippy
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+
+      # The desktop app points its WebView at the running gateway; a placeholder
+      # dist keeps the workspace `embedded-web` path happy during compile.
+      - name: Ensure web/dist placeholder exists
+        shell: bash
+        run: mkdir -p web/dist && touch web/dist/.gitkeep
+
+      - name: Clippy (zeroclaw-desktop)
+        run: cargo clippy -p zeroclaw-desktop --all-targets -- -D warnings

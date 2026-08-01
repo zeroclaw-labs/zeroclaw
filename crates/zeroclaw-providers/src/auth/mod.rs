@@ -51,6 +51,11 @@ impl AuthService {
         self.store.load().await
     }
 
+    /// Read-only listing of persisted profile IDs (no decrypt, no migration).
+    pub async fn list_profile_ids(&self) -> Result<Vec<String>> {
+        self.store.list_profile_ids().await
+    }
+
     pub async fn store_openai_tokens(
         &self,
         profile_name: &str,
@@ -277,16 +282,6 @@ impl AuthService {
         Ok(updated.token_set.map(|t| t.access_token))
     }
 
-    /// Get a valid Gemini OAuth access token, refreshing if necessary.
-    ///
-    /// `client_id` and `client_secret` are the OAuth app credentials from
-    /// the per-alias `[providers.models.gemini.<alias>]` typed config —
-    /// required when a refresh is triggered. Required when the cached
-    /// access token is near expiry; ignored when the access token is
-    /// still valid. Pass empty strings only if the caller is certain
-    /// the token won't need refresh in this call.
-    ///
-    /// Returns `None` if no Gemini profile exists.
     pub async fn get_valid_gemini_access_token(
         &self,
         profile_override: Option<&str>,
@@ -496,11 +491,6 @@ impl AuthService {
         Ok(profile)
     }
 
-    /// Return a valid IMAP OAuth2 bearer token for the given email channel alias.
-    ///
-    /// If the stored access token is near expiry and a refresh token is
-    /// available, a refresh is attempted using the supplied OAuth2 config
-    /// parameters. Returns `None` if no profile exists for this channel.
     pub async fn get_valid_email_oauth2_token(
         &self,
         channel_alias: &str,
@@ -600,11 +590,6 @@ impl AuthService {
     }
 }
 
-/// Auth-flow provider — the finite set the `auth login` /
-/// `auth paste-redirect` / `auth status` commands dispatch on. Synonym
-/// collapse and canonical-name rendering are both serde-driven via the
-/// `rename_all` + `alias` attributes, so no string-literal pattern match
-/// is needed at the parsing boundary or any dispatch site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AuthProvider {
@@ -655,15 +640,6 @@ impl AuthProvider {
     }
 }
 
-/// Permissive string-returning normalizer for token-storage callers
-/// (paste-token, setup-token, set-active-profile, …) that accept
-/// arbitrary provider names. Known OAuth-flow providers collapse to
-/// their canonical form via [`AuthProvider`]; unknown names lower-case
-/// and pass through unchanged so storage works for any bearer-token
-/// provider operators want to support. Empty input is rejected.
-///
-/// OAuth-dispatch sites (`auth login` / `auth refresh`) parse via
-/// [`AuthProvider`] directly — that path is strict by design.
 pub fn normalize_model_provider(model_provider: &str) -> Result<String> {
     if let Ok(provider) = model_provider.parse::<AuthProvider>() {
         return Ok(provider.as_canonical().to_string());
@@ -967,12 +943,6 @@ fn clear_refresh_backoff(profile_id: &str) {
     }
 }
 
-// ════════════════════════════════════════════════════════════════════════
-// PendingOAuthLogin — encrypted on-disk state for browser/paste-redirect
-// fallback. Moved here from `src/main.rs` so the AuthProviderFlow trait
-// impls below can save/load/clear without crossing the bin/lib boundary.
-// ════════════════════════════════════════════════════════════════════════
-
 /// Generic pending OAuth login state, shared across model providers.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PendingOAuthLogin {
@@ -1091,14 +1061,6 @@ pub fn clear_pending_oauth_login(config: &Config, model_provider: &str) {
     }
     let _ = std::fs::remove_file(path);
 }
-
-// ════════════════════════════════════════════════════════════════════════
-// AuthProviderFlow — per-provider auth flow trait, dispatched via
-// `AuthProvider::flow()`. Replaces the string-keyed `match
-// model_provider.as_str() { ... }` blocks formerly in `src/main.rs` —
-// every dispatch now goes through enum-variant matching followed by
-// trait-object virtual call.
-// ════════════════════════════════════════════════════════════════════════
 
 /// Shared context for auth-flow trait methods. Carries the runtime
 /// dependencies each flow needs (config for OAuth client creds, auth
@@ -1649,13 +1611,6 @@ impl AuthProviderFlow for GeminiFlow {
         }
     }
 }
-
-// ── Anthropic impl ─────────────────────────────────────────────────────
-//
-// Anthropic auth is bearer-token only (long-lived subscription tokens
-// from claude.ai). All three OAuth-flow methods rely on the trait's
-// default `bail!()` impls — Anthropic operators use `auth paste-token`
-// or `auth setup-token` instead.
 
 pub struct AnthropicFlow;
 

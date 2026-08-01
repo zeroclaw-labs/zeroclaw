@@ -1,9 +1,5 @@
 //! One-shot, streaming, in-place migration from schema_version 1 rows
 //! to schema_version 2.
-//!
-//! RAM contract: pure streaming. Read one line, parse, convert, write
-//! one line to a temp file. Bounded by a single line's allocation
-//! regardless of file size. Atomic rename at the end.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};

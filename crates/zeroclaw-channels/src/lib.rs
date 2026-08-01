@@ -8,7 +8,12 @@
 #![cfg_attr(feature = "channel-matrix", recursion_limit = "256")]
 
 pub mod allowlist;
+#[cfg(any(feature = "channel-wechat", feature = "whatsapp-web"))]
+pub(crate) mod identity_persist;
 pub mod listing;
+pub mod login_events;
+pub mod login_probe;
+pub mod login_relink;
 pub mod orchestrator;
 pub mod paced_channel;
 pub mod util;
@@ -39,6 +44,8 @@ pub mod discord_slash_state;
 pub mod email_channel;
 #[cfg(feature = "channel-filesystem")]
 pub mod filesystem;
+#[cfg(feature = "channel-git")]
+pub mod git;
 #[cfg(feature = "channel-email")]
 pub mod gmail_push;
 #[cfg(feature = "channel-imessage")]

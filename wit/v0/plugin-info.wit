@@ -2,9 +2,11 @@ package zeroclaw:plugin@0.1.0;
 
 /// Self-identification interface exported by all ZeroClaw plugin types.
 ///
-/// The host calls these functions once at load time. The reported name and
-/// version are cross-validated against the manifest fields; a mismatch
-/// produces a host-side warning but does not abort plugin loading.
+/// The reported name and version identify the component itself, independent of
+/// the manifest that ships next to it. The host does not yet call these
+/// exports; when it does, a mismatch against the manifest fields will produce
+/// a host-side warning, not a load failure. Keep them in sync with the
+/// manifest.
 @unstable(feature = plugins-wit-v0)
 interface plugin-info {
     /// Return the plugin's canonical name as declared by the plugin itself.

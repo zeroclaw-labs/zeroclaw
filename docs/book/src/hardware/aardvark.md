@@ -176,7 +176,8 @@ DatasheetTool.call(args)
   → "search":   return a Google/vendor search URL for the device
   → "download": fetch PDF from args["url"] → save to ~/.zeroclaw/hardware/datasheets/
   → "list":     scan the datasheets directory → return filenames
-  → "read":     open a saved PDF and return its text
+  → "read":     return the local path of a cached `.md` or `.txt` datasheet
+                (PDFs must be converted to text before indexing/reading)
 ```
 
 ---

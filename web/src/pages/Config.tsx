@@ -38,8 +38,12 @@ import FieldForm, {
 } from "../components/sections/FieldForm";
 import PersonalityEditor from "../components/sections/PersonalityEditor";
 import SkillsBundleEditor from "../components/sections/SkillsBundleEditor";
+import BindChannelForm from "../components/sections/BindChannelForm";
 import ReloadDaemonButton from "../components/sections/ReloadDaemonButton";
-import SectionPicker from "../components/sections/SectionPicker";
+import SectionPicker, {
+  badgeIsGood,
+  badgeTone,
+} from "../components/sections/SectionPicker";
 import SectionNavigator from "../components/sections/SectionNavigator";
 import AddEntityDialog from "../components/sections/AddEntityDialog";
 import SectionTabs, {
@@ -256,6 +260,28 @@ export default function Config() {
           ? `channels.${typeParam}.${aliasParam}`
           : `${activeSection.key}.${typeParam}.${aliasParam}`
         : typeParam;
+
+      // Pre-scoped operator-bind tab on a pairing channel's own page, so you
+      // can authorize a user (no /bind message) right where you configured it.
+      const channelExtraTabs: SectionTabSpec[] = [];
+      if (
+        activeSection.key === "channels" &&
+        ["telegram", "wechat", "line"].includes(typeParam)
+      ) {
+        channelExtraTabs.push({
+          key: "bind",
+          label: "Bind identity",
+          render: () => (
+            <BindChannelForm
+              key={`${reloadKey}-${typeParam}-${aliasParam}-bind`}
+              channelType={typeParam}
+              alias={aliasParam}
+              onBound={fetchDrift}
+            />
+          ),
+        });
+      }
+
       return (
         <div className="flex flex-col gap-3 flex-1 min-h-0">
           <Button
@@ -274,6 +300,9 @@ export default function Config() {
             reloadKey={reloadKey}
             onSaved={fetchDrift}
             drift={drifted}
+            extraTabs={
+              channelExtraTabs.length > 0 ? channelExtraTabs : undefined
+            }
           />
         </div>
       );
@@ -514,6 +543,16 @@ export default function Config() {
                   drift={drifted}
                   includePath={isDirectChannelSetting}
                   scopeActionsToIncludedPaths
+                />
+              ),
+            },
+            {
+              key: "bind",
+              label: "Bind identity",
+              render: () => (
+                <BindChannelForm
+                  key={`${reloadKey}-channels-bind`}
+                  onBound={fetchDrift}
                 />
               ),
             },
@@ -1579,9 +1618,7 @@ function ConfiguredOnlyPicker({
         .then((resp) => {
           if (cancelled) return;
           setItems(
-            resp.items.filter(
-              (i) => i.badge === "configured" || i.badge === "active",
-            ),
+            resp.items.filter((i) => badgeIsGood(i.badge)),
           );
         })
         .catch((e) => {
@@ -1653,7 +1690,7 @@ function ConfiguredOnlyPicker({
           </div>
           <div className="flex items-center gap-2 flex-shrink-0">
             {item.badge && (
-              <Badge tone={item.badge === "active" ? "ok" : "neutral"}>
+              <Badge tone={badgeTone(item.badge)}>
                 {item.badge}
               </Badge>
             )}

@@ -1,17 +1,5 @@
 //! Locale RPC methods: serve the in-memory locale registry and fetch
 //! translated FTL catalogues from upstream.
-//!
-//! `locales/list` returns the build's embedded `locales.toml` registry — no
-//! file read, no network. `locales/fetch` downloads catalogue bytes from the
-//! upstream repository (URL built entirely from constants plus the validated
-//! locale/catalog) and returns them so the client writes into its own config
-//! dir. The locale is validated against the embedded registry and the catalog
-//! against the fixed set, so neither can drive a request to an arbitrary host
-//! or path.
-//!
-//! Every emission runs inside an attribution span (`channel = "rpc"`, the
-//! caller's `tui_id` as `session_key`) so locale-fetch events are attributed to
-//! the originating TUI session, never orphaned.
 
 use ::zeroclaw_log::Instrument as _;
 use zeroclaw_api::jsonrpc::error_codes::*;

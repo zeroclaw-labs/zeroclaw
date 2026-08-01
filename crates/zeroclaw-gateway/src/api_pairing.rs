@@ -23,7 +23,7 @@ pub struct DeviceInfo {
     pub last_seen: DateTime<Utc>,
     pub ip_address: Option<String>,
     /// macOS TCC permissions (and equivalent on other OSes) the device reports as granted.
-    /// Pushed by the calling device via POST /api/devices/me/capabilities.
+    /// Pushed by the desktop app via POST /api/devices/me/capabilities.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<Vec<String>>,
 }
@@ -36,17 +36,6 @@ pub struct DeviceRegistry {
 }
 
 impl DeviceRegistry {
-    /// Construct a registry and warm its in-memory cache from the SQLite
-    /// database at `<workspace_dir>/devices.db`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the device registry database cannot be opened or initialised.
-    /// This is intentional startup-path behaviour: a gateway that cannot reach
-    /// its device registry at boot must not come up at all, since later
-    /// per-request errors would only surface after devices begin trying to
-    /// pair. Callers that prefer graceful degradation should wrap construction
-    /// in `catch_unwind` or call out of `main` before any HTTP server starts.
     pub fn new(workspace_dir: &Path) -> Self {
         let db_path = workspace_dir.join("devices.db");
         let conn = Connection::open(&db_path).expect("Failed to open device registry database");
@@ -119,14 +108,6 @@ impl DeviceRegistry {
         }
     }
 
-    /// Construct a registry directly from a database path with an empty
-    /// in-memory cache, bypassing the workspace-relative join and the
-    /// initial schema/cache warm-up.
-    ///
-    /// Intended only for tests that need to inject an unusable path
-    /// (e.g. a non-existent directory or read-only location) to force
-    /// `register` / `revoke` / `list` to surface a `rusqlite::Error`
-    /// without polluting the workspace.
     #[cfg(test)]
     pub(crate) fn with_db_path(db_path: PathBuf) -> Self {
         Self {
@@ -168,22 +149,6 @@ impl DeviceRegistry {
         Ok(())
     }
 
-    /// Backfill placeholder rows for paired tokens that have no device entry.
-    ///
-    /// Bearer tokens paired through the legacy `/pair` route (`handle_pair`)
-    /// historically never called [`register`](Self::register), so their hashes
-    /// live in `gateway.paired_tokens` — the canonical credential set the auth
-    /// gate checks — with no matching device row. Such tokens fully
-    /// authenticate yet are invisible in `GET /api/devices` and cannot be
-    /// revoked from the management UI, which is a security-management gap.
-    ///
-    /// This reconciles the registry (metadata, keyed by `token_hash`) against
-    /// that canonical set on startup: every hash without a row gets a neutral
-    /// `"legacy"` placeholder so it surfaces and can be revoked like any other
-    /// device. The source of truth for *which* tokens are valid remains
-    /// `PairingGuard`/`gateway.paired_tokens` — this never invents a token,
-    /// only surfaces ones that already authenticate. `INSERT OR IGNORE` keeps a
-    /// real row from being clobbered. Returns the number of rows inserted.
     pub fn reconcile_from_token_hashes(
         &self,
         token_hashes: &[String],
@@ -262,14 +227,6 @@ impl DeviceRegistry {
         rows.collect()
     }
 
-    /// Delete a device by id and return its SHA-256 token hash so the caller
-    /// can revoke the matching bearer token.
-    ///
-    /// `Ok(None)` means the device did not exist; real SQLite errors are
-    /// propagated so handlers can distinguish "nothing to do" from "DB is
-    /// broken" — confusing the two during incident response is dangerous.
-    /// Uses `DELETE … RETURNING` (SQLite ≥ 3.35) so the read and delete are
-    /// atomic under concurrent revoke calls.
     pub fn revoke(&self, device_id: &str) -> Result<Option<String>, rusqlite::Error> {
         let conn = self.open_db()?;
         let deleted: Option<String> = conn
@@ -317,12 +274,6 @@ impl DeviceRegistry {
         }
     }
 
-    /// Replace the capability list for the device identified by `token_hash`.
-    /// Returns true if a row was updated. A database error during the write
-    /// is reported as "no row updated" rather than propagated — the row may
-    /// legitimately not exist (token was revoked between bearer issuance and
-    /// capability push), and conflating that with "DB is broken" misleads the
-    /// operator during incident response.
     pub fn update_capabilities(&self, token_hash: &str, capabilities: Vec<String>) -> bool {
         let json = serde_json::to_string(&capabilities).unwrap_or_else(|_| "[]".into());
         let conn = match self.open_db() {
@@ -434,15 +385,6 @@ pub async fn submit_pairing_enhanced(
 
     match state.pairing.try_pair(code, &client_id).await {
         Ok(Some(token)) => {
-            // `try_pair` is not just validation: by the time we land
-            // here, the pairing code is consumed and the token's
-            // SHA-256 hash is already in `PairingGuard::paired_tokens`.
-            // Every step below must succeed atomically — if any of
-            // them fails, we MUST roll back via
-            // `revoke_token_hash` and return 500 WITHOUT the token
-            // in the body, otherwise the in-process credential state
-            // remains accepted while the operator sees a 500 (and a
-            // usable token if the legacy /pair path leaks it).
             let token_hash = {
                 use sha2::{Digest, Sha256};
                 let hash = Sha256::digest(token.as_bytes());
@@ -469,15 +411,6 @@ pub async fn submit_pairing_enhanced(
                             .with_attrs(::serde_json::json!({"error": format!("{e}")})),
                         "device registry insert failed after successful pairing; rolling back in-process token"
                     );
-                    // Compensating action: drop the just-accepted
-                    // hash so the failed pairing leaves no
-                    // authenticate-able state. The pairing code is
-                    // already consumed (one-shot), so the operator
-                    // must call `initiate_pairing` to issue a new
-                    // code. The orphaned registry row, if any, sits
-                    // until the operator removes it via the
-                    // management UI; the next `revoke_all` /
-                    // `reconcile` cycle cleans it up.
                     state.pairing.revoke_token_hash(&token_hash);
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -501,12 +434,6 @@ pub async fn submit_pairing_enhanced(
                         .with_attrs(::serde_json::json!({"error": format!("{e}")})),
                     "pairing token persistence failed; rolling back in-process token"
                 );
-                // Same compensating action as above: persistence
-                // failed, so a restart would resurrect the in-memory
-                // token. Drop it now and do NOT return the
-                // plaintext token in the body — the previous
-                // behavior leaked a usable bearer on a 200, which
-                // is the very gap this PR closes.
                 state.pairing.revoke_token_hash(&token_hash);
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -603,11 +530,6 @@ pub async fn revoke_device(
 
     state.pairing.revoke_token_hash(&token_hash);
 
-    // If persistence fails after the in-memory revoke + row delete, the
-    // device row is already gone and the token is already invalid in this
-    // process; a daemon restart will resurrect the token from the unchanged
-    // on-disk config. Surface that to the caller so they know to re-pair
-    // and audit, rather than treating the operation as silently complete.
     if let Err(e) = super::persist_pairing_tokens(state.config.clone(), &state.pairing).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -624,7 +546,6 @@ pub async fn revoke_device(
 }
 
 /// POST /api/devices/me/capabilities — the calling device replaces its capability list.
-///
 /// The "me" path means there's no separate device id in the URL — the bearer token in
 /// Authorization identifies which row gets updated. Body: `{ "capabilities": ["..."] }`.
 pub async fn update_my_capabilities(
@@ -678,22 +599,6 @@ pub async fn update_my_capabilities(
     }
 }
 
-/// POST /api/devices/{id}/token/rotate — revoke the device's current bearer
-/// token and issue a fresh pairing code for re-pairing.
-///
-/// The device row is removed because the schema keys on `token_hash`; once
-/// the token is revoked the row's primary key is dead anyway. Re-pairing
-/// inserts a fresh row with the new token's hash.
-///
-/// The rotation's load-bearing effect is invalidating the leaked token, not
-/// issuing a new code. If another flow holds the pairing-code slot the
-/// revoke still happens; the response reports that no new code was issued
-/// and the operator can use the pending code or call again once it clears.
-///
-/// If the caller is using the same bearer token as the device being rotated
-/// (self-revocation), the response is delivered over the now-invalid token;
-/// subsequent requests from that client will fail until they re-pair. That
-/// is the intended path for "rotate my own token after I think it leaked."
 pub async fn rotate_token(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -782,11 +687,6 @@ mod tests {
     fn unwriteable_registry_state() -> AppState {
         let mut state = test_state(Config::default());
         state.pairing = Arc::new(PairingGuard::new(true, &[]));
-        // `/this/path/does/not/exist/devices.db` cannot be opened because
-        // the parent directory does not exist. `open_db` returns
-        // `DatabasePathMissing`/`CannotOpen`, surfacing as
-        // `rusqlite::Error` from `register`. This is the regression
-        // setup we need.
         state.device_registry = Some(Arc::new(DeviceRegistry::with_db_path(PathBuf::from(
             "/this/path/does/not/exist/devices.db",
         ))));
@@ -800,10 +700,6 @@ mod tests {
         (status, json)
     }
 
-    /// If `registry.register(...)` fails after `try_pair` already
-    /// accepted the code, the handler must roll back the in-process
-    /// token (no accepted credential left behind) and must NOT return
-    /// the plaintext bearer in the 500 body.
     #[tokio::test]
     async fn submit_pairing_enhanced_rolls_back_in_process_token_when_registry_register_fails() {
         let state = unwriteable_registry_state();
@@ -844,24 +740,16 @@ mod tests {
         );
     }
 
-    /// If token persistence to `config.toml` fails after `try_pair`
-    /// already accepted the code, the handler must roll back the
-    /// in-process token (so a restart does not resurrect it) and must
-    /// NOT return the plaintext bearer in the body — the previous
-    /// version leaked a usable bearer on a 200, which is exactly the
-    /// gap this whole PR closes.
     #[tokio::test]
     async fn submit_pairing_enhanced_rolls_back_in_process_token_when_persist_fails() {
         let mut state = test_state(Config::default());
         state.pairing = Arc::new(PairingGuard::new(true, &[]));
-        // No device_registry at all → registry branch is skipped,
-        // so the persistence branch is the only failing step.
-        // Point the config path at a non-existent file inside a
-        // directory whose parent doesn't exist so `save_dirty`
-        // cannot write.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, b"").expect("seed blocker file");
         {
             let mut cfg = state.config.write();
-            cfg.config_path = PathBuf::from("/no/such/dir/config.toml");
+            cfg.config_path = blocker.join("config.toml");
         }
 
         let code = state

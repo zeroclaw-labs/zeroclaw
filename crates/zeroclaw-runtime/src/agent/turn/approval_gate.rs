@@ -8,11 +8,6 @@ use crate::agent::tool_execution::ToolExecutionOutcome;
 use crate::approval::{ApprovalRequest, ApprovalRequirement, ApprovalResponse};
 use std::time::Duration;
 
-/// Outcome of [`gate_tool_approval`] for one tool call.
-///
-/// `Deny`/`Replace` carry the synthesized [`ToolExecutionOutcome`] the caller
-/// records into its `ordered_results` slot before skipping execution;
-/// `Proceed::approved` feeds `set_runtime_approved_arg`.
 pub(crate) enum ApprovalGateOutcome {
     Proceed { approved: bool },
     Deny(ToolExecutionOutcome),
@@ -45,16 +40,16 @@ pub(crate) async fn gate_tool_approval(
         // Non-interactive (channels): try the channel's inline
         // approval (e.g. Telegram inline keyboard) before falling
         // back to auto-deny.
-        let decision = if mgr.is_non_interactive() {
-            let channel_decision = if let Some(ch) = ctx.channel {
+        let (decision, decided_by) = if mgr.is_non_interactive() {
+            let attributed = if let Some(ch) = ctx.channel {
                 let ch_request = zeroclaw_api::channel::ChannelApprovalRequest {
                     tool_name: request.tool_name.clone(),
                     arguments_summary: crate::approval::summarize_args(&request.arguments),
                     raw_arguments: Some(request.arguments.clone()),
                 };
                 let recipient = ctx.channel_reply_target.unwrap_or_default();
-                match ch.request_approval(recipient, &ch_request).await {
-                    Ok(Some(r)) => Some(r),
+                match ch.request_approval_attributed(recipient, &ch_request).await {
+                    Ok(Some(a)) => Some(a),
                     Ok(None) => None,
                     Err(e) => {
                         ::zeroclaw_log::record!(
@@ -74,7 +69,11 @@ pub(crate) async fn gate_tool_approval(
             } else {
                 None
             };
-            match channel_decision {
+            // The deciding back-channel (when a fan-out bridge answered) rides
+            // back on the response itself, so attribution can't be cross-wired
+            // by a concurrent approval on the same channel instance.
+            let decided_by = attributed.as_ref().and_then(|a| a.decided_by.clone());
+            let decision = match attributed.map(|a| a.response) {
                 Some(zeroclaw_api::channel::ChannelApprovalResponse::Approve) => {
                     ApprovalResponse::Yes
                 }
@@ -87,21 +86,13 @@ pub(crate) async fn gate_tool_approval(
                 }) => ApprovalResponse::ReplaceWith(replacement),
                 // Channel doesn't support approval — auto-deny.
                 None => ApprovalResponse::No,
-            }
+            };
+            (decision, decided_by)
         } else {
-            mgr.prompt_cli(&request)
+            (mgr.prompt_cli(&request), None)
         };
 
-        // The approval audit records which surface decided. On the streaming
-        // path `ctx.channel` is the approval bridge fanning out to several
-        // registered back-channels, and `ctx.channel_name` is the loop's
-        // static "cli"; prefer the back-channel that actually answered so a
-        // WS/ACP approval is attributed to WS/ACP, not "cli". Single channels
-        // and the CLI prompt path report `None` and keep `channel_name`.
-        let decision_channel = ctx
-            .channel
-            .and_then(|ch| ch.last_decision_channel())
-            .unwrap_or_else(|| ctx.channel_name.to_string());
+        let decision_channel = decided_by.unwrap_or_else(|| ctx.channel_name.to_string());
         mgr.record_decision(tool_name, tool_args, &decision, &decision_channel);
 
         if decision == ApprovalResponse::No {
@@ -135,6 +126,7 @@ pub(crate) async fn gate_tool_approval(
                 error_reason: Some(denied),
                 duration: Duration::ZERO,
                 receipt: None,
+                output_data: None,
             });
         }
 
@@ -169,6 +161,7 @@ pub(crate) async fn gate_tool_approval(
                 error_reason: None,
                 duration: Duration::ZERO,
                 receipt: None,
+                output_data: None,
             });
         }
 

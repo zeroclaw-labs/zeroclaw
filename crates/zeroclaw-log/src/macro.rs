@@ -1,20 +1,4 @@
 //! `record!` — the sole logging surface for the workspace.
-//!
-//! Call shape (compile-time-locked via the `Event` struct):
-//!
-//! ```ignore
-//! use zeroclaw_log::{record, Event, Action, EventOutcome};
-//!
-//! record!(INFO, Event::new(module_path!(), Action::Start), "starting step");
-//! record!(WARN, Event::new(module_path!(), Action::Fail).with_outcome(EventOutcome::Failure).with_attrs(serde_json::json!({"err": "timeout"})), "tool failed");
-//! ```
-//!
-//! Alias-bound attribution (channel, agent_alias, model_provider,
-//! tool, cron_job_id, …) is NOT a call-site argument — it is assembled
-//! automatically by the `LogCaptureLayer` from `attribution_span`s
-//! opened by entry points (channel listeners, the agent loop, cron
-//! tick handlers, the tool executor wrapper). To attach attribution
-//! to a region of work, wrap the work with [`crate::attribution_span`].
 
 /// Emit a structured ZeroClaw log event. The single positional `Event`
 /// expression carries the typed payload; the trailing literal is the
@@ -31,6 +15,7 @@ macro_rules! record {
             zc_outcome = %__zc_event.outcome_str(),
             zc_category = %__zc_event.category_str(),
             zc_attrs = %__zc_event.attrs_str(),
+            zc_ephemeral_attrs = %__zc_event.ephemeral_attrs_str(),
             zc_has_duration = %__zc_event.has_duration(),
             zc_duration_ms = %__zc_event.duration_ms_or_zero(),
             zc_file = %file!(),
@@ -40,11 +25,6 @@ macro_rules! record {
     }};
 }
 
-/// Open an attribution span for the given `Attributable` thing. Every
-/// `record!` emitted while the returned span is entered inherits the
-/// thing's role + alias as alias-bound attribution on the resulting
-/// LogEvent. Wrap entry-point work with `.instrument(span)` (async) or
-/// `let _g = span.entered()` (sync).
 #[macro_export]
 macro_rules! attribution_span {
     ($attributable:expr) => {{
@@ -64,18 +44,6 @@ macro_rules! attribution_span {
     }};
 }
 
-/// Open a free-form context span carrying ad-hoc fields (sender id,
-/// message id, turn id, etc.) for every `record!` inside its scope.
-/// Use sparingly — prefer `attribution_span!(thing)` for role-bearing
-/// attribution. This is for transient per-scope identifiers that
-/// aren't tied to an `Attributable`.
-///
-/// Field keys recognized by the layer: `agent_alias`, `tool`,
-/// `session_key`, `cron_job_id`, `risk_profile`, `runtime_profile`,
-/// `memory_namespace`, `skill_bundle`, `knowledge_bundle`, `mcp_bundle`,
-/// `peer_group`, `sop_name`, `model`, `embedding_provider`, `channel`,
-/// `model_provider`, `tts_provider`, `transcription_provider`,
-/// `tunnel_provider`. Anything else lands in event `attributes`.
 #[macro_export]
 macro_rules! scope {
     ($($key:ident : $value:expr),+ $(,)? => $body:expr) => {{

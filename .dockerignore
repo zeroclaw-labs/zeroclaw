@@ -69,8 +69,12 @@ coverage
 lcov.info
 
 # Application and script directories.
-# apps/zerocode IS shipped (the TUI binary), so its full source
+# apps/tauri is a desktop app not shipped in the server image; only its
+# Cargo.toml is needed for workspace resolution (src + build.rs are stubbed in
+# the Dockerfile). apps/zerocode IS shipped (the TUI binary), so its full source
 # is whitelisted and copied for the real build.
 apps/*
+!apps/tauri/
+!apps/tauri/Cargo.toml
 !apps/zerocode/
 scripts/

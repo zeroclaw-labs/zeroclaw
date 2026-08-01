@@ -49,7 +49,8 @@ pub fn build_refs(root: &Path) -> anyhow::Result<()> {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    std::fs::write(ref_dir.join("cli.md"), cli_content + "\n")?;
+    let cli_content = crate::cmd::mdbook::placeholders::normalize(&(cli_content + "\n"));
+    std::fs::write(ref_dir.join("cli.md"), cli_content)?;
 
     let schema = Command::new("cargo")
         .args([
@@ -65,7 +66,9 @@ pub fn build_refs(root: &Path) -> anyhow::Result<()> {
     if !schema.status.success() {
         anyhow::bail!("cargo run markdown-schema failed");
     }
-    std::fs::write(ref_dir.join("config.md"), &schema.stdout)?;
+    let config_content = String::from_utf8(schema.stdout)?;
+    let config_content = crate::cmd::mdbook::placeholders::normalize(&config_content);
+    std::fs::write(ref_dir.join("config.md"), config_content)?;
     Ok(())
 }
 
@@ -74,7 +77,14 @@ pub fn build_api(root: &Path) -> anyhow::Result<()> {
     let target = target_dir(root);
     run_cmd(
         Command::new("cargo")
-            .args(["doc", "--no-deps", "--workspace", "--target-dir"])
+            .args([
+                "doc",
+                "--no-deps",
+                "--workspace",
+                "--exclude",
+                "zeroclaw-desktop",
+                "--target-dir",
+            ])
             .arg(&target)
             .current_dir(root),
     )

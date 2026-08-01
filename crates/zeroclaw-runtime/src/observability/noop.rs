@@ -62,6 +62,7 @@ mod tests {
             turn_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
+            parent_agent_alias: None,
             tool: "shell".into(),
             tool_call_id: None,
             duration: Duration::from_secs(1),

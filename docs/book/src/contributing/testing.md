@@ -2,6 +2,8 @@
 
 ZeroClaw uses a five-level testing taxonomy backed by filesystem layout. Each level has a different boundary and a different cost; pick the lowest level that proves what you need to prove.
 
+When a PR claims behavior that a user directly runs, clicks, sends, installs, or observes, use [User-boundary proof](./user-boundary-proof.md) to identify the smallest test or manual check that reaches that boundary.
+
 ## The five levels
 
 | Level | What it tests | Boundary | Where it lives |
@@ -33,12 +35,30 @@ cargo test --test integration               # integration only
 cargo test --test system                    # system only
 cargo test --test live -- --ignored         # live (requires API credentials)
 cargo test --test integration agent         # filter within a level
-cargo nextest run --locked --workspace  # what CI runs
+cargo nextest run --locked --workspace --exclude zeroclaw-desktop  # what CI runs
+./scripts/ci/parallel_runtime_test_gate.sh  # repeated same-process runtime/channel tests
 ./dev/ci.sh all                             # full CI battery (Docker)
+./dev/ci.sh firmware-protocol               # standalone firmware protocol host gate (Docker)
 ./dev/ci.sh test-component                  # level-specific CI commands (Docker)
 ```
 
 </div>
+
+The `firmware-protocol` command checks the standalone
+`firmware/zeroclaw-fw-protocol` crate, which is outside the root Cargo
+workspace. `scripts/ci/firmware_protocol_gate.sh` is the canonical definition
+of its formatting, strict Clippy, and locked-test checks; required CI and the
+pre-push hook invoke the same helper.
+
+The parallel runtime gate repeats the complete `zeroclaw-runtime` and
+`zeroclaw-channels` library test binaries with 16 harness threads. Running the
+whole binaries is intentional: it detects interference between state-mutating
+tests and otherwise unrelated agent turns that filtered test runs cannot expose.
+Required CI runs this gate in a separate job for changes to either crate, the
+workspace dependency manifests, or the gate's own CI files. Other PRs skip it;
+pushes to `master` and merge queue runs retain the full regression backstop.
+Override repetitions with `ZEROCLAW_PARALLEL_TEST_RUNS` and harness threads
+with `ZEROCLAW_PARALLEL_TEST_THREADS`.
 
 ## Picking a level for a new test
 
@@ -58,7 +78,7 @@ Every test binary includes `mod support;`, making the shared mocks available as 
 | `mock_model_provider.rs` | `MockModelProvider` (FIFO scripted), `RecordingModelProvider` (captures requests), `TraceLlmModelProvider` (JSON fixture replay) |
 | `mock_tools.rs` | `EchoTool`, `CountingTool`, `FailingTool`, `RecordingTool` |
 | `mock_channel.rs` | `TestChannel` (captures sends, records typing events) |
-| `helpers.rs` | `make_memory()`, `make_observer()`, `build_agent()`, `text_response()`, `tool_response()`, `StaticMemoryStrategy` |
+| `helpers.rs` | `make_memory()`, `make_observer()`, `build_agent()`, `text_response()`, `tool_response()`, `StaticRecallMemory` |
 | `trace.rs` | `LlmTrace`, `TraceTurn`, `TraceStep` types + `LlmTrace::from_file()` |
 | `assertions.rs` | `verify_expects()` for declarative trace assertion |
 

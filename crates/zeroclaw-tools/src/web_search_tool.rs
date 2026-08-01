@@ -1,4 +1,6 @@
-use super::web_search_provider_routing::{WebSearchProviderRoute, resolve_web_search_provider};
+use super::web_search_provider_routing::{
+    SearchStatus, WebSearchProviderRoute, resolve_web_search_provider,
+};
 use async_trait::async_trait;
 use regex::Regex;
 use serde_json::json;
@@ -10,12 +12,16 @@ use zeroclaw_api::tool::{Tool, ToolResult};
 /// Web search tool for searching the internet.
 /// Supports multiple model_providers: DuckDuckGo (free), Brave (requires API key),
 /// Tavily (requires API key), SearXNG (self-hosted, requires instance URL),
-/// Jina AI (requires API key).
+/// Jina AI (requires API key), Bocha AI (requires API key, Chinese-friendly).
 ///
 /// API keys are resolved lazily at execution time: if the boot-time key
 /// is missing or still encrypted, the tool re-reads `config.toml`, decrypts the
 /// corresponding `[web_search]` field, and uses the result. This ensures that
 /// keys set or rotated after boot, and encrypted keys, are correctly picked up.
+/// The Bocha key has no boot-time snapshot at all — it is always resolved from
+/// `config.toml` at use time (see `resolve_bocha_api_key`), so the
+/// canonical `[web_search] bocha_api_key` field stays the single source of
+/// truth and rotation/removal takes effect without a restart.
 pub struct WebSearchTool {
     /// ModelProvider selector as configured by user. Routed via model_provider aliases at runtime.
     model_provider: String,
@@ -56,11 +62,6 @@ impl WebSearchTool {
         }
     }
 
-    /// Create a `WebSearchTool` with config-reload and decryption support.
-    ///
-    /// `config_path` is the path to `config.toml` so the tool can re-read API
-    /// keys at execution time. `secrets_encrypt` controls whether the keys are
-    /// decrypted via `SecretStore`.
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_config(
         model_provider: String,
@@ -202,7 +203,7 @@ impl WebSearchTool {
             if let Some(message) = duckduckgo_block_message(status, final_url_is_block, false) {
                 anyhow::bail!(message);
             }
-            anyhow::bail!("DuckDuckGo search failed with status: {}", status);
+            return Err(http_search_failure("duckduckgo", status));
         }
 
         let html = response.text().await?;
@@ -286,7 +287,7 @@ impl WebSearchTool {
             .await?;
 
         if !response.status().is_success() {
-            anyhow::bail!("Brave search failed with status: {}", response.status());
+            return Err(http_search_failure("brave", response.status()));
         }
 
         let json: serde_json::Value = response.json().await?;
@@ -378,13 +379,6 @@ impl WebSearchTool {
             .await
     }
 
-    /// Build the production HTTP client for Tavily, wired through the
-    /// process-global runtime proxy state. Extracted so the
-    /// `search_tavily_with_client` test path can substitute a fresh
-    /// client and stay isolated from concurrent tests that mutate
-    /// `RUNTIME_PROXY_CONFIG` (a request built off a stale "enabled"
-    /// proxy snapshot otherwise routes through a non-existent proxy
-    /// and the wiremock connection fails).
     fn build_tavily_client(&self) -> anyhow::Result<reqwest::Client> {
         let builder = reqwest::Client::builder().timeout(Duration::from_secs(self.timeout_secs));
         let builder =
@@ -424,7 +418,7 @@ impl WebSearchTool {
             .await?;
 
         if !response.status().is_success() {
-            anyhow::bail!("Tavily search failed with status: {}", response.status());
+            return Err(http_search_failure("tavily", response.status()));
         }
 
         let json: serde_json::Value = response.json().await?;
@@ -578,7 +572,7 @@ impl WebSearchTool {
             .await?;
 
         if !response.status().is_success() {
-            anyhow::bail!("Jina AI search failed with status: {}", response.status());
+            return Err(http_search_failure("jina", response.status()));
         }
 
         let json: serde_json::Value = response.json().await?;
@@ -622,6 +616,195 @@ impl WebSearchTool {
             lines.push(format!("   {}", url));
             if !snippet.is_empty() {
                 lines.push(format!("   {}", snippet));
+            }
+        }
+
+        Ok(lines.join("\n"))
+    }
+
+    fn resolve_bocha_api_key(&self) -> anyhow::Result<String> {
+        let contents = std::fs::read_to_string(&self.config_path).map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": self.config_path.display().to_string(),
+                        "search_provider": "bocha",
+                        "error": format!("{}", e),
+                    })),
+                "web_search: failed to read config for Bocha AI API key"
+            );
+            anyhow::Error::msg(format!(
+                "Failed to read config file {} for Bocha AI API key: {e}",
+                self.config_path.display()
+            ))
+        })?;
+
+        let config: zeroclaw_config::schema::Config = toml::from_str(&contents).map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": self.config_path.display().to_string(),
+                        "search_provider": "bocha",
+                        "error": format!("{}", e),
+                    })),
+                "web_search: failed to parse config for Bocha AI API key"
+            );
+            anyhow::Error::msg(format!(
+                "Failed to parse config file {} for Bocha AI API key: {e}",
+                self.config_path.display()
+            ))
+        })?;
+
+        let raw_key = config
+            .web_search
+            .bocha_api_key
+            .filter(|k| !k.is_empty())
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"search_provider": "bocha"})),
+                    "web_search: Bocha AI API key not configured"
+                );
+                anyhow::Error::msg(
+                    "Bocha AI API key not configured. Set [web_search] bocha_api_key in \
+                     config.toml. Obtain one at https://open.bochaai.com",
+                )
+            })?;
+
+        if zeroclaw_config::secrets::SecretStore::is_encrypted(&raw_key) {
+            let zeroclaw_dir = self.config_path.parent().unwrap_or_else(|| Path::new("."));
+            let store =
+                zeroclaw_config::secrets::SecretStore::new(zeroclaw_dir, self.secrets_encrypt);
+            let plaintext = store.decrypt(&raw_key)?;
+            if plaintext.is_empty() {
+                anyhow::bail!("Bocha AI API key not configured (decrypted value is empty)");
+            }
+            Ok(plaintext)
+        } else {
+            Ok(raw_key)
+        }
+    }
+
+    async fn search_bocha(&self, query: &str) -> anyhow::Result<String> {
+        let builder = reqwest::Client::builder().timeout(Duration::from_secs(self.timeout_secs));
+        let builder =
+            zeroclaw_config::schema::apply_runtime_proxy_to_builder(builder, "tool.web_search");
+        let client = builder.build()?;
+        self.search_bocha_with_client(&client, "https://api.bochaai.com/v1/web-search", query)
+            .await
+    }
+
+    async fn search_bocha_with_client(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        query: &str,
+    ) -> anyhow::Result<String> {
+        let api_key = self.resolve_bocha_api_key()?;
+
+        let body = serde_json::json!({
+            "query": query,
+            "count": self.max_results,
+            "summary": true,
+            "freshness": "noLimit",
+        });
+
+        let response = client
+            .post(url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .bearer_auth(&api_key)
+            .json(&body)
+            .send()
+            .await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(http_search_failure("bocha", status));
+        }
+
+        let json: serde_json::Value = response.json().await?;
+        self.parse_bocha_results(&json, query)
+    }
+
+    fn parse_bocha_results(&self, json: &serde_json::Value, query: &str) -> anyhow::Result<String> {
+        if let Some(code) = json.get("code").and_then(|c| c.as_i64())
+            && code != 200
+        {
+            let msg = json
+                .get("msg")
+                .and_then(|m| m.as_str())
+                .unwrap_or("(no message)");
+            anyhow::bail!("Bocha AI search returned error (code {code}): {msg}");
+        }
+
+        let results = json
+            .get("data")
+            .and_then(|d| d.get("webPages"))
+            .and_then(|w| w.get("value"))
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"search_provider": "bocha"})),
+                    "web_search: invalid Bocha AI response"
+                );
+                anyhow::Error::msg("Invalid Bocha AI API response")
+            })?;
+
+        if results.is_empty() {
+            return Ok(format!("No results found for: {}", query));
+        }
+
+        let mut lines = vec![format!("Search results for: {} (via Bocha)", query)];
+
+        for (i, result) in results.iter().take(self.max_results).enumerate() {
+            let title = result
+                .get("name")
+                .and_then(|t| t.as_str())
+                .unwrap_or("No title");
+            let url = result.get("url").and_then(|u| u.as_str()).unwrap_or("");
+            // Prefer Bocha's AI summary; fall back to the raw snippet.
+            let body = result
+                .get("summary")
+                .and_then(|s| s.as_str())
+                .filter(|s| !s.is_empty())
+                .or_else(|| result.get("snippet").and_then(|s| s.as_str()))
+                .unwrap_or("");
+            let site = result
+                .get("siteName")
+                .and_then(|s| s.as_str())
+                .unwrap_or("");
+            let date = result
+                .get("datePublished")
+                .and_then(|d| d.as_str())
+                .or_else(|| result.get("dateLastCrawled").and_then(|d| d.as_str()))
+                .unwrap_or("");
+
+            lines.push(format!("{}. {}", i + 1, title));
+            lines.push(format!("   {}", url));
+
+            // Compact attribution line: "siteName · date" when either is present.
+            let attribution = match (site.is_empty(), date.is_empty()) {
+                (false, false) => format!("   {site} · {date}"),
+                (false, true) => format!("   {site}"),
+                (true, false) => format!("   {date}"),
+                (true, true) => String::new(),
+            };
+            if !attribution.is_empty() {
+                lines.push(attribution);
+            }
+
+            if !body.is_empty() {
+                lines.push(format!("   {}", body));
             }
         }
 
@@ -760,7 +943,7 @@ impl WebSearchTool {
             .await?;
 
         if !response.status().is_success() {
-            anyhow::bail!("SearXNG search failed with status: {}", response.status());
+            return Err(http_search_failure("searxng", response.status()));
         }
 
         let json: serde_json::Value = response.json().await?;
@@ -835,6 +1018,50 @@ fn duckduckgo_block_message(
     } else {
         None
     }
+}
+
+/// Classify a non-2xx HTTP status into a coarse search status for the agent-
+/// visible error tag. Called only on the failure path (`!status.is_success()`);
+/// 2xx never reaches here.
+///
+/// These classes are coarse heuristics, not verified provider contracts — a
+/// status code alone does not prove why a provider refused the request, and
+/// providers differ. 451 stays `Blocked` because RFC 9110 ties it to a
+/// legal-refusal reason; 5xx, 429, and 408 are `Unavailable` (provider-side or
+/// transient); other non-2xx statuses fall through to `ClientError` (request/
+/// credential side). DuckDuckGo's confirmed CAPTCHA block is intercepted
+/// upstream by `duckduckgo_block_message`, so this helper only sees non-block
+/// failures. The agent should treat the tag as a hint to verify, not a diagnosis.
+fn classify_http_status(status: reqwest::StatusCode) -> SearchStatus {
+    match status.as_u16() {
+        451 => SearchStatus::Blocked, // legal block (RFC-tied refusal reason)
+        408 | 429 | 500..=599 => SearchStatus::Unavailable, // provider-side / transient
+        _ => SearchStatus::ClientError, // other non-success → request/credential side (coarse)
+    }
+}
+
+/// Build a provider HTTP-failure error whose message carries a precise
+/// `search_status` tag (blocked / unavailable / client_error) and an actionable
+/// hint matching the class. The central tool executor owns the failure log
+/// record; this helper emits no log of its own.
+///
+/// The runtime (`tool_execution.rs`) forwards the `Err` returned by `execute`
+/// to the agent as readable text, so placing actionable hints in the message
+/// makes them visible to the agent.
+fn http_search_failure(provider: &str, status: reqwest::StatusCode) -> anyhow::Error {
+    let search_status = classify_http_status(status);
+    let hint = match search_status {
+        SearchStatus::Blocked | SearchStatus::Unavailable => {
+            "Provider may be transiently unavailable or blocking the request; retry, or try a different provider (SearXNG, Brave, or Tavily)."
+        }
+        SearchStatus::ClientError => {
+            "The provider refused the request; verify the query, credentials, billing or quota, and provider configuration."
+        }
+    };
+    anyhow::Error::msg(format!(
+        "{provider} search failed (search_status={}, http={status}). {hint}",
+        search_status.as_str()
+    ))
 }
 
 fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
@@ -914,11 +1141,12 @@ impl Tool for WebSearchTool {
             WebSearchProviderRoute::Tavily => self.search_tavily(query).await?,
             WebSearchProviderRoute::SearXNG => self.search_searxng(query).await?,
             WebSearchProviderRoute::Jina => self.search_jina(query).await?,
+            WebSearchProviderRoute::Bocha => self.search_bocha(query).await?,
         };
 
         Ok(ToolResult {
             success: true,
-            output: result,
+            output: result.into(),
             error: None,
         })
     }
@@ -1029,6 +1257,90 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn http_search_failure_classifies_legal_block_as_blocked() {
+        // 451 (legal block) is the one status RFC 9110 ties to a refusal reason,
+        // so it is the one status classified as `Blocked`. It must surface
+        // search_status=blocked and the "different provider" hint. (403 and other
+        // 4xx fall through to client_error — see that case.)
+        let err = http_search_failure("brave", reqwest::StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS);
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("search_status=blocked"),
+            "451 must tag search_status=blocked, got: {msg}"
+        );
+        assert!(msg.contains("http=451"));
+        assert!(
+            msg.contains("different provider"),
+            "blocked status must suggest switching providers, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn http_search_failure_classifies_provider_side_failures_as_unavailable() {
+        // 5xx outages, 429 rate limiting, and 408 timeout are provider-side or
+        // transient — retrying or switching provider is the actionable remedy;
+        // each must tag `search_status=unavailable` and surface the "different
+        // provider" hint.
+        for status in [
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            reqwest::StatusCode::BAD_GATEWAY,
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            reqwest::StatusCode::REQUEST_TIMEOUT,
+        ] {
+            let err = http_search_failure("searxng", status);
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("search_status=unavailable"),
+                "{status} must classify as unavailable, got: {msg}"
+            );
+            assert!(
+                msg.contains(&format!("http={}", status.as_u16())),
+                "message must include the HTTP status code, got: {msg}"
+            );
+            assert!(
+                msg.contains("different provider"),
+                "unavailable status must suggest switching providers, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn http_search_failure_classifies_client_errors_as_client_error() {
+        // 400/401/402/403/404/410 all fall through to client_error as a coarse
+        // request/credential-side bucket — a status code alone doesn't prove the
+        // cause, so the hint stays neutral and asks the agent to verify, not to
+        // switch provider. DuckDuckGo's confirmed-block 403 is intercepted
+        // upstream by duckduckgo_block_message.
+        for status in [
+            reqwest::StatusCode::BAD_REQUEST,
+            reqwest::StatusCode::UNAUTHORIZED,
+            reqwest::StatusCode::PAYMENT_REQUIRED,
+            reqwest::StatusCode::FORBIDDEN,
+            reqwest::StatusCode::NOT_FOUND,
+            reqwest::StatusCode::GONE,
+        ] {
+            let err = http_search_failure("tavily", status);
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("search_status=client_error"),
+                "{status} must classify as client_error, got: {msg}"
+            );
+            assert!(
+                msg.contains(&format!("http={}", status.as_u16())),
+                "message must include the HTTP status code, got: {msg}"
+            );
+            assert!(
+                msg.contains("provider refused the request"),
+                "client_error hint must stay neutral, got: {msg}"
+            );
+            assert!(
+                !msg.contains("different provider"),
+                "client_error must NOT suggest switching providers, got: {msg}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_duckduckgo_request_reports_forbidden_status() {
         use wiremock::matchers::{method, path, query_param};
@@ -1050,6 +1362,36 @@ mod tests {
 
         assert!(err.to_string().contains("DuckDuckGo blocked"));
         assert!(err.to_string().contains("SearXNG"));
+    }
+
+    #[tokio::test]
+    async fn test_duckduckgo_request_reports_non_block_failure_with_status_tag() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/html/"))
+            .and(query_param("q", "test"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, None, 5, 15);
+        let err = tool
+            .search_duckduckgo_at(&format!("{}/html/", server.uri()), "test")
+            .await
+            .expect_err("500 should be reported as a non-block HTTP failure");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("search_status=unavailable"),
+            "non-block DDG failure must carry the search_status tag, got: {msg}"
+        );
+        assert!(
+            msg.contains("http=500"),
+            "non-block DDG failure must carry the HTTP status code, got: {msg}"
+        );
     }
 
     #[tokio::test]
@@ -1110,7 +1452,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_duckduckgo_request_reports_anomaly_modal_block() {
-        // Regression for #6373: DuckDuckGo's anti-bot page now ships an
+        // DuckDuckGo's anti-bot page now ships an
         // `anomaly-modal` interstitial (HTTP 200/202, no `/wr.do?` redirect,
         // no verification form), and the old detector slid past it,
         // returning a misleading "No results found" message to the agent.
@@ -1438,12 +1780,6 @@ mod tests {
         assert_eq!(key, "tvly-secret-key");
     }
 
-    /// Regression: Tavily auth must travel as `Authorization: Bearer <key>`
-    /// (the documented contract per
-    /// https://docs.tavily.com/documentation/api-reference/endpoint/search),
-    /// NOT as an `api_key` field in the JSON body. The previous shape worked
-    /// against the live service for legacy reasons, but the docs identify
-    /// bearer-header as the canonical method.
     #[tokio::test]
     async fn test_tavily_request_uses_bearer_auth_header_not_body_field() {
         use wiremock::matchers::{header, method, path};
@@ -1474,9 +1810,6 @@ mod tests {
             false,
         );
 
-        // Isolated client so the request shape under test isn't affected
-        // by `RUNTIME_PROXY_CONFIG` mutations from sibling proxy_config
-        // tests running concurrently in the same process.
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
             .build()
@@ -1773,5 +2106,262 @@ mod tests {
                 .to_string()
                 .contains("Jina AI API key not configured")
         );
+    }
+
+    /// Build a Bocha-routed tool over `config_path`. There is no boot-time
+    /// Bocha key parameter by design — the key always comes from config.
+    fn bocha_tool(config_path: PathBuf, secrets_encrypt: bool) -> WebSearchTool {
+        WebSearchTool::new_with_config(
+            "bocha".to_string(),
+            None,
+            None,
+            None,
+            None,
+            5,
+            15,
+            config_path,
+            secrets_encrypt,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_execute_bocha_without_api_key() {
+        // No config field → resolve_bocha_api_key must error before any
+        // network call is attempted.
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "[web_search]\n").unwrap();
+
+        let tool = bocha_tool(config_path, false);
+        let result = tool.execute(json!({"query": "test"})).await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Bocha AI API key not configured")
+        );
+    }
+
+    #[test]
+    fn test_resolve_bocha_api_key_reads_from_config() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[web_search]\nbocha_api_key = \"fresh-bocha-from-disk\"\n",
+        )
+        .unwrap();
+
+        let tool = bocha_tool(config_path, false);
+        let key = tool.resolve_bocha_api_key().unwrap();
+        assert_eq!(key, "fresh-bocha-from-disk");
+    }
+
+    #[test]
+    fn test_resolve_bocha_api_key_decrypts_encrypted_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = zeroclaw_config::secrets::SecretStore::new(tmp.path(), true);
+        let encrypted = store.encrypt("bocha-secret-key").unwrap();
+
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!("[web_search]\nbocha_api_key = \"{}\"\n", encrypted),
+        )
+        .unwrap();
+
+        let tool = bocha_tool(config_path, true);
+        let key = tool.resolve_bocha_api_key().unwrap();
+        assert_eq!(key, "bocha-secret-key");
+    }
+
+    #[test]
+    fn test_resolve_bocha_api_key_tracks_rotation_and_removal() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[web_search]\nbocha_api_key = \"initial-key\"\n",
+        )
+        .unwrap();
+
+        let tool = bocha_tool(config_path.clone(), false);
+        assert_eq!(tool.resolve_bocha_api_key().unwrap(), "initial-key");
+
+        // Operator rotates the key on disk — same tool instance must pick
+        // up the new value.
+        std::fs::write(
+            &config_path,
+            "[web_search]\nbocha_api_key = \"rotated-key\"\n",
+        )
+        .unwrap();
+        assert_eq!(tool.resolve_bocha_api_key().unwrap(), "rotated-key");
+
+        // Operator removes the key — the tool must fail instead of serving
+        // any previously observed value.
+        std::fs::write(&config_path, "[web_search]\n").unwrap();
+        let result = tool.resolve_bocha_api_key();
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Bocha AI API key not configured")
+        );
+    }
+
+    #[test]
+    fn test_parse_bocha_results_empty() {
+        let tool = WebSearchTool::new("bocha".to_string(), None, None, 5, 15);
+        let json = serde_json::json!({
+            "code": 200,
+            "msg": null,
+            "data": {"webPages": {"value": []}}
+        });
+        let result = tool.parse_bocha_results(&json, "test").unwrap();
+        assert!(result.contains("No results found"));
+    }
+
+    #[test]
+    fn test_parse_bocha_results_with_data() {
+        let tool = WebSearchTool::new("bocha".to_string(), None, None, 5, 15);
+        let json = serde_json::json!({
+            "code": 200,
+            "msg": null,
+            "data": {
+                "webPages": {
+                    "totalEstimatedMatches": 42,
+                    "value": [
+                        {
+                            "name": "Bocha Example Title",
+                            "url": "https://example.com/a",
+                            "snippet": "raw snippet body",
+                            "summary": "AI summary of the page",
+                            "siteName": "Example Site",
+                            "datePublished": "2025-01-15"
+                        },
+                        {
+                            "name": "Second Result",
+                            "url": "https://example.org/b",
+                            "snippet": "second snippet only",
+                            "siteName": "Org Site"
+                        }
+                    ]
+                }
+            }
+        });
+        let result = tool.parse_bocha_results(&json, "test").unwrap();
+        assert!(result.contains("via Bocha"));
+        assert!(result.contains("Bocha Example Title"));
+        assert!(result.contains("https://example.com/a"));
+        // AI summary preferred over the raw snippet when both are present.
+        assert!(result.contains("AI summary of the page"));
+        assert!(!result.contains("raw snippet body"));
+        // Attribution line combines siteName and date.
+        assert!(result.contains("Example Site · 2025-01-15"));
+        // Snippet fallback when summary is absent.
+        assert!(result.contains("second snippet only"));
+    }
+
+    #[test]
+    fn test_parse_bocha_results_surfaces_business_error() {
+        // Bocha reports business-logic failures as HTTP 200 with a non-200
+        // `code` in the body — the parser must surface them instead of
+        // returning a misleading "No results found".
+        let tool = WebSearchTool::new("bocha".to_string(), None, None, 5, 15);
+        let json = serde_json::json!({
+            "code": 403,
+            "msg": "Insufficient balance",
+            "data": null
+        });
+        let result = tool.parse_bocha_results(&json, "test");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("code 403"));
+        assert!(err.contains("Insufficient balance"));
+    }
+
+    #[test]
+    fn test_parse_bocha_results_invalid_response() {
+        let tool = WebSearchTool::new("bocha".to_string(), None, None, 5, 15);
+        let json = serde_json::json!({"unexpected": "shape"});
+        let result = tool.parse_bocha_results(&json, "test");
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid Bocha AI API response")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bocha_request_uses_bearer_auth_and_documented_body() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/web-search"))
+            .and(header("authorization", "Bearer bocha-test-key"))
+            .and(header("content-type", "application/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 200,
+                "msg": null,
+                "data": {"webPages": {"value": []}}
+            })))
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[web_search]\nbocha_api_key = \"bocha-test-key\"\n",
+        )
+        .unwrap();
+        let tool = bocha_tool(config_path, false);
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .expect("client builder should succeed without a proxy");
+        let result = tool
+            .search_bocha_with_client(
+                &client,
+                &format!("{}/v1/web-search", server.uri()),
+                "什么是 Rust",
+            )
+            .await
+            .expect("request should succeed against the mock");
+        assert!(
+            result.contains("No results found"),
+            "parser should report empty results: {result}"
+        );
+
+        let recorded = server
+            .received_requests()
+            .await
+            .expect("wiremock should have captured the request");
+        assert_eq!(
+            recorded.len(),
+            1,
+            "expected exactly one POST /v1/web-search"
+        );
+
+        let body: serde_json::Value =
+            serde_json::from_slice(&recorded[0].body).expect("body should be JSON");
+
+        // Auth must NOT leak into the body — bearer header is the only auth channel.
+        assert!(body.get("api_key").is_none());
+        assert!(body.get("apiKey").is_none());
+        assert!(body.get("token").is_none());
+
+        assert_eq!(body["query"], "什么是 Rust");
+        assert_eq!(body["count"], 5);
+        assert_eq!(body["summary"], true);
+        assert_eq!(body["freshness"], "noLimit");
     }
 }

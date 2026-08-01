@@ -71,6 +71,11 @@ sender_desc = "the Twitter/X @username"
 sender_example = "example_user"
 
 [[channel]]
+key = "git"
+sender_desc = "the forge username (login) of the comment author"
+sender_example = "octocat"
+
+[[channel]]
 key = "nostr"
 sender_desc = "the sender's hex public key"
 sender_example = "npub1exampleexampleexampleexample"

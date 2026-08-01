@@ -356,6 +356,63 @@ export function getHealth(): Promise<HealthSnapshot> {
   ).then((data) => unwrapField(data, "health"));
 }
 
+// ── Version check / self-upgrade (version.rs) ────────────────────────
+// Types are derived from the generated OpenAPI client (`components`) so the
+// dashboard contract stays in lock-step with `openapi::build_spec()`. Editing
+// a request/response shape in Rust and running `cargo web check` will fail the
+// typecheck here on drift, instead of silently disagreeing at runtime.
+
+export type VersionCheckResponse = components["schemas"]["VersionCheckResponse"];
+
+/**
+ * GET /api/version/check — is a newer release available?
+ *
+ * Backed by `zeroclaw update --check --json`, cached server-side for 1h.
+ * Pass `force` to bypass the cache, or `version` to check a specific tag.
+ */
+export function checkVersion(opts?: {
+  force?: boolean;
+  version?: string;
+}): Promise<VersionCheckResponse> {
+  const params = new URLSearchParams();
+  if (opts?.force) params.set("force", "true");
+  if (opts?.version) params.set("version", opts.version);
+  const qs = params.toString();
+  return apiFetch<VersionCheckResponse>(
+    `/api/version/check${qs ? `?${qs}` : ""}`,
+  );
+}
+
+export type UpgradeState = components["schemas"]["UpgradeStatusState"];
+export type UpgradeStatusResponse =
+  components["schemas"]["UpgradeStatusResponse"];
+export type UpgradeRequest = components["schemas"]["UpgradeRequest"];
+export type UpgradeAcceptedResponse =
+  components["schemas"]["UpgradeAcceptedResponse"];
+
+/**
+ * POST /api/version/upgrade — apply an upgrade via `zeroclaw update`.
+ *
+ * Returns a `handoff_id`; poll {@link getUpgradeStatus} for progress. Requires
+ * `gateway.allow_self_upgrade`. `auto_restart` is only honoured under a
+ * supervisor (systemd/launchd).
+ */
+export function startUpgrade(
+  opts?: UpgradeRequest,
+): Promise<UpgradeAcceptedResponse> {
+  return apiFetch<UpgradeAcceptedResponse>("/api/version/upgrade", {
+    method: "POST",
+    body: JSON.stringify(opts ?? {}),
+  });
+}
+
+export function getUpgradeStatus(
+  handoffId?: string,
+): Promise<UpgradeStatusResponse> {
+  const qs = handoffId ? `?handoff_id=${encodeURIComponent(handoffId)}` : "";
+  return apiFetch<UpgradeStatusResponse>(`/api/version/upgrade/status${qs}`);
+}
+
 // ---------------------------------------------------------------------------
 // TUIs
 // ---------------------------------------------------------------------------
@@ -428,6 +485,12 @@ export interface ListResponseEntry {
   section?: string;
   /** Tab grouping from `ConfigTab` enum. Absent when `ConfigTab::None`. */
   tab?: string;
+  /**
+   * Surface hint from the schema's `#[multiline]` attribute: render a
+   * multi-line text area (e.g. a PEM key body) instead of a single-line
+   * input. Absent/false on single-line fields.
+   */
+  multiline?: boolean;
 }
 
 export interface DriftEntry {
@@ -690,6 +753,33 @@ export async function putPersonalityFile(
 
 // ── Skills (api_skills.rs) ───────────────────────────────────────────
 
+/** A predefined choice for a typed slash option. Only meaningful for
+ *  string/integer/number options; `value` is kept as text and coerced to the
+ *  option's type by the channel. Mirrors the runtime `SkillSlashChoice`. */
+export interface SkillSlashChoice {
+  name: string;
+  value: string;
+}
+
+/** A typed option a `slash`-tagged skill exposes on its slash command. Mirrors
+ *  the runtime `SkillSlashOption` (SKILL.md `slash_options:` /
+ *  SKILL.toml `[[skill.slash_options]]`), shaped after Discord's application
+ *  command option model. `type` is one of `string | integer | number |
+ *  boolean | user | channel | role | mentionable`; unknown values are dropped
+ *  by the channel. `choices` apply to string/integer/number; `min`/`max` to
+ *  integer/number; `min_length`/`max_length` to string. */
+export interface SkillSlashOption {
+  name: string;
+  description: string;
+  type: string;
+  required?: boolean;
+  choices?: SkillSlashChoice[];
+  min?: number | null;
+  max?: number | null;
+  min_length?: number | null;
+  max_length?: number | null;
+}
+
 export interface SkillFrontmatter {
   name: string;
   description: string;
@@ -700,6 +790,10 @@ export interface SkillFrontmatter {
   /** Free-form skill tags. The `slash` tag opts the skill into Discord slash
    *  commands (zeroclaw-labs/zeroclaw#7490); `open-skills` is loader-managed. */
   tags?: string[];
+  /** Typed slash-command options (zeroclaw-labs/zeroclaw#8021). Only meaningful
+   *  with the `slash` tag; edited by the bespoke editor in SkillsBundleEditor.
+   *  Omitted by the backend when empty. */
+  slash_options?: SkillSlashOption[];
 }
 
 export interface SkillBundleEntry {
@@ -785,6 +879,21 @@ export interface SkillCreateRequest {
 
 export function listSkillBundles(): Promise<{ bundles: SkillBundleEntry[] }> {
   return apiFetch("/api/skills/bundles");
+}
+
+/** One kind's capability row from the backend slash-option kind registry. The
+ *  editor walks these rather than hardcoding the kind list or which constraints
+ *  each kind carries. Sourced from the generated OpenAPI schema, which is built
+ *  by walking the backend `SlashOptionKind` enum. */
+export type SlashOptionKindDescriptor =
+  components["schemas"]["SlashOptionKindDescriptor"];
+
+/** Fetch the canonical typed-slash-option kind registry (kind list + per-kind
+ *  choice/numeric-bound/length-bound capabilities). */
+export function listSlashOptionKinds(): Promise<{
+  kinds: SlashOptionKindDescriptor[];
+}> {
+  return apiFetch("/api/skills/slash-option-kinds");
 }
 
 export function listSkillsInBundle(
@@ -1023,6 +1132,43 @@ export function objectArrayElementProps(
     });
   }
   return out;
+}
+
+/** Read the backend-stamped `x-required-by-transport` metadata off the
+ *  `McpServerConfig` schema (a `mcp.servers.<name>` map value). The backend
+ *  derives this map from `McpTransport::required_leaf`, the same relationship
+ *  `validate_mcp_config` enforces, so the form classifies a transport's
+ *  required leaf by reading the registry rather than re-encoding the enum.
+ *  Returns `null` when the path doesn't resolve or the backend predates the
+ *  extension, in which case callers leave required-ness unclassified. */
+export function mcpRequiredByTransport(
+  schema: JsonSchema,
+): Record<string, string> | null {
+  if (!schema) return null;
+  // Walk root -> mcp -> servers (a map whose value type is McpServerConfig).
+  let cur: unknown = schema;
+  for (const seg of ["mcp", "servers"]) {
+    cur = unwrapOptional(resolveRef(cur, schema));
+    if (!cur || typeof cur !== "object") return null;
+    const props = (cur as { properties?: Record<string, unknown> }).properties;
+    if (!props || !Object.prototype.hasOwnProperty.call(props, seg)) return null;
+    cur = props[seg];
+  }
+  // `cur` is the servers map; its value type (McpServerConfig) carries the
+  // extension, reachable through `additionalProperties`.
+  cur = unwrapOptional(resolveRef(cur, schema));
+  if (!cur || typeof cur !== "object") return null;
+  const additional = (cur as { additionalProperties?: unknown })
+    .additionalProperties;
+  const serverDef = unwrapOptional(resolveRef(additional, schema));
+  if (!serverDef || typeof serverDef !== "object") return null;
+  const raw = (serverDef as Record<string, unknown>)["x-required-by-transport"];
+  if (!raw || typeof raw !== "object") return null;
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof v === "string") out[k.toLowerCase()] = v;
+  }
+  return Object.keys(out).length > 0 ? out : null;
 }
 
 export function descriptionForPath(
@@ -1429,6 +1575,8 @@ export interface QuickstartTypeOption {
   display_name: string;
   /** True for local providers that need no credential; always false for channels. */
   local: boolean;
+  /** Daemon-derived runtime preset to auto-select for this provider. */
+  default_runtime_profile?: string | null;
 }
 
 export interface QuickstartState {
@@ -1436,6 +1584,8 @@ export interface QuickstartState {
   agents: string[];
   risk_profiles: string[];
   runtime_profiles: string[];
+  /** Canonical fallback when a provider has no runtime recommendation. */
+  default_runtime_profile?: string | null;
   model_providers: string[];
   channels: string[];
   /**
@@ -1736,6 +1886,7 @@ export function addCronJob(body: {
   allowed_tools?: string[];
   enabled?: boolean;
   delivery?: CronDelivery;
+  uses_memory?: boolean;
 }): Promise<CronJob> {
   return apiFetch<CronJob | { status: string; job: CronJob }>("/api/cron", {
     method: "POST",
@@ -1790,6 +1941,7 @@ export function patchCronJob(
     command?: string;
     prompt?: string;
     enabled?: boolean;
+    uses_memory?: boolean;
   },
 ): Promise<CronJob> {
   return apiFetch<CronJob | { status: string; job: CronJob }>(
@@ -1986,6 +2138,33 @@ export function getChannels(): Promise<ChannelDetail[]> {
   ).then((data) => {
     const result = unwrapField(data, "channels");
     return Array.isArray(result) ? result : [];
+  });
+}
+
+export interface BindChannelRequest {
+  channel_type: string;
+  alias: string;
+  identity: string;
+}
+
+export interface BindChannelResponse {
+  saved: boolean;
+  already_bound?: boolean;
+  group?: string;
+  channel?: string;
+}
+
+/**
+ * Authorize an inbound identity on a pairing channel (telegram/wechat/line)
+ * — the GUI equivalent of `zeroclaw channel bind-<type> <id> --alias <alias>`.
+ * The bound user can message the bot immediately, with no `/bind` round trip.
+ */
+export function bindChannelIdentity(
+  body: BindChannelRequest,
+): Promise<BindChannelResponse> {
+  return apiFetch<BindChannelResponse>("/api/channels/bind", {
+    method: "POST",
+    body: JSON.stringify(body),
   });
 }
 

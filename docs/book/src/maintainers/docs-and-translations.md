@@ -7,7 +7,9 @@ ZeroClaw has two independent translation layers:
 | **App strings** | Mozilla Fluent (`.ftl`) | CLI help text, command descriptions, runtime messages |
 | **Docs** | gettext (`.po`) | Everything in this mdBook |
 
-They are filled separately and stored separately. Both use a provider-agnostic fill pipeline: configure any OpenAI-compatible endpoint under `providers.models.<kind>.<alias>` and pass `--model-provider <alias>` to the fill commands. Any configured alias is choosable: a bare alias (`--model-provider <alias>`), or a `kind.alias` qualifier (`--model-provider anthropic.<alias>`) when the same alias exists under more than one kind. The resolver reads `uri`, `model`, and `api_key` straight from the matched entry; a missing `uri` or `model` is a hard error, not a guessed default.
+For the source-of-truth, storage, loading, fallback, and release boundaries behind these procedures, see [Localization catalog lifecycle](../architecture/localization-catalog-lifecycle.md). The generated English references that feed docs extraction are mapped in [Generated documentation pipeline](../architecture/generated-documentation-pipeline.md).
+
+They are filled separately and stored separately. Both use the shared provider-agnostic runtime path: configure a model provider under `providers.models.<kind>.<alias>` and pass `--model-provider <alias>` to the fill commands. Any configured alias is choosable: a bare alias (`--model-provider <alias>`), or a `kind.alias` qualifier (`--model-provider anthropic.<alias>`) when the same alias exists under more than one kind. The resolver requires the matched entry to name a model, then delegates endpoint defaults, authentication, wire protocol, and optional custom `uri` handling to the runtime provider stack.
 
 Local models via [Ollama](https://ollama.com) are a first-class option: no API keys required, no per-call cost. A hosted provider is also fine for release-grade quality. Translation is a local operation. Run `cargo mdbook sync` for dedicated translation-cache PRs, release translation passes, and new locales; routine English docs PRs may defer broad generated `.po` churn to a focused follow-up.
 
@@ -29,7 +31,7 @@ Ollama is the current canonical source for docs. Ensure you have [Ollama](https:
 When English source changes, `cargo mdbook sync` runs two stages:
 
 1. **Extract**: `mdbook-xgettext` regenerates `po/messages.pot` from the current English source.
-2. **Merge**: `msgmerge` updates each locale's `.po` file, new strings get an empty `msgstr ""`; changed strings get marked `#, fuzzy` with the old translation preserved as a starting point.
+2. **Merge**: `msgmerge --no-fuzzy-matching` updates each locale's `.po` file, gives new or changed source strings an empty `msgstr ""`, and removes obsolete entries. Only fuzzy entries already present before the merge can remain available for later review or fill acceptance.
 
 Then the command counts fuzzy + untranslated entries and, when `--model-provider` is given, fills only those. Unchanged strings cost nothing: the `.po` cache means re-running against unchanged source is a no-op. Without `--model-provider`, sync still runs extract + merge and reports the delta; strings without a `msgstr` fall back to English at render time.
 
@@ -41,7 +43,11 @@ Routine English docs PRs may defer broad `.po` churn to a focused follow-up. Inc
 
 App strings live in `crates/zeroclaw-runtime/locales/`. English is the source of truth and is embedded at compile time.
 
-> **Runtime loading caveat (verify before relying on this).** Only `en` and `zh-CN` are wired into the runtime as built-ins: `crates/zeroclaw-runtime/src/i18n.rs` embeds `en` via `include_str!`, and `builtin_cli_ftl_source()` returns the embedded `zh-CN` catalogue for `zh-CN` and `None` for every other locale. A disk-override path exists: `load_ftl_from_disk` resolves `zeroclaw_config::schema::ftl_locale_dir(locale)`, i.e. `<config-dir>/data/ftl/<locale>/cli.ftl` (the same location `zeroclaw locales fetch` populates). **So a freshly filled `ja/cli.ftl` is generated and committed, but is not loaded at runtime** unless either the locale is added to `builtin_cli_ftl_source()` or the filled `cli.ftl` is placed under `<config-dir>/data/ftl/ja/`. Confirm the current state in `i18n.rs` and `zeroclaw_config::schema::ftl_locale_dir` rather than trusting this note.
+> **Runtime loading boundary.**
+>
+> - **Embedded sources:** English `cli.ftl` and `tools.ftl` are embedded. `builtin_cli_ftl_source()` enumerates the non-English CLI catalogs embedded by the runtime; `zeroclaw-tools` separately embeds English tool strings to preserve crate dependency direction.
+> - **Disk overlay:** A catalog at `<config-dir>/data/ftl/<locale>/` overrides an embedded CLI value and supplies translated runtime/tool values. `zeroclaw locales fetch` populates this shared directory.
+> - **Consumption caveat:** Filling and committing an `.ftl` file updates tracked catalog source, but a consumer uses it only when its loader embeds that catalog or the file is installed where that loader reads it.
 >
 > The `apps/zerocode` TUI maintains an independent Fluent catalogue (`apps/zerocode/locales/`), see [zerocode strings](#zerocode-strings-fluent-independent) below. `cargo fluent` walks **both** catalogue roots (runtime + zerocode), so every subcommand below covers both by default.
 
@@ -88,11 +94,9 @@ An unknown `--catalog` value errors with the valid choices.
 | Where | What |
 |---|---|
 | `apps/zerocode/locales/en/zerocode.ftl` | Source of truth, embedded at compile time |
-| `apps/zerocode/locales/<locale>/zerocode.ftl` | Other locales, embedded if present in-tree |
+| `apps/zerocode/locales/<locale>/zerocode.ftl` | Tracked translated catalog source used by fill/fetch and release workflows; not embedded automatically |
 | `$ZEROCODE_LOCALE_DIR/<locale>/zerocode.ftl` | Explicit override, useful for testing translations |
-| `<config-dir>/zerocode/locales/<locale>/zerocode.ftl` | Per-user catalogue override |
-| `~/.zeroclaw/zerocode/locales/<locale>/zerocode.ftl` | Alternate per-user location |
-| `<install-prefix>/share/zerocode/locales/<locale>/zerocode.ftl` | System install path |
+| `<config-dir>/data/ftl/<locale>/zerocode.ftl` | Shared per-user catalog written by `zeroclaw locales fetch` and loaded by zerocode |
 
 ### Key namespace
 
@@ -118,7 +122,7 @@ Locale comes from a top-level `locale` field in zerocode's config. When unset, `
 
 ### Filling translations
 
-`cargo fluent` walks the zerocode catalogue alongside the runtime one, so no manual step is needed. Running `cargo fluent fill --locale <code> --model-provider <alias>` generates `apps/zerocode/locales/<code>/zerocode.ftl` in the same pass that fills the runtime catalogue. `cargo fluent check` and `cargo fluent stats` likewise report zerocode; `scan` indexes `apps/` so `zc-` key references resolve against zerocode's source. The generated `<code>/zerocode.ftl` is embedded in-tree at compile time, or can be dropped into any of the disk-search paths above for testing with `--config-dir`.
+`cargo fluent` walks the zerocode catalogue alongside the runtime one, so no separate fill command is needed. Running `cargo fluent fill --locale <code> --model-provider <alias>` generates `apps/zerocode/locales/<code>/zerocode.ftl` in the same pass that fills the runtime catalogue. `cargo fluent check` and `cargo fluent stats` likewise report zerocode; `scan` indexes `apps/` so `zc-` key references resolve against zerocode's source. To exercise the translation in zerocode, install it through `zeroclaw locales fetch` or place it under one of the two disk-search roots above.
 
 ## Filling doc translations (gettext)
 
@@ -188,25 +192,14 @@ The translated `.po` catalogues are not in this repo's main tree. They live in t
 
 The Rust crate dev loop never needs the submodule. Only docs builds and the docs-deploy / release jobs require it; those checkouts pass `submodules: recursive`. Everything else stays submodule-free.
 
-Per release, the submodule is tagged `v{version}` to mirror the main repo, and `scripts/release/bump-version.sh` pins the gitlink to that tag (falling back to `main` with a warning if the tag is not yet cut). `messages.pot` and `*.failures.log` are regenerated artifacts and are gitignored in both repos, not tracked.
+Per release, `scripts/release/refresh-translations.sh` publishes changed catalogues to the submodule's `main` branch, tags that commit as `v{version}`, checks out the tag, and stages the main-repository gitlink. `bump-version.sh` deliberately leaves translation pinning to that helper. `messages.pot` and `*.failures.log` are regenerated artifacts and are gitignored in both repos, not tracked.
 
 ## Release translation workflow
 
-During a release, after `./scripts/release/bump-version.sh` has set the version in `Cargo.toml`, refresh the catalogues and cut the matching submodule tag. This is one command: it reads the version from `Cargo.toml`, runs the translation pass, commits and pushes the catalogues to the submodule repo, tags it `v{version}`, and stages the main-repo gitlink pinned to that tag. No `git -C` by hand, no version typed into git commands. It initialises the submodule if needed.
-
-<div class="os-tabs-src">
-
-#### sh
-
-```sh
-./scripts/release/refresh-translations.sh    # version from Cargo.toml
-```
-
-</div>
-
-Run it after `bump-version.sh` so the version it reads is the release version. To review coverage or validate format without cutting a tag, run `cargo mdbook stats` / `cargo mdbook check` in the working tree first. Pass `--no-translate` to skip the sync pass when the catalogues are already current, or an explicit version (`./scripts/release/refresh-translations.sh 0.8.2`) to override the `Cargo.toml` default. The `Validate Translations Pin` CI gate validates the pinned catalogues before merge.
-
-The model used is whatever is configured under `providers.models.<name>`.
+The release-time refresh, validation, tagging, push, and gitlink-pin procedure
+is part of [Step 2 in the Release Runbook](release-runbook.md#refresh-and-pin-translations).
+This page documents the translation system; use the runbook as the operational
+source of truth when preparing a release.
 
 ## Model quality notes
 

@@ -76,13 +76,13 @@ RUN test -f /usr/lib/libunwind.so && ln -s libunwind.so /usr/lib/libgcc_s.so.1 |
 RUN npm ci --prefix web && npm install --prefix web lightningcss-linux-$(uname -m | sed 's/x86_64/x64/;s/aarch64/arm64/')-musl
 
 # Fetch cargo dependencies (network allowed)
-RUN --mount=type=cache,target=/root/.cargo/registry \
-    --mount=type=cache,target=/root/.cargo/git \
+RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/git,sharing=locked \
     cargo fetch --locked
 
 # Build the web dashboard (gen-api + typescript build), no network
-RUN --mount=type=cache,target=/root/.cargo/registry \
-    --mount=type=cache,target=/root/.cargo/git \
+RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/git,sharing=locked \
     --network=none \
     <<-EOF
     set -e
@@ -103,16 +103,16 @@ WORKDIR /src
 COPY . .
 
 # Fetch all workspace dependencies (network available)
-RUN --mount=type=cache,target=/root/.cargo/registry \
-    --mount=type=cache,target=/root/.cargo/git \
+RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/git,sharing=locked \
     cargo fetch
 
 # Format + clippy (fully isolated — no network, reproducible)
 # -crt-static: the musl target defaults crt-static on, but host == target in
 # StageX, so proc-macro/build-script host artifacts cannot link statically.
 # This validates code correctness; the target static link is checked in build.
-RUN --mount=type=cache,target=/root/.cargo/registry \
-    --mount=type=cache,target=/root/.cargo/git \
+RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/git,sharing=locked \
     --network=none \
     <<-EOF
     set -e
@@ -121,12 +121,14 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     touch web/dist/.gitkeep
     cargo fmt --all -- --check
     # --features ci-all matches CI's Lint job — validates all feature-gated code.
+    # --exclude zeroclaw-desktop: needs GTK/WebKit (not in StageX).
     # --exclude zerocode: inkjet/tree-sitter needs C++ compiler (not in StageX).
-    cargo clippy --workspace --exclude zerocode --all-targets --features ci-all --locked -- -D warnings
+    cargo clippy --workspace --exclude zeroclaw-desktop --exclude zerocode --all-targets --features ci-all --locked -- -D warnings
 EOF
 
 # Test (needs loopback for wiremock — no --network=none)
 # --offline prevents cargo from fetching even if network is available.
+# --exclude zeroclaw-desktop: requires GTK/GLib (tauri + tray-icon), not in StageX.
 # --exclude zerocode: tree-sitter/inkjet inject -lstdc++ and need real C++ runtime
 #   symbols (operator new/delete, __cxa_throw, etc.) for YAML scanner code.
 #   The build stage succeeds because it uses -static + libstdc++.a stub, but test
@@ -141,12 +143,12 @@ EOF
 #   compiled by rustdoc as host artifacts that hit the musl static-link wall,
 #   and the criterion bench links a C dep (alloca) that the static link
 #   rejects. Both run in the standard CI Test/Benchmarks jobs.
-RUN --mount=type=cache,target=/root/.cargo/registry \
-    --mount=type=cache,target=/root/.cargo/git \
+RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/git,sharing=locked \
     <<-EOF
     set -e
     export RUSTFLAGS="-C target-feature=-crt-static"
-    cargo test --workspace --lib --bins --tests --exclude zerocode --exclude xtask --exclude zeroclaw-tools --offline --locked
+    cargo test --workspace --lib --bins --tests --exclude zeroclaw-desktop --exclude zerocode --exclude xtask --exclude zeroclaw-tools --offline --locked
 EOF
 
 # ── Stage: build (zeroclaw + zerocode, default channels) ────
@@ -156,13 +158,13 @@ WORKDIR /src
 COPY . .
 
 # Fetch all workspace dependencies (network available)
-RUN --mount=type=cache,target=/root/.cargo/registry \
-    --mount=type=cache,target=/root/.cargo/git \
+RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/git,sharing=locked \
     cargo fetch
 
 # Offline build: release binaries (validation moved to check stage)
-RUN --mount=type=cache,target=/root/.cargo/registry \
-    --mount=type=cache,target=/root/.cargo/git \
+RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/git,sharing=locked \
     --network=none \
     <<-EOF
     set -e
@@ -182,7 +184,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
 
     # Release build — zeroclawlabs (daemon)
     # >>> generated:container-standard by `cargo generate installers` - do not edit <<<
-    ZEROCLAW_FEATURES="acp-bridge,agent-runtime,channel-acp-server,channel-amqp,channel-bluesky,channel-clawdtalk,channel-dingtalk,channel-discord,channel-email,channel-filesystem,channel-imessage,channel-irc,channel-lark,channel-linq,channel-mattermost,channel-mochat,channel-mqtt,channel-nextcloud,channel-notion,channel-qq,channel-reddit,channel-signal,channel-slack,channel-telegram,channel-twitch,channel-twitter,channel-voice-call,channel-wati,channel-webhook,channel-wecom,channel-wecom-ws,channel-whatsapp-cloud,gateway,observability-prometheus,schema-export"
+    ZEROCLAW_FEATURES="acp-bridge,agent-runtime,channel-acp-server,channel-discord,channel-email,channel-filesystem,channel-lark,channel-matrix,channel-telegram,channel-webhook,gateway,observability-prometheus,schema-export,whatsapp-web"
 # >>> end generated:container-standard <<<
     CARGO_TARGET_DIR=/target \
     cargo build \
@@ -213,7 +215,7 @@ COPY --from=config-gen /rootfs/ /rootfs/
 COPY --from=web-build /src/web/dist /rootfs/usr/share/zeroclawlabs/web/dist
 
 # ── Stage: package (minimal runtime) ─────────────────────────
-FROM docker.io/stagex/core-filesystem@sha256:cd3a66471ce1f630fa77d5c9bd9829f9f9fab6302a1aaa64d67b74f1f069b750 AS package
+FROM docker.io/stagex/core-filesystem@sha256:da28831927652291b0fa573092fd41c8c96ca181ea224df7bff40e1833c3db13 AS package
 
 # Copy binaries, web dist, and default config; set data dir ownership to nobody(65534)
 COPY --from=build /rootfs/ /
@@ -242,13 +244,13 @@ COPY . .
 
 # Fetch all workspace dependencies (network available)
 # Shares cache with the build stage via mount target
-RUN --mount=type=cache,target=/root/.cargo/registry \
-    --mount=type=cache,target=/root/.cargo/git \
+RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/git,sharing=locked \
     cargo fetch
 
 # Offline build: release binaries with all channels
-RUN --mount=type=cache,target=/root/.cargo/registry \
-    --mount=type=cache,target=/root/.cargo/git \
+RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/git,sharing=locked \
     --network=none \
     <<-EOF
     set -e
@@ -268,7 +270,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
 
     # Release build — zeroclawlabs (all channels)
     # >>> generated:container-fat by `cargo generate installers` - do not edit <<<
-    ZEROCLAW_FEATURES="acp-bridge,agent-runtime,browser-native,channel-acp-server,channel-amqp,channel-bluesky,channel-clawdtalk,channel-dingtalk,channel-discord,channel-email,channel-feishu,channel-filesystem,channel-imessage,channel-irc,channel-lark,channel-line,channel-linq,channel-matrix,channel-mattermost,channel-mochat,channel-mqtt,channel-nextcloud,channel-nostr,channel-notion,channel-qq,channel-reddit,channel-signal,channel-slack,channel-telegram,channel-twitch,channel-twitter,channel-voice-call,channel-wati,channel-webhook,channel-wechat,channel-wecom,channel-wecom-ws,channel-whatsapp-cloud,dev-sim,gateway,hardware,memory-postgres,observability-otel,observability-prometheus,peripheral-rpi,plugins-wasm,plugins-wasm-cranelift,plugins-wasm-pulley,plugins-wasm-runtime-only,probe,rag-pdf,sandbox-bubblewrap,sandbox-landlock,schema-export,webauthn,whatsapp-web"
+    ZEROCLAW_FEATURES="acp-bridge,agent-runtime,browser-native,channel-acp-server,channel-amqp,channel-bluesky,channel-clawdtalk,channel-dingtalk,channel-discord,channel-email,channel-feishu,channel-filesystem,channel-git,channel-imessage,channel-irc,channel-lark,channel-line,channel-linq,channel-matrix,channel-mattermost,channel-mochat,channel-mqtt,channel-nextcloud,channel-nostr,channel-notion,channel-qq,channel-reddit,channel-signal,channel-slack,channel-telegram,channel-twitch,channel-twitter,channel-voice-call,channel-wati,channel-webhook,channel-wechat,channel-wecom,channel-wecom-ws,channel-whatsapp-cloud,dev-sim,gateway,hardware,memory-postgres,observability-otel,observability-prometheus,peripheral-rpi,plugins-wasm,plugins-wasm-cranelift,plugins-wasm-pulley,plugins-wasm-runtime-only,probe,provider-gitea,provider-github,sandbox-bubblewrap,sandbox-landlock,schema-export,webauthn,whatsapp-web"
 # >>> end generated:container-fat <<<
     CARGO_TARGET_DIR=/target \
     cargo build \
@@ -299,7 +301,7 @@ COPY --from=config-gen /rootfs/ /rootfs/
 COPY --from=web-build /src/web/dist /rootfs/usr/share/zeroclawlabs/web/dist
 
 # ── Stage: package-fat (full-channel runtime) ────────────────
-FROM docker.io/stagex/core-filesystem@sha256:cd3a66471ce1f630fa77d5c9bd9829f9f9fab6302a1aaa64d67b74f1f069b750 AS package-fat
+FROM docker.io/stagex/core-filesystem@sha256:da28831927652291b0fa573092fd41c8c96ca181ea224df7bff40e1833c3db13 AS package-fat
 
 # Copy binaries, web dist, and default config; set data dir ownership to nobody(65534)
 COPY --from=build-fat /rootfs/ /

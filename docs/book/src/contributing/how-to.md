@@ -11,7 +11,7 @@ See [RFC process](./rfcs.md) for larger changes that need design discussion befo
 For anything larger than a typo fix:
 
 1. **Check the issue tracker.** Someone may already be working on it or have filed a related discussion.
-2. **Read `AGENTS.md`.** The repo's root `AGENTS.md` is the canonical source of convention: risk tiers, PR discipline, anti-patterns, and review standards live there.
+2. **Read `AGENTS.md`.** The repo root contains the compact, always-loaded contract. Use [Coding agent guidelines](./agent-guidelines.md) for detailed risk, stability, source-of-truth, and skill-discovery references.
 3. **Use the [Architecture and contribution map](./architecture-map.md)** for anything that touches architecture, config, security, workflow, governance, CI, release behavior, or AI-assisted contribution policy.
 4. **Pick a branch.** PRs target `master`. Fork the repo and branch from there; there's no develop/integration branch to go through.
 
@@ -23,7 +23,7 @@ fork → branch → commit → push → open PR → review → merge (squash)
 
 The key checkpoints:
 
-- **PR template**: `.github/pull_request_template.md`. Fill it out. The summary, validation evidence, and compatibility sections are non-negotiable.
+- **PR template**: `.github/pull_request_template.md`. Fill it out. The summary, testing evidence, and compatibility sections are non-negotiable.
 - **CI**: runs on every PR. `ci.yml` is the composite gate; all legs must pass.
 - **Labels**: maintainers use labels to route review depth. You do not need to know every label family before opening a PR. If labels look obviously wrong and you cannot edit them, flag the mismatch in a comment; maintainers or reviewers with label permissions can correct obvious mismatches directly.
 - **Review routing**: make the scope, linked issues, validation, and risk/rollback context clear enough that reviewers can choose the right review path quickly.
@@ -41,10 +41,28 @@ The key checkpoints:
 - Inline unit tests: `#[cfg(test)] mod tests {}` at the bottom of the file or a sibling `tests.rs`
 - Don't commit secrets, personal data, or real-user identities: the [Privacy & PII discipline](./privacy.md) page is the merge gate
 
+### Comments and drift
+
+Comments should explain durable intent, invariants, hazards, or source ownership. Do not add comments that restate nearby control flow, duplicate schema or config field lists, mirror enum variants, or describe runtime behavior that the code and tests do not enforce. Those comments become drift surfaces: future contributors and tools may trust the prose after the source has changed.
+
+If a comment needs to mention behavior owned elsewhere, point to the owner instead of copying it. Prefer comments that say why a branch is safe, which contract owns a rule, or which source must change first.
+
+Prefer:
+
+- `The config schema owns accepted aliases; keep this resolver generic.`
+- `This panic is unreachable because the parser rejects empty tool names earlier.`
+
+Avoid:
+
+- `Supported variants are A, B, and C.`
+- `This flag always enables vector search.`
+
+If the statement can only stay true by manually editing the comment whenever code, config, WIT, schema, or tests change, make the source clearer or add a source pointer instead.
+
 ## Testing
 
 - Unit tests co-located with the code (`mod tests`)
-- Integration tests in `tests/` and crate-local unit tests: run via `cargo nextest run --locked --workspace`
+- Integration tests in `tests/` and crate-local unit tests: run via `cargo nextest run --locked --workspace --exclude zeroclaw-desktop`
 - Feature-gated code needs feature-gated tests
 - Don't mock the database for tests that exercise schema or SQL: integration tests must hit a real SQLite
 
@@ -54,7 +72,7 @@ For the full five-level taxonomy (unit / component / integration / system / live
 
 - Prose changes go in `docs/book/src/**/*.md` (this mdBook)
 - Rustdoc (`///`) changes update the API reference automatically on deploy
-- Reference pages (`docs/book/src/reference/cli.md`, `config.md`) are generated; don't hand-edit. Run `cargo mdbook refs` and commit the output
+- Reference pages (`docs/book/src/reference/cli.md`, `config.md`) are ignored generated outputs; don't hand-edit or commit them. Run `cargo mdbook refs` to preview changes from the owning CLI/config source.
 - Localisation: English markdown is the source of truth. Routine English docs PRs may omit broad generated `.po` churn; use the standard PR-body note in [Building the docs locally](../developing/building-docs.md).
 - Translation-cache PRs, release translation passes, and new locales should run `cargo mdbook sync`, commit the resulting `.po` files, and validate them with `cargo mdbook check`
 
@@ -93,7 +111,7 @@ Title mirrors the squash commit:
 feat(scope): short description
 ```
 
-Body uses the PR template. **The validation-evidence section is required**: paste the checks that match the change. For docs-only PRs, use `scripts/ci/docs_quality_gate.sh` and `scripts/ci/docs_links_gate.sh` or explain why link checking had no added links to inspect. For Rust/code PRs, include `cargo fmt --check`, `cargo clippy`, `cargo test`, plus whatever manual verification you did. "It works on my machine" is not evidence.
+Body uses the PR template. **The testing section is required**: explain how the change was checked, and paste the checks that match the change. The reviewer-run A/B recipe under `How you can test` is only needed when manual verification adds useful signal; mark it `N/A` for docs-only, pure-refactor, or trivial changes without a meaningful reviewer test path. For docs-only PRs, use `scripts/ci/docs_quality_gate.sh` and `scripts/ci/docs_links_gate.sh` or explain why link checking had no added links to inspect. For Rust/code PRs, use the evidence that matches the changed surface: required CI checks, focused crate or regression tests, manual smoke, or full workspace checks when broad coverage proves something narrower evidence would miss. Fresh required CI is enough when it covers the changed surface; extra local Cargo is not required just to duplicate the same head, target, and feature set. Add more evidence when the PR depends on a known CI coverage gap: platform-specific tests, cross-platform lint, desktop app coverage, release target builds, stale CI, or unavailable CI. "It works on my machine" is not evidence.
 
 Risk labels:
 

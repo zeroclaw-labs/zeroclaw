@@ -29,6 +29,7 @@ import {
 } from "../../lib/api";
 import { fuzzyFilter } from "../../lib/fuzzy";
 import { t } from "@/lib/i18n";
+import { badgeIsGood } from "./SectionPicker";
 
 // One selectable entity under a section. `url` is the entity's existing
 // form URL; `mapPath` is the dotted map path it lives under (used so the
@@ -123,9 +124,12 @@ export default function SectionNavigator({
       }
       if (section.shape === "typed_family_map") {
         // Configured/active provider or channel types under this section.
+        // Uses the shared `badgeIsGood` accept set so storage's "created" badge
+        // (see storage_picker in api_sections.rs) surfaces here alongside every
+        // other badge-filtered surface, from one source of truth.
         const picker = await getSectionPicker(section.key);
         const configuredTypes = picker.items
-          .filter((i) => i.badge === "configured" || i.badge === "active")
+          .filter((i) => badgeIsGood(i.badge))
           .map((i) => i.key);
         const out: NavEntity[] = [];
         for (const type of configuredTypes) {

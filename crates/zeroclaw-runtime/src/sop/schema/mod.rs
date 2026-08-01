@@ -7,7 +7,6 @@ pub use types::SchemaError;
 use types::{SchemaNode, value_kind};
 
 /// Validate a JSON value against ZeroClaw's minimal SOP schema subset.
-///
 /// Supported keywords are `type`, `required`, `properties`, and `items`.
 /// Malformed or unsupported type declarations fail closed.
 pub fn validate_value(schema: &Value, data: &Value) -> Result<(), SchemaError> {

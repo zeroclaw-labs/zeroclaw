@@ -3,12 +3,6 @@ use std::path::{Path, PathBuf};
 use zeroclaw_api::platform::is_android;
 use zeroclaw_api::runtime_traits::RuntimeAdapter;
 
-/// Command-line argument passed after `cmd.exe /C`.
-///
-/// The outer quotes make `cmd.exe` receive the whole configured command as one
-/// command string, while internal quotes remain verbatim for paths and args
-/// with spaces. This preserves the #7083 quoting contract for all Windows
-/// platform-shell call sites.
 pub fn windows_cmd_shell_raw_arg(command: &str) -> String {
     format!("\"{command}\"")
 }
@@ -45,6 +39,7 @@ pub fn windows_std_cmd_shell_command(command: &str) -> std::process::Command {
 /// Native runtime — full access, runs on Mac/Linux/Windows/Docker/Raspberry Pi
 pub struct NativeRuntime {
     /// Shell binary to invoke for command execution (e.g. `"sh"`, `"bash"`).
+    #[cfg(not(target_os = "windows"))]
     shell: String,
 }
 
@@ -57,15 +52,23 @@ impl Default for NativeRuntime {
 impl NativeRuntime {
     /// Create a native runtime that uses the system default shell (`sh`).
     pub fn new() -> Self {
-        Self { shell: "sh".into() }
+        Self::with_shell("sh".into())
     }
 
     /// Create a native runtime that uses a specific shell binary.
-    ///
     /// `shell` should be a path or name resolvable via `PATH`,
     /// e.g. `"bash"`, `"/bin/zsh"`, `"/usr/bin/fish"`.
     pub fn with_shell(shell: String) -> Self {
-        Self { shell }
+        #[cfg(not(target_os = "windows"))]
+        {
+            Self { shell }
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            drop(shell);
+            Self {}
+        }
     }
 }
 
@@ -168,11 +171,6 @@ mod tests {
         assert!(debug.contains("echo hello"));
     }
 
-    /// On Windows, `std::process::Command` applies `CommandLineToArgvW`
-    /// escaping to each `.arg()`, which mangles embedded double quotes
-    /// with backslash escapes that `cmd.exe` does not understand.
-    /// `raw_arg` must pass the command verbatim so that quoted paths
-    /// and arguments survive intact (see #7083).
     #[test]
     fn shell_command_preserves_double_quotes() {
         let cwd = std::env::temp_dir();
@@ -192,7 +190,7 @@ mod tests {
         );
 
         // On Windows, raw_arg must NOT produce backslash-escaped quotes
-        // (the core issue in #7083).
+        // (the core issue in
         #[cfg(target_os = "windows")]
         {
             assert!(
@@ -224,8 +222,6 @@ mod tests {
         );
     }
 
-    /// A command with mixed quoted and unquoted segments must pass
-    /// through without mangling any part of the command line.
     #[test]
     fn shell_command_preserves_mixed_quoted_unquoted() {
         let cwd = std::env::temp_dir();
@@ -270,9 +266,6 @@ mod tests {
         }
     }
 
-    /// On Windows, actually invoke `cmd /C` with a quoted `echo`
-    /// argument to confirm the fix works end-to-end. Skipped on
-    /// non-Windows hosts since there's no `cmd.exe`.
     #[tokio::test]
     #[cfg(target_os = "windows")]
     async fn windows_echo_quoted_argument_succeeds() {
@@ -292,9 +285,6 @@ mod tests {
         );
     }
 
-    /// On Windows, verify `dir` with a quoted path works (previous
-    /// behavior: "The filename, directory name, or volume label
-    /// syntax is incorrect").
     #[tokio::test]
     #[cfg(target_os = "windows")]
     async fn windows_dir_quoted_path_succeeds() {
@@ -314,8 +304,6 @@ mod tests {
         );
     }
 
-    /// Verify a command with entirely unquoted arguments still works
-    /// (regression check for the raw_arg conversion).
     #[test]
     fn shell_command_no_quotes_still_works() {
         let cwd = std::env::temp_dir();
@@ -326,8 +314,6 @@ mod tests {
         assert!(debug.contains("echo hello_world"));
     }
 
-    /// Verify `echo %VAR%` expansion syntax is preserved verbatim
-    /// and not mangled by escaping.
     #[tokio::test]
     #[cfg(target_os = "windows")]
     async fn windows_echo_percent_expansion_preserved() {
@@ -350,11 +336,11 @@ mod tests {
     // ── Configurable shell tests ─────────────────────────────
 
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn native_with_shell_defaults_to_sh() {
         let runtime = NativeRuntime::new();
         let cwd = std::env::temp_dir();
         let cmd = runtime.build_shell_command("echo hi", &cwd).unwrap();
-        #[cfg(not(target_os = "windows"))]
         assert!(
             format!("{cmd:?}").contains("\"sh\""),
             "default shell should be 'sh', got: {cmd:?}"
@@ -362,11 +348,11 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn native_with_shell_bash() {
         let runtime = NativeRuntime::with_shell("bash".into());
         let cwd = std::env::temp_dir();
         let cmd = runtime.build_shell_command("echo hi", &cwd).unwrap();
-        #[cfg(not(target_os = "windows"))]
         assert!(
             format!("{cmd:?}").contains("\"bash\""),
             "configured shell should appear in command debug, got: {cmd:?}"
@@ -374,11 +360,11 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn native_with_shell_absolute_path() {
         let runtime = NativeRuntime::with_shell("/usr/bin/zsh".into());
         let cwd = std::env::temp_dir();
         let cmd = runtime.build_shell_command("echo hi", &cwd).unwrap();
-        #[cfg(not(target_os = "windows"))]
         assert!(
             format!("{cmd:?}").contains("/usr/bin/zsh"),
             "absolute path should appear verbatim, got: {cmd:?}"
@@ -386,25 +372,23 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn native_default_and_with_shell_are_different() {
         let default = NativeRuntime::new();
         let configured = NativeRuntime::with_shell("bash".into());
         let cwd = std::env::temp_dir();
-        #[cfg(not(target_os = "windows"))]
-        {
-            let default_debug = format!(
-                "{:?}",
-                default.build_shell_command("echo hi", &cwd).unwrap()
-            );
-            let configured_debug = format!(
-                "{:?}",
-                configured.build_shell_command("echo hi", &cwd).unwrap()
-            );
-            assert_ne!(
-                default_debug, configured_debug,
-                "default shell and configured shell should produce different commands"
-            );
-        }
+        let default_debug = format!(
+            "{:?}",
+            default.build_shell_command("echo hi", &cwd).unwrap()
+        );
+        let configured_debug = format!(
+            "{:?}",
+            configured.build_shell_command("echo hi", &cwd).unwrap()
+        );
+        assert_ne!(
+            default_debug, configured_debug,
+            "default shell and configured shell should produce different commands"
+        );
     }
 
     #[test]

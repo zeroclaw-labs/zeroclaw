@@ -1,7 +1,7 @@
 import { memo, useState, useEffect, useRef, useCallback } from 'react';
 import { Link, Navigate, useParams } from 'react-router-dom';
-import { Send, Square, Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2, ChevronDown, Wrench, FolderOpen } from 'lucide-react';
-import ReactMarkdown from 'react-markdown';
+import { Send, Square, Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2, ChevronDown, Wrench, BarChart2, FolderOpen } from 'lucide-react';
+import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { useAgent, type ChatMessage } from '@/contexts/AgentContext';
 import { useDraft } from '@/hooks/useDraft';
@@ -14,13 +14,54 @@ import {
   parseCommand,
   type CommandSpec,
 } from '@/lib/slashCommands';
-import { Badge, Button } from '@/components/ui';
+import { Button } from '@/components/ui';
 import ChatWorkspace from '@/pages/ChatWorkspace';
 
 import ToolCallCard from '@/components/ToolCallCard';
 import ApprovalBanner from '@/components/ApprovalBanner';
 
 const DRAFT_KEY_PREFIX = 'agent-chat';
+
+// Open chat links in a new tab so navigation never replaces the live chat
+// page. In-page anchors (e.g. GFM footnote refs) keep default navigation.
+const markdownComponents: Components = {
+  a: ({ node: _node, href, ...props }) =>
+    href?.startsWith('#') ? (
+      <a {...props} href={href} />
+    ) : (
+      <a {...props} href={href} target="_blank" rel="noopener noreferrer" />
+    ),
+};
+
+/** Format token count with commas (e.g., 12345 -> "12,345"). */
+function fmtTokens(n: number): string {
+  return n.toLocaleString();
+}
+
+/** Context bar component showing context window usage. */
+function ContextBar({ contextMaxTokens, contextInputTokens }: { 
+  contextMaxTokens: number | null; 
+  contextInputTokens: number | null; 
+}) {
+  if (!contextMaxTokens) return null;
+
+  const used = contextInputTokens ?? 0;
+  const max = contextMaxTokens;
+  const pct = max > 0 ? Math.min((used / max) * 100, 100) : 0;
+  const barWidth = 16;
+  const filled = Math.round((pct / 100) * barWidth);
+  const empty = Math.max(0, barWidth - filled);
+  const bar = '█'.repeat(filled) + '░'.repeat(empty);
+
+  const label = `ctx: ${fmtTokens(used).padStart(7)} / ${fmtTokens(max).padStart(7)}  [${bar}]  ${pct.toFixed(0)}%`;
+
+  return (
+    <div className="px-4 py-1.5 border-b text-[11px] font-mono flex items-center gap-2" style={{ borderColor: 'var(--pc-border)', background: 'var(--pc-bg-surface)' }}>
+      <BarChart2 className="h-3 w-3 shrink-0" style={{ color: 'var(--pc-text-muted)' }} />
+      <span style={{ color: 'var(--pc-text-secondary)' }}>{label}</span>
+    </div>
+  );
+}
 
 /**
  * Route entry point for `/agent/:alias`. Reads the alias from the URL and
@@ -79,6 +120,8 @@ export function AgentChatInner({
     abortSession,
     pendingApproval,
     respondToApproval,
+    contextMaxTokens,
+    contextInputTokens,
   } = useAgent();
 
   const { draft, saveDraft, clearDraft } = useDraft(`${DRAFT_KEY_PREFIX}.${agentAlias}`);
@@ -595,14 +638,26 @@ export function AgentChatInner({
             </Button>
           )}
         </div>
-        <div className="flex items-center justify-center mt-2">
-          <Badge tone={typing ? 'warn' : connected ? 'ok' : 'error'}>
-            {typing
-              ? t('agent.running')
-              : connected
-                ? t('agent.connected_status')
-                : t('agent.disconnected_status')}
-          </Badge>
+        <div className="flex items-center justify-between mt-2 gap-2 max-w-4xl mx-auto">
+          <div className="flex items-center gap-2">
+            <span
+              className="status-dot"
+              style={typing
+                ? { background: 'var(--pc-accent)', boxShadow: '0 0 6px var(--pc-accent)' }
+                : connected
+                  ? { background: 'var(--color-status-success)', boxShadow: '0 0 6px var(--color-status-success)' }
+                  : { background: 'var(--color-status-error)', boxShadow: '0 0 6px var(--color-status-error)' }
+              }
+            />
+            <span className="text-[10px]" style={{ color: 'var(--pc-text-faint)' }}>
+              {typing
+                ? t('agent.running')
+                : connected
+                  ? t('agent.connected_status')
+                  : t('agent.disconnected_status')}
+            </span>
+          </div>
+          <ContextBar contextMaxTokens={contextMaxTokens} contextInputTokens={contextInputTokens} />
         </div>
       </div>
     </div>
@@ -659,12 +714,16 @@ const MessageItem = memo(function MessageItem({
       {!compact && (
         <div
           className={`flex-shrink-0 w-8 h-8 rounded-[var(--radius-md)] flex items-center justify-center border ${
-            msg.role === 'user'
+            msg.notice
+              ? 'bg-status-warning/10 border-status-warning/30'
+              : msg.role === 'user'
               ? 'bg-pc-accent/15 border-pc-accent/30'
               : 'bg-pc-elevated border-pc-border'
           }`}
         >
-          {msg.role === 'user' ? (
+          {msg.notice ? (
+            <AlertCircle className="h-4 w-4 text-status-warning" />
+          ) : msg.role === 'user' ? (
             <User className="h-4 w-4 text-pc-accent" />
           ) : (
             <Bot className="h-4 w-4 text-pc-accent" />
@@ -674,7 +733,9 @@ const MessageItem = memo(function MessageItem({
       <div className="relative max-w-[75%]">
         <div
           className={`${compact ? 'rounded-[var(--radius-md)] px-3 py-1.5 border' : 'rounded-[var(--radius-lg)] px-4 py-3 border'} text-pc-text ${
-            msg.role === 'user'
+            msg.notice
+              ? 'bg-status-warning/5 border-status-warning/30'
+              : msg.role === 'user'
               ? 'bg-pc-accent/10 border-pc-accent/20'
               : 'bg-pc-elevated border-pc-border'
           }`}
@@ -688,7 +749,7 @@ const MessageItem = memo(function MessageItem({
           {msg.toolCall ? (
             <ToolCallCard toolCall={msg.toolCall} />
           ) : msg.markdown ? (
-            <div className={`${compact ? 'text-xs' : 'text-sm'} break-words leading-relaxed chat-markdown`}><ReactMarkdown remarkPlugins={[remarkGfm]}>{cleanContent}</ReactMarkdown></div>
+            <div className={`${compact ? 'text-xs' : 'text-sm'} break-words leading-relaxed chat-markdown`}><ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>{cleanContent}</ReactMarkdown></div>
           ) : (
             <p className={`${compact ? 'text-xs' : 'text-sm'} whitespace-pre-wrap break-words leading-relaxed`}>{cleanContent}</p>
           )}

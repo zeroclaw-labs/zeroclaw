@@ -1,13 +1,9 @@
 //! HTTP-based tool derived from a skill's `[[tools]]` section.
-//!
-//! Each `SkillTool` with `kind = "http"` is converted into a `SkillHttpTool`
-//! that implements the `Tool` trait. The command field is used as the URL
-//! template and args are substituted as query parameters or path segments.
 
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::time::Duration;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 
 /// Maximum response body size (1 MB).
 const MAX_RESPONSE_BYTES: usize = 1_048_576;
@@ -24,7 +20,6 @@ pub struct SkillHttpTool {
 
 impl SkillHttpTool {
     /// Create a new skill HTTP tool.
-    ///
     /// The tool name is prefixed with the skill name (`skill_name__tool_name`)
     /// to prevent collisions with built-in tools.
     pub fn new(skill_name: &str, tool: &crate::skills::SkillTool) -> Self {
@@ -90,18 +85,12 @@ impl Tool for SkillHttpTool {
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let url = self.substitute_args(&args);
 
-        // Parse with `reqwest::Url` instead of hand-rolled scheme check. The
-        // pre-fix check only verified the URL prefix, so a template like
-        // `http://{{user}}@{{host}}/...` with attacker-controlled `{{user}}`
-        // could land `http://attacker@127.0.0.1/...` (userinfo bypass).
-        // Reject userinfo outright (parser-level SSRF defense; no skill-author
-        // opt-out). Mirrors the `text_browser` fix in PR #8635.
         let parsed = match reqwest::Url::parse(&url) {
             Ok(p) => p,
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Invalid URL: {e}")),
                 });
             }
@@ -109,14 +98,14 @@ impl Tool for SkillHttpTool {
         if !parsed.username().is_empty() || parsed.password().is_some() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("URL userinfo is not allowed".to_string()),
             });
         }
         if !matches!(parsed.scheme(), "http" | "https") {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Only http:// and https:// URLs are allowed, got: {url}"
                 )),
@@ -142,7 +131,7 @@ impl Tool for SkillHttpTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("HTTP request failed: {e}")),
                 });
             }
@@ -165,7 +154,7 @@ impl Tool for SkillHttpTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Failed to read response body: {e}")),
                 });
             }
@@ -173,7 +162,7 @@ impl Tool for SkillHttpTool {
 
         Ok(ToolResult {
             success: status.is_success(),
-            output: body,
+            output: body.into(),
             error: if status.is_success() {
                 None
             } else {
@@ -292,7 +281,7 @@ mod tests {
     fn skill_http_tool_name_sanitized_for_provider_regex() {
         // A plugin-namespaced HTTP skill (colons) or a dotted tool name must
         // still yield a provider-valid function name, the same as shell/builtin
-        // tools, so #6678 cannot survive through the HTTP registration path.
+        // tools, socannot survive through the HTTP registration path.
         let mut st = sample_http_tool();
         st.name = "fetch.weather".to_string();
         let tool = SkillHttpTool::new("pr-review-toolkit:code-reviewer", &st);
@@ -326,14 +315,6 @@ mod tests {
         let schema = tool.parameters_schema();
         assert!(schema["properties"].as_object().unwrap().is_empty());
     }
-
-    // ── SSRF guards (audit-zeroclaw-2026-07-03.md follow-up finding) ──
-    //
-    // The URL template is operator-trust (skill author), but `{{arg_name}}`
-    // is LLM-supplied at runtime. A template like `http://{{user}}@{{host}}`
-    // with attacker-controlled `{{user}}` would yield a userinfo bypass
-    // (`http://attacker@127.0.0.1/...`). Reject userinfo at the parser layer
-    // so the LLM cannot smuggle a private host through credential syntax.
 
     fn http_tool_with_command(command: &str) -> SkillHttpTool {
         let st = SkillTool {
