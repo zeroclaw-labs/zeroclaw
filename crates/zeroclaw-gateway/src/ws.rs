@@ -29,6 +29,19 @@ use zeroclaw_runtime::sop::approval::{
 /// channel-side default on `TelegramConfig::approval_timeout_secs`.
 const WS_APPROVAL_TIMEOUT_SECS: u64 = 120;
 
+/// Single ingress identity for gateway WebSocket turns.
+///
+/// This name is used in three places that MUST agree:
+///   1. `Agent.channel_name` — observer/attribution events for the turn
+///   2. the turn span's `channel` field — tracing/log correlation
+///   3. the interactive back-channel registration key — how `ask_user`,
+///      `poll`, and `escalate_to_human` find this conversation
+///
+/// If (3) diverges from (1) and (2), one turn is split across two channel
+/// names in observability while interactive tools still route correctly —
+/// or, worse, tools route to an arbitrary seeded channel.
+const WS_CHANNEL_KEY: &str = "wss";
+
 #[derive(Debug, Deserialize)]
 struct ConnectParams {
     #[serde(rename = "type")]
@@ -482,7 +495,12 @@ async fn handle_socket(
                 return;
             }
         };
-    agent.set_channel_name("wss".to_string());
+    // Keep ONE ingress identity for the WebSocket turn: the turn span records
+    // `channel = "wss"`, and observer events derive from `Agent.channel_name`,
+    // so this must stay `wss` or a single turn is split across two names.
+    // The back-channel is registered under the same `wss` key below, which is
+    // what lets ask_user/poll/escalate_to_human default to this conversation.
+    agent.set_channel_name(WS_CHANNEL_KEY.to_string());
     agent.set_memory_session_id(Some(memory_session_id));
     let restore_trim_event = if stored_messages.is_empty() {
         None
@@ -500,7 +518,7 @@ async fn handle_socket(
     ));
     agent
         .channel_handles()
-        .register_channel("ws", approval_channel.clone());
+        .register_channel(WS_CHANNEL_KEY, approval_channel.clone());
 
     let ch = agent.channel_handles();
     let channel_names = zeroclaw_channels::orchestrator::register_channels_for_tools(
@@ -992,7 +1010,7 @@ async fn process_chat_message(
             agent_alias = %turn_alias,
             model_provider = %turn_provider,
             model = %turn_model,
-            channel = "wss",
+            channel = WS_CHANNEL_KEY,
         );
         zeroclaw_runtime::agent::loop_::scope_session_key(
             Some(session_key_owned.clone()),
@@ -1490,6 +1508,58 @@ async fn process_chat_message(
 mod tests {
     use super::*;
     use axum::http::HeaderMap;
+
+    #[test]
+    fn ws_turn_has_a_single_channel_identity() {
+        // Regression: `Agent.channel_name` was set to "ws" to match the
+        // back-channel registration key while the turn span still recorded
+        // `channel = "wss"`, so one turn was attributed to two channel names.
+        // All three uses now derive from WS_CHANNEL_KEY; this pins the value
+        // to the historical ingress name so observability stays stable and
+        // interactive-tool lookups still resolve.
+        assert_eq!(
+            WS_CHANNEL_KEY, "wss",
+            "WS ingress identity must stay `wss` — it is the name already used by \
+             the turn span and SSE `channel` field; changing it splits attribution"
+        );
+    }
+
+    #[tokio::test]
+    async fn ws_back_channel_registers_under_the_ingress_identity() {
+        // The interactive tools (`ask_user`, `poll`, `escalate_to_human`) look
+        // the channel up by the agent's channel name. If the registration key
+        // and WS_CHANNEL_KEY ever diverge, that lookup misses and the tools
+        // silently fall back to an arbitrary seeded channel — the original bug.
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let pending = new_pending_approvals();
+        let approval_channel = Arc::new(WsApprovalChannel::new(
+            tx,
+            pending,
+            Duration::from_secs(WS_APPROVAL_TIMEOUT_SECS),
+        ));
+
+        let handle: zeroclaw_runtime::tools::PerToolChannelHandle =
+            Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
+        handle.write().insert(
+            WS_CHANNEL_KEY.to_string(),
+            approval_channel as Arc<dyn zeroclaw_api::channel::Channel>,
+        );
+
+        // Interactive tools resolve the back-channel by the agent's channel
+        // name; this is the lookup `ask_user` / `poll` / `escalate_to_human`
+        // perform against their shared channel map.
+        let resolved = handle.read().get(WS_CHANNEL_KEY).cloned();
+        assert!(
+            resolved.is_some(),
+            "back-channel must be resolvable by the same key the agent reports \
+             as its channel name ({WS_CHANNEL_KEY})"
+        );
+        assert!(
+            !resolved.unwrap().supports_outbound_send(),
+            "WS approval channel must declare that `send` does not deliver, so \
+             poll/escalate_to_human fail honestly instead of reporting false success"
+        );
+    }
 
     #[test]
     fn restore_trim_uses_live_history_trimmed_frame_shape() {

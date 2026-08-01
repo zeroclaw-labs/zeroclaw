@@ -13,7 +13,7 @@ pub const MAX_DELIVER_FILE_BYTES: u64 = 10 * 1024 * 1024;
 /// Source of truth for the `attachment://deliver/<id>` string, where `<id>` is
 /// the opaque content hash from [`content_hash_name`] — never a caller-supplied
 /// filename. ACP must reuse this helper (or the `uri` carried on the tool's
-/// [`ToolArtifact`]), not a second formatter.
+/// [`zeroclaw_api::agent::ToolArtifact`]), not a second formatter.
 pub fn attachment_deliver_uri(id: &str) -> String {
     format!("attachment://deliver/{id}")
 }
@@ -33,8 +33,8 @@ fn sanitize_display_title(raw: &str) -> String {
 /// Deliver a workspace file to an ACP client as an embedded binary resource.
 ///
 /// Returns path/mime metadata as structured data (projected into the event's
-/// [`ToolArtifact`]) without embedding file bytes in the tool result — the ACP
-/// layer re-reads the file for `blob`.
+/// [`zeroclaw_api::agent::ToolArtifact`]) without embedding file bytes in the
+/// tool result — the ACP layer re-reads the file for `blob`.
 pub struct DeliverFileTool {
     security: Arc<SecurityPolicy>,
 }

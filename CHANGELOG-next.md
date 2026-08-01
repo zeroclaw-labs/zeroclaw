@@ -89,6 +89,9 @@ This release is a large consolidation cycle spanning **379 commits** from **56 c
 | Deps | Bump crossbeam-epoch (RUSTSEC-2026-0204), anyhow (RUSTSEC-2026-0190), and remove rag-pdf/ttf-parser (RUSTSEC-2026-0192) (#8783, #8500, #8547) |
 | Install | Prebuild dashboard for embedded web; exclude Tauri apps from `--full` app sweep; register `zerocode.exe` in the Scoop manifest (#8643, #8786, #8276) |
 | Tools | Pin `http_request` to vetted DNS addresses; cap calculator values array to prevent OOM; bound `browser_open` launcher waits (#7902, #8481, #8564) |
+| Tools | Stop `ask_user` hangs: prefer the originating conversation channel over HashMap order, fail fast when structured-only channels return no choice, and align RPC/ACP/WS `channel_name` with the registered back-channel key |
+| Tools | Route `escalate_to_human` to the conversation's channel via a new `channel` parameter, and fall back to `[escalation] alert_channels` when that channel cannot deliver — failing honestly when nothing delivers, instead of reporting a delivery that never happened |
+| Tools | Stop `poll` reporting "Poll created" when a structured-only channel cancelled the prompt and the text fallback could not be delivered (single- and multi-select) |
 
 ## Breaking Changes
 
