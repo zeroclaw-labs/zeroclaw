@@ -9,18 +9,45 @@ use std::path::{Path, PathBuf};
 pub struct LlmTrace {
     /// Identifier for the trace (surfaced in reports).
     pub model_name: String,
+    /// Optional stable report identity. When set, reports and receipts use this
+    /// instead of `model_name`; readers should go through [`LlmTrace::display_id`].
+    #[serde(default)]
+    pub id: Option<String>,
     /// Conversation turns, replayed in order.
     pub turns: Vec<TraceTurn>,
     /// Declarative expectations graded against the run.
     #[serde(default)]
     pub expects: TraceExpects,
+    /// Pre-run environment preparation for the case (live mode).
+    #[serde(default)]
+    pub setup: Option<CaseSetup>,
+    /// Tool names this case requests. Live mode only; ignored in replay.
+    #[serde(default)]
+    pub tools: Option<Vec<String>>,
+}
+
+/// Pre-run environment preparation for a case.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CaseSetup {
+    /// Files written into the case's temp workspace before the run.
+    /// Keys are workspace-relative paths; absolute paths and `..` are rejected.
+    #[serde(default)]
+    pub workspace_files: std::collections::BTreeMap<String, String>,
+    /// Memory entries seeded before the run. Keys use the same safe relative-path
+    /// contract as workspace setup and expectation keys.
+    #[serde(default)]
+    pub memory: std::collections::BTreeMap<String, String>,
 }
 
 /// A single conversation turn (user input + scripted LLM response steps).
+///
+/// `steps` is optional: replay cases script every LLM round-trip, while live
+/// cases must omit them (the real provider produces the responses).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraceTurn {
     pub user_input: String,
-    pub steps: Vec<TraceStep>,
+    #[serde(default)]
+    pub steps: Option<Vec<TraceStep>>,
 }
 
 /// A single LLM response step within a turn.
@@ -83,9 +110,86 @@ pub struct TraceExpects {
     /// Regex patterns the final response must match.
     #[serde(default)]
     pub response_matches: Vec<String>,
+    /// End-state checks against the case workspace after the run.
+    #[serde(default)]
+    pub workspace: Option<WorkspaceExpects>,
+    /// End-state checks against the case memory after the run.
+    #[serde(default)]
+    pub memory: Option<MemoryExpects>,
+    /// Resource ceilings for the run.
+    #[serde(default)]
+    pub budget: Option<BudgetExpects>,
+    /// JSON-pointer checks against the final response parsed as JSON.
+    #[serde(default)]
+    pub response_json: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+/// End-state checks against the case workspace after the run.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WorkspaceExpects {
+    /// Workspace-relative paths that must exist as a regular file after the run
+    /// (a directory at the path does not satisfy the check).
+    #[serde(default)]
+    pub file_exists: Vec<String>,
+    /// Workspace-relative paths at which nothing (file or directory) may exist
+    /// after the run.
+    #[serde(default)]
+    pub file_absent: Vec<String>,
+    /// Path -> substrings that must appear in that file.
+    #[serde(default)]
+    pub file_contains: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+/// End-state checks against the case memory after the run.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MemoryExpects {
+    /// Memory keys that must be present after the run.
+    #[serde(default)]
+    pub present: Vec<String>,
+    /// Memory keys that must be absent after the run.
+    #[serde(default)]
+    pub absent: Vec<String>,
+    /// Memory key -> substrings that must appear in that entry.
+    #[serde(default)]
+    pub contains: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+/// Resource ceilings for the run (all optional; each present bound is one
+/// inclusive check, `actual <= max`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BudgetExpects {
+    /// Max accumulated input tokens reported by the provider.
+    #[serde(default)]
+    pub max_input_tokens: Option<u64>,
+    /// Max accumulated output tokens reported by the provider.
+    #[serde(default)]
+    pub max_output_tokens: Option<u64>,
+    /// Max total tokens (input + output).
+    #[serde(default)]
+    pub max_total_tokens: Option<u64>,
+    /// Max wall-clock duration of the turns loop, in milliseconds.
+    #[serde(default)]
+    pub max_duration_ms: Option<u64>,
+    /// Max number of LLM responses (model round-trips) during the run.
+    #[serde(default)]
+    pub max_llm_calls: Option<u32>,
 }
 
 impl LlmTrace {
+    /// The identity used in reports and receipts: the explicit `id` when set,
+    /// otherwise `model_name`.
+    pub fn display_id(&self) -> &str {
+        self.id.as_deref().unwrap_or(&self.model_name)
+    }
+
+    /// Whether this trace seeds memory or declares memory expectations.
+    pub fn declares_memory(&self) -> bool {
+        self.setup
+            .as_ref()
+            .is_some_and(|setup| !setup.memory.is_empty())
+            || self.expects.memory.is_some()
+    }
+
     /// Load a trace from a JSON file.
     pub fn from_file(path: &Path) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)
@@ -94,6 +198,27 @@ impl LlmTrace {
             .with_context(|| format!("parsing trace fixture {}", path.display()))?;
         Ok(trace)
     }
+}
+
+/// Validate that `path` is a safe workspace-relative path: non-empty, not absolute,
+/// and free of any `..` component. Used before writing setup files or grading
+/// workspace paths, so a case cannot read or write outside its sandbox.
+pub fn validate_workspace_rel_path(path: &str) -> anyhow::Result<()> {
+    if path.is_empty() {
+        anyhow::bail!("workspace path must not be empty");
+    }
+    for component in Path::new(path).components() {
+        match component {
+            std::path::Component::ParentDir => {
+                anyhow::bail!("workspace path {path:?} must not contain a `..` component");
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                anyhow::bail!("workspace path {path:?} must be relative, not absolute");
+            }
+            std::path::Component::CurDir | std::path::Component::Normal(_) => {}
+        }
+    }
+    Ok(())
 }
 
 /// Load every `*.json` trace fixture in `dir`, sorted by path for stable ordering.
@@ -164,6 +289,77 @@ mod tests {
         assert!(t.turns.is_empty());
         assert!(t.expects.response_contains.is_empty());
         assert!(t.expects.max_tool_calls.is_none());
+        assert!(t.expects.memory.is_none());
+    }
+
+    #[test]
+    fn memory_fields_use_serde_defaults_when_omitted() {
+        let setup: CaseSetup = serde_json::from_str("{}").unwrap();
+        assert!(setup.workspace_files.is_empty());
+        assert!(setup.memory.is_empty());
+
+        let expects: MemoryExpects = serde_json::from_str("{}").unwrap();
+        assert!(expects.present.is_empty());
+        assert!(expects.absent.is_empty());
+        assert!(expects.contains.is_empty());
+    }
+
+    #[test]
+    fn memory_fields_deserialize_from_trace() {
+        let t: LlmTrace = serde_json::from_str(
+            r#"{
+                "model_name": "m",
+                "turns": [],
+                "setup": { "memory": { "project/role": "zeroclaw_operator" } },
+                "expects": {
+                    "memory": {
+                        "present": ["project/role"],
+                        "absent": ["obsolete"],
+                        "contains": { "project/role": ["zeroclaw"] }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let setup = t.setup.as_ref().unwrap();
+        assert_eq!(setup.memory["project/role"], "zeroclaw_operator");
+        let expects = t.expects.memory.as_ref().unwrap();
+        assert_eq!(expects.present, ["project/role"]);
+        assert_eq!(expects.absent, ["obsolete"]);
+        assert_eq!(expects.contains["project/role"], ["zeroclaw"]);
+    }
+
+    #[test]
+    fn declares_memory_detects_seeds_and_expectations() {
+        let no_memory: LlmTrace =
+            serde_json::from_str(r#"{"model_name":"m","turns":[],"setup":{}}"#).unwrap();
+        assert!(!no_memory.declares_memory());
+
+        let with_seed: LlmTrace = serde_json::from_str(
+            r#"{"model_name":"m","turns":[],"setup":{"memory":{"key":"value"}}}"#,
+        )
+        .unwrap();
+        assert!(with_seed.declares_memory());
+
+        let with_expectations: LlmTrace =
+            serde_json::from_str(r#"{"model_name":"m","turns":[],"expects":{"memory":{}}}"#)
+                .unwrap();
+        assert!(with_expectations.declares_memory());
+    }
+
+    #[test]
+    fn workspace_only_setup_does_not_declare_memory() {
+        let trace: LlmTrace = serde_json::from_str(
+            r#"{
+                "model_name": "m",
+                "turns": [],
+                "setup": { "workspace_files": { "input.txt": "hello" }, "memory": {} }
+            }"#,
+        )
+        .unwrap();
+
+        assert!(!trace.declares_memory());
     }
 
     #[test]
@@ -173,6 +369,44 @@ mod tests {
         let t = LlmTrace::from_file(&path).unwrap();
         assert_eq!(t.model_name, "demo");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn display_id_prefers_id_then_falls_back_to_model_name() {
+        let with_id: LlmTrace =
+            serde_json::from_str(r#"{"model_name":"m","id":"case-7","turns":[]}"#).unwrap();
+        assert_eq!(with_id.display_id(), "case-7");
+        let without_id: LlmTrace =
+            serde_json::from_str(r#"{"model_name":"m","turns":[]}"#).unwrap();
+        assert_eq!(without_id.display_id(), "m");
+    }
+
+    #[test]
+    fn turn_steps_default_to_none_when_omitted() {
+        let t: LlmTrace =
+            serde_json::from_str(r#"{"model_name":"m","turns":[{"user_input":"hi"}]}"#).unwrap();
+        assert!(t.turns[0].steps.is_none());
+    }
+
+    #[test]
+    fn validate_workspace_rel_path_rejects_absolute() {
+        assert!(validate_workspace_rel_path("/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn validate_workspace_rel_path_rejects_empty() {
+        assert!(validate_workspace_rel_path("").is_err());
+    }
+
+    #[test]
+    fn validate_workspace_rel_path_rejects_parent_component() {
+        assert!(validate_workspace_rel_path("../secret").is_err());
+        assert!(validate_workspace_rel_path("sub/../../secret").is_err());
+    }
+
+    #[test]
+    fn validate_workspace_rel_path_accepts_nested_relative() {
+        assert!(validate_workspace_rel_path("sub/dir/file.txt").is_ok());
     }
 
     #[test]
