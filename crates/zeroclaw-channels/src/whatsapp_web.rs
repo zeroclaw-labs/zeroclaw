@@ -987,6 +987,47 @@ impl WhatsAppWebChannel {
         use wacore::proto_helpers::MessageExt;
         let base = msg.get_base_message();
 
+        // A reaction arrives as a message carrying `reaction_message`, not as a
+        // distinct event. Without this branch it renders as empty content and
+        // the agent never learns that someone reacted to it.
+        if let Some(ref reaction) = base.reaction_message {
+            let emoji = reaction.text.as_deref().unwrap_or("");
+            return if emoji.is_empty() {
+                "[Reaction removed]".to_string()
+            } else {
+                format!("[Reacted {emoji}]")
+            };
+        }
+        // Poll votes are encrypted; the option text is only recoverable with the
+        // poll's message secret. Surface the event so the agent can respond to
+        // the fact of a vote even when the choice stays opaque.
+        if let Some(ref poll) = base.poll_creation_message {
+            let name = poll.name.as_deref().unwrap_or("");
+            return if name.is_empty() {
+                "[Poll]".to_string()
+            } else {
+                format!("[Poll: {name}]")
+            };
+        }
+        if base.poll_update_message.is_some() {
+            return "[Poll vote]".to_string();
+        }
+        if let Some(ref contact) = base.contact_message {
+            let name = contact.display_name.as_deref().unwrap_or("");
+            return if name.is_empty() {
+                "[Contact]".to_string()
+            } else {
+                format!("[Contact: {name}]")
+            };
+        }
+        if let Some(ref contacts) = base.contacts_array_message {
+            return format!("[{} contacts]", contacts.contacts.len());
+        }
+        // Round "video note" messages: a distinct social gesture from a plain
+        // video, so it is labelled distinctly.
+        if base.ptv_message.is_some() {
+            return "[Video note]".to_string();
+        }
         if base.sticker_message.is_some() {
             return "[Sticker]".to_string();
         }
@@ -2262,6 +2303,18 @@ impl Channel for WhatsAppWebChannel {
                                     }
                                 }
 
+                                // A status/story update arrives on the
+                                // `status@broadcast` chat. Treated as a plain DM
+                                // it would look like the author messaged the
+                                // agent privately, and a reply would be
+                                // addressed to the broadcast JID instead of the
+                                // author. Labelling it keeps the agent from
+                                // mistaking a public post for a private message.
+                                let is_status = {
+                                    use wacore_binary::JidExt;
+                                    info.source.chat.is_status_broadcast()
+                                };
+
                                 let is_group = info.source.is_group;
                                 let reply_target = Self::compute_reply_target(&chat);
 
@@ -2380,6 +2433,9 @@ impl Channel for WhatsAppWebChannel {
                                 let mut passive_context = false;
                                 let text_content = msg.text_content().unwrap_or("").trim().to_string();
                                 let mut content = Self::media_fallback_content(text_content, msg);
+                                if is_status && !content.is_empty() {
+                                    content = format!("[Status] {content}");
+                                }
 
                                 ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("WhatsApp Web message received (sender_len={}, chat_len={}, content_len={})", sender.len(), chat.len(), content.len()));
                                 ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("WhatsApp Web message content: {}", content));
@@ -3447,6 +3503,86 @@ mod tests {
         assert!(
             uuid::Uuid::parse_str(&msg.id).is_err(),
             "inbound id must not be a locally generated UUID"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn media_fallback_surfaces_an_incoming_reaction() {
+        // A reaction arrives as a message with no text body. Before this it
+        // rendered as empty content, so the agent could not tell it had been
+        // reacted to at all.
+        let reacted = waproto::whatsapp::Message {
+            reaction_message: Some(waproto::whatsapp::message::ReactionMessage {
+                text: Some("\u{1F44D}".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            WhatsAppWebChannel::media_fallback_content(String::new(), &reacted),
+            "[Reacted \u{1F44D}]"
+        );
+
+        // An empty emoji is WhatsApp's reaction-removal.
+        let removed = waproto::whatsapp::Message {
+            reaction_message: Some(waproto::whatsapp::message::ReactionMessage {
+                text: Some(String::new()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            WhatsAppWebChannel::media_fallback_content(String::new(), &removed),
+            "[Reaction removed]"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn media_fallback_labels_polls_and_contacts() {
+        let poll = waproto::whatsapp::Message {
+            poll_creation_message: Some(Box::new(
+                waproto::whatsapp::message::PollCreationMessage {
+                    name: Some("Lunch?".to_string()),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+        assert_eq!(
+            WhatsAppWebChannel::media_fallback_content(String::new(), &poll),
+            "[Poll: Lunch?]"
+        );
+
+        let contact = waproto::whatsapp::Message {
+            contact_message: Some(Box::new(waproto::whatsapp::message::ContactMessage {
+                display_name: Some("Ada".to_string()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert_eq!(
+            WhatsAppWebChannel::media_fallback_content(String::new(), &contact),
+            "[Contact: Ada]"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn media_fallback_keeps_existing_text_untouched() {
+        // The fallback must only fill in for empty bodies; a caption or text
+        // body always wins over a synthetic label.
+        let captioned = waproto::whatsapp::Message {
+            reaction_message: Some(waproto::whatsapp::message::ReactionMessage {
+                text: Some("\u{1F44D}".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            WhatsAppWebChannel::media_fallback_content("real text".to_string(), &captioned),
+            "real text"
         );
     }
 
