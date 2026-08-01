@@ -14,6 +14,122 @@ use zeroclaw_api::media::MediaAttachment;
 use zeroclaw_runtime::i18n;
 
 #[cfg(feature = "whatsapp-web")]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct InboundTranscriptRecord {
+    /// Receipt time in unix seconds.
+    pub received_at: i64,
+    /// WhatsApp's own stanza id.
+    pub stanza_id: String,
+    /// Chat JID (DM, group, or `status@broadcast`).
+    pub chat: String,
+    /// Sender JID as it arrived (may be a LID).
+    pub sender: String,
+    /// Phone number resolved from a LID sender, when available.
+    pub sender_phone: Option<String>,
+    pub is_group: bool,
+    pub is_from_me: bool,
+    /// `true` for status/story broadcasts.
+    pub is_status: bool,
+    pub push_name: String,
+    /// Extracted text, empty for media-only messages.
+    pub content: String,
+    /// Whether the sender passed the allowlist. `false` means the agent never
+    /// saw this message.
+    pub allowed: bool,
+}
+
+#[cfg(feature = "whatsapp-web")]
+impl InboundTranscriptRecord {
+    /// Append one record to `path`, creating the file if needed.
+    ///
+    /// Failures are reported to the caller rather than swallowed: a transcript
+    /// that silently stops recording is worse than no transcript, because it
+    /// looks complete.
+    fn append(&self, path: &std::path::Path) -> std::io::Result<()> {
+        use std::io::Write;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut line = serde_json::to_string(self).map_err(std::io::Error::other)?;
+        line.push('\n');
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?
+            .write_all(line.as_bytes())
+    }
+}
+
+/// Separator for the composite inbound message id. `|` is not valid in a JID
+/// and never appears in a stanza id, so it cannot collide with the parts.
+#[cfg(feature = "whatsapp-web")]
+const WA_ID_SEP: char = '|';
+
+/// The addressing context WhatsApp needs to act on an existing message.
+///
+/// `Channel::add_reaction` receives only `(channel_id, message_id, emoji)`, but
+/// `wa::MessageKey` also needs `from_me` and, for groups and status broadcasts,
+/// the original sender. Those facts are created by the inbound `MessageInfo`;
+/// encoding them into the id transports them to the outbound call instead of
+/// caching them in a side table. Telegram does the same with
+/// `telegram_{chat_id}_{message_id}`.
+#[cfg(feature = "whatsapp-web")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WhatsAppMessageRef {
+    pub stanza_id: String,
+    pub from_me: bool,
+    pub chat: String,
+    /// Original sender. `None` in DMs, where WA Web omits the attribute.
+    pub participant: Option<String>,
+}
+
+#[cfg(feature = "whatsapp-web")]
+impl WhatsAppMessageRef {
+    /// Render as `whatsapp|<stanza>|<from_me>|<chat>|<participant>`.
+    pub(crate) fn encode(&self) -> String {
+        format!(
+            "whatsapp{sep}{id}{sep}{me}{sep}{chat}{sep}{participant}",
+            sep = WA_ID_SEP,
+            id = self.stanza_id,
+            me = self.from_me,
+            chat = self.chat,
+            participant = self.participant.as_deref().unwrap_or(""),
+        )
+    }
+
+    /// Inverse of [`Self::encode`]. Returns `None` for an id this channel did
+    /// not mint, so another channel's id is rejected rather than half-parsed
+    /// into a bogus wire target.
+    pub(crate) fn decode(id: &str) -> Option<Self> {
+        let rest = id.strip_prefix("whatsapp")?.strip_prefix(WA_ID_SEP)?;
+        let mut parts = rest.splitn(4, WA_ID_SEP);
+        let stanza_id = parts.next().filter(|s| !s.is_empty())?;
+        let from_me = parts.next()?.parse().ok()?;
+        let chat = parts.next().filter(|s| !s.is_empty())?;
+        let participant = parts.next()?;
+        Some(Self {
+            stanza_id: stanza_id.to_string(),
+            from_me,
+            chat: chat.to_string(),
+            participant: (!participant.is_empty()).then(|| participant.to_string()),
+        })
+    }
+
+    /// Build the `wa::MessageKey` the send path expects.
+    ///
+    /// `participant` is required for groups and status broadcasts so the server
+    /// can attribute the receipt; WA Web drops it in DMs.
+    pub(crate) fn to_message_key(&self) -> waproto::whatsapp::MessageKey {
+        waproto::whatsapp::MessageKey {
+            remote_jid: Some(self.chat.clone()),
+            from_me: Some(self.from_me),
+            id: Some(self.stanza_id.clone()),
+            participant: self.participant.clone(),
+        }
+    }
+}
+
+#[cfg(feature = "whatsapp-web")]
 pub struct WhatsAppWebChannel {
     /// Session database path
     session_path: String,
@@ -36,6 +152,21 @@ pub struct WhatsAppWebChannel {
     /// When true, allowed unaddressed group messages become context-only
     /// history entries instead of being dropped.
     passive_group_context: bool,
+    /// When true, announce availability on connect so the account shows as
+    /// online to its contacts, the way a running client does. Presence is also
+    /// what makes typing indicators visible to the other side.
+    announce_presence: bool,
+    /// When true, send a read receipt for every inbound message the agent is
+    /// allowed to act on, the way a human client does on opening a chat.
+    /// Without it the account never shows blue ticks, which is the clearest
+    /// tell that nobody is really reading.
+    send_read_receipts: bool,
+    /// Optional path for the wire-level inbound transcript. When set, every
+    /// inbound message is appended before gating, including ones the agent
+    /// never sees. This is the source of truth for "what did the account
+    /// receive", which no other store holds: `sessions/*.jsonl` covers only
+    /// what the agent answered, and the protocol DB stores ciphertext.
+    inbound_transcript_path: Option<PathBuf>,
     /// Bot phone number (digits only), resolved from pair_phone or device identity at runtime
     bot_phone: Arc<Mutex<Option<String>>>,
     /// Bot LID number (digits only), resolved from device identity at runtime
@@ -155,6 +286,9 @@ impl WhatsAppWebChannel {
             group_mention_patterns: Arc::new(Vec::new()),
             workspace_dir: None,
             persist: None,
+            announce_presence: false,
+            send_read_receipts: false,
+            inbound_transcript_path: None,
         }
     }
 
@@ -179,6 +313,33 @@ impl WhatsAppWebChannel {
     }
 
     #[cfg(feature = "whatsapp-web")]
+    /// Announce availability on connect.
+    ///
+    /// Off by default: appearing online is visible to every contact and is the
+    /// operator's decision, not an implicit side effect of starting the bot.
+    pub fn with_presence(mut self, enabled: bool) -> Self {
+        self.announce_presence = enabled;
+        self
+    }
+
+    /// Send read receipts for messages the agent processes.
+    ///
+    /// Off by default because a receipt is a visible, irreversible signal to
+    /// the sender: it must be the operator's choice, not an implicit default.
+    pub fn with_read_receipts(mut self, enabled: bool) -> Self {
+        self.send_read_receipts = enabled;
+        self
+    }
+
+    /// Enable the wire-level inbound transcript at `path`.
+    ///
+    /// Off by default: the transcript records messages from senders who never
+    /// interacted with the agent, so it is opt-in rather than implicit.
+    pub fn with_inbound_transcript(mut self, path: PathBuf) -> Self {
+        self.inbound_transcript_path = Some(path);
+        self
+    }
+
     pub fn with_workspace_dir(mut self, dir: PathBuf) -> Self {
         self.workspace_dir = Some(dir);
         self
@@ -877,6 +1038,52 @@ impl WhatsAppWebChannel {
         addressed_to_bot: bool,
     ) -> bool {
         passive_group_context && is_group && !addressed_to_bot
+    }
+
+    /// Send a reaction to a message this channel delivered. An empty `emoji`
+    /// revokes the account's previous reaction (WA Web's sender-revoke).
+    ///
+    /// The target is decoded from `message_id` rather than taken from the
+    /// caller's `channel_id`, so a reaction cannot be addressed to a chat the
+    /// message does not belong to.
+    #[cfg(feature = "whatsapp-web")]
+    async fn send_reaction_for(&self, message_id: &str, emoji: &str) -> Result<()> {
+        let client = self.client.lock().clone();
+        let Some(client) = client else {
+            anyhow::bail!("WhatsApp Web client not connected. Initialize the bot first.");
+        };
+
+        let Some(message_ref) = WhatsAppMessageRef::decode(message_id) else {
+            anyhow::bail!(
+                "not a WhatsApp message id: {message_id} (this channel mints whatsapp|<id>|<from_me>|<chat>|<participant>)"
+            );
+        };
+
+        let chat = self.recipient_to_jid(&message_ref.chat)?;
+        client
+            .send_reaction(&chat, message_ref.to_message_key(), emoji)
+            .await
+            .map_err(|e| anyhow::Error::msg(format!("Failed to send reaction: {e}")))?;
+
+        Ok(())
+    }
+
+    /// Encode the addressing context of an inbound message into its id.
+    ///
+    /// `participant` is carried only for groups and status broadcasts, matching
+    /// the gate WA Web applies when it builds a `MessageKey`; in a DM the server
+    /// rejects the attribute.
+    #[cfg(feature = "whatsapp-web")]
+    fn inbound_message_id(info: &whatsapp_rust::types::message::MessageInfo) -> String {
+        use wacore_binary::JidExt;
+        let needs_participant = info.source.is_group || info.source.chat.is_status_broadcast();
+        WhatsAppMessageRef {
+            stanza_id: info.id.to_string(),
+            from_me: info.source.is_from_me,
+            chat: info.source.chat.to_string(),
+            participant: needs_participant.then(|| info.source.sender.to_string()),
+        }
+        .encode()
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -1950,6 +2157,9 @@ impl Channel for WhatsAppWebChannel {
             let wa_group_mention_patterns = self.group_mention_patterns.clone();
             let allowed_groups_resolver = Arc::clone(&self.allowed_groups_resolver);
             let persist_clone = self.persist.clone();
+            let transcript_path_inner = self.inbound_transcript_path.clone().map(Arc::new);
+            let send_read_receipts = self.send_read_receipts;
+            let announce_presence = self.announce_presence;
 
             let mut builder = Bot::builder()
                 .with_backend(backend)
@@ -1983,6 +2193,7 @@ impl Channel for WhatsAppWebChannel {
                     let wa_group_mention_patterns = wa_group_mention_patterns.clone();
                     let allowed_groups_resolver = Arc::clone(&allowed_groups_resolver);
                     let persist_inner = persist_clone.clone();
+                    let transcript_path_inner = transcript_path_inner.clone();
                     async move {
                         // whatsapp-rust 0.6: event handlers receive `Arc<Event>`
                         // per so we match against `&*event` to get a
@@ -2015,6 +2226,41 @@ impl Channel for WhatsAppWebChannel {
                                         Self::is_number_allowed_for_list(&allowed_peers, candidate)
                                     })
                                     .cloned();
+
+                                // Wire-level tap: recorded before the allowlist
+                                // decision below, so the transcript shows what
+                                // the account received rather than what the
+                                // agent chose to answer.
+                                if let Some(ref transcript_path) = transcript_path_inner {
+                                    let record = InboundTranscriptRecord {
+                                        received_at: chrono::Utc::now().timestamp(),
+                                        stanza_id: info.id.to_string(),
+                                        chat: chat.clone(),
+                                        sender: sender_jid.to_string(),
+                                        sender_phone: mapped_phone.clone(),
+                                        is_group: info.source.is_group,
+                                        is_from_me: info.source.is_from_me,
+                                        is_status: {
+                                            use wacore_binary::JidExt;
+                                            info.source.chat.is_status_broadcast()
+                                        },
+                                        push_name: info.push_name.clone(),
+                                        content: Self::media_fallback_content(
+                                            msg.text_content().unwrap_or("").trim().to_string(),
+                                            msg,
+                                        ),
+                                        allowed: normalized.is_some(),
+                                    };
+                                    if let Err(e) = record.append(transcript_path) {
+                                        ::zeroclaw_log::record!(
+                                            WARN,
+                                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                                .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+                                            "inbound transcript append failed"
+                                        );
+                                    }
+                                }
 
                                 let is_group = info.source.is_group;
                                 let reply_target = Self::compute_reply_target(&chat);
@@ -2102,6 +2348,32 @@ impl Channel for WhatsAppWebChannel {
                                     }
                                 }
 
+                                // A human client acknowledges a message when it
+                                // opens the chat. Only messages that passed the
+                                // allowlist are acknowledged: receipting a
+                                // filtered sender would confirm the account is
+                                // live to someone the operator chose to ignore.
+                                if send_read_receipts && normalized.is_some() && !info.source.is_from_me {
+                                    let sender_for_receipt =
+                                        info.source.is_group.then(|| info.source.sender.clone());
+                                    if let Err(e) = client
+                                        .mark_as_read(
+                                            &info.source.chat,
+                                            sender_for_receipt.as_ref(),
+                                            vec![info.id.to_string()],
+                                        )
+                                        .await
+                                    {
+                                        ::zeroclaw_log::record!(
+                                            DEBUG,
+                                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                                .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+                                            "read receipt failed"
+                                        );
+                                    }
+                                }
+
                                 let normalized = normalized.unwrap_or_else(|| sender.clone());
                                 let conversation_scope =
                                     Self::group_context_scope(passive_group_context, is_group);
@@ -2174,7 +2446,7 @@ impl Channel for WhatsAppWebChannel {
                                         Vec::new(),
                                         true,
                                         conversation_scope,
-                                        info.id.to_string(),
+                                        Self::inbound_message_id(info),
                                     )
                                     .await;
                                     return;
@@ -2265,7 +2537,7 @@ impl Channel for WhatsAppWebChannel {
                                     attachments,
                                     false,
                                     conversation_scope,
-                                    info.id.to_string(),
+                                    Self::inbound_message_id(info),
                                 )
                                 .await;
                             }
@@ -2280,6 +2552,22 @@ impl Channel for WhatsAppWebChannel {
                                     .persistence_manager()
                                     .get_device_snapshot()
                                     .await;
+
+                                // Without an explicit presence announcement the
+                                // account stays invisible and typing indicators
+                                // never reach the other party.
+                                if announce_presence
+                                    && let Err(e) = client.presence().set_available().await
+                                {
+                                    ::zeroclaw_log::record!(
+                                        WARN,
+                                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                            .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+                                        "presence announcement failed"
+                                    );
+                                }
+
                                 // Resolve bot identity from the device store
                                 if mention_only {
                                     if let Some(ref pn) = device.pn
@@ -2540,6 +2828,21 @@ impl Channel for WhatsAppWebChannel {
             &format!("start typing for {}", recipient)
         );
         Ok(())
+    }
+
+    async fn add_reaction(&self, _channel_id: &str, message_id: &str, emoji: &str) -> Result<()> {
+        self.send_reaction_for(message_id, emoji).await
+    }
+
+    async fn remove_reaction(
+        &self,
+        _channel_id: &str,
+        message_id: &str,
+        _emoji: &str,
+    ) -> Result<()> {
+        // An empty reaction is WhatsApp's sender-revoke: it clears whatever this
+        // account previously reacted with, so no emoji argument is needed.
+        self.send_reaction_for(message_id, "").await
     }
 
     async fn stop_typing(&self, recipient: &str) -> Result<()> {
@@ -3144,6 +3447,71 @@ mod tests {
         assert!(
             uuid::Uuid::parse_str(&msg.id).is_err(),
             "inbound id must not be a locally generated UUID"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_message_ref_round_trips_a_group_target() {
+        // Groups carry `participant`: without it the server cannot attribute
+        // the reaction to the message's original sender.
+        let original = WhatsAppMessageRef {
+            stanza_id: "3EB0F1C2D3E4F5A6B7C8".to_string(),
+            from_me: false,
+            chat: "120363000000000000@g.us".to_string(),
+            participant: Some("15551234567@s.whatsapp.net".to_string()),
+        };
+        assert_eq!(
+            WhatsAppMessageRef::decode(&original.encode()),
+            Some(original.clone())
+        );
+
+        let key = original.to_message_key();
+        assert_eq!(key.id.as_deref(), Some("3EB0F1C2D3E4F5A6B7C8"));
+        assert_eq!(key.from_me, Some(false));
+        assert_eq!(key.remote_jid.as_deref(), Some("120363000000000000@g.us"));
+        assert_eq!(
+            key.participant.as_deref(),
+            Some("15551234567@s.whatsapp.net")
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_message_ref_omits_participant_in_dms() {
+        // WA Web drops `participant` in one-to-one chats; carrying an empty
+        // string instead of `None` would put a bogus attribute on the wire.
+        let dm = WhatsAppMessageRef {
+            stanza_id: "ABCD1234".to_string(),
+            from_me: true,
+            chat: "15551234567@s.whatsapp.net".to_string(),
+            participant: None,
+        };
+        let encoded = dm.encode();
+        assert!(
+            encoded.ends_with('|'),
+            "empty participant slot is preserved"
+        );
+        assert_eq!(WhatsAppMessageRef::decode(&encoded), Some(dm.clone()));
+        assert_eq!(dm.to_message_key().participant, None);
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_message_ref_rejects_foreign_ids() {
+        // A reaction must never be addressed from an id this channel did not
+        // mint, so decoding is all-or-nothing rather than best-effort.
+        assert_eq!(WhatsAppMessageRef::decode("telegram_-100123_7"), None);
+        assert_eq!(
+            WhatsAppMessageRef::decode("f81d4fae-7dec-11d0-a765-00a0c91e6bf6"),
+            None
+        );
+        // Well-formed prefix but missing fields.
+        assert_eq!(WhatsAppMessageRef::decode("whatsapp|ABCD|true"), None);
+        // Empty stanza id would target no message at all.
+        assert_eq!(
+            WhatsAppMessageRef::decode("whatsapp||true|15551234567@s.whatsapp.net|"),
+            None
         );
     }
 

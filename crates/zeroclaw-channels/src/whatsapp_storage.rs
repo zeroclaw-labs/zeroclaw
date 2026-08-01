@@ -374,6 +374,27 @@ impl RusqliteStore {
                 PRIMARY KEY (jid, device_id)
             );
 
+            -- Message secrets for encrypted add-ons (reactions, polls, edits)
+            -- in Community Announcement Groups and status broadcasts. The
+            -- secret is created by the inbound message and lives only here.
+            -- `expires_at = 0` means never expire; the store prunes by
+            -- deadline and does not know the retention horizon itself.
+            CREATE TABLE IF NOT EXISTS msg_secrets (
+                chat TEXT NOT NULL,
+                sender TEXT NOT NULL,
+                msg_id TEXT NOT NULL,
+                secret BLOB NOT NULL,
+                expires_at INTEGER NOT NULL DEFAULT 0,
+                message_ts INTEGER NOT NULL DEFAULT 0,
+                device_id INTEGER NOT NULL,
+                PRIMARY KEY (chat, sender, msg_id, device_id)
+            );
+
+            -- Index supporting `delete_expired_msg_secrets`
+            -- (WHERE device_id = ? AND expires_at != 0 AND expires_at < ?).
+            CREATE INDEX IF NOT EXISTS idx_msg_secrets_device_expires
+                ON msg_secrets(device_id, expires_at);
+
             -- Index supporting `delete_expired_sent_messages`
             -- (WHERE device_id = ? AND created_at < ?). Without it the cleanup
             -- pass would full-scan `sent_messages`, which grows unbounded until
@@ -787,6 +808,147 @@ impl AppSyncStore for RusqliteStore {
 }
 
 #[cfg(feature = "whatsapp-web")]
+impl RusqliteStore {
+    /// Current `expires_at` for an entry's key, or `0` when absent.
+    /// Read inside the caller's transaction so the merge sees a consistent row.
+    fn existing_msg_secret_expiry(
+        tx: &rusqlite::Transaction<'_>,
+        entry: &wacore::store::traits::MsgSecretEntry,
+        device_id: i32,
+    ) -> i64 {
+        tx.query_row(
+            "SELECT expires_at FROM msg_secrets
+             WHERE chat = ?1 AND sender = ?2 AND msg_id = ?3 AND device_id = ?4",
+            params![entry.chat, entry.sender, entry.msg_id, device_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+    }
+
+    /// Current `message_ts` for an entry's key, or `0` when absent.
+    fn existing_msg_secret_message_ts(
+        tx: &rusqlite::Transaction<'_>,
+        entry: &wacore::store::traits::MsgSecretEntry,
+        device_id: i32,
+    ) -> i64 {
+        tx.query_row(
+            "SELECT message_ts FROM msg_secrets
+             WHERE chat = ?1 AND sender = ?2 AND msg_id = ?3 AND device_id = ?4",
+            params![entry.chat, entry.sender, entry.msg_id, device_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+    }
+}
+
+#[async_trait]
+impl wacore::store::traits::MsgSecretStore for RusqliteStore {
+    // Message secrets for encrypted add-ons (reactions, polls, edits) in
+    // Community Announcement Groups and status broadcasts. The secret is
+    // created by the inbound message; this table is its only home.
+
+    async fn put_msg_secrets(
+        &self,
+        entries: Vec<wacore::store::traits::MsgSecretEntry>,
+    ) -> wacore::store::error::Result<usize> {
+        if entries.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.conn.lock();
+
+        // One transaction for the batch: a partial write would leave some
+        // add-ons decryptable and others not, which surfaces later as a
+        // silently undecryptable reaction.
+        let tx = to_store_err!(conn.transaction())?;
+        let mut written = 0usize;
+
+        for entry in &entries {
+            // On conflict the retention window must never shrink and the
+            // parent timestamp must never regress, so both are merged with
+            // the upstream helpers rather than overwritten.
+            to_store_err!(execute: tx.execute(
+                "INSERT INTO msg_secrets
+                 (chat, sender, msg_id, secret, expires_at, message_ts, device_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(chat, sender, msg_id, device_id) DO UPDATE SET
+                     secret = excluded.secret,
+                     expires_at = ?8,
+                     message_ts = ?9",
+                params![
+                    entry.chat,
+                    entry.sender,
+                    entry.msg_id,
+                    entry.secret,
+                    entry.expires_at,
+                    entry.message_ts,
+                    self.device_id,
+                    wacore::store::traits::merge_msg_secret_expiry(
+                        Self::existing_msg_secret_expiry(&tx, entry, self.device_id),
+                        entry.expires_at,
+                    ),
+                    wacore::store::traits::merge_msg_secret_message_ts(
+                        Self::existing_msg_secret_message_ts(&tx, entry, self.device_id),
+                        entry.message_ts,
+                    ),
+                ],
+            ))?;
+            written += 1;
+        }
+
+        to_store_err!(execute: tx.commit())?;
+        Ok(written)
+    }
+
+    async fn get_msg_secret(
+        &self,
+        chat: &str,
+        sender: &str,
+        msg_id: &str,
+    ) -> wacore::store::error::Result<Option<Vec<u8>>> {
+        Ok(self
+            .get_msg_secret_with_ts(chat, sender, msg_id)
+            .await?
+            .map(|(secret, _)| secret))
+    }
+
+    async fn get_msg_secret_with_ts(
+        &self,
+        chat: &str,
+        sender: &str,
+        msg_id: &str,
+    ) -> wacore::store::error::Result<Option<(Vec<u8>, i64)>> {
+        let conn = self.conn.lock();
+        let mut stmt = to_store_err!(conn.prepare(
+            "SELECT secret, message_ts FROM msg_secrets
+             WHERE chat = ?1 AND sender = ?2 AND msg_id = ?3 AND device_id = ?4"
+        ))?;
+
+        let mut rows = to_store_err!(stmt.query_map(
+            params![chat, sender, msg_id, self.device_id],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
+        ))?;
+
+        match rows.next() {
+            Some(row) => Ok(Some(to_store_err!(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn delete_expired_msg_secrets(
+        &self,
+        cutoff_timestamp: i64,
+    ) -> wacore::store::error::Result<u32> {
+        let conn = self.conn.lock();
+        // `expires_at = 0` means "never expire" and must survive every sweep.
+        let deleted = to_store_err!(conn.execute(
+            "DELETE FROM msg_secrets
+             WHERE device_id = ?1 AND expires_at != 0 AND expires_at < ?2",
+            params![self.device_id, cutoff_timestamp],
+        ))?;
+        Ok(deleted as u32)
+    }
+}
+
 #[async_trait]
 impl ProtocolStore for RusqliteStore {
     async fn get_sender_key_devices(
@@ -1433,10 +1595,12 @@ impl DeviceStoreTrait for RusqliteStore {
                 adv_secret.copy_from_slice(&adv_secret_bytes);
 
                 let account = if let Some(bytes) = account_bytes {
-                    Some(
+                    // Upstream now stores the identity behind an `Arc` so the
+                    // decoded value can be shared without re-decoding.
+                    Some(std::sync::Arc::new(
                         waproto::whatsapp::AdvSignedDeviceIdentity::decode(&*bytes)
                             .map_err(to_rusqlite_err)?,
-                    )
+                    ))
                 } else {
                     None
                 };
@@ -1695,6 +1859,114 @@ mod tests {
                 .await
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    #[tokio::test]
+    async fn msg_secret_round_trips_and_expiry_never_shrinks() {
+        use wacore::store::traits::{MsgSecretEntry, MsgSecretStore};
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = RusqliteStore::new(tmp.path()).unwrap();
+
+        let entry = |expires_at: i64, message_ts: i64| MsgSecretEntry {
+            chat: "120363000000000000@g.us".to_string(),
+            sender: "15551234567@s.whatsapp.net".to_string(),
+            msg_id: "3EB0F1C2".to_string(),
+            secret: vec![7u8; 32],
+            expires_at,
+            message_ts,
+        };
+
+        assert_eq!(
+            MsgSecretStore::put_msg_secrets(&store, vec![entry(2_000, 1_000)])
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            MsgSecretStore::get_msg_secret_with_ts(
+                &store,
+                "120363000000000000@g.us",
+                "15551234567@s.whatsapp.net",
+                "3EB0F1C2",
+            )
+            .await
+            .unwrap(),
+            Some((vec![7u8; 32], 1_000))
+        );
+
+        // A re-delivery carrying an earlier deadline must not shorten the
+        // window, or a still-valid add-on would become undecryptable.
+        MsgSecretStore::put_msg_secrets(&store, vec![entry(1_500, 900)])
+            .await
+            .unwrap();
+        let (_, message_ts) = MsgSecretStore::get_msg_secret_with_ts(
+            &store,
+            "120363000000000000@g.us",
+            "15551234567@s.whatsapp.net",
+            "3EB0F1C2",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(message_ts, 1_000, "parent timestamp must not regress");
+
+        // Sweeping before the retained deadline must keep the row.
+        assert_eq!(
+            MsgSecretStore::delete_expired_msg_secrets(&store, 1_800)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            MsgSecretStore::delete_expired_msg_secrets(&store, 2_500)
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    #[tokio::test]
+    async fn msg_secret_with_no_expiry_survives_every_sweep() {
+        use wacore::store::traits::{MsgSecretEntry, MsgSecretStore};
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = RusqliteStore::new(tmp.path()).unwrap();
+
+        // `expires_at = 0` means "never expire".
+        MsgSecretStore::put_msg_secrets(
+            &store,
+            vec![MsgSecretEntry {
+                chat: "status@broadcast".to_string(),
+                sender: "15551234567@s.whatsapp.net".to_string(),
+                msg_id: "STATUS1".to_string(),
+                secret: vec![1u8; 32],
+                expires_at: 0,
+                message_ts: 500,
+            }],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            MsgSecretStore::delete_expired_msg_secrets(&store, i64::MAX)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(
+            MsgSecretStore::get_msg_secret(
+                &store,
+                "status@broadcast",
+                "15551234567@s.whatsapp.net",
+                "STATUS1",
+            )
+            .await
+            .unwrap()
+            .is_some()
         );
     }
 
