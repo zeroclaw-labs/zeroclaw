@@ -280,4 +280,57 @@ mod tests {
             );
         }
     }
+
+    /// Loads real weights, so it needs a model on disk and stays opt-in:
+    ///
+    /// ```text
+    /// ZEROCLAW_TEST_LOCAL_MODEL_DIR=/path/to/snapshot \
+    ///   cargo test -p zeroclaw-memory --features memory-local-embeddings \
+    ///   -- --ignored on_disk_model
+    /// ```
+    ///
+    /// The unit tests above only cover name resolution; nothing else proves
+    /// that a directory of weights actually produces vectors, which is the
+    /// whole point of the on-disk path.
+    #[test]
+    #[ignore = "requires a model snapshot on disk; set ZEROCLAW_TEST_LOCAL_MODEL_DIR"]
+    fn on_disk_model_embeds_and_separates_meaning() {
+        let Ok(dir) = std::env::var("ZEROCLAW_TEST_LOCAL_MODEL_DIR") else {
+            panic!("set ZEROCLAW_TEST_LOCAL_MODEL_DIR to a model snapshot directory");
+        };
+
+        let provider = LocalEmbedding::new(&dir, None).expect("model loads from disk");
+        assert!(provider.dimensions() > 0, "probe must report a real width");
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let vectors = rt
+            .block_on(provider.embed(&[
+                "el gato duerme en el sofá",
+                "el felino descansa en el sillón",
+                "la bolsa de valores cerró a la baja",
+            ]))
+            .expect("embedding succeeds");
+
+        assert_eq!(vectors.len(), 3);
+        for v in &vectors {
+            assert_eq!(v.len(), provider.dimensions());
+        }
+
+        let cosine = |a: &[f32], b: &[f32]| {
+            let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+            let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+            dot / (na * nb)
+        };
+
+        // A model that loads but returns constant or garbage vectors would pass
+        // a shape-only assertion, so check that meaning actually separates:
+        // the paraphrase must sit closer than the unrelated sentence.
+        let paraphrase = cosine(&vectors[0], &vectors[1]);
+        let unrelated = cosine(&vectors[0], &vectors[2]);
+        assert!(
+            paraphrase > unrelated,
+            "paraphrase similarity {paraphrase} should exceed unrelated {unrelated}"
+        );
+    }
 }
