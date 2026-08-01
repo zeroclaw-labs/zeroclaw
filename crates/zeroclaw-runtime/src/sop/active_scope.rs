@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 
 use super::types::SopStep;
@@ -57,6 +58,52 @@ impl HeadlessStepScope {
         excluded.sort();
         excluded
     }
+}
+
+tokio::task_local! {
+    /// The headless step scope in force on this task.
+    ///
+    /// Set once around the step's `agent::run` by the headless driver, which is
+    /// the single site that resolves the scope. Tool calls execute inline on
+    /// that task (the turn loop awaits them directly), so a tool that starts a
+    /// nested run can read the boundary it is running under instead of being
+    /// handed a copy through every registry constructor between the two.
+    static ACTIVE_HEADLESS_STEP_SCOPE: HeadlessStepScope;
+}
+
+/// Run `future` with `scope` as the active headless step scope.
+pub async fn with_active_headless_step_scope<T>(
+    scope: HeadlessStepScope,
+    future: impl Future<Output = T>,
+) -> T {
+    ACTIVE_HEADLESS_STEP_SCOPE.scope(scope, future).await
+}
+
+/// Re-establish an inherited scope on a task that could not inherit it.
+///
+/// A task-local does not cross `spawn`, so a caller that hands step work to a
+/// background task captures [`active_headless_step_scope`] first and restores it
+/// inside. `None` runs `future` unchanged.
+pub async fn with_inherited_headless_step_scope<T>(
+    scope: Option<HeadlessStepScope>,
+    future: impl Future<Output = T>,
+) -> T {
+    match scope {
+        Some(scope) => with_active_headless_step_scope(scope, future).await,
+        None => future.await,
+    }
+}
+
+/// The headless step scope this task is running under, if any.
+///
+/// A tool that starts a child agent run passes this into the child's
+/// `AgentRunOverrides`: spawning a child does not widen the step's capability
+/// boundary, so the child re-resolves the same exclusions against its own
+/// registry. `None` outside a headless step, where there is no boundary to
+/// carry.
+#[must_use]
+pub fn active_headless_step_scope() -> Option<HeadlessStepScope> {
+    ACTIVE_HEADLESS_STEP_SCOPE.try_with(Clone::clone).ok()
 }
 
 /// Resolve the active step's enforced tool scope, if step-scope enforcement is

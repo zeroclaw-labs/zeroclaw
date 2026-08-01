@@ -7900,6 +7900,13 @@ type SopDriverSet = std::sync::Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<
 #[cfg(feature = "agent-runtime")]
 const SOP_DRIVER_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How long the shutdown waits for aborted drivers to actually stop. An aborted
+/// task ends at its next await point, so this is a grace for that hop, not a
+/// second drain — a driver still running when it expires is reported rather than
+/// waited on forever, so one wedged task cannot hold a reload open.
+#[cfg(feature = "agent-runtime")]
+const SOP_DRIVER_ABORT_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// One daemon generation's SOP maintenance: the tick task plus every cron
 /// driver it started.
 ///
@@ -7916,12 +7923,23 @@ struct SopMaintenance {
 #[cfg(feature = "agent-runtime")]
 impl SopMaintenance {
     /// Stop the tick, then let in-flight drivers finish under the configuration
-    /// they started with, aborting any that overrun
+    /// they started with, aborting — and then joining — any that overrun
     /// [`SOP_DRIVER_DRAIN_TIMEOUT`].
     ///
     /// The tick is aborted first so no new driver can join the set while the
     /// drain is running.
     async fn shutdown(self) {
+        self.shutdown_with_deadlines(SOP_DRIVER_DRAIN_TIMEOUT, SOP_DRIVER_ABORT_JOIN_TIMEOUT)
+            .await;
+    }
+
+    /// [`Self::shutdown`] with the two deadlines supplied, so a test can drive
+    /// the drain-expiry path without waiting out the production ones.
+    async fn shutdown_with_deadlines(
+        self,
+        drain_timeout: std::time::Duration,
+        abort_join_timeout: std::time::Duration,
+    ) {
         self.ticker.abort();
         // Joined, not just aborted: `abort` requests cancellation, so a tick
         // already inside `check_sop_cron_triggers` can still spawn and register
@@ -7930,39 +7948,64 @@ impl SopMaintenance {
         // final — otherwise a late driver would be detached and outlive this
         // generation, which is the leak this whole type exists to prevent.
         let _ = self.ticker.await;
-        let pending = match self.drivers.lock() {
+        // Borrowed by the drain below, not consumed: it must be able to time
+        // out without dropping the handles, because dropping a `JoinHandle`
+        // detaches its task rather than stopping it — and the abort arm still
+        // has to join them.
+        let mut pending = match self.drivers.lock() {
             Ok(mut drivers) => std::mem::take(&mut *drivers),
             Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
         };
         if pending.is_empty() {
             return;
         }
-        // Taken before the drain: dropping a `JoinHandle` detaches its task
-        // rather than stopping it, so the timeout arm below would leave
-        // stragglers running unless it holds abort handles of its own.
-        let aborts: Vec<tokio::task::AbortHandle> = pending
-            .iter()
-            .map(tokio::task::JoinHandle::abort_handle)
-            .collect();
-        let drained = tokio::time::timeout(SOP_DRIVER_DRAIN_TIMEOUT, async {
+        let drained = tokio::time::timeout(drain_timeout, async {
+            for driver in &mut pending {
+                let _ = driver.await;
+            }
+        })
+        .await;
+        if drained.is_ok() {
+            return;
+        }
+        // `abort` only *requests* cancellation: the task stops at its next
+        // await point, which is after this call returns. Joining the aborted
+        // handles is what makes the no-overlap contract true — without it the
+        // next generation could start while a straggler is still inside a
+        // provider call under the superseded config. The join is bounded in
+        // turn, so a task that never reaches an await point degrades to a
+        // logged overlap instead of wedging the reload.
+        for driver in &pending {
+            driver.abort();
+        }
+        let joined = tokio::time::timeout(abort_join_timeout, async {
             for driver in pending {
                 let _ = driver.await;
             }
         })
         .await;
-        if drained.is_err() {
-            for abort in &aborts {
-                abort.abort();
-            }
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "drain_timeout_secs": drain_timeout.as_secs(),
+                    "abort_join_timeout_secs": abort_join_timeout.as_secs(),
+                    "joined_after_abort": joined.is_ok(),
+                })),
+            "SOP cron drivers did not finish before the drain deadline; aborted them so the next \
+             daemon generation does not overlap superseded configuration"
+        );
+        if joined.is_err() {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({
-                        "drain_timeout_secs": SOP_DRIVER_DRAIN_TIMEOUT.as_secs(),
+                        "abort_join_timeout_secs": abort_join_timeout.as_secs(),
                     })),
-                "SOP cron drivers did not finish before the drain deadline; aborting them so the \
-                 next daemon generation does not overlap superseded configuration"
+                "SOP cron driver did not stop after abort within the join grace; the next daemon \
+                 generation may briefly overlap it"
             );
         }
     }
@@ -9899,6 +9942,106 @@ mod tests {
             !step.output.contains(CRON_SOP_AGENT),
             "the refusal must not fall back to the one configured agent, got {:?}",
             step.output
+        );
+    }
+
+    /// Disabling an agent withdraws it from service. An unattended cron SOP is
+    /// the one run with nobody watching, so a disabled owner must stop it
+    /// rather than quietly keep executing under the agent the operator turned
+    /// off.
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn sop_maintenance_tick_refuses_a_disabled_owner() {
+        let mut harness = cron_sop_harness(Some(CRON_SOP_AGENT)).await;
+        harness
+            .config
+            .agents
+            .get_mut(CRON_SOP_AGENT)
+            .expect("harness configures the owning agent")
+            .enabled = false;
+
+        let mut last_cron_check = chrono::Utc::now() - chrono::Duration::minutes(2);
+        let report = run_sop_maintenance_tick(
+            &harness.config,
+            &harness.engine,
+            Some(&harness.audit),
+            Some(&harness.cache),
+            &mut last_cron_check,
+            &harness.drivers,
+        )
+        .await
+        .expect("maintenance tick should complete");
+        assert_eq!(report.cron_started, 1);
+
+        let run = await_terminal_cron_run(&harness).await;
+        assert_eq!(
+            run.status,
+            zeroclaw_runtime::sop::types::SopRunStatus::Failed,
+            "a SOP owned by a disabled agent must fail closed"
+        );
+        let step = run
+            .step_results
+            .first()
+            .expect("the refused step should be recorded on the run");
+        assert_eq!(
+            step.effective_agent, None,
+            "a refused step must not be attributed to any agent"
+        );
+        assert!(
+            step.output.contains("disabled"),
+            "the failure should name the disabled owner, got {:?}",
+            step.output
+        );
+        assert!(
+            !step.output.contains("step one done"),
+            "the step must not have run under the disabled agent, got {:?}",
+            step.output
+        );
+    }
+
+    /// `abort` only requests cancellation. Shutdown must join the handles it
+    /// aborts, or the replacement generation can start while a straggler is
+    /// still running under the superseded config — the overlap this teardown
+    /// exists to prevent.
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn sop_maintenance_shutdown_joins_the_drivers_it_aborts() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        /// Flips its flag when the driver task's future is dropped, which is
+        /// what actually happens when an aborted task stops.
+        struct StoppedFlag(std::sync::Arc<AtomicBool>);
+        impl Drop for StoppedFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let stopped = std::sync::Arc::new(AtomicBool::new(false));
+        let driver_flag = std::sync::Arc::clone(&stopped);
+        // Outlasts the drain deadline: shutdown has to abort it.
+        let driver = ::zeroclaw_spawn::spawn!(async move {
+            let _flag = StoppedFlag(driver_flag);
+            tokio::time::sleep(std::time::Duration::from_hours(24)).await;
+        });
+        let drivers = SopDriverSet::default();
+        drivers.lock().unwrap().push(driver);
+        let ticker = ::zeroclaw_spawn::spawn!(async {
+            tokio::time::sleep(std::time::Duration::from_hours(24)).await;
+        });
+
+        // Short deadlines so the drain-expiry path runs without waiting out the
+        // production ones; the logic under test is identical.
+        SopMaintenance { ticker, drivers }
+            .shutdown_with_deadlines(
+                std::time::Duration::from_millis(50),
+                std::time::Duration::from_secs(5),
+            )
+            .await;
+
+        assert!(
+            stopped.load(Ordering::SeqCst),
+            "shutdown returned while an aborted driver was still running"
         );
     }
 

@@ -1067,22 +1067,74 @@ fn validate_planned_call_bindings(
     }
 }
 
-/// Every `execute` step reachable by a headless trigger must resolve an owning
-/// agent, from the step's own `agent` or the procedure's.
+/// `execute` step numbers that resolve no owning agent, from the step's own
+/// `agent` or the procedure's.
 ///
-/// Blocking rather than advisory: a headless trigger has no ambient agent turn
-/// to borrow an identity from, so the headless driver refuses an unowned step
-/// outright. Saving such a SOP produces a procedure that fires on schedule and
-/// then fails every run at dispatch. `checkpoint` and `capability` steps are
-/// exempt — they park for approval and run through the deterministic capability
-/// registry respectively, neither of which assumes an agent.
-fn validate_headless_ownership(sop: &Sop, blocking: &mut Vec<String>) {
+/// One source for both the authoring gate and the run surfaces that start a
+/// procedure with no ambient agent turn, so a start can never be permitted on a
+/// rule the executing driver does not share. `checkpoint` and `capability` steps
+/// are exempt — they park for approval and run through the deterministic
+/// capability registry respectively, neither of which assumes an agent.
+#[must_use]
+pub fn unowned_execute_steps(sop: &Sop) -> Vec<u32> {
     let has_owner = |value: &Option<String>| {
         value
             .as_deref()
             .is_some_and(|alias| !alias.trim().is_empty())
     };
     if has_owner(&sop.agent) {
+        return Vec::new();
+    }
+    sop.steps
+        .iter()
+        .filter(|step| step.kind == SopStepKind::Execute && !has_owner(&step.agent))
+        .map(|step| step.number)
+        .collect()
+}
+
+/// The refusal a headless start surface returns for a procedure whose `execute`
+/// steps resolve no owner. `None` when every step has one.
+///
+/// Phrased for the operator who pressed the button rather than for the author,
+/// but drawn from [`unowned_execute_steps`] — the same rule the authoring gate
+/// and the headless driver apply.
+#[must_use]
+pub fn headless_ownership_refusal(sop: &Sop) -> Option<String> {
+    let steps = unowned_execute_steps(sop);
+    if steps.is_empty() {
+        return None;
+    }
+    let numbers = steps
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "SOP '{}' cannot be started here: step(s) [{numbers}] resolve no owning agent, and a run \
+         started outside an agent turn has none to inherit. Set `agent` on the SOP or on the \
+         step, or start the procedure from an agent with `sop_execute`.",
+        sop.name
+    ))
+}
+
+/// Every `execute` step reachable by a headless trigger must resolve an owning
+/// agent.
+///
+/// Blocking rather than advisory: a headless trigger has no ambient agent turn
+/// to borrow an identity from, so the headless driver refuses an unowned step
+/// outright. Saving such a SOP produces a procedure that fires on schedule and
+/// then fails every run at dispatch.
+///
+/// `manual` is the one trigger that can start from either side, so it warns
+/// instead of blocking: through `sop_execute` the calling agent owns the run and
+/// no declared owner is needed, but the dashboard's run endpoint emits the same
+/// Manual event from outside any agent turn and hands the run to the headless
+/// driver. That endpoint refuses an unowned procedure at start
+/// ([`headless_ownership_refusal`]); blocking the save instead would force an
+/// owner on every ordinary agent-driven procedure.
+fn validate_headless_ownership(sop: &Sop, blocking: &mut Vec<String>, warnings: &mut Vec<String>) {
+    let unowned = unowned_execute_steps(sop);
+    if unowned.is_empty() {
         return;
     }
     let mut sources: Vec<String> = sop
@@ -1091,20 +1143,34 @@ fn validate_headless_ownership(sop: &Sop, blocking: &mut Vec<String>) {
         .filter(|trigger| trigger.is_headless())
         .map(|trigger| trigger.source().to_string())
         .collect();
-    if sources.is_empty() {
-        return;
-    }
     sources.sort();
     sources.dedup();
 
-    for step in &sop.steps {
-        if step.kind != SopStepKind::Execute || has_owner(&step.agent) {
-            continue;
+    if sources.is_empty() {
+        if sop
+            .triggers
+            .iter()
+            .any(|trigger| matches!(trigger, SopTrigger::Manual))
+        {
+            warnings.push(format!(
+                "Step(s) [{}]: no owning agent. `sop_execute` runs these under the calling agent, \
+                 but a dashboard-started run has no agent turn to inherit from and will be \
+                 refused. Set `agent` on the SOP or on the step to make it startable from the \
+                 dashboard.",
+                unowned
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
         }
+        return;
+    }
+
+    for step in unowned {
         blocking.push(format!(
-            "Step {}: no owning agent for headless trigger(s) [{}]. Set `agent` on the SOP or on \
-             the step; a headless run has no agent turn to inherit one from.",
-            step.number,
+            "Step {step}: no owning agent for headless trigger(s) [{}]. Set `agent` on the SOP or \
+             on the step; a headless run has no agent turn to inherit one from.",
             sources.join(", ")
         ));
     }
@@ -1145,9 +1211,8 @@ pub fn validate_sop_strict(sop: &Sop) -> SopValidation {
         }
     }
 
-    validate_headless_ownership(sop, &mut blocking);
-
     let mut warnings = Vec::new();
+    validate_headless_ownership(sop, &mut blocking, &mut warnings);
     validate_planned_call_bindings(sop, &mut blocking, &mut warnings);
 
     let graph = SopGraph::from_sop(sop);
@@ -1481,6 +1546,70 @@ mod tests {
         let validation = validate_sop_strict(&authoring_sop(vec![titled_step(1, "a")]));
 
         assert!(validation.is_ok(), "{:?}", validation.blocking);
+    }
+
+    /// ...but a Manual SOP is also startable from the dashboard, which has no
+    /// agent turn behind it. That start is refused, so the author is warned
+    /// rather than left with a procedure that only works from one of its two
+    /// surfaces.
+    #[test]
+    fn validate_sop_strict_warns_that_an_unowned_manual_sop_is_not_dashboard_startable() {
+        let sop = authoring_sop(vec![titled_step(1, "a")]);
+
+        let validation = validate_sop_strict(&sop);
+
+        let warning = validation
+            .warnings
+            .iter()
+            .find(|w| w.contains("no owning agent"))
+            .unwrap_or_else(|| panic!("expected an ownership warning, got {validation:?}"));
+        assert!(
+            warning.contains("dashboard"),
+            "the warning should name the surface that refuses the start, got {warning:?}"
+        );
+
+        let owned = Sop {
+            agent: Some("ops".into()),
+            ..sop
+        };
+        assert!(
+            !validate_sop_strict(&owned)
+                .warnings
+                .iter()
+                .any(|w| w.contains("no owning agent")),
+            "an owned procedure must not warn"
+        );
+    }
+
+    /// The refusal a headless start surface returns is derived from the same
+    /// rule the authoring gate uses, so a start can never be permitted on a
+    /// rule the executing driver does not share.
+    #[test]
+    fn headless_ownership_refusal_names_every_unowned_execute_step() {
+        let mut owned_step = titled_step(2, "b");
+        owned_step.agent = Some("ops".into());
+        let mut checkpoint = titled_step(3, "approve");
+        checkpoint.kind = SopStepKind::Checkpoint;
+        let sop = authoring_sop(vec![titled_step(1, "a"), owned_step, checkpoint]);
+
+        assert_eq!(unowned_execute_steps(&sop), vec![1]);
+        let refusal =
+            headless_ownership_refusal(&sop).expect("an unowned execute step must be refused");
+        assert!(
+            refusal.contains("[1]"),
+            "only the unowned execute step should be named — the owned step and the checkpoint \
+             carry their own exemption, got {refusal:?}"
+        );
+
+        let owned = Sop {
+            agent: Some("ops".into()),
+            ..sop
+        };
+        assert!(unowned_execute_steps(&owned).is_empty());
+        assert!(
+            headless_ownership_refusal(&owned).is_none(),
+            "a procedure whose SOP-level agent covers every step must start"
+        );
     }
 
     /// Only `execute` steps need an agent: checkpoints park for human approval
