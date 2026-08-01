@@ -272,7 +272,7 @@ impl StreamThinkTagStripper {
 }
 
 /// Streaming-safe stripper for **trailing** provider/model end-of-message
-/// markers (issue #9006 — `<eom>` and `<|eom|>` leaking into transcripts).
+/// markers (`<eom>` and `<|eom|>` leaking into transcripts).
 ///
 /// Peels complete markers from the input tail on every chunk and withholds a
 /// small suffix that could still become a marker on the next chunk. Mid-text
