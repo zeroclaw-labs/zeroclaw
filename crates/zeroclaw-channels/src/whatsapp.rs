@@ -12,6 +12,58 @@ type PendingApprovalsMap = Mutex<HashMap<String, oneshot::Sender<ChannelApproval
 static PENDING_APPROVALS: LazyLock<Arc<PendingApprovalsMap>> =
     LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
 
+/// Removes a parked approval token when the requesting future goes away.
+///
+/// `request_approval` registers a token in [`PENDING_APPROVALS`] before it does
+/// anything else, and the token is a bearer credential for a tool-call decision:
+/// whoever presents it decides that call. An entry left behind is therefore a
+/// decision that stays resolvable for the lifetime of the process, and the map is
+/// process-global, so it is not bounded by a channel instance either.
+///
+/// Two exits used to leave one behind, and neither is exotic.
+///
+/// The send is the first thing after registration, so a transient send failure
+/// propagates out with the entry already in the map and nothing later in the
+/// function runs. That one needs no cancellation at all to reach.
+///
+/// The other is cancellation. Every explicit cleanup lives inside the async body,
+/// so none of it runs if the future is dropped, which a caller-side timeout or a
+/// shutdown both do. `Drop` is the only hook that survives that, which is why the
+/// entry's lifetime is tied to a guard rather than to any code path.
+///
+/// The guard is disarmed once a decision has been taken through a normal path, so
+/// the existing removals still own their own cleanup and nothing is removed twice.
+struct PendingApprovalGuard {
+    token: Option<String>,
+}
+
+impl PendingApprovalGuard {
+    fn new(token: String) -> Self {
+        Self { token: Some(token) }
+    }
+
+    /// The decision was taken through a normal path; stop guarding.
+    fn disarm(&mut self) {
+        self.token = None;
+    }
+}
+
+impl Drop for PendingApprovalGuard {
+    fn drop(&mut self) {
+        let Some(token) = self.token.take() else {
+            return;
+        };
+        // `Drop` is not async, and blocking here would stall whichever runtime
+        // thread is unwinding. Spawn the removal instead: the entry is gone well
+        // before any realistic reply, and a reply that beats it still finds a
+        // receiver whose sender was dropped with this future, so it cannot be
+        // reported as an accepted decision.
+        zeroclaw_spawn::spawn!(async move {
+            PENDING_APPROVALS.lock().await.remove(&token);
+        });
+    }
+}
+
 fn ensure_https(url: &str) -> anyhow::Result<()> {
     if !url.starts_with("https://") {
         anyhow::bail!(
@@ -804,17 +856,32 @@ impl Channel for WhatsAppChannel {
             let mut map = PENDING_APPROVALS.lock().await;
             map.insert(token.clone(), tx_approval);
         }
+        // Armed immediately after registration rather than later, because the
+        // send below is the first thing that can leave the function.
+        let mut guard = PendingApprovalGuard::new(token.clone());
 
         let text = format!(
             "APPROVAL REQUIRED [{}]\nTool: {}\nArgs: {}\n\nReply: \"{} yes\", \"{} no\", or \"{} always\"",
             token, request.tool_name, request.arguments_summary, token, token, token
         );
+        // The `?` here is what used to orphan a live token: it returns with the
+        // entry already registered. The guard now cleans up on that path.
         self.send(&SendMessage::new(text, recipient)).await?;
 
         let timeout = std::time::Duration::from_secs(self.approval_timeout_secs);
         let response = match tokio::time::timeout(timeout, rx_approval).await {
-            Ok(Ok(response)) => response,
+            Ok(Ok(response)) => {
+                // The reply arrived, which means the gateway's reply handler
+                // already removed the entry to take the sender out of the map.
+                guard.disarm();
+                response
+            }
             _ => {
+                // Timed out or the sender was dropped. This arm already owned its
+                // own removal before the guard existed, so keep it and disarm,
+                // which also keeps the removal synchronous with the deny rather
+                // than deferring it to a spawned task.
+                guard.disarm();
                 let mut map = PENDING_APPROVALS.lock().await;
                 map.remove(&token);
                 ChannelApprovalResponse::Deny
@@ -2695,6 +2762,94 @@ mod tests {
         assert_eq!(ch.approval_timeout_secs, 300);
         let ch2 = ch.with_approval_timeout_secs(60);
         assert_eq!(ch2.approval_timeout_secs, 60);
+    }
+
+    /// Park a token the way `request_approval` does, and hand back the guard so
+    /// a test can decide when the requesting future goes away.
+    async fn park_guarded_token(
+        token: &str,
+    ) -> (
+        PendingApprovalGuard,
+        oneshot::Receiver<ChannelApprovalResponse>,
+    ) {
+        let (tx, rx) = oneshot::channel();
+        PENDING_APPROVALS.lock().await.insert(token.to_string(), tx);
+        (PendingApprovalGuard::new(token.to_string()), rx)
+    }
+
+    /// Wait for the guard's spawned removal, rather than assuming it has landed.
+    /// `Drop` cannot await, so the removal is a spawned task and a bare assert
+    /// straight after the drop would race it and pass or fail on scheduling.
+    async fn assert_token_cleared(token: &str) {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while PENDING_APPROVALS.lock().await.contains_key(token) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!("token {token} was still registered after its request went away")
+        });
+    }
+
+    /// The send is the first thing after registration, so a transient send
+    /// failure used to return with the entry already in the map. That path needs
+    /// no cancellation to reach, which is what made it the cheapest to exploit.
+    #[tokio::test]
+    async fn send_failure_leaves_no_live_token() {
+        let token = "sendfl";
+        let (guard, _rx) = park_guarded_token(token).await;
+        assert!(
+            PENDING_APPROVALS.lock().await.contains_key(token),
+            "fixture failed to register the token, so the assertion below would pass vacuously"
+        );
+
+        // What `self.send(...).await?` does on the error path: the function
+        // returns and everything it owns, including the guard, is dropped.
+        drop(guard);
+
+        assert_token_cleared(token).await;
+    }
+
+    /// Cancellation is the exit no in-body cleanup can cover, because none of
+    /// that code runs once the future is dropped. A caller-side timeout and a
+    /// shutdown both do exactly this.
+    #[tokio::test]
+    async fn cancelled_request_leaves_no_live_token() {
+        let token = "cancel";
+        let (guard, _rx) = park_guarded_token(token).await;
+        assert!(PENDING_APPROVALS.lock().await.contains_key(token));
+
+        let task = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        task.abort();
+        let _ = task.await;
+
+        assert_token_cleared(token).await;
+    }
+
+    /// The control for the two above. A guard that removed unconditionally would
+    /// pass both of them while breaking the normal path, where the reply handler
+    /// has already taken the sender out of the map and a second removal would be
+    /// removing whatever registered next.
+    #[tokio::test]
+    async fn a_disarmed_guard_removes_nothing() {
+        let token = "disarm";
+        let (mut guard, _rx) = park_guarded_token(token).await;
+        guard.disarm();
+        drop(guard);
+
+        // Give a spawned removal every chance to run before concluding it did not.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            PENDING_APPROVALS.lock().await.contains_key(token),
+            "a disarmed guard must not remove an entry the normal path owns"
+        );
+        PENDING_APPROVALS.lock().await.remove(token);
     }
 
     #[tokio::test]
