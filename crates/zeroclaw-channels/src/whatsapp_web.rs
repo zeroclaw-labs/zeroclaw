@@ -516,6 +516,21 @@ impl WhatsAppWebChannel {
         chat_jid.to_string()
     }
 
+    /// Where a reply to this message should go.
+    ///
+    /// Status updates all arrive on the shared `status@broadcast` chat. Replying
+    /// there addresses the broadcast pseudo-JID rather than a person, so the
+    /// reply reaches nobody; WhatsApp itself opens a private thread with the
+    /// author instead. Everything else replies in its own chat.
+    #[cfg(feature = "whatsapp-web")]
+    fn reply_target_for(chat_jid: &str, sender_jid: &str, is_status: bool) -> String {
+        if is_status {
+            sender_jid.to_string()
+        } else {
+            Self::compute_reply_target(chat_jid)
+        }
+    }
+
     /// Resolve an outbound recipient. With whatsapp-rust 0.6+ and
     /// LID JIDs are handled internally by the library, so we pass through unchanged.
     #[cfg(feature = "whatsapp-web")]
@@ -2331,7 +2346,8 @@ impl Channel for WhatsAppWebChannel {
                                 };
 
                                 let is_group = info.source.is_group;
-                                let reply_target = Self::compute_reply_target(&chat);
+                                let reply_target =
+                                    Self::reply_target_for(&chat, &sender_jid.to_string(), is_status);
 
                                 let allowed_groups = allowed_groups_resolver();
                                 if is_group && !is_group_chat_allowed(&chat, &allowed_groups) {
@@ -3884,6 +3900,44 @@ mod tests {
         let candidates =
             WhatsAppWebChannel::sender_phone_candidates(&sender, None, Some("15551234567"));
         assert!(candidates.contains(&"+15551234567".to_string()));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn status_replies_are_addressed_to_the_author() {
+        // Every status shares the `status@broadcast` chat. Replying there
+        // targets the broadcast pseudo-JID and reaches nobody, so the reply
+        // must be redirected to whoever posted it.
+        assert_eq!(
+            WhatsAppWebChannel::reply_target_for(
+                "status@broadcast",
+                "15551234567@s.whatsapp.net",
+                true,
+            ),
+            "15551234567@s.whatsapp.net"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn non_status_messages_still_reply_in_their_own_chat() {
+        // A group reply must land in the group, not in the sender's DM.
+        assert_eq!(
+            WhatsAppWebChannel::reply_target_for(
+                "120363000000000000@g.us",
+                "15551234567@s.whatsapp.net",
+                false,
+            ),
+            "120363000000000000@g.us"
+        );
+        assert_eq!(
+            WhatsAppWebChannel::reply_target_for(
+                "15559999999@s.whatsapp.net",
+                "15559999999@s.whatsapp.net",
+                false,
+            ),
+            "15559999999@s.whatsapp.net"
+        );
     }
 
     #[test]

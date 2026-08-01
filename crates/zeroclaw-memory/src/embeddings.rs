@@ -222,6 +222,24 @@ pub fn create_embedding_provider(
             let key = api_key.unwrap_or("");
             Box::new(OpenAiEmbedding::new(base_url, key, model, dims))
         }
+        #[cfg(feature = "memory-local-embeddings")]
+        "local" => match crate::embeddings_local::LocalEmbedding::new(model, None) {
+            Ok(provider) => Box::new(provider),
+            Err(e) => {
+                // Falling back to Noop would leave the agent with a
+                // keyword-only memory and no indication why recall got worse,
+                // so make the misconfiguration audible instead.
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    &format!(
+                        "local embedding model unavailable, memory will not be vectorised: {e}"
+                    )
+                );
+                Box::new(NoopEmbedding)
+            }
+        },
         _ => Box::new(NoopEmbedding),
     }
 }

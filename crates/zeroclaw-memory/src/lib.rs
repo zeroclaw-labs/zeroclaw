@@ -18,6 +18,8 @@ pub mod consolidation;
 pub mod decay;
 pub mod dedup;
 pub mod embeddings;
+#[cfg(feature = "memory-local-embeddings")]
+pub mod embeddings_local;
 pub mod hygiene;
 pub mod importance;
 pub mod knowledge_graph;

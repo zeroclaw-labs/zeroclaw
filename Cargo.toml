@@ -375,6 +375,7 @@ channel-feishu = ["channel-lark"]
 whatsapp-web = ["zeroclaw-channels/whatsapp-web", "zeroclaw-gateway?/whatsapp-web"]
 voice-wake = ["zeroclaw-channels/voice-wake"]
 memory-postgres = ["zeroclaw-memory/memory-postgres"]
+memory-local-embeddings = ["zeroclaw-memory/memory-local-embeddings"]
 
 # Backends and platform flags — each forwards to ONE crate
 observability-prometheus = [

@@ -10592,6 +10592,12 @@ pub struct MemoryConfig {
     #[serde(default = "default_zero_retention")]
     pub core_retention_days: u32,
     /// Source of embedding vectors for semantic search. `none` = keyword-only retrieval (no API calls, no vector cost); `openai` = OpenAI's embedding API; `custom:URL` = any OpenAI-compatible embedding endpoint (LiteLLM, local gateway, etc.).
+    /// Where embeddings come from: `none` (keyword-only recall), `openai`,
+    /// `openrouter`, `custom:<base_url>` for an OpenAI-compatible endpoint, or
+    /// `local` to run an ONNX model in-process (requires the
+    /// `memory-local-embeddings` build feature). `local` costs nothing per
+    /// memory and needs no key or network, which also makes it the only option
+    /// that can serve a language-specific encoder.
     #[serde(default = "default_embedding_provider")]
     pub embedding_provider: String,
     /// Embedding model identifier — must match a model your chosen embedding model_provider serves (e.g. `text-embedding-3-small` for OpenAI). Changing this invalidates existing embeddings: the change is detected at startup and stale vectors are cleared automatically; run `zeroclaw memory reindex` to re-embed (or set `auto_reindex_on_identity_change`).

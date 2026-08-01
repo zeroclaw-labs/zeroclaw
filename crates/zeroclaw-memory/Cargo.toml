@@ -25,9 +25,13 @@ sha2 = "0.10"
 tokio = { version = "1.50", default-features = false, features = ["fs", "io-util", "macros", "process", "sync", "time"] }
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 postgres = { version = "0.19", features = ["with-chrono-0_4"], optional = true }
+fastembed = { version = "5", default-features = false, features = ["hf-hub-native-tls"], optional = true }
 
 [features]
 memory-postgres = ["dep:postgres", "zeroclaw-config/memory-postgres"]
+# Local ONNX embeddings. Off by default: the ONNX runtime is a heavy
+# dependency and most deployments use an HTTP provider or none.
+memory-local-embeddings = ["dep:fastembed"]
 
 [dev-dependencies]
 filetime = "0.2"
