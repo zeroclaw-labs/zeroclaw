@@ -604,6 +604,15 @@ impl Memory for LucidMemory {
     }
 }
 
+impl ::zeroclaw_api::attribution::Attributable for LucidMemory {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Memory(::zeroclaw_api::attribution::MemoryKind::Lucid)
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
+
 #[cfg(test)]
 mod platform_tests {
     use super::*;
@@ -1140,14 +1149,5 @@ exit 1
 
         let calls = tokio::fs::read_to_string(&marker).await.unwrap_or_default();
         assert_eq!(calls.lines().count(), 1);
-    }
-}
-
-impl ::zeroclaw_api::attribution::Attributable for LucidMemory {
-    fn role(&self) -> ::zeroclaw_api::attribution::Role {
-        ::zeroclaw_api::attribution::Role::Memory(::zeroclaw_api::attribution::MemoryKind::Lucid)
-    }
-    fn alias(&self) -> &str {
-        &self.alias
     }
 }

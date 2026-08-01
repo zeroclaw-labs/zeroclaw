@@ -248,6 +248,7 @@ mod tests {
             Ok(vec![ModelInfo {
                 id: "priced-model".to_string(),
                 pricing: Some(pricing),
+                context_window: None,
             }])
         }
     }

@@ -512,6 +512,9 @@ pub struct AppState {
     pub reload_tx: Option<tokio::sync::watch::Sender<bool>>,
     /// Registry of dynamically connected nodes
     pub node_registry: Arc<nodes::NodeRegistry>,
+    /// LAN-local peer hints discovered by multicast. These are informational
+    /// only; they never authorize or connect a peer.
+    pub mdns_peer_registry: nodes::mdns::MdnsPeerRegistry,
     /// Path prefix for reverse-proxy deployments (empty string = no prefix)
     pub path_prefix: String,
     /// Filesystem path to `web/dist/` for serving the dashboard (None = API-only)
@@ -613,7 +616,8 @@ pub async fn run_gateway(
         }
     };
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    let actual_port = listener.local_addr()?.port();
+    let actual_addr = listener.local_addr()?;
+    let actual_port = actual_addr.port();
     let display_addr = format!("{host}:{actual_port}");
 
     let (boot_family, boot_alias, boot_entry) = config
@@ -820,6 +824,7 @@ pub async fn run_gateway(
                 connect_peripherals: false,
                 emit_assembly_logs: false,
                 exclude_memory: false,
+                acp_delivery: false,
                 list_deferred_mcp_specs: true,
             })
             .await;
@@ -957,6 +962,7 @@ pub async fn run_gateway(
             connect_peripherals: false,
             emit_assembly_logs: false,
             exclude_memory: false,
+            acp_delivery: false,
             list_deferred_mcp_specs: true,
         })
         .await;
@@ -1127,7 +1133,21 @@ pub async fn run_gateway(
                 alias.clone(),
                 Arc::new(NextcloudTalkChannel::new(
                     nc.base_url.clone(),
-                    nc.app_token.clone(),
+                    // Resolve the same installed-bot secret used by inbound
+                    // verification. `webhook_secret` is canonical and
+                    // `bot_token` is a deprecated alias for the same value.
+                    nc.resolve_bot_secret().unwrap_or_else(|e| {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                            &e.to_string()
+                        );
+                        None
+                    }),
                     nc.bot_name.clone().unwrap_or_default(),
                     alias.clone(),
                     peer_resolver,
@@ -1143,12 +1163,23 @@ pub async fn run_gateway(
         .nextcloud_talk
         .iter()
         .filter_map(|(alias, nc)| {
-            let secret = nc
-                .webhook_secret
-                .as_deref()
-                .map(str::trim)
-                .filter(|secret| !secret.is_empty())
-                .map(ToOwned::to_owned)?;
+            // Same resolver as the outbound signing path: Nextcloud installs one
+            // secret per bot, so inbound verification and outbound signing must
+            // agree. A conflict or an unresolved secret yields no entry, and the
+            // handler rejects rather than skipping verification.
+            let secret = match nc.resolve_bot_secret() {
+                Ok(Some(secret)) => secret,
+                Ok(None) => return None,
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        &e.to_string()
+                    );
+                    return None;
+                }
+            };
             Some((alias.clone(), Arc::from(secret)))
         })
         .collect();
@@ -1443,6 +1474,46 @@ pub async fn run_gateway(
 
     // Node registry for dynamic node discovery
     let node_registry = Arc::new(nodes::NodeRegistry::new(config.nodes.max_nodes));
+    let mdns_config_state = Arc::clone(&config_state);
+    let mdns_peer_registry =
+        nodes::mdns::MdnsPeerRegistry::new(move || mdns_config_state.read().nodes.mdns.max_peers);
+    let mdns_task = if config.nodes.mdns.enabled
+        && nodes::mdns::is_advertisable_gateway_addr(&actual_addr)
+    {
+        let mdns_config = config.nodes.mdns.clone();
+        let advertised_gateway = nodes::mdns::MdnsAdvertisedGateway::new(actual_port, path_prefix);
+        let mdns_registry = mdns_peer_registry.clone();
+        let mdns_shutdown_rx = shutdown_tx.subscribe();
+        Some(zeroclaw_spawn::spawn!(async move {
+            if let Err(err) = nodes::mdns::run_peer_discovery(
+                mdns_config,
+                advertised_gateway,
+                mdns_registry,
+                mdns_shutdown_rx,
+            )
+            .await
+            {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{err}")})),
+                    "mDNS local peer discovery stopped"
+                );
+            }
+        }))
+    } else if config.nodes.mdns.enabled {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"bind_addr": actual_addr.to_string()})),
+            "mDNS local peer discovery skipped because the gateway is bound to a loopback-only host"
+        );
+        None
+    } else {
+        None
+    };
 
     // Device registry and pairing store (only when pairing is required)
     let device_registry = if config.gateway.require_pairing {
@@ -1516,6 +1587,7 @@ pub async fn run_gateway(
         shutdown_tx,
         reload_tx,
         node_registry,
+        mdns_peer_registry,
         session_backend,
         session_queue: Arc::new(session_queue::SessionActorQueue::new(8, 30, 600)),
         device_registry,
@@ -2044,8 +2116,27 @@ pub async fn run_gateway(
         .await?;
     }
 
-    drop(broadcast_hook_guard);
+    if let Some(task) = mdns_task {
+        let mut task = task;
+        tokio::select! {
+            result = &mut task => {
+                if let Err(err) = result {
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"error": format!("{err}")})),
+                        "LAN peer discovery task join failed"
+                    );
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_secs(2)) => {
+                task.abort();
+            }
+        }
+    }
 
+    drop(broadcast_hook_guard);
     Ok(())
 }
 
@@ -3455,8 +3546,20 @@ async fn process_nextcloud_talk_webhook(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let body_str = String::from_utf8_lossy(&body);
 
-    // ── Security: Verify Nextcloud Talk HMAC signature if secret is configured ──
-    if let Some(webhook_secret) = webhook_secret {
+    // ── Security: Nextcloud Talk webhooks MUST be signature-verified ──
+    // Fail closed: with no resolved bot secret we cannot verify the signature, so the
+    // request is rejected. Previously an unresolved secret skipped verification
+    // entirely, which left a bot_token-only configuration accepting unverified inbound
+    // webhooks while still signing outbound replies.
+    let Some(webhook_secret) = webhook_secret else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": "nextcloud_talk: no bot secret configured; refusing to accept an unverified webhook"
+            })),
+        );
+    };
+    {
         let random = headers
             .get("X-Nextcloud-Talk-Random")
             .and_then(|v| v.to_str().ok())
@@ -4353,6 +4456,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -4981,6 +5085,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -5068,6 +5173,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -5662,6 +5768,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -5767,6 +5874,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -5887,6 +5995,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -5987,6 +6096,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -6106,6 +6216,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -6191,6 +6302,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -6281,6 +6393,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -6378,6 +6491,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -6418,7 +6532,7 @@ mod tests {
         let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = Arc::new(Vec::new);
         let channel = Arc::new(NextcloudTalkChannel::new(
             "https://cloud.example.com".into(),
-            "app-token".into(),
+            None,
             String::new(),
             alias,
             peer_resolver,
@@ -6471,6 +6585,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -6563,15 +6678,23 @@ mod tests {
         let provider: Arc<dyn ModelProvider> = provider_impl.clone();
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
 
+        // Obviously-fake placeholder, never a real credential.
+        let secret = "fake-nextcloud-webhook-secret-not-real";
+        let random = "0123456789abcdef0123456789abcdef";
+
+        // The same secret governs both directions now, so the channel is built
+        // with that resolved secret as its bot token rather than the `None` this
+        // test used to pass.
         let channel = Arc::new(NextcloudTalkChannel::new(
             "https://cloud.example.com".into(),
-            "app-token".into(),
+            Some(secret.to_string()),
             String::new(),
             "default",
             Arc::new(|| vec!["*".to_string()]),
         ));
 
         let body = r#"{"type":"message","object":{"token":"room-token"},"actor":{"id":"user_a","name":"User A"},"message":{"actorType":"users","actorId":"user_a","message":"hello"}}"#;
+        let signature = compute_nextcloud_signature_hex(secret, random, body);
 
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
@@ -6600,7 +6723,16 @@ mod tests {
             #[cfg(feature = "channel-linq")]
             linq_signing_secrets: HashMap::new(),
             nextcloud_talk: HashMap::from([("default".to_string(), channel)]),
-            nextcloud_talk_webhook_secret: HashMap::new(),
+            // A resolved secret, not an empty map. Inbound verification is now
+            // mandatory and fail-closed, so an unsigned request is rejected with
+            // 401 before the handler ever spawns the LLM task — which would make
+            // this test pass for the wrong reason (no provider call because the
+            // request was refused, not because the ack raced ahead of a slow
+            // provider). Signing the request keeps it on the fast-ack path.
+            nextcloud_talk_webhook_secret: HashMap::from([(
+                "default".to_string(),
+                std::sync::Arc::<str>::from(secret),
+            )]),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             #[cfg(feature = "channel-wati")]
@@ -6616,6 +6748,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -6632,12 +6765,22 @@ mod tests {
             webauthn: None,
         };
 
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Nextcloud-Talk-Random",
+            HeaderValue::from_str(random).unwrap(),
+        );
+        headers.insert(
+            "X-Nextcloud-Talk-Signature",
+            HeaderValue::from_str(&signature).unwrap(),
+        );
+
         let start = std::time::Instant::now();
         let response = tokio::time::timeout(
             Duration::from_secs(2),
             Box::pin(handle_nextcloud_talk_webhook(
                 State(state),
-                HeaderMap::new(),
+                headers,
                 Bytes::from(body),
             )),
         )
@@ -7439,6 +7582,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -7525,6 +7669,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -7685,6 +7830,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,

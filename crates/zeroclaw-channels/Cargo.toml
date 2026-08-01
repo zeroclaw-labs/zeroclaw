@@ -288,6 +288,14 @@ image = { version = "0.25", default-features = false, features = [
   "png",
   "webp",
 ] }
+matrix-sdk = { version = "0.18", default-features = false, features = [
+  "testing",
+  "e2e-encryption",
+  "markdown",
+  "sqlite",
+] }
+matrix-sdk-base = { version = "0.18", default-features = false, features = ["e2e-encryption"] }
+matrix-sdk-test = "0.18"
 tempfile = "3.26"
 toml = "1.0"
 wiremock = "0.6"

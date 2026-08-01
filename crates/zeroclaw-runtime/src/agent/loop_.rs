@@ -131,7 +131,6 @@ use std::fmt::Write;
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use zeroclaw_api::channel::Channel;
@@ -218,28 +217,6 @@ fn discard_until_newline<R: std::io::BufRead>(reader: &mut R) -> std::io::Result
         reader.consume(len);
     }
 }
-
-/// Global model switch request state - used for runtime model switching via model_switch tool.
-/// This is set by the model_switch tool and checked by the agent loop.
-#[allow(clippy::type_complexity)]
-static MODEL_SWITCH_REQUEST: LazyLock<Arc<Mutex<Option<(String, String)>>>> =
-    LazyLock::new(|| Arc::new(Mutex::new(None)));
-
-/// Get the global model switch request state
-pub fn get_model_switch_state() -> ModelSwitchCallback {
-    Arc::clone(&MODEL_SWITCH_REQUEST)
-}
-
-/// Clear any pending model switch request
-pub fn clear_model_switch_request() {
-    if let Ok(guard) = MODEL_SWITCH_REQUEST.lock() {
-        let mut guard = guard;
-        *guard = None;
-    }
-}
-
-#[cfg(test)]
-pub(crate) static MODEL_SWITCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn glob_match(pattern: &str, name: &str) -> bool {
     match pattern.find('*') {
@@ -1354,6 +1331,7 @@ pub async fn run(
             // cannot read or write memory even though the registry is otherwise
             // built identically.
             exclude_memory: memory_free,
+            acp_delivery: false,
             list_deferred_mcp_specs: false,
             emit_assembly_logs: true,
             // Honor the daemon worker's pre-built shared registry so stdio
@@ -1475,15 +1453,14 @@ pub async fn run(
                 &provider_runtime_options,
             )?;
 
-        let model_switch_callback = get_model_switch_state();
-
-        observer.record_event(&ObserverEvent::AgentStart {
-            model_provider: provider_name.to_string(),
-            model: model_name.to_string(),
-            channel: Some(channel_name.to_string()),
-            agent_alias: Some(agent_alias.to_string()),
-            turn_id: Some(turn_id.clone()),
-        });
+        let mut turn_guard = crate::observability::AgentTurnGuard::start(
+            observer.as_ref(),
+            provider_name.to_string(),
+            model_name.to_string(),
+            Some(channel_name.to_string()),
+            Some(agent_alias.to_string()),
+            Some(turn_id.clone()),
+        );
 
         // ── Hardware RAG (datasheet retrieval when peripherals + datasheet_dir) ──
         let hardware_rag: Option<crate::rag::HardwareRag> = config
@@ -1703,8 +1680,6 @@ pub async fn run(
             crate::agent::cost::tool_loop_cost_tracking_context_for_agent(&config, agent_alias);
 
         // ── Execute ──────────────────────────────────────────────────
-        let start = Instant::now();
-
         let mut final_output = String::new();
 
         // Save the base system prompt before any thinking modifications so
@@ -1919,7 +1894,7 @@ pub async fn run(
                                         config: Some(&config),
                                         hooks: None,
                                         activated_tools: activated_handle.as_ref(),
-                                        model_switch_callback: Some(model_switch_callback.clone()),
+                                        model_switch_callback: None,
                                         receipt_generator: None,
                                     },
                                     ResolvedRuntimeKnobs {
@@ -2020,15 +1995,7 @@ pub async fn run(
                             provider_name = new_model_provider;
                             model_name = new_model;
 
-                            clear_model_switch_request();
-
-                            observer.record_event(&ObserverEvent::AgentStart {
-                                model_provider: provider_name.to_string(),
-                                model: model_name.to_string(),
-                                channel: Some(channel_name.to_string()),
-                                agent_alias: Some(agent_alias.to_string()),
-                                turn_id: Some(turn_id.clone()),
-                            });
+                            turn_guard.set_model_route(provider_name.clone(), model_name.clone());
 
                             continue;
                         }
@@ -2471,9 +2438,7 @@ pub async fn run(
                                             config: Some(&config),
                                             hooks: None,
                                             activated_tools: activated_handle.as_ref(),
-                                            model_switch_callback: Some(
-                                                model_switch_callback.clone(),
-                                            ),
+                                            model_switch_callback: None,
                                             receipt_generator: None,
                                         },
                                         ResolvedRuntimeKnobs {
@@ -2580,15 +2545,8 @@ pub async fn run(
                                 provider_name = new_model_provider;
                                 model_name = new_model;
 
-                                clear_model_switch_request();
-
-                                observer.record_event(&ObserverEvent::AgentStart {
-                                    model_provider: provider_name.to_string(),
-                                    model: model_name.to_string(),
-                                    channel: Some(channel_name.to_string()),
-                                    agent_alias: Some(agent_alias.to_string()),
-                                    turn_id: Some(turn_id.clone()),
-                                });
+                                turn_guard
+                                    .set_model_route(provider_name.clone(), model_name.clone());
 
                                 continue;
                             }
@@ -2784,7 +2742,6 @@ pub async fn run(
             }
         }
 
-        let duration = start.elapsed();
         let tokens_used = cost_tracking_context.as_ref().and_then(|ctx| {
             let usage = ctx.snapshot_turn_usage();
             (usage.input_tokens > 0 || usage.output_tokens > 0).then_some(
@@ -2794,16 +2751,9 @@ pub async fn run(
                 },
             )
         });
-        observer.record_event(&ObserverEvent::AgentEnd {
-            model_provider: provider_name.to_string(),
-            model: model_name.to_string(),
-            duration,
-            tokens_used,
-            cost_usd: None,
-            channel: Some(channel_name.to_string()),
-            agent_alias: Some(agent_alias.to_string()),
-            turn_id: Some(turn_id),
-        });
+        turn_guard.set_model_route(provider_name.clone(), model_name.clone());
+        turn_guard.set_usage(tokens_used, None);
+        turn_guard.finish();
 
         Ok(final_output)
     };
@@ -2970,6 +2920,7 @@ pub async fn process_message(
             connect_mcp: true,
             connect_peripherals: true,
             exclude_memory: false,
+            acp_delivery: false,
             list_deferred_mcp_specs: false,
             emit_assembly_logs: true,
             // `process_message` is the channel/orchestrator live-chat path;
@@ -3902,6 +3853,7 @@ mod tests {
                 tools_registry: &[],
                 activated_tools: None,
                 excluded_tools: &[],
+                model_switch_callback: None,
             },
             &meta,
             &observer,
@@ -3945,6 +3897,7 @@ mod tests {
                 tools_registry: &[],
                 activated_tools: Some(&activated),
                 excluded_tools: &[],
+                model_switch_callback: None,
             },
             &meta,
             &observer,
@@ -3994,6 +3947,7 @@ mod tests {
                 tools_registry: &[],
                 activated_tools: Some(&activated),
                 excluded_tools: &[],
+                model_switch_callback: None,
             },
             &meta,
             &observer,
@@ -4028,6 +3982,7 @@ mod tests {
                 tools_registry: &tools,
                 activated_tools: None,
                 excluded_tools: &[],
+                model_switch_callback: None,
             },
             &meta,
             &observer,
@@ -4083,6 +4038,7 @@ mod tests {
                 tools_registry: &tools,
                 activated_tools: None,
                 excluded_tools: &[],
+                model_switch_callback: None,
             },
             &meta,
             &observer,
@@ -15386,6 +15342,7 @@ Let me check the result."#;
                 connect_mcp: false,   // exercise the filter without MCP fixtures
                 connect_peripherals: false,
                 exclude_memory: false,
+                acp_delivery: false,
                 list_deferred_mcp_specs: false,
                 emit_assembly_logs: false,
                 mcp_registry: None,
@@ -15800,6 +15757,532 @@ Let me check the result."#;
         // The bracket and the inner engine events must also agree on the
         // full (channel, agent_alias, turn_id) triple with the pre-minted id.
         assert_all_events_share_turn_id(&events, Some("test-agent"), Some("daemon"));
+    }
+
+    /// `run()` (the CLI/daemon direct-turn entry point) was the last
+    /// production site that open-coded its own `AgentStart`/`AgentEnd`
+    /// instead of going through `AgentTurnGuard` like every other entry
+    /// point (`agent_turn`, `Agent::turn`/`turn_streamed`, the
+    /// orchestrator's `process_channel_message`). Between the open-coded
+    /// events sat roughly a dozen exit paths (`?`, early `return`) where
+    /// `AgentStart` fired but `AgentEnd` never did, leaving observers
+    /// permanently unbalanced. `run()` builds its own observer and model
+    /// provider internally with no injection seam, so these tests drive it
+    /// end to end: a real `Config`, the real tool registry, and a local
+    /// HTTP server standing in for the model. Event capture leans on the
+    /// process-wide broadcast hook the gateway uses to fan events out to
+    /// `/api/events` (`observability::set_scoped_broadcast_hook`);
+    /// `observability::HOOK_TEST_LOCK` serializes against
+    /// `observability::mod`'s own hook tests so neither steals the other's
+    /// events off the single global hook slot.
+    // `config.providers.models.ollama.*` dispatches through the OpenAI-
+    // compatible wire (`OllamaModelProviderConfig::create_provider` builds an
+    // `OpenAiCompatibleModelProvider` labeled "Ollama"), so the scripted
+    // response is OpenAI's `choices[0].message.content` shape at
+    // `/v1/chat/completions`, not the native `/api/chat` shape.
+    async fn respond_with_done() -> axum::Json<serde_json::Value> {
+        axum::Json(serde_json::json!({
+            "choices": [{"message": {"content": "done"}}]
+        }))
+    }
+
+    fn lifecycle_events_for_alias(events: &[ObserverEvent], alias: &str) -> (usize, usize) {
+        let starts = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    ObserverEvent::AgentStart { agent_alias, .. }
+                        if agent_alias.as_deref() == Some(alias)
+                )
+            })
+            .count();
+        let ends = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    ObserverEvent::AgentEnd { agent_alias, .. }
+                        if agent_alias.as_deref() == Some(alias)
+                )
+            })
+            .count();
+        (starts, ends)
+    }
+
+    /// The target alias's own `AgentStart`/`AgentEnd` events, in capture order.
+    ///
+    /// The `run()` lifecycle tests install a *process-wide* broadcast hook, so
+    /// the raw capture can interleave events emitted by other agents —
+    /// including other tests executing concurrently under the parallel runtime
+    /// gate. Ordering assertions (first is `AgentStart`, last is `AgentEnd`)
+    /// must therefore scope to the target alias before inspecting the ends of
+    /// the sequence; asserting on the raw stream's `first()`/`last()` is a
+    /// cross-talk flake.
+    fn alias_lifecycle_sequence<'a>(
+        events: &'a [ObserverEvent],
+        alias: &str,
+    ) -> Vec<&'a ObserverEvent> {
+        events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    ObserverEvent::AgentStart { agent_alias, .. }
+                        | ObserverEvent::AgentEnd { agent_alias, .. }
+                        if agent_alias.as_deref() == Some(alias)
+                )
+            })
+            .collect()
+    }
+
+    /// Regression guard for the parallel-gate flake: the `run()` lifecycle tests
+    /// capture through a process-wide hook, so unrelated observer traffic (e.g. a
+    /// concurrent runtime test) can land at the head or tail of the raw stream.
+    /// `alias_lifecycle_sequence` must scope ordering to the target alias so
+    /// foreign `AgentStart`/`AgentEnd` events cannot invalidate the first/last
+    /// assertions. This is deterministic (no scheduling dependence), unlike the
+    /// intermittent CI failure it guards against.
+    #[test]
+    fn alias_lifecycle_sequence_scopes_out_foreign_observer_traffic() {
+        fn start(alias: &str) -> ObserverEvent {
+            ObserverEvent::AgentStart {
+                model_provider: "p".into(),
+                model: "m".into(),
+                channel: None,
+                agent_alias: Some(alias.into()),
+                turn_id: Some("t".into()),
+            }
+        }
+        fn end(alias: &str) -> ObserverEvent {
+            ObserverEvent::AgentEnd {
+                model_provider: "p".into(),
+                model: "m".into(),
+                duration: std::time::Duration::from_millis(0),
+                tokens_used: None,
+                cost_usd: None,
+                channel: None,
+                agent_alias: Some(alias.into()),
+                turn_id: Some("t".into()),
+            }
+        }
+
+        // Foreign events bracket the target's own pair on both ends — exactly
+        // the interleaving that made the raw first()/last() assertions flake.
+        let events = vec![
+            end("other-agent"), // foreign AgentEnd at the head
+            start("target-agent"),
+            start("other-agent"),
+            end("target-agent"),
+            start("other-agent"), // foreign AgentStart at the tail
+        ];
+
+        // Counts stay scoped to the target alias (unchanged behavior).
+        assert_eq!(lifecycle_events_for_alias(&events, "target-agent"), (1, 1));
+
+        // The raw stream's ends are foreign, so the old unscoped assertions
+        // would fail here — which is the bug.
+        assert!(!matches!(
+            events.first(),
+            Some(ObserverEvent::AgentStart { .. })
+        ));
+        assert!(!matches!(
+            events.last(),
+            Some(ObserverEvent::AgentEnd { .. })
+        ));
+
+        // The alias-scoped sequence is exactly [AgentStart, AgentEnd] regardless
+        // of the foreign cross-talk.
+        let lifecycle = alias_lifecycle_sequence(&events, "target-agent");
+        assert!(matches!(
+            lifecycle.as_slice(),
+            [
+                ObserverEvent::AgentStart { .. },
+                ObserverEvent::AgentEnd { .. }
+            ]
+        ));
+        assert!(matches!(
+            lifecycle.first(),
+            Some(ObserverEvent::AgentStart { .. })
+        ));
+        assert!(matches!(
+            lifecycle.last(),
+            Some(ObserverEvent::AgentEnd { .. })
+        ));
+    }
+
+    /// A `Config::default()` rooted under a fresh temp dir instead of the
+    /// real `$HOME/.zeroclaw`. `Config::default()` points `data_dir` (the
+    /// sqlite memory db, `{data_dir}/memory/brain.db`) and `config_path`
+    /// (whose parent `install_root_dir()` backs `agent_workspace_dir`, i.e.
+    /// `{install_root}/agents/<alias>/workspace`) at the real home
+    /// directory, so a `run()`-driving test that doesn't override them
+    /// creates/writes real files on every dev and CI machine and, under the
+    /// crate's parallel test gate, has every such test contend on the same
+    /// `brain.db`. The returned `TempDir` must be kept alive for the
+    /// duration of the test — it deletes the directory on drop.
+    fn isolated_run_test_config() -> (tempfile::TempDir, Config) {
+        let tmp = tempdir().expect("temp dir for isolated run() test config should create");
+        let config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        (tmp, config)
+    }
+
+    #[tokio::test]
+    async fn run_brackets_successful_turn_with_agent_start_and_agent_end() {
+        use axum::{Router, routing::post};
+        use tokio::net::TcpListener;
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, ModelProviderConfig, OllamaModelProviderConfig, RiskProfileConfig,
+        };
+
+        let _hook_lock = observability::HOOK_TEST_LOCK.lock().await;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let addr = listener.local_addr().expect("listener should have address");
+        let app = Router::new().route("/v1/chat/completions", post(respond_with_done));
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test server should run");
+        });
+
+        let (_tmp, mut config) = isolated_run_test_config();
+        config.providers.models.ollama.insert(
+            "default".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("run-lifecycle-success-model".to_string()),
+                    timeout_secs: Some(5),
+                    uri: Some(format!("http://{addr}")),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "run-lifecycle-success-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "ollama.default".into(),
+                risk_profile: "default".into(),
+                ..Default::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("default".to_string(), RiskProfileConfig::default());
+
+        let capturing = Arc::new(CapturingObserver::default());
+        let observer: Arc<dyn Observer> = capturing.clone();
+        let hook_guard = observability::set_scoped_broadcast_hook(observer);
+
+        let result = super::run(
+            config,
+            "run-lifecycle-success-agent",
+            Some("hello".to_string()),
+            None,
+            None,
+            None,
+            Vec::new(),
+            false,
+            None,
+            None,
+            TurnOrigin::SubTurn,
+            super::AgentRunOverrides::default(),
+        )
+        .await;
+
+        drop(hook_guard);
+        server.abort();
+
+        let output = result.expect("run() should complete the scripted turn");
+        assert_eq!(output, "done");
+
+        let events = capturing.events.lock();
+        let (starts, ends) = lifecycle_events_for_alias(&events, "run-lifecycle-success-agent");
+        assert_eq!(starts, 1, "exactly one AgentStart, got {events:?}");
+        assert_eq!(ends, 1, "exactly one AgentEnd, got {events:?}");
+        // Scope ordering to the target agent: the process-wide hook can capture
+        // unrelated events from concurrently executing tests.
+        let lifecycle = alias_lifecycle_sequence(&events, "run-lifecycle-success-agent");
+        assert!(
+            matches!(lifecycle.first(), Some(ObserverEvent::AgentStart { .. })),
+            "the target agent's first lifecycle event must be AgentStart, \
+             got {lifecycle:?} (full captured stream: {events:?})"
+        );
+        assert!(
+            matches!(lifecycle.last(), Some(ObserverEvent::AgentEnd { .. })),
+            "the target agent's last lifecycle event must be AgentEnd, \
+             got {lifecycle:?} (full captured stream: {events:?})"
+        );
+    }
+
+    /// The core regression this fix addresses: before it, a model-call
+    /// failure inside `run()` propagated out through `?` while the
+    /// open-coded `AgentStart` had already fired, so `AgentEnd` never did.
+    /// With `AgentTurnGuard` in place, `Drop` closes the bracket on this
+    /// early-return path too.
+    #[tokio::test]
+    async fn run_still_closes_the_bracket_when_the_model_call_fails() {
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, ModelProviderConfig, OllamaModelProviderConfig, RiskProfileConfig,
+        };
+
+        let _hook_lock = observability::HOOK_TEST_LOCK.lock().await;
+
+        // Bind an ephemeral port and immediately drop the listener: any
+        // connection attempt against it fails fast and deterministically
+        // (connection refused) without depending on a hardcoded "probably
+        // unused" port number.
+        let addr = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("test listener should bind");
+            listener.local_addr().expect("listener should have address")
+        };
+
+        let (_tmp, mut config) = isolated_run_test_config();
+        config.providers.models.ollama.insert(
+            "default".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("run-lifecycle-error-model".to_string()),
+                    timeout_secs: Some(5),
+                    uri: Some(format!("http://{addr}")),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "run-lifecycle-error-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "ollama.default".into(),
+                risk_profile: "default".into(),
+                ..Default::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("default".to_string(), RiskProfileConfig::default());
+
+        let capturing = Arc::new(CapturingObserver::default());
+        let observer: Arc<dyn Observer> = capturing.clone();
+        let hook_guard = observability::set_scoped_broadcast_hook(observer);
+
+        let result = super::run(
+            config,
+            "run-lifecycle-error-agent",
+            Some("hello".to_string()),
+            None,
+            None,
+            None,
+            Vec::new(),
+            false,
+            None,
+            None,
+            TurnOrigin::SubTurn,
+            super::AgentRunOverrides::default(),
+        )
+        .await;
+
+        drop(hook_guard);
+
+        assert!(
+            result.is_err(),
+            "run() should surface the model provider's connection failure, got {result:?}"
+        );
+
+        let events = capturing.events.lock();
+        let (starts, ends) = lifecycle_events_for_alias(&events, "run-lifecycle-error-agent");
+        assert_eq!(
+            starts, 1,
+            "exactly one AgentStart even on the error path, got {events:?}"
+        );
+        assert_eq!(
+            ends, 1,
+            "AgentEnd must still fire via Drop on the early-return error path \
+             (the regression this fix closes), got {events:?}"
+        );
+        // Scope ordering to the target agent: the process-wide hook can
+        // capture unrelated events from concurrently executing tests.
+        let lifecycle = alias_lifecycle_sequence(&events, "run-lifecycle-error-agent");
+        assert!(
+            matches!(lifecycle.first(), Some(ObserverEvent::AgentStart { .. })),
+            "the target agent's first lifecycle event must be AgentStart, \
+             got {lifecycle:?} (full captured stream: {events:?})"
+        );
+        assert!(
+            matches!(lifecycle.last(), Some(ObserverEvent::AgentEnd { .. })),
+            "the target agent's last lifecycle event must be AgentEnd even on the \
+             error path, got {lifecycle:?} (full captured stream: {events:?})"
+        );
+    }
+
+    /// An in-loop model switch (the real `model_switch` tool, driven exactly
+    /// as production traffic would) must still close the bracket with
+    /// exactly one balanced pair, attributed to the switched-TO route — the
+    /// second open-coded `AgentStart` this fix replaced with
+    /// `turn_guard.set_model_route(..)` would have shown up here as two
+    /// `AgentStart`s for one `AgentEnd`.
+    #[tokio::test]
+    async fn run_model_switch_emits_single_balanced_pair_for_the_switched_route() {
+        use axum::{Json, Router, extract::State, routing::post};
+        use tokio::net::TcpListener;
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, ModelProviderConfig, OllamaModelProviderConfig, RiskProfileConfig,
+        };
+
+        let _hook_lock = observability::HOOK_TEST_LOCK.lock().await;
+
+        // First response: a native tool call requesting a switch to
+        // `ollama.switched`. Second response (only reachable once the
+        // switched-to provider is actually in use): plain "done".
+        type CallCount = Arc<std::sync::atomic::AtomicUsize>;
+
+        async fn respond_switch_then_done(
+            State(calls): State<CallCount>,
+        ) -> Json<serde_json::Value> {
+            let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call == 0 {
+                Json(serde_json::json!({
+                    "choices": [{
+                        "message": {
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "call-switch-1",
+                                "type": "function",
+                                "function": {
+                                    "name": "model_switch",
+                                    "arguments": "{\"action\":\"set\",\"model_provider\":\"ollama.switched\",\"model\":\"switched-model\"}"
+                                }
+                            }]
+                        }
+                    }]
+                }))
+            } else {
+                Json(serde_json::json!({
+                    "choices": [{"message": {"content": "done"}}]
+                }))
+            }
+        }
+
+        let calls: CallCount = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let addr = listener.local_addr().expect("listener should have address");
+        let app = Router::new()
+            .route("/v1/chat/completions", post(respond_switch_then_done))
+            .with_state(calls);
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test server should run");
+        });
+
+        let (_tmp, mut config) = isolated_run_test_config();
+        for alias in ["default", "switched"] {
+            config.providers.models.ollama.insert(
+                alias.to_string(),
+                OllamaModelProviderConfig {
+                    base: ModelProviderConfig {
+                        model: Some(format!("run-lifecycle-switch-{alias}-model")),
+                        timeout_secs: Some(5),
+                        uri: Some(format!("http://{addr}")),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            );
+        }
+        config.agents.insert(
+            "run-lifecycle-switch-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "ollama.default".into(),
+                risk_profile: "default".into(),
+                ..Default::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("default".to_string(), RiskProfileConfig::default());
+
+        let capturing = Arc::new(CapturingObserver::default());
+        let observer: Arc<dyn Observer> = capturing.clone();
+        let hook_guard = observability::set_scoped_broadcast_hook(observer);
+
+        let result = super::run(
+            config,
+            "run-lifecycle-switch-agent",
+            Some("please switch models".to_string()),
+            None,
+            None,
+            None,
+            Vec::new(),
+            false,
+            None,
+            None,
+            TurnOrigin::SubTurn,
+            super::AgentRunOverrides::default(),
+        )
+        .await;
+
+        drop(hook_guard);
+        server.abort();
+
+        let output = result.expect("run() should complete after the model switch");
+        assert_eq!(output, "done");
+
+        let events = capturing.events.lock();
+        let (starts, ends) = lifecycle_events_for_alias(&events, "run-lifecycle-switch-agent");
+        assert_eq!(
+            starts, 1,
+            "a model switch must not open a second bracket, got {events:?}"
+        );
+        assert_eq!(
+            ends, 1,
+            "a model switch must still close with exactly one AgentEnd, got {events:?}"
+        );
+        // Scope ordering to the target agent: the process-wide hook can
+        // capture unrelated events from concurrently executing tests.
+        let lifecycle = alias_lifecycle_sequence(&events, "run-lifecycle-switch-agent");
+        assert!(
+            matches!(lifecycle.first(), Some(ObserverEvent::AgentStart { .. })),
+            "the target agent's first lifecycle event must be AgentStart, \
+             got {lifecycle:?} (full captured stream: {events:?})"
+        );
+        assert!(
+            matches!(lifecycle.last(), Some(ObserverEvent::AgentEnd { .. })),
+            "the target agent's last lifecycle event must be AgentEnd, \
+             got {lifecycle:?} (full captured stream: {events:?})"
+        );
+
+        let end_route = events
+            .iter()
+            .find_map(|e| match e {
+                ObserverEvent::AgentEnd {
+                    agent_alias,
+                    model_provider,
+                    model,
+                    ..
+                } if agent_alias.as_deref() == Some("run-lifecycle-switch-agent") => {
+                    Some((model_provider.clone(), model.clone()))
+                }
+                _ => None,
+            })
+            .expect("AgentEnd for the switch agent should be present");
+        assert_eq!(
+            end_route,
+            ("ollama.switched".to_string(), "switched-model".to_string()),
+            "AgentEnd must be attributed to the switched-TO route (set_model_route), \
+             not the original one, got {events:?}"
+        );
     }
 
     /// `build_hardware_context` must forward the caller's TurnMeta onto the

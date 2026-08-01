@@ -23,8 +23,10 @@ Last verified against the `v0.8.2` release cycle.
 7. [Versioned documentation deployment](#step-7-versioned-documentation-deployment)
 
 That is the entire process. Everything else (Docker, website redeploy, Scoop,
-AUR, Homebrew, Discord, tweet) runs automatically as downstream jobs. You do not
-need to do anything for those unless a job explicitly fails.
+AUR, Discord, tweet) runs automatically as downstream jobs. Homebrew Core
+detects the stable GitHub release through its own autobump service. You do not
+need to do anything for those unless a job explicitly fails or Homebrew's
+external bump remains stale.
 
 ---
 
@@ -356,6 +358,9 @@ Once `publish` completes, confirm:
 [ ] GitHub Release exists at /releases/tag/vX.Y.Z and is marked Latest
 [ ] Release notes are non-empty
 [ ] SHA256SUMS asset is present and non-empty
+[ ] Both SPDX and CycloneDX SBOM assets are present
+[ ] Exactly one zeroclaw-vX.Y.Z-verification.tar.gz asset is present
+[ ] No loose *.bundle, *.attestation.jsonl, or *.intoto.jsonl assets are present
 [ ] At least one binary archive is downloadable (spot-check linux x86_64)
 [ ] Prebuilt Docker and generated Docker matrix jobs are green
 ```
@@ -369,12 +374,20 @@ inside the stable release workflow. You do not need a separate Docker check if
 all release jobs are green. If a maintainer instead starts the release by
 pushing a `vX.Y.Z` tag, Docker Publish starts as a separate tag-triggered run;
 confirm that sibling run is green before treating container publication as
-complete. Distribution channels need separate attention only when their jobs
-show red.
+complete. Scoop and AUR need separate attention only when their jobs show red.
+Homebrew Core is external to this workflow; its
+[autobump service](https://docs.brew.sh/Autobump) checks eligible formulae on
+its own schedule.
 
 Consumers who want to verify signatures, SBOMs, or SLSA provenance on the
 published artifacts can follow
 [Release artifact verification](./release-verification.md).
+
+After any release-attestation workflow change, a human maintainer must also run
+the online and disconnected verification rehearsal in
+`docs/maintainers/release-attestation-runbook.md` before closing the tracking
+issue. A local workflow lint or `act` run does not replace that release-level
+check because neither can mint GitHub's production OIDC attestation.
 
 ---
 
@@ -460,10 +473,14 @@ you typed the wrong version. Fix the mismatch and re-trigger.
 **An environment gate timed out:** Re-run only the timed-out job. No need to
 restart the workflow.
 
-**A distribution channel job failed (Scoop, AUR, Homebrew):** Each has a
-corresponding manually-triggerable sub-workflow. Re-run the specific one with
-`dry_run: true` first to confirm the fix, then `dry_run: false`. These are
-nice-to-have: a failed Scoop job does not invalidate the release itself.
+**A Scoop or AUR distribution job failed:** Each has a corresponding
+manually-triggerable sub-workflow. Re-run the specific one with `dry_run: true`
+first to confirm the fix, then `dry_run: false`. These are nice-to-have: a
+failed distribution job does not invalidate the release itself.
+
+**Homebrew Core is stale:** Homebrew is not a release-workflow job. Check the
+[Homebrew autobump status and documented manual bump
+path](https://docs.brew.sh/Autobump) instead of adding a repository fork token.
 
 ---
 
