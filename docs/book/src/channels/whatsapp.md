@@ -37,17 +37,28 @@ The shared `interrupt_on_new_message` option applies to both Cloud API mode and 
 
 ## Personal and business behavior
 
-For Web mode, `mode = "personal"` applies separate DM, group, and self-chat policies:
+For Web mode, `dm_policy` and `group_policy` apply under **both** modes. `self_chat_mode` is personal-only:
 
-| Field | Values | Effect |
-|---|---|---|
-| `dm_policy` | `allowlist`, `ignore`, `all` | Controls direct messages |
-| `group_policy` | `allowlist`, `ignore`, `all` | Controls group chats |
-| `self_chat_mode` | `true`, `false` | Controls the user's self-chat |
-| `mention_only` | `true`, `false` | Requires group messages to mention the bot |
-| `passive_group_context` | `true`, `false` | Records allowed unaddressed group messages as context only |
+| Field | Values | Applies under | Effect |
+|---|---|---|---|
+| `dm_policy` | `allowlist`, `ignore`, `all` | both modes | Controls direct messages |
+| `group_policy` | `allowlist`, `ignore`, `all` | both modes | Controls group chats |
+| `self_chat_mode` | `true`, `false` | personal only | Controls the user's self-chat |
+| `mention_only` | `true`, `false` | both modes | Requires group messages to mention the bot |
+| `passive_group_context` | `true`, `false` | both modes | Records allowed unaddressed group messages as context only |
 
-The default `mode = "business"` does not apply the personal DM/group policy split. For peer-gated regular-account deployments, use `mode = "personal"` with `dm_policy = "allowlist"` and `group_policy = "allowlist"`.
+`self_chat_mode` and the fromMe handling stay personal-only because they describe a personal account talking to itself, and a business account has no equivalent.
+
+### Compatibility note for `mode = "business"`
+
+Business mode previously accepted `dm_policy` and `group_policy` and then never consulted either one, so a channel that read as restrictive answered every message it received. Both keys are now enforced under business mode.
+
+`dm_policy` defaults to `allowlist`, so a business-mode deployment that relied on the previous permissive behavior must choose one of:
+
+- **Keep answering everyone** - set `dm_policy = "all"` and `group_policy = "all"` explicitly.
+- **Keep the restriction** - leave the defaults and make sure the senders you intend to serve are reachable through the channel's peer group, via `[peer_groups.<name>].external_peers`.
+
+`config validate` reports the affected keys before you upgrade.
 
 `passive_group_context = true` is opt-in and applies only to WhatsApp Web group chats. Allowed unaddressed group messages are stored in the room-scoped conversation history without starting an agent turn, sending reactions, downloading media, or calling the model. Later addressed messages in the same group can use that passive context.
 

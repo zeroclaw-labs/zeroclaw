@@ -10972,15 +10972,17 @@ pub fn validate_memory_semantics(
 
 /// Surface WhatsApp chat-policy keys that are accepted but never consulted.
 ///
-/// `dm_policy`, `group_policy` and `self_chat_mode` are read only by the Web
-/// transport inside its `mode == Personal` block, so under `mode = "business"`
-/// they validate cleanly and have no effect. That is easy to miss because
-/// `dm_policy` DEFAULTS to `Allowlist`: a business-mode Web channel reads as
-/// restrictive while answering every DM it receives.
+/// `self_chat_mode` is read only by the Web transport inside its
+/// `mode == Personal` block, so under `mode = "business"` it validates cleanly
+/// and has no effect. It describes a personal account talking to itself, and a
+/// business account has no equivalent.
+///
+/// `dm_policy` and `group_policy` are consulted under BOTH modes, so they are
+/// not reported here.
 ///
 /// `allowed_groups` is separate. `is_group_chat_allowed` returns true when the
-/// list is empty, and that gate does run in both modes, which makes an empty
-/// list the only group protection under `mode = "business"` and an open one.
+/// list is empty, so under `group_policy = "allowlist"` an empty list is an
+/// allowlist that admits every group. That holds under both modes.
 ///
 /// Warnings only, no behaviour change: an operator who is relying on the
 /// current defaults keeps working, and learns about it at `config validate`.
@@ -10998,18 +11000,6 @@ pub fn validate_whatsapp_semantics(
 
     if wa.mode != WhatsAppWebMode::Personal {
         let mut inert: Vec<(&'static str, String)> = Vec::new();
-        if wa.dm_policy != WhatsAppChatPolicy::All {
-            inert.push((
-                "dm_policy",
-                "every direct message is answered regardless of this setting".to_string(),
-            ));
-        }
-        if wa.group_policy != WhatsAppChatPolicy::All {
-            inert.push((
-                "group_policy",
-                "group messages are not filtered by this setting".to_string(),
-            ));
-        }
         if wa.self_chat_mode {
             inert.push((
                 "self_chat_mode",
@@ -11029,7 +11019,7 @@ pub fn validate_whatsapp_semantics(
     }
 
     // An empty allowed_groups only creates UNINTENDED open access where the
-    // effective policy would otherwise have consulted the list. Two personal-mode
+    // effective policy would otherwise have consulted the list. Two
     // configurations must stay quiet:
     //
     //   group_policy = "ignore"    the channel gate drops every group message
@@ -11039,14 +11029,10 @@ pub fn validate_whatsapp_semantics(
     //   group_policy = "all"       an explicit opt-in to open group access. Warning
     //                              here reports a deliberate choice as unsafe.
     //
-    // So the warning applies to business mode (where the list is consulted no matter
-    // what group_policy says) and to personal mode with group_policy = "allowlist"
-    // (where an empty list is an allowlist that admits everything).
-    let empty_list_permits_all = if wa.mode == WhatsAppWebMode::Personal {
-        wa.group_policy == WhatsAppChatPolicy::Allowlist
-    } else {
-        true
-    };
+    // group_policy is consulted under BOTH modes, so this predicate is
+    // mode-independent: the unintended case is `allowlist`, where an empty list
+    // is an allowlist that admits every group.
+    let empty_list_permits_all = wa.group_policy == WhatsAppChatPolicy::Allowlist;
 
     if wa.allowed_groups.is_empty() && empty_list_permits_all {
         out.push(crate::validation_warnings::ValidationWarning::new(
@@ -11054,7 +11040,7 @@ pub fn validate_whatsapp_semantics(
             format!(
                 "channels.whatsapp.{alias}.allowed_groups is empty, which permits EVERY \
                  group the linked account belongs to. List the group JIDs you intend to \
-                 serve, or set group_policy = \"ignore\" under mode = \"personal\"."
+                 serve, or set group_policy = \"ignore\" to serve no group at all."
             ),
             format!("channels.whatsapp.{alias}.allowed_groups"),
         ));
@@ -14717,20 +14703,24 @@ impl ChannelConfig for SignalConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum WhatsAppWebMode {
-    /// Respond to all messages passing the allowlist (default).
+    /// Respond to messages passing `dm_policy` and `group_policy` (default).
     #[default]
     Business,
-    /// Apply per-chat-type policies (dm_policy, group_policy, self_chat_mode).
+    /// As business mode, and additionally applies the self-chat semantics
+    /// (`self_chat_mode` and the fromMe handling) that only a personal account
+    /// has.
     Personal,
 }
 
-/// Policy for a particular WhatsApp chat type (DMs or groups) when
-/// `mode = "personal"`.
+/// Policy for a particular WhatsApp chat type (DMs or groups).
+///
+/// Applied under both `mode = "business"` and `mode = "personal"`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, zeroclaw_macros::ConfigEnum)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum WhatsAppChatPolicy {
-    /// Only respond to senders on the `allowed_numbers` list (default).
+    /// Only respond to recognized senders (default). Senders are resolved from
+    /// the channel's peer group, via `[peer_groups.<name>].external_peers`.
     #[default]
     Allowlist,
     /// Ignore all messages in this chat type.
@@ -14817,17 +14807,18 @@ pub struct WhatsAppConfig {
     #[serde(default)]
     pub interrupt_on_new_message: bool,
     /// Usage mode for WhatsApp Web: "business" (default) or "personal".
-    /// In personal mode the bot applies dm_policy, group_policy, and
-    /// self_chat_mode to decide which chats to respond in.
+    /// `dm_policy` and `group_policy` apply under BOTH modes. Personal mode
+    /// additionally applies `self_chat_mode` and the fromMe handling, which
+    /// describe a personal account talking to itself.
     #[tab(Advanced)]
     #[serde(default)]
     pub mode: WhatsAppWebMode,
-    /// Policy for direct messages when mode = "personal".
+    /// Policy for direct messages, applied under both modes.
     /// "allowlist" (default) | "ignore" | "all".
     #[tab(Advanced)]
     #[serde(default)]
     pub dm_policy: WhatsAppChatPolicy,
-    /// Policy for group chats when mode = "personal".
+    /// Policy for group chats, applied under both modes.
     /// "allowlist" (default) | "ignore" | "all".
     #[tab(Advanced)]
     #[serde(default)]
@@ -36755,24 +36746,38 @@ allowed_users = []
     const WA_INERT_WARNING: &str = "whatsapp_chat_policy_inert";
     const WA_OPEN_GROUPS_WARNING: &str = "whatsapp_empty_group_allowlist_permits_all";
 
-    /// A Web channel in business mode: the chat policies are accepted and never
-    /// consulted, and dm_policy DEFAULTS to allowlist, so the operator believes
-    /// the channel is gated when every DM is answered.
+    /// A Web channel in business mode: `dm_policy` and `group_policy` are
+    /// consulted under both modes, so calling them inert would now be false.
+    /// `self_chat_mode` describes a personal account talking to itself and has
+    /// no business-mode equivalent, so it is the one key that stays inert.
     #[test]
-    async fn whatsapp_business_mode_flags_inert_chat_policies() {
+    async fn whatsapp_business_mode_flags_only_self_chat_mode() {
         let toml = r#"
 [channels.whatsapp.shop]
 enabled = true
 mode = "business"
 session_path = "/tmp/wa-session"
+self_chat_mode = true
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
         let warnings = warnings_with_code(&cfg, WA_INERT_WARNING);
         assert!(
-            warnings
+            !warnings
                 .iter()
                 .any(|w| w.path == "channels.whatsapp.shop.dm_policy"),
-            "default dm_policy under business mode must be flagged: {warnings:?}"
+            "dm_policy is enforced under both modes and must not be reported inert: {warnings:?}"
+        );
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.path == "channels.whatsapp.shop.group_policy"),
+            "group_policy is enforced under both modes and must not be reported inert: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.path == "channels.whatsapp.shop.self_chat_mode"),
+            "self_chat_mode has no business-mode equivalent and stays inert: {warnings:?}"
         );
         assert!(
             warnings.iter().any(|w| w.message.contains("personal")),
@@ -36897,9 +36902,9 @@ group_policy = "all"
         );
     }
 
-    /// Business mode never consults group_policy, so the list is the only gate
-    /// and an empty one really does admit every group. This is the positive
-    /// case that must survive narrowing the warning.
+    /// The default group_policy is `allowlist`, so an empty list really does
+    /// admit every group. This is the positive case that must survive narrowing
+    /// the warning.
     #[test]
     async fn whatsapp_business_empty_allowed_groups_is_flagged() {
         let toml = r#"
@@ -36918,12 +36923,11 @@ session_path = "/tmp/wa-session"
         assert_eq!(warnings[0].path, "channels.whatsapp.shop.allowed_groups");
     }
 
-    /// Business mode ignores group_policy entirely, so even the value that
-    /// silences the warning under personal mode must NOT silence it here.
-    /// Without this, narrowing the check could be over-applied and reopen the
-    /// original bug from the other side.
+    /// Business mode now consults group_policy, so `ignore` closes group access
+    /// there exactly as it does under personal mode. Warning that an empty list
+    /// "permits EVERY group" would be false for this configuration.
     #[test]
-    async fn whatsapp_business_ignore_group_policy_still_flagged() {
+    async fn whatsapp_business_ignore_group_policy_is_not_flagged() {
         let toml = r#"
 [channels.whatsapp.shop]
 enabled = true
@@ -36932,11 +36936,10 @@ session_path = "/tmp/wa-session"
 group_policy = "ignore"
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
-        assert_eq!(
-            warnings_with_code(&cfg, WA_OPEN_GROUPS_WARNING).len(),
-            1,
-            "group_policy is inert under business mode, so it must not silence \
-             the open-groups warning"
+        assert!(
+            warnings_with_code(&cfg, WA_OPEN_GROUPS_WARNING).is_empty(),
+            "group_policy = \"ignore\" drops every group message under both modes, \
+             so the open-groups warning must not fire"
         );
     }
 
