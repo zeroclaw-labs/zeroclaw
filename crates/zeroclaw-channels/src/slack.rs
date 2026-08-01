@@ -60,6 +60,16 @@ pub struct SlackChannel {
     /// older turn's completion would blank a newer turn's status, and its late
     /// lifecycle write would overwrite it.
     assistant_status_owners: AsyncMutex<HashMap<AssistantTarget, AssistantStatusOwner>>,
+    /// Write serializer per Assistant status surface.
+    ///
+    /// Checking ownership is not enough on its own: the check ends when it
+    /// returns, but the Slack request continues. A stalled older request could
+    /// therefore still cross a newer turn's claim and land last, overwriting or
+    /// clearing live status. Holding this lock across *both* the ownership check
+    /// and the request makes the pair atomic per target, so requests to one
+    /// surface complete in order and a superseded turn re-checks — and backs
+    /// off — before it ever issues its own call.
+    assistant_status_locks: AsyncMutex<HashMap<AssistantTarget, Arc<AsyncMutex<()>>>>,
     /// In-flight progress `chat.update` tasks per draft. Progress updates are
     /// dispatched detached so the draft updater never back-pressures the tool
     /// loop, which means a slow update can still be in flight when the turn
@@ -323,6 +333,7 @@ impl SlackChannel {
             active_assistant_threads: Mutex::new(HashSet::new()),
             draft_turns: AsyncMutex::new(HashMap::new()),
             assistant_status_owners: AsyncMutex::new(HashMap::new()),
+            assistant_status_locks: AsyncMutex::new(HashMap::new()),
             pending_draft_updates: AsyncMutex::new(HashMap::new()),
             seen_threads: Mutex::new(HashSet::new()),
             use_markdown_blocks: false,
@@ -631,8 +642,61 @@ impl SlackChannel {
                 .min_by_key(|(_, owner)| owner.claimed_at)
                 .map(|(target, _)| target.clone())
         {
-            owners.remove(&victim);
+            let evicted = owners.remove(&victim);
+            // Eviction is a real loss of cleanup authority: the evicted target
+            // may still be showing status in Slack and nothing owns clearing it
+            // any more. Bounding memory must not silently orphan external
+            // state, so record it with the target and how long it was held.
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "channel_id": victim.channel_id,
+                        "thread_ts": victim.thread_ts,
+                        "held_secs": evicted
+                            .as_ref()
+                            .map_or(0, |owner| owner.claimed_at.elapsed().as_secs()),
+                        "cap": ASSISTANT_STATUS_OWNER_CAP,
+                    })),
+                "Evicted an Assistant status owner at cap; that thread's status \
+                 can no longer be cleared by this process"
+            );
         }
+    }
+
+    /// The write serializer for `target`, creating it on first use.
+    ///
+    /// Entries whose only remaining reference is the registry are dropped here,
+    /// so this map tracks live contention rather than every target ever seen.
+    async fn assistant_status_lock(&self, target: &AssistantTarget) -> Arc<AsyncMutex<()>> {
+        let mut locks = self.assistant_status_locks.lock().await;
+        if let Some(existing) = locks.get(target) {
+            return Arc::clone(existing);
+        }
+        locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+        let created = Arc::new(AsyncMutex::new(()));
+        locks.insert(target.clone(), Arc::clone(&created));
+        created
+    }
+
+    /// Publish `status` to `target` only if `message_id` still owns it, with the
+    /// check and the Slack request serialized against every other write to the
+    /// same surface. Returns `Ok(())` without calling Slack when superseded.
+    async fn write_owned_assistant_status(
+        &self,
+        target: &AssistantTarget,
+        message_id: &str,
+        status: &str,
+    ) -> anyhow::Result<()> {
+        let serializer = self.assistant_status_lock(target).await;
+        let _ordered = serializer.lock().await;
+        // Re-checked inside the ordering boundary: a turn that was current when
+        // it started waiting may have been superseded while it queued.
+        if !self.owns_assistant_status(target, message_id).await {
+            return Ok(());
+        }
+        self.set_assistant_status(target, status).await
     }
 
     /// Whether `message_id` still owns `target`'s status surface. A superseded
@@ -676,15 +740,24 @@ impl SlackChannel {
             return;
         };
 
+        let serializer = self.assistant_status_lock(target).await;
         for attempt in 0..ASSISTANT_STATUS_CLEAR_ATTEMPTS {
-            // Re-checked every attempt: a newer turn may claim the surface while
-            // we are retrying, and blanking it would erase live state.
-            if !self.owns_assistant_status(target, message_id).await {
-                return;
-            }
-            match self.set_assistant_status(target, "").await {
-                Ok(()) => {
+            // The check, the clear, and the release are one ordered unit per
+            // target. Without that a newer turn could claim and publish while
+            // this clear was in flight, and the clear would blank live status.
+            let outcome = {
+                let _ordered = serializer.lock().await;
+                if !self.owns_assistant_status(target, message_id).await {
+                    return;
+                }
+                let result = self.set_assistant_status(target, "").await;
+                if result.is_ok() {
                     self.release_assistant_status(target, message_id).await;
+                }
+                result
+            };
+            match outcome {
+                Ok(()) => {
                     return;
                 }
                 Err(e) => {
@@ -4798,16 +4871,15 @@ impl Channel for SlackChannel {
             .get(message_id)
             .and_then(|turn| turn.assistant_target.clone());
         if let Some(target) = assistant_target {
-            // A superseded turn must not write to the shared status surface: the
-            // newer turn's state is what the single display should show.
-            if !self.owns_assistant_status(&target, message_id).await {
-                return Ok(());
-            }
             if self.progress_rate_limited(message_id) {
                 return Ok(());
             }
             self.record_progress_update(message_id);
-            return self.set_assistant_status(&target, &status_line).await;
+            // Ownership is checked inside the per-target serializer so a stalled
+            // request cannot land after a newer turn has published.
+            return self
+                .write_owned_assistant_status(&target, message_id, &status_line)
+                .await;
         }
 
         self.update_draft(recipient, message_id, &status_line).await
@@ -7794,6 +7866,119 @@ mod tests {
                 thread_ts: format!("thread-{}", ASSISTANT_STATUS_OWNER_CAP + 31),
             }),
             "the newest claim must survive eviction"
+        );
+    }
+
+    /// Preflight ownership alone is not enough: the check ends when it returns,
+    /// but the Slack request keeps going. This holds turn A's status write
+    /// *in flight*, lets turn B claim the same target and publish, then releases
+    /// A — and proves B's status is still the final visible value.
+    ///
+    /// Without serializing through request completion, A's delayed write lands
+    /// last and overwrites B.
+    #[tokio::test]
+    async fn an_in_flight_write_cannot_cross_a_newer_turns_claim() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        Mock::given(method("POST"))
+            .and(path("/chat.postMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true, "ts": "final-ts",
+            })))
+            .mount(&server)
+            .await;
+        // A's write stalls for 2s; B's is immediate.
+        Mock::given(method("POST"))
+            .and(path("/assistant.threads.setStatus"))
+            .and(body_string_contains("Running tool"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(2))
+                    .set_body_json(serde_json::json!({"ok": true})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/assistant.threads.setStatus"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&server)
+            .await;
+
+        let ch = Arc::new(test_slack_channel(&server, tmp.path()).with_streaming(true, 1));
+        ch.active_assistant_threads
+            .lock()
+            .unwrap()
+            .insert(AssistantTarget {
+                channel_id: "C123".to_string(),
+                thread_ts: "shared-thread".to_string(),
+            });
+        let draft = |id: &'static str| {
+            SendMessage::new("...", "C123")
+                .in_thread(Some("shared-thread".to_string()))
+                .in_reply_to(Some(id.to_string()))
+        };
+        let turn_a = ch
+            .send_draft(&draft("slack_C123_msg-a"))
+            .await
+            .unwrap()
+            .unwrap();
+
+        // A starts writing and stalls inside the Slack request.
+        let a_ch = Arc::clone(&ch);
+        let a_id = turn_a.clone();
+        let started = Arc::new(AtomicUsize::new(0));
+        let started_a = Arc::clone(&started);
+        let a_task = zeroclaw_spawn::spawn!(async move {
+            started_a.fetch_add(1, Ordering::SeqCst);
+            a_ch.update_draft_lifecycle("C123", &a_id, ProgressEvent::RunningTool)
+                .await
+        });
+        while started.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // B claims the same target and publishes while A is still in flight.
+        let turn_b = ch
+            .send_draft(&draft("slack_C123_msg-b"))
+            .await
+            .unwrap()
+            .unwrap();
+        let b_started = std::time::Instant::now();
+        ch.update_draft_lifecycle("C123", &turn_b, ProgressEvent::WaitingOnModel)
+            .await
+            .unwrap();
+        let b_publish_elapsed = b_started.elapsed();
+
+        // B's publish must have been held behind A's in-flight request rather
+        // than racing it. Arrival order alone cannot show this — wiremock
+        // records a request on receipt — so assert B was actually blocked for
+        // most of A's 2s response. Without the serializer this returns
+        // immediately and the elapsed time collapses.
+        assert!(
+            b_publish_elapsed >= Duration::from_millis(1_200),
+            "B's write must serialize behind A's in-flight request, took {b_publish_elapsed:?}"
+        );
+
+        // Release A and let its superseded terminal path run too.
+        a_task.await.unwrap().unwrap();
+        ch.finalize_draft("C123", &turn_a, "A's answer", false)
+            .await
+            .unwrap();
+
+        let calls = assistant_status_calls(&server).await;
+        assert_eq!(
+            calls.last(),
+            Some(&("shared-thread".to_string(), "Waiting on model".to_string())),
+            "the newer turn's status must remain the final visible value: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|(_, status)| status.is_empty()),
+            "a superseded turn must not clear the live turn's status: {calls:?}"
         );
     }
 
