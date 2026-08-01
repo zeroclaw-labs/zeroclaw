@@ -1132,6 +1132,53 @@ fn command_basename(raw: &str) -> &str {
     after_fwd.rsplit('\\').next().unwrap_or(after_fwd)
 }
 
+fn python_module_is_safe(module: &str, workspace_dir: &Path) -> bool {
+    if matches!(module, "unittest" | "pytest" | "mypy" | "json.tool") {
+        return true;
+    }
+
+    let valid_local_name = module.split('.').all(|component| {
+        let mut chars = component.chars();
+        chars
+            .next()
+            .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+            && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    });
+    if !valid_local_name {
+        return false;
+    }
+
+    let Ok(workspace) = workspace_dir.canonicalize() else {
+        return false;
+    };
+    let relative = module.replace('.', std::path::MAIN_SEPARATOR_STR);
+    let module_file = workspace.join(format!("{relative}.py"));
+    let package_entrypoint = workspace.join(relative).join("__main__.py");
+    [module_file, package_entrypoint]
+        .iter()
+        .filter_map(|candidate| candidate.canonicalize().ok())
+        .any(|candidate| candidate.starts_with(&workspace))
+}
+
+fn python_args_safe(args: &[String], workspace_dir: &Path) -> bool {
+    for (index, arg) in args.iter().enumerate() {
+        if arg.starts_with("-c") {
+            return false;
+        }
+
+        if arg == "-m" {
+            return args
+                .get(index + 1)
+                .is_some_and(|module| python_module_is_safe(module, workspace_dir));
+        }
+        if let Some(module) = arg.strip_prefix("-m").filter(|module| !module.is_empty()) {
+            return python_module_is_safe(module, workspace_dir);
+        }
+    }
+
+    true
+}
+
 /// Strip common Windows executable suffixes (.exe, .cmd, .bat) for uniform
 /// matching against allowlists and risk tables. On non-Windows platforms this
 /// is a no-op that returns the input unchanged.
@@ -1516,9 +1563,7 @@ impl SecurityPolicy {
                             || arg.starts_with("alias.")
                     })
             }
-            "python" | "python3" => !args
-                .iter()
-                .any(|arg| arg.starts_with("-c") || arg.starts_with("-m")),
+            "python" | "python3" => python_args_safe(args, &self.workspace_dir),
             "node" => {
                 // -e/--eval evaluates argument as JavaScript
                 // -p/--print same as --eval but prints the result
@@ -3519,10 +3564,9 @@ mod tests {
         assert!(!p.is_command_allowed("python -c '__import__(\"os\").system(\"id\")'"));
         assert!(!p.is_command_allowed("python3 -m http.server"));
         assert!(!p.is_command_allowed("python3 -m pip install evil"));
-        // Broad -m block: these are intentional collateral
-        assert!(!p.is_command_allowed("python3 -m pytest"));
-        assert!(!p.is_command_allowed("python3 -m mypy src/"));
         assert!(!p.is_command_allowed("python3 -m venv .venv"));
+        assert!(!p.is_command_allowed("python3 -m local_package"));
+        assert!(!p.is_command_allowed("python3 -m"));
         // Glued form: -mhttp.server is one token
         assert!(!p.is_command_allowed("python3 -mhttp.server"));
         // node: -e/--eval evaluates JS, -p/--print evaluates and prints
@@ -3537,6 +3581,33 @@ mod tests {
         assert!(!p.is_command_allowed("node -e'process.exit()'"));
         // Flag with other args before it
         assert!(!p.is_command_allowed("python3 -W ignore -c 'import os'"));
+    }
+
+    #[test]
+    fn python_validation_modules_allowed() {
+        let p = default_policy();
+        assert!(p.is_command_allowed("python3 -m unittest discover -s tests -v"));
+        assert!(p.is_command_allowed("python3 -munittest discover -s tests"));
+        assert!(p.is_command_allowed("python3 -m pytest"));
+        assert!(p.is_command_allowed("python3 -m mypy src/"));
+        assert!(p.is_command_allowed("python3 -m json.tool package.json"));
+    }
+
+    #[test]
+    fn python_local_workspace_module_allowed() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let package = workspace.path().join("receipt");
+        std::fs::create_dir(&package).expect("package directory");
+        std::fs::write(package.join("__main__.py"), "print('ok')\n").expect("package entrypoint");
+        let p = SecurityPolicy {
+            workspace_dir: workspace.path().to_path_buf(),
+            ..default_policy()
+        };
+
+        assert!(p.is_command_allowed("python3 -m receipt"));
+        assert!(p.is_command_allowed("python3 -mreceipt"));
+        assert!(!p.is_command_allowed("python3 -m missing_package"));
+        assert!(!p.is_command_allowed("python3 -m ../receipt"));
     }
 
     #[test]

@@ -325,6 +325,11 @@ impl Tool for ShellTool {
             anyhow::Error::msg(format!("Sandbox error: {e}"))
         })?;
 
+        // Wrapping backends replace the command and therefore discard the
+        // current directory set by the runtime adapter. Reapply the workspace
+        // so the sandboxed shell starts inside the directory its policy grants.
+        cmd.current_dir(&self.security.workspace_dir);
+
         cmd.env_clear();
 
         for var in collect_allowed_shell_env_vars(&self.security) {
@@ -1496,6 +1501,67 @@ mod tests {
         assert_eq!(
             cmd.get_args().map(|a| a.to_os_string()).collect::<Vec<_>>(),
             args_before
+        );
+    }
+
+    #[cfg(unix)]
+    struct ReplacingSandbox;
+
+    #[cfg(unix)]
+    impl Sandbox for ReplacingSandbox {
+        fn wrap_command(&self, cmd: &mut std::process::Command) -> std::io::Result<()> {
+            let program = cmd.get_program().to_os_string();
+            let args = cmd.get_args().map(ToOwned::to_owned).collect::<Vec<_>>();
+            let mut replacement = std::process::Command::new(program);
+            replacement.args(args);
+            *cmd = replacement;
+            Ok(())
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn name(&self) -> &str {
+            "replacing-test-sandbox"
+        }
+
+        fn description(&self) -> &str {
+            "Test sandbox that replaces the command"
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_reapplies_workspace_after_sandbox_wrap() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace.path().to_path_buf(),
+            allowed_commands: vec!["pwd".into()],
+            ..SecurityPolicy::default()
+        });
+        let tool =
+            ShellTool::new_with_sandbox(security, test_runtime(), Arc::new(ReplacingSandbox));
+
+        let result = tool
+            .execute(json!({"command": "pwd"}))
+            .await
+            .expect("pwd should execute");
+
+        assert!(
+            result.success,
+            "unexpected shell failure: {:?}",
+            result.error
+        );
+        assert_eq!(
+            result.output.trim(),
+            workspace
+                .path()
+                .canonicalize()
+                .expect("canonical workspace")
+                .to_string_lossy(),
+            "sandboxed command must run from the configured workspace"
         );
     }
 
