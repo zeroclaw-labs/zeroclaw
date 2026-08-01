@@ -2288,6 +2288,107 @@ pub fn strip_think_tags(s: &str) -> String {
     result.trim().to_string()
 }
 
+/// Strip trailing provider terminal markers (`<eom>`, `<|eom|>`) from response text.
+/// Only strips when the marker is at the very end (optionally followed by whitespace
+/// or additional recognized markers). Inline markers in prose are preserved.
+pub fn strip_trailing_terminal_markers(s: &str) -> String {
+    const MARKERS: &[&str] = &["<|eom|>", "<eom>"];
+
+    let mut result = s.to_string();
+
+    // Loop to handle stacked markers like "<eom><|eom|>" or "<eom>\n<|eom|>"
+    loop {
+        let mut found = false;
+
+        for &marker in MARKERS {
+            // Try stripping marker at end
+            if let Some(stripped) = result.strip_suffix(marker) {
+                result = stripped.to_string();
+                found = true;
+                break;
+            }
+
+            // Try stripping marker + trailing whitespace (up to 10 chars)
+            for ws_len in (1..=10.min(result.len())).rev() {
+                if result.len() > marker.len() + ws_len {
+                    let suffix_start = result.len() - ws_len;
+                    if let Some(suffix) = result.get(suffix_start..) {
+                        if suffix.chars().all(|c| c.is_whitespace()) {
+                            if let Some(before_ws) = result.get(..suffix_start) {
+                                if let Some(stripped) = before_ws.strip_suffix(marker) {
+                                    result = stripped.to_string();
+                                    found = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if found {
+                break;
+            }
+        }
+
+        if !found {
+            break;
+        }
+    }
+
+    result
+}
+
+#[cfg(test)]
+mod terminal_marker_strip_tests {
+    use super::*;
+
+    #[test]
+    fn strips_trailing_eom() {
+        assert_eq!(strip_trailing_terminal_markers("Summary<eom>"), "Summary");
+    }
+
+    #[test]
+    fn strips_trailing_pipe_eom() {
+        assert_eq!(strip_trailing_terminal_markers("Summary<|eom|>"), "Summary");
+    }
+
+    #[test]
+    fn preserves_inline_eom() {
+        assert_eq!(
+            strip_trailing_terminal_markers("literal <eom> in code"),
+            "literal <eom> in code"
+        );
+    }
+
+    #[test]
+    fn strips_marker_followed_by_newline() {
+        assert_eq!(strip_trailing_terminal_markers("Summary<eom>\n"), "Summary");
+    }
+
+    #[test]
+    fn strips_stacked_markers() {
+        assert_eq!(
+            strip_trailing_terminal_markers("Summary<eom><|eom|>"),
+            "Summary"
+        );
+    }
+
+    #[test]
+    fn strips_stacked_markers_with_whitespace() {
+        assert_eq!(strip_trailing_terminal_markers("Summary<eom>\n<|eom|>"), "Summary");
+    }
+
+    #[test]
+    fn preserves_plain_text() {
+        assert_eq!(strip_trailing_terminal_markers("plain text"), "plain text");
+    }
+
+    #[test]
+    fn handles_empty_string() {
+        assert_eq!(strip_trailing_terminal_markers(""), "");
+    }
+}
+
 /// Strip prompt-guided tool artifacts from visible output while preserving
 /// raw model text in history for future turns.
 pub fn strip_tool_result_blocks(text: &str) -> String {

@@ -278,6 +278,11 @@ impl StreamThinkTagStripper {
 /// small suffix that could still become a marker on the next chunk. Mid-text
 /// markers are left intact — the issue explicitly demands "narrowly scoped"
 /// normalization so prose like "literal <eom> in code" stays untouched.
+///
+/// **Handles stacked markers and marker+whitespace**: when a complete marker
+/// is followed only by whitespace or another recognized marker, the sequence
+/// is held pending until either meaningful text proves it inline or the stream
+/// ends and it is discarded.
 #[derive(Debug, Default)]
 pub(crate) struct StreamTerminalMarkerStripper {
     pending: String,
@@ -294,14 +299,60 @@ impl StreamTerminalMarkerStripper {
         let old_pending = std::mem::take(&mut self.pending);
         let old_pending_was_complete_marker = Self::MARKERS.contains(&old_pending.as_str());
 
-        // If the previous call held a complete candidate marker and the new
-        // chunk is non-empty, the marker was inline. Release it into the
-        // visible output before processing the new text.
         let mut input = String::with_capacity(old_pending.len() + chunk.len());
         let mut visible = String::new();
+
         if old_pending_was_complete_marker {
-            visible.push_str(&old_pending);
-            input.push_str(chunk);
+            // Previous chunk ended with a complete marker. Check if this chunk
+            // is another marker (stacked), whitespace, whitespace+marker, or
+            // meaningful text (which makes the first marker inline).
+
+            // First check: is this chunk itself a complete marker or marker prefix?
+            let chunk_is_marker = Self::MARKERS.contains(&chunk);
+            let chunk_starts_with_marker = Self::MARKERS.iter().any(|m| chunk.starts_with(*m));
+
+            if chunk_is_marker || chunk_starts_with_marker {
+                // Another marker (or marker prefix) arrives - the first marker is terminal
+                // Accumulate both for now; finish() will strip them
+                self.pending.push_str(&old_pending);
+                self.pending.push_str(chunk);
+                return visible;
+            }
+
+            let meaningful_pos = chunk
+                .find(|c: char| !c.is_whitespace())
+                .unwrap_or(chunk.len());
+
+            if meaningful_pos == 0 {
+                // Meaningful text immediately (not starting with '<'): marker was inline
+                visible.push_str(&old_pending);
+                input.push_str(chunk);
+            } else if meaningful_pos < chunk.len() {
+                // Whitespace followed by meaningful text
+                let whitespace = &chunk[..meaningful_pos];
+                let rest = &chunk[meaningful_pos..];
+
+                // Check if the meaningful text is another marker
+                let trimmed_rest = rest.trim_start();
+                if Self::MARKERS.contains(&trimmed_rest)
+                    || Self::MARKERS.iter().any(|m| trimmed_rest.starts_with(*m))
+                {
+                    // Another marker follows after whitespace - hold everything pending
+                    self.pending.push_str(&old_pending);
+                    self.pending.push_str(whitespace);
+                    input.push_str(rest);
+                } else {
+                    // Whitespace + meaningful non-marker text: marker was inline
+                    visible.push_str(&old_pending);
+                    visible.push_str(whitespace);
+                    input.push_str(rest);
+                }
+            } else {
+                // Entire chunk is whitespace after marker - accumulate
+                self.pending.push_str(&old_pending);
+                self.pending.push_str(chunk);
+                return visible;
+            }
         } else {
             input.push_str(&old_pending);
             input.push_str(chunk);
@@ -309,6 +360,19 @@ impl StreamTerminalMarkerStripper {
 
         loop {
             let Some(start) = input.find('<') else {
+                // No '<' in input - check if we're accumulating whitespace after a marker
+                if self.pending_is_terminal_marker_plus_whitespace() {
+                    // Check if this input is only whitespace
+                    if input.chars().all(|c| c.is_whitespace()) {
+                        self.pending.push_str(&input);
+                        return visible;
+                    }
+                    // Meaningful text after marker+whitespace - marker was inline
+                    visible.push_str(&self.pending);
+                    visible.push_str(&input);
+                    self.pending.clear();
+                    return visible;
+                }
                 visible.push_str(&input);
                 self.pending.clear();
                 return visible;
@@ -317,33 +381,45 @@ impl StreamTerminalMarkerStripper {
             visible.push_str(&input[..start]);
             let tail = &input[start..];
 
-            // Case 1: `tail` is exactly a complete marker. Hold it
-            // provisionally until either the next chunk proves it inline or
-            // `finish()` confirms it terminal.
+            // Case 1: `tail` is exactly a complete marker
             if let Some(marker) = Self::MARKERS.iter().find(|m| tail == **m).copied() {
                 self.pending.clear();
                 self.pending.push_str(marker);
                 return visible;
             }
 
-            // Case 2: `tail` starts with a complete marker but has more text
-            // after it within this same chunk. The marker is inline.
+            // Case 2: `tail` starts with a complete marker but has more text after it
             if let Some(marker) = Self::MARKERS
                 .iter()
                 .find(|m| tail.starts_with(**m))
                 .copied()
             {
-                visible.push_str(marker);
-                input = tail[marker.len()..].to_string();
-                continue;
+                let after_marker = &tail[marker.len()..];
+
+                // Check what comes after the marker
+                let after_trimmed = after_marker.trim_start();
+
+                if after_trimmed.is_empty() {
+                    // Only whitespace after marker - hold marker + whitespace pending
+                    self.pending.clear();
+                    self.pending.push_str(tail);
+                    return visible;
+                } else if Self::MARKERS.contains(&after_trimmed)
+                    || Self::MARKERS.iter().any(|m| after_trimmed.starts_with(*m))
+                {
+                    // Another marker follows - this marker is terminal, hold it + following text
+                    self.pending.clear();
+                    self.pending.push_str(tail);
+                    return visible;
+                } else {
+                    // Meaningful non-marker text after marker - inline marker
+                    visible.push_str(marker);
+                    input = after_marker.to_string();
+                    continue;
+                }
             }
 
-            // Case 3: `tail` is a strict prefix of some marker. Keep it
-            // pending. `longest_suffix_matching_prefix` is safe here because
-            // `pattern[..len]` walks byte offsets within an ASCII marker; the
-            // returned `len` is at most `tail.len()`, and the slice boundary
-            // sits at a known ASCII prefix so the resulting split is a valid
-            // UTF-8 boundary.
+            // Case 3: `tail` is a strict prefix of some marker
             let keep_len = Self::MARKERS
                 .iter()
                 .map(|m| longest_suffix_matching_prefix(tail, m))
@@ -355,22 +431,69 @@ impl StreamTerminalMarkerStripper {
                 return visible;
             }
 
-            // Case 4: `tail` begins with `<` but is not a marker prefix.
-            // Consume the `<` and continue scanning.
+            // Case 4: `tail` begins with `<` but is not a marker prefix
             visible.push('<');
             input = tail[1..].to_string();
         }
     }
 
+    /// Check if pending is a complete marker optionally followed by whitespace
+    /// and/or additional complete markers.
+    fn pending_is_terminal_marker_plus_whitespace(&self) -> bool {
+        let pending_trimmed = self.pending.trim_end();
+        if Self::MARKERS.contains(&pending_trimmed) {
+            return true;
+        }
+        // Check for stacked markers
+        let mut remaining = pending_trimmed;
+        loop {
+            let mut found = false;
+            for &marker in Self::MARKERS {
+                if let Some(before) = remaining.strip_suffix(marker) {
+                    remaining = before.trim_end();
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                break;
+            }
+        }
+        remaining.is_empty()
+    }
+
     pub(crate) fn finish(&mut self) -> String {
         let final_pending = std::mem::take(&mut self.pending);
-        // If the held suffix is itself a complete marker, the stream ended
-        // before any further text arrived — discard it. Otherwise emit the
-        // held text verbatim (it may be a partial marker prefix or ordinary
-        // trailing bytes that the loop above chose to retain).
-        if Self::MARKERS.contains(&final_pending.as_str()) {
-            String::new()
+
+        // Check if pending ends with terminal marker(s) + optional whitespace
+        let pending_trimmed = final_pending.trim_end();
+
+        // Try to strip stacked markers from the end
+        let mut result = pending_trimmed.to_string();
+        loop {
+            let mut found_marker = false;
+            for &marker in Self::MARKERS {
+                if let Some(stripped) = result.strip_suffix(marker) {
+                    result = stripped.trim_end().to_string();
+                    found_marker = true;
+                    break;
+                }
+            }
+            if !found_marker {
+                break;
+            }
+        }
+
+        // If we stripped at least one marker, the rest was terminal - discard
+        if result.len() < pending_trimmed.len() {
+            // We stripped markers - check if anything meaningful remains
+            if result.is_empty() {
+                return String::new();
+            }
+            // Something remains after stripping markers - it was before the markers
+            result
         } else {
+            // No markers found - return original pending
             final_pending
         }
     }
@@ -519,5 +642,52 @@ mod terminal_marker_stripper_tests {
     fn marker_inside_word_is_inline() {
         // `<eom` mid-word with no closing `>` is not a complete marker.
         assert_eq!(drain(&["see<eomfile"]), "see<eomfile");
+    }
+
+    #[test]
+    fn strips_marker_followed_by_newline() {
+        // IftekharUddin review Blocking 2: marker + whitespace must be stripped
+        assert_eq!(drain(&["Summary<eom>\n"]), "Summary");
+    }
+
+    #[test]
+    fn strips_marker_followed_by_multiple_whitespace() {
+        assert_eq!(drain(&["Summary<eom>\n\n  "]), "Summary");
+    }
+
+    #[test]
+    fn strips_stacked_markers_same_chunk() {
+        // IftekharUddin review Blocking 2: stacked markers must be stripped
+        assert_eq!(drain(&["Summary<eom><|eom|>"]), "Summary");
+    }
+
+    #[test]
+    fn strips_stacked_markers_different_chunks() {
+        assert_eq!(drain(&["Summary<eom>", "<|eom|>"]), "Summary");
+    }
+
+    #[test]
+    fn strips_stacked_markers_with_whitespace_between() {
+        assert_eq!(drain(&["Summary<eom>\n", "<|eom|>"]), "Summary");
+    }
+
+    #[test]
+    fn strips_stacked_markers_with_whitespace_in_same_chunk() {
+        assert_eq!(drain(&["Summary<eom>\n<|eom|>"]), "Summary");
+    }
+
+    #[test]
+    fn preserves_inline_eom_followed_by_whitespace_then_text() {
+        // Marker + whitespace + meaningful text = inline marker
+        assert_eq!(
+            drain(&["literal <eom>\n", "in code"]),
+            "literal <eom>\nin code"
+        );
+    }
+
+    #[test]
+    fn preserves_inline_eom_with_meaningful_text_immediately() {
+        // Marker followed immediately by non-whitespace text = inline
+        assert_eq!(drain(&["literal <eom>in code"]), "literal <eom>in code");
     }
 }

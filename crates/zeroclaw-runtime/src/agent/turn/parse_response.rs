@@ -168,6 +168,7 @@ pub(crate) async fn interpret_chat_response(
     }
 
     let response_text = strip_think_tags(resp.text_or_empty());
+    let response_text = zeroclaw_tool_call_parser::strip_trailing_terminal_markers(&response_text);
     // First try native structured tool calls (OpenAI-format).
     // Fall back to text-based parsing (XML tags, markdown blocks,
     // GLM format) only if the model_provider returned no native calls —
