@@ -11,7 +11,10 @@
 
 use super::embeddings::EmbeddingProvider;
 use async_trait::async_trait;
-use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
+use fastembed::{
+    EmbeddingModel, InitOptionsUserDefined, Pooling, QuantizationMode, TextEmbedding,
+    TextInitOptions, TokenizerFiles, UserDefinedEmbeddingModel,
+};
 use parking_lot::Mutex;
 use std::sync::Arc;
 
@@ -41,6 +44,15 @@ impl LocalEmbedding {
     /// because embeddings from two different models are not comparable and a
     /// silent substitution would corrupt every stored vector.
     pub fn new(model_name: &str, cache_dir: Option<&std::path::Path>) -> anyhow::Result<Self> {
+        // A path points at weights on disk, which is the only way to run a
+        // model `fastembed` does not ship in its catalogue — for instance a
+        // language-specific encoder chosen because the agent does not work in
+        // English.
+        let candidate = std::path::Path::new(model_name);
+        if candidate.is_dir() {
+            return Self::from_directory(candidate);
+        }
+
         let model = Self::parse_model(model_name)?;
         let dimensions = Self::dimensions_for(model.clone())?;
 
@@ -58,6 +70,70 @@ impl LocalEmbedding {
         Ok(Self {
             model: Arc::new(Mutex::new(embedding)),
             model_name: model_name.to_string(),
+            dimensions,
+        })
+    }
+
+    /// Load an ONNX model laid out on disk.
+    ///
+    /// Expects a Hugging Face-style snapshot: `onnx/model.onnx` (or
+    /// `model.onnx` at the root) beside the tokenizer files. Every required
+    /// file is reported by name when missing, because "failed to load" alone
+    /// sends the operator digging through a directory tree.
+    ///
+    /// Dimensions are probed by embedding a token rather than read from
+    /// config: a declared width that disagrees with the weights yields vectors
+    /// that are silently wrong.
+    fn from_directory(dir: &std::path::Path) -> anyhow::Result<Self> {
+        let read = |rel: &str| -> anyhow::Result<Vec<u8>> {
+            let path = dir.join(rel);
+            std::fs::read(&path).map_err(|e| anyhow::Error::msg(format!("{}: {e}", path.display())))
+        };
+
+        // Exporters disagree on whether the graph sits in onnx/ or at the root.
+        let onnx_file = match read("onnx/model.onnx") {
+            Ok(bytes) => bytes,
+            Err(_) => read("model.onnx")?,
+        };
+
+        let tokenizer_files = TokenizerFiles {
+            tokenizer_file: read("tokenizer.json")?,
+            config_file: read("config.json")?,
+            special_tokens_map_file: read("special_tokens_map.json")?,
+            tokenizer_config_file: read("tokenizer_config.json")?,
+        };
+
+        let user_model = UserDefinedEmbeddingModel {
+            onnx_file,
+            external_initializers: Vec::new(),
+            tokenizer_files,
+            // Mean pooling is what sentence-transformers exports assume; the
+            // wrong choice here degrades recall without erroring.
+            pooling: Some(Pooling::Mean),
+            quantization: QuantizationMode::None,
+            output_key: None,
+        };
+
+        let mut embedding =
+            TextEmbedding::try_new_from_user_defined(user_model, InitOptionsUserDefined::default())
+                .map_err(|e| {
+                    anyhow::Error::msg(format!(
+                        "failed to load local embedding model from {}: {e}",
+                        dir.display()
+                    ))
+                })?;
+
+        let probe = embedding
+            .embed(vec!["dimension probe"], None)
+            .map_err(|e| anyhow::Error::msg(format!("model loaded but cannot embed: {e}")))?;
+        let dimensions = probe
+            .first()
+            .map(Vec::len)
+            .ok_or_else(|| anyhow::Error::msg("model returned no vector for the probe text"))?;
+
+        Ok(Self {
+            model: Arc::new(Mutex::new(embedding)),
+            model_name: dir.display().to_string(),
             dimensions,
         })
     }
@@ -134,6 +210,35 @@ impl EmbeddingProvider for LocalEmbedding {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_directory_missing_weights_names_the_file_it_wanted() {
+        // "failed to load" alone sends the operator digging through a tree;
+        // the path that was actually missing is the whole diagnostic.
+        let dir = std::env::temp_dir().join("zeroclaw-embed-empty-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = LocalEmbedding::from_directory(&dir)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("model.onnx"),
+            "error should name the missing weights file: {err}"
+        );
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn directory_paths_are_not_looked_up_in_the_catalogue() {
+        // A path is a bring-your-own model, so it must not be rejected for
+        // being absent from the built-in list.
+        let err = LocalEmbedding::parse_model("/models/jina-es")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("unknown local embedding model"),
+            "catalogue lookup should still reject non-paths: {err}"
+        );
+    }
 
     #[test]
     fn unknown_model_names_are_rejected_with_the_available_list() {

@@ -6084,7 +6084,9 @@ async fn process_channel_message_body(
                         })),
                     "channel_message_error"
                 );
-                if let Some(channel) = target_channel.as_ref() {
+                if let Some(channel) = target_channel.as_ref()
+                    && ctx.prompt_config.channels.report_errors_to_user
+                {
                     if let Some(draft_id) = draft_message_id.as_deref() {
                         let _ = channel.cancel_draft(&msg.reply_target, draft_id).await;
                     }
@@ -6154,7 +6156,9 @@ async fn process_channel_message_body(
                         ChatMessage::assistant("[Task failed — not continuing this request]"),
                     );
                 }
-                if let Some(channel) = target_channel.as_ref() {
+                if let Some(channel) = target_channel.as_ref()
+                    && ctx.prompt_config.channels.report_errors_to_user
+                {
                     let user_msg = zeroclaw_providers::reliable::transient_error_hint(&e)
                         .map(str::to_string)
                         .unwrap_or_else(|| format!("⚠️ Error: {safe_error}"));
@@ -6206,7 +6210,9 @@ async fn process_channel_message_body(
                 &history_key,
                 ChatMessage::assistant("[Task timed out — not continuing this request]"),
             );
-            if let Some(channel) = target_channel.as_ref() {
+            if let Some(channel) = target_channel.as_ref()
+                && ctx.prompt_config.channels.report_errors_to_user
+            {
                 // Localized error text (master) delivered with suppress_voice
                 // (RFCerror-path fix): cancel the draft, then send as
                 // text so a timeout notice is never read aloud on a voice peer.

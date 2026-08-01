@@ -13088,6 +13088,21 @@ pub struct ChannelsConfig {
     /// Enable the CLI interactive channel. Default: `true`.
     #[serde(default = "default_true")]
     pub cli: bool,
+    /// Whether runtime failures are reported to whoever is chatting.
+    ///
+    /// When the model provider errors, the context window overflows, or a turn
+    /// times out, the orchestrator sends a notice into the conversation
+    /// ("⚠️ Error: …", "I've hit a usage limit…"). That is right for an
+    /// operator watching their own bot, and wrong for a deployment where the
+    /// person on the other end should only ever see the persona: a machine
+    /// notice breaks the illusion and leaks that there is infrastructure
+    /// behind it.
+    ///
+    /// Setting this to `false` keeps the conversation silent on failure. The
+    /// failure is still recorded in the logs at WARN — this suppresses the
+    /// user-facing message, never the diagnostics.
+    #[serde(default = "default_true")]
+    pub report_errors_to_user: bool,
     /// Telegram bot channel instances (`[channels.telegram.<alias>]`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
@@ -13641,6 +13656,7 @@ impl Default for ChannelsConfig {
     fn default() -> Self {
         Self {
             cli: true,
+            report_errors_to_user: true,
             telegram: HashMap::new(),
             discord: HashMap::new(),
             slack: HashMap::new(),
@@ -25357,6 +25373,10 @@ auto_save = true
     async fn channels_default() {
         let c = ChannelsConfig::default();
         assert!(c.cli);
+        // Errors are reported by default: an operator running their own bot
+        // needs to see failures. Deployments that must never break persona
+        // opt out explicitly.
+        assert!(c.report_errors_to_user);
         assert!(c.telegram.is_empty());
         assert!(c.discord.is_empty());
         assert!(c.wecom_ws.is_empty());
@@ -25541,6 +25561,7 @@ auto_save = true
             acp: AcpConfig::default(),
             channels: ChannelsConfig {
                 cli: true,
+                report_errors_to_user: true,
                 telegram: HashMap::from([(
                     "default".to_string(),
                     TelegramConfig {
@@ -27273,6 +27294,7 @@ allowed_users = ["@u:matrix.org"]
     async fn channels_with_imessage_and_matrix() {
         let c = ChannelsConfig {
             cli: true,
+            report_errors_to_user: true,
             telegram: HashMap::new(),
             discord: HashMap::new(),
             slack: HashMap::new(),
@@ -27798,6 +27820,7 @@ allowed_numbers = ["+1", "+2"]
     async fn channels_with_whatsapp() {
         let c = ChannelsConfig {
             cli: true,
+            report_errors_to_user: true,
             telegram: HashMap::new(),
             discord: HashMap::new(),
             slack: HashMap::new(),
