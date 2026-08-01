@@ -191,15 +191,18 @@ impl LeakDetector {
                 ),
                 // Slack
                 (
-                    Regex::new(r"xox[baprs]-[0-9A-Za-z-]{10,}").unwrap(),
+                    Regex::new(r"xox[baprs]-[0-9A-Za-z-]{10,}")
+                        .expect("static Slack token regex must compile"),
                     "Slack token",
                 ),
                 (
-                    Regex::new(r"xapp-[0-9A-Za-z-]{10,}").unwrap(),
+                    Regex::new(r"xapp-[0-9A-Za-z-]{10,}")
+                        .expect("static Slack app-level token regex must compile"),
                     "Slack app-level token",
                 ),
                 (
-                    Regex::new(r"xwfp-[0-9A-Za-z-]{10,}").unwrap(),
+                    Regex::new(r"xwfp-[0-9A-Za-z-]{10,}")
+                        .expect("static Slack workflow token regex must compile"),
                     "Slack workflow token",
                 ),
                 (
@@ -208,7 +211,8 @@ impl LeakDetector {
                     // `xox[baprs]-` class excludes `e`, and matching only the
                     // inner `xoxb-`/`xoxp-` would leave the `xoxe.` prefix
                     // unredacted, so cover the whole token explicitly.
-                    Regex::new(r"xoxe[.-][0-9A-Za-z.-]{10,}").unwrap(),
+                    Regex::new(r"xoxe(?:-[0-9A-Za-z-]{10,}|\.xox[bp]-[0-9A-Za-z-]{10,})")
+                        .expect("static Slack rotation token regex must compile"),
                     "Slack refresh/rotated token",
                 ),
                 // Generic
@@ -1328,15 +1332,20 @@ MIIEowIBAAKCAQEA0ZPr5JeyVDonXsKhfq...
         // rotated `xoxe.` forms it is the leading `xoxe` prefix, proving the
         // whole token is redacted rather than only the inner `xoxb-`/`xoxp-`.
         let config = LeakDetectionConfig {
+            sensitivity: 0.5,
             high_entropy_tokens: false,
             ..Default::default()
         };
         let detector = LeakDetector::with_config(&config);
+        // Assemble rotation-token fixtures at runtime so push protection does not
+        // mistake synthetic test data for live Slack credentials.
+        let refresh = ["xo", "xe-1-", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"].concat();
+        let rotated_bot = ["xo", "xe.xoxb-1-", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"].concat();
+        let rotated_user = ["xo", "xe.xoxp-1-", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"].concat();
 
         // (label, content, substring that must be gone from the output)
-        // Placeholder token bodies are all-`x`: they satisfy the detector
-        // patterns without resembling real credentials, so secret-scanning
-        // push protection does not flag this test as a leaked token.
+        // Placeholder token bodies are all-`x`; rotation tokens are assembled
+        // above so synthetic fixtures are not mistaken for live credentials.
         let cases = [
             (
                 "bot",
@@ -1358,21 +1367,9 @@ MIIEowIBAAKCAQEA0ZPr5JeyVDonXsKhfq...
                 "xwfp-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
                 "xwfp-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
             ),
-            (
-                "refresh",
-                "xoxe-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
-                "xoxe-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
-            ),
-            (
-                "rotated bot",
-                "xoxe.xoxb-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
-                "xoxe",
-            ),
-            (
-                "rotated user",
-                "xoxe.xoxp-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
-                "xoxe",
-            ),
+            ("refresh", refresh.as_str(), refresh.as_str()),
+            ("rotated bot", rotated_bot.as_str(), "xoxe"),
+            ("rotated user", rotated_user.as_str(), "xoxe"),
         ];
 
         for (label, content, absent) in cases {
@@ -1390,6 +1387,11 @@ MIIEowIBAAKCAQEA0ZPr5JeyVDonXsKhfq...
                 LeakResult::Clean => panic!("{label}: Slack token not detected"),
             }
         }
+
+        assert!(matches!(
+            detector.scan("xoxe.example.com"),
+            LeakResult::Clean
+        ));
     }
 
     #[test]
