@@ -280,6 +280,7 @@ pub enum ModelProviderKind {
     Lepton,
     Synthetic,
     Opencode,
+    Zerorouter,
     Custom,
     Plugin,
 }

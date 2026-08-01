@@ -493,6 +493,7 @@ pub fn resolve_model_provider_type(type_key: &str) -> Option<(&'static str, bool
         zeroclaw_providers::auth::AuthProvider::Anthropic => ("anthropic", false),
         zeroclaw_providers::auth::AuthProvider::Gemini => ("gemini", false),
         zeroclaw_providers::auth::AuthProvider::Xai => ("xai", false),
+        zeroclaw_providers::auth::AuthProvider::Zerorouter => ("zerorouter", false),
     })
 }
 

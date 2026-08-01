@@ -3159,6 +3159,39 @@ impl FamilyEndpoint for KiloModelProviderConfig {
     }
 }
 
+// ── ZeroRouter (self-hosted LLM gateway — OpenAI-compatible) ──
+
+/// ZeroRouter endpoint. No hosted deployment exists yet, so the single
+/// variant points at the router container's default bind
+/// (`ZEROROUTER_BIND=0.0.0.0:8080`); operators reaching a remote router set
+/// `base.uri`. When a canonical hosted URL exists this constant flips —
+/// guarded by the factory's lockstep regression test
+/// (`zerorouter_default_url_matches_schema_endpoint`).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ZerorouterEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for ZerorouterEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "http://localhost:8080/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.zerorouter"]
+pub struct ZerorouterModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
 // ── Custom (user-supplied URL, no canonical default) ──
 
 /// Custom catch-all for operator-defined endpoints. The endpoint variant has
@@ -3278,6 +3311,7 @@ impl_default_family_endpoint! {
     VeniceModelProviderConfig,
     NearaiModelProviderConfig,
     NovitaModelProviderConfig,
+    ZerorouterModelProviderConfig,
     NvidiaModelProviderConfig,
     TelnyxModelProviderConfig,
     VercelModelProviderConfig,

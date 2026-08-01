@@ -28,6 +28,7 @@ use super::schema::{
     TelnyxModelProviderConfig, TogetherModelProviderConfig, UpstageModelProviderConfig,
     VeniceModelProviderConfig, VercelModelProviderConfig, VllmModelProviderConfig,
     XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
+    ZerorouterModelProviderConfig,
 };
 use super::schema::{
     AssemblyAiTranscriptionProviderConfig, DeepgramTranscriptionProviderConfig,
@@ -215,6 +216,7 @@ macro_rules! for_each_model_provider_slot {
             (opencode, "opencode", OpencodeModelProviderConfig),
             (kilocli, "kilocli", KiloCliModelProviderConfig),
             (kilo, "kilo", KiloModelProviderConfig),
+            (zerorouter, "zerorouter", ZerorouterModelProviderConfig),
             (custom, "custom", CustomModelProviderConfig),
         }
     };
