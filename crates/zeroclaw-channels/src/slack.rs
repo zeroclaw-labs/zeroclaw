@@ -42,7 +42,15 @@ pub struct SlackChannel {
     user_display_name_cache: Mutex<HashMap<String, CachedSlackDisplayName>>,
     workspace_dir: Option<PathBuf>,
     /// Assistant thread targets proven by Slack's assistant lifecycle events.
-    active_assistant_threads: Mutex<HashSet<AssistantTarget>>,
+    /// Assistant threads this process has been told about, with when each was
+    /// last seen.
+    ///
+    /// Entries are driven entirely by inbound Slack events, so an unbounded set
+    /// would let normal workspace growth — or a flood across distinct thread
+    /// ids — grow process memory for the daemon's whole lifetime. It is capped,
+    /// evicting the least recently seen target, and every observation refreshes
+    /// the timestamp so live threads outlast idle ones.
+    active_assistant_threads: Mutex<HashMap<AssistantTarget, Instant>>,
     /// Per-turn draft routing, keyed by the exact draft ID returned to the orchestrator.
     draft_turns: AsyncMutex<HashMap<String, SlackDraftTurn>>,
     /// Which draft currently owns each Assistant status surface.
@@ -139,6 +147,11 @@ struct AssistantStatusOwner {
 /// `PACING_RECIPIENT_CAP`. One entry per Assistant thread; the oldest claim is
 /// evicted past this point so a long-lived daemon cannot grow the map forever.
 const ASSISTANT_STATUS_OWNER_CAP: usize = 1024;
+
+/// Upper bound on remembered Assistant threads. These entries are created by
+/// inbound Slack events rather than by this process, so the registry needs its
+/// own bound: the owner cap does not constrain it.
+const ASSISTANT_THREAD_REGISTRY_CAP: usize = 1024;
 
 /// Bounded attempts for the terminal Assistant status clear, so a transient
 /// Slack failure does not immediately strand stale lifecycle text.
@@ -330,7 +343,7 @@ impl SlackChannel {
             group_reply_allowed_sender_ids: Vec::new(),
             user_display_name_cache: Mutex::new(HashMap::new()),
             workspace_dir: None,
-            active_assistant_threads: Mutex::new(HashSet::new()),
+            active_assistant_threads: Mutex::new(HashMap::new()),
             draft_turns: AsyncMutex::new(HashMap::new()),
             assistant_status_owners: AsyncMutex::new(HashMap::new()),
             assistant_status_locks: AsyncMutex::new(HashMap::new()),
@@ -804,7 +817,36 @@ impl SlackChannel {
         self.active_assistant_threads
             .lock()
             .ok()
-            .is_some_and(|threads| threads.contains(target))
+            .is_some_and(|threads| threads.contains_key(target))
+    }
+
+    /// Record an Assistant thread, refreshing it if already known, and keep the
+    /// registry within [`ASSISTANT_THREAD_REGISTRY_CAP`] by dropping the least
+    /// recently seen target.
+    fn remember_assistant_thread(&self, target: AssistantTarget) {
+        let Ok(mut threads) = self.active_assistant_threads.lock() else {
+            return;
+        };
+        threads.insert(target, Instant::now());
+        if threads.len() > ASSISTANT_THREAD_REGISTRY_CAP
+            && let Some(victim) = threads
+                .iter()
+                .min_by_key(|(_, seen)| **seen)
+                .map(|(target, _)| target.clone())
+        {
+            threads.remove(&victim);
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "channel_id": victim.channel_id,
+                        "thread_ts": victim.thread_ts,
+                        "cap": ASSISTANT_THREAD_REGISTRY_CAP,
+                    })),
+                "Dropped the least recently seen Assistant thread at cap; a new \
+                 event for it will re-register it"
+            );
+        }
     }
 
     async fn set_assistant_status(
@@ -3903,11 +3945,8 @@ impl SlackChannel {
                             .get("thread_ts")
                             .and_then(|v| v.as_str())
                             .unwrap_or_default();
-                        if !ch.is_empty()
-                            && !tts.is_empty()
-                            && let Ok(mut threads) = self.active_assistant_threads.lock()
-                        {
-                            threads.insert(AssistantTarget {
+                        if !ch.is_empty() && !tts.is_empty() {
+                            self.remember_assistant_thread(AssistantTarget {
                                 channel_id: ch.to_string(),
                                 thread_ts: tts.to_string(),
                             });
@@ -7140,13 +7179,10 @@ mod tests {
             .await;
 
         let ch = test_slack_channel(&server, tmp.path()).with_streaming(true, 60_000);
-        ch.active_assistant_threads
-            .lock()
-            .unwrap()
-            .insert(AssistantTarget {
-                channel_id: "C123".to_string(),
-                thread_ts: "1709999999.000001".to_string(),
-            });
+        ch.remember_assistant_thread(AssistantTarget {
+            channel_id: "C123".to_string(),
+            thread_ts: "1709999999.000001".to_string(),
+        });
         let draft_id = ch
             .send_draft(
                 &SendMessage::new("...", "C123")
@@ -7195,13 +7231,10 @@ mod tests {
             .await;
 
         let ch = test_slack_channel(&server, tmp.path()).with_streaming(true, 60_000);
-        ch.active_assistant_threads
-            .lock()
-            .unwrap()
-            .insert(AssistantTarget {
-                channel_id: "C123".to_string(),
-                thread_ts: "thread-one".to_string(),
-            });
+        ch.remember_assistant_thread(AssistantTarget {
+            channel_id: "C123".to_string(),
+            thread_ts: "thread-one".to_string(),
+        });
         let first = ch
             .send_draft(
                 &SendMessage::new("...", "C123")
@@ -7212,13 +7245,10 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        ch.active_assistant_threads
-            .lock()
-            .unwrap()
-            .insert(AssistantTarget {
-                channel_id: "C123".to_string(),
-                thread_ts: "thread-two".to_string(),
-            });
+        ch.remember_assistant_thread(AssistantTarget {
+            channel_id: "C123".to_string(),
+            thread_ts: "thread-two".to_string(),
+        });
         let second = ch
             .send_draft(
                 &SendMessage::new("...", "C123")
@@ -7275,13 +7305,10 @@ mod tests {
             .await;
 
         let ch = test_slack_channel(&server, tmp.path()).with_streaming(true, 1);
-        ch.active_assistant_threads
-            .lock()
-            .unwrap()
-            .insert(AssistantTarget {
-                channel_id: "C123".to_string(),
-                thread_ts: "assistant-thread".to_string(),
-            });
+        ch.remember_assistant_thread(AssistantTarget {
+            channel_id: "C123".to_string(),
+            thread_ts: "assistant-thread".to_string(),
+        });
         let ordinary = ch
             .send_draft(
                 &SendMessage::new("...", "C123")
@@ -7335,13 +7362,10 @@ mod tests {
     ) -> (SlackChannel, String, String) {
         let ch = test_slack_channel(server, data_dir).with_streaming(true, 1);
         for thread_ts in ["thread-one", "thread-two"] {
-            ch.active_assistant_threads
-                .lock()
-                .unwrap()
-                .insert(AssistantTarget {
-                    channel_id: "C123".to_string(),
-                    thread_ts: thread_ts.to_string(),
-                });
+            ch.remember_assistant_thread(AssistantTarget {
+                channel_id: "C123".to_string(),
+                thread_ts: thread_ts.to_string(),
+            });
         }
 
         let mut drafts = Vec::new();
@@ -7628,13 +7652,10 @@ mod tests {
             .await;
 
         let ch = test_slack_channel(&server, tmp.path()).with_streaming(true, 1);
-        ch.active_assistant_threads
-            .lock()
-            .unwrap()
-            .insert(AssistantTarget {
-                channel_id: "C123".to_string(),
-                thread_ts: "shared-thread".to_string(),
-            });
+        ch.remember_assistant_thread(AssistantTarget {
+            channel_id: "C123".to_string(),
+            thread_ts: "shared-thread".to_string(),
+        });
 
         // Two turns, same Assistant thread, distinct draft IDs.
         let draft = |message_id: &'static str| {
@@ -7718,10 +7739,7 @@ mod tests {
             channel_id: "C123".to_string(),
             thread_ts: "thread-one".to_string(),
         };
-        ch.active_assistant_threads
-            .lock()
-            .unwrap()
-            .insert(target.clone());
+        ch.remember_assistant_thread(target.clone());
         let draft = ch
             .send_draft(
                 &SendMessage::new("...", "C123")
@@ -7808,10 +7826,7 @@ mod tests {
             channel_id: "C123".to_string(),
             thread_ts: "thread-one".to_string(),
         };
-        ch.active_assistant_threads
-            .lock()
-            .unwrap()
-            .insert(target.clone());
+        ch.remember_assistant_thread(target.clone());
         let draft = ch
             .send_draft(
                 &SendMessage::new("...", "C123")
@@ -7909,13 +7924,10 @@ mod tests {
             .await;
 
         let ch = Arc::new(test_slack_channel(&server, tmp.path()).with_streaming(true, 1));
-        ch.active_assistant_threads
-            .lock()
-            .unwrap()
-            .insert(AssistantTarget {
-                channel_id: "C123".to_string(),
-                thread_ts: "shared-thread".to_string(),
-            });
+        ch.remember_assistant_thread(AssistantTarget {
+            channel_id: "C123".to_string(),
+            thread_ts: "shared-thread".to_string(),
+        });
         let draft = |id: &'static str| {
             SendMessage::new("...", "C123")
                 .in_thread(Some("shared-thread".to_string()))
@@ -8066,26 +8078,62 @@ mod tests {
         }
 
         // Simulate storing a thread_ts (as listen_socket_mode would).
-        {
-            let mut threads = ch.active_assistant_threads.lock().unwrap();
-            threads.insert(AssistantTarget {
-                channel_id: "C123".to_string(),
-                thread_ts: "1741234567.000100".to_string(),
-            });
-        }
+        ch.remember_assistant_thread(AssistantTarget {
+            channel_id: "C123".to_string(),
+            thread_ts: "1741234567.000100".to_string(),
+        });
 
         // Verify retrieval.
-        {
-            let threads = ch.active_assistant_threads.lock().unwrap();
-            assert!(threads.contains(&AssistantTarget {
-                channel_id: "C123".to_string(),
-                thread_ts: "1741234567.000100".to_string(),
-            }));
-            assert!(!threads.contains(&AssistantTarget {
-                channel_id: "C999".to_string(),
-                thread_ts: "1741234567.000100".to_string(),
-            }));
+        assert!(ch.is_assistant_target(&AssistantTarget {
+            channel_id: "C123".to_string(),
+            thread_ts: "1741234567.000100".to_string(),
+        }));
+        assert!(!ch.is_assistant_target(&AssistantTarget {
+            channel_id: "C999".to_string(),
+            thread_ts: "1741234567.000100".to_string(),
+        }));
+    }
+
+    /// Registry entries come from inbound Slack events, so the set must stay
+    /// bounded rather than growing for the daemon's lifetime. The least
+    /// recently seen target is dropped, and a refreshed target outlives idle
+    /// ones even when it was registered first.
+    #[tokio::test]
+    async fn the_assistant_thread_registry_is_bounded_and_keeps_recent_targets() {
+        use wiremock::MockServer;
+
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let ch = test_slack_channel(&server, tmp.path());
+
+        let target = |i: usize| AssistantTarget {
+            channel_id: "C123".to_string(),
+            thread_ts: format!("thread-{i}"),
+        };
+
+        ch.remember_assistant_thread(target(0));
+        for i in 1..ASSISTANT_THREAD_REGISTRY_CAP {
+            ch.remember_assistant_thread(target(i));
         }
+        // Re-observing target 0 makes it the most recently seen.
+        ch.remember_assistant_thread(target(0));
+        for i in ASSISTANT_THREAD_REGISTRY_CAP..(ASSISTANT_THREAD_REGISTRY_CAP + 16) {
+            ch.remember_assistant_thread(target(i));
+        }
+
+        let len = ch.active_assistant_threads.lock().unwrap().len();
+        assert!(
+            len <= ASSISTANT_THREAD_REGISTRY_CAP,
+            "registry must stay bounded, got {len}"
+        );
+        assert!(
+            ch.is_assistant_target(&target(0)),
+            "a refreshed target must survive eviction of idle ones"
+        );
+        assert!(
+            ch.is_assistant_target(&target(ASSISTANT_THREAD_REGISTRY_CAP + 15)),
+            "the newest target must be present"
+        );
     }
 
     #[test]
