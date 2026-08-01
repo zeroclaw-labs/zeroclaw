@@ -889,10 +889,11 @@ impl WhatsAppWebChannel {
         attachments: Vec<MediaAttachment>,
         passive_context: bool,
         conversation_scope: ChannelConversationScope,
+        message_id: String,
     ) {
         if let Err(e) = tx
             .send(ChannelMessage {
-                id: uuid::Uuid::new_v4().to_string(),
+                id: message_id,
                 channel: "whatsapp".to_string(),
                 channel_alias: Some(alias.to_string()),
                 sender: sender.to_string(),
@@ -2173,6 +2174,7 @@ impl Channel for WhatsAppWebChannel {
                                         Vec::new(),
                                         true,
                                         conversation_scope,
+                                        info.id.to_string(),
                                     )
                                     .await;
                                     return;
@@ -2263,6 +2265,7 @@ impl Channel for WhatsAppWebChannel {
                                     attachments,
                                     false,
                                     conversation_scope,
+                                    info.id.to_string(),
                                 )
                                 .await;
                             }
@@ -3108,6 +3111,40 @@ mod tests {
             &allowed,
             "+1 (555) 123-4567"
         ));
+    }
+
+    /// The inbound id must be WhatsApp's own stanza id, because reacting to or
+    /// replying to a message requires a `MessageKey` the server can resolve. A
+    /// locally generated id (the previous `Uuid::new_v4()`) is unresolvable, so
+    /// every id-addressed action silently targeted a message that does not exist.
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn whatsapp_web_inbound_id_is_the_wire_stanza_id() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let stanza_id = "3EB0F1C2D3E4F5A6B7C8";
+
+        WhatsAppWebChannel::send_inbound_channel_message(
+            &tx,
+            "default",
+            "+155****4567",
+            "15551234567@s.whatsapp.net".to_string(),
+            "hi".to_string(),
+            Vec::new(),
+            false,
+            ChannelConversationScope::Sender,
+            stanza_id.to_string(),
+        )
+        .await;
+
+        let msg = rx.recv().await.expect("inbound message");
+        assert_eq!(
+            msg.id, stanza_id,
+            "inbound id must round-trip the wire stanza id so reactions can address it"
+        );
+        assert!(
+            uuid::Uuid::parse_str(&msg.id).is_err(),
+            "inbound id must not be a locally generated UUID"
+        );
     }
 
     #[test]
