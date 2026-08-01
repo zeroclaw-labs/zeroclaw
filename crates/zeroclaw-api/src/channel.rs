@@ -755,6 +755,29 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         anyhow::bail!("channel does not support polls")
     }
 
+    /// Block or unblock a contact.
+    ///
+    /// An agent with no way to block cannot end an abusive conversation on its
+    /// own; the operator has to intervene by hand.
+    async fn set_contact_blocked(&self, _channel_id: &str, _blocked: bool) -> anyhow::Result<()> {
+        anyhow::bail!("channel does not support blocking contacts")
+    }
+
+    /// Whether a contact is currently blocked.
+    async fn is_contact_blocked(&self, _channel_id: &str) -> anyhow::Result<bool> {
+        anyhow::bail!("channel does not support blocking contacts")
+    }
+
+    /// Set the account's own display name.
+    async fn set_display_name(&self, _name: &str) -> anyhow::Result<()> {
+        anyhow::bail!("channel does not support setting a display name")
+    }
+
+    /// Set the account's own status/about text.
+    async fn set_about_text(&self, _text: &str) -> anyhow::Result<()> {
+        anyhow::bail!("channel does not support setting an about text")
+    }
+
     /// Archive or unarchive a conversation.
     ///
     /// These conversation-management methods bail by default rather than

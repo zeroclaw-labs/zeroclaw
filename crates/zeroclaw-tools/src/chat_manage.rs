@@ -45,6 +45,10 @@ enum ChatAction {
     Unstar,
     PublishStatus,
     CreatePoll,
+    Block,
+    Unblock,
+    SetDisplayName,
+    SetAboutText,
 }
 
 impl ChatAction {
@@ -61,11 +65,23 @@ impl ChatAction {
         "unstar",
         "publish_status",
         "create_poll",
+        "block",
+        "unblock",
+        "set_display_name",
+        "set_about_text",
     ];
 
     /// Actions that address a single message rather than the conversation.
     fn targets_message(self) -> bool {
         matches!(self, Self::Star | Self::Unstar)
+    }
+
+    /// Actions that address the account itself, so they carry no chat id.
+    fn targets_account(self) -> bool {
+        matches!(
+            self,
+            Self::PublishStatus | Self::SetDisplayName | Self::SetAboutText
+        )
     }
 }
 
@@ -86,6 +102,10 @@ impl FromStr for ChatAction {
             "unstar" => Ok(Self::Unstar),
             "publish_status" => Ok(Self::PublishStatus),
             "create_poll" => Ok(Self::CreatePoll),
+            "block" => Ok(Self::Block),
+            "unblock" => Ok(Self::Unblock),
+            "set_display_name" => Ok(Self::SetDisplayName),
+            "set_about_text" => Ok(Self::SetAboutText),
             other => anyhow::bail!(
                 "unknown action '{other}' (expected one of: {})",
                 ChatAction::SCHEMA_VALUES.join(", ")
@@ -153,7 +173,7 @@ impl Tool for ChatManageTool {
                 },
                 "text": {
                     "type": "string",
-                    "description": "Status text. Required for 'publish_status'."
+                    "description": "Text payload: the status for 'publish_status', the name for 'set_display_name', the about text for 'set_about_text'."
                 },
                 "question": {
                     "type": "string",
@@ -194,7 +214,7 @@ impl Tool for ChatManageTool {
         let channel_name = required_str(&args, "channel")?;
         // A status is a broadcast, so it has no chat to address; every other
         // action needs one.
-        let chat_id = if action == ChatAction::PublishStatus {
+        let chat_id = if action.targets_account() {
             ""
         } else {
             required_str(&args, "chat_id")?
@@ -273,6 +293,18 @@ impl Tool for ChatManageTool {
                     Err(e) => Err(e),
                 }
             }
+            ChatAction::Block => channel.set_contact_blocked(chat_id, true).await,
+            ChatAction::Unblock => channel.set_contact_blocked(chat_id, false).await,
+            ChatAction::SetDisplayName => match required_str(&args, "text") {
+                Ok(name) => channel.set_display_name(name).await,
+                Err(e) => Err(e),
+            },
+            // An empty about text is a legitimate value (it clears the field),
+            // so this reads the raw argument instead of requiring non-empty.
+            ChatAction::SetAboutText => {
+                let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                channel.set_about_text(text).await
+            }
             ChatAction::Star | ChatAction::Unstar => {
                 let starred = action == ChatAction::Star;
                 let id = message_id.unwrap_or_default();
@@ -309,6 +341,10 @@ fn describe(action: ChatAction) -> &'static str {
         ChatAction::Unstar => "unstarred",
         ChatAction::PublishStatus => "published status",
         ChatAction::CreatePoll => "created poll",
+        ChatAction::Block => "blocked",
+        ChatAction::Unblock => "unblocked",
+        ChatAction::SetDisplayName => "set display name",
+        ChatAction::SetAboutText => "set about text",
     }
 }
 
@@ -374,6 +410,47 @@ mod tests {
             "publish_status must be advertised exactly once"
         );
         assert!(ChatAction::CreatePoll != ChatAction::PublishStatus);
+    }
+
+    #[test]
+    fn account_scoped_actions_need_no_chat_id() {
+        // These address the account itself; demanding a chat id would make
+        // them unusable, and accepting one would imply a target they ignore.
+        assert!(ChatAction::PublishStatus.targets_account());
+        assert!(ChatAction::SetDisplayName.targets_account());
+        assert!(ChatAction::SetAboutText.targets_account());
+    }
+
+    #[test]
+    fn conversation_actions_still_require_a_chat_id() {
+        // Blocking without a target would be a no-op at best and a wrong-person
+        // block at worst, so these must stay chat-scoped.
+        for action in [
+            ChatAction::Block,
+            ChatAction::Unblock,
+            ChatAction::Archive,
+            ChatAction::Mute,
+            ChatAction::CreatePoll,
+        ] {
+            assert!(
+                !action.targets_account(),
+                "{} must require a chat id",
+                describe(action)
+            );
+        }
+    }
+
+    #[test]
+    fn account_and_message_scopes_never_overlap() {
+        // A single action cannot both address the account and a message; the
+        // dispatcher would have to guess which target to honour.
+        for value in ChatAction::SCHEMA_VALUES {
+            let action = value.parse::<ChatAction>().unwrap();
+            assert!(
+                !(action.targets_account() && action.targets_message()),
+                "{value} claims both scopes"
+            );
+        }
     }
 
     #[test]

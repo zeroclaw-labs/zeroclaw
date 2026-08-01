@@ -2917,6 +2917,56 @@ impl Channel for WhatsAppWebChannel {
         Ok(())
     }
 
+    async fn set_contact_blocked(&self, channel_id: &str, blocked: bool) -> Result<()> {
+        let (client, jid) = self.chat_action_target(channel_id)?;
+        let blocking = client.blocking();
+        if blocked {
+            blocking.block(&jid).await
+        } else {
+            blocking.unblock(&jid).await
+        }
+        .map_err(|e| anyhow::Error::msg(format!("Failed to block contact: {e}")))
+    }
+
+    async fn is_contact_blocked(&self, channel_id: &str) -> Result<bool> {
+        let (client, jid) = self.chat_action_target(channel_id)?;
+        client
+            .blocking()
+            .is_blocked(&jid)
+            .await
+            .map_err(|e| anyhow::Error::msg(format!("Failed to read block state: {e}")))
+    }
+
+    async fn set_display_name(&self, name: &str) -> Result<()> {
+        let name = name.trim();
+        if name.is_empty() {
+            anyhow::bail!("display name cannot be empty");
+        }
+        let client = self.client.lock().clone();
+        let Some(client) = client else {
+            anyhow::bail!("WhatsApp Web client not connected. Initialize the bot first.");
+        };
+        client
+            .profile()
+            .set_push_name(name)
+            .await
+            .map_err(|e| anyhow::Error::msg(format!("Failed to set display name: {e}")))
+    }
+
+    async fn set_about_text(&self, text: &str) -> Result<()> {
+        let client = self.client.lock().clone();
+        let Some(client) = client else {
+            anyhow::bail!("WhatsApp Web client not connected. Initialize the bot first.");
+        };
+        // An empty string clears the about text, which is a legitimate state,
+        // so this is not validated the way a display name is.
+        client
+            .profile()
+            .set_status_text(text.trim())
+            .await
+            .map_err(|e| anyhow::Error::msg(format!("Failed to set about text: {e}")))
+    }
+
     /// Publish a text status, broadcast to the configured peers.
     ///
     /// Recipients come from the same allowlist that gates inbound messages
