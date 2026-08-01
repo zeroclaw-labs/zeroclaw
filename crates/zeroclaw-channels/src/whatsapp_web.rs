@@ -2901,6 +2901,80 @@ impl Channel for WhatsAppWebChannel {
         Ok(())
     }
 
+    /// Publish a text status, broadcast to the configured peers.
+    ///
+    /// Recipients come from the same allowlist that gates inbound messages
+    /// rather than the full address book: a status is a broadcast, and
+    /// defaulting to every contact would publish to people the operator never
+    /// put in scope.
+    async fn publish_status(&self, text: &str) -> Result<String> {
+        let text = text.trim();
+        if text.is_empty() {
+            anyhow::bail!("cannot publish an empty status");
+        }
+
+        let client = self.client.lock().clone();
+        let Some(client) = client else {
+            anyhow::bail!("WhatsApp Web client not connected. Initialize the bot first.");
+        };
+
+        let peers = (self.peer_resolver)();
+        if peers.is_empty() {
+            anyhow::bail!(
+                "no status recipients configured; add peers to this channel's allowlist first"
+            );
+        }
+        let recipients = peers
+            .iter()
+            .map(|peer| self.recipient_to_jid(peer))
+            .collect::<Result<Vec<_>>>()?;
+
+        // Defaults match WA Web's own text-status composer.
+        const DEFAULT_STATUS_BACKGROUND_ARGB: u32 = 0xFF31_5575;
+        const DEFAULT_STATUS_FONT: i32 = 0;
+
+        let result = client
+            .status()
+            .send_text(
+                text,
+                DEFAULT_STATUS_BACKGROUND_ARGB,
+                DEFAULT_STATUS_FONT,
+                &recipients,
+                whatsapp_rust::StatusSendOptions::default(),
+            )
+            .await
+            .map_err(|e| anyhow::Error::msg(format!("Failed to publish status: {e}")))?;
+
+        Ok(result.message_id)
+    }
+
+    /// Create a poll.
+    ///
+    /// The library mints a 32-byte secret per poll and persists it through the
+    /// storage backend; votes arrive encrypted and are undecryptable without
+    /// it, so poll support depends on that store being present.
+    async fn create_poll(
+        &self,
+        channel_id: &str,
+        question: &str,
+        options: &[String],
+        selectable_count: u32,
+    ) -> Result<String> {
+        let question = question.trim();
+        if question.is_empty() {
+            anyhow::bail!("a poll needs a question");
+        }
+
+        let (client, jid) = self.chat_action_target(channel_id)?;
+        let (result, _secret) = client
+            .polls()
+            .create(&jid, question, options, selectable_count)
+            .await
+            .map_err(|e| anyhow::Error::msg(format!("Failed to create poll: {e}")))?;
+
+        Ok(result.message_id)
+    }
+
     async fn set_chat_archived(&self, channel_id: &str, archived: bool) -> Result<()> {
         let (client, jid) = self.chat_action_target(channel_id)?;
         let actions = client.chat_actions();

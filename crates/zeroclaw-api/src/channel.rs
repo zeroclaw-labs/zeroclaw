@@ -736,6 +736,25 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         Ok(())
     }
 
+    /// Publish a text status/story visible to the account's contacts.
+    ///
+    /// Returns the published message id so it can be revoked later.
+    async fn publish_status(&self, _text: &str) -> anyhow::Result<String> {
+        anyhow::bail!("channel does not support publishing status updates")
+    }
+
+    /// Create a poll in a conversation. `selectable_count` is how many options
+    /// a voter may pick.
+    async fn create_poll(
+        &self,
+        _channel_id: &str,
+        _question: &str,
+        _options: &[String],
+        _selectable_count: u32,
+    ) -> anyhow::Result<String> {
+        anyhow::bail!("channel does not support polls")
+    }
+
     /// Archive or unarchive a conversation.
     ///
     /// These conversation-management methods bail by default rather than

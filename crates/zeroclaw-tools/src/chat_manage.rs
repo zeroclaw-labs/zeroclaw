@@ -43,6 +43,8 @@ enum ChatAction {
     MarkUnread,
     Star,
     Unstar,
+    PublishStatus,
+    CreatePoll,
 }
 
 impl ChatAction {
@@ -57,6 +59,8 @@ impl ChatAction {
         "mark_unread",
         "star",
         "unstar",
+        "publish_status",
+        "create_poll",
     ];
 
     /// Actions that address a single message rather than the conversation.
@@ -80,6 +84,8 @@ impl FromStr for ChatAction {
             "mark_unread" => Ok(Self::MarkUnread),
             "star" => Ok(Self::Star),
             "unstar" => Ok(Self::Unstar),
+            "publish_status" => Ok(Self::PublishStatus),
+            "create_poll" => Ok(Self::CreatePoll),
             other => anyhow::bail!(
                 "unknown action '{other}' (expected one of: {})",
                 ChatAction::SCHEMA_VALUES.join(", ")
@@ -145,12 +151,29 @@ impl Tool for ChatManageTool {
                     "type": "string",
                     "description": "Message to star/unstar. Required for those actions."
                 },
+                "text": {
+                    "type": "string",
+                    "description": "Status text. Required for 'publish_status'."
+                },
+                "question": {
+                    "type": "string",
+                    "description": "Poll question. Required for 'create_poll'."
+                },
+                "options": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Poll options (2-12). Required for 'create_poll'."
+                },
+                "selectable_count": {
+                    "type": "integer",
+                    "description": "How many poll options a voter may pick. Defaults to 1."
+                },
                 "until_unix_ms": {
                     "type": "integer",
                     "description": "For 'mute': unix milliseconds to stay muted until. Omit to mute indefinitely."
                 }
             },
-            "required": ["action", "channel", "chat_id"]
+            "required": ["action", "channel"]
         })
     }
 
@@ -169,7 +192,13 @@ impl Tool for ChatManageTool {
         let action = required_str(&args, "action")?;
         let action = ChatAction::from_str(action)?;
         let channel_name = required_str(&args, "channel")?;
-        let chat_id = required_str(&args, "chat_id")?;
+        // A status is a broadcast, so it has no chat to address; every other
+        // action needs one.
+        let chat_id = if action == ChatAction::PublishStatus {
+            ""
+        } else {
+            required_str(&args, "chat_id")?
+        };
 
         let channel = match self.lookup_channel(channel_name) {
             Ok(channel) => channel,
@@ -212,6 +241,38 @@ impl Tool for ChatManageTool {
             ChatAction::Unpin => channel.set_chat_pinned(chat_id, false).await,
             ChatAction::MarkRead => channel.set_chat_read(chat_id, true).await,
             ChatAction::MarkUnread => channel.set_chat_read(chat_id, false).await,
+            ChatAction::PublishStatus => match required_str(&args, "text") {
+                Ok(text) => channel.publish_status(text).await.map(|_| ()),
+                Err(e) => Err(e),
+            },
+            ChatAction::CreatePoll => {
+                let question = required_str(&args, "question");
+                let options: Vec<String> = args
+                    .get("options")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .map(str::trim)
+                            .filter(|option| !option.is_empty())
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let selectable = args
+                    .get("selectable_count")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(1) as u32;
+                match question {
+                    Ok(question) => channel
+                        .create_poll(chat_id, question, &options, selectable)
+                        .await
+                        .map(|_| ()),
+                    Err(e) => Err(e),
+                }
+            }
             ChatAction::Star | ChatAction::Unstar => {
                 let starred = action == ChatAction::Star;
                 let id = message_id.unwrap_or_default();
@@ -220,7 +281,11 @@ impl Tool for ChatManageTool {
         };
 
         Ok(match outcome {
-            Ok(()) => ToolResult::ok(format!("{} on {chat_id}", describe(action))),
+            Ok(()) => ToolResult::ok(if chat_id.is_empty() {
+                describe(action).to_string()
+            } else {
+                format!("{} on {chat_id}", describe(action))
+            }),
             Err(error) => ToolResult {
                 success: false,
                 output: ToolOutput::default(),
@@ -242,6 +307,8 @@ fn describe(action: ChatAction) -> &'static str {
         ChatAction::MarkUnread => "marked unread",
         ChatAction::Star => "starred",
         ChatAction::Unstar => "unstarred",
+        ChatAction::PublishStatus => "published status",
+        ChatAction::CreatePoll => "created poll",
     }
 }
 
@@ -282,6 +349,45 @@ mod tests {
         assert!(ChatAction::Unstar.targets_message());
         assert!(!ChatAction::Archive.targets_message());
         assert!(!ChatAction::Mute.targets_message());
+    }
+
+    #[test]
+    fn broadcast_actions_do_not_target_a_message() {
+        // Star/unstar are the only message-scoped actions; a status or poll
+        // must not be routed through the message_id validation path.
+        assert!(!ChatAction::PublishStatus.targets_message());
+        assert!(!ChatAction::CreatePoll.targets_message());
+    }
+
+    #[test]
+    fn chat_id_is_only_optional_for_a_status() {
+        // A status is a broadcast with no chat to address, but every other
+        // action would silently act on the wrong conversation without one.
+        assert_eq!(
+            ChatAction::SCHEMA_VALUES
+                .iter()
+                .filter(|value| {
+                    value.parse::<ChatAction>().unwrap() == ChatAction::PublishStatus
+                })
+                .count(),
+            1,
+            "publish_status must be advertised exactly once"
+        );
+        assert!(ChatAction::CreatePoll != ChatAction::PublishStatus);
+    }
+
+    #[test]
+    fn every_action_has_a_distinct_description() {
+        // The description is echoed back as the tool's result; a duplicate
+        // would make two different outcomes indistinguishable to the agent.
+        let mut seen = std::collections::HashSet::new();
+        for value in ChatAction::SCHEMA_VALUES {
+            let action = value.parse::<ChatAction>().unwrap();
+            assert!(
+                seen.insert(describe(action)),
+                "duplicate description for {value}"
+            );
+        }
     }
 
     #[test]
