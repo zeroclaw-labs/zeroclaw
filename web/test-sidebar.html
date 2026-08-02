@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sidebar Test - 800x500</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #1a1a1a;
+            color: #e5e5e5;
+        }
+        .test-info {
+            position: fixed;
+            top: 10px;
+            right: 10px;
+            background: #333;
+            padding: 10px;
+            border-radius: 8px;
+            font-size: 12px;
+            z-index: 9999;
+        }
+        .sidebar {
+            position: fixed;
+            top: 0;
+            left: 0;
+            height: 100vh;
+            width: 56px;
+            background: #2a2a2a;
+            border-right: 1px solid #404040;
+            display: flex;
+            flex-direction: column;
+        }
+        .rail-logo {
+            height: 56px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-bottom: 1px solid #404040;
+        }
+        .rail-logo img {
+            width: 32px;
+            height: 32px;
+        }
+        .rail-nav {
+            flex: 1;
+            overflow-y: auto;
+            overflow-x: clip;
+            padding: 12px 6px;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+        .nav-item {
+            width: 40px;
+            height: 40px;
+            margin: 0 auto;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 8px;
+            background: #333;
+            color: #a3a3a3;
+            cursor: pointer;
+            position: relative;
+        }
+        .nav-item:hover {
+            background: #404040;
+            color: #e5e5e5;
+        }
+        .nav-item.active {
+            background: rgba(59, 130, 246, 0.1);
+            color: #3b82f6;
+        }
+        .nav-item.active::before {
+            content: '';
+            position: absolute;
+            left: 0;
+            top: 6px;
+            bottom: 6px;
+            width: 2px;
+            background: #3b82f6;
+            border-radius: 9999px;
+        }
+        .nav-icon {
+            width: 22px;
+            height: 22px;
+        }
+        .rail-footer {
+            height: 56px;
+            border-top: 1px solid #404040;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 9px;
+            color: #737373;
+        }
+        /* Tooltip */
+        .tooltip {
+            position: fixed;
+            z-index: 9999;
+            padding: 4px 8px;
+            background: #404040;
+            color: #e5e5e5;
+            border: 1px solid #525252;
+            border-radius: 4px;
+            font-size: 12px;
+            white-space: nowrap;
+            pointer-events: none;
+            opacity: 0;
+            transition: opacity 0.15s;
+            transform: translateY(-50%);
+        }
+        .tooltip.visible {
+            opacity: 1;
+        }
+    </style>
+</head>
+<body>
+    <div class="test-info">
+        <div><strong>Viewport:</strong> 800×500</div>
+        <div><strong>Test:</strong> Sidebar horizontal overflow</div>
+        <div><strong>Status:</strong> <span id="status">Testing...</span></div>
+    </div>
+
+    <aside aria-label="nav.aria.primary" class="sidebar">
+        <div class="rail-logo">
+            <img src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%233b82f6'%3E%3Cpath d='M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5'/%3E%3C/svg%3E" alt="logo">
+        </div>
+        <nav class="rail-nav" aria-label="nav.aria.primary">
+            <div class="nav-item active" data-label="Dashboard">
+                <svg class="nav-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6"/>
+                </svg>
+            </div>
+            <div class="nav-item" data-label="Agents">
+                <svg class="nav-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z"/>
+                </svg>
+            </div>
+            <!-- Add many items to force vertical scrolling -->
+            <div class="nav-item" data-label="Config">
+                <svg class="nav-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/>
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/>
+                </svg>
+            </div>
+            <div class="nav-item" data-label="Tools">
+                <svg class="nav-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/>
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/>
+                </svg>
+            </div>
+            <div class="nav-item" data-label="Skills">
+                <svg class="nav-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143L13 3z"/>
+                </svg>
+            </div>
+            <div class="nav-item" data-label="SOPs">
+                <svg class="nav-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
+                </svg>
+            </div>
+            <div class="nav-item" data-label="Runs">
+                <svg class="nav-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01"/>
+                </svg>
+            </div>
+            <div class="nav-item" data-label="Integrations">
+                <svg class="nav-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 4a2 2 0 114 0v1a1 1 0 001 1h3a1 1 0 011 1v3a1 1 0 01-1 1h-1a2 2 0 100 4h1a1 1 0 011 1v3a1 1 0 01-1 1h-3a1 1 0 01-1-1v-1a2 2 0 10-4 0v1a1 1 0 01-1 1H7a1 1 0 01-1-1v-3a1 1 0 00-1-1H4a2 2 0 110-4h1a1 1 0 001-1V7a1 1 0 011-1h3a1 1 0 001-1V4z"/>
+                </svg>
+            </div>
+            <div class="nav-item" data-label="Cron">
+                <svg class="nav-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                </svg>
+            </div>
+            <div class="nav-item" data-label="Logs">
+                <svg class="nav-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/>
+                </svg>
+            </div>
+            <div class="nav-item" data-label="Pairing">
+                <svg class="nav-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 18h.01M8 21h8a2 2 0 002-2V5a2 2 0 00-2-2H8a2 2 0 00-2 2v14a2 2 0 002 2z"/>
+                </svg>
+            </div>
+            <div class="nav-item" data-label="Doctor">
+                <svg class="nav-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4.318 6.318a4.5 4.5 0 000 6.364L12 20.364l7.682-7.682a4.5 4.5 0 00-6.364-6.364L12 7.636l-1.318-1.318a4.5 4.5 0 00-6.364 0z"/>
+                </svg>
+            </div>
+            <div class="nav-item" data-label="Canvas">
+                <svg class="nav-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"/>
+                </svg>
+            </div>
+            <div class="nav-item" data-label="ACP Console">
+                <svg class="nav-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/>
+                </svg>
+            </div>
+        </nav>
+        <div class="rail-footer">
+            <span>v0.8.3</span>
+        </div>
+    </aside>
+
+    <!-- Tooltip element -->
+    <div id="tooltip" class="tooltip"></div>
+
+    <script>
+        // Setup tooltips
+        const tooltip = document.getElementById('tooltip');
+        document.querySelectorAll('.nav-item').forEach(item => {
+            item.addEventListener('mouseenter', (e) => {
+                const rect = e.currentTarget.getBoundingClientRect();
+                const railRect = document.querySelector('aside').getBoundingClientRect();
+                tooltip.textContent = item.getAttribute('data-label');
+                tooltip.style.top = (rect.top + rect.height / 2) + 'px';
+                tooltip.style.left = (railRect.right + 8) + 'px';
+                tooltip.classList.add('visible');
+            });
+            
+            item.addEventListener('mouseleave', () => {
+                tooltip.classList.remove('visible');
+            });
+            
+            item.addEventListener('focus', (e) => {
+                const rect = e.currentTarget.getBoundingClientRect();
+                const railRect = document.querySelector('aside').getBoundingClientRect();
+                tooltip.textContent = item.getAttribute('data-label');
+                tooltip.style.top = (rect.top + rect.height / 2) + 'px';
+                tooltip.style.left = (railRect.right + 8) + 'px';
+                tooltip.classList.add('visible');
+            });
+            
+            item.addEventListener('blur', () => {
+                tooltip.classList.remove('visible');
+            });
+        });
+
+        // Measure and report
+        setTimeout(() => {
+            const nav = document.querySelector('nav.rail-nav');
+            const measurements = {
+                scrollWidth: nav.scrollWidth,
+                clientWidth: nav.clientWidth,
+                scrollHeight: nav.scrollHeight,
+                clientHeight: nav.clientHeight,
+                overflowX: getComputedStyle(nav).overflowX,
+                overflowY: getComputedStyle(nav).overflowY
+            };
+            
+            const hasHorizontalOverflow = measurements.scrollWidth > measurements.clientWidth;
+            
+            document.getElementById('status').textContent = hasHorizontalOverflow 
+                ? '❌ FAIL: Horizontal overflow detected' 
+                : '✅ PASS: No horizontal overflow';
+            document.getElementById('status').style.color = hasHorizontalOverflow ? '#f87171' : '#4ade80';
+            
+            // Output measurements for automation
+            console.log('=== MEASUREMENTS ===');
+            console.log(JSON.stringify(measurements, null, 2));
+            console.log('Has horizontal overflow:', hasHorizontalOverflow);
+            
+            // Save to window for Playwright to access
+            window.sidebarMeasurements = {
+                ...measurements,
+                hasHorizontalOverflow,
+                pass: !hasHorizontalOverflow
+            };
+        }, 1000);
+    </script>
+</body>
+</html>
