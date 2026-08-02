@@ -90,7 +90,7 @@ jobs:
     name: Lint
     needs: [fmt]
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -147,6 +147,8 @@ jobs:
           exit "$cargo_status"
         env:
           RUST_CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
+      - name: Rustdoc warnings gate
+        run: cargo doc --no-deps --workspace
       - name: Config-write isolation guard
         run: cargo test --test architecture tests_that_persist_config_isolate_the_path
       - name: Fluent coverage guard (no bare user-facing strings)

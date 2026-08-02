@@ -62,6 +62,9 @@ cargo test --locked
 # Format and lint (required before PR)
 ./scripts/ci/rust_quality_gate.sh
 
+# Rustdoc warnings (required CI lint step; fatal via .cargo/config.toml)
+cargo doc --no-deps --workspace
+
 # Full CI parity in Docker
 ./dev/ci.sh all
 ```
