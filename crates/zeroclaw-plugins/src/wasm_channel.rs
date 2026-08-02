@@ -9,7 +9,9 @@ use crate::component::bindings::channel::exports::zeroclaw::plugin::channel::{
     ChannelCapabilities, InboundMessage as WitInboundMessage,
     MediaAttachment as WitMediaAttachment, SendMessage as WitSendMessage,
 };
-use crate::component::{PluginState, PluginStoreSpec, call_plugin, engine, load_component, wt};
+use crate::component::{
+    PluginState, PluginStoreSpec, call_plugin, engine, load_component, wt, wt_instantiate,
+};
 use crate::endpoint::PluginChannelEndpoint;
 use crate::instance::PluginGrantSet;
 use anyhow::Result;
@@ -107,7 +109,7 @@ impl WasmChannel {
         let http = store.data().http_enabled();
         let linker = build_linker(http)?;
         crate::component::ensure_http_coherent(&store, http)?;
-        let bindings = wt(
+        let bindings = wt_instantiate(
             ChannelPlugin::instantiate_async(&mut store, &component, &linker).await,
             "failed to instantiate channel plugin",
         )?;

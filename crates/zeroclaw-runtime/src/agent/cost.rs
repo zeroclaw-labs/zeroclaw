@@ -802,4 +802,35 @@ mod tests {
         assert_eq!(recorded.output_tokens, 200);
         assert!((recorded.cost_usd - expected).abs() < 1e-12);
     }
+
+    #[test]
+    fn tool_loop_cost_tracking_context_from_tracker_stamps_given_alias() {
+        // `tool_loop_cost_tracking_context_for_agent` (the builder
+        // `send_message_to_peer.rs` calls for the peer-turn cost scope)
+        // delegates to this function after resolving the process-global
+        // tracker. Exercise it directly with an explicit LOCAL tracker so
+        // this stays flake-free (no global-tracker singleton touched) while
+        // still pinning the alias-stamping contract the per-agent
+        // attribution depends on.
+        let workspace = tempfile::TempDir::new().unwrap();
+        let tracker = Arc::new(
+            CostTracker::new(
+                zeroclaw_config::schema::CostConfig {
+                    enabled: true,
+                    track_per_agent: true,
+                    ..zeroclaw_config::schema::CostConfig::default()
+                },
+                workspace.path(),
+            )
+            .unwrap(),
+        );
+
+        let ctx = tool_loop_cost_tracking_context_from_tracker(
+            &Config::default(),
+            "peer-recipient",
+            tracker,
+        );
+
+        assert_eq!(ctx.agent_alias, Some("peer-recipient".to_string()));
+    }
 }

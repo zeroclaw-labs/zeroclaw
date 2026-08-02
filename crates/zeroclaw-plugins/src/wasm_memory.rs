@@ -9,7 +9,9 @@ use crate::component::bindings::memory::exports::zeroclaw::plugin::memory::{
     MemoryCategory as WitMemoryCategory, MemoryEntry as WitMemoryEntry,
     ProceduralMessage as WitProceduralMessage,
 };
-use crate::component::{PluginState, PluginStoreSpec, call_plugin, engine, load_component, wt};
+use crate::component::{
+    PluginState, PluginStoreSpec, call_plugin, engine, load_component, wt, wt_instantiate,
+};
 use crate::instance::PluginInstanceScope;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -69,7 +71,7 @@ impl WasmMemory {
         let mut store = crate::component::new_store(PluginStoreSpec::new(scope.clone(), limits));
         let linker = linker()?;
         crate::component::ensure_http_coherent(&store, false)?;
-        let bindings = wt(
+        let bindings = wt_instantiate(
             MemoryPlugin::instantiate_async(&mut store, &component, &linker).await,
             "failed to instantiate memory plugin",
         )?;

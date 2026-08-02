@@ -81,6 +81,9 @@ jobs:
       - name: Test translation release submodule handling
         run: scripts/release/refresh-translations.test.sh
 
+      - name: Guard release attestation contract
+        run: python3 scripts/ci/release_attestation_contract_test.py
+
   # ── Post-format required quality gate ─────────────────────────────────────
 
   lint:
@@ -528,6 +531,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       run: ${{ steps.changed.outputs.run }}
+      scope: ${{ steps.changed.outputs.scope }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -544,8 +548,9 @@ jobs:
             pull_request)
               changed_files="$(mktemp)"
               git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD > "$changed_files"
-              if bash scripts/ci/parallel_runtime_test_scope.sh < "$changed_files"; then
+              if scope="$(bash scripts/ci/parallel_runtime_test_scope.sh < "$changed_files")"; then
                 echo "run=true" >> "$GITHUB_OUTPUT"
+                echo "scope=$scope" >> "$GITHUB_OUTPUT"
               else
                 status=$?
                 if [ "$status" -ne 1 ]; then
@@ -586,6 +591,7 @@ jobs:
       - name: Repeat parallel runtime tests
         run: ./scripts/ci/parallel_runtime_test_gate.sh
         env:
+          ZEROCLAW_PARALLEL_TEST_SCOPE: ${{ needs.parallel-runtime-test-changes.outputs.scope }}
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
@@ -651,6 +657,7 @@ jobs:
           for path in (
               ".github/workflows/ci.yml",
               ".github/workflows/project-dashboard-plan.yml",
+              ".github/workflows/release-stable-manual.yml",
           ):
               yaml.safe_load(open(path))
               print(f"{path}: valid")
@@ -804,6 +811,9 @@ jobs:
       - name: Run permission and catalog regressions
         working-directory: web
         run: npm run test:permissions
+      - name: Run turn-stream regressions
+        working-directory: web
+        run: npm run test:contexts
 
   # ── Required gate ─────────────────────────────────────────────────────────
   # Branch protection requires only this single job — internal structure

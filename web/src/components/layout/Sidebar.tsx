@@ -1,5 +1,7 @@
-import { NavLink } from 'react-router-dom';
+import { useLocation } from 'react-router-dom';
 import { basePath } from '../../lib/basePath';
+import { findActiveNavPath } from './sidebarNav';
+import { SidebarNavLink } from './SidebarNavLink';
 import {
   Activity,
   ArrowDownToLine,
@@ -75,6 +77,10 @@ const navGroups: NavGroup[] = [
   },
 ];
 
+// NavLink matches path prefixes by default. Resolve the longest registered
+// destination so a specific item can suppress its otherwise-active ancestors.
+const navPaths = navGroups.flatMap((group) => group.items.map((item) => item.to));
+
 // The 6 Quickstart sections (Workspace, Providers, Channels, Memory,
 // Hardware, Tunnel) live under /config now — they're the first group
 // inside the Config explorer's sidebar. The /setup/<section> deep-link
@@ -87,13 +93,21 @@ const navGroups: NavGroup[] = [
 // and a token-styled popover to the right shown on hover OR keyboard focus.
 // Active state = accent icon + a 2px left accent bar + subtle accent tint, with
 // aria-current="page" so assistive tech announces the current section.
-function RailNavItem({ item, onClick }: { item: NavItem; onClick: () => void }) {
+function RailNavItem({
+  item,
+  activePath,
+  onClick,
+}: {
+  item: NavItem;
+  activePath: string | null;
+  onClick: () => void;
+}) {
   const { to, icon: Icon, labelKey } = item;
   const text = t(labelKey);
   return (
-    <NavLink
+    <SidebarNavLink
       to={to}
-      end={to === '/'}
+      activePath={activePath}
       onClick={onClick}
       title={text}
       aria-label={text}
@@ -138,7 +152,7 @@ function RailNavItem({ item, onClick }: { item: NavItem; onClick: () => void }) 
           </span>
         </>
       )}
-    </NavLink>
+    </SidebarNavLink>
   );
 }
 
@@ -146,13 +160,21 @@ function RailNavItem({ item, onClick }: { item: NavItem; onClick: () => void }) 
 // Full labelled row (icon + text) for the mobile drawer, with the same calm
 // active treatment as before: subtle accent tint, 2px left accent bar, accent
 // icon, and aria-current via NavLink.
-function DrawerNavItem({ item, onClick }: { item: NavItem; onClick: () => void }) {
+function DrawerNavItem({
+  item,
+  activePath,
+  onClick,
+}: {
+  item: NavItem;
+  activePath: string | null;
+  onClick: () => void;
+}) {
   const { to, icon: Icon, labelKey } = item;
   const text = t(labelKey);
   return (
-    <NavLink
+    <SidebarNavLink
       to={to}
-      end={to === '/'}
+      activePath={activePath}
       onClick={onClick}
       className={({ isActive }) =>
         [
@@ -180,16 +202,17 @@ function DrawerNavItem({ item, onClick }: { item: NavItem; onClick: () => void }
           <span className="whitespace-nowrap">{text}</span>
         </>
       )}
-    </NavLink>
+    </SidebarNavLink>
   );
 }
 
 // ── Mobile drawer group ─────────────────────────────────────────────────────
 // One labelled cluster: a faint uppercase heading associated with its <ul> via
 // aria-labelledby so screen readers announce the group name.
-function DrawerGroup({ group, index, onClick }: {
+function DrawerGroup({ group, index, activePath, onClick }: {
   group: NavGroup;
   index: number;
+  activePath: string | null;
   onClick: () => void;
 }) {
   const heading = t(group.headingKey);
@@ -204,7 +227,12 @@ function DrawerGroup({ group, index, onClick }: {
         {heading}
       </h2>
       {group.items.map((item) => (
-        <DrawerNavItem key={item.to} item={item} onClick={onClick} />
+        <DrawerNavItem
+          key={item.to}
+          item={item}
+          activePath={activePath}
+          onClick={onClick}
+        />
       ))}
     </div>
   );
@@ -216,6 +244,8 @@ interface SidebarProps {
 }
 
 export default function Sidebar({ open, onClose }: SidebarProps) {
+  const { pathname } = useLocation();
+  const activePath = findActiveNavPath(pathname, navPaths);
   const [status, setStatus] = useState<StatusResponse | null>(null);
   useEffect(() => {
     getStatus()
@@ -265,7 +295,12 @@ export default function Sidebar({ open, onClose }: SidebarProps) {
                 />
               )}
               {group.items.map((item) => (
-                <RailNavItem key={item.to} item={item} onClick={onClose} />
+                <RailNavItem
+                  key={item.to}
+                  item={item}
+                  activePath={activePath}
+                  onClick={onClose}
+                />
               ))}
             </div>
           ))}
@@ -285,7 +320,13 @@ export default function Sidebar({ open, onClose }: SidebarProps) {
         <DrawerLogo />
         <nav className="flex-1 overflow-y-auto py-3 px-2 space-y-0.5" aria-label={t('nav.aria.primary')}>
           {navGroups.map((group, index) => (
-            <DrawerGroup key={group.headingKey} group={group} index={index} onClick={onClose} />
+            <DrawerGroup
+              key={group.headingKey}
+              group={group}
+              index={index}
+              activePath={activePath}
+              onClick={onClose}
+            />
           ))}
         </nav>
         <DrawerFooter version={version} hasUpdate={hasUpdate} onOpen={openUpgrade} />

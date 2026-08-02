@@ -9679,6 +9679,37 @@ fn validate_required_bot_token(field_path: &str, enabled: bool, token: &str) -> 
     Ok(())
 }
 
+/// Shared "required once enabled" rule for channel-credential fields whose
+/// name doesn't end in `bot_token` (Signal's `http_url`/`account`, Voice
+/// Call's `account_id`/`auth_token`/`from_number`), so the sibling
+/// `.enabled` path can't be derived by suffix-stripping like
+/// `validate_required_bot_token` does. An enabled channel built with an
+/// empty required credential never connects, so its per-channel supervisor
+/// restarts it forever; rejecting at config-load time turns that crashloop
+/// into a fail-fast startup error instead.
+pub(crate) fn validate_required_field(
+    field_path: &str,
+    enabled_path: &str,
+    enabled: bool,
+    value: &str,
+) -> Result<()> {
+    if value.trim() == crate::traits::UNSET_DISPLAY {
+        validation_bail!(
+            RequiredFieldEmpty,
+            field_path.to_string(),
+            "{field_path} must not contain the unset display placeholder",
+        );
+    }
+    if enabled && crate::traits::is_unset_display_value(value) {
+        validation_bail!(
+            RequiredFieldEmpty,
+            field_path.to_string(),
+            "{field_path} is required when {enabled_path} = true",
+        );
+    }
+    Ok(())
+}
+
 fn set_proxy_env_pair(key: &str, value: Option<&str>) {
     let lowercase_key = key.to_ascii_lowercase();
     if let Some(value) = value.and_then(|candidate| normalize_proxy_url_option(Some(candidate))) {
@@ -10937,6 +10968,99 @@ pub fn validate_memory_semantics(
             )
         })
         .collect()
+}
+
+/// Surface WhatsApp chat-policy keys that are accepted but never consulted.
+///
+/// `dm_policy`, `group_policy` and `self_chat_mode` are read only by the Web
+/// transport inside its `mode == Personal` block, so under `mode = "business"`
+/// they validate cleanly and have no effect. That is easy to miss because
+/// `dm_policy` DEFAULTS to `Allowlist`: a business-mode Web channel reads as
+/// restrictive while answering every DM it receives.
+///
+/// `allowed_groups` is separate. `is_group_chat_allowed` returns true when the
+/// list is empty, and that gate does run in both modes, which makes an empty
+/// list the only group protection under `mode = "business"` and an open one.
+///
+/// Warnings only, no behaviour change: an operator who is relying on the
+/// current defaults keeps working, and learns about it at `config validate`.
+///
+/// Called from `Config::collect_warnings`, so this reaches the CLI and the
+/// gateway dashboard on the same path as the other warnings.
+pub fn validate_whatsapp_semantics(
+    alias: &str,
+    wa: &WhatsAppConfig,
+) -> Vec<crate::validation_warnings::ValidationWarning> {
+    let mut out = Vec::new();
+    if !wa.enabled || !wa.is_web_config() {
+        return out;
+    }
+
+    if wa.mode != WhatsAppWebMode::Personal {
+        let mut inert: Vec<(&'static str, String)> = Vec::new();
+        if wa.dm_policy != WhatsAppChatPolicy::All {
+            inert.push((
+                "dm_policy",
+                "every direct message is answered regardless of this setting".to_string(),
+            ));
+        }
+        if wa.group_policy != WhatsAppChatPolicy::All {
+            inert.push((
+                "group_policy",
+                "group messages are not filtered by this setting".to_string(),
+            ));
+        }
+        if wa.self_chat_mode {
+            inert.push((
+                "self_chat_mode",
+                "self-chat handling is unchanged by this setting".to_string(),
+            ));
+        }
+        for (key, effect) in inert {
+            out.push(crate::validation_warnings::ValidationWarning::new(
+                "whatsapp_chat_policy_inert",
+                format!(
+                    "channels.whatsapp.{alias}.{key} is set but the Web transport only \
+                     consults it under mode = \"personal\"; as configured, {effect}"
+                ),
+                format!("channels.whatsapp.{alias}.{key}"),
+            ));
+        }
+    }
+
+    // An empty allowed_groups only creates UNINTENDED open access where the
+    // effective policy would otherwise have consulted the list. Two personal-mode
+    // configurations must stay quiet:
+    //
+    //   group_policy = "ignore"    the channel gate drops every group message
+    //                              downstream, so nothing is permitted. Warning here
+    //                              also told the operator to set exactly this, and
+    //                              then kept firing after they did.
+    //   group_policy = "all"       an explicit opt-in to open group access. Warning
+    //                              here reports a deliberate choice as unsafe.
+    //
+    // So the warning applies to business mode (where the list is consulted no matter
+    // what group_policy says) and to personal mode with group_policy = "allowlist"
+    // (where an empty list is an allowlist that admits everything).
+    let empty_list_permits_all = if wa.mode == WhatsAppWebMode::Personal {
+        wa.group_policy == WhatsAppChatPolicy::Allowlist
+    } else {
+        true
+    };
+
+    if wa.allowed_groups.is_empty() && empty_list_permits_all {
+        out.push(crate::validation_warnings::ValidationWarning::new(
+            "whatsapp_empty_group_allowlist_permits_all",
+            format!(
+                "channels.whatsapp.{alias}.allowed_groups is empty, which permits EVERY \
+                 group the linked account belongs to. List the group JIDs you intend to \
+                 serve, or set group_policy = \"ignore\" under mode = \"personal\"."
+            ),
+            format!("channels.whatsapp.{alias}.allowed_groups"),
+        ));
+    }
+
+    out
 }
 
 /// Write-time duplicate handling policy for memory entries.
@@ -12258,6 +12382,22 @@ pub struct ModelRouteConfig {
     pub api_key: Option<String>,
 }
 
+// ── Model cache (shared between CLI refresh and channel reader) ──
+
+/// Canonical on-disk model cache schema. Written by `zeroclaw models refresh`
+/// and read by the channel `/model` command. Both sides MUST use this type
+/// to prevent schema drift (single-source-of-truth rule).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ModelCacheState {
+    pub entries: Vec<ModelCacheEntry>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ModelCacheEntry {
+    pub model_provider: String,
+    pub models: Vec<String>,
+}
+
 // ── Embedding routing ───────────────────────────────────────────
 
 /// Route an embedding hint to a specific model_provider + model.
@@ -12581,6 +12721,17 @@ pub struct CronJobDecl {
     #[serde(default)]
     #[nested]
     pub delivery: Option<DeliveryConfigDecl>,
+    /// Output format for shell jobs: `"wrapped"` (default) or `"raw"`.
+    ///
+    /// - `"wrapped"` (default): returns stdout and stderr wrapped in a
+    ///   `status=... / stdout: / stderr:` envelope.
+    /// - `"raw"`: returns trimmed stdout when the process exits zero. A
+    ///   non-zero process exit still gets the wrapped status/stdout/stderr
+    ///   envelope for diagnosis. Failures that never reach a process exit —
+    ///   a security-policy denial, a shell setup/spawn failure, or a
+    ///   timeout — return a plain error string in either format.
+    #[serde(default)]
+    pub shell_output_format: CronShellOutputFormat,
 }
 
 impl Default for CronJobDecl {
@@ -12597,8 +12748,23 @@ impl Default for CronJobDecl {
             uses_memory: true,
             session_target: None,
             delivery: None,
+            shell_output_format: CronShellOutputFormat::default(),
         }
     }
+}
+
+/// Output format for shell cron job stdout.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, zeroclaw_macros::ConfigEnum)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum CronShellOutputFormat {
+    /// Wrapped format: `status=...\nstdout:\n...\nstderr:\n...` (default).
+    #[default]
+    Wrapped,
+    /// Raw stdout on a zero process exit; wrapped status/stdout/stderr on a
+    /// non-zero exit; a plain error string for failures that never reach a
+    /// process exit (security denial, spawn/setup failure, timeout).
+    Raw,
 }
 
 /// Schedule variant for declarative cron jobs.
@@ -14498,6 +14664,40 @@ pub struct SignalConfig {
     pub reply_queue_depth_max: u16,
 }
 
+impl SignalConfig {
+    /// Whether both required credentials (`http_url`, `account`) are
+    /// present. Mirrors `WhatsAppConfig::is_cloud_config`'s role: the
+    /// channel orchestrator uses this bool to decide whether to build the
+    /// channel at all, skipping (with a warning) an enabled-but-uncredentialed
+    /// alias instead of building a listener that can never connect and
+    /// crashloops its per-channel supervisor.
+    pub fn has_required_credentials(&self) -> bool {
+        !crate::traits::is_unset_display_value(&self.http_url)
+            && !crate::traits::is_unset_display_value(&self.account)
+    }
+
+    /// Validate this alias's required credentials once enabled. Mirrors
+    /// `TelegramConfig::validate_bot_token` / `DiscordConfig::validate_bot_token`:
+    /// an enabled Signal channel built with an empty `http_url` or `account`
+    /// never connects and crashloops its per-channel supervisor, so reject
+    /// it at config-load time instead.
+    pub fn validate_required(&self, alias: &str) -> Result<()> {
+        let enabled_path = format!("channels.signal.{alias}.enabled");
+        validate_required_field(
+            &format!("channels.signal.{alias}.http_url"),
+            &enabled_path,
+            self.enabled,
+            &self.http_url,
+        )?;
+        validate_required_field(
+            &format!("channels.signal.{alias}.account"),
+            &enabled_path,
+            self.enabled,
+            &self.account,
+        )
+    }
+}
+
 impl ChannelConfig for SignalConfig {
     fn name() -> &'static str {
         "Signal"
@@ -14805,7 +15005,7 @@ impl ChannelConfig for WatiConfig {
     }
 }
 
-/// Nextcloud Talk bot configuration (webhook receive + OCS send API).
+/// Nextcloud Talk bot configuration (webhook receive + signed bot send API).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.nextcloud_talk"]
@@ -14820,12 +15020,35 @@ pub struct NextcloudTalkConfig {
     /// Nextcloud base URL (e.g. `"https://cloud.example.com"`).
     #[tab(Connection)]
     pub base_url: String,
-    /// Bot app token used for OCS API bearer auth.
+    /// Deprecated, unused. Nextcloud Talk sends do not authenticate via
+    /// OCS bearer auth (see `webhook_secret`); this field is only accepted so
+    /// existing configs that set it don't fail to parse. Safe to remove
+    /// from your config.
+    #[serde(default)]
     #[secret]
     #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
-    pub app_token: String,
-    /// Shared secret for webhook signature verification.
+    pub app_token: Option<String>,
+    /// DEPRECATED alias for `webhook_secret`, kept for migration.
+    ///
+    /// Nextcloud issues ONE secret per installed bot and uses it for both
+    /// directions, so this cannot hold a different outbound secret. When both
+    /// are set to different non-empty values the channel logs the conflict and
+    /// fails closed as unconfigured: inbound `401` and no outbound send.
+    /// Prefer `webhook_secret`; this alias will be removed.
+    ///
+    /// Upgrade from a `bot_token`-only configuration: copy the installed bot
+    /// secret to `webhook_secret`, verify replies still send, then delete
+    /// `bot_token`.
+    #[secret]
+    #[tab(Connection)]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub bot_token: Option<String>,
+    /// The bot secret Nextcloud installed for this bot. Canonical field.
+    ///
+    /// Used for BOTH directions: verifying inbound webhook signatures and
+    /// signing outbound bot-API requests. When it is unset, inbound webhooks
+    /// are rejected and no outbound request is sent (fail closed).
     ///
     /// Can also be set via `ZEROCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET`.
     #[serde(default)]
@@ -14849,20 +15072,69 @@ pub struct NextcloudTalkConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub excluded_tools: Vec<String>,
-    /// Controls whether and how streaming draft updates are delivered.
-    ///
-    /// - `"off"` (default): responses are sent as a single final message.
-    /// - `"partial"`: a placeholder is posted first and edited incrementally
-    ///   as tokens arrive, making long responses visible in real time.
+    /// Retained for configuration compatibility. Nextcloud Talk's bot API does
+    /// not provide message IDs or edit/delete operations, so draft updates are
+    /// disabled and responses are currently sent as one final message for every
+    /// value.
     #[tab(Behavior)]
     #[serde(default)]
     pub stream_mode: StreamMode,
-    /// Minimum interval in milliseconds between consecutive OCS edit calls per
-    /// room when `stream_mode = "partial"`. Default: 1000 ms.
+    /// Retained for configuration compatibility. Currently inert while draft
+    /// updates are disabled for this channel. Default: 1000 ms.
     #[tab(Behavior)]
     #[serde(default = "default_draft_update_interval_ms")]
     pub draft_update_interval_ms: u64,
 }
+impl NextcloudTalkConfig {
+    /// Resolve the single bot secret Nextcloud installs for this bot.
+    ///
+    /// Nextcloud issues ONE secret per installed bot and uses it for both directions:
+    /// verifying inbound webhook signatures and signing outbound bot-API requests. So
+    /// both directions must resolve it identically, or one of them cannot match the
+    /// installed bot.
+    ///
+    /// `webhook_secret` is canonical; `bot_token` is a deprecated alias kept for
+    /// migration. Both are trimmed, and a blank value is treated as absent so an empty
+    /// or whitespace alias cannot mask a real secret. Two conflicting non-empty values
+    /// are rejected rather than silently split into two authorities.
+    ///
+    /// Returns `Ok(None)` when no secret is configured. Callers must fail closed on
+    /// `Ok(None)` and on `Err`: send no outbound request, and reject inbound webhooks
+    /// rather than skipping verification.
+    pub fn resolve_bot_secret(&self) -> Result<Option<String>, NextcloudTalkSecretConflict> {
+        let norm = |v: &Option<String>| -> Option<String> {
+            v.as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)
+        };
+        let canonical = norm(&self.webhook_secret);
+        let alias = norm(&self.bot_token);
+        match (canonical, alias) {
+            (Some(a), Some(b)) if a != b => Err(NextcloudTalkSecretConflict),
+            (Some(a), _) => Ok(Some(a)),
+            (None, Some(b)) => Ok(Some(b)),
+            (None, None) => Ok(None),
+        }
+    }
+}
+
+/// `webhook_secret` and the deprecated `bot_token` alias hold different non-empty
+/// values. Nextcloud installs one secret per bot, so there is no correct choice
+/// between them and guessing would leave one direction unable to match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NextcloudTalkSecretConflict;
+
+impl std::fmt::Display for NextcloudTalkSecretConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "nextcloud_talk: `webhook_secret` and the deprecated `bot_token` alias are set \
+to different values; Nextcloud installs one secret per bot. Set `webhook_secret` only.",
+        )
+    }
+}
+
+impl std::error::Error for NextcloudTalkSecretConflict {}
 
 impl ChannelConfig for NextcloudTalkConfig {
     fn name() -> &'static str {
@@ -18787,7 +19059,15 @@ impl Config {
         self.collect_cross_provider_summary_model_warnings(&mut warnings);
         self.collect_a2a_exposed_skills_warnings(&mut warnings);
         self.collect_memory_semantic_search_warnings(&mut warnings);
+        // Must run after `collect_cross_provider_summary_model_warnings`: it
+        // scans `warnings` to suppress its generic inert `summary_model`
+        // warning when the more specific cross-provider diagnostic already
+        // covers the same path.
+        self.collect_context_compression_ignored_warnings(&mut warnings);
         warnings.extend(validate_memory_semantics(&self.memory));
+        for (alias, wa) in &self.channels.whatsapp {
+            warnings.extend(validate_whatsapp_semantics(alias, wa));
+        }
         // `wire_api` is only honored by bring-your-own-endpoint families; on a
         // branded family with a fixed wire protocol it is silently ignored.
         // Surface that so an operator who sets it on, e.g., `mistral` learns it
@@ -18938,27 +19218,33 @@ impl Config {
         }
     }
 
-    /// Surface the cross-provider shape on a legacy config that has NOT
-    /// migrated to `summary_provider`. The deprecated
-    /// `runtime_profiles.<p>.context_compression.summary_model` is a bare model
-    /// id dispatched onto each consuming agent's OWN provider; when a single
-    /// profile is shared by agents resolving to MORE THAN ONE distinct provider,
-    /// that one bare id is cross-provider for at least one of them and silently
-    /// fails at runtime. The new `summary_provider` (agent override or profile
-    /// level) supersedes the bare id and is self-contained, so an agent that
-    /// sets it is safe and excluded from the count.
+    /// Surface cross-provider ambiguity in a legacy config while reporting
+    /// the current contract: context compression has no runtime consumer, so
+    /// this knob is inert like every other `context_compression` field (see
+    /// `collect_context_compression_ignored_warnings`). This diagnostic adds
+    /// config-shape detail as a more specific companion for the same line. The
+    /// deprecated
+    /// `runtime_profiles.<p>.context_compression.summary_model` is a bare
+    /// model id that names no provider of its own — it would need to be
+    /// resolved onto each consuming agent's OWN provider were the field ever
+    /// read again — so when a single profile is shared by agents resolving
+    /// to MORE THAN ONE distinct provider, that one bare id is ambiguous for
+    /// at least one of them. A `summary_provider` supplies provider identity
+    /// for this narrower diagnostic and excludes the corresponding value from
+    /// the ambiguity count; it does not make context compression functional.
     ///
-    /// This is the offline, deterministic "startup diagnostic" the review
-    /// asked for: no schema bump, no network, no model catalog. It names the
-    /// profile, the affected agents, and their differing providers, and
-    /// recommends migrating to `context_compression.summary_provider`.
+    /// The diagnostic is offline and deterministic: no schema bump, no
+    /// network, and no model catalog. It names the profile, the affected
+    /// agents, and their differing providers, then recommends removing the
+    /// unsupported setting or waiting for an accepted compression design.
     fn collect_cross_provider_summary_model_warnings(
         &self,
         warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
     ) {
         for (profile_alias, profile) in &self.runtime_profiles {
-            // Only the deprecated bare summary_model is at risk; a profile-level
-            // summary_provider already supersedes it for every consumer.
+            // Only the deprecated bare summary_model lacks provider identity.
+            // A profile-level summary_provider excludes this narrower
+            // ambiguity shape, but context compression remains inert.
             if !profile
                 .context_compression
                 .summary_provider
@@ -18974,10 +19260,11 @@ impl Config {
                 continue;
             }
 
-            // Gather the agents that (a) reference this profile and (b) have no
-            // agent-level summary_provider override (an override supersedes the
-            // bare id, so the agent is safe). For each, resolve the canonical
-            // provider entry its bare summary_model would be dispatched onto.
+            // Gather agents that reference this profile and have no agent-level
+            // summary_provider identity. An override excludes that agent from
+            // this ambiguity diagnostic but does not make compression
+            // functional. Resolve the provider that would be paired with the
+            // bare model if a future implementation consumed this config.
             let mut affected: Vec<(String, String)> = Vec::new();
             for (agent_alias, agent) in &self.agents {
                 if agent.runtime_profile.trim() != profile_alias {
@@ -18990,10 +19277,10 @@ impl Config {
                 affected.push((agent_alias.clone(), provider_label));
             }
 
-            // The bug only manifests across distinct providers: a single shared
-            // bare id sent to two or more different providers. Same-provider use
-            // is the deprecated-but-correct case and stays silent here (the
-            // runtime deprecation WARN still nudges migration).
+            // Cross-provider ambiguity requires distinct providers. A
+            // same-provider bare id is still inert, but the generic
+            // context-compression warning reports that fact without this
+            // additional ambiguity detail.
             let distinct: std::collections::BTreeSet<&str> =
                 affected.iter().map(|(_, p)| p.as_str()).collect();
             if distinct.len() < 2 {
@@ -19012,15 +19299,128 @@ impl Config {
                 "cross_provider_summary_model",
                 format!(
                     "runtime_profiles.{profile_alias}.context_compression.summary_model \
-                     ({summary_model:?}) is a bare model id reused by agents resolving to \
-                     different providers ({detail}); the deprecated summary_model is \
-                     dispatched on each agent's own provider, so it is sent to the wrong \
-                     provider for at least one of them and silently fails at runtime (#7964). \
-                     Migrate to context_compression.summary_provider (or an agent-level \
-                     summary_provider), which is self-contained and runs on its own provider."
+                     ({summary_model:?}) is set, but context compression is not currently \
+                     implemented in the runtime; this setting has no effect. It is also a \
+                     bare model id reused by agents resolving to different providers \
+                     ({detail}), which names no provider of its own and would be ambiguous \
+                     for at least one of them if compression were read again. Remove the \
+                     unsupported context_compression setting (every context_compression \
+                     field, including summary_provider, is currently inert), or wait for a \
+                     separately accepted compression design before configuring it."
                 ),
                 format!("runtime_profiles.{profile_alias}.context_compression.summary_model"),
             ));
+        }
+    }
+
+    /// Surface every non-default `context_compression` knob as inert: the
+    /// runtime context compressor was removed and nothing in the
+    /// workspace reads `context_compression` at runtime anymore, so the whole
+    /// struct — `enabled`, thresholds, protected counts, summarizer limits,
+    /// provider selection, tool-result retrimming — has no effect. Mirrors
+    /// `validate_memory_semantics`: one warning per non-default field, so a
+    /// user sees exactly which of their authored knobs are dead. A field
+    /// explicitly written at its default value is indistinguishable from an
+    /// omitted one post-deserialization and stays silent (same limitation as
+    /// `validate_memory_semantics`).
+    ///
+    /// Only `[runtime_profiles.<alias>.context_compression]` is checked —
+    /// `AliasedAgentConfig` (`[agents.<alias>]`) has no `context_compression`
+    /// field of its own, and the legacy pre-V3 `[agent.context_compression]`
+    /// top-level table (folded into `[runtime_profiles.default]` by the V2→V3
+    /// migration, see `schema/v2.rs`) has already collapsed into this same
+    /// surface by the time `Config` exists, so a single pass over
+    /// `runtime_profiles` covers both the historical and current authored
+    /// forms without double-warning.
+    fn collect_context_compression_ignored_warnings(
+        &self,
+        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
+    ) {
+        let defaults = crate::scattered_types::ContextCompressionConfig::default();
+        for (alias, profile) in &self.runtime_profiles {
+            let cc = &profile.context_compression;
+
+            // `enabled = true` gets its own message: it is the master switch
+            // users flip expecting compression to happen at all.
+            if cc.enabled {
+                warnings.push(crate::validation_warnings::ValidationWarning::new(
+                    "context_compression_unsupported",
+                    format!(
+                        "runtime_profiles.{alias}.context_compression.enabled is set but context \
+                         compression is not currently implemented in the runtime (the compressor \
+                         was removed in #8196); this setting has no effect."
+                    ),
+                    format!("runtime_profiles.{alias}.context_compression.enabled"),
+                ));
+            }
+
+            // Every other knob: flag any value that differs from the default.
+            let mut inert: Vec<&'static str> = Vec::new();
+            if (cc.threshold_ratio - defaults.threshold_ratio).abs() > f64::EPSILON {
+                inert.push("threshold_ratio");
+            }
+            if cc.protect_first_n != defaults.protect_first_n {
+                inert.push("protect_first_n");
+            }
+            if cc.protect_last_n != defaults.protect_last_n {
+                inert.push("protect_last_n");
+            }
+            if cc.max_passes != defaults.max_passes {
+                inert.push("max_passes");
+            }
+            if cc.summary_max_chars != defaults.summary_max_chars {
+                inert.push("summary_max_chars");
+            }
+            if cc.source_max_chars != defaults.source_max_chars {
+                inert.push("source_max_chars");
+            }
+            if cc.timeout_secs != defaults.timeout_secs {
+                inert.push("timeout_secs");
+            }
+            if cc.summary_provider != defaults.summary_provider {
+                inert.push("summary_provider");
+            }
+            if cc.summary_model != defaults.summary_model {
+                // Ordering dependency: `collect_warnings()` runs
+                // `collect_cross_provider_summary_model_warnings` before this
+                // helper, so a cross-provider `summary_model` diagnostic for
+                // this same path is already in `warnings`. That diagnostic
+                // reports the same "has no effect" fact plus the specific
+                // cross-provider agents affected, so it wins and the generic
+                // inert warning is skipped to avoid printing two warnings
+                // for the same config line. All other `summary_model`
+                // shapes (single-provider, unshared) still get the inert
+                // warning; no other diagnostic covers them.
+                let summary_model_path =
+                    format!("runtime_profiles.{alias}.context_compression.summary_model");
+                if !warnings.iter().any(|w| {
+                    w.code == "cross_provider_summary_model" && w.path == summary_model_path
+                }) {
+                    inert.push("summary_model");
+                }
+            }
+            if cc.identifier_policy != defaults.identifier_policy {
+                inert.push("identifier_policy");
+            }
+            if cc.tool_result_retrim_chars != defaults.tool_result_retrim_chars {
+                inert.push("tool_result_retrim_chars");
+            }
+            if cc.tool_result_trim_exempt != defaults.tool_result_trim_exempt {
+                inert.push("tool_result_trim_exempt");
+            }
+
+            for field in inert {
+                warnings.push(crate::validation_warnings::ValidationWarning::new(
+                    "context_compression_unsupported",
+                    format!(
+                        "runtime_profiles.{alias}.context_compression.{field} is set to a \
+                         non-default value but context compression is not currently implemented \
+                         in the runtime (the compressor was removed in #8196); this setting has \
+                         no effect."
+                    ),
+                    format!("runtime_profiles.{alias}.context_compression.{field}"),
+                ));
+            }
         }
     }
 
@@ -19282,6 +19682,37 @@ impl Config {
 
         for (alias, dc) in &self.channels.discord {
             dc.validate_bot_token(alias)?;
+        }
+
+        // Signal and Voice Call: like Telegram/Discord's bot_token, these
+        // channels have unambiguous required plain-String credentials. An
+        // enabled channel built with an empty credential never connects and
+        // its per-channel supervisor restarts it forever (crashloop), so
+        // reject at config-load time instead.
+        for (alias, sig) in &self.channels.signal {
+            sig.validate_required(alias)?;
+        }
+
+        for (alias, vc) in &self.channels.voice_call {
+            let enabled_path = format!("channels.voice_call.{alias}.enabled");
+            validate_required_field(
+                &format!("channels.voice_call.{alias}.account_id"),
+                &enabled_path,
+                vc.enabled,
+                &vc.account_id,
+            )?;
+            validate_required_field(
+                &format!("channels.voice_call.{alias}.auth_token"),
+                &enabled_path,
+                vc.enabled,
+                &vc.auth_token,
+            )?;
+            validate_required_field(
+                &format!("channels.voice_call.{alias}.from_number"),
+                &enabled_path,
+                vc.enabled,
+                &vc.from_number,
+            )?;
         }
 
         // Git forge channel: a PAT-backed provider must name its API origin
@@ -22491,6 +22922,96 @@ impl HasPropKind for serde_json::Value {
 #[cfg(test)]
 mod tests {
 
+    // ── Nextcloud Talk: one normalized bot secret for both directions ──
+    //
+    // Nextcloud installs ONE secret per bot and uses it to verify inbound webhook
+    // signatures AND to sign outbound bot-API requests. Before this, outbound used a
+    // raw `bot_token.or_else(webhook_secret)` (no trim, no non-empty check) while
+    // inbound read only a trimmed non-empty `webhook_secret`, so the two directions
+    // could resolve different secrets -- or outbound could sign with whitespace.
+
+    fn nc_cfg(webhook_secret: Option<&str>, bot_token: Option<&str>) -> NextcloudTalkConfig {
+        NextcloudTalkConfig {
+            webhook_secret: webhook_secret.map(ToOwned::to_owned),
+            bot_token: bot_token.map(ToOwned::to_owned),
+            ..NextcloudTalkConfig::default()
+        }
+    }
+
+    /// Alias-only configuration must resolve, so a `bot_token`-only install keeps
+    /// working through the migration window -- and, critically, now resolves for the
+    /// INBOUND direction too, where it previously produced no secret at all.
+    #[::core::prelude::v1::test]
+    fn nextcloud_alias_only_configuration_resolves_the_secret() {
+        let cfg = nc_cfg(None, Some("shared-bot-secret"));
+        assert_eq!(
+            cfg.resolve_bot_secret().unwrap(),
+            Some("shared-bot-secret".to_string())
+        );
+    }
+
+    /// The canonical field wins when both carry the SAME value, and agreeing
+    /// duplicates are not treated as a conflict.
+    #[::core::prelude::v1::test]
+    fn nextcloud_agreeing_alias_and_canonical_resolve_to_one_secret() {
+        let cfg = nc_cfg(Some("same"), Some("same"));
+        assert_eq!(cfg.resolve_bot_secret().unwrap(), Some("same".to_string()));
+    }
+
+    /// Two conflicting non-empty values must be REJECTED rather than silently split
+    /// into two authorities: whichever direction loses cannot match the installed bot.
+    #[::core::prelude::v1::test]
+    fn nextcloud_conflicting_alias_is_rejected() {
+        let cfg = nc_cfg(Some("canonical"), Some("different"));
+        assert!(
+            cfg.resolve_bot_secret().is_err(),
+            "conflicting non-empty secrets must not silently pick one"
+        );
+    }
+
+    /// A blank or whitespace alias must not mask a real secret. Previously the raw
+    /// `bot_token.or_else(...)` would hand whitespace to the outbound signer.
+    #[::core::prelude::v1::test]
+    fn nextcloud_blank_alias_does_not_mask_the_real_secret() {
+        for blank in ["", "   ", "\t", "\n  "] {
+            let cfg = nc_cfg(Some("real-secret"), Some(blank));
+            assert_eq!(
+                cfg.resolve_bot_secret().unwrap(),
+                Some("real-secret".to_string()),
+                "blank alias {blank:?} must not mask the canonical secret"
+            );
+        }
+        // ...and a blank canonical falls back to a real alias rather than resolving blank.
+        let cfg = nc_cfg(Some("  "), Some("real-secret"));
+        assert_eq!(
+            cfg.resolve_bot_secret().unwrap(),
+            Some("real-secret".to_string())
+        );
+    }
+
+    /// Values are trimmed, so trailing whitespace in config cannot produce a secret
+    /// that differs between the two directions.
+    #[::core::prelude::v1::test]
+    fn nextcloud_secret_is_trimmed() {
+        let cfg = nc_cfg(Some("  padded  "), None);
+        assert_eq!(
+            cfg.resolve_bot_secret().unwrap(),
+            Some("padded".to_string())
+        );
+    }
+
+    /// With nothing configured the secret is unresolved. Callers must fail closed:
+    /// no outbound request is signed, and inbound verification is NOT skipped.
+    /// (The gateway rejects with 401 in that case; see the inbound handler.)
+    #[::core::prelude::v1::test]
+    fn nextcloud_unresolved_secret_yields_none_so_callers_fail_closed() {
+        assert_eq!(nc_cfg(None, None).resolve_bot_secret().unwrap(), None);
+        assert_eq!(
+            nc_cfg(Some(""), Some("   ")).resolve_bot_secret().unwrap(),
+            None
+        );
+    }
+
     #[::core::prelude::v1::test]
     fn todotracker_config_defaults() {
         let cfg = super::TodoTrackerConfig::default();
@@ -22885,7 +23406,6 @@ max_height = 8
         assert_eq!(cfg.events.len(), 4);
     }
     use super::*;
-    #[cfg(unix)]
     use std::ffi::OsString;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -22896,13 +23416,11 @@ max_height = 8
     use tokio::sync::MutexGuard;
     use tokio::test;
 
-    #[cfg(unix)]
     struct EnvValueGuard {
         key: &'static str,
         previous: Option<OsString>,
     }
 
-    #[cfg(unix)]
     impl EnvValueGuard {
         fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
             let previous = std::env::var_os(key);
@@ -22919,7 +23437,6 @@ max_height = 8
         }
     }
 
-    #[cfg(unix)]
     impl Drop for EnvValueGuard {
         fn drop(&mut self) {
             // SAFETY: tests that mutate env vars serialize on env_override_lock().
@@ -24121,6 +24638,203 @@ api_base_url = "http://127.0.0.1:8081"
         config
             .validate()
             .expect_err("the unset display sentinel must never become persisted config");
+    }
+
+    // Regression: an enabled Signal or Voice Call channel with empty
+    // required credentials was built anyway, then its listener failed to
+    // connect and the per-channel supervisor restarted it forever
+    // (crashloop). Reject at config-load time instead, mirroring how
+    // Telegram/Discord require `bot_token`.
+    #[test]
+    async fn validate_rejects_enabled_signal_without_http_url() {
+        let mut config = Config::default();
+        config.channels.signal.insert(
+            "signal".to_string(),
+            SignalConfig {
+                enabled: true,
+                http_url: "   ".into(),
+                account: "+15551234567".into(),
+                ..Default::default()
+            },
+        );
+
+        let err = config
+            .validate()
+            .expect_err("enabled Signal channel must require an http_url");
+        assert!(err.to_string().contains("channels.signal.signal.http_url"));
+    }
+
+    #[test]
+    async fn validate_rejects_enabled_signal_without_account() {
+        let mut config = Config::default();
+        config.channels.signal.insert(
+            "signal".to_string(),
+            SignalConfig {
+                enabled: true,
+                http_url: "http://127.0.0.1:8686".into(),
+                account: "   ".into(),
+                ..Default::default()
+            },
+        );
+
+        let err = config
+            .validate()
+            .expect_err("enabled Signal channel must require an account");
+        assert!(err.to_string().contains("channels.signal.signal.account"));
+    }
+
+    #[test]
+    async fn validate_allows_disabled_signal_without_creds() {
+        let mut config = Config::default();
+        config.channels.signal.insert(
+            "signal".to_string(),
+            SignalConfig {
+                enabled: false,
+                http_url: "   ".into(),
+                account: "   ".into(),
+                ..Default::default()
+            },
+        );
+
+        config
+            .validate()
+            .expect("disabled Signal channel may be staged without credentials");
+    }
+
+    #[test]
+    async fn validate_rejects_disabled_signal_with_unset_sentinel() {
+        let mut config = Config::default();
+        config.channels.signal.insert(
+            "signal".to_string(),
+            SignalConfig {
+                enabled: false,
+                http_url: crate::traits::UNSET_DISPLAY.to_string(),
+                account: "+15551234567".into(),
+                ..Default::default()
+            },
+        );
+
+        let err = config
+            .validate()
+            .expect_err("the unset display sentinel must never become persisted config, even for a disabled channel");
+        assert!(err.to_string().contains("channels.signal.signal.http_url"));
+    }
+
+    #[test]
+    async fn signal_has_required_credentials_true_when_both_set() {
+        let sig = SignalConfig {
+            http_url: "http://127.0.0.1:8686".into(),
+            account: "+15551234567".into(),
+            ..Default::default()
+        };
+        assert!(sig.has_required_credentials());
+    }
+
+    #[test]
+    async fn signal_has_required_credentials_false_when_either_blank() {
+        let missing_http_url = SignalConfig {
+            http_url: "   ".into(),
+            account: "+15551234567".into(),
+            ..Default::default()
+        };
+        assert!(!missing_http_url.has_required_credentials());
+
+        let missing_account = SignalConfig {
+            http_url: "http://127.0.0.1:8686".into(),
+            account: "   ".into(),
+            ..Default::default()
+        };
+        assert!(!missing_account.has_required_credentials());
+
+        assert!(!SignalConfig::default().has_required_credentials());
+    }
+
+    #[test]
+    async fn validate_rejects_enabled_voice_call_without_account_id() {
+        let mut config = Config::default();
+        config.channels.voice_call.insert(
+            "voice".to_string(),
+            crate::scattered_types::VoiceCallConfig {
+                enabled: true,
+                account_id: "   ".into(),
+                auth_token: "tok".into(),
+                from_number: "+15551234567".into(),
+                ..Default::default()
+            },
+        );
+
+        let err = config
+            .validate()
+            .expect_err("enabled Voice Call channel must require an account_id");
+        assert!(
+            err.to_string()
+                .contains("channels.voice_call.voice.account_id")
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_enabled_voice_call_without_auth_token() {
+        let mut config = Config::default();
+        config.channels.voice_call.insert(
+            "voice".to_string(),
+            crate::scattered_types::VoiceCallConfig {
+                enabled: true,
+                account_id: "AC123".into(),
+                auth_token: "   ".into(),
+                from_number: "+15551234567".into(),
+                ..Default::default()
+            },
+        );
+
+        let err = config
+            .validate()
+            .expect_err("enabled Voice Call channel must require an auth_token");
+        assert!(
+            err.to_string()
+                .contains("channels.voice_call.voice.auth_token")
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_enabled_voice_call_without_from_number() {
+        let mut config = Config::default();
+        config.channels.voice_call.insert(
+            "voice".to_string(),
+            crate::scattered_types::VoiceCallConfig {
+                enabled: true,
+                account_id: "AC123".into(),
+                auth_token: "tok".into(),
+                from_number: "   ".into(),
+                ..Default::default()
+            },
+        );
+
+        let err = config
+            .validate()
+            .expect_err("enabled Voice Call channel must require a from_number");
+        assert!(
+            err.to_string()
+                .contains("channels.voice_call.voice.from_number")
+        );
+    }
+
+    #[test]
+    async fn validate_allows_disabled_voice_call_without_creds() {
+        let mut config = Config::default();
+        config.channels.voice_call.insert(
+            "voice".to_string(),
+            crate::scattered_types::VoiceCallConfig {
+                enabled: false,
+                account_id: "   ".into(),
+                auth_token: "   ".into(),
+                from_number: "   ".into(),
+                ..Default::default()
+            },
+        );
+
+        config
+            .validate()
+            .expect("disabled Voice Call channel may be staged without credentials");
     }
 
     // Regression (fail closed, both PAT-backed forge providers): a Gitea or
@@ -28048,11 +28762,20 @@ wire_api = "ws"
     #[test]
     async fn classify_runtime_config_kind_uses_runtime_resolution_source() {
         let _env_guard = env_override_lock().await;
+        #[cfg(unix)]
         let fake_home =
             PathBuf::from("/non-temp-zeroclaw-test-home").join(uuid::Uuid::new_v4().to_string());
+        #[cfg(not(unix))]
+        let fake_home = UserDirs::new()
+            .expect("user directories should be available")
+            .home_dir()
+            .to_path_buf();
         let explicit_config_dir = fake_home.join("explicit-config");
 
+        #[cfg(unix)]
         let _home_guard = EnvValueGuard::set("HOME", &fake_home);
+        #[cfg(not(unix))]
+        let _home_guard = EnvValueGuard::remove("HOME");
         let _data_guard = EnvValueGuard::remove("ZEROCLAW_DATA_DIR");
         let _workspace_guard = EnvValueGuard::remove("ZEROCLAW_WORKSPACE");
 
@@ -29431,7 +30154,8 @@ group_policy = "disabled"
         let nc = NextcloudTalkConfig {
             enabled: true,
             base_url: "https://cloud.example.com".into(),
-            app_token: "app-token".into(),
+            app_token: None,
+            bot_token: None,
             webhook_secret: Some("webhook-secret".into()),
             proxy_url: None,
             bot_name: None,
@@ -29443,15 +30167,26 @@ group_policy = "disabled"
         let json = serde_json::to_string(&nc).unwrap();
         let parsed: NextcloudTalkConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.base_url, "https://cloud.example.com");
-        assert_eq!(parsed.app_token, "app-token");
+        assert!(parsed.app_token.is_none());
         assert_eq!(parsed.webhook_secret.as_deref(), Some("webhook-secret"));
     }
 
     #[test]
     async fn nextcloud_talk_config_defaults_optional_fields() {
-        let json = r#"{"base_url":"https://cloud.example.com","app_token":"app-token"}"#;
+        let json = r#"{"base_url":"https://cloud.example.com"}"#;
         let parsed: NextcloudTalkConfig = serde_json::from_str(json).unwrap();
         assert!(parsed.webhook_secret.is_none());
+        assert!(parsed.app_token.is_none());
+    }
+
+    #[test]
+    async fn nextcloud_talk_config_accepts_legacy_app_token_without_using_it() {
+        // Pre-existing configs may still set the now-deprecated app_token;
+        // it must parse (not fail-closed the whole config) and just be
+        // carried as a no-op field.
+        let json = r#"{"base_url":"https://cloud.example.com","app_token":"legacy-value"}"#;
+        let parsed: NextcloudTalkConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.app_token.as_deref(), Some("legacy-value"));
     }
 
     // ── Config file permission hardening (Unix only) ───────────────
@@ -35521,6 +36256,350 @@ allowed_users = []
         );
     }
 
+    // The `cross_provider_summary_model` diagnostic must report the setting
+    // as unsupported/inert like every other `context_compression` knob, not
+    // as something that is actively dispatched onto per-agent providers and
+    // fails at runtime — there is no runtime consumer left to dispatch
+    // anything. The cross-provider detail (which agents, which providers)
+    // must still be present since it is useful context for the fix, but the
+    // message must not claim any runtime behavior.
+    #[tokio::test]
+    async fn collect_warnings_cross_provider_summary_model_reports_inert_not_dispatch() {
+        let toml = r#"
+            [providers.models.custom.p1]
+            api_key = "k"
+            model = "m1"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+            [providers.models.custom.p2]
+            api_key = "k"
+            model = "m2"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+
+            [risk_profiles.default]
+            level = "supervised"
+
+            [runtime_profiles.shared.context_compression]
+            summary_model = "haiku"
+
+            [agents.alpha]
+            enabled = true
+            model_provider = "custom.p1"
+            risk_profile = "default"
+            runtime_profile = "shared"
+
+            [agents.beta]
+            enabled = true
+            model_provider = "custom.p2"
+            risk_profile = "default"
+            runtime_profile = "shared"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let warnings = cfg.collect_warnings();
+        let w = warnings
+            .iter()
+            .find(|w| w.code == "cross_provider_summary_model")
+            .expect("expected cross_provider_summary_model warning");
+        assert!(
+            w.message.contains("not currently implemented") && w.message.contains("no effect"),
+            "message must truthfully report the setting as unsupported/inert: {}",
+            w.message
+        );
+        assert!(
+            !w.message.contains("silently fails"),
+            "message must not claim the setting silently fails at runtime: {}",
+            w.message
+        );
+        assert!(
+            !w.message.contains("dispatched"),
+            "message must not claim the setting is dispatched to a provider at runtime: {}",
+            w.message
+        );
+        // Cross-provider specificity must survive the rewrite — it is still
+        // useful detail even though the setting is inert.
+        assert!(
+            w.message.contains("alpha -> custom.p1") && w.message.contains("beta -> custom.p2"),
+            "message must keep naming the affected agents and providers: {}",
+            w.message
+        );
+        // The remediation must NOT send the operator to another inert
+        // context_compression field: this PR's per-field pass classifies a
+        // non-default `summary_provider` as unsupported/inert too, so
+        // "migrate to context_compression.summary_provider" would just produce
+        // another no-effect setting and another warning.
+        assert!(
+            !w.message
+                .contains("Migrate to context_compression.summary_provider"),
+            "remediation must not recommend migrating to the inert summary_provider: {}",
+            w.message
+        );
+        assert!(
+            w.message
+                .contains("Remove the unsupported context_compression setting"),
+            "remediation should tell the operator to remove the inert setting: {}",
+            w.message
+        );
+    }
+
+    // The runtime context compressor was removed; nothing reads
+    // `context_compression` at runtime anymore, so an explicit
+    // `enabled = true` on a named runtime profile is inert and must be
+    // flagged.
+    #[tokio::test]
+    async fn collect_warnings_flags_context_compression_enabled_on_runtime_profile() {
+        let toml = r#"
+            [risk_profiles.default]
+            level = "supervised"
+
+            [runtime_profiles.fast.context_compression]
+            enabled = true
+
+            [agents.alpha]
+            enabled = true
+            risk_profile = "default"
+            runtime_profile = "fast"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let warnings = cfg.collect_warnings();
+        let w = warnings
+            .iter()
+            .find(|w| w.code == "context_compression_unsupported")
+            .expect("expected context_compression_unsupported warning");
+        assert_eq!(w.path, "runtime_profiles.fast.context_compression.enabled");
+        assert!(
+            w.message.contains("not currently implemented"),
+            "message explains the flag is inert: {}",
+            w.message
+        );
+    }
+
+    // The legacy pre-V3 `[agent.context_compression]` top-level table is
+    // folded into `[runtime_profiles.default]` by the V1/V2→V3 migration
+    // (see `schema/v2.rs`), so it must surface the same diagnostic once
+    // migrated — this is the historical form of the surface commonly
+    // called "agent-level" configuration.
+    #[::core::prelude::v1::test]
+    fn collect_warnings_flags_context_compression_enabled_via_legacy_agent_table() {
+        let raw = r#"
+            default_temperature = 0.7
+
+            [agent.context_compression]
+            enabled = true
+        "#;
+        let parsed = crate::migration::migrate_to_current(raw).expect("migration succeeds");
+        let warnings = parsed.collect_warnings();
+        let w = warnings
+            .iter()
+            .find(|w| w.code == "context_compression_unsupported")
+            .expect("expected context_compression_unsupported warning after migration");
+        assert_eq!(
+            w.path,
+            "runtime_profiles.default.context_compression.enabled"
+        );
+    }
+
+    // A default config (no explicit `context_compression.enabled`) must stay
+    // silent — the flag now defaults to `false`, matching the runtime, which
+    // does not consult it at all.
+    #[tokio::test]
+    async fn collect_warnings_silent_for_context_compression_default() {
+        let toml = r#"
+            [risk_profiles.default]
+            level = "supervised"
+
+            [agents.alpha]
+            enabled = true
+            risk_profile = "default"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let warnings = cfg.collect_warnings();
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.code == "context_compression_unsupported"),
+            "default config must not flag context_compression_unsupported: {warnings:?}"
+        );
+    }
+
+    // Every `context_compression` knob is inert, not just `enabled` — tuning
+    // fields set to non-default values must each surface their own warning
+    // with a per-field path, even with `enabled` left off, since the whole
+    // struct is covered.
+    #[tokio::test]
+    async fn collect_warnings_flags_context_compression_tuning_fields() {
+        let toml = r#"
+            [risk_profiles.default]
+            level = "supervised"
+
+            [runtime_profiles.fast.context_compression]
+            threshold_ratio = 0.9
+            protect_first_n = 500
+
+            [agents.alpha]
+            enabled = true
+            risk_profile = "default"
+            runtime_profile = "fast"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let warnings = cfg.collect_warnings();
+        let paths: Vec<&str> = warnings
+            .iter()
+            .filter(|w| w.code == "context_compression_unsupported")
+            .map(|w| w.path.as_str())
+            .collect();
+        assert!(
+            paths.contains(&"runtime_profiles.fast.context_compression.threshold_ratio"),
+            "threshold_ratio must be flagged: {paths:?}"
+        );
+        assert!(
+            paths.contains(&"runtime_profiles.fast.context_compression.protect_first_n"),
+            "protect_first_n must be flagged: {paths:?}"
+        );
+        // `enabled` was not set (defaults to false) — no warning for it.
+        assert!(
+            !paths.contains(&"runtime_profiles.fast.context_compression.enabled"),
+            "unset enabled must not be flagged: {paths:?}"
+        );
+        let w = warnings
+            .iter()
+            .find(|w| w.path == "runtime_profiles.fast.context_compression.threshold_ratio")
+            .expect("threshold_ratio warning present");
+        assert!(
+            w.message.contains("non-default value"),
+            "message says the value is non-default: {}",
+            w.message
+        );
+    }
+
+    // A knob explicitly written at its default value is indistinguishable
+    // from an omitted one post-deserialization and must stay silent — the
+    // same accepted limitation as `validate_memory_semantics`.
+    #[tokio::test]
+    async fn collect_warnings_silent_for_context_compression_default_values_written_explicitly() {
+        let toml = r#"
+            [risk_profiles.default]
+            level = "supervised"
+
+            [runtime_profiles.fast.context_compression]
+            enabled = false
+            threshold_ratio = 0.50
+            protect_first_n = 3
+            tool_result_retrim_chars = 2000
+
+            [agents.alpha]
+            enabled = true
+            risk_profile = "default"
+            runtime_profile = "fast"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let warnings = cfg.collect_warnings();
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.code == "context_compression_unsupported"),
+            "explicit default values must not flag context_compression_unsupported: {warnings:?}"
+        );
+    }
+
+    // Specific-warning-wins dedup: a bare cross-provider `summary_model`
+    // already draws the more specific `cross_provider_summary_model`
+    // diagnostic, which itself reports the setting as inert (same fact as
+    // `context_compression_unsupported`) plus the cross-provider detail, so
+    // the generic inert warning must NOT also fire for the identical path —
+    // doctor/gateway print both with no dedup, and it would just be the same
+    // statement twice.
+    #[tokio::test]
+    async fn collect_warnings_context_compression_defers_to_cross_provider_summary_model() {
+        let toml = r#"
+            [providers.models.custom.p1]
+            api_key = "k"
+            model = "m1"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+            [providers.models.custom.p2]
+            api_key = "k"
+            model = "m2"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+
+            [risk_profiles.default]
+            level = "supervised"
+
+            [runtime_profiles.shared.context_compression]
+            summary_model = "haiku"
+
+            [agents.alpha]
+            enabled = true
+            model_provider = "custom.p1"
+            risk_profile = "default"
+            runtime_profile = "shared"
+
+            [agents.beta]
+            enabled = true
+            model_provider = "custom.p2"
+            risk_profile = "default"
+            runtime_profile = "shared"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let warnings = cfg.collect_warnings();
+        let summary_model_warnings: Vec<_> = warnings
+            .iter()
+            .filter(|w| w.path == "runtime_profiles.shared.context_compression.summary_model")
+            .collect();
+        assert_eq!(
+            summary_model_warnings.len(),
+            1,
+            "exactly one warning for the summary_model path: {summary_model_warnings:?}"
+        );
+        assert_eq!(
+            summary_model_warnings[0].code, "cross_provider_summary_model",
+            "the specific cross-provider diagnostic wins for the shared path"
+        );
+    }
+
+    // Same-provider control: without a cross-provider diagnostic covering
+    // the path, the inert warning must still fire for `summary_model` — no
+    // other diagnostic covers the single-provider shape.
+    #[tokio::test]
+    async fn collect_warnings_context_compression_flags_same_provider_summary_model() {
+        let toml = r#"
+            [providers.models.custom.p1]
+            api_key = "k"
+            model = "m1"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+
+            [risk_profiles.default]
+            level = "supervised"
+
+            [runtime_profiles.shared.context_compression]
+            summary_model = "haiku"
+
+            [agents.alpha]
+            enabled = true
+            model_provider = "custom.p1"
+            risk_profile = "default"
+            runtime_profile = "shared"
+
+            [agents.beta]
+            enabled = true
+            model_provider = "custom.p1"
+            risk_profile = "default"
+            runtime_profile = "shared"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let warnings = cfg.collect_warnings();
+        let w = warnings
+            .iter()
+            .find(|w| w.path == "runtime_profiles.shared.context_compression.summary_model")
+            .expect("expected a warning for the summary_model path");
+        assert_eq!(
+            w.code, "context_compression_unsupported",
+            "single-provider summary_model gets the inert warning"
+        );
+    }
+
     // exposed_skills set with no skill_bundles -> the agent card resolves no
     // skills (skills: []) silently; the diagnostic fires and names the agent.
     #[tokio::test]
@@ -35670,6 +36749,194 @@ allowed_users = []
                 .iter()
                 .any(|w| w.code == "cross_provider_summary_model"),
             "agent-level summary_provider override must suppress the warning"
+        );
+    }
+
+    const WA_INERT_WARNING: &str = "whatsapp_chat_policy_inert";
+    const WA_OPEN_GROUPS_WARNING: &str = "whatsapp_empty_group_allowlist_permits_all";
+
+    /// A Web channel in business mode: the chat policies are accepted and never
+    /// consulted, and dm_policy DEFAULTS to allowlist, so the operator believes
+    /// the channel is gated when every DM is answered.
+    #[test]
+    async fn whatsapp_business_mode_flags_inert_chat_policies() {
+        let toml = r#"
+[channels.whatsapp.shop]
+enabled = true
+mode = "business"
+session_path = "/tmp/wa-session"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let warnings = warnings_with_code(&cfg, WA_INERT_WARNING);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.path == "channels.whatsapp.shop.dm_policy"),
+            "default dm_policy under business mode must be flagged: {warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.message.contains("personal")),
+            "the warning should name the mode that would honour it: {warnings:?}"
+        );
+    }
+
+    /// Personal mode consults the policies, so there is nothing to warn about.
+    #[test]
+    async fn whatsapp_personal_mode_does_not_flag_chat_policies() {
+        let toml = r#"
+[channels.whatsapp.shop]
+enabled = true
+mode = "personal"
+session_path = "/tmp/wa-session"
+allowed_groups = ["123@g.us"]
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(
+            warnings_with_code(&cfg, WA_INERT_WARNING).is_empty(),
+            "personal mode honours the policies and must not warn"
+        );
+    }
+
+    /// A Cloud-API channel has no Web transport, so neither warning applies.
+    /// Without this guard the check would fire for every Cloud user.
+    #[test]
+    async fn whatsapp_cloud_channel_is_not_flagged() {
+        let toml = r#"
+[channels.whatsapp.cloud]
+enabled = true
+phone_number_id = "1234567890"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(warnings_with_code(&cfg, WA_INERT_WARNING).is_empty());
+        assert!(warnings_with_code(&cfg, WA_OPEN_GROUPS_WARNING).is_empty());
+    }
+
+    /// A disabled channel cannot answer anything, so it must stay quiet.
+    #[test]
+    async fn whatsapp_disabled_channel_is_not_flagged() {
+        let toml = r#"
+[channels.whatsapp.shop]
+enabled = false
+mode = "business"
+session_path = "/tmp/wa-session"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(warnings_with_code(&cfg, WA_INERT_WARNING).is_empty());
+        assert!(warnings_with_code(&cfg, WA_OPEN_GROUPS_WARNING).is_empty());
+    }
+
+    /// The group gate runs in BOTH modes and returns true when the list is
+    /// empty, which makes the default the open case.
+    #[test]
+    async fn whatsapp_empty_allowed_groups_is_flagged() {
+        let toml = r#"
+[channels.whatsapp.shop]
+enabled = true
+mode = "personal"
+session_path = "/tmp/wa-session"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let warnings = warnings_with_code(&cfg, WA_OPEN_GROUPS_WARNING);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(warnings[0].path, "channels.whatsapp.shop.allowed_groups");
+    }
+
+    /// An explicit list is the closed case and must not warn.
+    #[test]
+    async fn whatsapp_populated_allowed_groups_is_not_flagged() {
+        let toml = r#"
+[channels.whatsapp.shop]
+enabled = true
+mode = "personal"
+session_path = "/tmp/wa-session"
+allowed_groups = ["123@g.us"]
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(warnings_with_code(&cfg, WA_OPEN_GROUPS_WARNING).is_empty());
+    }
+
+    /// The remediation the warning itself recommends must SILENCE the warning.
+    /// Under personal mode the channel gate drops every group message when
+    /// group_policy = "ignore", so an empty list permits nothing. Warning here
+    /// told the operator to set exactly this and then kept firing after they
+    /// did, which is the defect this test pins.
+    #[test]
+    async fn whatsapp_personal_ignore_groups_is_not_flagged() {
+        let toml = r#"
+[channels.whatsapp.shop]
+enabled = true
+mode = "personal"
+session_path = "/tmp/wa-session"
+group_policy = "ignore"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(
+            warnings_with_code(&cfg, WA_OPEN_GROUPS_WARNING).is_empty(),
+            "group_policy = \"ignore\" drops every group message, so an empty \
+             allowed_groups permits nothing and the warning must not fire"
+        );
+    }
+
+    /// group_policy = "all" is the explicit opt-in to open group access. An
+    /// empty list is then consistent with a deliberate choice, not an accident,
+    /// and reporting it as unsafe would flag intent as error.
+    #[test]
+    async fn whatsapp_personal_all_groups_is_not_flagged() {
+        let toml = r#"
+[channels.whatsapp.shop]
+enabled = true
+mode = "personal"
+session_path = "/tmp/wa-session"
+group_policy = "all"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(
+            warnings_with_code(&cfg, WA_OPEN_GROUPS_WARNING).is_empty(),
+            "group_policy = \"all\" is an explicit opt-in to open groups and must \
+             not be reported as an unintended configuration"
+        );
+    }
+
+    /// Business mode never consults group_policy, so the list is the only gate
+    /// and an empty one really does admit every group. This is the positive
+    /// case that must survive narrowing the warning.
+    #[test]
+    async fn whatsapp_business_empty_allowed_groups_is_flagged() {
+        let toml = r#"
+[channels.whatsapp.shop]
+enabled = true
+mode = "business"
+session_path = "/tmp/wa-session"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let warnings = warnings_with_code(&cfg, WA_OPEN_GROUPS_WARNING);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "business mode with an empty allowed_groups must still warn: {warnings:?}"
+        );
+        assert_eq!(warnings[0].path, "channels.whatsapp.shop.allowed_groups");
+    }
+
+    /// Business mode ignores group_policy entirely, so even the value that
+    /// silences the warning under personal mode must NOT silence it here.
+    /// Without this, narrowing the check could be over-applied and reopen the
+    /// original bug from the other side.
+    #[test]
+    async fn whatsapp_business_ignore_group_policy_still_flagged() {
+        let toml = r#"
+[channels.whatsapp.shop]
+enabled = true
+mode = "business"
+session_path = "/tmp/wa-session"
+group_policy = "ignore"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            warnings_with_code(&cfg, WA_OPEN_GROUPS_WARNING).len(),
+            1,
+            "group_policy is inert under business mode, so it must not silence \
+             the open-groups warning"
         );
     }
 
