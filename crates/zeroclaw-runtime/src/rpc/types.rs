@@ -222,6 +222,20 @@ rpc_type! {
 }
 
 rpc_type! {
+    pub struct SessionSkillPromptParams {
+        pub session_id: String,
+        pub skill: String,
+        #[serde(default)]
+        pub arguments: String,
+        /// Exact slash invocation entered by the user. The runtime validates
+        /// it against `skill` and `arguments` before using it for history.
+        pub invocation: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub attachments: Vec<FileEntry>,
+    }
+}
+
+rpc_type! {
     pub struct SessionPromptResult {
         pub session_id: String,
         pub stop_reason: String,
@@ -826,6 +840,17 @@ rpc_type! {
 }
 
 rpc_type! {
+    pub struct AgentSkillsParams {
+        pub agent: String,
+    }
+}
+
+rpc_type! {
+    /// One skill in an agent's *effective* set (the runtime's four-source
+    /// union), with provenance — for `GET /api/agents/{alias}/skills`.
+    /// Distinct from [`SkillListEntry`] (bundle-editor wire type); the two must
+    /// not be conflated. `origin` is the discriminant; `plugin`/`bundle` carry
+    /// the source detail; `editable` is `true` only for `origin == "bundle"`.
     pub struct AgentSkillEntry {
         pub name: String,
         pub description: String,
@@ -1370,6 +1395,11 @@ pub enum SessionUpdateEvent {
         /// Final assistant text (Completed) or partial accumulated text
         /// at cancel point (Cancelled).
         content: String,
+        /// Machine-readable failure key for client-side localization.
+        /// When set, the client should look up a Fluent key like
+        /// `zc-skill-error-{reason}` instead of displaying `content` verbatim.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        failure_reason: Option<String>,
     },
     /// Emitted whenever older whole turns were dropped from structured history
     /// to fit a token budget or message cap. Surfaces a user-visible "context

@@ -110,6 +110,10 @@ zc-input-detached = Detached: { $name }
 zc-input-invalid-index = Invalid index: { $index }
 zc-input-pending-attachments-header = Pending attachments:
 zc-input-clipboard-error = Clipboard error: { $error }
+zc-input-skill-usage = Usage: { $command } <name> [arguments]
+zc-input-skill-not-found = Skill not found for this agent: { $name }
+zc-input-skill-catalog-error = Could not load skills for this agent: { $error }
+zc-input-skill-shortcut-conflicts = Skill shortcuts disabled for reserved names: { $names }. Use { $command } <name> ...
 
 zc-queue-empty = Nothing to send.
 zc-cancel-timed-out = Cancel timed out; turn settled locally.
@@ -134,6 +138,12 @@ zc-queue-help-enqueue = Queue message
 zc-queue-help-inject = Send now (skip queue)
 zc-queue-edit-busy = Finish or clear the current message before editing a queued one.
 zc-queue-dispatch-failed = Could not send queued message: { $error }
+zc-skill-error-skill-prompt-failure = Could not prepare the skill: { $details }
+zc-skill-error-session-not-found = The skill could not run because the session no longer exists.
+zc-skill-error-skill-not-found = This skill is no longer available for the active agent.
+zc-skill-error-empty-prompt = This skill produced no prompt to run.
+zc-skill-error-attachment-failure = A skill attachment could not be processed.
+zc-skill-error-session-busy = The session could not start this skill turn.
 
 zc-logs-label-timestamp = Timestamp
 zc-logs-label-severity = Severity

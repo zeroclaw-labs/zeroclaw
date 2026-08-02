@@ -263,6 +263,38 @@ mod tests {
     }
 
     #[test]
+    fn stable_skill_failures_are_localized_without_runtime_diagnostics() {
+        let locales = [
+            ("es", include_str!("../locales/es/zerocode.ftl")),
+            ("fr", include_str!("../locales/fr/zerocode.ftl")),
+            ("ja", include_str!("../locales/ja/zerocode.ftl")),
+            ("zh-CN", include_str!("../locales/zh-CN/zerocode.ftl")),
+        ];
+        let keys = [
+            "zc-skill-error-session-not-found",
+            "zc-skill-error-skill-not-found",
+            "zc-skill-error-empty-prompt",
+            "zc-skill-error-attachment-failure",
+            "zc-skill-error-session-busy",
+        ];
+        let diagnostic = "internal English diagnostic";
+
+        for (locale, source) in locales {
+            for key in keys {
+                let localized = format_ftl_message(source, locale, key, &[("details", diagnostic)])
+                    .unwrap_or_else(|| panic!("{locale} must define {key}"));
+                let english = format_ftl_message(EN_FTL, "en", key, &[("details", diagnostic)])
+                    .unwrap_or_else(|| panic!("English must define {key}"));
+                assert_ne!(localized, english, "{locale} must translate {key}");
+                assert!(
+                    !localized.contains(diagnostic),
+                    "{locale} must not expose runtime diagnostics for {key}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn missing_key_returns_brace_form() {
         let value = t("zc-definitely-not-a-real-key");
         assert_eq!(value, "{zc-definitely-not-a-real-key}");
