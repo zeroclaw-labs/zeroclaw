@@ -569,6 +569,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       run: ${{ steps.changed.outputs.run }}
+      scope: ${{ steps.changed.outputs.scope }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -585,8 +586,9 @@ jobs:
             pull_request)
               changed_files="$(mktemp)"
               git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD > "$changed_files"
-              if bash scripts/ci/parallel_runtime_test_scope.sh < "$changed_files"; then
+              if scope="$(bash scripts/ci/parallel_runtime_test_scope.sh < "$changed_files")"; then
                 echo "run=true" >> "$GITHUB_OUTPUT"
+                echo "scope=$scope" >> "$GITHUB_OUTPUT"
               else
                 status=$?
                 if [ "$status" -ne 1 ]; then
@@ -627,6 +629,7 @@ jobs:
       - name: Repeat parallel runtime tests
         run: ./scripts/ci/parallel_runtime_test_gate.sh
         env:
+          ZEROCLAW_PARALLEL_TEST_SCOPE: ${{ needs.parallel-runtime-test-changes.outputs.scope }}
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 

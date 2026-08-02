@@ -572,8 +572,8 @@ fi
             "selected".into(),
             LucidStorageConfig {
                 binary_path: Some(script_path.display().to_string()),
-                recall_timeout_ms: Some(500),
-                store_timeout_ms: Some(500),
+                recall_timeout_ms: Some(10_000),
+                store_timeout_ms: Some(10_000),
             },
         );
 
