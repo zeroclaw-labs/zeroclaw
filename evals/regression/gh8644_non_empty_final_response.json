@@ -1,0 +1,13 @@
+{
+  "model_name": "gh8644-non-empty-final-response",
+  "turns": [
+    { "user_input": "Summarize the plan in one sentence.", "steps": [
+      { "response": { "type": "text", "content": "The plan has three steps: gather inputs, build, then verify.", "input_tokens": 25, "output_tokens": 14 } }
+    ]}
+  ],
+  "expects": {
+    "response_matches": ["\\S"],
+    "response_not_contains": ["error", "ERROR"],
+    "max_tool_calls": 0
+  }
+}

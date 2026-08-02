@@ -1,0 +1,15 @@
+{
+  "model_name": "regression-single-tool-echo-formatting",
+  "turns": [
+    { "user_input": "Echo the word ready.", "steps": [
+      { "response": { "type": "tool_calls", "tool_calls": [{ "id": "c1", "name": "echo", "arguments": {"message": "ready"} }], "input_tokens": 18, "output_tokens": 8 } },
+      { "response": { "type": "text", "content": "The echo tool returned: ready.", "input_tokens": 28, "output_tokens": 8 } }
+    ]}
+  ],
+  "expects": {
+    "response_contains": ["ready"],
+    "tools_used": ["echo"],
+    "max_tool_calls": 1,
+    "all_tools_succeeded": true
+  }
+}

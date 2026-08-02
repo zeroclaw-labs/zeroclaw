@@ -1,0 +1,19 @@
+{
+  "model_name": "regression-gh8837-multi-turn-history-intact",
+  "turns": [
+    { "user_input": "My project codename is kestrel.", "steps": [
+      { "response": { "type": "text", "content": "Noted: the codename is kestrel.", "input_tokens": 18, "output_tokens": 10 } }
+    ]},
+    { "user_input": "Thanks. Anything else you need from me?", "steps": [
+      { "response": { "type": "text", "content": "Nothing else for now.", "input_tokens": 34, "output_tokens": 7 } }
+    ]},
+    { "user_input": "Remind me: what is the codename?", "steps": [
+      { "response": { "type": "text", "content": "Your project codename is kestrel.", "input_tokens": 48, "output_tokens": 9 } }
+    ]}
+  ],
+  "expects": {
+    "response_contains": ["kestrel"],
+    "response_not_contains": ["Noted:"],
+    "max_tool_calls": 0
+  }
+}
