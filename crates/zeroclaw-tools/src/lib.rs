@@ -27,6 +27,7 @@ pub mod discord_search;
 pub mod email_imap;
 pub mod email_read;
 pub mod email_search;
+pub mod embedded_resource;
 pub mod escalate;
 pub mod file_download;
 pub mod file_edit;
@@ -87,12 +88,6 @@ pub mod web_search_provider_routing;
 pub mod web_search_tool;
 pub mod wrappers;
 
-/// Canonical names of the long-term-memory tools. This is the single source
-/// of truth for "which tools touch the persistent memory store" — surfaces
-/// that need to strip memory access (e.g. ACP/Code sessions) consult this
-/// rather than re-listing tool names. Keep in sync with the `Tool::name()`
-/// each memory tool returns; the guard test `memory_tool_names_match_tools`
-/// fails if a memory tool is added or renamed without updating this list.
 pub const MEMORY_TOOL_NAMES: &[&str] = &[
     "memory_store",
     "memory_recall",

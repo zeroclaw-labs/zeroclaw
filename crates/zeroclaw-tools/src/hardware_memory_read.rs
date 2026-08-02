@@ -1,5 +1,4 @@
 //! Hardware memory read tool — read actual memory/register values from Nucleo via probe-rs.
-//!
 //! Use when user asks to "read register values", "read memory at address", "dump lower memory", etc.
 //! Requires probe feature and Nucleo connected via USB.
 

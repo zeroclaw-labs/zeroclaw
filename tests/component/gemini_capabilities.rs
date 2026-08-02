@@ -1,8 +1,4 @@
 //! Gemini model_provider capabilities and contract tests.
-//!
-//! Validates that the Gemini model_provider correctly declares its capabilities
-//! through the public ModelProvider trait, ensuring the agent loop selects the
-//! right tool-calling strategy (prompt-guided, not native).
 
 use zeroclaw::providers::create_model_provider_with_url;
 use zeroclaw::providers::traits::ModelProvider;

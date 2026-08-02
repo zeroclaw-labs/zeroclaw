@@ -1,12 +1,5 @@
 //! `GitChannel` — the provider-agnostic composition root implementing the
 //! `Channel` trait over a [`GitProvider`].
-//!
-//! Layer: channel composition root. Owns everything forge-neutral — the
-//! poll loop, dedup, per-stream cursor advance, routing, dispatch, draft
-//! throttle, comment chunking, mention gating, and allowlist — and drives
-//! a single boxed provider for all forge IO. Selecting and constructing
-//! the provider from config is the only forge-aware step, isolated to
-//! [`build_provider`]; everything else here is identical for any forge.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -53,10 +46,35 @@ fn resolve_github_private_key(cfg: &GitConfig) -> anyhow::Result<Option<String>>
         return Ok(None);
     };
     match std::fs::read_to_string(path) {
-        Ok(pem) => Ok(Some(pem)),
+        Ok(pem) => {
+            warn_on_loose_permissions(path);
+            Ok(Some(pem))
+        }
         Err(e) => anyhow::bail!("git channel: reading private_key_path `{path}` failed: {e}"),
     }
 }
+
+/// The private key is a long-lived credential: group/other access on the
+/// key file is operator error worth surfacing, but not worth refusing to
+/// start over.
+#[cfg(unix)]
+fn warn_on_loose_permissions(path: &str) {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
+    if meta.mode() & 0o077 != 0 {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"path": path})),
+            "GitHub App private key is readable by group/other; chmod 600 recommended"
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn warn_on_loose_permissions(_path: &str) {}
 
 /// Build the configured forge provider, or a clear error for an unknown
 /// `provider` value. The only forge-aware seam in the channel.
@@ -156,7 +174,6 @@ impl GitChannel {
         })
     }
 
-    /// Construct with an explicit provider (mock-server tests).
     #[cfg(test)]
     fn with_provider(
         cfg: GitConfig,
@@ -254,11 +271,6 @@ impl GitChannel {
         streams
     }
 
-    /// Poll one repo's active streams through the provider, dedup and
-    /// order the normalized events, and dispatch them in event-time
-    /// order. Returns `Ok(false)` when the orchestrator hung up; provider
-    /// errors are returned for the caller to log and continue (rate
-    /// limiting is handled specially there).
     async fn poll_repo(
         &self,
         repo: &RepoRef,
@@ -269,12 +281,6 @@ impl GitChannel {
     ) -> Result<bool, GitChannelError> {
         let repo_key = repo.to_string();
         let mut batch: Vec<GitEvent> = Vec::new();
-        // Cursor advances and the fresh feed ETag are STAGED here, not
-        // committed to `state`, until the whole batch has been dispatched.
-        // A fetch error on a later stream (or the rate-limit backoff that
-        // re-enters this function) must not advance a cursor or mark an
-        // event seen for events that were never delivered — otherwise the
-        // next tick skips them permanently.
         let mut advances: Vec<(PollStream, DateTime<Utc>)> = Vec::new();
         let mut fresh_etag: Option<String> = None;
         // Dedup across streams within this tick, since the shared seen-set
@@ -334,11 +340,6 @@ impl GitChannel {
         Ok(true)
     }
 
-    /// Route one typed event through the per-event table and deliver it.
-    /// Returns `false` when the orchestrator hung up.
-    ///
-    /// SOP-routed events are emitted as channel-carried SOP envelopes;
-    /// the orchestrator consumes them before normal chat processing.
     async fn dispatch_event(
         &self,
         event: GitEvent,
@@ -753,12 +754,6 @@ mod tests {
         assert!(msg.contains("supported: github, gitea, forgejo"));
     }
 
-    // Regression (fail closed): a gitea/forgejo config without api_base_url
-    // must error at construction - synchronously, before any provider or
-    // HTTP client exists, so no request (carrying the access token) can be
-    // sent anywhere. The old code silently fell back to
-    // https://gitea.com/api/v1 and attached the configured token to every
-    // request against it.
     #[cfg(feature = "provider-gitea")]
     #[test]
     fn gitea_forgejo_without_api_base_url_fails_closed() {
@@ -838,12 +833,6 @@ mod tests {
         }
     }
 
-    // ── Mock-server integration tests (wiremock) ───────────────────
-    //
-    // These exercise the GitHub provider THROUGH the generic `GitChannel`:
-    // the same GitHub REST mocks, the same assertions as the original
-    // channel-github suite, now flowing provider → generic poll/dedup/
-    // dispatch.
     #[cfg(feature = "provider-github")]
     mod github_integration {
         use super::*;
@@ -1323,13 +1312,6 @@ mod tests {
             }
         }
 
-        /// Regression: a fetch error on a later stream must not drop events
-        /// already fetched from an earlier one. Before the staged-commit
-        /// fix, `poll_repo` advanced the Issues cursor and marked the issue
-        /// seen the moment the Issues stream returned, so a Comments-stream
-        /// error (the same shape as the rate-limit backoff that re-enters
-        /// this function) permanently lost the already-fetched issue: the
-        /// next tick's cursor had moved past it and the dedup set held it.
         #[tokio::test]
         async fn later_stream_error_does_not_drop_earlier_events() {
             use wiremock::matchers::{method, path};
@@ -1398,13 +1380,6 @@ mod tests {
             assert!(rx2.recv().await.is_none());
         }
 
-        /// Regression: the Issues stream follows `Link: rel="next"`
-        /// pagination, so items beyond the first 100-item page are still
-        /// delivered. Before this, one unpaginated page let a busy repo's
-        /// older `updated`-matching items saturate the page and starve
-        /// newer ones, livelocking a cursor that advances on the newest
-        /// returned item. Here page one links to page two and both issues
-        /// are forwarded.
         #[tokio::test]
         async fn issues_stream_follows_link_pagination() {
             use wiremock::matchers::{method, path};

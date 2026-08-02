@@ -1,5 +1,4 @@
 //! Config Schema Boundary Tests
-//!
 //! Validates: config defaults, backward compatibility, invalid input rejection,
 //! and gateway/security/agent config boundary conditions.
 
@@ -14,9 +13,6 @@ fn migrate(toml_str: &str) -> Config {
 // Invalid value fail-fast
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Regression test for #5414, #5320, #5483, #5507: Option<T> fields
-/// (api_key) and serde aliases (model_provider) must not be flagged as
-/// unknown config keys.
 #[test]
 fn config_valid_keys_not_flagged_as_unknown() {
     // api_key: Option<T> defaulting to None — TOML omits it.
@@ -580,12 +576,12 @@ allowed_users = ["@user:example.com"]
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Issue #3456 – top-level [cli] section must not clash with channels.cli
+// – top-level [cli] section must not clash with channels.cli
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
 fn config_toplevel_cli_section_with_whatsapp_parses() {
-    // Exact config from issue #3456
+    // Exact config from
     let toml_str = r#"
 [cli]
 

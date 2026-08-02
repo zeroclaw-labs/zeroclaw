@@ -79,16 +79,21 @@ echo "Workspace Cargo.toml..."
 ROOT_CARGO="$REPO_ROOT/Cargo.toml"
 if [[ -f "$ROOT_CARGO" ]]; then
   before="$(sha256sum "$ROOT_CARGO" | awk '{print $1}')"
-  # [workspace.package] version, first bare `version = "..."` line in the file
-  sed -i -E '0,/^version = "[^"]+"/s||version = "'"$VERSION"'"|' "$ROOT_CARGO" 2>/dev/null \
-    || sed -i '' -E '/^version = "[^"]+"/{s//version = "'"$VERSION"'"/;:a;n;ba;}' "$ROOT_CARGO"
+  # [workspace.package] version, first bare `version = "..."` line in the file.
+  # Use Perl here because GNU sed's `0,/pattern/` address silently matches
+  # nothing under BSD sed while still returning success.
+  perl -pi -e '
+    if (!$done && s/^version = "[^"]+"/version = "'"$VERSION"'"/) { $done = 1 }
+  ' "$ROOT_CARGO"
   # [workspace.dependencies] path-dep version pins, skipping aardvark*. Covers
   # both crates/ and apps/ path deps (e.g. apps/zerocode) so every in-tree
   # member tracks the workspace version; a missed apps/ pin leaves the lockfile
-  # unresolvable and breaks `cargo metadata` mid-bump. Uses '#' as the sed
-  # delimiter so the (crates|apps) alternation pipe is not read as a delimiter.
-  sed -i -E '/path = "crates\/aardvark/!s#(path = "(crates|apps)/[^"]+", version = ")[^"]+(")#\1'"$VERSION"'\3#' "$ROOT_CARGO" 2>/dev/null \
-    || sed -i '' -E '/path = "crates\/aardvark/!s#(path = "(crates|apps)/[^"]+", version = ")[^"]+(")#\1'"$VERSION"'\3#' "$ROOT_CARGO"
+  # unresolvable and breaks `cargo metadata` mid-bump.
+  perl -pi -e '
+    if (!/path = "crates\/aardvark/) {
+      s{(path = "(?:crates|apps)/[^"]+", version = ")[^"]+(")}{${1}'"$VERSION"'${2}}g
+    }
+  ' "$ROOT_CARGO"
   after="$(sha256sum "$ROOT_CARGO" | awk '{print $1}')"
   if [[ "$before" != "$after" ]]; then
     echo "  updated: Cargo.toml ([workspace.package] + [workspace.dependencies])"
@@ -133,21 +138,21 @@ bump "marketplace/easypanel/meta.yaml" \
 
 # ── Workflow description examples ──────────────────────────────────
 echo "Workflow descriptions..."
-for wf in \
-  .github/workflows/discord-release.yml; do
-  bump "$wf" \
-    '\(e\.g\. v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]*)?\)' \
-    "(e.g. v${VERSION})"
-done
+bump ".github/workflows/discord-release.yml" \
+  '\(e\.g\. v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]*)?\)' \
+  "(e.g. v${VERSION})"
 
 # ── Docs book examples + matching i18n catalogs ────────────────────
 # Two surgical patterns, both anchored enough to skip release-runbook
-# history lines like "Last verified: May 2026 (v0.7.4 cycle)" or
-# "scheduled for deletion in v0.7.4 (#5915)" which intentionally pin
-# to the version they were written for:
+# release-runbook history lines that intentionally pin an original verification
+# month or scheduled-removal release instead of tracking the current version:
 #   - container image tags    `zeroclawlabs/zeroclaw:vX.Y.Z`
-#   - /health response example `"version": "X.Y.Z"`
-#   - RPC initialize example     `"serverVersion": "X.Y.Z"`
+#   - /health response example `"version":"X.Y.Z"` (compact or spaced JSON)
+#   - RPC initialize example   `"serverVersion":"X.Y.Z"` (compact or spaced JSON)
+# The `"version"`/`"serverVersion"` swaps tolerate an optional space after the
+# colon and preserve whichever style each occurrence uses, so both minified
+# examples (e.g. the RPC handshake) and pretty-printed ones stay in step. The
+# key anchor is unchanged, so historical-version prose is still skipped.
 # Sweeping `docs/book/src/**/*.md` keeps user-facing examples in step
 # with the release. The translation catalogues (`docs/book/po`) live in the
 # zeroclaw-docs-translations submodule and own their own version-literal swaps,
@@ -158,16 +163,16 @@ while IFS= read -r -d '' f; do
   docs_files+=("$f")
 done < <(find "$REPO_ROOT/docs/book/src" -type f -name '*.md' -print0)
 for f in "${docs_files[@]}"; do
-  rel="${f#$REPO_ROOT/}"
+  rel="${f#"$REPO_ROOT"/}"
   bump "$rel" \
     'zeroclawlabs/zeroclaw:v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]*)?' \
     "zeroclawlabs/zeroclaw:v${VERSION}"
   bump "$rel" \
-    '"version": "[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]*)?"' \
-    "\"version\": \"${VERSION}\""
+    '"version":( ?)"[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]*)?"' \
+    "\"version\":\\1\"${VERSION}\""
   bump "$rel" \
-    '"serverVersion": "[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]*)?"' \
-    "\"serverVersion\": \"${VERSION}\""
+    '"serverVersion":( ?)"[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]*)?"' \
+    "\"serverVersion\":\\1\"${VERSION}\""
 done
 
 # ── Docs stable-version pointer ────────────────────────────────────

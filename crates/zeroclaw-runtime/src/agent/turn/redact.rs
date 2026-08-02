@@ -9,11 +9,6 @@ static SENSITIVE_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)(authorization|token|api[_-]?key|password|secret|user[_-]?key|bearer|credential|set[_-]?cookie|cookie)["']?\s*[:=]\s*(?:"([^"]{8,})"|'([^']{8,})'|([a-zA-Z0-9_\-\./+=]{8,}))"#).unwrap()
 });
 
-/// Scrub credentials from text bound for a human-facing surface (log records,
-/// observer event fields, UI/editor turn events). Replaces known credential
-/// patterns with a redacted placeholder while preserving a small prefix for
-/// context. Callers must apply this only at the rendering boundary, never to
-/// the output that flows back into the agent loop.
 pub fn scrub_credentials(input: &str) -> String {
     SENSITIVE_KV_REGEX
         .replace_all(input, |caps: &regex::Captures| {

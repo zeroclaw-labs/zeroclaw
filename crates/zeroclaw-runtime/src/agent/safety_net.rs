@@ -1,23 +1,10 @@
-//! #7415 safety net — pins the turn-engine behaviors the existing suite is
+//! safety net — pins the turn-engine behaviors the existing suite is
 //! known NOT to cover (spec: the eight seams in the consolidation plan).
-//!
-//! These tests pass against the UNMODIFIED engines and must stay green
-//! through every extraction commit. Expected-to-change flips (each must be
-//! updated in the same commit that changes the behavior, never silently):
-//!
-//! - task-locals on the streaming/`Agent::turn` paths: unscoped → scoped
-//!   (`safety_net_task_locals_probe_per_entry_path`)
-//! - streaming max-iteration outcome: error → graceful summary
-//!   (`Agent::turn` keeps the error — `safety_net_agent_turn_errors_at_iteration_cap`
-//!   must NOT flip)
-//!
-//! Related oracles that live elsewhere and are never modified: the 44
-//! `run_tool_call_loop_*` tests, `agent/tests.rs::turn_bails_out_at_max_iterations`,
-//! and the 3 steering oracles in `agent.rs`.
 
 use super::*;
 use async_trait::async_trait;
 use std::collections::VecDeque;
+use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::mpsc;
 use zeroclaw_api::ingress::IngressContext;
@@ -26,13 +13,36 @@ use zeroclaw_providers::{ChatResponse, ToolCall};
 
 // ── shared fixtures ─────────────────────────────────────────────────────
 
-fn mem_none() -> Arc<dyn Memory> {
+struct TestAgent {
+    agent: Agent,
+    _workspace: tempfile::TempDir,
+}
+
+impl Deref for TestAgent {
+    type Target = Agent;
+
+    fn deref(&self) -> &Self::Target {
+        &self.agent
+    }
+}
+
+impl DerefMut for TestAgent {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.agent
+    }
+}
+
+fn test_workspace() -> tempfile::TempDir {
+    tempfile::tempdir().expect("test workspace should be created")
+}
+
+fn mem_none(workspace: &Path) -> Arc<dyn Memory> {
     let cfg = zeroclaw_config::schema::MemoryConfig {
         backend: "none".into(),
         ..zeroclaw_config::schema::MemoryConfig::default()
     };
     Arc::from(
-        zeroclaw_memory::create_memory(&cfg, Path::new("/tmp"), None)
+        zeroclaw_memory::create_memory(&cfg, workspace, None)
             .expect("memory creation should succeed"),
     )
 }
@@ -153,36 +163,46 @@ impl Tool for CountingTool {
     }
 }
 
-fn build_agent(provider: Box<dyn ModelProvider>, tools_vec: Vec<Box<dyn Tool>>) -> Agent {
-    Agent::builder()
+fn build_agent(provider: Box<dyn ModelProvider>, tools_vec: Vec<Box<dyn Tool>>) -> TestAgent {
+    let workspace = test_workspace();
+    let agent = Agent::builder()
         .model_provider(provider)
         .tools(tools_vec)
-        .memory(mem_none())
+        .memory(mem_none(workspace.path()))
         .observer(Arc::from(observability::NoopObserver {}))
         .tool_dispatcher(Box::new(NativeToolDispatcher))
-        .workspace_dir(std::path::PathBuf::from("/tmp"))
+        .workspace_dir(workspace.path().to_path_buf())
         .build()
-        .expect("agent builder should succeed")
+        .expect("agent builder should succeed");
+    TestAgent {
+        agent,
+        _workspace: workspace,
+    }
 }
 
 fn build_agent_with_runtime(
     provider: Box<dyn ModelProvider>,
     tools_vec: Vec<Box<dyn Tool>>,
     resolved: zeroclaw_config::schema::ResolvedRuntime,
-) -> Agent {
-    Agent::builder()
+) -> TestAgent {
+    let workspace = test_workspace();
+    let agent = Agent::builder()
         .model_provider(provider)
         .tools(tools_vec)
-        .memory(mem_none())
+        .memory(mem_none(workspace.path()))
         .observer(Arc::from(observability::NoopObserver {}))
         .tool_dispatcher(Box::new(NativeToolDispatcher))
-        .workspace_dir(std::path::PathBuf::from("/tmp"))
+        .workspace_dir(workspace.path().to_path_buf())
         .config(zeroclaw_config::schema::AliasedAgentConfig {
             resolved,
             ..zeroclaw_config::schema::AliasedAgentConfig::default()
         })
         .build()
-        .expect("agent builder should succeed")
+        .expect("agent builder should succeed");
+    TestAgent {
+        agent,
+        _workspace: workspace,
+    }
 }
 
 // ── seam 1: dedup is OFF on the streaming and Agent::turn engines ───────
@@ -235,12 +255,6 @@ async fn safety_net_dedup_off_identical_calls_both_execute() {
         "Agent::turn: both identical tool calls must execute (dedup off)"
     );
 }
-
-// ── seam 2: Agent::turn ERRORS at the iteration cap ─────────────────────
-// Embedder control signal: routing through the loop's graceful summary
-// would silently replace the error with text. Complements
-// `agent/tests.rs::turn_bails_out_at_max_iterations`; this pins the exact
-// message prefix. Must NOT flip in G2.
 
 #[tokio::test]
 async fn safety_net_agent_turn_errors_at_iteration_cap() {
@@ -446,6 +460,8 @@ async fn safety_net_thinking_never_leaks_into_draft_or_chunks() {
     let (dtx, mut drx) = mpsc::channel(256);
     let turn_id = uuid::Uuid::new_v4().to_string();
     let result = crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
+        parent_agent_alias: None,
+        sop_reassembly: None,
         exec: crate::agent::loop_::ResolvedAgentExecution {
             model_access: crate::agent::loop_::ResolvedModelAccess {
                 model_provider: &provider,
@@ -458,6 +474,7 @@ async fn safety_net_thinking_never_leaks_into_draft_or_chunks() {
             silent: true,
             approval: None,
             multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+            config: None,
             max_tool_iterations: 5,
             hooks: None,
             excluded_tools: &[],
@@ -484,8 +501,8 @@ async fn safety_net_thinking_never_leaks_into_draft_or_chunks() {
         steering: None,
         new_messages_out: None,
         image_cache: None,
-        // Phase 1: stamp Internal/Trusted. Real per-transport
-        // stamping is PR C (RFC #6971 §4).
+        // Phase 1: stamp Internal/Trusted. Per-transport
+        // stamping lands in a later phase.
         memory: None,
         ingress: IngressContext::sub_turn(),
         agent_alias: None,
@@ -558,13 +575,6 @@ async fn safety_net_thinking_never_leaks_into_draft_or_chunks() {
     );
 }
 
-// ── seam 5: approval round-trip on the streaming path, incl. DenyWithEdit ─
-// The correlation contract is pause/resume through a registered back-channel;
-// DenyWithEdit must complete the call with the (sanitized) replacement as the
-// tool output without executing the tool. Existing ACP tests cover
-// Approve/Deny but not DenyWithEdit; the gateway `request_id` layer
-// (ws_approval.rs) has no tests and sits above this seam.
-
 #[tokio::test]
 async fn safety_net_streaming_approval_deny_with_edit_round_trip() {
     struct EditChannel {
@@ -618,7 +628,8 @@ async fn safety_net_streaming_approval_deny_with_edit_round_trip() {
         ..zeroclaw_config::schema::RiskProfileConfig::default()
     };
     let approval_mgr = Arc::new(ApprovalManager::for_non_interactive(&risk));
-    let mut agent = Agent::builder()
+    let workspace = test_workspace();
+    let agent = Agent::builder()
         .model_provider(Box::new(ScriptedProvider::new(vec![tool_response(vec![
             ToolCall {
                 id: "tc-5".into(),
@@ -631,13 +642,17 @@ async fn safety_net_streaming_approval_deny_with_edit_round_trip() {
             name: "echo",
             calls: Arc::clone(&exec_count),
         })])
-        .memory(mem_none())
+        .memory(mem_none(workspace.path()))
         .observer(Arc::from(observability::NoopObserver {}))
         .tool_dispatcher(Box::new(NativeToolDispatcher))
-        .workspace_dir(std::path::PathBuf::from("/tmp"))
+        .workspace_dir(workspace.path().to_path_buf())
         .approval_manager(Some(Arc::clone(&approval_mgr)))
         .build()
         .expect("agent builder should succeed");
+    let mut agent = TestAgent {
+        agent,
+        _workspace: workspace,
+    };
 
     let handle: tools::PerToolChannelHandle = Arc::new(parking_lot::RwLock::new(HashMap::new()));
     agent.channel_handles.ask_user = Some(Arc::clone(&handle));
@@ -688,11 +703,6 @@ async fn safety_net_streaming_approval_deny_with_edit_round_trip() {
         "persisted tool result must carry the replacement output"
     );
 
-    // Channel attribution (PR #7540 blocker 1): the approval audit log is a
-    // security record of *which* surface decided. The deciding back-channel
-    // here is "edit-channel"; the consolidated streaming wrapper passes the
-    // loop a static channel name of "cli", so without per-channel attribution
-    // the entry would read "cli" — affirmatively wrong. Pin the real channel.
     let log = approval_mgr.audit_log();
     let entry = log.last().expect("a decision must be recorded");
     assert_eq!(
@@ -752,13 +762,6 @@ async fn safety_net_steering_persistence_includes_tool_round_shapes() {
         "new_messages must persist the steering user message content"
     );
 }
-
-// ── seam 7: task-local probe per entry path ─────────────────────────────
-// Records, from INSIDE tool execution, whether TOOL_LOOP_THREAD_ID /
-// TOOL_LOOP_SESSION_KEY / TOOL_CHOICE_OVERRIDE are scoped. Today: the
-// channel/E1 path is scoped by its caller; the streaming and Agent::turn
-// paths are NOT. The streaming/Agent expectation flips to scoped in G2
-// (the eighth gap) — flip it in that commit, never silently.
 
 #[tokio::test]
 async fn safety_net_task_locals_probe_per_entry_path() {
@@ -847,6 +850,8 @@ async fn safety_net_task_locals_probe_per_entry_path() {
         Some("thread-1".into()),
         crate::agent::loop_::scope_session_key(Some("session-1".into()), async {
             crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
+                parent_agent_alias: None,
+                sop_reassembly: None,
                 exec: crate::agent::loop_::ResolvedAgentExecution {
                     model_access: crate::agent::loop_::ResolvedModelAccess {
                         model_provider: &provider,
@@ -859,6 +864,7 @@ async fn safety_net_task_locals_probe_per_entry_path() {
                     silent: true,
                     approval: None,
                     multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                    config: None,
                     max_tool_iterations: 5,
                     hooks: None,
                     excluded_tools: &[],
@@ -885,8 +891,8 @@ async fn safety_net_task_locals_probe_per_entry_path() {
                 steering: None,
                 new_messages_out: None,
                 image_cache: None,
-                // Phase 1: stamp Internal/Trusted. Real per-transport
-                // stamping is PR C (RFC #6971 §4).
+                // Phase 1: stamp Internal/Trusted. Per-transport
+                // stamping lands in a later phase.
                 memory: None,
                 ingress: IngressContext::sub_turn(),
                 agent_alias: None,
@@ -905,7 +911,7 @@ async fn safety_net_task_locals_probe_per_entry_path() {
 }
 
 // ── seam 8: streaming tool results in input order + mid-batch cancel ────
-// #1043 semantics exist as E1 tests only; the streaming engine must keep
+// semantics exist as E1 tests only; the streaming engine must keep
 // them observably: results persist in input order, and a cancel mid-batch
 // synthesizes interrupted results for the calls that never ran.
 
@@ -1059,12 +1065,6 @@ async fn safety_net_streaming_tool_results_input_order_and_midbatch_cancel() {
     );
 }
 
-// ── seam 9: AgentEnd carries token totals on Agent::turn ────────────────
-// E3 summed per-response usage straight into its TurnGuard. After the C4
-// consolidation the wrapper no longer sees per-call responses; totals flow
-// through the usage-only cost-tracking context instead (plan flag §8.6).
-// Pins: AgentEnd.tokens_used = usage summed across ALL loop iterations.
-
 /// Captures observer events for assertion; no-op for metrics.
 #[derive(Default)]
 struct EventCapture {
@@ -1093,7 +1093,8 @@ async fn safety_net_agent_turn_agent_end_reports_token_totals() {
 
     let calls = Arc::new(AtomicUsize::new(0));
     let capture = Arc::new(EventCapture::default());
-    let mut agent = Agent::builder()
+    let workspace = test_workspace();
+    let agent = Agent::builder()
         .model_provider(Box::new(ScriptedProvider::new(vec![
             tool_round,
             final_round,
@@ -1102,12 +1103,16 @@ async fn safety_net_agent_turn_agent_end_reports_token_totals() {
             name: "echo",
             calls: Arc::clone(&calls),
         })])
-        .memory(mem_none())
+        .memory(mem_none(workspace.path()))
         .observer(Arc::clone(&capture) as Arc<dyn Observer>)
         .tool_dispatcher(Box::new(NativeToolDispatcher))
-        .workspace_dir(std::path::PathBuf::from("/tmp"))
+        .workspace_dir(workspace.path().to_path_buf())
         .build()
         .expect("agent builder should succeed");
+    let mut agent = TestAgent {
+        agent,
+        _workspace: workspace,
+    };
 
     agent
         .turn("count tokens")
@@ -1132,13 +1137,6 @@ async fn safety_net_agent_turn_agent_end_reports_token_totals() {
         "output tokens must sum across all loop iterations"
     );
 }
-
-// ── seam 10: turn survives in-loop history pruning ──────────────────────
-// The loop's preflight maintenance prunes `history` in place when the token
-// estimate exceeds `max_context_tokens`. `new_messages_out` (Agent::turn)
-// and the streamed wrapper's per-round capture must not be derived from
-// pre-prune history indices: that panics (slice start past the shrunken
-// length) or silently persists the wrong messages.
 
 #[tokio::test]
 async fn safety_net_turn_survives_in_loop_history_pruning() {
@@ -1251,12 +1249,6 @@ async fn safety_net_turn_survives_in_loop_history_pruning() {
     );
 }
 
-// ── seam 11: Agent::turn keeps executed rounds on a later-call error ────
-// Tools that ran carry side effects. The pre-consolidation engine pushed
-// each round into `self.history` as it happened, so rounds survived a
-// later-iteration provider failure; losing them makes a retry re-run
-// side-effecting work the model can no longer see.
-
 /// Scripted responses, then a hard provider error once exhausted.
 struct ErrAfterScriptProvider {
     responses: parking_lot::Mutex<VecDeque<ChatResponse>>,
@@ -1343,13 +1335,6 @@ async fn safety_net_agent_turn_error_path_keeps_executed_rounds() {
     );
 }
 
-// ── seam 12: completed tools still emit events/hooks on mid-batch cancel ─
-// A tool that RAN before the user cancelled must emit its TurnEvent
-// ToolCall/ToolResult pair (and fire after_tool_call) even though the
-// cancellation surfaces right after — otherwise the live event stream and
-// the persisted transcript permanently disagree about what executed. The
-// old streamed engine emitted these live, per tool, before the cancel hit.
-
 #[tokio::test]
 async fn safety_net_midbatch_cancel_emits_events_for_completed_tools() {
     struct CancelAfterRunTool {
@@ -1427,13 +1412,6 @@ async fn safety_net_midbatch_cancel_emits_events_for_completed_tools() {
         "the completed tool must emit its ToolResult event despite the cancel"
     );
 }
-
-// ── seam 13: streamed-partial fidelity on interruption ──────────────────
-// (a) A user cancel after visible streamed text persists the watched
-//     partial with "[interrupted by user]" (the old streaming engine's
-//     committed-partial-on-cancel), without a duplicate bare marker.
-// (b) A stream error persists only text the consumer actually SAW
-//     (forwarded chunks), never guard-withheld protocol fragments.
 
 /// Streams the given events, then hangs (pending) so the test can cancel.
 struct StreamThenHangProvider {
@@ -1616,14 +1594,6 @@ async fn safety_net_stream_error_persists_only_forwarded_text() {
     );
 }
 
-// ── seam 14: the graceful max-iteration summary persists coherently ─────
-// GracefulSummary pushes a synthetic "provide your best answer" user
-// message and delivers the model's summary as the response. The summary
-// must ALSO persist as the answering assistant message — otherwise
-// persistent-history callers (streamed wrapper, new_messages consumers)
-// store a transcript ending on an unanswered synthetic user prompt and the
-// delivered summary is absent from the conversation.
-
 #[tokio::test]
 async fn safety_net_graceful_summary_persists_assistant_summary() {
     let calls = Arc::new(AtomicUsize::new(0));
@@ -1668,10 +1638,6 @@ async fn safety_net_graceful_summary_persists_assistant_summary() {
     );
 }
 
-/// Companion to seam 14: when the summary call itself FAILS, the synthetic
-/// prompt must not persist either — a transcript ending on the unanswered
-/// "provide your best answer" prompt is the incoherence under test, and the
-/// failure branch must not reintroduce it.
 #[tokio::test]
 async fn safety_net_failed_graceful_summary_does_not_persist_prompt() {
     let calls = Arc::new(AtomicUsize::new(0));
@@ -1713,19 +1679,6 @@ async fn safety_net_failed_graceful_summary_does_not_persist_prompt() {
         "the unanswered synthetic summary prompt must not persist when the summary call fails"
     );
 }
-
-// ── seam 15: direct-execution approval semantics, now via the loop ──────
-// The pre-consolidation Agent carried a private `execute_tool_call` that
-// mirrored the loop's approval pipeline; six oracles pinned its
-// `set_runtime_approved_arg` trust semantics. That mirror is deleted — the
-// loop's `turn/call_prep.rs` runs the identical
-//   set_runtime_approved_arg(&name, &mut args, false)   (strip model value)
-//   → gate_tool_approval(..)                             (real decision)
-//   → set_runtime_approved_arg(&name, &mut args, approved)
-// sequence, so the same security oracles now drive the production path
-// (`turn_streamed_with_steering_state` → AskUserApprovalBridge →
-// gate_tool_approval). `approved` is true only when the gate returns an
-// Approved requirement (Yes/Always); NotRequired stays false.
 
 /// Records each approval request and answers with a fixed decision.
 struct RecordingApprovalChannel {
@@ -1816,14 +1769,15 @@ fn approval_agent(
     tools_vec: Vec<Box<dyn Tool>>,
     manager: Option<Arc<ApprovalManager>>,
     channel: Option<Arc<dyn zeroclaw_api::channel::Channel>>,
-) -> Agent {
+) -> TestAgent {
+    let workspace = test_workspace();
     let mut builder = Agent::builder()
         .model_provider(provider)
         .tools(tools_vec)
-        .memory(mem_none())
+        .memory(mem_none(workspace.path()))
         .observer(Arc::from(observability::NoopObserver {}))
         .tool_dispatcher(Box::new(NativeToolDispatcher))
-        .workspace_dir(std::path::PathBuf::from("/tmp"));
+        .workspace_dir(workspace.path().to_path_buf());
     if let Some(mgr) = manager {
         builder = builder.approval_manager(Some(mgr));
     }
@@ -1834,7 +1788,10 @@ fn approval_agent(
         agent.channel_handles.ask_user = Some(handle);
         agent.channel_handles().register_channel("acp", ch);
     }
-    agent
+    TestAgent {
+        agent,
+        _workspace: workspace,
+    }
 }
 
 #[tokio::test]

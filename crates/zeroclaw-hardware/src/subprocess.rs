@@ -1,20 +1,4 @@
 //! SubprocessTool — wraps any external binary as a [`Tool`].
-//!
-//! Plugins do not need to be written in Rust. Any executable that follows the
-//! ZeroClaw subprocess protocol is a valid tool:
-//!
-//! **Protocol (stdin/stdout, one line each):**
-//! ```text
-//! Host → binary stdin:  {"device":"pico0","pin":5}\n
-//! Binary → stdout:      {"success":true,"output":"done","error":null}\n
-//! ```
-//!
-//! Error protocol:
-//! - **Timeout (10 s)** — process is killed; `ToolResult::error` contains timeout message.
-//! - **Non-zero exit** — process is killed; `ToolResult::error` contains stderr.
-//! - **Empty / unparseable stdout** — `ToolResult::error` describes the failure.
-//!
-//! The schema advertised to the LLM is auto-generated from [`ToolManifest::parameters`].
 
 use super::manifest::ToolManifest;
 use async_trait::async_trait;
@@ -36,11 +20,6 @@ const SUBPROCESS_TIMEOUT_SECS: u64 = 10;
 /// Prevents a hung cleanup phase from blocking indefinitely.
 const PROCESS_EXIT_TIMEOUT_SECS: u64 = 5;
 
-/// A tool backed by an external subprocess.
-///
-/// The binary receives the LLM-supplied JSON arguments on stdin (one line,
-/// `\n`-terminated) and must write a single `ToolResult`-compatible JSON
-/// object to stdout before exiting.
 pub struct SubprocessTool {
     /// Parsed plugin manifest (tool metadata + parameter definitions).
     manifest: ToolManifest,
@@ -108,16 +87,6 @@ impl Tool for SubprocessTool {
         })
     }
 
-    /// Spawn the binary, write args to stdin, read `ToolResult` from stdout.
-    ///
-    /// Steps:
-    /// 1. Serialize `args` to a JSON string.
-    /// 2. Spawn `binary_path` with piped stdin/stdout/stderr.
-    /// 3. Write `<json>\n` to child stdin; close stdin (signal EOF).
-    /// 4. Read one line from child stdout (10 s timeout).
-    /// 5. Kill the child process.
-    /// 6. Deserialize the line to `ToolResult`.
-    /// 7. On timeout → return error `ToolResult`; on empty/bad output → error.
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let args_json = serde_json::to_string(&args).map_err(|e| {
             ::zeroclaw_log::record!(
@@ -424,8 +393,6 @@ mod tests {
         assert!(required.is_empty());
     }
 
-    /// Verify that a binary which exits 0 with valid ToolResult JSON on stdout
-    /// is deserialised correctly.
     #[tokio::test]
     async fn execute_successful_subprocess() {
         // Use `echo` to emit a valid ToolResult on stdout.
@@ -475,7 +442,6 @@ mod tests {
         format!("#!/bin/sh\ncat > /dev/null\necho '{}'\n", result_json)
     }
 
-    /// A binary that hangs forever should be killed and return a timeout error.
     #[tokio::test]
     #[ignore = "slow: waits SUBPROCESS_TIMEOUT_SECS (~10 s) to elapse — run manually"]
     async fn execute_timeout_kills_process_and_returns_error() {

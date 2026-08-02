@@ -146,8 +146,7 @@ Each provider entry resolves credentials in this order:
 
 1. **Inline `api_key`** on the provider entry.
 2. **Secrets store** at `~/.zeroclaw/secrets`.
-3. **Generic env override**: `ZEROCLAW_providers__models__<type>__<alias>__api_key=...` at startup. See [Environment variables](../reference/env-vars.md) for the full grammar.
-4. **Per-vendor env var** when the family supports it (e.g. `ANTHROPIC_API_KEY` / `ANTHROPIC_OAUTH_TOKEN` for Anthropic; `OPENROUTER_API_KEY` for OpenRouter).
+3. **Generic env override**: `ZEROCLAW_providers__models__<type>__<alias>__api_key=...` at startup. If your shell already exports `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`, or a similar vendor-default name, bridge it into this schema-mirror variable before startup unless the provider family explicitly documents a native runtime env bridge. See [Environment variables](../reference/env-vars.md) for the full grammar and bridge examples.
 
 Credentials are not shared between providers, set them per provider entry.
 

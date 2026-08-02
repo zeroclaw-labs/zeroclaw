@@ -1,9 +1,3 @@
-// Pipeline tool: collapses multi-step tool chains into a single inference call.
-//
-// The agent invokes `execute_pipeline` with a JSON payload describing steps,
-// and this tool executes them sequentially (or in parallel) with result
-// interpolation between steps.
-
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -77,6 +71,8 @@ pub struct PipelineTool {
 }
 
 impl PipelineTool {
+    pub const NAME: &'static str = "execute_pipeline";
+
     pub fn new(config: PipelineConfig, tools: Vec<Arc<dyn Tool>>) -> Self {
         let allowed_set: HashSet<String> = config.allowed_tools.iter().cloned().collect();
         Self {
@@ -227,7 +223,7 @@ impl PipelineTool {
 #[async_trait]
 impl Tool for PipelineTool {
     fn name(&self) -> &str {
-        "execute_pipeline"
+        Self::NAME
     }
 
     fn description(&self) -> &str {
@@ -329,7 +325,6 @@ impl Tool for PipelineTool {
 }
 
 /// Interpolate `{{step[N].result}}` references in tool arguments.
-///
 /// Single-pass replacement: values containing `{{` after substitution are stripped
 /// to prevent injection.
 pub fn interpolate_args(

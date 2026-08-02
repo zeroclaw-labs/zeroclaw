@@ -63,6 +63,7 @@ cli-wechat-bound-success = ✅ WeChatアカウントが正常にバインドさ�
 cli-wechat-invalid-bind-code = ❌ 無効なバインドコードです。もう一度お試しください。
 cli-skills-list-about = すべてのインストール済みスキルをリスト表示
 cli-skills-audit-about = スキルソースディレクトリまたはインストール済みスキル名を監査
+cli-skills-audit-failed = スキル監査に失敗しました。
 cli-skills-install-about = URLまたはローカルパスから新しいスキルをインストール
 cli-skills-remove-about = インストール済みスキルを削除
 cli-skills-test-about = スキル (またはすべてのスキル) の TEST.sh 検証を実行
@@ -70,8 +71,16 @@ cli-skills-review-summary = { "  " }💾 スキルレビュー: {$summary}
 cli-skills-install-start = スキルをインストール中: {$source}
 cli-skills-install-resolving-registry = { "  " }スキルレジストリから '{$source}' を解決中...
 cli-skills-install-resolving-extra-registry = { "  " }レジストリ '{$registry}' から '{$source}' を解決中...
+cli-skills-install-git-failed = git スキルソースのインストールに失敗しました: {$source}
+cli-skills-install-registry-failed = レジストリからのスキルのインストールに失敗しました: {$source}
+cli-skills-install-extra-registry-failed = 追加レジストリからのスキルのインストールに失敗しました: {$source}
+cli-skills-install-local-failed = ローカルスキルソースのインストールに失敗しました: {$source}
 cli-skills-install-installed-audited = { "  " }{$status} スキルがインストールされ、監査されました: {$path}（{$files} ファイルをスキャン）
 cli-skills-install-security-audit-completed = { "  " }セキュリティ監査が正常に完了しました。
+cli-skills-install-into-bundle = { "  " }バンドル '{$alias}' にインストールしました。skill_bundles にこのバンドルを列挙しているエージェントが読み込みます。
+cli-skills-install-global-note = { "  " }注意: グローバルスキルディレクトリにインストールされましたが、どのエージェントも自動的には読み込みません。読み込み可能にするには --bundle <alias> を付けて再実行するか、バンドルをエージェントに割り当ててください。
+cli-skills-removed-archived = { "  " }{$status} スキル '{$name}' をバンドル '{$bundle}' から削除しました（shared/skills/_deleted/ 配下にアーカイブされました）。
+cli-skills-removed-global = { "  " }{$status} スキル '{$name}' をグローバルスキルディレクトリから削除しました。
 cli-skills-install-tier-official = {$name} v{$version} をインストール中 — 公式（zeroclaw-labs 管理）
 cli-skills-install-tier-community =
     {$name} v{$version} をインストール中 — コミュニティ提出
@@ -288,13 +297,11 @@ cli-skills-install-suggestion =
 
     一致した機能: {$matched}
     次: `{$install_command}` を実行してインストールしてください。
-
 cli-plugin-install-suggestion =
     このリクエストには `{$name}` プラグインが必要なようですが、インストールされていません。
 
     一致した機能: {$matched}
     次: `{$install_command}` を実行してインストールしてください。
-
 cli-completions-long-about =
     `zeroclaw` のシェル補完スクリプトを生成します。
 
@@ -403,6 +410,13 @@ cli-skills-none-installed = スキルがインストールされていません�
 cli-skills-create-hint = {"  "}作成: mkdir -p ~/.zeroclaw/workspace/skills/my-skill
 cli-skills-install-hint = {"  "}またはインストール: zeroclaw skills install <source>
 cli-skills-installed-header = インストール済みのスキル ({$count}):
+cli-skills-list-group-bundle = バンドル: {$alias}
+cli-skills-list-group-agent = エージェント '{$alias}' によって読み込み
+cli-skills-list-group-global = グローバル / open-skills / プラグイン（バンドル外）
+cli-skills-agent-not-configured = エージェント '{$alias}' は設定されていません
+cli-skills-agent-multiple-bundles = エージェント '{$alias}' には複数のスキルバンドル ({$bundles}) があります。--bundle で1つを選択してください
+cli-skills-multiple-locations-bundle = スキル '{$name}' は複数の場所 ({$locations}) に存在します。--bundle で1つを選択してください
+cli-skills-multiple-locations-path = スキル '{$name}' は複数の場所 ({$locations}) に存在します。明示的なパスを渡して区別してください
 cli-skills-tags = タグ:  {$tags}
 cli-skills-skipped-header = スキップ済み ({$count}):
 cli-skills-skipped-reason = {"    "}理由: {$reason}
@@ -428,6 +442,8 @@ cli-sop-execution-mode = {"  "}実行モード: {$value}
 cli-sop-deterministic = {"  "}決定論的:  {$value}
 cli-sop-cooldown = {"  "}クールダウン:       {$value}秒
 cli-sop-max-concurrent = {"  "}最大同時実行数: {$value}
+cli-sop-admission-policy = {"  "}許可ポリシー:   {$value}
+cli-sop-max-pending-approvals = {"  "}最大保留承認数: {$value}
 cli-sop-location = {"  "}場所:       {$value}
 cli-sop-triggers = {"  "}トリガー:
 cli-sop-steps = {"  "}ステップ:
@@ -463,6 +479,7 @@ cli-cron-added-oneshot = ✅ ワンショットcronジョブ {$id} を追加し�
 cli-cron-added-interval-agent = ✅ インターバルエージェントcronジョブ {$id} を追加しました
 cli-cron-added-interval = ✅ インターバルcronジョブ {$id} を追加しました
 cli-cron-updated = ✅ cronジョブ {$id} を更新しました
+cli-cron-update-no-field = --expression、--tz、--command、--name、--allowed-tool、--uses-memory のうち少なくとも1つを指定する必要があります
 cli-cron-removed = ✅ cronジョブ {$id} を削除しました
 cli-cron-paused = ⏸️  cronジョブ {$id} を一時停止しました
 cli-cron-resumed = ▶️  cronジョブ {$id} を再開しました
@@ -511,6 +528,19 @@ cli-quickstart-peer-group-row = {$channel} → {$name} (ピア {$count} 件)
 cli-quickstart-provider-local-label = {$name} (ローカル)
 cli-quickstart-provider-type-prompt = プロバイダータイプ
 cli-quickstart-alias-for = {$name} のエイリアス
+cli-quickstart-openai-auth-mode-label = 認証
+cli-quickstart-openai-auth-mode-help = ChatGPT/Codex サブスクリプションの認証プロファイルを使用する場合は `codex` を選択してください。Codex CLI で既にサインイン済みの場合は `zeroclaw auth login --model-provider openai-codex --import ~/.codex/auth.json` を実行し、そうでない場合は `zeroclaw auth login --model-provider openai-codex` を実行してください。
+cli-quickstart-anthropic-auth-mode-label = 認証
+cli-quickstart-anthropic-auth-mode-help = Anthropic Console のキーには `api_key` を選択し、Claude Max 向けに `claude setup-token` を実行して生成したトークンを貼り付ける場合は `setup_token` を選択してください。
+cli-quickstart-anthropic-api-key-help = Anthropic Console の API キー、または `claude setup-token` で生成したトークンを貼り付けてください。
+cli-quickstart-auth-codex-prompt = 今すぐ ChatGPT アカウントで OpenAI Codex にサインインしますか？
+cli-quickstart-auth-codex-import-prompt = 既存の Codex ログイン (~/.codex/auth.json) が見つかりました — 今すぐインポートしますか？
+cli-quickstart-auth-codex-skip-hint = {"  "}後で完了させるには: zeroclaw auth login --model-provider openai-codex
+cli-quickstart-auth-anthropic-prompt = Anthropic プロバイダー `{$alias}` 用に今すぐ `claude setup-token` を実行しますか？
+cli-quickstart-auth-anthropic-token-prompt = `claude setup-token` のトークンを貼り付けてください
+cli-quickstart-auth-anthropic-saved = {"  "}anthropic.{$alias} の Claude setup token を保存しました
+cli-quickstart-auth-anthropic-skip-hint = {"  "}後で完了させるには: claude setup-token を実行し、次に zeroclaw config set providers.models.anthropic.{$alias}.api_key <token>
+cli-quickstart-auth-failed = {"  "}認証の設定が完了しませんでした: {$error}
 cli-quickstart-model-field-missing-warning = 警告: スキーマが `{$provider}` の `model` フィールドを生成しませんでした — 手動入力にフォールバックします。報告してください。
 cli-quickstart-model-id-for = {$name} のモデルID
 cli-quickstart-risk-profile-prompt = リスクプロファイル
@@ -556,12 +586,16 @@ cli-quickstart-error-not-type-alias-ref = `{$reference}` は `<type>.<alias>` �
 cli-quickstart-error-no-configured-path = `{$path}` は設定されていません
 cli-quickstart-error-provider-required = プロバイダータイプ、エイリアス、モデルが必要です
 cli-quickstart-error-unknown-provider-type = 不明なモデルプロバイダータイプ `{$provider}` — プロバイダー一覧から選択してください
+cli-quickstart-error-unknown-openai-auth-mode = 不明な OpenAI 認証モード `{$mode}` — `api_key` または `codex` を選択してください
+cli-quickstart-error-unknown-anthropic-auth-mode = 不明な Anthropic 認証モード `{$mode}` — `api_key` または `setup_token` を選択してください
 cli-quickstart-error-alias-exists = エイリアス `{$alias}` は既に存在します
 cli-quickstart-error-no-profile = プロファイル `{$alias}` は設定されていません
 cli-quickstart-error-unknown-risk-preset = 不明なリスクプリセット `{$preset}`
 cli-quickstart-error-unknown-runtime-preset = 不明なランタイムプリセット `{$preset}`
 cli-quickstart-error-channel-bound = チャンネル `{$reference}` は既にエージェント `{$owner}` に割り当てられています
 cli-quickstart-error-channel-required = チャンネルタイプとエイリアスが必要です
+cli-quickstart-error-channel-field-not-advertised = チャンネルフィールド `{$field}` は Quickstart では使用できません
+cli-quickstart-error-channel-token-required = Telegram Bot トークンが必要です
 cli-quickstart-error-peer-group-name-required = ピアグループ名が必要です
 cli-quickstart-error-peer-group-channel-required = ピアグループのチャンネル参照が必要です
 cli-quickstart-error-peer-group-unknown-channel = ピアグループ `{$name}` が不明なチャンネル `{$channel}` を参照しています
@@ -674,7 +708,7 @@ cli-plugins-none = インストールされているプラグインはありま�
 cli-plugins-installed = インストール済みプラグイン:
 cli-plugin-search-none = '{$query}' に一致するプラグインはありません。
 cli-plugin-search-results = '{$query}' に一致するプラグイン ({$count}):
-cli-plugin-search-result =   {$name} v{$version} — {$description}
+cli-plugin-search-result = {$name} v{$version} — {$description}
 cli-plugin-no-description = (説明なし)
 cli-plugin-install-resolving = プラグインレジストリから '{$source}' を解決しています...
 cli-plugin-installed-from = プラグインを {$source} からインストールしました
@@ -742,7 +776,7 @@ cli-hardware-unsupported-platform = このプラットフォームではハー�
 cli-hardware-supported-platforms = 対応プラットフォーム: Linux、macOS、Windows。
 cli-update-already-current = すでに最新です (v{$version})。
 cli-update-success = v{$version} に正常に更新しました！
-cli-update-prebuilt-channel-note = ビルド済み更新は軽量なデフォルトチャンネルバンドルを使います。Slack やその他の非デフォルトチャンネルを使うには、`./install.sh --source --preset full`、`--features channels-full`、または特定の `channel-*` 機能でソースからビルドしてください。
+cli-update-prebuilt-channel-note = ビルド済み更新は軽量な標準配布セットを使います。Slack やその他の配布対象外チャンネルを使うには、`./install.sh --source --preset full`、`--features channels-full`、または特定の `channel-*` 機能でソースからビルドしてください。
 cli-update-available = 更新が利用可能です: v{$current} -> v{$latest}
 cli-update-forcing-reinstall = 再インストールを強制します: v{$current} -> v{$latest}
 cli-update-not-writable = インストールディレクトリ {$dir} は書き込みできません（{$error}）。権限を昇格して `zeroclaw update` を再実行してください（macOS/Linux では sudo、Windows では管理者コンソール）
@@ -764,8 +798,10 @@ cli-models-status-none = デフォルトモデルが設定されていません�
 turn-interrupted-by-user = [ユーザーによって中断されました]
 turn-cancelled-client-rpc = [クライアント経由でターンがキャンセルされました]
 turn-stream-interrupted = [ストリームが中断されました]
+turn-model-fallback-notice = ⚡ { $requested_model }（{ $requested_provider }）が利用できなかったため、この応答は { $actual_model }（{ $actual_provider }）によって生成されました。
 history-trim-breadcrumb = [earlier turns omitted to fit the context window]
 history-trim-reason-budget = context token budget exceeded
+history-trim-reason-message-cap = 履歴メッセージ数の上限を超えました
 history-trim-floor-exceeds-budget = system prompt and tool definitions ({$floor} tokens) alone meet or exceed the context budget ({$budget} tokens); raise [runtime_profiles.<name>] max_context_tokens or reduce the tool surface by disabling unused integrations
 turn-ingress-dropped = このリクエストは処理されませんでした: { $reason }
 turn-tool-interrupted-before-result = [このツールが結果を生成する前にユーザーによって中断されました]
@@ -775,6 +811,7 @@ channel-runtime-stop-sent = 停止シグナルを送信しました。
 channel-runtime-stop-no-task = この送信者スコープに実行中のタスクはありません。
 channel-runtime-model-empty = モデル ID は空にできません。`/model <model-id>` を使用してください。
 channel-runtime-model-switched = モデルを `{ $model }`（model_provider: `{ $provider }`）に切り替えました。コンテキストは保持されています。
+channel-runtime-agent-scope-rejected = 送信者 `{ $sender }` はエージェント `{ $agent }` で `/model --agent` を実行する権限がありません。セッション限定の上書きには `/model --user { $model }` を使用するか、管理者にあなたをメンバーとして `admin_for_agent_scope = true` のピアグループへ登録するよう依頼してください。
 channel-runtime-request-timeout = ⚠️ モデルの応答待ちがタイムアウトしました。もう一度お試しください。
 channel-runtime-current-model-status =
     現在の model_provider: `{ $provider }`
@@ -871,10 +908,16 @@ cli-bundle-deleted = skill_bundles.{$alias} を削除しました（{$count} 件
 cli-bundle-warn-move = 警告: バンドルディレクトリの移動に失敗しました: {$error}
 cli-bundle-renamed = skill_bundles.{$from} → skill_bundles.{$to} にリネームしました
 
+# ── Web ダッシュボードの再起動ヒント — アプリ内アップグレード後に表示される RestartInfo.hint (PR #8173) ──
+# 最初の 4 つはそのまま表示されるシェルコマンドのテンプレートのため翻訳しません。
+cli-gateway-restart-hint-kubernetes = kubectl rollout restart deployment/zeroclaw
+cli-gateway-restart-hint-container = docker compose restart
+cli-gateway-restart-hint-systemd = systemctl restart zeroclaw
+cli-gateway-restart-hint-launchd = launchctl kickstart -k <your-zeroclaw-label>
+cli-gateway-restart-hint-process = `zeroclaw daemon` プロセスを再起動してください
+
 cli-daemon-gateway-already-running = ZeroClaw ゲートウェイは既に {$host}:{$port} で実行中です。デーモンは自身のゲートウェイを監視しており、同じアドレスで2つ目を開始しません。そのゲートウェイを停止するか、`zeroclaw config set gateway.port <port>` でデーモンを空きポートに向けてから、もう一度デーモンを実行してください。
 cli-daemon-gateway-port-occupied = ゲートウェイアドレス {$host}:{$port} は別のプロセスで既に使用されています。ポートを解放するか、デーモンを空きポートに向けて (`zeroclaw config set gateway.port <port>`)、もう一度デーモンを実行してください。
-
-# ── Context window (doctor update-context-windows, agent interactive) ──
 cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%
 cli-agent-context-bar-unknown = ctx: 不明 / {$max}
 cli-doctor-ctxwin-already-set = {$provider_ref}: 既に context_window = {$ctx} が設定されています
@@ -887,3 +930,44 @@ cli-doctor-ctxwin-saved = config.toml に {$updated} 件の更新を保存しま
 cli-doctor-ctxwin-dry-run = ドライラン完了 — 変更は書き込まれません。--dry-run なしで実行して適用してください。
 cli-doctor-ctxwin-none = 更新は必要ありません。
 cli-doctor-ctxwin-write-failed = {$provider_ref}: context_window の書き込みに失敗しました: {$error}
+
+# ── Degraded config sections (doctor diagnose, #8835) ──
+cli-doctor-degraded-security = セキュリティ上重要な設定セクション `{$path}` が無効なため、デーモンを起動できるようデフォルト値にリセットされました。実行中のセキュリティ設定は意図したものより弱くなっている可能性があります。`zeroclaw config migrate` を実行してパースエラーを確認し、ファイルを修復してください。
+cli-doctor-degraded-section = 設定セクション `{$path}` は不正な形式のためデフォルト値にリセットされました。このセクションの値は反映されていません。`zeroclaw config migrate` を実行してパースエラーを確認し、ファイルを修復してください。
+sop-approval-deferred-at-capacity = 実行スロットが満杯のため、実行 {$run_id} を再開できませんでした。承認は待機状態のままです。スロットが空いてから再試行してください。
+sop-approval-policy-unavailable = 待機中の SOP ステップを利用できないため、承認に失敗しました: {$reason}。実行は待機状態のままです。
+sop-rpc-decision-invalid-state = 実行 {$run_id} は現在の状態では解決できません。
+sop-rpc-decision-unauthorized = RPC プリンシパルには、この SOP ステップを解決する権限がありません。
+sop-rpc-policy-missing = SOP 承認ポリシー '{$name}' が構成されていません。
+sop-rpc-policy-unavailable = 待機中の SOP ポリシーを利用できません: {$reason}。
+
+# ── Tool approval (channels, #9409) ──
+# Human-visible copy for the operator-facing tool-approval prompt, shared
+# across the button adapters (Telegram, Discord, Slack) and the text-reply
+# adapters (Matrix, Signal, WhatsApp, Slack polling fallback). Approval
+# TOKENS, `callback_data`/`custom_id`/`action_id` values, and the reply
+# KEYWORDS parsed by `util::parse_approval_reply` (yes/y/approve, no/n/deny,
+# always) stay hardcoded ASCII in Rust — only the surrounding prose is
+# localized here.
+channel-approval-heading = ツールの承認が必要です
+channel-approval-heading-shout = 承認が必要です
+channel-approval-tool-label = ツール
+channel-approval-args-label = 引数
+channel-approval-btn-approve = 承認
+channel-approval-btn-deny = 拒否
+channel-approval-btn-always = 常に
+channel-approval-tap-instruction = 下のボタンをタップしてください：
+channel-approval-reply-instruction-yesno = 返信：「{ $yes_command }」、「{ $no_command }」、または「{ $always_command }」
+channel-approval-reply-instruction-approve-deny = 「{ $approve_command }」/「{ $deny_command }」/「{ $always_command }」と返信してください。
+channel-telegram-approval-ack-approved = 承認しました
+channel-telegram-approval-ack-always-approved = 常に承認しました
+channel-telegram-approval-ack-denied = 拒否しました
+channel-telegram-approval-ack-unknown = 不明な操作です
+channel-discord-approval-btn-allow-once = 今回のみ許可
+channel-discord-approval-btn-allow-session = このセッションのみ許可
+channel-discord-approval-btn-allow-always = 常に許可
+channel-approval-title = { $tool } を承認しますか？
+channel-approval-opt-allow-once = 今回のみ許可
+channel-approval-opt-allow-always = 常に許可
+channel-approval-opt-reject = 拒否
+channel-approval-opt-reject-with-edit = 編集して拒否

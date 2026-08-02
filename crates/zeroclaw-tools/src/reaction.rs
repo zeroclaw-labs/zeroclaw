@@ -1,9 +1,4 @@
 //! Emoji reaction tool for cross-channel message reactions.
-//!
-//! Exposes `add_reaction` and `remove_reaction` from the [`Channel`] trait as an
-//! agent-callable tool. The tool holds a late-binding channel map handle that is
-//! populated once channels are initialized (after tool construction). This mirrors
-//! the pattern used by `DelegateTool` for its parent-tools handle.
 
 use async_trait::async_trait;
 use parking_lot::RwLock;

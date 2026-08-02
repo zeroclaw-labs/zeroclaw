@@ -20,17 +20,20 @@ Almost every family also takes the shared fields from `ModelProviderConfig`:
 - `fallback_models`: alternate model IDs on the same provider alias.
 - `fallback`: ordered list of other dotted provider aliases to try after this alias fails.
 - `wire_api`, `native_tools`, `provider_extra`, `think`, and `chat_template_kwargs`: advanced protocol and request-body overrides.
+- `vision`: override the provider's image-input (vision) capability. Leave unset to use the family's built-in default. Set `false` for a text-only model served by a vision-capable family (for example, a text model behind llama.cpp) so image messages route to a configured `[multimodal] vision_model_provider` instead of erroring; set `true` to force it on.
 - `tls_ca_cert_path`: absolute path to a PEM-encoded CA certificate for TLS connections to this provider (a per-provider trust override, distinct from the gateway TLS `ca_cert_path`). Shell expansion such as `~` is not performed; leave unset to use the system trust store.
 
 Family-specific entries add their own typed fields on top of these shared fields.
 
 ## Field resolution order
 
-For every family, the URL is resolved in this order:
+For most families, the URL is resolved in this order:
 
 1. **Operator override**: `uri` field on the alias entry, if set.
 2. **Family endpoint**: the family's `*Endpoint` enum supplies the URL (e.g. `OpenAIEndpoint::Default` -> `https://api.openai.com/v1`). Multi-region families have an `endpoint` field on the alias entry that picks the variant (e.g. `endpoint = "cn"` for Moonshot).
-3. **Templated families**: Azure and Bedrock take typed inputs (`resource`, `deployment`, `api_version` for Azure; `region` for Bedrock) and substitute them into the family's URI template. Missing fields fail loud at runtime.
+3. **Templated families**: Azure takes typed inputs (`resource`, `deployment`, `api_version`) and substitutes them into the family's URI template. Missing fields fail loud at runtime.
+
+Bedrock is an exception: its endpoint hostname is constructed at request time from the signing region resolved through the AWS credential chain (`AWS_REGION`, `AWS_DEFAULT_REGION`, or the `region` from the active `credential_process` or IMDS profile). The `uri` alias field and the schema-level `providers.models.bedrock.<alias>.region` field have no effect in the current implementation.
 
 ## Family slots
 
@@ -65,6 +68,33 @@ When ZeroClaw runs inside a container and a provider is on the host (e.g. Ollama
 {{#env-var container}}
 
 The `__` is the path separator; the example above sets `providers.models.ollama.home.uri`. See [Environment variables](../reference/env-vars.md) for the full grammar.
+
+## Per-model vision capability
+
+Use `vision` when a provider family can serve both multimodal and text-only
+models. The value belongs to the provider alias, so routing and fallback paths
+resolve it together with that alias's endpoint, credentials, and model:
+
+```toml
+[providers.models.openai.vision]
+model = "gpt-4o"
+wire_api = "responses"
+vision = true
+
+[providers.models.llamacpp.text]
+model = "qwen3-4b"
+vision = false
+```
+
+Leaving `vision` unset preserves the provider family's built-in default. For
+OpenAI Responses aliases, set `vision = true` for models that accept image
+input; this opt-in keeps text-only Responses models from receiving image
+payloads accidentally.
+
+When `[multimodal] vision_model_provider` names a dotted provider alias, its
+`model` is used automatically. An explicit `[multimodal] vision_model` takes
+precedence over the alias model; if neither is set, the primary turn model is
+used for backward compatibility.
 
 ## Per-family knobs: worked examples
 
@@ -101,6 +131,42 @@ api_version = "2024-10-21"
 ```
 
 The `resource`, `deployment`, and `api_version` values live in this typed config, they are not read from Azure-specific environment variables. Use `uri` only when you need to override the computed endpoint completely.
+
+### Amazon Bedrock
+
+Bedrock needs an alias with a model; endpoint region currently comes from the Bedrock auth environment/profile path:
+
+```toml
+[providers.models.bedrock.work]
+model = "anthropic.claude-sonnet-4-6"
+```
+
+The Bedrock provider uses the credential paths implemented in `crates/zeroclaw-providers/src/bedrock.rs`:
+
+1. `api_key` on the Bedrock alias, or `BEDROCK_API_KEY`, uses Bedrock bearer-token auth and takes precedence over SigV4 credentials.
+2. `AWS_ACCESS_KEY_ID` plus `AWS_SECRET_ACCESS_KEY` uses SigV4. `AWS_SESSION_TOKEN` is optional. `AWS_REGION` or `AWS_DEFAULT_REGION` selects the signing region and falls back to `us-east-1`.
+3. `credential_process` in the active profile from `~/.aws/config`, or from `AWS_CONFIG_FILE`, uses SigV4. `AWS_PROFILE` selects the profile and defaults to `default`.
+4. EC2 IMDSv2 instance credentials are the final SigV4 fallback.
+
+The config schema additionally defines a `providers.models.bedrock.<alias>.region`
+field, but the current implementation does not read it. The endpoint region is
+always resolved from the AWS credential chain (environment variables,
+`credential_process`, or IMDS) as described above.
+
+A normal static profile in `~/.aws/credentials` is not read by the current Bedrock implementation. `~/.zeroclaw/secrets` only stores ZeroClaw config secrets such as an alias `api_key`; it does not export `AWS_*` variables for the provider.
+
+To reuse an AWS CLI profile through the implemented profile path, put a `credential_process` in `~/.aws/config`:
+
+```ini
+[profile zeroclaw-bedrock]
+credential_process = /usr/bin/aws configure export-credentials --profile my-existing-profile
+region = us-east-1
+```
+
+`/usr/bin/aws` is the default path on Debian and Ubuntu. On other systems,
+use the absolute path from `command -v aws`.
+
+Then run ZeroClaw with `AWS_PROFILE=zeroclaw-bedrock`. For a systemd user service, see [Service management](../setup/service.md#environment-overrides-systemd).
 
 ### Multi-region (Moonshot / Qwen / GLM / MiniMax / ...)
 

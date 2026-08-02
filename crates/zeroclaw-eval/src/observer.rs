@@ -1,9 +1,4 @@
 //! An [`Observer`] that records tool-call outcomes and token usage from a run.
-//!
-//! This is the clean seam for trajectory/cost capture: the agent loop already
-//! emits [`ObserverEvent`]s for every tool call and LLM response, so the eval
-//! harness observes them without touching the agent. It is the Phase 0 seed of
-//! the richer run-record capture used by later phases.
 
 use std::sync::Mutex;
 use zeroclaw_api::observability_traits::{Observer, ObserverEvent, ObserverMetric};
@@ -90,6 +85,7 @@ mod tests {
 
     fn tool_call_event(tool: &str, success: bool) -> ObserverEvent {
         ObserverEvent::ToolCall {
+            parent_agent_alias: None,
             tool: tool.to_string(),
             tool_call_id: None,
             duration: Duration::from_millis(10),
@@ -104,6 +100,7 @@ mod tests {
 
     fn llm_event(input: u64, output: u64) -> ObserverEvent {
         ObserverEvent::LlmResponse {
+            parent_agent_alias: None,
             model_provider: String::new(),
             model: String::new(),
             duration: Duration::from_millis(50),

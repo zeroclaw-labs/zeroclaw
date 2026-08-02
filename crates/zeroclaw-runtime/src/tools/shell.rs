@@ -93,13 +93,6 @@ pub struct ShellTool {
     /// real shell environment (PATH, credentials, etc.) reach subprocesses
     /// even though the daemon itself may have a stripped-down env.
     tui_env: Option<HashMap<String, String>>,
-    /// Whether workspace writes performed by the command persist on the host.
-    /// `false` when the runtime uses an ephemeral sandbox (e.g. Docker without
-    /// a workspace volume mount), in which case files written via shell succeed
-    /// inside the container but are invisible on the host and discarded at
-    /// session end. The shell tool can't tell a read from a write, so rather
-    /// than refusing (like `file_write`) it attaches a loud warning to every
-    /// executed command's result. See issue #4627.
     persistent_writes: bool,
 }
 
@@ -132,12 +125,6 @@ impl ShellTool {
         }
     }
 
-    /// Mark whether the active runtime persists workspace writes to the host.
-    ///
-    /// Pass `false` for an ephemeral runtime (Docker tmpfs / no volume mount)
-    /// to attach a loud ephemeral-workspace warning to every executed command,
-    /// so silent data loss is visible (issue #4627). Defaults to `true`,
-    /// preserving existing behaviour on native runtimes and in tests.
     pub fn with_persistent_writes(mut self, persistent: bool) -> Self {
         self.persistent_writes = persistent;
         self
@@ -150,7 +137,6 @@ impl ShellTool {
     }
 
     /// Overlay the TUI client's environment on top of the safe-env snapshot.
-    ///
     /// Pass `Some(env)` to enable forwarding; `None` is a no-op (same as not
     /// calling this method at all).
     pub fn with_tui_env(mut self, env: Option<HashMap<String, String>>) -> Self {
@@ -159,15 +145,6 @@ impl ShellTool {
     }
 }
 
-/// Decode raw process output bytes to a UTF-8 String.
-///
-/// On Windows, cmd.exe emits bytes in the active console output code page
-/// (e.g. CP936/GBK on Simplified Chinese systems). We query the code page at
-/// runtime and transcode via `encoding_rs` so non-ASCII characters survive
-/// intact instead of being replaced by U+FFFD.
-///
-/// On all other platforms the shell runs under the user's locale (usually
-/// UTF-8 already), so `from_utf8_lossy` is sufficient.
 #[cfg(target_os = "windows")]
 fn decode_output(bytes: &[u8]) -> String {
     use windows::Win32::Globalization::GetACP;
@@ -335,7 +312,7 @@ impl Tool for ShellTool {
         };
 
         // Apply sandbox wrapping before execution.
-        // The Sandbox trait operates on std::process::Command, so use as_std_mut()
+        // The Sandbox trait operates on std::process::Command, so use as_std_mut
         // to get a mutable reference to the underlying command.
         self.sandbox.wrap_command(cmd.as_std_mut()).map_err(|e| {
             ::zeroclaw_log::record!(
@@ -465,7 +442,7 @@ impl Tool for ShellTool {
             };
 
         // The command ran inside an ephemeral workspace: any files it wrote are
-        // invisible on the host and discarded at session end (issue #4627).
+        // invisible on the host and discarded at session end
         // Inject the warning into whichever field the dispatcher surfaces to the
         // model — `output` on success, `error` on failure — so it is never lost.
         if !self.persistent_writes {
@@ -815,11 +792,8 @@ mod tests {
         assert!(!result.success);
     }
 
-    // ── Ephemeral-workspace warning (issue #4627) ────────────────
+    // ── Ephemeral-workspace warning────────────────
 
-    /// On an ephemeral runtime the shell tool stays usable but every executed
-    /// command's output carries a loud warning so writes that won't persist are
-    /// visible. The original command output must be preserved below the banner.
     #[tokio::test]
     async fn shell_warns_on_ephemeral_workspace() {
         let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime())
@@ -846,9 +820,6 @@ mod tests {
         );
     }
 
-    /// A failed command surfaces `error`, not `output`, to the model. The
-    /// ephemeral warning must be injected into the error field too so it is
-    /// never lost on the failure path.
     #[tokio::test]
     async fn shell_warns_on_ephemeral_workspace_failure_path() {
         let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime())
@@ -869,10 +840,6 @@ mod tests {
         );
     }
 
-    /// A command that exits 0 but also writes to stderr yields
-    /// `{ success: true, output, error: Some }`. The dispatcher shows `output`
-    /// on success, but the banner must land in BOTH fields so it survives
-    /// regardless of which the model reads. Exercises the dual-field branch.
     #[tokio::test]
     async fn shell_warns_on_ephemeral_success_with_stderr() {
         let tool = ShellTool::new(test_security(AutonomyLevel::Full), test_runtime())
@@ -898,7 +865,6 @@ mod tests {
         );
     }
 
-    /// On a persistent runtime (the default) no warning is attached.
     #[tokio::test]
     async fn shell_no_warning_when_persistent() {
         let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());

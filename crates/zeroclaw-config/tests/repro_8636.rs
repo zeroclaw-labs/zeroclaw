@@ -1,4 +1,4 @@
-//! Regression for zeroclaw-labs/zeroclaw#8636: a malformed `[plugins.entries]`
+//! Regression for a malformed `[plugins.entries]`
 //! (table instead of array-of-tables) must be reported as a dropped section,
 //! never silently swallowed into defaults.
 

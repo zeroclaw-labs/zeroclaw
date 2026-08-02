@@ -408,12 +408,6 @@ mod tests {
 
     #[test]
     fn validate_accepts_http_for_wildcard_allowlist() {
-        // Explicit pin of the default posture: with the shipped default
-        // `browser.allowed_domains = ["*"]`, browser_open accepts plain http://
-        // to any public host. This is the same default that web_fetch,
-        // http_request, and the `browser` tool already ship (all default to
-        // `["*"]` and already accept http://); this test makes the
-        // default-posture change for browser_open conscious and reviewable.
         let tool = test_tool(vec!["*"]);
         let got = tool.validate_url("http://example.com/page").unwrap();
         assert_eq!(got, "http://example.com/page");
@@ -606,12 +600,6 @@ mod tests {
 
     #[test]
     fn listed_private_host_permits_http_scheme() {
-        // `browser_open` accepts `http://` (since it was relaxed to accept
-        // both schemes upstream), so a listed private host can be reached
-        // over plain HTTP — internal services frequently lack a public TLS
-        // cert. The unlisted-host SSRF guard still applies; this test just
-        // pins that the scheme guard does not pre-empt the allowlist for
-        // listed hosts.
         let tool = test_tool_with_private(vec![], vec!["10.0.0.1"]);
         assert!(tool.validate_url("http://10.0.0.1").is_ok());
     }

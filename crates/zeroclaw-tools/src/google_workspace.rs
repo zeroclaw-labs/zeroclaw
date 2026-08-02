@@ -6,7 +6,6 @@ use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::GoogleWorkspaceAllowedOperation;
 
-/// Default `gws` command execution time before kill (overridden by config).
 #[cfg(test)]
 const DEFAULT_GWS_TIMEOUT_SECS: u64 = 30;
 /// Maximum output size in bytes (1MB).
@@ -14,11 +13,6 @@ const MAX_OUTPUT_BYTES: usize = 1_048_576;
 
 use zeroclaw_config::schema::DEFAULT_GWS_SERVICES;
 
-/// Google Workspace CLI (`gws`) integration tool.
-///
-/// Wraps the `gws` CLI binary to give the agent structured access to
-/// Google Workspace services (Drive, Gmail, Calendar, Sheets, etc.).
-/// Requires `gws` to be installed and authenticated (`gws auth login`).
 pub struct GoogleWorkspaceTool {
     security: Arc<SecurityPolicy>,
     allowed_services: Vec<String>,
@@ -33,7 +27,6 @@ pub struct GoogleWorkspaceTool {
 
 impl GoogleWorkspaceTool {
     /// Create a new `GoogleWorkspaceTool`.
-    ///
     /// If `allowed_services` is empty, the default service set is used.
     pub fn new(
         security: Arc<SecurityPolicy>,
@@ -506,7 +499,7 @@ mod tests {
         })
     }
 
-    // Regression for #6410: PATH resolution must produce a usable PathBuf
+    // PATH resolution must produce a usable PathBuf
     // even when `gws` is not installed, so the executor can still emit the
     // documented "Failed to execute gws" error rather than panicking.
     #[test]

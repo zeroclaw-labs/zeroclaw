@@ -82,12 +82,11 @@ cargo install --locked --path .
 zeroclaw quickstart
 ```
 
-### Option 4: Scoop (currently stale)
+### Option 4: Scoop
 
-> ⚠️ **The Scoop manifest in the repo is pinned to v0.5.9** (23 patch releases behind master). Until a release-time CI hook bumps it, prefer Option 1 or 3. If you do use Scoop and hit issues, please open a PR against `dist/scoop/zeroclaw.json`.
-
-```
-scoop install zeroclaw     # currently installs an older release; see warning above
+```cmd
+scoop bucket add zeroclaw https://github.com/zeroclaw-labs/scoop-zeroclaw
+scoop install zeroclaw
 zeroclaw quickstart
 ```
 
@@ -220,8 +219,8 @@ zeroclaw service restart
 
 ### Scoop
 
-```
-scoop update zeroclaw       # subject to the staleness caveat above
+```cmd
+scoop update zeroclaw
 zeroclaw service restart
 ```
 

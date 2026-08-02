@@ -1,18 +1,5 @@
 //! WebSocket-backed [`Channel`] implementation that surfaces tool approval
 //! prompts to the gateway client and waits for the operator's decision.
-//!
-//! The agent's tool loop calls
-//! [`zeroclaw_api::channel::Channel::request_approval`]
-//! whenever a supervised-mode tool needs operator consent. This struct mints
-//! a `request_id`, emits a [`TurnEvent::ApprovalRequest`] that the existing
-//! forward loop serialises onto the wire, and parks on a oneshot until the
-//! matching `approval_response` frame arrives.
-//!
-//! The pending-request map is shared with the connection's receive loop; on
-//! `approval_response` the loop pops the oneshot sender keyed by `request_id`
-//! and resolves the agent's pending future. If the operator does not respond
-//! within `timeout_secs` the wait yields `Deny`, matching the policy of every
-//! other channel that implements `request_approval`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -84,6 +71,14 @@ impl Channel for WsApprovalChannel {
         Ok(())
     }
 
+    /// `send` above is a deliberate no-op (see comment). Surfaces that must
+    /// genuinely deliver — `poll`'s formatted-text fallback and
+    /// `escalate_to_human` — check this so they fail honestly instead of
+    /// claiming success for a message that was never rendered.
+    fn supports_outbound_send(&self) -> bool {
+        false
+    }
+
     async fn listen(&self, _tx: mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         // The gateway WS path does not act as a message source for the
         // channel orchestrator; turns are driven directly by the WS
@@ -92,12 +87,6 @@ impl Channel for WsApprovalChannel {
     }
 
     fn supports_free_form_ask(&self) -> bool {
-        // The gateway WS path only implements structured approval
-        // (request_approval). It cannot transport free-form ask_user
-        // questions through the generic send+listen flow — send() is
-        // a no-op and listen() returns immediately. Returning false
-        // here lets callers fail fast with a clear error instead of
-        // the misleading "Channel closed before receiving a response".
         false
     }
 
@@ -149,13 +138,6 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    /// Regression test: WsApprovalChannel only implements structured
-    /// approval (request_approval).  Its generic send() is a no-op and
-    /// listen() returns immediately, so free-form ask_user / escalate
-    /// must fail fast instead of falling through to the misleading
-    /// "Channel closed before receiving a response" error.  This test
-    /// pins the capability bit so the trait default (true) cannot
-    /// silently regress during later channel cleanup.
     #[test]
     fn ws_approval_channel_declines_free_form_ask() {
         let (tx, _rx) = tokio::sync::mpsc::channel(8);

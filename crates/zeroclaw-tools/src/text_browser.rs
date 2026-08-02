@@ -33,7 +33,7 @@ impl TextBrowserTool {
     }
 
     /// Construct with an explicit `allowed_private_hosts` opt-in list (mirrors
-    /// the `browser`/`browser_open`/`http_request` pattern from PRs #8171 and #6981).
+    /// the `browser`/`browser_open`/`http_request` pattern from PRsand
     pub fn new_with_private_hosts(
         security: Arc<SecurityPolicy>,
         preferred_browser: Option<String>,
@@ -78,13 +78,6 @@ impl TextBrowserTool {
             anyhow::bail!("Only http:// and https:// URLs are allowed");
         }
 
-        // Parse with `reqwest::Url` instead of hand-rolling authority/host
-        // extraction. The pre-fix `validate_url` only checked the scheme, so
-        // `http://169.254.169.254/latest/meta-data` (EC2 IMDS),
-        // `http://localhost:9200/_cat/indices`, and
-        // `http://example.com@127.0.0.1/` (userinfo) all reached the text
-        // browser. Using the same parser that the browser backend resolves
-        // against closes the userinfo/path-class mismatch surfaces.
         let parsed = reqwest::Url::parse(url)
             .map_err(|e| anyhow::Error::msg(format!("Invalid URL format: {e}")))?;
 
@@ -96,18 +89,6 @@ impl TextBrowserTool {
             .host_str()
             .ok_or_else(|| anyhow::Error::msg("URL must include a host"))?;
 
-        // Derive two host strings:
-        // - `display_host`: preserves the original shape (with IPv6 brackets) for
-        //   user-facing error messages.
-        // - `host`: unbracketed, lowercased, and for IPv6 normalized through
-        //   Ipv6Addr::to_string() so it matches the form stored by
-        //   domain_guard::normalize_allowed_domains (which strips brackets and
-        //   compresses via IpAddr::to_string()).
-        //
-        // `Url::host_str()` keeps the original URL text including IPv6 brackets
-        // (e.g. `"[::1]"`), so strip brackets before attempting to parse as an
-        // IPv6 address. Normalize through Ipv6Addr::to_string() so the compressed
-        // form matches what domain_guard::normalize_allowed_domains stores.
         let bare_host = host_str.trim_start_matches('[').trim_end_matches(']');
         let is_ipv6 = bare_host.parse::<std::net::Ipv6Addr>().is_ok();
         let (host, display_host) = if is_ipv6 {
@@ -127,15 +108,6 @@ impl TextBrowserTool {
             anyhow::bail!("Blocked local/private host: {display_host}");
         }
 
-        // Resolved-IP SSRF gate. The literal-host check above only inspects
-        // the string. An attacker who controls a public-looking hostname whose
-        // DNS answer points at `10.0.0.5`, `127.0.0.1`, or `169.254.169.254`
-        // (e.g. a corporate internal name, or a DNS-rebinding setup) would
-        // pass the literal gate and reach `lynx`/`links`/`w3m`. Resolving the
-        // host and rejecting non-public / cloud-metadata addresses closes
-        // that path. Skipped when the operator has allowed the host via
-        // explicit entry or "*" wildcard, regardless of whether the host is
-        // literally private — they have already accepted the risk.
         if !host_allowed {
             validate_dns(&host)?;
         }
@@ -387,15 +359,6 @@ impl Tool for TextBrowserTool {
 
 // ── Helper functions ────────────────────────────────────────────────────────
 
-/// Resolve `host` and reject any answer that points at a non-global /
-/// cloud-metadata address. Mirrors `web_fetch::validate_resolved_host_is_public`.
-///
-/// In `#[cfg(test)]` builds this is a no-op so unit tests don't depend on real
-/// DNS. The rejection logic itself is covered exhaustively at
-/// `helpers/domain_guard.rs::validate_resolved_ips_are_public` (see the unit
-/// tests there for IP-cloud-metadata / RFC1918 / loopback / link-local
-/// coverage). The integration with `validate_url` is exercised by
-/// `validate_url_with_dns_check` tests in this file.
 #[cfg(not(test))]
 fn validate_resolved_host_is_public(host: &str) -> anyhow::Result<()> {
     use std::net::ToSocketAddrs;
@@ -508,12 +471,6 @@ mod tests {
 
     #[test]
     fn validate_url_with_dns_check_rejects_hostname_resolving_to_private_ip() {
-        // Regression for Audacity88's 2026-07-03 review of #8635: the
-        // literal-host gate only inspects the host *string*. An attacker who
-        // controls a public-looking hostname whose DNS answer points at
-        // `10.0.0.5` would pass the literal gate and reach the text browser.
-        // Use the test-seam `validate_url_with_dns_check` to feed a fake DNS
-        // answer and verify the resolved-IP gate fires.
         let tool = test_tool();
         let err = tool
             .validate_url_with_dns_check("http://internal.corp/", |host| {
@@ -555,11 +512,6 @@ mod tests {
 
     #[test]
     fn validate_url_with_dns_check_skips_dns_when_private_host_allowlisted() {
-        // When the operator lists a literal-private host in
-        // `allowed_private_hosts`, the literal gate accepts and the resolved-IP
-        // gate is skipped — they have already accepted the risk for that host.
-        // Use `10.0.0.5` (a literal RFC1918 IP) so the literal-host gate
-        // classifies it as private in the first place.
         let security = Arc::new(SecurityPolicy::default());
         let tool =
             TextBrowserTool::new_with_private_hosts(security, None, 30, vec!["10.0.0.5".into()])
@@ -592,7 +544,7 @@ mod tests {
 
     #[test]
     fn validate_url_with_dns_check_skips_dns_when_public_looking_hostname_allowlisted() {
-        // Regression for Audacity88's 2026-07-04 review of #8635: when the
+        // Regression for Audacity88's 2026-07-04 review of when the
         // operator lists a public-looking hostname (not literally private) in
         // `allowed_private_hosts`, the resolved-IP gate must be skipped even
         // though `is_private_or_local_host` returns false for the host string.
@@ -710,8 +662,6 @@ mod tests {
         assert!(result.error.unwrap().contains("rate limit"));
     }
 
-    // ── SSRF guards (audit-zeroclaw-2026-07-03.md finding #2) ──────
-
     fn private_tool(allowed_private_hosts: Vec<&str>) -> TextBrowserTool {
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
@@ -790,7 +740,7 @@ mod tests {
 
     #[test]
     fn specific_ipv6_loopback_allowlist_permits_bracketed_url() {
-        // Regression for Audacity88's 2026-07-04 review of #8635: an explicit
+        // Regression for Audacity88's 2026-07-04 review of an explicit
         // IPv6 allowlist entry like "::1" must match the URL http://[::1]/ even
         // though the URL host is parsed with brackets while the normalized
         // allowlist entry stores the bare IP.
@@ -831,7 +781,7 @@ mod tests {
     #[test]
     fn rejects_userinfo_targeting_private_host() {
         // `reqwest::Url` rejects userinfo outright — parser-level SSRF defense
-        // (no operator opt-out). Mirrors the `browser` tool fix in PR #8171.
+        // (no operator opt-out). Mirrors the `browser` tool fix in
         let tool = private_tool(vec!["*"]);
         let err = tool
             .validate_url("http://example.com@127.0.0.1/")

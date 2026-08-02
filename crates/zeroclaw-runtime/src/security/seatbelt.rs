@@ -1,19 +1,9 @@
 //! macOS sandbox-exec (Seatbelt) sandbox backend.
-//!
-//! Uses Apple's built-in `sandbox-exec` tool to enforce per-session Seatbelt
-//! profiles that restrict network access, filesystem writes, and process
-//! spawning. Policy files are generated in `.sb` format and written to a
-//! temporary directory that is cleaned up when the sandbox is dropped.
 
 use crate::security::traits::Sandbox;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// macOS sandbox-exec (Seatbelt) sandbox backend.
-///
-/// Generates per-session `.sb` policy files and wraps commands with
-/// `sandbox-exec -f <policy>`. The policy denies network and filesystem
-/// writes by default, allowing only the workspace directory.
 #[derive(Debug, Clone)]
 pub struct SeatbeltSandbox {
     /// Directory where per-session policy files are stored.
@@ -24,7 +14,6 @@ pub struct SeatbeltSandbox {
 
 impl SeatbeltSandbox {
     /// Create a new Seatbelt sandbox, generating a per-session policy file.
-    ///
     /// Returns an error if `sandbox-exec` is not available or the policy file
     /// cannot be written.
     pub fn new() -> std::io::Result<Self> {
@@ -32,7 +21,6 @@ impl SeatbeltSandbox {
     }
 
     /// Create a new Seatbelt sandbox for the provided workspace root.
-    ///
     /// If no workspace is provided, falls back to the process current
     /// directory for compatibility with direct construction.
     pub fn with_workspace(workspace: Option<&Path>) -> std::io::Result<Self> {
@@ -144,14 +132,6 @@ fn seatbelt_string_literal(value: &str) -> String {
     escaped
 }
 
-/// Generate a Seatbelt `.sb` policy with restrictive defaults.
-///
-/// The policy:
-/// - Denies all network operations by default
-/// - Allows DNS lookups and outbound connections to localhost only
-/// - Denies filesystem writes outside the workspace and temp directories
-/// - Allows reads to system paths required for process execution
-/// - Restricts process spawning to essential operations
 fn generate_policy(workspace: &Path) -> String {
     let workspace_str = seatbelt_string_literal(&workspace.to_string_lossy());
     format!(

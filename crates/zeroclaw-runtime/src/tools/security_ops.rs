@@ -1,8 +1,4 @@
 //! Security operations tool for managed cybersecurity service (MCSS) workflows.
-//!
-//! Provides alert triage, incident response playbook execution, vulnerability
-//! scan parsing, and security report generation. All actions that modify state
-//! enforce human approval gates unless explicitly configured otherwise.
 
 use async_trait::async_trait;
 use serde_json::json;

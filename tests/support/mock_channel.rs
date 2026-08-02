@@ -1,5 +1,4 @@
 //! Mock channel for system-level tests.
-//!
 //! `TestChannel` implements the `Channel` trait with MPSC-based message
 //! injection and response capture for race-free testing.
 

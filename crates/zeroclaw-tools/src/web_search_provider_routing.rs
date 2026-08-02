@@ -8,6 +8,29 @@ pub enum WebSearchProviderRoute {
     Bocha,
 }
 
+/// Provider HTTP-failure status surfaced to the agent via the error message's
+/// `search_status=` tag. Only the classes `classify_http_status` actually
+/// produces appear here — no speculative variants (wire-or-remove).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchStatus {
+    Blocked,
+    Unavailable,
+    ClientError,
+}
+
+impl SearchStatus {
+    /// Stable lowercase tag embedded in the agent-visible error message
+    /// (`search_status=<tag>`). This is an error-text tag, not a structured
+    /// wire or log-attr contract — the runtime forwards the error as opaque text.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Blocked => "blocked",
+            Self::Unavailable => "unavailable",
+            Self::ClientError => "client_error",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WebSearchProviderResolution {
     pub route: WebSearchProviderRoute,
@@ -180,5 +203,13 @@ mod tests {
         let r = resolve_web_search_provider("Tavily-Search");
         assert_eq!(r.route, WebSearchProviderRoute::Tavily);
         assert!(!r.used_fallback);
+    }
+
+    #[test]
+    fn search_status_as_str_returns_stable_tags() {
+        // The agent-visible error tag depends on these exact lowercase strings.
+        assert_eq!(SearchStatus::Blocked.as_str(), "blocked");
+        assert_eq!(SearchStatus::Unavailable.as_str(), "unavailable");
+        assert_eq!(SearchStatus::ClientError.as_str(), "client_error");
     }
 }

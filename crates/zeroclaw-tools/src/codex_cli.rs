@@ -13,14 +13,6 @@ const SAFE_ENV_VARS: &[&str] = &[
     "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
 ];
 
-/// Delegates coding tasks to the Codex CLI (`codex exec`).
-///
-/// This creates a two-tier agent architecture: ZeroClaw orchestrates high-level
-/// tasks and delegates complex coding work to Codex, which has its own
-/// agent loop with file editing and shell tools.
-///
-/// Authentication uses the `codex` binary's own session by default. No API key
-/// is needed unless `env_passthrough` includes `OPENAI_API_KEY`.
 pub struct CodexCliTool {
     security: Arc<SecurityPolicy>,
     config: CodexCliConfig,
@@ -93,11 +85,6 @@ impl Tool for CodexCliTool {
         // specially-crafted path components).
         let work_dir = if let Some(wd) = args.get("working_directory").and_then(|v| v.as_str()) {
             let wd_path = std::path::PathBuf::from(wd);
-            // Resolve relative working_directory against workspace_dir, NOT
-            // the daemon's current working directory. This prevents the bug
-            // where an external coding tool's relative working_directory
-            // would silently resolve to a path outside the workspace when
-            // the daemon cwd differs from workspace_dir.
             let wd_path = if wd_path.is_relative() {
                 self.security.workspace_dir.join(&wd_path)
             } else {
@@ -341,11 +328,16 @@ mod tests {
 
     #[tokio::test]
     async fn codex_cli_rejects_path_outside_workspace() {
-        let tool = CodexCliTool::new(test_security(AutonomyLevel::Full), test_config());
+        let workspace = tempfile::TempDir::new().expect("temp workspace");
+        let outside = tempfile::TempDir::new().expect("temp directory outside workspace");
+        let tool = CodexCliTool::new(
+            test_security_with_workspace(AutonomyLevel::Full, workspace.path().to_path_buf()),
+            test_config(),
+        );
         let result = tool
             .execute(json!({
                 "prompt": "hello",
-                "working_directory": "/etc"
+                "working_directory": outside.path()
             }))
             .await
             .expect("should return a result for path validation");

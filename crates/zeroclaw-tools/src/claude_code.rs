@@ -26,15 +26,6 @@ const SAFE_ENV_VARS: &[&str] = &[
     "TMPDIR",
 ];
 
-/// Delegates coding tasks to the Claude Code CLI (`claude -p`).
-///
-/// This creates a two-tier agent architecture: ZeroClaw orchestrates high-level
-/// tasks and delegates complex coding work to Claude Code, which has its own
-/// agent loop with Read/Edit/Bash tools.
-///
-/// Authentication uses the `claude` binary's own OAuth session (Max subscription)
-/// by default. No API key is needed unless `env_passthrough` includes
-/// `ANTHROPIC_API_KEY` for API-key billing.
 pub struct ClaudeCodeTool {
     security: Arc<SecurityPolicy>,
     config: ClaudeCodeConfig,
@@ -145,11 +136,6 @@ impl Tool for ClaudeCodeTool {
         // specially-crafted path components).
         let work_dir = if let Some(wd) = args.get("working_directory").and_then(|v| v.as_str()) {
             let wd_path = std::path::PathBuf::from(wd);
-            // Resolve relative working_directory against workspace_dir, NOT
-            // the daemon's current working directory. This prevents the bug
-            // where an external coding tool's relative working_directory
-            // would silently resolve to a path outside the workspace when
-            // the daemon cwd differs from workspace_dir.
             let wd_path = if wd_path.is_relative() {
                 self.security.workspace_dir.join(&wd_path)
             } else {
@@ -435,11 +421,20 @@ mod tests {
 
     #[tokio::test]
     async fn claude_code_rejects_path_outside_workspace() {
-        let tool = ClaudeCodeTool::new(test_security(AutonomyLevel::Full), test_config());
+        let workspace = tempfile::TempDir::new().expect("temp workspace");
+        let outside = tempfile::TempDir::new().expect("temp directory outside workspace");
+        let tool = ClaudeCodeTool::new(
+            Arc::new(SecurityPolicy {
+                autonomy: AutonomyLevel::Full,
+                workspace_dir: workspace.path().to_path_buf(),
+                ..SecurityPolicy::default()
+            }),
+            test_config(),
+        );
         let result = tool
             .execute(json!({
                 "prompt": "hello",
-                "working_directory": "/etc"
+                "working_directory": outside.path()
             }))
             .await
             .expect("should return a result for path validation");

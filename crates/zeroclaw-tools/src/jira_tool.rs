@@ -19,24 +19,6 @@ enum LevelOfDetails {
     Changelog,
 }
 
-/// Tool for interacting with the Jira REST API.
-///
-/// When `email` is provided, uses **API v3** with HTTP Basic auth
-/// (`email:api_token`) — the standard Jira Cloud authentication model.
-///
-/// When `email` is `None`, uses **API v2** with Bearer token auth
-/// (`Authorization: Bearer <api_token>`) — the standard Jira Server /
-/// Data Center (self-hosted) authentication model.
-///
-/// Supports eight actions gated by `[jira].allowed_actions` in config:
-/// - `get_ticket`        — always in the default allowlist; read-only.
-/// - `search_tickets`    — requires explicit opt-in; read-only.
-/// - `comment_ticket`    — requires explicit opt-in; mutating (Act policy).
-/// - `list_projects`     — requires explicit opt-in; read-only.
-/// - `myself`            — requires explicit opt-in; read-only. Verifies credentials.
-/// - `list_transitions`  — requires explicit opt-in; read-only.
-/// - `transition_ticket` — requires explicit opt-in; mutating (Act policy).
-/// - `create_ticket`     — requires explicit opt-in; mutating (Act policy).
 pub struct JiraTool {
     base_url: String,
     email: Option<String>,
@@ -1697,7 +1679,6 @@ mod tests {
         )
     }
 
-    /// Cloud mode helper (email present → API v3 + Basic auth).
     fn test_tool(allowed_actions: Vec<&str>) -> JiraTool {
         test_tool_with_base_url(
             "https://test.atlassian.net".into(),
@@ -1707,7 +1688,6 @@ mod tests {
         )
     }
 
-    /// Server/DC mode helper (no email → API v2 + Bearer auth).
     fn test_tool_server(allowed_actions: Vec<&str>) -> JiraTool {
         test_tool_with_base_url(
             "https://internal-jira.company.com".into(),

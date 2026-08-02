@@ -1,12 +1,4 @@
 //! Shared execution-plan types for the TodoWrite tracker.
-//!
-//! These mirror the ACP `plan` entry shape (`content`, `priority`,
-//! `status`) with one additive ZeroClaw extension (`active_form`,
-//! serialized as `activeForm`) that strict ACP clients ignore. The
-//! entry field casing already matches ACP; only `active_form` needs a
-//! `rename`. The `session/update` envelope casing (camel for ACP,
-//! snake for the ZeroCode RPC channel) is handled at the two emission
-//! sites, not here.
 
 use serde::{Deserialize, Serialize};
 

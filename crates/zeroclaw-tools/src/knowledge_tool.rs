@@ -1,5 +1,4 @@
 //! Knowledge management tool for capturing, searching, and reusing expertise.
-//!
 //! Exposes the knowledge graph to the agent via the `Tool` trait.
 
 use async_trait::async_trait;
