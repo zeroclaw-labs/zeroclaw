@@ -33,7 +33,7 @@ Each source has a dedicated guide in the sidebar. Live sources (delivered by a r
 | **Cron validation** | Invalid cron expressions fail closed during parsing and cache build |
 | **Headless ownership** | A headless SOP must declare an owning `agent` that is configured and `enabled`; authoring blocks the save and the driver refuses the step rather than borrowing another configured agent. A dashboard-started manual run is refused the same way |
 | **Headless tool scope** | Headless step turns always exclude the SOP control tools and honour the step's declared `scope` under `step_scope_enforce`; child agents spawned from the step inherit those exclusions |
-| **Headless driver lifetime** | Cron drivers are owned by the daemon generation that started them and are drained (then aborted after 30s, and joined so they have actually stopped) before a reload rebuilds the config and SOP engine |
+| **Headless driver lifetime** | Cron drivers are owned by the daemon generation that started them: drained (30s), then aborted and joined (5s) before a reload rebuilds the config and SOP engine. A driver that reaches no await point in that grace keeps running and is carried into the next generation, logged rather than detached |
 | **Headless dispatch** | Sources with no live driver log run progression instead of auto-executing `ExecuteStep` |
 
 ## Troubleshooting
