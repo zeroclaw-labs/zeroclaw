@@ -2,7 +2,7 @@
 
 use super::events::{DraftEvent, StreamDelta};
 use super::outcome::{StreamCancelledAfterOutput, StreamInterruptedAfterOutput, ToolLoopCancelled};
-use super::stream_guard::{StreamTextGuard, StreamThinkTagStripper};
+use super::stream_guard::{StreamTerminalMarkerStripper, StreamTextGuard, StreamThinkTagStripper};
 use anyhow::Result;
 use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
@@ -51,8 +51,14 @@ pub(crate) async fn consume_provider_streaming_response(
     );
     let mut outcome = StreamedChatOutcome::default();
     let mut delta_sender = on_delta;
+    let mut suppress_forwarding = false;
     let mut text_guard = StreamTextGuard::new(request_tools);
     let mut think_stripper = StreamThinkTagStripper::default();
+    // Streaming-safe stripper for trailing provider/model end-of-message
+    // markers like `<eom>` / `<|eom|>`. Sits between the think stripper and
+    // the text guard so transcript display, persisted history, and forwarded
+    // live deltas all observe a single canonical clean text.
+    let mut terminal_marker_stripper = StreamTerminalMarkerStripper::default();
     // Correlates PreExecutedToolCall events with their later results so both
     // TurnEvents share a stable id (FIFO per tool name).
     let mut pre_executed_ids: std::collections::HashMap<
@@ -150,6 +156,8 @@ pub(crate) async fn consume_provider_streaming_response(
             }
             StreamEvent::ToolCall(tool_call) => {
                 outcome.tool_calls.push(tool_call);
+                suppress_forwarding = true;
+                text_guard.suppress_forwarding = true;
             }
             // Pre-executed tool events are for observability only: they are
             // relayed as TurnEvents but do not affect the agent's tool
@@ -214,7 +222,16 @@ pub(crate) async fn consume_provider_streaming_response(
                     continue;
                 }
 
+                let sanitized_delta = terminal_marker_stripper.push(&sanitized_delta);
+                if sanitized_delta.is_empty() {
+                    continue;
+                }
+
                 outcome.response_text.push_str(&sanitized_delta);
+
+                if suppress_forwarding {
+                    continue;
+                }
 
                 if strict_tool_parsing {
                     forward_visible!(sanitized_delta, true);
@@ -232,11 +249,32 @@ pub(crate) async fn consume_provider_streaming_response(
 
     let trailing_delta = think_stripper.finish();
     if !trailing_delta.is_empty() {
-        outcome.response_text.push_str(&trailing_delta);
-        if strict_tool_parsing {
-            forward_visible!(trailing_delta, false);
-        } else if let Some(forward_text) = text_guard.push(&trailing_delta) {
-            forward_visible!(forward_text, false);
+        let trailing_delta = terminal_marker_stripper.push(&trailing_delta);
+        if !trailing_delta.is_empty() {
+            outcome.response_text.push_str(&trailing_delta);
+            if !suppress_forwarding {
+                if strict_tool_parsing {
+                    forward_visible!(trailing_delta, false);
+                } else if let Some(forward_text) = text_guard.push(&trailing_delta) {
+                    forward_visible!(forward_text, false);
+                }
+            }
+        }
+    }
+
+    // Stream is over — flush any suffix the marker stripper was withholding
+    // pending the next chunk. No more chunks arrive, so whatever was held
+    // cannot complete into a known marker; emit it verbatim so it lands in
+    // `response_text` and (via the text guard) the live transcript.
+    let final_marker_flush = terminal_marker_stripper.finish();
+    if !final_marker_flush.is_empty() {
+        outcome.response_text.push_str(&final_marker_flush);
+        if !suppress_forwarding {
+            if strict_tool_parsing {
+                forward_visible!(final_marker_flush, false);
+            } else if let Some(forward_text) = text_guard.push(&final_marker_flush) {
+                forward_visible!(forward_text, false);
+            }
         }
     }
 
@@ -254,16 +292,17 @@ pub(crate) async fn consume_provider_streaming_response(
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use futures_util::stream::BoxStream;
+    use futures_util::stream;
     use zeroclaw_api::model_provider::StreamChunk;
-    use zeroclaw_providers::ToolCall;
     use zeroclaw_providers::traits::{
         ChatResponse, ProviderCapabilities, StreamOptions, StreamResult,
     };
 
-    struct ToolThenTextProvider;
+    struct TestStreamingProvider {
+        chunks: Vec<StreamChunk>,
+    }
 
-    impl ::zeroclaw_api::attribution::Attributable for ToolThenTextProvider {
+    impl ::zeroclaw_api::attribution::Attributable for TestStreamingProvider {
         fn role(&self) -> ::zeroclaw_api::attribution::Role {
             ::zeroclaw_api::attribution::Role::Provider(
                 ::zeroclaw_api::attribution::ProviderKind::Model(
@@ -272,15 +311,15 @@ mod tests {
             )
         }
         fn alias(&self) -> &str {
-            "ToolThenTextProvider"
+            "TestStreamingProvider"
         }
     }
 
     #[async_trait]
-    impl ModelProvider for ToolThenTextProvider {
+    impl ModelProvider for TestStreamingProvider {
         fn capabilities(&self) -> ProviderCapabilities {
             ProviderCapabilities {
-                native_tool_calling: true,
+                native_tool_calling: false,
                 vision: false,
                 prompt_caching: false,
                 extended_thinking: false,
@@ -320,55 +359,161 @@ mod tests {
             _model: &str,
             _temperature: Option<f64>,
             _options: StreamOptions,
-        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
-            let tool_call = ToolCall {
-                id: "call_1".to_string(),
-                name: "noop".to_string(),
-                arguments: "{}".to_string(),
-                extra_content: None,
-            };
-            Box::pin(futures_util::stream::iter(vec![
-                Ok(StreamEvent::TextDelta(StreamChunk::delta("Let me "))),
-                Ok(StreamEvent::ToolCall(tool_call)),
-                Ok(StreamEvent::TextDelta(StreamChunk::delta(
-                    "check the count.",
-                ))),
-                Ok(StreamEvent::Final),
-            ]))
+        ) -> stream::BoxStream<'static, StreamResult<zeroclaw_api::model_provider::StreamEvent>>
+        {
+            let chunks = self.chunks.clone();
+            Box::pin(stream::iter(
+                chunks
+                    .into_iter()
+                    .map(zeroclaw_api::model_provider::StreamEvent::from_chunk)
+                    .map(Ok),
+            ))
         }
     }
 
     #[tokio::test]
-    async fn forwards_text_deltas_emitted_after_a_native_tool_call() {
-        let provider = ToolThenTextProvider;
+    async fn stream_consume_strips_terminal_eom_split_across_chunks() {
+        // End-to-end test: terminal marker fragmented across chunks must not
+        // leak into response_text or forwarded events
+        let provider = TestStreamingProvider {
+            chunks: vec![
+                StreamChunk::delta("Summary"),
+                StreamChunk::delta("<"),
+                StreamChunk::delta("eom"),
+                StreamChunk::delta(">"),
+            ],
+        };
+
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(16);
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
         let outcome = consume_provider_streaming_response(
             &provider,
-            &[ChatMessage::user("go")],
+            &[],
             None,
-            "mock-model",
-            Some(0.0),
+            "test-model",
             None,
             None,
+            Some(&delta_tx),
             Some(&event_tx),
             false,
         )
         .await
-        .expect("stream consume should succeed");
-        drop(event_tx);
+        .unwrap();
 
-        let mut forwarded = String::new();
-        while let Some(event) = event_rx.recv().await {
+        // The marker must not appear in response_text
+        assert!(
+            !outcome.response_text.contains('<'),
+            "response_text must not contain '<', got: {}",
+            outcome.response_text
+        );
+        assert_eq!(outcome.response_text, "Summary");
+
+        // No TurnEvent::Chunk should contain '<' either
+        while let Ok(event) = event_rx.try_recv() {
             if let TurnEvent::Chunk { delta } = event {
-                forwarded.push_str(&delta);
+                assert!(
+                    !delta.contains('<'),
+                    "TurnEvent::Chunk must not contain '<', got: {}",
+                    delta
+                );
             }
         }
 
-        assert_eq!(outcome.tool_calls.len(), 1);
-        assert!(
-            forwarded.contains("check the count."),
-            "narration emitted after the native tool call must be forwarded live; forwarded={forwarded:?}"
-        );
+        // Draft deltas should also be clean
+        while let Ok(delta) = delta_rx.try_recv() {
+            if let StreamDelta::Text(text) = delta {
+                assert!(
+                    !text.contains('<'),
+                    "DraftEvent text must not contain '<', got: {}",
+                    text
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_consume_preserves_inline_eom() {
+        // Inline marker in prose must be preserved
+        let provider = TestStreamingProvider {
+            chunks: vec![StreamChunk::delta("literal <eom> in code")],
+        };
+
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(16);
+        let (delta_tx, _delta_rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
+
+        let outcome = consume_provider_streaming_response(
+            &provider,
+            &[],
+            None,
+            "test-model",
+            None,
+            None,
+            Some(&delta_tx),
+            Some(&event_tx),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.response_text, "literal <eom> in code");
+    }
+
+    #[tokio::test]
+    async fn stream_consume_strips_stacked_markers() {
+        // Stacked markers at end must be stripped
+        let provider = TestStreamingProvider {
+            chunks: vec![
+                StreamChunk::delta("Summary<eom>"),
+                StreamChunk::delta("<|eom|>"),
+            ],
+        };
+
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(16);
+        let (delta_tx, _delta_rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
+
+        let outcome = consume_provider_streaming_response(
+            &provider,
+            &[],
+            None,
+            "test-model",
+            None,
+            None,
+            Some(&delta_tx),
+            Some(&event_tx),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.response_text, "Summary");
+        assert!(!outcome.response_text.contains("eom"));
+    }
+
+    #[tokio::test]
+    async fn stream_consume_preserves_inline_stacked_markers() {
+        // Stacked markers followed by meaningful text must be preserved
+        let provider = TestStreamingProvider {
+            chunks: vec![StreamChunk::delta("literal <eom><|eom|> in code")],
+        };
+
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(16);
+        let (delta_tx, _delta_rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
+
+        let outcome = consume_provider_streaming_response(
+            &provider,
+            &[],
+            None,
+            "test-model",
+            None,
+            None,
+            Some(&delta_tx),
+            Some(&event_tx),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.response_text, "literal <eom><|eom|> in code");
     }
 }

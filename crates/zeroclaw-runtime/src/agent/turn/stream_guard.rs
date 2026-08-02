@@ -270,3 +270,444 @@ impl StreamThinkTagStripper {
         std::mem::take(&mut self.pending)
     }
 }
+
+/// Streaming-safe stripper for **trailing** provider/model end-of-message
+/// markers (`<eom>` and `<|eom|>` leaking into transcripts).
+///
+/// Peels complete markers from the input tail on every chunk and withholds a
+/// small suffix that could still become a marker on the next chunk. Mid-text
+/// markers are left intact — the issue explicitly demands "narrowly scoped"
+/// normalization so prose like "literal <eom> in code" stays untouched.
+///
+/// **Handles stacked markers and marker+whitespace**: when a complete marker
+/// is followed only by whitespace or another recognized marker, the sequence
+/// is held pending until either meaningful text proves it inline or the stream
+/// ends and it is discarded.
+///
+/// **Handles fragmented markers across chunks**: when a marker is split across
+/// multiple chunks (e.g., `"<"`, `"eom", `">"`), the stripper accumulates the
+/// prefix until it can confirm or refute it as a complete marker.
+///
+/// **Handles stacked marker fragmentation**: when multiple markers are stacked
+/// and fragmented (e.g., `"<eom>"`, `"<|"`, `"eom|>"`), the stripper scans
+/// through the chain and accumulates until meaningful text proves the sequence
+/// inline or stream completion confirms it terminal.
+#[derive(Debug, Default)]
+pub(crate) struct StreamTerminalMarkerStripper {
+    pending: String,
+}
+
+impl StreamTerminalMarkerStripper {
+    const MARKERS: &'static [&'static str] = &["<|eom|>", "<eom>"];
+
+    pub(crate) fn push(&mut self, chunk: &str) -> String {
+        if chunk.is_empty() {
+            return String::new();
+        }
+
+        let old_pending = std::mem::take(&mut self.pending);
+        let old_pending_was_complete_marker = Self::MARKERS.contains(&old_pending.as_str());
+
+        let mut input = String::with_capacity(old_pending.len() + chunk.len());
+        let mut visible = String::new();
+
+        if old_pending_was_complete_marker {
+            // Previous chunk ended with a complete marker. Check if this chunk
+            // starts with '<' to distinguish meaningful text from marker prefixes.
+            if !chunk.starts_with('<') {
+                // Chunk doesn't start with '<' - it's meaningful text, so the
+                // previous marker was inline
+                visible.push_str(&old_pending);
+                input.push_str(chunk);
+            } else {
+                // Chunk starts with '<' - check if it's a marker or marker prefix
+                let chunk_is_complete_marker = Self::MARKERS.contains(&chunk);
+                let chunk_is_marker_prefix = Self::MARKERS.iter().any(|m| m.starts_with(chunk));
+
+                if chunk_is_complete_marker || chunk_is_marker_prefix {
+                    // Another marker (or prefix) arrives - accumulate
+                    self.pending.push_str(&old_pending);
+                    self.pending.push_str(chunk);
+                    return visible;
+                } else {
+                    // Chunk starts with '<' but is not a marker prefix (e.g., "<foo>")
+                    // The first marker is inline
+                    visible.push_str(&old_pending);
+                    input.push_str(chunk);
+                }
+            }
+        } else {
+            input.push_str(&old_pending);
+            input.push_str(chunk);
+        }
+
+        loop {
+            let Some(start) = input.find('<') else {
+                // No '<' in input - check if pending is terminal marker+whitespace chain
+                if self.pending_is_terminal_marker_chain() && !input.is_empty() {
+                    if input.chars().all(|c| c.is_whitespace()) {
+                        // Only whitespace after marker chain - accumulate
+                        self.pending.push_str(&input);
+                        return visible;
+                    }
+                    // Meaningful text after marker chain - inline
+                    visible.push_str(&self.pending);
+                    visible.push_str(&input);
+                    self.pending.clear();
+                    return visible;
+                }
+                visible.push_str(&input);
+                self.pending.clear();
+                return visible;
+            };
+
+            visible.push_str(&input[..start]);
+            let tail = &input[start..];
+
+            // Case 1: `tail` is exactly a complete marker
+            if let Some(marker) = Self::MARKERS.iter().find(|m| tail == **m).copied() {
+                self.pending.clear();
+                self.pending.push_str(marker);
+                return visible;
+            }
+
+            // Case 2: `tail` starts with a complete marker but has more text
+            if let Some(marker) = Self::MARKERS
+                .iter()
+                .find(|m| tail.starts_with(**m))
+                .copied()
+            {
+                let _after_marker = &tail[marker.len()..];
+
+                // Scan through the chain of markers and whitespace
+                let mut scan_pos = marker.len();
+                let mut found_meaningful_text = false;
+
+                while scan_pos < tail.len() {
+                    let remaining = &tail[scan_pos..];
+
+                    // Check if remaining starts with whitespace
+                    if let Some(ws_end) = remaining.find(|c: char| !c.is_whitespace()) {
+                        // There's whitespace followed by something
+                        let after_ws = &remaining[ws_end..];
+
+                        // Check if that something is another marker
+                        let next_marker = Self::MARKERS.iter().find(|m| after_ws.starts_with(**m));
+                        if let Some(next_marker) = next_marker {
+                            // Another marker follows - continue scanning
+                            scan_pos += ws_end + next_marker.len();
+                            continue;
+                        }
+
+                        // Meaningful non-marker text after whitespace - entire chain is inline
+                        found_meaningful_text = true;
+                        break;
+                    } else {
+                        // Only whitespace remains - terminal
+                        break;
+                    }
+                }
+
+                if found_meaningful_text {
+                    // Meaningful text after marker chain - inline
+                    visible.push_str(tail);
+                    input.clear();
+                } else {
+                    // Only markers and whitespace - hold pending
+                    self.pending.clear();
+                    self.pending.push_str(tail);
+                }
+                return visible;
+            }
+
+            // Case 3: `tail` is a strict prefix of some marker
+            let keep_len = Self::MARKERS
+                .iter()
+                .map(|m| longest_suffix_matching_prefix(tail, m))
+                .max()
+                .unwrap_or(0);
+            if keep_len > 0 && keep_len == tail.len() {
+                self.pending.clear();
+                self.pending.push_str(tail);
+                return visible;
+            }
+
+            // Case 4: `tail` begins with `<` but is not a marker prefix
+            visible.push('<');
+            input = tail[1..].to_string();
+        }
+    }
+
+    /// Check if pending is a chain of complete markers optionally separated by
+    /// whitespace. Used to determine whether to hold or release accumulated text.
+    fn pending_is_terminal_marker_chain(&self) -> bool {
+        let pending_trimmed = self.pending.trim_end();
+        if Self::MARKERS.contains(&pending_trimmed) {
+            return true;
+        }
+        // Check for stacked markers with optional whitespace between
+        let mut remaining = pending_trimmed;
+        loop {
+            let mut found = false;
+            for &marker in Self::MARKERS {
+                if let Some(before) = remaining.strip_suffix(marker) {
+                    remaining = before.trim_end();
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                break;
+            }
+        }
+        remaining.is_empty()
+    }
+
+    pub(crate) fn finish(&mut self) -> String {
+        let final_pending = std::mem::take(&mut self.pending);
+
+        // Check if pending ends with terminal marker(s) + optional whitespace
+        let pending_trimmed = final_pending.trim_end();
+
+        // Try to strip stacked markers from the end
+        let mut result = pending_trimmed.to_string();
+        loop {
+            let mut found_marker = false;
+            for &marker in Self::MARKERS {
+                if let Some(stripped) = result.strip_suffix(marker) {
+                    result = stripped.trim_end().to_string();
+                    found_marker = true;
+                    break;
+                }
+            }
+            if !found_marker {
+                break;
+            }
+        }
+
+        // If we stripped at least one marker, the rest was terminal - discard
+        if result.len() < pending_trimmed.len() {
+            // We stripped markers - check if anything meaningful remains
+            if result.is_empty() {
+                return String::new();
+            }
+            // Something remains after stripping markers - it was before the markers
+            result
+        } else {
+            // No markers found - return original pending
+            final_pending
+        }
+    }
+}
+
+#[cfg(test)]
+mod terminal_marker_stripper_tests {
+    use super::StreamTerminalMarkerStripper;
+
+    /// Drive the stripper to completion and concatenate the result.
+    /// Per-call emissions are intentionally not asserted: the stripper holds
+    /// a bounded suffix for streaming safety, so an intermediate `push`
+    /// return value may include only the safe-to-emit prefix. The aggregate
+    /// (visible text + finish flush) is the contract that matters.
+    fn drain(chunks: &[&str]) -> String {
+        let mut stripper = StreamTerminalMarkerStripper::default();
+        let mut out = String::new();
+        for chunk in chunks {
+            out.push_str(&stripper.push(chunk));
+        }
+        out.push_str(&stripper.finish());
+        out
+    }
+
+    #[test]
+    fn strips_complete_trailing_eom() {
+        assert_eq!(drain(&["Summary<eom>"]), "Summary");
+    }
+
+    #[test]
+    fn strips_complete_trailing_pipe_eom() {
+        assert_eq!(drain(&["Summary<|eom|>"]), "Summary");
+    }
+
+    #[test]
+    fn preserves_inline_eom_when_more_text_follows() {
+        assert_eq!(
+            drain(&["literal <eom>", " in code"]),
+            "literal <eom> in code"
+        );
+    }
+
+    #[test]
+    fn preserves_inline_pipe_eom_when_more_text_follows() {
+        assert_eq!(
+            drain(&["literal <|eom|>", " in code"]),
+            "literal <|eom|> in code"
+        );
+    }
+
+    #[test]
+    fn splits_eom_across_chunks() {
+        // Marker fragmented across four chunks
+        assert_eq!(drain(&["Summary", "<", "eom", ">"]), "Summary");
+    }
+
+    #[test]
+    fn splits_pipe_eom_across_chunks() {
+        assert_eq!(drain(&["Summary", "<|", "eom|", ">"]), "Summary");
+    }
+
+    #[test]
+    fn preserves_inline_marker_after_complete_chunk_boundary() {
+        // Marker followed by more text in a later chunk must be preserved
+        assert_eq!(
+            drain(&["Summary<eom>", " more text"]),
+            "Summary<eom> more text"
+        );
+    }
+
+    #[test]
+    fn holds_partial_marker_prefix_across_chunks() {
+        assert_eq!(drain(&["hello<", "world"]), "hello<world");
+    }
+
+    #[test]
+    fn handles_multibyte_text_adjacent_to_marker_prefix() {
+        // Multibyte scalar immediately before a `<` marker prefix must not panic
+        assert_eq!(drain(&["你<", "world"]), "你<world");
+    }
+
+    #[test]
+    fn handles_multibyte_text_alone() {
+        assert_eq!(drain(&["你好世界"]), "你好世界");
+    }
+
+    #[test]
+    fn handles_empty_chunk() {
+        let mut stripper = StreamTerminalMarkerStripper::default();
+        assert_eq!(stripper.push(""), "");
+        assert_eq!(stripper.push("hello"), "hello");
+        assert_eq!(stripper.finish(), "");
+    }
+
+    #[test]
+    fn preserves_plain_text_without_markers() {
+        assert_eq!(
+            drain(&["plain answer with no tag"]),
+            "plain answer with no tag"
+        );
+    }
+
+    #[test]
+    fn finish_returns_held_suffix_when_stream_ends_with_partial_marker() {
+        // `push("hello<")` returns `"hello"`; `finish()` returns the held `<`
+        let mut stripper = StreamTerminalMarkerStripper::default();
+        let first = stripper.push("hello<");
+        let tail = stripper.finish();
+        assert_eq!(first + &tail, "hello<");
+    }
+
+    #[test]
+    fn finish_returns_empty_when_nothing_held() {
+        let mut stripper = StreamTerminalMarkerStripper::default();
+        assert_eq!(stripper.finish(), "");
+        assert_eq!(stripper.finish(), ""); // Idempotency
+    }
+
+    #[test]
+    fn finish_is_idempotent() {
+        let mut stripper = StreamTerminalMarkerStripper::default();
+        stripper.push("hello<");
+        let first = stripper.finish();
+        let second = stripper.finish();
+        assert_eq!(first, "<");
+        assert_eq!(second, "");
+    }
+
+    #[test]
+    fn does_not_strip_marker_like_text() {
+        // Trailing character invalidates the marker
+        assert_eq!(drain(&["Summary<eomx>"]), "Summary<eomx>");
+    }
+
+    #[test]
+    fn marker_inside_word_is_inline() {
+        assert_eq!(drain(&["see<eomfile"]), "see<eomfile");
+    }
+
+    #[test]
+    fn strips_marker_followed_by_newline() {
+        assert_eq!(drain(&["Summary<eom>\n"]), "Summary");
+    }
+
+    #[test]
+    fn strips_marker_followed_by_multiple_whitespace() {
+        assert_eq!(drain(&["Summary<eom>\n\n  "]), "Summary");
+    }
+
+    #[test]
+    fn strips_stacked_markers_same_chunk() {
+        assert_eq!(drain(&["Summary<eom><|eom|>"]), "Summary");
+    }
+
+    #[test]
+    fn strips_stacked_markers_different_chunks() {
+        assert_eq!(drain(&["Summary<eom>", "<|eom|>"]), "Summary");
+    }
+
+    #[test]
+    fn strips_stacked_markers_with_whitespace_between() {
+        assert_eq!(drain(&["Summary<eom>\n", "<|eom|>"]), "Summary");
+    }
+
+    #[test]
+    fn strips_stacked_markers_with_whitespace_in_same_chunk() {
+        assert_eq!(drain(&["Summary<eom>\n<|eom|>"]), "Summary");
+    }
+
+    #[test]
+    fn preserves_inline_eom_followed_by_whitespace_then_text() {
+        assert_eq!(
+            drain(&["literal <eom>\n", "in code"]),
+            "literal <eom>\nin code"
+        );
+    }
+
+    #[test]
+    fn preserves_inline_eom_with_meaningful_text_immediately() {
+        assert_eq!(drain(&["literal <eom>in code"]), "literal <eom>in code");
+    }
+
+    #[test]
+    fn strips_stacked_markers_fragmented_across_chunks() {
+        // Audacity88 round-3 Blocking 1
+        assert_eq!(drain(&["Summary<eom>", "<|", "eom|>"]), "Summary");
+        assert_eq!(
+            drain(&["Summary<|", "eom", "|>", "extra"]),
+            "Summary<|eom|>extra"
+        );
+        assert_eq!(drain(&["<eom>", "<|", "eom|>"]), "");
+    }
+
+    #[test]
+    fn preserves_inline_stacked_markers_followed_by_text() {
+        // Audacity88 round-3 Blocking 3
+        assert_eq!(
+            drain(&["literal <eom><|eom|> in code"]),
+            "literal <eom><|eom|> in code"
+        );
+        assert_eq!(drain(&["a", "<eom>", "<|eom|>", " b"]), "a<eom><|eom|> b");
+    }
+
+    #[test]
+    fn strips_stacked_markers_with_long_whitespace() {
+        // Audacity88 round-3 Blocking 2 equivalent (streaming path)
+        let long_ws = "            "; // 12 spaces
+        assert_eq!(drain(&[&format!("Summary<eom>{}", long_ws)]), "Summary");
+    }
+
+    #[test]
+    fn handles_marker_prefix_not_followed_by_marker() {
+        // "<|" is a marker prefix, but followed by non-marker text
+        assert_eq!(drain(&["Summary<|", "code"]), "Summary<|code");
+    }
+}
