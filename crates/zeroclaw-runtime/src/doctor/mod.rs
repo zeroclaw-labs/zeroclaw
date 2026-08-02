@@ -2204,6 +2204,149 @@ mod tests {
         );
     }
 
+    fn config_with_install_root(tmp: &TempDir) -> Config {
+        Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().to_path_buf(),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn canonicalize_provider_ref_defaults_undotted_names() {
+        assert_eq!(
+            canonicalize_provider_ref("openrouter"),
+            "openrouter.default"
+        );
+        assert_eq!(
+            canonicalize_provider_ref("openrouter.work"),
+            "openrouter.work"
+        );
+    }
+
+    #[test]
+    fn persist_model_cache_merges_multiple_providers_and_replaces_on_refresh() {
+        let tmp = TempDir::new().unwrap();
+        let config = config_with_install_root(&tmp);
+
+        persist_model_cache(&config, "openrouter", &["a".to_string(), "b".to_string()]).unwrap();
+        persist_model_cache(&config, "ollama", &["c".to_string()]).unwrap();
+        // Refreshing openrouter replaces its entry rather than duplicating it.
+        persist_model_cache(&config, "openrouter", &["a2".to_string()]).unwrap();
+
+        let raw = std::fs::read_to_string(tmp.path().join("state/models_cache.json")).unwrap();
+        let cache: zeroclaw_config::schema::ModelCacheState = serde_json::from_str(&raw).unwrap();
+        assert_eq!(cache.entries.len(), 2);
+        let openrouter = cache
+            .entries
+            .iter()
+            .find(|e| e.model_provider == "openrouter.default")
+            .unwrap();
+        assert_eq!(openrouter.models, vec!["a2".to_string()]);
+        let ollama = cache
+            .entries
+            .iter()
+            .find(|e| e.model_provider == "ollama.default")
+            .unwrap();
+        assert_eq!(ollama.models, vec!["c".to_string()]);
+    }
+
+    #[test]
+    fn persist_model_cache_preserves_malformed_existing_file() {
+        let tmp = TempDir::new().unwrap();
+        let config = config_with_install_root(&tmp);
+        let state_dir = tmp.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let cache_path = state_dir.join(MODEL_CACHE_FILE);
+        std::fs::write(&cache_path, "not valid json").unwrap();
+
+        let result = persist_model_cache(&config, "openrouter", &["a".to_string()]);
+
+        assert!(
+            result.is_err(),
+            "malformed existing cache must fail the write, not silently replace it"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&cache_path).unwrap(),
+            "not valid json",
+            "existing malformed cache must be left untouched"
+        );
+    }
+
+    #[test]
+    fn persist_model_cache_preserves_unreadable_existing_file() {
+        let tmp = TempDir::new().unwrap();
+        let config = config_with_install_root(&tmp);
+        let state_dir = tmp.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let cache_path = state_dir.join(MODEL_CACHE_FILE);
+        std::fs::create_dir_all(&cache_path).unwrap();
+
+        let result = persist_model_cache(&config, "openrouter", &["a".to_string()]);
+
+        assert!(result.is_err());
+        assert!(
+            cache_path.is_dir(),
+            "unreadable existing cache path must be left untouched, not replaced"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn persist_model_cache_does_not_follow_a_preexisting_tmp_symlink() {
+        let tmp = TempDir::new().unwrap();
+        let config = config_with_install_root(&tmp);
+        let state_dir = tmp.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        let decoy = tmp.path().join("decoy.json");
+        std::fs::write(&decoy, "untouched").unwrap();
+        std::os::unix::fs::symlink(&decoy, state_dir.join("models_cache.json.tmp")).unwrap();
+
+        persist_model_cache(&config, "openrouter", &["a".to_string()]).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&decoy).unwrap(),
+            "untouched",
+            "persistence must not write through a pre-existing symlink at a predictable temp path"
+        );
+        let raw = std::fs::read_to_string(state_dir.join(MODEL_CACHE_FILE)).unwrap();
+        assert!(raw.contains("openrouter"));
+    }
+
+    #[tokio::test]
+    async fn run_models_targeted_refresh_fails_when_cache_write_fails() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/tags"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "models": [{"name": "llama3"}]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = config_with_install_root(&tmp);
+        config
+            .providers
+            .models
+            .ensure("ollama", "default")
+            .expect("known model_provider type")
+            .uri = Some(server.uri());
+
+        std::fs::write(tmp.path().join("state"), "not a directory").unwrap();
+
+        let result = run_models(&config, Some("ollama.default"), false, false).await;
+
+        assert!(
+            result.is_err(),
+            "a targeted refresh must fail the command when the fetched catalog cannot be persisted, \
+             even though the network fetch itself succeeded"
+        );
+    }
+
     /// Regression test: production-path timeout via `run_structured_with_timeout`
     /// must preserve pre-timeout diagnostics and set `timed_out_phase` when
     /// `probe_models` exceeds the deadline. This pins the actual RPC boundary
