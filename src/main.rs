@@ -4162,6 +4162,11 @@ async fn async_main(command: clap::Command) -> Result<()> {
             // config stops the warning and a freshly-degraded one starts it.
             let mut degraded_nag: Option<tokio::task::JoinHandle<()>> =
                 gate_security_posture(&current_config, allow_degraded_security)?;
+            // Cron drivers a generation aborted that had not stopped by the time
+            // its teardown returned. Held across the reload boundary so the next
+            // generation adopts them instead of the process losing track of a
+            // task that is still doing work under superseded config.
+            let mut carried_sop_drivers: Vec<tokio::task::JoinHandle<()>> = Vec::new();
             loop {
                 // Per-iteration clones so the subsystem closures (which
                 // `move`-capture) don't consume the outer bindings on the
@@ -4195,6 +4200,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     sop_engine.as_ref(),
                     sop_audit.as_ref(),
                     current_config.sop.maintenance_interval_secs,
+                    std::mem::take(&mut carried_sop_drivers),
                 );
 
                 #[cfg(feature = "gateway")]
@@ -4323,7 +4329,10 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 // engine: in-flight cron drivers hold this generation's config
                 // and engine, so they must not straddle the rebuild.
                 if let Some(maintenance) = sop_maintenance {
-                    maintenance.shutdown().await;
+                    // Anything still running is carried into the next
+                    // generation rather than detached, so a driver that has not
+                    // yet reached an await point stays owned and observable.
+                    carried_sop_drivers = maintenance.shutdown().await;
                 }
                 let exit = exit?;
                 match exit {
@@ -4959,6 +4968,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     sop_engine.as_ref(),
                     sop_audit.as_ref(),
                     config.sop.maintenance_interval_secs,
+                    Vec::new(),
                 );
                 let result = Box::pin(channels::start_channels(
                     config, None, cancel, sop_engine, sop_audit,
@@ -4968,7 +4978,9 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 // but drivers still hold the engine; drain them before the
                 // process tears the subsystem down.
                 if let Some(maintenance) = sop_maintenance {
-                    maintenance.shutdown().await;
+                    // No next generation on this path: the process exits after
+                    // `channel start` returns, which ends any straggler.
+                    drop(maintenance.shutdown().await);
                 }
                 result
             }
@@ -7836,11 +7848,40 @@ fn spawn_sop_maintenance(
     sop_engine: Option<&std::sync::Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<&std::sync::Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
     interval_secs: u64,
+    // Drivers a previous generation aborted that had not stopped yet. This
+    // generation adopts them so they stay tracked; if there is no generation to
+    // adopt them (SOP maintenance is off in the new config) they are re-aborted
+    // and reported rather than silently dropped.
+    carried: Vec<tokio::task::JoinHandle<()>>,
 ) -> Option<SopMaintenance> {
+    let disown = |carried: Vec<tokio::task::JoinHandle<()>>| {
+        let orphaned = carried
+            .iter()
+            .filter(|driver| !driver.is_finished())
+            .count();
+        for driver in &carried {
+            driver.abort();
+        }
+        if orphaned > 0 {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"orphaned": orphaned})),
+                "SOP cron driver(s) from a previous generation are still running, but this \
+                 configuration runs no SOP maintenance to own them; re-aborted and left \
+                 untracked"
+            );
+        }
+    };
     if interval_secs == 0 {
+        disown(carried);
         return None;
     }
-    let engine = sop_engine.cloned()?;
+    let Some(engine) = sop_engine.cloned() else {
+        disown(carried);
+        return None;
+    };
     let audit = sop_audit.cloned();
     let config = config.clone();
     let cron_cache = audit
@@ -7848,6 +7889,15 @@ fn spawn_sop_maintenance(
         .map(|_| zeroclaw_runtime::sop::dispatch::SopCronCache::from_engine(&engine));
     let drivers = SopDriverSet::default();
     let tick_drivers = drivers.clone();
+    if !carried.is_empty() {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"carried": carried.len()})),
+            "Adopted SOP cron driver(s) that a previous generation aborted but that had not \
+             stopped; this generation tracks them until they do"
+        );
+    }
     let ticker = ::zeroclaw_spawn::spawn!(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -7883,7 +7933,11 @@ fn spawn_sop_maintenance(
             }
         }
     });
-    Some(SopMaintenance { ticker, drivers })
+    Some(SopMaintenance {
+        ticker,
+        drivers,
+        carried,
+    })
 }
 
 /// In-flight cron-started headless drivers for one daemon generation.
@@ -7918,6 +7972,18 @@ const SOP_DRIVER_ABORT_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::
 struct SopMaintenance {
     ticker: tokio::task::JoinHandle<()>,
     drivers: SopDriverSet,
+    /// Drivers a previous generation aborted that had not stopped by the time
+    /// its teardown returned.
+    ///
+    /// Cancellation lands at a task's next await point, and a task that reaches
+    /// none cannot be forced. Rather than dropping those handles — which
+    /// detaches the tasks and loses every way to observe them — this generation
+    /// adopts them: [`Self::shutdown`] reports the ones still running and hands
+    /// the rest forward again, so a straggler stays owned and counted until it
+    /// actually ends. They are already aborted, so they are never waited on
+    /// again; a wedged task costs one `is_finished` check per reload, not
+    /// another drain.
+    carried: Vec<tokio::task::JoinHandle<()>>,
 }
 
 #[cfg(feature = "agent-runtime")]
@@ -7928,18 +7994,29 @@ impl SopMaintenance {
     ///
     /// The tick is aborted first so no new driver can join the set while the
     /// drain is running.
-    async fn shutdown(self) {
+    ///
+    /// Returns the drivers that were still running when this returned: aborted,
+    /// but not yet stopped, because cancellation only lands at a task's next
+    /// await point and one that reaches none cannot be forced. The next
+    /// generation adopts them (see [`SopMaintenance::carried`]) instead of
+    /// detaching them. **A returned handle means a task from this generation is
+    /// still executing under superseded config, for as long as it takes to
+    /// yield** — the caller cannot assume a clean boundary, only a tracked one.
+    /// Empty on every ordinary shutdown.
+    #[must_use]
+    async fn shutdown(self) -> Vec<tokio::task::JoinHandle<()>> {
         self.shutdown_with_deadlines(SOP_DRIVER_DRAIN_TIMEOUT, SOP_DRIVER_ABORT_JOIN_TIMEOUT)
-            .await;
+            .await
     }
 
     /// [`Self::shutdown`] with the two deadlines supplied, so a test can drive
-    /// the drain-expiry path without waiting out the production ones.
+    /// the drain-expiry and join-expiry paths without waiting out the
+    /// production ones.
     async fn shutdown_with_deadlines(
         self,
         drain_timeout: std::time::Duration,
         abort_join_timeout: std::time::Duration,
-    ) {
+    ) -> Vec<tokio::task::JoinHandle<()>> {
         self.ticker.abort();
         // Joined, not just aborted: `abort` requests cancellation, so a tick
         // already inside `check_sop_cron_triggers` can still spawn and register
@@ -7948,6 +8025,14 @@ impl SopMaintenance {
         // final — otherwise a late driver would be detached and outlive this
         // generation, which is the leak this whole type exists to prevent.
         let _ = self.ticker.await;
+        // Adopted from an earlier generation: already aborted, so they are
+        // re-checked rather than re-waited. Anything still running is handed
+        // forward again below.
+        let mut still_running: Vec<tokio::task::JoinHandle<()>> = self
+            .carried
+            .into_iter()
+            .filter(|driver| !driver.is_finished())
+            .collect();
         // Borrowed by the drain below, not consumed: it must be able to time
         // out without dropping the handles, because dropping a `JoinHandle`
         // detaches its task rather than stopping it — and the abort arm still
@@ -7957,7 +8042,7 @@ impl SopMaintenance {
             Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
         };
         if pending.is_empty() {
-            return;
+            return still_running;
         }
         let drained = tokio::time::timeout(drain_timeout, async {
             for driver in &mut pending {
@@ -7966,20 +8051,20 @@ impl SopMaintenance {
         })
         .await;
         if drained.is_ok() {
-            return;
+            return still_running;
         }
         // `abort` only *requests* cancellation: the task stops at its next
         // await point, which is after this call returns. Joining the aborted
-        // handles is what makes the no-overlap contract true — without it the
-        // next generation could start while a straggler is still inside a
-        // provider call under the superseded config. The join is bounded in
-        // turn, so a task that never reaches an await point degrades to a
-        // logged overlap instead of wedging the reload.
+        // handles is what makes the boundary real — without it the next
+        // generation could start while a straggler is still inside a provider
+        // call under the superseded config. The join is bounded in turn, so a
+        // task that reaches no await point cannot wedge the reload; it is
+        // carried forward instead, still aborted and still tracked.
         for driver in &pending {
             driver.abort();
         }
         let joined = tokio::time::timeout(abort_join_timeout, async {
-            for driver in pending {
+            for driver in &mut pending {
                 let _ = driver.await;
             }
         })
@@ -7996,18 +8081,23 @@ impl SopMaintenance {
             "SOP cron drivers did not finish before the drain deadline; aborted them so the next \
              daemon generation does not overlap superseded configuration"
         );
-        if joined.is_err() {
+        still_running.extend(pending.into_iter().filter(|driver| !driver.is_finished()));
+        if !still_running.is_empty() {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({
                         "abort_join_timeout_secs": abort_join_timeout.as_secs(),
+                        "still_running": still_running.len(),
                     })),
-                "SOP cron driver did not stop after abort within the join grace; the next daemon \
-                 generation may briefly overlap it"
+                "SOP cron driver(s) had not stopped when the post-abort join grace expired; they \
+                 keep running under the superseded config until they reach an await point, and \
+                 the next generation starts alongside them. Carried into that generation so they \
+                 stay tracked rather than detached"
             );
         }
+        still_running
     }
 }
 
@@ -10032,16 +10122,90 @@ mod tests {
 
         // Short deadlines so the drain-expiry path runs without waiting out the
         // production ones; the logic under test is identical.
-        SopMaintenance { ticker, drivers }
-            .shutdown_with_deadlines(
-                std::time::Duration::from_millis(50),
-                std::time::Duration::from_secs(5),
-            )
-            .await;
+        let carried = SopMaintenance {
+            ticker,
+            drivers,
+            carried: Vec::new(),
+        }
+        .shutdown_with_deadlines(
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_secs(5),
+        )
+        .await;
 
         assert!(
             stopped.load(Ordering::SeqCst),
             "shutdown returned while an aborted driver was still running"
+        );
+        assert!(
+            carried.is_empty(),
+            "a driver that stopped on abort has nothing to carry forward"
+        );
+    }
+
+    /// The other half of the contract: a driver that reaches no await point
+    /// cannot be cancelled on demand, and the join grace exists so one cannot
+    /// wedge a reload. It must then be carried into the next generation rather
+    /// than dropped — dropping a `JoinHandle` detaches the task, losing the
+    /// last way to observe work still running under superseded config.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "agent-runtime")]
+    async fn sop_maintenance_shutdown_carries_a_driver_that_outlives_its_abort() {
+        // Blocking, not `tokio::time::sleep`: abort lands at the next await
+        // point, and this task deliberately reaches none while the grace runs.
+        let driver = ::zeroclaw_spawn::spawn!(async {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        });
+        let drivers = SopDriverSet::default();
+        drivers.lock().unwrap().push(driver);
+        let ticker = ::zeroclaw_spawn::spawn!(async {
+            tokio::time::sleep(std::time::Duration::from_hours(24)).await;
+        });
+
+        let started = std::time::Instant::now();
+        let carried = SopMaintenance {
+            ticker,
+            drivers,
+            carried: Vec::new(),
+        }
+        .shutdown_with_deadlines(
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+
+        assert_eq!(
+            carried.len(),
+            1,
+            "a driver still running when the join grace expired must be carried, not detached"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the join grace must bound the wait rather than block on the task"
+        );
+
+        // The next generation adopts it: already aborted, so it is re-checked
+        // and handed on again without a second drain.
+        let adopted_at = std::time::Instant::now();
+        let still_carried = SopMaintenance {
+            ticker: ::zeroclaw_spawn::spawn!(async {}),
+            drivers: SopDriverSet::default(),
+            carried,
+        }
+        .shutdown_with_deadlines(
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+
+        assert_eq!(
+            still_carried.len(),
+            1,
+            "an adopted driver that is still running stays carried"
+        );
+        assert!(
+            adopted_at.elapsed() < std::time::Duration::from_millis(500),
+            "adopting an already-aborted driver must not re-drain it"
         );
     }
 
