@@ -10,8 +10,6 @@ generate = "run --release -p xtask --bin generate --"
 # is owned by `xtask::mdbook::refs::build_api` and `docs-deploy.yml`, not here.
 # A follow-up will remove this line and migrate any other non-rustdoc flags
 # (e.g. `--cfg=docsrs`) to the appropriate call sites.
-#
-# Refs: issue #8847, PR #8874
 [build]
 rustdocflags = []
 
