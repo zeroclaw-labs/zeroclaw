@@ -2,6 +2,14 @@
 
 use crate::grader::GradeResult;
 
+/// A case's comparison id: the record's `case_id` when present, else its name.
+fn case_id(case: &CaseReport) -> &str {
+    case.record
+        .as_ref()
+        .map(|r| r.case_id.as_str())
+        .unwrap_or(&case.name)
+}
+
 /// The result of running a single eval case.
 #[derive(Debug)]
 pub struct CaseReport {
@@ -9,6 +17,9 @@ pub struct CaseReport {
     pub name: String,
     /// The fixture file name the case came from.
     pub source: String,
+    /// The run record (receipt + transcript). `None` when the run errored before
+    /// producing a record.
+    pub record: Option<crate::record::RunRecord>,
     /// Per-check grades.
     pub grades: Vec<GradeResult>,
     /// Set if the run itself errored (e.g. trace exhausted) — counts as a failure.
@@ -16,13 +27,48 @@ pub struct CaseReport {
 }
 
 impl CaseReport {
-    /// A case passes when it ran without error and every check passed.
+    /// A case passes when it ran without error and every non-diagnostic check
+    /// passed. Diagnostic grades (e.g. an uncalibrated judge dimension) never gate.
     pub fn passed(&self) -> bool {
-        self.error.is_none() && self.grades.iter().all(|g| g.passed)
+        self.error.is_none() && self.grades.iter().all(|g| g.passed || g.diagnostic)
     }
 
     fn checks_passed(&self) -> usize {
         self.grades.iter().filter(|g| g.passed).count()
+    }
+
+    /// Partial-credit score: fraction of checks passed. A case with no checks
+    /// scores 1.0 (it passes vacuously). Informational; the gate is pass/fail.
+    pub fn score(&self) -> f64 {
+        if self.grades.is_empty() {
+            1.0
+        } else {
+            self.checks_passed() as f64 / self.grades.len() as f64
+        }
+    }
+
+    /// Per-category `(passed, total)` tallies, keyed by the category's snake_case
+    /// label. Only categories with at least one grade appear.
+    fn category_totals(&self) -> serde_json::Value {
+        use std::collections::BTreeMap;
+        let mut totals: BTreeMap<&'static str, (usize, usize)> = BTreeMap::new();
+        for g in &self.grades {
+            let entry = totals.entry(g.category.as_str()).or_insert((0, 0));
+            entry.1 += 1;
+            if g.passed {
+                entry.0 += 1;
+            }
+        }
+        let map: serde_json::Map<String, serde_json::Value> = totals
+            .into_iter()
+            .map(|(cat, (passed, total))| {
+                (
+                    cat.to_string(),
+                    serde_json::json!({ "passed": passed, "total": total }),
+                )
+            })
+            .collect();
+        serde_json::Value::Object(map)
     }
 }
 
@@ -43,6 +89,75 @@ impl SuiteReport {
 
     pub fn all_passed(&self) -> bool {
         self.cases.iter().all(CaseReport::passed)
+    }
+
+    /// Process exit code for a completed run. Gating is strictly per-case:
+    /// - Regression suites, no baseline: 0 iff every case passed.
+    /// - Regression suites, with a baseline: 0 iff every case passed AND there are
+    ///   zero confirmed per-case Pass->Fail regressions.
+    /// - Capability suites: always 0 unless a case ERRORED (a run error, not a
+    ///   check failure), which still exits 1.
+    ///
+    /// Kept as a pure function so the CLI gate is testable at its real boundary.
+    pub fn exit_code(
+        &self,
+        kind: crate::baseline::SuiteKind,
+        comparison: Option<&crate::baseline::BaselineComparison>,
+    ) -> i32 {
+        use crate::baseline::{CaseComparison, SuiteKind};
+        match kind {
+            SuiteKind::Regression => match comparison {
+                None => i32::from(!self.all_passed()),
+                Some(cmp) => {
+                    // A failing case gates unless the comparison excuses it: an
+                    // Unverifiable case (hash changed, refresh the baseline) or a
+                    // FlakyUnconfirmed live case (regressed but passed on re-run).
+                    let gating_failure = self.cases.iter().any(|c| {
+                        !c.passed()
+                            && !matches!(
+                                cmp.per_case.get(case_id(c)),
+                                Some(CaseComparison::FlakyUnconfirmed)
+                                    | Some(CaseComparison::Unverifiable)
+                            )
+                    });
+                    i32::from(gating_failure)
+                }
+            },
+            SuiteKind::Capability => {
+                // Never gate on failing checks; only a run error fails a capability run.
+                i32::from(self.cases.iter().any(|c| c.error.is_some()))
+            }
+        }
+    }
+
+    /// A one-line capability summary: current pass rate, the baseline's pass rate
+    /// when given, and a saturation warning at or above 95%.
+    pub fn capability_summary(&self, baseline: Option<&crate::baseline::Baseline>) -> String {
+        let total = self.cases.len();
+        let rate = if total == 0 {
+            0.0
+        } else {
+            self.passed_count() as f64 / total as f64 * 100.0
+        };
+        let mut s = format!("pass rate {rate:.0}%");
+        if let Some(base) = baseline {
+            let bt = base.entries.len();
+            let bp = base
+                .entries
+                .iter()
+                .filter(|e| e.verdict == crate::baseline::Verdict::Pass)
+                .count();
+            let brate = if bt == 0 {
+                0.0
+            } else {
+                bp as f64 / bt as f64 * 100.0
+            };
+            s.push_str(&format!(" (was {brate:.0}%)"));
+        }
+        if rate >= 95.0 {
+            s.push_str("\n  saturation warning: >=95% - consider graduating to regression/");
+        }
+        s
     }
 
     /// Render a human-readable table. Failing checks are listed beneath their case.
@@ -89,13 +204,41 @@ impl SuiteReport {
             .cases
             .iter()
             .map(|c| {
-                serde_json::json!({
+                let mut obj = serde_json::json!({
                     "name": c.name,
                     "source": c.source,
                     "passed": c.passed(),
+                    "score": c.score(),
+                    "category_totals": c.category_totals(),
                     "error": c.error,
                     "grades": c.grades,
-                })
+                });
+                if let (Some(rec), Some(map)) = (&c.record, obj.as_object_mut()) {
+                    map.insert("schema".into(), rec.schema.clone().into());
+                    map.insert(
+                        "mode".into(),
+                        serde_json::to_value(rec.mode).unwrap_or_default(),
+                    );
+                    map.insert("case_id".into(), rec.case_id.clone().into());
+                    map.insert("case_hash".into(), rec.case_hash.clone().into());
+                    map.insert("provider_ref".into(), rec.provider_ref.clone().into());
+                    map.insert(
+                        "tool_surface".into(),
+                        serde_json::to_value(&rec.tool_surface).unwrap_or_default(),
+                    );
+                    map.insert(
+                        "sandbox".into(),
+                        serde_json::to_value(&rec.sandbox).unwrap_or_default(),
+                    );
+                    map.insert(
+                        "total_tokens".into(),
+                        (rec.input_tokens + rec.output_tokens).into(),
+                    );
+                    if let Some(judge_ref) = &rec.judge_ref {
+                        map.insert("judge_ref".into(), judge_ref.clone().into());
+                    }
+                }
+                obj
             })
             .collect();
 
@@ -119,6 +262,8 @@ mod tests {
             check: check.to_string(),
             passed,
             detail: detail.to_string(),
+            category: crate::grader::GradeCategory::Response,
+            diagnostic: false,
         }
     }
 
@@ -126,6 +271,7 @@ mod tests {
         CaseReport {
             name: name.to_string(),
             source: "fixture.json".to_string(),
+            record: None,
             grades,
             error: error.map(str::to_string),
         }
@@ -168,6 +314,144 @@ mod tests {
         assert_eq!(suite.passed_count(), 1);
         assert_eq!(suite.failed_count(), 2);
         assert!(!suite.all_passed());
+    }
+
+    use crate::baseline::{BaselineComparison, CaseComparison, SuiteKind};
+
+    fn cmp_of(pairs: Vec<(&str, CaseComparison)>) -> BaselineComparison {
+        BaselineComparison {
+            per_case: pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+        }
+    }
+
+    #[test]
+    fn exit_regression_no_baseline_all_pass_is_zero() {
+        let s = SuiteReport {
+            cases: vec![case("ok", vec![grade("c", true, "")], None)],
+        };
+        assert_eq!(s.exit_code(SuiteKind::Regression, None), 0);
+    }
+
+    #[test]
+    fn exit_regression_no_baseline_any_fail_is_one() {
+        let s = SuiteReport {
+            cases: vec![case("bad", vec![grade("c", false, "")], None)],
+        };
+        assert_eq!(s.exit_code(SuiteKind::Regression, None), 1);
+    }
+
+    #[test]
+    fn exit_regression_with_baseline_clean_is_zero() {
+        let s = SuiteReport {
+            cases: vec![case("ok", vec![grade("c", true, "")], None)],
+        };
+        let cmp = cmp_of(vec![(
+            "ok",
+            CaseComparison::Unchanged {
+                token_delta_pct: None,
+            },
+        )]);
+        assert_eq!(s.exit_code(SuiteKind::Regression, Some(&cmp)), 0);
+    }
+
+    #[test]
+    fn exit_regression_with_baseline_confirmed_regression_is_one() {
+        let s = SuiteReport {
+            cases: vec![case("bad", vec![grade("c", false, "")], None)],
+        };
+        let cmp = cmp_of(vec![(
+            "bad",
+            CaseComparison::Regression {
+                categories: vec![crate::grader::GradeCategory::Response],
+            },
+        )]);
+        assert_eq!(s.exit_code(SuiteKind::Regression, Some(&cmp)), 1);
+    }
+
+    #[test]
+    fn improvement_never_fails_exit() {
+        let s = SuiteReport {
+            cases: vec![case("ok", vec![grade("c", true, "")], None)],
+        };
+        let cmp = cmp_of(vec![("ok", CaseComparison::Improvement)]);
+        assert_eq!(s.exit_code(SuiteKind::Regression, Some(&cmp)), 0);
+    }
+
+    #[test]
+    fn exit_regression_flaky_failure_is_excused() {
+        // A failing live case downgraded to flaky must not gate.
+        let s = SuiteReport {
+            cases: vec![case("live", vec![grade("c", false, "")], None)],
+        };
+        let cmp = cmp_of(vec![("live", CaseComparison::FlakyUnconfirmed)]);
+        assert_eq!(s.exit_code(SuiteKind::Regression, Some(&cmp)), 0);
+    }
+
+    #[test]
+    fn exit_regression_unverifiable_failure_is_excused() {
+        // A failing case whose comparability key changed must not gate.
+        let s = SuiteReport {
+            cases: vec![case("changed", vec![grade("c", false, "")], None)],
+        };
+        let cmp = cmp_of(vec![("changed", CaseComparison::Unverifiable)]);
+        assert_eq!(s.exit_code(SuiteKind::Regression, Some(&cmp)), 0);
+    }
+
+    #[test]
+    fn exit_regression_mixed_excused_and_regression_gates() {
+        // An excused flaky failure alongside a real regression still gates.
+        let s = SuiteReport {
+            cases: vec![
+                case("flaky", vec![grade("c", false, "")], None),
+                case("bad", vec![grade("c", false, "")], None),
+            ],
+        };
+        let cmp = cmp_of(vec![
+            ("flaky", CaseComparison::FlakyUnconfirmed),
+            (
+                "bad",
+                CaseComparison::Regression {
+                    categories: vec![crate::grader::GradeCategory::Response],
+                },
+            ),
+        ]);
+        assert_eq!(s.exit_code(SuiteKind::Regression, Some(&cmp)), 1);
+    }
+
+    #[test]
+    fn exit_capability_all_pass_is_zero() {
+        let s = SuiteReport {
+            cases: vec![case("ok", vec![grade("c", true, "")], None)],
+        };
+        assert_eq!(s.exit_code(SuiteKind::Capability, None), 0);
+    }
+
+    #[test]
+    fn exit_capability_check_failure_is_zero() {
+        // A failing check does not gate a capability suite.
+        let s = SuiteReport {
+            cases: vec![case("low", vec![grade("c", false, "")], None)],
+        };
+        assert_eq!(s.exit_code(SuiteKind::Capability, None), 0);
+    }
+
+    #[test]
+    fn exit_capability_run_error_is_one() {
+        // A run error still gates a capability suite.
+        let s = SuiteReport {
+            cases: vec![case("err", vec![], Some("boom"))],
+        };
+        assert_eq!(s.exit_code(SuiteKind::Capability, None), 1);
+    }
+
+    #[test]
+    fn capability_summary_reports_rate_trend_and_saturation() {
+        let s = SuiteReport {
+            cases: vec![case("ok", vec![grade("c", true, "")], None)],
+        };
+        let sum = s.capability_summary(None);
+        assert!(sum.contains("pass rate 100%"), "got: {sum}");
+        assert!(sum.contains("saturation warning"), "got: {sum}");
     }
 
     #[test]
@@ -223,5 +507,44 @@ mod tests {
         assert_eq!(json["cases"].as_array().unwrap().len(), 2);
         assert_eq!(json["cases"][0]["name"].as_str(), Some("ok"));
         assert_eq!(json["cases"][0]["passed"].as_bool(), Some(true));
+        // Each grade now carries its category (snake_case) in the JSON report.
+        assert_eq!(
+            json["cases"][0]["grades"][0]["category"].as_str(),
+            Some("response")
+        );
+    }
+
+    #[test]
+    fn category_totals_aggregate_correctly() {
+        use crate::grader::GradeCategory;
+        let grade_cat = |passed: bool, category: GradeCategory| GradeResult {
+            check: "c".to_string(),
+            passed,
+            detail: String::new(),
+            category,
+            diagnostic: false,
+        };
+        let report = CaseReport {
+            name: "mixed".to_string(),
+            source: "f.json".to_string(),
+            record: None,
+            grades: vec![
+                grade_cat(true, GradeCategory::Response),
+                grade_cat(false, GradeCategory::Response),
+                grade_cat(true, GradeCategory::Tool),
+                grade_cat(true, GradeCategory::SideEffect),
+            ],
+            error: None,
+        };
+        // score = 3/4 passed.
+        assert!((report.score() - 0.75).abs() < f64::EPSILON);
+        let totals = report.category_totals();
+        assert_eq!(totals["response"]["passed"].as_u64(), Some(1));
+        assert_eq!(totals["response"]["total"].as_u64(), Some(2));
+        assert_eq!(totals["tool"]["passed"].as_u64(), Some(1));
+        assert_eq!(totals["tool"]["total"].as_u64(), Some(1));
+        assert_eq!(totals["side_effect"]["total"].as_u64(), Some(1));
+        // Categories with no grades do not appear.
+        assert!(totals.get("budget").is_none());
     }
 }
