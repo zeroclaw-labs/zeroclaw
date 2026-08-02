@@ -939,3 +939,18 @@ sop-rpc-decision-invalid-state = 运行 {$run_id} 无法在当前状态下完成
 sop-rpc-decision-unauthorized = RPC 主体无权对该 SOP 步骤作出决策。
 sop-rpc-policy-missing = 未配置 SOP 审批策略“{$name}”。
 sop-rpc-policy-unavailable = 暂停的 SOP 策略不可用：{$reason}。
+
+# --- 补全翻译（skills install / turn iterations） ---
+cli-skills-install-skill-requires-git = --skill <name> 需要一个 git 仓库 URL 作为来源（收到 '{$source}'）
+cli-skills-install-catalog-failed = 无法从目录 {$source} 安装技能 '{$skill}'
+cli-skills-install-invalid-skill-name = 无效的 --skill 名称 '{$skill}'：请使用纯技能名（字母、数字、'-'、'_'）
+cli-skills-install-catalog-clone-failed = 无法克隆技能目录 {$url}
+cli-skills-install-skill-not-in-catalog-empty = 在 {$url} 中未找到技能 '{$skill}'：没有 skills/ 目录，或目录为空
+cli-skills-install-skill-not-in-catalog =
+    在 {$url} 中未找到技能 '{$skill}'。
+    可用技能：{$available}
+cli-skills-install-catalog-root-symlink = 技能目录 {$url} 的 skills/ 目录是符号链接；拒绝检查
+cli-skills-install-catalog-root-escapes = 技能目录 {$url} 的 skills/ 目录解析到克隆目录之外；拒绝检查
+cli-skills-install-catalog-skill-symlink = {$url} 中的技能 '{$skill}' 是符号链接；目录技能必须是仓库内的真实目录
+cli-skills-install-catalog-skill-escapes = {$url} 中的技能 '{$skill}' 解析到克隆目录之外；拒绝安装
+turn-max-iterations-reached = *回合已停止：达到最大工具迭代次数（{ $max_iterations }）。*

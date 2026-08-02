@@ -491,3 +491,17 @@ zc-config-footer-action-back-to-skills = 返回技能
 zc-config-footer-action-help = 帮助
 zc-config-footer-action-new-line = 换行
 zc-config-field-edit-hint = { $keys } → 按下以编辑
+
+# --- 补全翻译（dashboard rename / chat copy / history trim） ---
+zc-dashboard-agent-rename-action-apply = 重命名
+zc-dashboard-agent-rename-action-cancel = 取消
+zc-dashboard-agent-rename-hint = 重命名
+zc-dashboard-agent-rename-prefix = 重命名：
+zc-dashboard-agent-rename-empty = 智能体名称不能为空
+zc-dashboard-agent-rename-unchanged = 智能体名称未更改
+zc-dashboard-agent-rename-success = 已将 { $from } 重命名为 { $to }
+zc-dashboard-agent-rename-success-warnings = 已将 { $from } 重命名为 { $to }，但有警告：{ $warnings }
+zc-dashboard-agent-rename-failed = 重命名失败：{ $error }
+zc-chat-history-trimmed = 较早的对话历史已被裁剪：{ $reason }（丢弃了 { $dropped } 条消息；保留了 { $kept } 个回合）。
+zc-chat-copy-message = [复制]
+zc-chat-copy-message-copied = [已复制]
