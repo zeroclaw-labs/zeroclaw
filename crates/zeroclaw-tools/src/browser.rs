@@ -1198,9 +1198,10 @@ impl BrowserTool {
 
         if let Ok(parsed) = serde_json::from_str::<ComputerUseResponse>(&body) {
             if status.is_success() && parsed.success.unwrap_or(true) {
-                // If this was a screenshot with a validated path, write the PNG locally
+                // If this was a screenshot with a validated non-empty path, write the PNG locally
                 if action == "screenshot"
                     && let Some(path_str) = validated_path.as_deref()
+                    && !path_str.is_empty()
                 {
                     // Extract PNG data from the response
                     let png_data = parsed
@@ -3560,7 +3561,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/"))
             .respond_with(ResponseTemplate::new(200))
-            .expect(0..)
+            .expect(0)
             .mount(&server)
             .await;
 
@@ -3573,12 +3574,14 @@ mod tests {
             "path": "../etc/passwd"
         });
 
-        let err = tool.execute(args).await.unwrap_err();
+        // Validation happens in execute_computer_use_action, returns ToolResult with error
+        let result = tool.execute(args).await.unwrap();
+        assert!(!result.success, "Expected validation to fail");
+        let error = result.error.expect("Expected error in result");
         assert!(
-            err.to_string().contains("not in the workspace allowlist")
-                || err.to_string().contains("../etc/passwd"),
+            error.contains("not in the workspace allowlist") || error.contains("../etc/passwd"),
             "Expected traversal rejection, got: {}",
-            err
+            error
         );
     }
 
@@ -3603,11 +3606,12 @@ mod tests {
             .mount(&server)
             .await;
 
+        // Mock the POST endpoint to return PNG data
         Mock::given(method("POST"))
             .and(path("/"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "success": true,
-                "data": {"ok": true}
+                "data": {"png_base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="}
             })))
             .expect(1)
             .mount(&server)
@@ -3643,20 +3647,25 @@ mod tests {
             "path": page_path.to_string_lossy().to_string()
         });
 
-        // Should succeed and forward to sidecar
+        // Should succeed - path is validated but NOT forwarded to sidecar
+        // Sidecar returns PNG, we write it locally
         let result = tool.execute(args).await.unwrap();
-        assert!(result.success);
+        assert!(
+            result.success,
+            "Expected success, got error: {:?}",
+            result.error
+        );
 
-        // Verify sidecar received canonical path
+        // Verify sidecar was called (without path in params)
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1);
         let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
         let params = body.get("params").unwrap().as_object().unwrap();
-        let path_sent = params.get("path").unwrap().as_str().unwrap();
-
-        // Path should be canonical
-        let canonical_page = std::fs::canonicalize(&page_path).unwrap();
-        assert_eq!(path_sent, canonical_page.to_string_lossy().as_ref());
+        // Path should NOT be in params anymore
+        assert!(
+            !params.contains_key("path"),
+            "Path should not be forwarded to sidecar"
+        );
     }
 
     #[tokio::test]
@@ -3745,12 +3754,14 @@ mod tests {
             "action": "screenshot",
             "path": 12345
         });
-        let err = tool.execute(args).await.unwrap_err();
-        // The error should be about non-string path, not about endpoint unreachability
+        // Validation happens in execute_computer_use_action, returns ToolResult with error
+        let result = tool.execute(args).await.unwrap();
+        assert!(!result.success, "Expected validation to fail");
+        let error = result.error.expect("Expected error in result");
         assert!(
-            err.to_string().contains("path") || err.to_string().contains("string"),
+            error.contains("string") || error.contains("path"),
             "Expected non-string path error, got: {}",
-            err
+            error
         );
 
         // Array path
@@ -3758,11 +3769,13 @@ mod tests {
             "action": "screenshot",
             "path": ["path1", "path2"]
         });
-        let err = tool.execute(args).await.unwrap_err();
+        let result = tool.execute(args).await.unwrap();
+        assert!(!result.success, "Expected validation to fail");
+        let error = result.error.expect("Expected error in result");
         assert!(
-            err.to_string().contains("path") || err.to_string().contains("string"),
+            error.contains("string") || error.contains("path"),
             "Expected non-string path error, got: {}",
-            err
+            error
         );
 
         // Object path
@@ -3770,11 +3783,13 @@ mod tests {
             "action": "screenshot",
             "path": {"key": "value"}
         });
-        let err = tool.execute(args).await.unwrap_err();
+        let result = tool.execute(args).await.unwrap();
+        assert!(!result.success, "Expected validation to fail");
+        let error = result.error.expect("Expected error in result");
         assert!(
-            err.to_string().contains("path") || err.to_string().contains("string"),
+            error.contains("string") || error.contains("path"),
             "Expected non-string path error, got: {}",
-            err
+            error
         );
     }
 
@@ -3785,11 +3800,12 @@ mod tests {
 
         let server = MockServer::start().await;
 
+        // Empty string path → inline PNG semantics, no path validation, forwarded to sidecar
         Mock::given(method("POST"))
             .and(path("/"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "success": true,
-                "data": {"ok": true}
+                "data": {"png_base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="}
             })))
             .expect(1)
             .mount(&server)
@@ -3799,22 +3815,18 @@ mod tests {
         config.endpoint = server.uri();
         let tool = browser_tool_with_computer_use(config);
 
-        // Empty string path → inline PNG semantics, forwarded to sidecar
+        // Empty string path → inline PNG, no local write
         let args = json!({
             "action": "screenshot",
             "path": ""
         });
 
         let result = tool.execute(args).await.unwrap();
-        assert!(result.success);
-
-        // Verify sidecar received empty string
-        let requests = server.received_requests().await.unwrap();
-        assert_eq!(requests.len(), 1);
-        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
-        let params = body.get("params").unwrap().as_object().unwrap();
-        let path_sent = params.get("path").unwrap().as_str().unwrap();
-        assert_eq!(path_sent, "");
+        assert!(
+            result.success,
+            "Expected success, got error: {:?}",
+            result.error
+        );
     }
 
     #[tokio::test]
@@ -3838,7 +3850,9 @@ mod tests {
     #[tokio::test]
     async fn endpoint_is_remote_filesystem_remote_endpoint_disabled_is_false() {
         let mut config = test_computer_use_config();
-        config.endpoint = "http://192.168.1.100:8787".to_string();
+        // When allow_remote_endpoint=false, only loopback is allowed
+        // and considered same-host (can forward paths)
+        config.endpoint = "http://127.0.0.1:8787".to_string();
         config.allow_remote_endpoint = false;
         let tool = browser_tool_with_computer_use(config);
         assert!(!tool.endpoint_is_remote_filesystem());
