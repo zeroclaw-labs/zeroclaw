@@ -4,8 +4,16 @@ fluent = "run --release -p xtask --bin fluent --"
 web = "run --release -p xtask --bin web --"
 generate = "run --release -p xtask --bin generate --"
 
+# `[build] rustdocflags` reaches `cargo test --doc`. Under Rust 1.96+ the
+# stricter rustdoc argument parser rejects a duplicate `--default-theme` with
+# `Option 'default-theme' given more than once`. The docs-site rustdoc theme
+# is owned by `xtask::mdbook::refs::build_api` and `docs-deploy.yml`, not here.
+# A follow-up will remove this line and migrate any other non-rustdoc flags
+# (e.g. `--cfg=docsrs`) to the appropriate call sites.
+#
+# Refs: issue #8847, PR #8874
 [build]
-rustdocflags = ["--default-theme=ayu"]
+rustdocflags = []
 
 [target.x86_64-unknown-linux-musl]
 rustflags = ["-C", "link-arg=-static"]
