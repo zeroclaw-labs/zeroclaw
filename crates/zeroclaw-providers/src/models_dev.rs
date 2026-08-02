@@ -30,6 +30,8 @@ struct ModelEntry {
     /// dropped during deserialization; per-model vision support is now
     /// resolved through this field.
     #[serde(default)]
+    #[allow(dead_code)]
+    // TODO: wire into provider.capabilities() and orchestrator supports_vision() call site (follow-up work)
     modalities: Option<Modalities>,
 }
 
@@ -69,6 +71,7 @@ impl Modalities {
     /// an explicit `"image"` token in `input` flips it on. Malformed
     /// catalog entries (missing `modalities` or empty `input`) yield
     /// `false`; callers fall back to the family default in that case.
+    #[allow(dead_code)] // TODO: wire into provider.capabilities() and orchestrator supports_vision() call site (follow-up work)
     fn supports_image_input(&self) -> bool {
         self.input.iter().any(|m| m == "image")
     }
@@ -166,7 +169,7 @@ pub async fn list_models_with_context_for(
 /// Pure / sync / no network. This is the parser half of the modalities work;
 /// wiring the result into `provider.capabilities()` and the orchestrator
 /// `supports_vision()` call site is a separate follow-up change.
-#[allow(dead_code)] // TODO: wire into provider.capabilities() and orchestrator supports_vision() call site (follow-up for #8733)
+#[allow(dead_code)] // TODO: wire into provider.capabilities() and orchestrator supports_vision() call site (follow-up work)
 pub(crate) fn model_supports_vision(
     catalog: &Catalog,
     provider_key: &str,
