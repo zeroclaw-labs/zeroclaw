@@ -3,6 +3,7 @@
 use crate::helpers::domain_guard;
 use anyhow::Context;
 use async_trait::async_trait;
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::net::ToSocketAddrs;
@@ -816,7 +817,6 @@ impl BrowserTool {
     /// 5. `symlink_metadata` — rejects existing symlink targets
     ///
     /// Replaces the raw path with the canonical target so backends write the checked string.
-    #[allow(dead_code)] // Used only in tests, but that's intentional for coverage
     async fn validate_screenshot_path(&self, action: &mut BrowserAction) -> anyhow::Result<()> {
         let BrowserAction::Screenshot { path, .. } = action else {
             return Ok(());
@@ -899,27 +899,43 @@ impl BrowserTool {
         Ok(())
     }
 
-    /// Returns `true` if the ComputerUse sidecar is on a different filesystem
-    /// than the ZeroClaw daemon. Private-network endpoints (RFC1918) are
-    /// considered different-host unless they are provably loopback.
-    #[allow(dead_code)] // Used only in tests, but that's intentional for coverage
-    fn endpoint_is_different_filesystem(&self) -> bool {
+    /// Returns `true` if the ComputerUse sidecar endpoint is a remote/private-network address.
+    /// This is used to reject screenshot paths when the sidecar is on a different filesystem.
+    ///
+    /// When `allow_remote_endpoint=false`, only loopback is allowed and considered same-host.
+    /// When `allow_remote_endpoint=true`, loopback is same-host, all others are different-host.
+    ///
+    /// Loopback (127.0.0.1, ::1, localhost) are considered same-host.
+    /// All other addresses (RFC1918 private, public) are considered different-host,
+    /// meaning we cannot safely forward filesystem paths.
+    fn endpoint_is_remote_filesystem(&self) -> bool {
+        // If remote endpoints are disabled, only loopback is allowed
+        // and we consider it same-host (can forward paths)
         if !self.computer_use.allow_remote_endpoint {
-            return false;
-        }
-        match reqwest::Url::parse(&self.computer_use.endpoint) {
-            Ok(parsed) => match parsed.host_str() {
-                Some(host) => {
-                    // Loopback addresses are same-host
-                    if host == "127.0.0.1" || host == "::1" || host == "localhost" {
-                        return false;
+            // Even if disabled, check if it's loopback
+            match reqwest::Url::parse(&self.computer_use.endpoint) {
+                Ok(parsed) => match parsed.host_str() {
+                    Some(host) => host != "127.0.0.1" && host != "::1" && host != "localhost",
+                    None => true, // Unparseable → different-host
+                },
+                Err(_) => true, // Unparseable → different-host
+            }
+        } else {
+            // Remote endpoints allowed - only loopback is same-host
+            match reqwest::Url::parse(&self.computer_use.endpoint) {
+                Ok(parsed) => match parsed.host_str() {
+                    Some(host) => {
+                        // Loopback addresses are same-host - safe to forward paths
+                        if host == "127.0.0.1" || host == "::1" || host == "localhost" {
+                            return false;
+                        }
+                        // All other addresses are different-host - cannot forward paths
+                        true
                     }
-                    // All other addresses (including RFC1918 private) are different-host
-                    true
-                }
-                None => true, // Unparseable → conservative fallback
-            },
-            Err(_) => true, // Unparseable → conservative fallback
+                    None => true, // Unparseable → different-host
+                },
+                Err(_) => true, // Unparseable → different-host
+            }
         }
     }
 
@@ -993,6 +1009,16 @@ impl BrowserTool {
                 let mut args = args;
                 let path_str = path.as_ref().unwrap().as_str().unwrap();
 
+                // Reject paths when sidecar is on a remote filesystem
+                // We cannot safely forward filesystem paths to remote sidecars
+                if self.endpoint_is_remote_filesystem() {
+                    let msg = crate::i18n::get_required_tool_string_with_args(
+                        "tool-browser-screenshot-error-remote-sidecar-path",
+                        &[("endpoint", &self.computer_use.endpoint)],
+                    );
+                    anyhow::bail!("{msg}");
+                }
+
                 // String-level reject
                 if !self.security.is_path_allowed(path_str) {
                     let msg = crate::i18n::get_required_tool_string_with_args(
@@ -1057,7 +1083,8 @@ impl BrowserTool {
                     anyhow::bail!("{msg}");
                 }
 
-                // Replace with canonical target
+                // Store the validated path for local write after sidecar returns PNG
+                // Do NOT forward the path to the sidecar - it returns PNG bytes
                 if let Some(obj) = args.as_object_mut() {
                     obj.insert(
                         "path".to_string(),
@@ -1084,22 +1111,45 @@ impl BrowserTool {
     ) -> anyhow::Result<ToolResult> {
         let endpoint = self.computer_use_endpoint_url()?;
 
-        // Validate screenshot path before forwarding to sidecar
-        let screenshot_args = if action == "screenshot" {
-            self.validate_screenshot_path_for_computer_use(action, args.clone())
-                .await?
+        // Validate screenshot path but do NOT forward it to the sidecar.
+        // The sidecar returns PNG bytes, and we perform the validated local write.
+        let validated_path = if action == "screenshot" {
+            match self
+                .validate_screenshot_path_for_computer_use(action, args.clone())
+                .await
+            {
+                Ok(validated_args) => {
+                    // Extract the validated path from the returned args
+                    validated_args
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                }
+                Err(e) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(e.to_string()),
+                    });
+                }
+            }
         } else {
-            args.clone()
+            None
         };
-        let mut params = screenshot_args.as_object().cloned().ok_or_else(|| {
+
+        // Build params without the path - sidecar should return PNG bytes
+        let mut params = args.as_object().cloned().ok_or_else(|| {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                "browser: validated screenshot args must be a JSON object"
+                "browser: screenshot args must be a JSON object"
             );
-            anyhow::Error::msg("validated screenshot args must be a JSON object")
+            anyhow::Error::msg("screenshot args must be a JSON object")
         })?;
+
+        // Remove path from params - we'll handle the write locally after validation
+        params.remove("path");
         params.remove("action");
 
         self.validate_computer_use_action(action, &params)?;
@@ -1148,6 +1198,45 @@ impl BrowserTool {
 
         if let Ok(parsed) = serde_json::from_str::<ComputerUseResponse>(&body) {
             if status.is_success() && parsed.success.unwrap_or(true) {
+                // If this was a screenshot with a validated path, write the PNG locally
+                if action == "screenshot"
+                    && let Some(path_str) = validated_path.as_deref()
+                {
+                    // Extract PNG data from the response
+                    let png_data = parsed
+                        .data
+                        .as_ref()
+                        .and_then(|d| d.get("png_base64"))
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            anyhow::Error::msg("computer-use sidecar did not return PNG data")
+                        })?;
+
+                    // Decode and write the screenshot
+                    let png_bytes = base64::engine::general_purpose::STANDARD
+                        .decode(png_data)
+                        .with_context(|| "Failed to decode PNG base64 data")?;
+
+                    tokio::fs::write(path_str, &png_bytes)
+                        .await
+                        .with_context(|| format!("Failed to write screenshot to {path_str}"))?;
+
+                    // Return success with the path information
+                    let output = serde_json::to_string_pretty(&json!({
+                        "backend": "computer_use",
+                        "action": action,
+                        "path": path_str,
+                        "bytes": png_bytes.len(),
+                    }))
+                    .unwrap_or_default();
+
+                    return Ok(ToolResult {
+                        success: true,
+                        output: output.into(),
+                        error: None,
+                    });
+                }
+
                 let output = parsed
                     .data
                     .map(|data| serde_json::to_string_pretty(&data).unwrap_or_default())
@@ -1204,9 +1293,14 @@ impl BrowserTool {
 
     async fn execute_action(
         &self,
-        action: BrowserAction,
+        mut action: BrowserAction,
         backend: ResolvedBackend,
     ) -> anyhow::Result<ToolResult> {
+        // Validate screenshot path before any backend writes a file
+        if matches!(action, BrowserAction::Screenshot { .. }) {
+            self.validate_screenshot_path(&mut action).await?;
+        }
+
         match backend {
             ResolvedBackend::AgentBrowser => self.execute_agent_browser_action(action).await,
             ResolvedBackend::RustNative => self.execute_rust_native_action(action).await,
@@ -3580,7 +3674,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        // Mock the POST endpoint - should NOT be called because endpoint_is_different_filesystem rejects
+        // Mock the POST endpoint - should NOT be called because endpoint_is_remote_filesystem rejects
         Mock::given(method("POST"))
             .and(path("/"))
             .respond_with(ResponseTemplate::new(200))
@@ -3590,7 +3684,7 @@ mod tests {
 
         // Setup: use the mock server URI but pretend it's a remote endpoint
         let mut config = test_computer_use_config();
-        // Replace 127.0.0.1 with a public-looking hostname to trigger endpoint_is_different_filesystem
+        // Replace 127.0.0.1 with a public-looking hostname to trigger endpoint_is_remote_filesystem
         let server_uri = server.uri();
         config.endpoint = server_uri.replace("127.0.0.1", "example.com");
         config.allow_remote_endpoint = true;
@@ -3724,29 +3818,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn endpoint_is_different_filesystem_loopback_is_false() {
+    async fn endpoint_is_remote_filesystem_loopback_is_false() {
         let mut config = test_computer_use_config();
         config.endpoint = "http://127.0.0.1:8787".to_string();
         config.allow_remote_endpoint = true;
         let tool = browser_tool_with_computer_use(config);
-        assert!(!tool.endpoint_is_different_filesystem());
+        assert!(!tool.endpoint_is_remote_filesystem());
     }
 
     #[tokio::test]
-    async fn endpoint_is_different_filesystem_private_network_is_true() {
+    async fn endpoint_is_remote_filesystem_private_network_is_true() {
         let mut config = test_computer_use_config();
         config.endpoint = "http://192.168.1.100:8787".to_string();
         config.allow_remote_endpoint = true;
         let tool = browser_tool_with_computer_use(config);
-        assert!(tool.endpoint_is_different_filesystem());
+        assert!(tool.endpoint_is_remote_filesystem());
     }
 
     #[tokio::test]
-    async fn endpoint_is_different_filesystem_remote_endpoint_disabled_is_false() {
+    async fn endpoint_is_remote_filesystem_remote_endpoint_disabled_is_false() {
         let mut config = test_computer_use_config();
         config.endpoint = "http://192.168.1.100:8787".to_string();
         config.allow_remote_endpoint = false;
         let tool = browser_tool_with_computer_use(config);
-        assert!(!tool.endpoint_is_different_filesystem());
+        assert!(!tool.endpoint_is_remote_filesystem());
     }
 }

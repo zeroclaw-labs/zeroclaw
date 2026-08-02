@@ -156,6 +156,7 @@ tool-browser-screenshot-error-missing-filename = Screenshot path '{ $path }' is 
 tool-browser-screenshot-error-runtime-config-target = Cannot write screenshot to runtime config path '{ $target }'
 tool-browser-screenshot-error-symlink-target = Cannot write screenshot to symlink target '{ $target }'
 tool-browser-screenshot-error-computeruse-non-string-path = Screenshot 'path' parameter must be a string, got { $path }
+tool-browser-screenshot-error-remote-sidecar-path = Cannot forward screenshot path to remote sidecar at '{ $endpoint }' - sidecar must be on same filesystem for path validation
 
 tool-security-ops = Security operations tool for managed cybersecurity services. Actions: triage_alert (classify/prioritize alerts), run_playbook (execute incident response steps), parse_vulnerability (parse scan results), generate_report (create security posture reports), list_playbooks (list available playbooks), alert_stats (summarize alert metrics).
 
