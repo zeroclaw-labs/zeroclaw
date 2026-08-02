@@ -1,13 +1,5 @@
 //! GitHub payload → [`GitEvent`] normalization, plus the GitHub reaction
 //! map.
-//!
-//! Layer: provider mapping. This is the only place GitHub's REST shapes
-//! ([`super::payloads`]) meet the generic event model
-//! ([`crate::git::events`]): every constructor produces the same
-//! [`GitEvent`] a different transport would, so cross-transport dedup is a
-//! plain id match. The id space is shared where GitHub shares it (comment,
-//! issue, run, release ids), `owner/repo#number` where it isn't (PRs).
-//! No IO — every function here is fixture-testable.
 
 use super::payloads::{
     GhComment, GhIssue, GhPull, GhRelease, GhRepoEvent, GhReviewComment, GhUser, GhWorkflowRun,
@@ -141,11 +133,6 @@ pub fn from_release(release: &GhRelease, repo: &RepoRef) -> Option<GitEvent> {
     }))
 }
 
-/// One repository-feed entry (Tier C backbone). `None` for feed
-/// types/actions outside the supported set and for entries whose trimmed
-/// payload is missing the embedded object. Workflow runs never appear
-/// here — the Events API carries no Actions events (which is why the
-/// dedicated runs endpoint stays on regardless of this transport).
 pub fn from_repo_event(event: &GhRepoEvent, repo: &RepoRef) -> Option<GitEvent> {
     fn embedded<T: serde::de::DeserializeOwned>(
         payload: &serde_json::Value,

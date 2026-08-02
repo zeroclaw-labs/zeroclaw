@@ -26,6 +26,7 @@ A `[peer_groups.<name>]` block carries:
 | `external_peers` | Non-agent members by the channel's native username/ID. `["*"]` accepts anyone; empty accepts no one. |
 | `ignore` | Per-group blocklist; subtracts from the resolved peer set. |
 | `output_modality` | Preferred reply modality for the group: `mirror` (input-driven, default), `voice` (always reply and deliver proactive messages as TTS notes on audio-capable channels), or `text` (always text). |
+| `admin_for_agent_scope` | When `true`, the group's `external_peers` are authorized to issue `/model --agent <model>` on the bound agent. Default `false` (deny-by-default). See [Admin agent-scope authorization](#admin-agent-scope-authorization). |
 
 ## Resolution
 
@@ -45,3 +46,31 @@ channel page states the identifier shape it expects.
 
 Each channel page shows the directive form with that channel's sender-identifier
 shape.
+
+## Admin agent-scope authorization
+
+`admin_for_agent_scope = true` extends the group's privilege boundary: in
+addition to being a routable peer, each `external_peers` member is allowed
+to issue `/model --agent <model>` on the bound agent, i.e. switch the
+agent's *binding* to a model other than the default. The flag is
+deny-by-default: every group without it explicitly set to `true` denies the
+capability, including groups with non-empty `external_peers`. `/model
+--user <model>` (session-only override, no agent re-binding) is **not**
+gated by this flag and is available to every accepted peer.
+
+The orchestrator resolves the authorized admin set live from
+`Config::channel_agent_scope_admins`, but the dispatch gate reads through
+the **config snapshot** the runtime was started with. Operator edits to
+`admin_for_agent_scope` (or to a group's `external_peers` / `channel` /
+`agents`) therefore take effect on the **next daemon restart**, not on
+the running process. Flipping the flag on a live daemon will not, on its
+own, authorize any new senders within the current session.
+
+This is deliberate: authorization is computed against the
+immutable-on-startup config, so a peer who is *added* to an admin group
+mid-flight cannot escalate within the current process lifetime. The set
+is re-resolved only on a full config reload, which is itself a restart
+path. If a `/model --agent` invocation reports "not authorized" for a
+sender you expected to be in scope, restart the daemon after editing
+`admin_for_agent_scope` and re-issue the command from a fresh client
+session before drawing further conclusions.

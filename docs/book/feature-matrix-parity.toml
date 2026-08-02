@@ -1,0 +1,507 @@
+# Parity data for the ZeroClaw / OpenClaw / Hermes comparison columns of the
+# feature-and-support matrix. The ZeroClaw column is NOT here: it is walked from
+# the code registries at generation time. This file carries only the two
+# external columns the binary has no knowledge of.
+#
+# Regenerate the page with `cargo xtask mdbook build` (or `serve`), which walks
+# the code registries and rewrites the gitignored feature-matrix snippets before
+# mdBook renders. There is no separate drift-check command: a parity key here
+# that the source walk no longer produces is a hard error that fails the docs
+# build, and that build runs in CI. A walked ZeroClaw row with no entry here
+# renders `Unknown` in the external columns; fill it in as parity is confirmed.
+#
+# Status vocabulary matches the page legend: supported | partial | experimental
+# | planned | none | unknown.
+#
+# Sources (source-walked from the upstream repositories, checked 2026-07-06).
+# The @ <sha> is the exact clone HEAD each column was walked against, so the next
+# re-walk diffs a fixed commit instead of re-verifying every slot from scratch.
+#   OpenClaw: https://github.com/openclaw/openclaw
+#     @ 5aa7c6267cc06bd5e33679c4f6845046a677cbb5
+#     channels  -> extensions/ platform plugins + src/channels/
+#     providers -> extensions/ provider plugins (litellm gateway for custom)
+#     tools     -> extensions/openshell + src/ file/glob/ripgrep tooling
+#   Hermes:   https://github.com/NousResearch/hermes-agent
+#     @ 7426c09beee73bdff94d916015bac71384f6bc92
+#     channels  -> plugins/platforms/ + gateway/platforms/
+#     providers -> agent/*_adapter.py + website/docs/integrations/providers.md
+#     tools     -> tools/ (file_operations, shell/bash, grep, search_files)
+# A cell is `supported` when the upstream tree ships a first-class module for it,
+# `none` when the tree has no equivalent, and `partial` where support is indirect
+# (e.g. reachable only through a generic gateway rather than a dedicated module).
+# A cell is `planned` when the tree has no module yet but an open upstream feature
+# request tracks it (checked against each repo's issue tracker on 2026-07-06).
+
+# ── Channels ────────────────────────────────────────────────────────────────
+
+[channels.telegram]
+openclaw = "supported"
+hermes = "supported"
+
+[channels.discord]
+openclaw = "supported"
+hermes = "supported"
+
+[channels.slack]
+openclaw = "supported"
+hermes = "supported"
+
+[channels.mattermost]
+openclaw = "supported"
+hermes = "supported"
+
+[channels.imessage]
+openclaw = "supported"
+hermes = "supported"
+
+[channels.matrix]
+openclaw = "supported"
+hermes = "supported"
+
+[channels.signal]
+openclaw = "supported"
+hermes = "supported"
+
+[channels.whatsapp]
+openclaw = "supported"
+hermes = "supported"
+
+[channels.whatsapp-web]
+openclaw = "supported"
+hermes = "supported"
+
+[channels.linq]
+openclaw = "none"
+hermes = "none"
+
+[channels.wati]
+openclaw = "none"
+hermes = "none"
+
+[channels.nextcloud]
+openclaw = "supported"
+hermes = "none"
+
+[channels.email]
+openclaw = "none"
+hermes = "supported"
+
+[channels.gmail-push]
+openclaw = "none"
+hermes = "none"
+
+[channels.twitch]
+openclaw = "supported"
+hermes = "none"
+
+[channels.irc]
+openclaw = "supported"
+hermes = "supported"
+
+[channels.lark]
+openclaw = "supported"
+hermes = "supported"
+
+[channels.dingtalk]
+openclaw = "none"
+hermes = "supported"
+
+[channels.wecom]
+openclaw = "none"
+hermes = "supported"
+
+[channels.wecom-ws]
+openclaw = "none"
+hermes = "supported"
+
+[channels.wechat]
+openclaw = "none"
+hermes = "supported"
+
+[channels.qq]
+openclaw = "supported"
+hermes = "supported"
+
+[channels.nostr]
+openclaw = "supported"
+hermes = "none"
+
+[channels.clawdtalk]
+openclaw = "none"
+hermes = "none"
+
+[channels.reddit]
+openclaw = "none"
+hermes = "none"
+
+[channels.bluesky]
+openclaw = "none"
+hermes = "none"
+
+[channels.twitter]
+openclaw = "none"
+hermes = "none"
+
+[channels.mochat]
+openclaw = "none"
+hermes = "none"
+
+[channels.line]
+openclaw = "supported"
+hermes = "supported"
+
+[channels.voice-call]
+openclaw = "supported"
+hermes = "none"
+
+[channels.voice-wake]
+openclaw = "none"
+hermes = "none"
+
+[channels.mqtt]
+openclaw = "none"
+hermes = "none"
+
+[channels.amqp]
+openclaw = "none"
+hermes = "none"
+
+[channels.filesystem]
+openclaw = "none"
+hermes = "none"
+
+[channels.webhook]
+openclaw = "supported"
+hermes = "supported"
+
+# ── Provider slots ──────────────────────────────────────────────────────────
+# Source-walked from each upstream tree: OpenClaw extensions/ provider plugins
+# (litellm covers the custom passthrough), Hermes agent adapters + the
+# providers.md first-class list + hermes_cli model-setup provider branches. A
+# slot with no dedicated upstream module is `none`, not a guess.
+
+[providers.openai]
+openclaw = "supported"
+hermes = "supported"
+
+[providers.azure]
+openclaw = "supported"
+hermes = "supported"
+
+[providers.anthropic]
+openclaw = "supported"
+hermes = "supported"
+
+[providers.moonshot]
+openclaw = "supported"
+hermes = "supported"
+
+[providers.qwen]
+openclaw = "supported"
+hermes = "supported"
+
+[providers.glm]
+openclaw = "supported"
+hermes = "supported"
+
+[providers.minimax]
+openclaw = "supported"
+hermes = "supported"
+
+[providers.zai]
+openclaw = "supported"
+hermes = "supported"
+
+[providers.doubao]
+openclaw = "supported"
+hermes = "planned"
+
+[providers.yi]
+openclaw = "none"
+hermes = "none"
+
+[providers.hunyuan]
+openclaw = "none"
+hermes = "none"
+
+[providers.qianfan]
+openclaw = "supported"
+hermes = "none"
+
+[providers.baichuan]
+openclaw = "none"
+hermes = "none"
+
+[providers.openrouter]
+openclaw = "supported"
+hermes = "supported"
+
+[providers.ollama]
+openclaw = "supported"
+hermes = "supported"
+
+[providers.gemini]
+openclaw = "supported"
+hermes = "supported"
+
+[providers.gemini_cli]
+openclaw = "supported"
+hermes = "none"
+
+[providers.bedrock]
+openclaw = "supported"
+hermes = "supported"
+
+[providers.telnyx]
+openclaw = "none"
+hermes = "none"
+
+[providers.together]
+openclaw = "supported"
+hermes = "supported"
+
+[providers.fireworks]
+openclaw = "supported"
+hermes = "supported"
+
+[providers.groq]
+openclaw = "supported"
+hermes = "supported"
+
+[providers.mistral]
+openclaw = "supported"
+hermes = "supported"
+
+[providers.deepseek]
+openclaw = "supported"
+hermes = "supported"
+
+[providers.atomic_chat]
+openclaw = "none"
+hermes = "none"
+
+[providers.cohere]
+openclaw = "supported"
+hermes = "supported"
+
+[providers.perplexity]
+openclaw = "none"
+hermes = "supported"
+
+[providers.xai]
+openclaw = "supported"
+hermes = "supported"
+
+[providers.cerebras]
+openclaw = "supported"
+hermes = "supported"
+
+[providers.sambanova]
+openclaw = "none"
+hermes = "none"
+
+[providers.hyperbolic]
+openclaw = "none"
+hermes = "none"
+
+[providers.deepinfra]
+openclaw = "supported"
+hermes = "planned"
+
+[providers.huggingface]
+openclaw = "supported"
+hermes = "supported"
+
+[providers.ai21]
+openclaw = "none"
+hermes = "none"
+
+[providers.reka]
+openclaw = "none"
+hermes = "none"
+
+[providers.baseten]
+openclaw = "none"
+hermes = "none"
+
+[providers.nscale]
+openclaw = "none"
+hermes = "none"
+
+[providers.anyscale]
+openclaw = "none"
+hermes = "none"
+
+[providers.nebius]
+openclaw = "none"
+hermes = "none"
+
+[providers.friendli]
+openclaw = "none"
+hermes = "none"
+
+[providers.stepfun]
+openclaw = "supported"
+hermes = "supported"
+
+[providers.aihubmix]
+openclaw = "none"
+hermes = "none"
+
+[providers.siliconflow]
+openclaw = "none"
+hermes = "none"
+
+[providers.astrai]
+openclaw = "none"
+hermes = "none"
+
+[providers.avian]
+openclaw = "none"
+hermes = "none"
+
+[providers.deepmyst]
+openclaw = "none"
+hermes = "none"
+
+[providers.venice]
+openclaw = "supported"
+hermes = "planned"
+
+[providers.nearai]
+openclaw = "none"
+hermes = "none"
+
+[providers.novita]
+openclaw = "supported"
+hermes = "supported"
+
+[providers.nvidia]
+openclaw = "supported"
+hermes = "supported"
+
+[providers.vercel]
+openclaw = "supported"
+hermes = "none"
+
+[providers.cloudflare]
+openclaw = "supported"
+hermes = "planned"
+
+[providers.ovh]
+openclaw = "none"
+hermes = "none"
+
+[providers.copilot]
+openclaw = "supported"
+hermes = "supported"
+
+[providers.lmstudio]
+openclaw = "supported"
+hermes = "supported"
+
+[providers.llamacpp]
+openclaw = "supported"
+hermes = "none"
+
+[providers.sglang]
+openclaw = "supported"
+hermes = "none"
+
+[providers.vllm]
+openclaw = "supported"
+hermes = "planned"
+
+[providers.osaurus]
+openclaw = "none"
+hermes = "none"
+
+[providers.litellm]
+openclaw = "supported"
+hermes = "planned"
+
+[providers.lepton]
+openclaw = "none"
+hermes = "none"
+
+[providers.manifest]
+openclaw = "none"
+hermes = "none"
+
+[providers.morph]
+openclaw = "none"
+hermes = "none"
+
+[providers.github_models]
+openclaw = "none"
+hermes = "none"
+
+[providers.upstage]
+openclaw = "none"
+hermes = "none"
+
+[providers.featherless]
+openclaw = "none"
+hermes = "none"
+
+[providers.arcee]
+openclaw = "supported"
+hermes = "supported"
+
+[providers.lambda_ai]
+openclaw = "none"
+hermes = "none"
+
+[providers.inception]
+openclaw = "none"
+hermes = "none"
+
+[providers.synthetic]
+openclaw = "supported"
+hermes = "none"
+
+[providers.opencode]
+openclaw = "supported"
+hermes = "none"
+
+[providers.kilocli]
+openclaw = "supported"
+hermes = "none"
+
+[providers.kilo]
+openclaw = "supported"
+hermes = "none"
+
+[providers.custom]
+openclaw = "supported"
+hermes = "supported"
+
+# ── Default tools ───────────────────────────────────────────────────────────
+# The six default tools are generic runtime capability. Both trees ship
+# equivalents: OpenClaw via the openshell extension plus src/ file and
+# glob/ripgrep tooling; Hermes via tools/ (file_operations, shell/bash, grep,
+# search_files). Mapped by capability, not by identical tool name.
+
+[tools.shell]
+openclaw = "supported"
+hermes = "supported"
+
+[tools.file_read]
+openclaw = "supported"
+hermes = "supported"
+
+[tools.file_write]
+openclaw = "supported"
+hermes = "supported"
+
+[tools.file_edit]
+openclaw = "supported"
+hermes = "supported"
+
+[tools.glob_search]
+openclaw = "supported"
+hermes = "supported"
+
+[tools.content_search]
+openclaw = "supported"
+hermes = "supported"

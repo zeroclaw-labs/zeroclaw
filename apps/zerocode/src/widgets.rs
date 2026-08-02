@@ -1,14 +1,5 @@
 #![allow(dead_code)]
 
-/// A single help entry: one or more keys that trigger the same action.
-///
-/// The renderer joins keys with " / " so you don't have to format manually.
-/// An entry with all-empty keys/action renders as a blank spacer row.
-///
-/// Keys are owned `String`s so callers can pass live chord displays resolved
-/// from the keymap (`Action::Variant.resolved()[..].display()`) instead of
-/// hardcoded literals — the help always reflects the actual bindings, including
-/// user overrides.
 #[derive(Debug, Clone, Default)]
 pub struct HelpEntry {
     /// Keys that trigger this action, e.g. ["↑", "k"]. Rendered labels,
@@ -60,21 +51,6 @@ impl HelpEntry {
     }
 }
 
-/// A node in the help context tree.
-///
-/// The help system cascades: Pane → Tab → Widget (or Screen → Tab → Widget
-/// for the config pane). Each level produces one `HelpNode`. The modal renders
-/// them depth-first:
-///
-///   [title]
-///   [description, soft-wrapped]
-///   key   action
-///   key   action
-///   ── dim separator ──
-///   [child title]
-///   ...
-///
-/// Any field may be empty/None — the renderer skips it cleanly.
 #[derive(Debug, Clone, Default)]
 pub struct HelpNode {
     /// Short label shown as a dim section header (e.g. "Tab", "Widget"). None = no header.
@@ -91,6 +67,14 @@ impl HelpNode {
     /// Leaf node with just keybindings.
     pub fn entries(entries: Vec<HelpEntry>) -> Self {
         Self {
+            entries,
+            ..Default::default()
+        }
+    }
+
+    pub fn titled(title: impl Into<String>, entries: Vec<HelpEntry>) -> Self {
+        Self {
+            title: Some(title.into()),
             entries,
             ..Default::default()
         }
@@ -117,7 +101,6 @@ use ratatui::{
 };
 
 /// A one-row context-window usage bar.
-///
 /// Renders left-aligned into whatever `Rect` you hand it.
 /// Returns `None` from `widget()` when there is nothing to show.
 pub struct CtxBar {
@@ -309,12 +292,8 @@ use ratatui::{
     layout::Rect,
     widgets::{Block, Borders, Clear, List, ListItem, ListState},
 };
+use unicode_width::UnicodeWidthStr;
 
-/// A reusable centered modal list picker over a `Vec<String>`. Owns its items,
-/// cursor, and an optional title; renders a bordered, scrollable list with the
-/// highlighted row styled. The caller owns the state (see [`PickerState`]) and
-/// keys; this type is the renderer plus cursor-movement helpers so other
-/// surfaces can reuse it.
 pub struct PickerModal<'a> {
     title: &'a str,
     items: &'a [String],
@@ -339,10 +318,10 @@ impl<'a> PickerModal<'a> {
         // on the same rows the user sees.
         let longest = items
             .iter()
-            .map(|s| s.chars().count())
+            .map(|s| UnicodeWidthStr::width(s.as_str()))
             .max()
             .unwrap_or(0)
-            .max(title.chars().count());
+            .max(UnicodeWidthStr::width(title));
         let inner_w = longest + 2; // 1 col padding each side
         let box_w = (inner_w + 2).clamp(12, area.width as usize) as u16;
         let box_h = (items.len() + 2).clamp(3, area.height as usize) as u16;
@@ -494,6 +473,25 @@ mod info_bar_tests {
 #[cfg(test)]
 mod picker_tests {
     use super::*;
+
+    #[test]
+    fn area_for_uses_display_width_for_wide_items() {
+        let items = vec!["界界界界界界".to_string()];
+
+        let area = PickerModal::area_for("Pick", &items, Rect::new(0, 0, 80, 24)).unwrap();
+
+        assert_eq!(area.width, 16);
+    }
+
+    #[test]
+    fn area_for_uses_display_width_for_wide_title() {
+        let items = vec!["one".to_string()];
+
+        let area =
+            PickerModal::area_for("界界界界界界界", &items, Rect::new(0, 0, 80, 24)).unwrap();
+
+        assert_eq!(area.width, 18);
+    }
 
     #[test]
     fn new_defaults_to_first_when_no_default() {

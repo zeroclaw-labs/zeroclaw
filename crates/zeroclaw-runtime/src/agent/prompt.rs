@@ -11,12 +11,6 @@ use zeroclaw_config::schema::IdentityConfig;
 
 pub struct PromptContext<'a> {
     pub workspace_dir: &'a Path,
-    /// Per-agent persona workspace (where SOUL.md / IDENTITY.md / USER.md /
-    /// AGENTS.md live). Separate from `workspace_dir`, which is the security
-    /// sandbox root and can be overridden per session by an IDE-supplied cwd.
-    /// Channel-driven runs typically pass the same path for both; gateway and
-    /// ACP sessions pass the agent's own dir here while letting `workspace_dir`
-    /// follow the session cwd.
     pub agent_workspace_dir: &'a Path,
     pub model_name: &'a str,
     pub tools: &'a [Box<dyn Tool>],
@@ -30,7 +24,7 @@ pub struct PromptContext<'a> {
     /// Pre-rendered security policy summary for inclusion in the Safety
     /// prompt section.  When present, the LLM sees the concrete constraints
     /// (allowed commands, forbidden paths, autonomy level) so it can plan
-    /// tool calls without trial-and-error.  See issue #2404.
+    /// tool calls without trial-and-error.  See
     pub security_summary: Option<String>,
     /// Autonomy level from config. Controls whether the safety section
     /// includes "ask before acting" instructions. Full autonomy omits them

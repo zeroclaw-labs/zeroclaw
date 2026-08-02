@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::json;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::Config;
 
 /// Tool that lets the agent manage recurring and one-shot scheduled tasks.
@@ -198,7 +198,7 @@ impl Tool for ScheduleTool {
             }
             other => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Unknown action '{other}'. Use create/add/once/list/get/cancel/remove/pause/resume."
                 )),
@@ -212,7 +212,7 @@ impl ScheduleTool {
         if !self.config.scheduler.enabled {
             return Some(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "cron is disabled by config (scheduler.enabled=false); cannot perform '{action}'"
                 )),
@@ -222,7 +222,7 @@ impl ScheduleTool {
         if !self.security.can_act() {
             return Some(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Security policy: read-only mode, cannot perform '{action}'"
                 )),
@@ -232,7 +232,7 @@ impl ScheduleTool {
         if !self.security.record_action() {
             return Some(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Rate limit exceeded: action budget exhausted".to_string()),
             });
         }
@@ -245,7 +245,7 @@ impl ScheduleTool {
         if jobs.is_empty() {
             return Ok(ToolResult {
                 success: true,
-                output: "No scheduled jobs.".to_string(),
+                output: "No scheduled jobs.".to_string().into(),
                 error: None,
             });
         }
@@ -278,7 +278,7 @@ impl ScheduleTool {
 
         Ok(ToolResult {
             success: true,
-            output: format!("Scheduled jobs ({}):\n{}", lines.len(), lines.join("\n")),
+            output: format!("Scheduled jobs ({}):\n{}", lines.len(), lines.join("\n")).into(),
             error: None,
         })
     }
@@ -298,13 +298,13 @@ impl ScheduleTool {
                 });
                 Ok(ToolResult {
                     success: true,
-                    output: serde_json::to_string_pretty(&detail)?,
+                    output: serde_json::to_string_pretty(&detail)?.into(),
                     error: None,
                 })
             }
             Err(_) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Job '{id}' not found")),
             }),
         }
@@ -341,7 +341,7 @@ impl ScheduleTool {
                 if expression.is_none() || delay.is_some() || run_at.is_some() {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some("'add' requires 'expression' and forbids delay/run_at".into()),
                     });
                 }
@@ -350,14 +350,14 @@ impl ScheduleTool {
                 if expression.is_some() || (delay.is_none() && run_at.is_none()) {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some("'once' requires exactly one of 'delay' or 'run_at'".into()),
                     });
                 }
                 if delay.is_some() && run_at.is_some() {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some("'once' supports either delay or run_at, not both".into()),
                     });
                 }
@@ -370,7 +370,7 @@ impl ScheduleTool {
                 if count != 1 {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(
                             "Exactly one of 'expression', 'delay', or 'run_at' must be provided"
                                 .into(),
@@ -381,7 +381,7 @@ impl ScheduleTool {
         }
 
         // Enforce rate-limiting AFTER command/args validation so that invalid
-        // requests do not consume the action budget.  (Fixes #3699)
+        // requests do not consume the action budget.
         if let Some(blocked) = self.enforce_mutation_allowed(action) {
             return Ok(blocked);
         }
@@ -405,7 +405,7 @@ impl ScheduleTool {
                 Err(error) => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(error.to_string()),
                     });
                 }
@@ -418,7 +418,8 @@ impl ScheduleTool {
                     job.expression,
                     job.next_run.to_rfc3339(),
                     job.command
-                ),
+                )
+                .into(),
                 error: None,
             });
         }
@@ -435,7 +436,7 @@ impl ScheduleTool {
                 Err(error) => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(error.to_string()),
                     });
                 }
@@ -447,7 +448,8 @@ impl ScheduleTool {
                     job.id,
                     job.next_run.to_rfc3339(),
                     job.command
-                ),
+                )
+                .into(),
                 error: None,
             });
         }
@@ -488,7 +490,7 @@ impl ScheduleTool {
             Err(error) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(error.to_string()),
                 });
             }
@@ -500,7 +502,8 @@ impl ScheduleTool {
                 job.id,
                 job.next_run.to_rfc3339(),
                 job.command
-            ),
+            )
+            .into(),
             error: None,
         })
     }
@@ -509,12 +512,12 @@ impl ScheduleTool {
         match cron::remove_job(&self.config, id) {
             Ok(()) => ToolResult {
                 success: true,
-                output: format!("Cancelled job {id}"),
+                output: format!("Cancelled job {id}").into(),
                 error: None,
             },
             Err(error) => ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(error.to_string()),
             },
         }
@@ -531,15 +534,15 @@ impl ScheduleTool {
             Ok(_) => ToolResult {
                 success: true,
                 output: if pause {
-                    format!("Paused job {id}")
+                    format!("Paused job {id}").into()
                 } else {
-                    format!("Resumed job {id}")
+                    format!("Resumed job {id}").into()
                 },
                 error: None,
             },
             Err(error) => ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(error.to_string()),
             },
         }

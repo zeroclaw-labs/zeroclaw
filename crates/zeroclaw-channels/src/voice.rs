@@ -1,5 +1,4 @@
 //! Unified voice pipeline facade for channel code.
-//!
 //! This module keeps speech-to-text and text-to-speech wiring behind one
 //! small API without changing the existing managers or channel call sites.
 
@@ -10,11 +9,6 @@ use zeroclaw_config::schema::Config;
 use crate::transcription::TranscriptionManager;
 use crate::tts::TtsManager;
 
-/// Combined STT and TTS facade for an optional agent binding.
-///
-/// Both halves are optional. A pipeline can be constructed when neither
-/// `[transcription]` nor `[tts]` is enabled, and callers can inspect the
-/// availability helpers before invoking either side.
 pub struct VoicePipeline {
     stt: Option<TranscriptionManager>,
     tts: Option<TtsManager>,
@@ -26,11 +20,6 @@ impl VoicePipeline {
         Self::from_config_for_agent(config, None)
     }
 
-    /// Build a pipeline bound to a specific channel-owning agent.
-    ///
-    /// `agent_alias` should be the same owner a channel would pass to
-    /// [`TtsManager::from_config_for_agent`]. When it is `None`, the
-    /// pipeline falls back to [`Config::resolved_runtime_agent_alias`].
     pub fn from_config_for_agent(config: &Config, agent_alias: Option<&str>) -> Result<Self> {
         let stt = if config.transcription.enabled {
             Some(

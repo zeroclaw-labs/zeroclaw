@@ -2,11 +2,11 @@
 
 ZeroClaw has exactly one logging surface: the `zeroclaw_log::record!` macro. Every emission in the workspace, agent loop activity, channel I/O, cron runs, tool calls, memory ops, session lifecycle, errors, flows through it. The macro fires a `tracing` event that the installed subscriber feeds to two sibling layers: the stderr fmt layer (terminal output) and the `LogCaptureLayer`. The fmt layer prints colored, alias-prefixed lines on stderr (muted unless `--verbose`). The `LogCaptureLayer` materializes a structured `LogEvent` and fans it out, via `writer::record_event`, to:
 
-1. The Observer bridge (`observer_bridge::forward`) for Prometheus / OTel typed metrics.
-2. The process-wide broadcast channel so the dashboard's SSE stream sees every event live.
-3. The persisted JSONL log at `<workspace>/state/runtime-trace.jsonl` (when `[observability] log_persistence` is `"rolling"`, `"full"`, or `"rotating"`).
+1. The optional Observer bridge (`observer_bridge::forward`) for the subset of actions that map to typed Prometheus / OTel events, but only when a caller has installed a binding with `set_observer_bridge`. The current production bootstrap does not install one.
+2. The process-wide broadcast channel for live subscribers such as the dashboard's SSE stream.
+3. The asynchronous JSONL writer for `<workspace>/state/runtime-trace.jsonl` (when `[observability] log_persistence` is `"rolling"`, `"full"`, or `"rotating"`).
 
-The on-disk JSONL append happens last and only when persistence is enabled; the Observer bridge and broadcast hook fire unconditionally.
+When the Observer bridge is bound, its projection and the broadcast send happen before the persistence enqueue attempt. Those three destinations have different completeness and durability guarantees; sharing one `LogEvent` does not make them interchangeable.
 
 ## Read this first: attribution is not attrs
 
@@ -185,9 +185,9 @@ The layer in `crates/zeroclaw-log/src/layer.rs` is a `tracing-subscriber` Layer 
 1. On span creation/record with target `"zeroclaw_log_internal_attribution"` (the target the `attribution_span!` macro opens with): parses the role + alias fields into a `ZeroclawAttribution` snapshot stored on the span's extensions.
 2. On span creation/record with target `"zeroclaw_log_internal_scope"` (`scope!`-opened): parses ad-hoc kvps and stashes them similarly.
 3. On event emission with target `"zeroclaw_log_event"` (the target the `record!` macro fires through): builds a `LogEvent` from the `zc_*` field set, walks the span scope leaf→root merging every attribution snapshot it finds, parses the `zc_attrs` JSON blob into the event `attributes`, attaches `_file`/`_line` from auto-captured source location, and hands the final event to `writer::record_event`, which fans out in this order:
-   - Observer bridge (`observer_bridge.rs`) for Prometheus / OTel typed metrics (unconditional).
-   - Broadcast hook (`broadcast.rs`) for SSE/dashboard subscribers (unconditional).
-   - JSONL persistence (`writer.rs`), appended last and only when `log_persistence` is enabled.
+   - Observer bridge (`observer_bridge.rs`) for mapped Prometheus / OTel typed events when an Observer is bound.
+   - Broadcast hook (`broadcast.rs`) for current SSE/dashboard subscribers when a sender is installed.
+   - JSONL persistence (`writer.rs`), offered last to the asynchronous writer queue only when `log_persistence` is enabled.
 
 The on-disk JSON shape (`LogEvent` in `event.rs`):
 
@@ -198,7 +198,7 @@ The on-disk JSON shape (`LogEvent` in `event.rs`):
   "severity_number": 9,
   "severity_text": "INFO",
   "event": { "category": "channel", "action": "inbound", "outcome": "success" },
-  "service": { "name": "zeroclaw", "version": "0.8.2" },
+  "service": { "name": "zeroclaw", "version": "0.8.4" },
   "trace_id": "<turn id>",
   "span_id": "<sub-span id>",
   "zeroclaw": {
@@ -219,9 +219,57 @@ The on-disk JSON shape (`LogEvent` in `event.rs`):
 
 `@timestamp` is `chrono::DateTime<Utc>` serialized as RFC 3339 with `Z`. The schema version is `2`; older `version: 1` rows are migrated in place at daemon startup by `migrate::migrate_legacy_jsonl_in_place`.
 
+## Delivery surfaces have different guarantees
+
+`writer::record_event` builds the persisted value once, then derives the other deliveries from the same `LogEvent`. Each destination has a separate contract:
+
+| Destination | Owner | Contract and loss boundary |
+|---|---|---|
+| Optional typed Observer bridge | `observer_bridge.rs` | `forward` is a no-op until an Observer is explicitly bound, and the current production bootstrap does not bind one. When bound, it forwards synchronously but projects only actions recognized by `project`; the current mapping may omit actions or default fields. Treat it as a selective metrics/tracing projection, not a complete event ledger, and inspect `project` for the current field mapping. |
+| Live broadcast | `broadcast.rs` and its consumer | Sends the structured event to current in-process subscribers. A subscriber only sees events emitted after it subscribes, bounded receivers can lag, and the gateway SSE adapter skips lagged frames. Broadcast-only ephemeral attributes may appear in an authenticated live frame but are excluded from persisted JSONL. This is a live notification path, not replayable evidence. |
+| Persisted JSONL | `writer.rs` | Enqueues the serialized event without blocking the runtime. The bounded queue can drop an event when full, worker write failures are warnings, and periodic `sync_all` covers only the current active file. Daily rotation before a new UTC day's first append and size rotation after a threshold-crossing append can rename the active file without first syncing it, so the cadence does not bound durability for a just-rotated archive. Persistence mode then decides whether the active file is trimmed, retained indefinitely, or rotated. This is best-effort operational history, not a transactional audit log. |
+
+Do not use Observer output or SSE delivery to prove that every canonical event was retained. Conversely, do not assume a row absent from JSONL was never emitted: it may have reached live broadcast, and the Observer bridge when bound, before the persistence queue dropped or failed it.
+
+## Reader cursors belong to one active file
+
+`GET /api/logs` resolves the writer's current active path and calls `reader::load_page`. The reader scans that one JSONL file, keeps the newest matching window, and returns events newest first. It does not merge rotated archives.
+
+The primary pagination cursor is `next_cursor_line_offset`, the byte offset immediately after the oldest matching event on the current page. A caller passes it back as `until_line_offset`; the next scan stops before that line and returns older matches. Pure appends preserve the prefix addressed by an existing cursor, so later events do not disturb an in-progress walk.
+
+The offset is not a durable event identity or cross-file checkpoint. It becomes stale whenever the active file's bytes are replaced or its path changes:
+
+- `rolling` trim streams the retained tail to a temporary file and renames it over the active path.
+- `rotating` renames the active file to an archive; the next append creates a new active file.
+- schema migration rewrites the active file through a temporary file and atomic rename.
+- a daemon config reload can install a new persistence path.
+
+After one of those boundaries, restart pagination from the newest page. Reusing the old number can duplicate, skip, or return unrelated rows because the API does not attach file identity or generation metadata to the cursor. The legacy timestamp/ID cursor remains for compatibility but is deprecated under [#8012](https://github.com/zeroclaw-labs/zeroclaw/issues/8012) because lexicographic ID ordering can skip tied events.
+
+## Persistence policy owns rewrites and retention
+
+`StoragePolicy` in `config.rs` controls only the JSONL destination. Observer and broadcast delivery remain independent of it.
+
+| Policy | Active-file behavior | Retention owner |
+|---|---|---|
+| `none` | No new JSONL writes. | None. |
+| `rolling` | After an append exceeds `max_entries`, stream only the newest non-empty lines to a temporary file and rename it over the active file. | The writer keeps the configured active-window size. It creates no archives and leaves archives from an earlier `rotating` configuration unmanaged. |
+| `full` | Append without writer-managed trim or rotation. | The operator owns file growth and any external rotation. |
+| `rotating` | Before a new UTC day's first append, or after an append reaches the byte threshold, rename the active file to a timestamped archive. | After each successful rotation, the writer prunes matching archives by age and then count. Removal is best-effort and never fails the enclosing append. |
+
+Age and count retention run only after rotation. They do not sweep continuously, do not apply to `full` or `rolling`, and do not delete arbitrary neighboring files: archive discovery accepts only names generated from the active path's timestamped archive shape. The live `/api/logs` reader still sees only the active file; archives are offline diagnostic artifacts.
+
+## Schema migration is an active-file rewrite
+
+When persistence is enabled and the active path exists, `writer::init_from_config` runs `migrate::migrate_legacy_jsonl_in_place` before starting the disk worker. The migrator streams non-empty rows through a temporary file, converts legacy rows with `timestamp` but no `@timestamp`, preserves already-current rows, skips malformed JSON with a warning, syncs the temporary file, and atomically renames it over the active path.
+
+Migration is best-effort. Its cheap schema check stops at the first non-empty row. Migration runs when that row is malformed or has `timestamp` without `@timestamp`; any other parseable JSON is treated as current, even when it is an unknown or invalid schema, so later legacy rows can remain unmigrated. If migration returns an error, initialization warns and continues, so later v2 appends can coexist with old rows that the v2 reader cannot deserialize. Rotated archives are not migrated.
+
+`LogEvent` is the schema source of truth. For each schema change, assess migration compatibility, active-file deserialization, HTTP and RPC serialization/consumers, and the architecture and operator documentation; update only the boundaries whose behavior or compatibility changes. The RPC log surfaces live in `crates/zeroclaw-runtime/src/rpc/types.rs` and `dispatch.rs`. A migration that replaces the active file invalidates byte-offset cursors, while an additive compatible change that does not rewrite existing bytes does not.
+
 ## `LogConfig` vs `ObservabilityConfig`
 
-`zeroclaw-log` defines its own minimal `LogConfig` (in `crates/zeroclaw-log/src/config.rs`): `log_persistence`, `log_persistence_path`, `log_persistence_max_entries`, `log_persistence_max_bytes`, `log_persistence_rotate_daily`, `log_persistence_retention_max_files`, `log_persistence_retention_max_age_days`, `log_tool_io`, `log_tool_io_truncate_bytes`, `log_tool_io_denylist`. This breaks what would otherwise be a dep cycle: `zeroclaw-config::ObservabilityConfig` carries the full schema (with TOML deserialization and validation), and the runtime converts to `LogConfig` at startup via `crates/zeroclaw-runtime/src/observability/runtime_trace.rs::to_log_config`. The result: `zeroclaw-config` can `record!` without inverting the dep tree.
+`zeroclaw-log` defines its own minimal `LogConfig` (in `crates/zeroclaw-log/src/config.rs`): `log_persistence`, `log_persistence_path`, `log_persistence_max_entries`, `log_persistence_max_bytes`, `log_persistence_rotate_daily`, `log_persistence_retention_max_files`, `log_persistence_retention_max_age_days`, `log_tool_io`, `log_tool_io_truncate_bytes`, `log_tool_io_denylist`. This breaks what would otherwise be a dep cycle: `zeroclaw-config::ObservabilityConfig` carries the full schema (with TOML deserialization and validation), and the runtime converts to `LogConfig` at startup and after daemon config reload via `crates/zeroclaw-runtime/src/observability/runtime_trace.rs::to_log_config`. The result: `zeroclaw-config` can `record!` without inverting the dep tree, while log persistence and rotation policy changes still take effect on the next daemon reload.
 
 ## Subscriber installation
 

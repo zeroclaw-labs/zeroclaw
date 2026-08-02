@@ -1,8 +1,5 @@
 //! Reusable input bar widget with text editing, file attachments,
 //! file explorer, and clipboard paste support.
-//!
-//! Embedded by both Chat and ACP panes — each pane owns its own
-//! `InputBarState` instance with independent state.
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -18,7 +15,6 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
 };
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::attachment::PendingAttachment;
 use crate::clipboard;
@@ -32,12 +28,19 @@ use crate::turn_status::TurnStatus;
 /// Maximum number of visible content rows before the input bar scrolls.
 const MAX_INPUT_ROWS: u16 = 5;
 
+/// Maximum number of attachment rows visible in the manager before it scrolls.
+const MAX_ATTACHMENT_MANAGER_ROWS: usize = 8;
+
+const ATTACHMENT_REMOVE_LABEL: &str = "[×]";
+
 /// Slash commands available for auto-complete.
 const SLASH_COMMANDS: &[&str] = &[
     "/attach",
     "/attachments",
+    "/browse",
     "/clear-queue",
     "/detach",
+    "/help",
     "/model",
     "/model-provider",
     "/new",
@@ -77,6 +80,10 @@ pub(crate) enum InputBarAction {
     StatusMessage(String),
     /// User typed `/toggle-thinking` — parent should toggle thought visibility.
     ToggleThinking,
+    /// User typed `/browse` — parent should enter transcript browse mode.
+    EnterBrowseMode,
+    /// User typed `/help` — parent should open the app-level Help overlay.
+    OpenHelp,
     /// User chose a model directly (`/model <name>`) — parent applies it via
     /// `session/configure`.
     SetModel(String),
@@ -113,6 +120,8 @@ enum SlashCommand<'a> {
     /// `/model-provider` (no arg) — open the two-stage model_provider picker.
     ModelProviderPicker,
     RestartSession,
+    EnterBrowseMode,
+    OpenHelp,
     NotACommand,
 }
 
@@ -138,6 +147,10 @@ fn parse_slash_command(input: &str) -> SlashCommand<'_> {
         SlashCommand::RestartSession
     } else if trimmed == "/toggle-thinking" {
         SlashCommand::ToggleThinking
+    } else if trimmed == "/browse" {
+        SlashCommand::EnterBrowseMode
+    } else if trimmed == "/help" {
+        SlashCommand::OpenHelp
     } else if let Some(name) = trimmed.strip_prefix("/model-provider ") {
         let name = name.trim();
         if name.is_empty() {
@@ -170,12 +183,14 @@ struct VisualLine {
     width: u16,
 }
 
-fn char_cell_width(ch: char) -> u16 {
-    ch.width().and_then(|w| u16::try_from(w).ok()).unwrap_or(0)
+fn str_cell_width(text: &str) -> u16 {
+    crate::display_width::display_width(text)
+        .try_into()
+        .unwrap_or(u16::MAX)
 }
 
-fn str_cell_width(text: &str) -> u16 {
-    UnicodeWidthStr::width(text).try_into().unwrap_or(u16::MAX)
+fn grapheme_is_whitespace(grapheme: &str) -> bool {
+    grapheme.chars().next().is_some_and(char::is_whitespace)
 }
 
 fn push_hard_wrapped(
@@ -188,13 +203,16 @@ fn push_hard_wrapped(
     let mut line_start = start;
     let mut line_width = 0;
 
-    for (offset, ch) in text[start..end].char_indices() {
+    // Advance by grapheme so presentation sequences (e.g. ⚠️) stay one unit.
+    for (offset, grapheme, g_width_usize) in
+        crate::display_width::grapheme_widths(&text[start..end])
+    {
         let byte_idx = start + offset;
-        let ch_width = char_cell_width(ch);
-        if ch_width > width {
+        let g_width = u16::try_from(g_width_usize).unwrap_or(u16::MAX);
+        if g_width > width {
             continue;
         }
-        if line_width > 0 && line_width + ch_width > width {
+        if line_width > 0 && line_width + g_width > width {
             lines.push(VisualLine {
                 start: line_start,
                 end: byte_idx,
@@ -203,7 +221,9 @@ fn push_hard_wrapped(
             line_start = byte_idx;
             line_width = 0;
         }
-        line_width += ch_width;
+        // Silence unused-binding lint if grapheme is only needed for width.
+        let _ = grapheme;
+        line_width = line_width.saturating_add(g_width);
     }
 
     if line_start < end || line_width > 0 {
@@ -233,30 +253,29 @@ fn push_wrapped_physical_line(
 
     let mut line_start = start;
     let mut line_end = start;
-    let mut line_width = 0;
+    let mut line_width = 0u16;
     let mut pending_ws_start: Option<usize> = None;
     let mut pending_ws_end = start;
-    let mut pending_ws_width = 0;
+    let mut pending_ws_width = 0u16;
     let mut idx = start;
 
     while idx < end {
-        let Some(ch) = text[idx..end].chars().next() else {
+        let Some((_, first_grapheme, _)) =
+            crate::display_width::grapheme_widths(&text[idx..end]).next()
+        else {
             break;
         };
 
-        if ch.is_whitespace() {
+        if grapheme_is_whitespace(first_grapheme) {
             let ws_start = idx;
             let mut ws_end = idx;
-            let mut ws_width = 0;
-            while ws_end < end {
-                let Some(ws_ch) = text[ws_end..end].chars().next() else {
-                    break;
-                };
-                if !ws_ch.is_whitespace() {
+            let mut ws_width = 0u16;
+            for (off, g, w) in crate::display_width::grapheme_widths(&text[idx..end]) {
+                if !grapheme_is_whitespace(g) {
                     break;
                 }
-                ws_width += char_cell_width(ws_ch);
-                ws_end += ws_ch.len_utf8();
+                ws_width = ws_width.saturating_add(u16::try_from(w).unwrap_or(u16::MAX));
+                ws_end = idx + off + g.len();
             }
             pending_ws_start = Some(ws_start);
             pending_ws_end = ws_end;
@@ -267,16 +286,13 @@ fn push_wrapped_physical_line(
 
         let word_start = idx;
         let mut word_end = idx;
-        let mut word_width = 0;
-        while word_end < end {
-            let Some(word_ch) = text[word_end..end].chars().next() else {
-                break;
-            };
-            if word_ch.is_whitespace() {
+        let mut word_width = 0u16;
+        for (off, g, w) in crate::display_width::grapheme_widths(&text[idx..end]) {
+            if grapheme_is_whitespace(g) {
                 break;
             }
-            word_width += char_cell_width(word_ch);
-            word_end += word_ch.len_utf8();
+            word_width = word_width.saturating_add(u16::try_from(w).unwrap_or(u16::MAX));
+            word_end = idx + off + g.len();
         }
 
         if word_width > width {
@@ -316,7 +332,9 @@ fn push_wrapped_physical_line(
             }
         } else if line_width + pending_ws_width + word_width <= width {
             line_end = word_end;
-            line_width += pending_ws_width + word_width;
+            line_width = line_width
+                .saturating_add(pending_ws_width)
+                .saturating_add(word_width);
         } else {
             lines.push(VisualLine {
                 start: line_start,
@@ -470,12 +488,15 @@ fn visual_to_cursor(text: &str, target_row: u16, target_col: u16, width: u16) ->
         return text.len();
     };
 
-    let mut col = 0;
-    for (offset, ch) in text[line.start..line.end].char_indices() {
+    let mut col = 0u16;
+    for (offset, _grapheme, g_width_usize) in
+        crate::display_width::grapheme_widths(&text[line.start..line.end])
+    {
         if col >= target_col {
             return line.start + offset;
         }
-        col += char_cell_width(ch);
+        let g_width = u16::try_from(g_width_usize).unwrap_or(u16::MAX);
+        col = col.saturating_add(g_width);
         if col > target_col {
             return line.start + offset;
         }
@@ -487,6 +508,90 @@ fn visual_to_cursor(text: &str, target_row: u16, target_col: u16, width: u16) ->
     }
 }
 
+fn attachment_row_at(
+    area: Option<Rect>,
+    first_index: usize,
+    column: u16,
+    row: u16,
+) -> Option<usize> {
+    let area = area?;
+    if !mouse::in_rect(column, row, area) {
+        return None;
+    }
+    Some(first_index + usize::from(row - area.y))
+}
+
+fn attachment_remove_at(
+    area: Option<Rect>,
+    first_index: usize,
+    attachments: &[PendingAttachment],
+    column: u16,
+    row: u16,
+) -> Option<usize> {
+    let area = area?;
+    let index = attachment_row_at(Some(area), first_index, column, row)?;
+    let attachment = attachments.get(index)?;
+    let (_, remove_col) = attachment_line(index, &attachment.label(), area.width);
+    let remove_col = remove_col?;
+    let remove_width = crate::display_width::display_width(ATTACHMENT_REMOVE_LABEL) as u16;
+    let relative_col = column - area.x;
+    if relative_col < remove_col || relative_col >= remove_col + remove_width {
+        return None;
+    }
+    Some(index)
+}
+
+fn attachment_line(index: usize, label: &str, width: u16) -> (String, Option<u16>) {
+    let remove_width = crate::display_width::display_width(ATTACHMENT_REMOVE_LABEL) as u16;
+    if width < remove_width {
+        return (truncate_to_cells(label, width as usize), None);
+    }
+
+    let main_width = width - remove_width;
+    if main_width == 0 {
+        return (String::new(), Some(0));
+    }
+
+    let raw = format!(" [{index}] {label}");
+    let mut main = truncate_to_cells(&raw, main_width.saturating_sub(1) as usize);
+    main.push(' ');
+    let remove_col = crate::display_width::display_width(&main) as u16;
+    (main, Some(remove_col))
+}
+
+fn truncate_to_cells(text: &str, max_width: usize) -> String {
+    if crate::display_width::display_width(text) <= max_width {
+        return text.to_string();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+
+    let mut out = String::new();
+    let budget = max_width - 1;
+    let mut used = 0;
+    for (_, grapheme, width) in crate::display_width::grapheme_widths(text) {
+        if used + width > budget {
+            break;
+        }
+        out.push_str(grapheme);
+        used += width;
+    }
+    out.push('…');
+    out
+}
+
+fn attachment_manager_key_labels() -> (Vec<String>, Vec<String>, Vec<String>) {
+    use crate::keymap::{InputBarAction as Ib, ModalAction as M, action_key_labels};
+
+    let mut navigate = action_key_labels(M::Up);
+    navigate.extend(action_key_labels(M::Down));
+    let mut remove = action_key_labels(Ib::Backspace);
+    remove.push("Del".to_string());
+    let close = action_key_labels(M::Cancel);
+    (navigate, remove, close)
+}
+
 // ── State ────────────────────────────────────────────────────────
 
 /// Input bar state. Each pane (Chat, ACP) owns its own instance.
@@ -496,6 +601,10 @@ pub(crate) struct InputBarState {
     /// Byte offset of the editing cursor within `input`. Always on a char boundary.
     cursor: usize,
     pending_attachments: Vec<PendingAttachment>,
+    attachment_manager: Option<AttachmentManagerState>,
+    /// Latest composer and modal list geometry for mouse hit-testing.
+    last_attachment_area: Option<Rect>,
+    last_attachment_manager_area: Option<Rect>,
     file_explorer: Option<FileExplorerState>,
     clipboard_temps: Vec<PathBuf>,
 
@@ -550,12 +659,21 @@ enum AutocompleteTarget {
     ModelProviderArg,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct AttachmentManagerState {
+    selected: usize,
+    scroll: usize,
+}
+
 impl InputBarState {
     pub fn new() -> Self {
         Self {
             input: String::new(),
             cursor: 0,
             pending_attachments: Vec::new(),
+            attachment_manager: None,
+            last_attachment_area: None,
+            last_attachment_manager_area: None,
             file_explorer: None,
             clipboard_temps: Vec::new(),
             scroll_offset: 0,
@@ -598,14 +716,23 @@ impl InputBarState {
         &self.clipboard_temps
     }
 
+    #[cfg(test)]
+    pub fn attachment_area(&self) -> Option<Rect> {
+        self.last_attachment_area
+    }
+
     pub fn has_file_explorer(&self) -> bool {
         self.file_explorer.is_some()
     }
 
-    /// Whether the input bar is in text-input mode (input non-empty
-    /// or file explorer open). Used to suppress single-char keybindings.
+    pub fn has_attachment_manager(&self) -> bool {
+        self.attachment_manager.is_some()
+    }
+
+    /// Whether the input bar is in text-input mode (input non-empty or an
+    /// input-owned modal open). Used to suppress single-char keybindings.
     pub fn wants_text_input(&self) -> bool {
-        !self.input.is_empty() || self.file_explorer.is_some()
+        !self.input.is_empty() || self.file_explorer.is_some() || self.attachment_manager.is_some()
     }
 
     // ── Selection helpers ────────────────────────────────────
@@ -755,11 +882,6 @@ impl InputBarState {
         self.cursor = self.input.len();
     }
 
-    /// Enter pressed while the autocomplete popup is open: accept the
-    /// highlighted match. A command completion that still expects an argument
-    /// (`/model `, `/model-provider `) only fills the input so the user can keep
-    /// typing or pick from the argument popup; any other accepted completion is
-    /// a runnable line, so submit it in the same keystroke.
     fn accept_completion_on_submit(&mut self) -> InputBarAction {
         let Some(idx) = self.autocomplete_index else {
             return self.handle_enter();
@@ -901,6 +1023,7 @@ impl InputBarState {
         self.input = text;
         self.cursor = self.input.len();
         self.scroll_offset = 0;
+        self.attachment_manager = None;
         self.clear_selection();
         self.dismiss_autocomplete();
         for att in &attachments {
@@ -914,12 +1037,37 @@ impl InputBarState {
     }
 
     pub fn remove_attachment(&mut self, index: usize) {
-        if index < self.pending_attachments.len() {
-            self.pending_attachments.remove(index);
+        if index >= self.pending_attachments.len() {
+            return;
+        }
+
+        let removed = self.pending_attachments.remove(index);
+        if removed.source == crate::attachment::AttachmentSource::Clipboard {
+            self.clipboard_temps.retain(|path| path != &removed.path);
+            let _ = std::fs::remove_file(removed.path);
+        }
+
+        if self.pending_attachments.is_empty() {
+            self.attachment_manager = None;
+        } else if let Some(manager) = &mut self.attachment_manager {
+            manager.selected = manager.selected.min(self.pending_attachments.len() - 1);
+            manager.scroll = manager.scroll.min(manager.selected);
         }
     }
 
+    fn open_attachment_manager(&mut self) {
+        if self.pending_attachments.is_empty() {
+            return;
+        }
+        self.dismiss_autocomplete();
+        self.attachment_manager = Some(AttachmentManagerState {
+            selected: 0,
+            scroll: 0,
+        });
+    }
+
     pub fn take_attachments(&mut self) -> Vec<PendingAttachment> {
+        self.attachment_manager = None;
         let taken = std::mem::take(&mut self.pending_attachments);
         for att in &taken {
             if att.source == crate::attachment::AttachmentSource::Clipboard {
@@ -937,6 +1085,9 @@ impl InputBarState {
         self.cursor = 0;
         self.scroll_offset = 0;
         self.pending_attachments.clear();
+        self.attachment_manager = None;
+        self.last_attachment_area = None;
+        self.last_attachment_manager_area = None;
         self.file_explorer = None;
         self.clear_selection();
         self.dismiss_autocomplete();
@@ -998,6 +1149,10 @@ impl InputBarState {
                 ExplorerAction::None => {}
             }
             return InputBarAction::Consumed;
+        }
+
+        if self.attachment_manager.is_some() {
+            return self.handle_attachment_manager_key(key);
         }
 
         use crate::keymap::{GlobalAction, InputBarAction as IbWidgetAction};
@@ -1172,6 +1327,53 @@ impl InputBarState {
             return true;
         }
 
+        if self.attachment_manager.is_some() {
+            let first_index = self
+                .attachment_manager
+                .map(|manager| manager.scroll)
+                .unwrap_or(0);
+            match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if let Some(index) = attachment_remove_at(
+                        self.last_attachment_manager_area,
+                        first_index,
+                        &self.pending_attachments,
+                        mouse.column,
+                        mouse.row,
+                    ) {
+                        self.remove_attachment(index);
+                    } else if let Some(index) = attachment_row_at(
+                        self.last_attachment_manager_area,
+                        first_index,
+                        mouse.column,
+                        mouse.row,
+                    ) && let Some(manager) = &mut self.attachment_manager
+                    {
+                        manager.selected = index;
+                    } else {
+                        self.attachment_manager = None;
+                    }
+                }
+                MouseEventKind::ScrollUp => self.move_attachment_selection(-1),
+                MouseEventKind::ScrollDown => self.move_attachment_selection(1),
+                _ => {}
+            }
+            return true;
+        }
+
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && let Some(index) = attachment_remove_at(
+                self.last_attachment_area,
+                0,
+                &self.pending_attachments,
+                mouse.column,
+                mouse.row,
+            )
+        {
+            self.remove_attachment(index);
+            return true;
+        }
+
         // Input bar interactions.
         if !mouse::in_rect(mouse.column, mouse.row, self.last_input_area) {
             return false;
@@ -1287,27 +1489,20 @@ impl InputBarState {
                     }
                 }
                 SlashCommand::ListAttachments => {
-                    let atts = &self.pending_attachments;
-                    if atts.is_empty() {
+                    if self.pending_attachments.is_empty() {
                         InputBarAction::StatusMessage(crate::i18n::t(
                             "zc-input-no-pending-attachments",
                         ))
                     } else {
-                        let list = atts
-                            .iter()
-                            .enumerate()
-                            .map(|(i, a)| format!("  [{i}] {}", a.label()))
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        InputBarAction::StatusMessage(format!(
-                            "{}\n{list}",
-                            crate::i18n::t("zc-input-pending-attachments-header")
-                        ))
+                        self.open_attachment_manager();
+                        InputBarAction::Consumed
                     }
                 }
                 SlashCommand::ClearQueue(idx) => InputBarAction::ClearQueue(idx),
                 SlashCommand::RestartSession => InputBarAction::RestartSession,
                 SlashCommand::ToggleThinking => InputBarAction::ToggleThinking,
+                SlashCommand::EnterBrowseMode => InputBarAction::EnterBrowseMode,
+                SlashCommand::OpenHelp => InputBarAction::OpenHelp,
                 SlashCommand::Model(name) => InputBarAction::SetModel(name.to_string()),
                 SlashCommand::ModelPicker => InputBarAction::OpenModelPicker,
                 SlashCommand::ModelProvider(name) => {
@@ -1393,11 +1588,48 @@ impl InputBarState {
         }
     }
 
-    /// Fallback paste path: insert clipboard text directly. Used when Ctrl+V
-    /// finds no image, and as the only paste route on terminals that don't
-    /// emit bracketed paste (`Event::Paste`) — e.g. the legacy Windows
-    /// console. Routes through `handle_paste` so a pasted file path is still
-    /// auto-attached, matching bracketed-paste behaviour.
+    fn handle_attachment_manager_key(&mut self, key: KeyEvent) -> InputBarAction {
+        use crate::keymap::{InputBarAction as Ib, ModalAction};
+
+        match ModalAction::from_chord(&key) {
+            Some(ModalAction::Up) => self.move_attachment_selection(-1),
+            Some(ModalAction::Down) => self.move_attachment_selection(1),
+            Some(ModalAction::Cancel) => self.attachment_manager = None,
+            _ if Ib::from_chord(&key) == Some(Ib::Backspace) || key.code == KeyCode::Delete => {
+                if let Some(index) = self.attachment_manager.map(|manager| manager.selected) {
+                    self.remove_attachment(index);
+                }
+            }
+            _ => match key.code {
+                KeyCode::Home => {
+                    if let Some(manager) = &mut self.attachment_manager {
+                        manager.selected = 0;
+                        manager.scroll = 0;
+                    }
+                }
+                KeyCode::End => {
+                    if let Some(manager) = &mut self.attachment_manager {
+                        manager.selected = self.pending_attachments.len().saturating_sub(1);
+                    }
+                }
+                _ => {}
+            },
+        };
+        InputBarAction::Consumed
+    }
+
+    fn move_attachment_selection(&mut self, delta: isize) {
+        let Some(manager) = &mut self.attachment_manager else {
+            return;
+        };
+        let last = self.pending_attachments.len().saturating_sub(1);
+        manager.selected = if delta < 0 {
+            manager.selected.saturating_sub(delta.unsigned_abs())
+        } else {
+            manager.selected.saturating_add(delta as usize).min(last)
+        };
+    }
+
     fn paste_clipboard_text(&mut self) -> InputBarAction {
         match clipboard::read_clipboard_text() {
             Some(text) => {
@@ -1414,12 +1646,6 @@ impl InputBarState {
 
     // ── Selection rendering helper ───────────────────────────
 
-    /// Build styled lines for the input text, pre-wrapped using the same
-    /// `wrap_visual_lines` logic that drives cursor positioning.
-    ///
-    /// Each returned `Line` corresponds to exactly one visual row so the
-    /// `Paragraph` must be rendered **without** `Wrap` — otherwise ratatui
-    /// would re-wrap with its own algorithm and the cursor would drift.
     fn build_input_lines(&self, width: u16) -> Vec<Line<'_>> {
         let sel_style = Style::default()
             .bg(theme::selection_bg())
@@ -1473,18 +1699,6 @@ impl InputBarState {
 
     // ── Rendering ────────────────────────────────────────────
 
-    /// Render the input bar (attachment bar + input box) at the bottom of `area`.
-    ///
-    /// Returns the remaining `Rect` above the input bar for the parent to
-    /// render conversation content into.
-    ///
-    /// `show_cursor` controls whether the terminal cursor is positioned in the
-    /// input box (false when an approval overlay is active).
-    ///
-    /// `turn_status` drives the title-bar label (verb + animated dots); it is
-    /// always `Idle` when no turn is in flight. `turn_started_at` is the
-    /// animation anchor — pass the `Instant` recorded when the turn began so
-    /// the dots cycle deterministically across redraws.
     pub fn render(
         &mut self,
         f: &mut Frame,
@@ -1496,6 +1710,8 @@ impl InputBarState {
         queue_paused_hint: Option<&str>,
     ) -> Rect {
         let has_attachments = !self.pending_attachments.is_empty();
+        self.last_attachment_area = None;
+        self.last_attachment_manager_area = None;
 
         // Compute dynamic input height.
         let inner_width = area.width.saturating_sub(2);
@@ -1517,7 +1733,12 @@ impl InputBarState {
 
         let mut constraints = vec![Constraint::Min(3)];
         if has_attachments {
-            constraints.push(Constraint::Length(1));
+            let available = area.height.saturating_sub(input_height + 3).max(1);
+            constraints.push(Constraint::Length(
+                u16::try_from(self.pending_attachments.len())
+                    .unwrap_or(u16::MAX)
+                    .min(available),
+            ));
         }
         constraints.push(Constraint::Length(input_height));
         let chunks = Layout::default()
@@ -1535,21 +1756,29 @@ impl InputBarState {
 
         // Attachment bar.
         if let Some(att_rect) = att_area {
-            let labels: Vec<String> = self.pending_attachments.iter().map(|a| a.label()).collect();
-            let text = format!(" Attachments: {}", labels.join(", "));
-            let bar = Paragraph::new(Span::styled(
-                text,
-                theme::accent_style().add_modifier(Modifier::ITALIC),
-            ));
-            f.render_widget(bar, att_rect);
+            self.last_attachment_area = Some(att_rect);
+            for (row, (index, attachment)) in self
+                .pending_attachments
+                .iter()
+                .enumerate()
+                .take(att_rect.height as usize)
+                .enumerate()
+            {
+                let row_rect = Rect::new(att_rect.x, att_rect.y + row as u16, att_rect.width, 1);
+                let (main, remove_col) =
+                    attachment_line(index, &attachment.label(), row_rect.width);
+                let mut spans = vec![Span::styled(
+                    main,
+                    theme::accent_style().add_modifier(Modifier::ITALIC),
+                )];
+                if remove_col.is_some() {
+                    spans.push(Span::styled(ATTACHMENT_REMOVE_LABEL, theme::warn_style()));
+                }
+                let line = Line::from(spans);
+                f.render_widget(Paragraph::new(line), row_rect);
+            }
         }
 
-        // Input box.
-        //
-        // Title comes from `TurnStatus::label`, which encodes both the verb
-        // and the dot-pulse animation (anchored to `turn_started_at` so paints
-        // within the same animation phase render identically). When idle, the
-        // status is `Idle` and the label is the plain " > " prompt.
         let label_owned = turn_status.label(turn_started_at);
         let label: &str = &label_owned;
         let block = Block::default()
@@ -1585,12 +1814,11 @@ impl InputBarState {
             f.render_widget(p, input_area);
         }
 
-        // Terminal owns cursor blinking; a software blink that skips
-        // set_cursor_position can latch the cursor hidden. The cursor shows
-        // whenever the input box is editable — including while a turn is in
-        // flight, since the user can type a queued message then. Only an
-        // approval overlay (show_cursor=false) or the file browser suppress it.
-        if show_cursor && inner_width > 0 && self.file_explorer.is_none() {
+        if show_cursor
+            && inner_width > 0
+            && self.file_explorer.is_none()
+            && self.attachment_manager.is_none()
+        {
             let (cursor_row, cursor_col) = cursor_to_visual(&self.input, self.cursor, inner_width);
 
             if cursor_row < self.scroll_offset {
@@ -1629,6 +1857,117 @@ impl InputBarState {
         }
 
         conv_area
+    }
+
+    pub fn render_attachment_manager(&mut self, f: &mut Frame, area: Rect) {
+        self.last_attachment_manager_area = None;
+        let Some(manager) = &mut self.attachment_manager else {
+            return;
+        };
+        if self.pending_attachments.is_empty() || area.width < 8 || area.height < 3 {
+            return;
+        }
+
+        let visible_rows = self
+            .pending_attachments
+            .len()
+            .min(MAX_ATTACHMENT_MANAGER_ROWS)
+            .min(area.height.saturating_sub(2) as usize)
+            .max(1);
+        if manager.selected < manager.scroll {
+            manager.scroll = manager.selected;
+        } else if manager.selected >= manager.scroll + visible_rows {
+            manager.scroll = manager.selected + 1 - visible_rows;
+        }
+
+        let title = crate::i18n::t_args(
+            "zc-input-attachment-manager-title",
+            &[("count", &self.pending_attachments.len().to_string())],
+        );
+        let (navigate_keys, remove_keys, close_keys) = attachment_manager_key_labels();
+        let hint = crate::i18n::t_args(
+            "zc-input-attachment-manager-hint",
+            &[
+                ("navigate", &navigate_keys.join("/")),
+                ("remove", &remove_keys.join("/")),
+                ("close", &close_keys.join("/")),
+            ],
+        );
+        let labels = self
+            .pending_attachments
+            .iter()
+            .map(PendingAttachment::label)
+            .collect::<Vec<_>>();
+        let desired_width = labels
+            .iter()
+            .enumerate()
+            .map(|(index, label)| {
+                crate::display_width::display_width(label) + index.to_string().len() + 10
+            })
+            .chain([
+                crate::display_width::display_width(&title) + 4,
+                crate::display_width::display_width(&hint) + 4,
+            ])
+            .max()
+            .unwrap_or(24);
+        let box_width = u16::try_from(desired_width)
+            .unwrap_or(u16::MAX)
+            .clamp(24.min(area.width), area.width);
+        let box_height = visible_rows as u16 + 2;
+        let modal = Rect::new(
+            area.x + area.width.saturating_sub(box_width) / 2,
+            area.y + area.height.saturating_sub(box_height) / 2,
+            box_width,
+            box_height,
+        );
+        let inner_width = modal.width.saturating_sub(2);
+
+        let items = labels
+            .iter()
+            .enumerate()
+            .skip(manager.scroll)
+            .take(visible_rows)
+            .map(|(index, label)| {
+                let (main, remove_col) = attachment_line(index, label, inner_width);
+                let style = if index == manager.selected {
+                    theme::selected_style()
+                } else {
+                    theme::body_style()
+                };
+                let mut spans = vec![Span::styled(main, style)];
+                if remove_col.is_some() {
+                    spans.push(Span::styled(ATTACHMENT_REMOVE_LABEL, theme::warn_style()));
+                }
+                ListItem::new(Line::from(spans))
+            })
+            .collect::<Vec<_>>();
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(theme::overlay_border_style())
+            .style(theme::fill_style())
+            .title(Span::styled(format!(" {title} "), theme::heading_style()))
+            .title_bottom(Span::styled(format!(" {hint} "), theme::dim_style()));
+        f.render_widget(Clear, modal);
+        f.render_widget(List::new(items).block(block), modal);
+        self.last_attachment_manager_area = Some(Rect::new(
+            modal.x + 1,
+            modal.y + 1,
+            inner_width,
+            visible_rows as u16,
+        ));
+
+        let buf = f.buffer_mut();
+        if manager.scroll > 0 {
+            buf[(modal.x + modal.width - 1, modal.y)]
+                .set_char('▲')
+                .set_style(theme::accent_style());
+        }
+        if manager.scroll + visible_rows < self.pending_attachments.len() {
+            buf[(modal.x + modal.width - 1, modal.y + modal.height - 1)]
+                .set_char('▼')
+                .set_style(theme::accent_style());
+        }
     }
 
     /// Render the auto-complete popup above the input bar if active.
@@ -1701,6 +2040,18 @@ impl crate::widgets::HelpContext for InputBarState {
         if let Some(explorer) = &self.file_explorer {
             return explorer.help_context();
         }
+        if self.attachment_manager.is_some() {
+            let (navigate, remove, close) = attachment_manager_key_labels();
+            return HelpNode::entries(vec![
+                E::new(navigate, crate::i18n::t("zc-chat-help-navigate")),
+                E::new(remove, crate::i18n::t("zc-input-help-attachment-remove")),
+                E::new(close, crate::i18n::t("zc-chat-help-close")),
+                E::new(
+                    vec!["/detach N"],
+                    crate::i18n::t("zc-input-help-attachment-detach"),
+                ),
+            ]);
+        }
         if self.autocomplete_active {
             use crate::keymap::{InputBarAction as Ib, action_key_labels};
             // Both Enter (Submit, contextual) and the dedicated accept
@@ -1732,6 +2083,54 @@ impl crate::widgets::HelpContext for InputBarState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    fn test_attachment(name: &str) -> PendingAttachment {
+        PendingAttachment {
+            path: PathBuf::from(name),
+            mime_type: "image/png".into(),
+            filename: name.into(),
+            size_bytes: 1,
+            source: crate::attachment::AttachmentSource::File,
+        }
+    }
+
+    fn render_input_bar(bar: &mut InputBarState, width: u16, height: u16) {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                bar.render(
+                    frame,
+                    area,
+                    false,
+                    false,
+                    &TurnStatus::Idle,
+                    Instant::now(),
+                    None,
+                );
+                bar.render_attachment_manager(frame, area);
+            })
+            .expect("draw input bar");
+    }
+
+    #[test]
+    fn attachment_line_preserves_visible_remove_control_when_truncated() {
+        let (main, remove_col) = attachment_line(12, "a-very-long-filename.png", 20);
+
+        assert_eq!(remove_col, Some(17));
+        assert_eq!(crate::display_width::display_width(&main), 17);
+        assert!(main.trim_end().ends_with('…'));
+    }
+
+    #[test]
+    fn attachment_line_places_remove_control_next_to_short_label() {
+        let (main, remove_col) = attachment_line(0, "one.png", 40);
+
+        assert_eq!(main, " [0] one.png ");
+        assert_eq!(remove_col, Some(13));
+    }
 
     #[test]
     fn input_append_and_take() {
@@ -1913,6 +2312,183 @@ mod tests {
     }
 
     #[test]
+    fn removing_clipboard_attachment_deletes_owned_temp() {
+        let mut bar = InputBarState::new();
+        let tmp = std::env::temp_dir().join("zc_test_clip_remove.png");
+        std::fs::write(&tmp, b"x").unwrap();
+        bar.clipboard_temps.push(tmp.clone());
+        bar.add_attachment(PendingAttachment {
+            path: tmp.clone(),
+            mime_type: "image/png".into(),
+            filename: "clip.png".into(),
+            size_bytes: 1,
+            source: crate::attachment::AttachmentSource::Clipboard,
+        });
+
+        bar.remove_attachment(0);
+
+        assert!(bar.pending_attachments().is_empty());
+        assert!(bar.clipboard_temps().is_empty());
+        assert!(!tmp.exists());
+    }
+
+    #[test]
+    fn removing_file_attachment_preserves_user_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("user-file.png");
+        std::fs::write(&path, b"x").expect("write user file");
+        let mut bar = InputBarState::new();
+        bar.add_attachment(PendingAttachment {
+            path: path.clone(),
+            mime_type: "image/png".into(),
+            filename: "user-file.png".into(),
+            size_bytes: 1,
+            source: crate::attachment::AttachmentSource::File,
+        });
+
+        bar.remove_attachment(0);
+
+        assert!(bar.pending_attachments().is_empty());
+        assert!(
+            path.exists(),
+            "removal must not delete a user-selected file"
+        );
+    }
+
+    #[test]
+    fn slash_attachments_opens_indexed_manager() {
+        let mut bar = InputBarState::new();
+        bar.add_attachment(test_attachment("one.png"));
+        bar.add_attachment(test_attachment("two.png"));
+        bar.insert_text("/attachments");
+
+        let action = bar.handle_enter();
+
+        assert!(matches!(action, InputBarAction::Consumed));
+        assert_eq!(bar.input(), "");
+        assert_eq!(bar.attachment_manager.as_ref().map(|m| m.selected), Some(0));
+    }
+
+    #[test]
+    fn attachment_manager_delete_removes_selected_item() {
+        let mut bar = InputBarState::new();
+        bar.add_attachment(test_attachment("one.png"));
+        bar.add_attachment(test_attachment("two.png"));
+        bar.open_attachment_manager();
+
+        bar.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        let action = bar.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+
+        assert!(matches!(action, InputBarAction::Consumed));
+        assert_eq!(bar.pending_attachments().len(), 1);
+        assert_eq!(bar.pending_attachments()[0].filename, "one.png");
+        assert_eq!(bar.attachment_manager.as_ref().map(|m| m.selected), Some(0));
+    }
+
+    #[test]
+    fn attachment_manager_backspace_removes_last_item_and_closes() {
+        let mut bar = InputBarState::new();
+        bar.add_attachment(test_attachment("one.png"));
+        bar.open_attachment_manager();
+
+        let action = bar.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+
+        assert!(matches!(action, InputBarAction::Consumed));
+        assert!(bar.pending_attachments().is_empty());
+        assert!(bar.attachment_manager.is_none());
+    }
+
+    #[test]
+    fn attachment_manager_escape_closes_without_removing() {
+        let mut bar = InputBarState::new();
+        bar.add_attachment(test_attachment("one.png"));
+        bar.open_attachment_manager();
+
+        let action = bar.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(matches!(action, InputBarAction::Consumed));
+        assert_eq!(bar.pending_attachments().len(), 1);
+        assert!(bar.attachment_manager.is_none());
+    }
+
+    #[test]
+    fn attachment_manager_claims_text_input() {
+        let mut bar = InputBarState::new();
+        bar.add_attachment(test_attachment("one.png"));
+        bar.open_attachment_manager();
+
+        assert!(bar.wants_text_input());
+    }
+
+    #[test]
+    fn attachment_remove_control_click_removes_target_item() {
+        let mut bar = InputBarState::new();
+        bar.add_attachment(test_attachment("one.png"));
+        bar.add_attachment(test_attachment("two.png"));
+        render_input_bar(&mut bar, 40, 12);
+        let area = bar.last_attachment_area.expect("attachment rows rendered");
+
+        let consumed = bar.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.x + area.width - 2,
+            row: area.y + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert!(!consumed);
+        assert_eq!(bar.pending_attachments().len(), 2);
+
+        let (_, remove_col) = attachment_line(1, &bar.pending_attachments()[1].label(), area.width);
+
+        let consumed = bar.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.x + remove_col.expect("remove control rendered"),
+            row: area.y + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert!(consumed);
+        assert_eq!(bar.pending_attachments().len(), 1);
+        assert_eq!(bar.pending_attachments()[0].filename, "one.png");
+    }
+
+    #[test]
+    fn attachment_manager_scrolled_remove_control_removes_visible_item() {
+        let mut bar = InputBarState::new();
+        for index in 0..10 {
+            bar.add_attachment(test_attachment(&format!("item-{index}.png")));
+        }
+        bar.open_attachment_manager();
+        for _ in 0..9 {
+            bar.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        render_input_bar(&mut bar, 60, 16);
+
+        let manager = bar.attachment_manager.as_ref().expect("manager open");
+        assert_eq!(manager.selected, 9);
+        assert_eq!(manager.scroll, 2);
+        let area = bar
+            .last_attachment_manager_area
+            .expect("attachment manager rendered");
+        let (_, remove_col) = attachment_line(9, &bar.pending_attachments()[9].label(), area.width);
+
+        let consumed = bar.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.x + remove_col.expect("remove control rendered"),
+            row: area.y + 7,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert!(consumed);
+        assert_eq!(bar.pending_attachments().len(), 9);
+        assert!(
+            bar.pending_attachments()
+                .iter()
+                .all(|attachment| attachment.filename != "item-9.png")
+        );
+    }
+
+    #[test]
     fn loading_for_edit_retakes_clipboard_temp_ownership() {
         let mut bar = InputBarState::new();
         let tmp = std::env::temp_dir().join("zc_test_clip_retake.png");
@@ -2016,6 +2592,14 @@ mod tests {
         assert!(matches!(
             parse_slash_command("/toggle-thinking"),
             SlashCommand::ToggleThinking
+        ));
+        assert!(matches!(
+            parse_slash_command("/browse"),
+            SlashCommand::EnterBrowseMode
+        ));
+        assert!(matches!(
+            parse_slash_command("/help"),
+            SlashCommand::OpenHelp
         ));
         assert!(matches!(
             parse_slash_command("hello"),
@@ -2188,6 +2772,25 @@ mod tests {
     }
 
     #[test]
+    fn help_context_keeps_slash_commands_out_of_general_help() {
+        use crate::widgets::HelpContext;
+        let bar = InputBarState::new();
+        let node = bar.help_context();
+        let listed = node
+            .entries
+            .iter()
+            .chain(node.children.iter().flat_map(|child| child.entries.iter()))
+            .map(|entry| entry.key_str())
+            .collect::<Vec<_>>();
+        for command in SLASH_COMMANDS {
+            assert!(
+                !listed.iter().any(|key| key == command),
+                "{command} stays in autocomplete, not the general Help modal"
+            );
+        }
+    }
+
+    #[test]
     fn model_provider_picker_command_returns_open_action() {
         let mut bar = InputBarState::new();
         bar.insert_text("/model-provider");
@@ -2195,6 +2798,23 @@ mod tests {
             bar.handle_enter(),
             InputBarAction::OpenModelProviderPicker
         ));
+    }
+
+    #[test]
+    fn browse_command_returns_enter_browse_action() {
+        let mut bar = InputBarState::new();
+        bar.insert_text("/browse");
+        assert!(matches!(
+            bar.handle_enter(),
+            InputBarAction::EnterBrowseMode
+        ));
+    }
+
+    #[test]
+    fn help_command_returns_open_help_action() {
+        let mut bar = InputBarState::new();
+        bar.insert_text("/help");
+        assert!(matches!(bar.handle_enter(), InputBarAction::OpenHelp));
     }
 
     #[test]
@@ -2310,6 +2930,57 @@ mod tests {
     fn cursor_to_visual_uses_terminal_cell_width() {
         let text = "abcd界";
         assert_eq!(cursor_to_visual(text, text.len(), 5), (1, 2));
+    }
+
+    #[test]
+    fn cursor_to_visual_emoji_presentation_is_two_cells() {
+        // 🏔️ is U+1F3D4 + U+FE0F. unicode-width string width is 2; char-wise
+        // sum of the base alone is 1 and leaves the cursor one cell short.
+        let emoji = "\u{1F3D4}\u{FE0F}";
+        let text = format!("{emoji}x");
+        assert_eq!(cursor_to_visual(&text, text.len(), 10), (0, 3));
+        assert_eq!(str_cell_width(emoji), 2);
+        assert_eq!(str_cell_width(&format!("{emoji} ")), 3);
+    }
+
+    #[test]
+    fn cursor_to_visual_text_default_presentation_sequence_is_two_cells() {
+        // ⚠️ is text-default ⚠ + VS16. Scalar loops that cannot see FE0F would
+        // count base width 1 + selector 0 and leave the cursor short.
+        let emoji = "\u{26A0}\u{FE0F}";
+        let text = format!("{emoji}x");
+        assert_eq!(str_cell_width(emoji), 2);
+        assert_eq!(cursor_to_visual(&text, text.len(), 10), (0, 3));
+        // Bare text form stays width 1.
+        let bare = "\u{26A0}x";
+        assert_eq!(str_cell_width("\u{26A0}"), 1);
+        assert_eq!(cursor_to_visual(bare, bare.len(), 10), (0, 2));
+    }
+
+    #[test]
+    fn hard_wrap_keeps_text_default_presentation_sequence_together() {
+        // Width 2 must not split ⚠️ across lines; the sequence is one unit.
+        let emoji = "\u{26A0}\u{FE0F}";
+        let text = format!("ab{emoji}cd");
+        let lines = wrap_visual_lines(&text, 2);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(&text[lines[0].start..lines[0].end], "ab");
+        assert_eq!(&text[lines[1].start..lines[1].end], emoji);
+        assert_eq!(&text[lines[2].start..lines[2].end], "cd");
+        assert_eq!(lines[1].width, 2);
+    }
+
+    #[test]
+    fn visual_to_cursor_text_default_presentation_sequence() {
+        // Reverse mapping must land on grapheme boundaries for ⚠️.
+        let emoji = "\u{26A0}\u{FE0F}";
+        let text = format!("a{emoji}b");
+        // col 0 -> 'a', col 1/2 -> start of ⚠️, col 3 -> 'b'
+        assert_eq!(visual_to_cursor(&text, 0, 0, 10), 0);
+        assert_eq!(visual_to_cursor(&text, 0, 1, 10), 1);
+        assert_eq!(visual_to_cursor(&text, 0, 2, 10), 1);
+        assert_eq!(visual_to_cursor(&text, 0, 3, 10), text.len() - 1);
+        assert_eq!(cursor_to_visual(&text, text.len(), 10), (0, 4));
     }
 
     #[test]

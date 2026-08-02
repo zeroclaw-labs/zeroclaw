@@ -1,32 +1,9 @@
-// Autonomous skill creation from successful multi-step task executions.
-//
-// After the agent completes a multi-step tool-call sequence, this module
-// can persist the execution as a reusable skill definition under
-// `~/.zeroclaw/workspace/skills/<slug>/`.
-//
-// Two emit paths share the same gating (enabled flag, minimum tool calls,
-// embedding dedup, slug validation, LRU eviction):
-//   * the default deterministic `SKILL.toml` generator, and
-//   * an opt-in reflection path (`reflection_enabled`) that asks the model
-//     provider to synthesize a canonical `SKILL.md` from a *bounded* slice of
-//     the execution. The reflection path always falls back to `SKILL.toml`
-//     when the provider call or its output is unusable, so enabling it can
-//     never leave a skill un-created.
-//
-// The reflection path forwards turn content (task, tool-call trace, final
-// answer) to the model provider, so every variable-length input is scrubbed of
-// credential-shaped data via the shared outbound-content `LeakDetector` *before*
-// it is composed into the prompt — the redaction is a hard privacy boundary
-// applied before the request leaves the process, not an instruction the model
-// is asked to honor after it has already received the raw content.
-
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use zeroclaw_api::model_provider::{ChatMessage, ChatRequest, ModelProvider};
 use zeroclaw_config::schema::SkillCreationConfig;
 use zeroclaw_memory::embeddings::EmbeddingProvider;
 use zeroclaw_memory::vector::cosine_similarity;
-use zeroclaw_providers::ProviderDispatch;
 
 use super::document::SkillDocument;
 
@@ -88,14 +65,14 @@ impl SkillCreator {
         Ok(Some(slug))
     }
 
-    /// Like [`create_from_execution`], but synthesizes a canonical `SKILL.md`
+    /// Like [`Self::create_from_execution`], but synthesizes a canonical `SKILL.md`
     /// from a *bounded* slice of the execution via a model-provider reflection
     /// call. If reflection fails — provider error, malformed output, empty
     /// body — it falls back to the deterministic `SKILL.toml` generator so a
     /// creation attempt is never left half-done.
     ///
     /// Gating (enabled flag, minimum tool calls, dedup, slug, LRU) is shared
-    /// with [`create_from_execution`].
+    /// with [`Self::create_from_execution`].
     pub async fn create_from_execution_reflected(
         &self,
         task_description: &str,
@@ -150,11 +127,6 @@ impl SkillCreator {
         Ok(Some(slug))
     }
 
-    /// Shared gating + slug + directory preparation for both emit paths.
-    ///
-    /// Returns `Ok(Some((slug, skill_dir)))` (directory already created) when a
-    /// new skill should be written, or `Ok(None)` when creation is skipped
-    /// (disabled, fewer than two tool calls, duplicate, or invalid slug).
     async fn prepare_skill_dir(
         &self,
         task_description: &str,
@@ -225,46 +197,28 @@ impl SkillCreator {
         model: &str,
     ) -> Result<String> {
         let prompt = self.build_reflection_prompt(slug, task_description, tool_calls, final_answer);
-        // Fail closed before spending a provider call when the parent turn's
-        // cost budget is already exhausted. No-op when unscoped (e.g. tests that
-        // drive reflection without a `TOOL_LOOP_COST_TRACKING_CONTEXT` scope).
-        crate::agent::turn::provider_call::enforce_tool_loop_budget()?;
-        // Route through the structured dispatch path (rather than the bare
-        // `chat_with_system`) so the returned token usage can be recorded
-        // against the same cost tracker as the main tool loop.
         let messages = [
             ChatMessage::system(REFLECTION_SYSTEM_PROMPT),
             ChatMessage::user(prompt),
         ];
-        let resp = ProviderDispatch::from_ref(model_provider)
-            .chat(
-                ChatRequest {
-                    messages: &messages,
-                    tools: None,
-                    thinking: None,
-                },
-                model,
-                None,
-            )
+        let access = crate::agent::loop_::ResolvedModelAccess {
+            model_provider,
+            provider_name,
+            model,
+            temperature: None,
+        };
+        let resp = access
+            .run_model_query(ChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: None,
+            })
             .await
             .context("reflection provider call failed")?;
-        // Record spend before output validation, so a malformed reflected body
-        // that falls back to SKILL.toml still counts the provider usage.
-        if let Some(usage) = resp.usage.as_ref() {
-            crate::agent::cost::record_tool_loop_cost_usage(provider_name, model, usage);
-        }
         let raw = resp.text.unwrap_or_default();
         Self::normalize_reflected_md(slug, &raw)
     }
 
-    /// Build the bounded user prompt. Every variable-length input (task,
-    /// tool-call trace, final answer) is first scrubbed of credential-shaped
-    /// data (see [`scrub_secrets`]) and then independently truncated to its
-    /// configured character budget, so a large execution cannot produce an
-    /// unbounded reflection request and raw secrets cannot reach the provider.
-    ///
-    /// Scrubbing precedes truncation so a secret straddling the budget boundary
-    /// is detected on the whole input rather than on a severed prefix.
     fn build_reflection_prompt(
         &self,
         slug: &str,
@@ -300,20 +254,6 @@ impl SkillCreator {
         )
     }
 
-    /// Render the tool-call trace as a compact, numbered list of `name args`.
-    ///
-    /// Bounded by construction: each call's serialized args are capped at
-    /// [`MAX_TOOL_ARG_CHARS`] and rendering stops once the accumulated output
-    /// reaches `budget`, so a pathological execution (many calls, huge args)
-    /// cannot allocate a large intermediate string before the caller's final
-    /// truncation.
-    ///
-    /// Both the tool name and each call's serialized args are scrubbed of
-    /// credential-shaped data (see [`scrub_secrets`]) before they enter the
-    /// trace — the args before the per-call cap is applied — so no raw secret
-    /// embedded in a tool name or argument reaches the reflection prompt.
-    /// Scrubbing precedes the cap so a secret is matched on the full serialized
-    /// args rather than on a truncated prefix.
     fn render_tool_trace(tool_calls: &[ToolCallRecord], budget: usize) -> String {
         use std::fmt::Write;
         let mut out = String::new();
@@ -332,11 +272,6 @@ impl SkillCreator {
         out
     }
 
-    /// Parse, validate, and normalize raw model output into a canonical
-    /// `SKILL.md`. Forces the frontmatter `name` to the deterministic slug and
-    /// stamps the `zeroclaw-auto` author so reflected skills are recognized by
-    /// dedup and LRU eviction exactly like the `SKILL.toml` path. Errors if the
-    /// output is not a valid `SKILL.md` with a non-empty body.
     fn normalize_reflected_md(slug: &str, raw: &str) -> Result<String> {
         let content = extract_frontmatter_block(raw);
         let mut doc = SkillDocument::parse(&content).context("reflected SKILL.md is invalid")?;
@@ -584,17 +519,6 @@ fn extract_skill_description(manifest: &std::path::Path, content: &str) -> Optio
     }
 }
 
-/// Redact credential-shaped substrings — API keys, tokens, AWS credentials,
-/// PEM private keys, JWTs, database connection URLs, and high-entropy secrets —
-/// from `s`, returning the input unchanged when nothing is detected.
-///
-/// This is the privacy boundary for the reflection path: raw turn content
-/// (task, tool arguments, final answer) must be scrubbed *before* it is placed
-/// in the prompt sent to the model provider, not merely generalized away by the
-/// model after it has already received the raw content. It reuses the same
-/// [`LeakDetector`](crate::security::LeakDetector) guardrail applied to
-/// outbound channel responses, so the two outbound surfaces share one
-/// redaction policy.
 fn scrub_secrets(s: &str) -> String {
     match crate::security::LeakDetector::new().scan(s) {
         crate::security::LeakResult::Clean => s.to_string(),
@@ -640,7 +564,6 @@ fn extract_frontmatter_block(raw: &str) -> String {
 }
 
 /// Extract `ToolCallRecord`s from the agent conversation history.
-///
 /// Scans assistant messages for tool call patterns (both JSON and XML formats)
 /// and returns records for each unique tool invocation.
 pub fn extract_tool_calls_from_history(
@@ -906,11 +829,6 @@ version = "0.1.0"
 
     // ── Deduplication ────────────────────────────────────────────
 
-    /// A mock embedding model_provider that returns deterministic embeddings.
-    ///
-    /// The "new" description (first text embedded) always gets `[1, 0, 0]`.
-    /// The "existing" skill description (second text embedded) gets a vector
-    /// whose cosine similarity with `[1, 0, 0]` equals `self.similarity`.
     struct MockEmbeddingProvider {
         similarity: f32,
         call_count: std::sync::atomic::AtomicUsize,
@@ -1708,11 +1626,6 @@ tags = ["auto-generated"]
 
     #[test]
     fn reflection_prompt_scrubs_credential_shaped_slug() {
-        // The slug is interpolated into the prompt as the suggested skill name.
-        // It is normally derived from the task (lowercased + hyphenated), which
-        // mangles most credential shapes, but the scrub is defense-in-depth: the
-        // prompt-bound copy of *any* slug must be redacted. Drive the boundary
-        // directly with a credential-shaped slug.
         let creator = SkillCreator::new(std::path::PathBuf::from("/tmp"), reflect_config());
         let key_slug = "sk-ant-api03-AbC123dEf456GhI789jKl012MnO345pQr678";
 

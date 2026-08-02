@@ -16,11 +16,6 @@ pub struct GiteaProvider {
 }
 
 impl GiteaProvider {
-    /// `api_base_url` is required and must be non-blank; there is no
-    /// default host. [`build_provider`](crate::git::channel) fails closed
-    /// before constructing this provider when the config omits it, so a
-    /// bearer `access_token` is never sent to a host the operator did not
-    /// name.
     pub fn new(api_base_url: String, access_token: String, proxy_url: Option<String>) -> Self {
         Self {
             api: GiteaApi::new(api_base_url, proxy_url),
@@ -48,13 +43,6 @@ impl GiteaProvider {
         let mut advance_to: Option<DateTime<Utc>> = None;
         for issue in self.api.list_issues_since(token, repo, since).await? {
             events.push(mapping::from_issue_opened(&issue, repo));
-            // Advance the cursor by the max timestamp of the events actually
-            // emitted for this issue, not just `created_at`. A PR created before
-            // the cursor but closed/merged after it emits a transition timed at
-            // `closed_at` (> created_at); advancing only by `created_at` would
-            // leave it inside the `since` window and re-fetch it every tick.
-            // Safe now that `list_issues_since` consumes all pages (no unseen
-            // older items can hide behind a page boundary).
             let mut newest = issue.created_at;
             if let Some(transition) = mapping::from_pull_transition(&issue, repo) {
                 newest = newest.max(transition.created_at());
@@ -231,6 +219,78 @@ impl GitProvider for GiteaProvider {
             }
         }
     }
+
+    async fn forge_request(
+        &self,
+        req: crate::git::types::ForgeRequest,
+    ) -> Result<crate::git::types::ForgeResponse, GitChannelError> {
+        let req = translate_to_gitea(req);
+        let method = crate::git::providers::forge_method_to_reqwest(req.method);
+        let (status, body) = self
+            .api
+            .forge_call(self.token()?, method, &req.path, req.body.as_ref())
+            .await?;
+        Ok(crate::git::types::ForgeResponse { status, body })
+    }
+}
+
+/// Rewrite a GitHub-canonical [`ForgeRequest`] into Gitea/Forgejo's dialect.
+///
+/// The `git_forge` tool speaks one canonical vocabulary (GitHub's); the forge
+/// that diverges translates on the way through, so forge-specific knowledge
+/// lives behind the provider, not in the tool. Every rewrite below is grounded
+/// in Gitea's OpenAPI/source: the merge endpoint is `POST` with a `Do` verb and
+/// `MergeTitleField`/`MergeMessageField` (GitHub uses `PUT` +
+/// `merge_method`/`commit_title`/`commit_message`); `EditIssueOption` has no
+/// `state_reason`; and `ReviewStateType` spells approval `APPROVED`, not
+/// GitHub's `APPROVE`. Shapes Gitea shares with GitHub (pull close via
+/// `{state:closed}`, labels, milestone id, comments) pass through untouched.
+fn translate_to_gitea(req: crate::git::types::ForgeRequest) -> crate::git::types::ForgeRequest {
+    use crate::git::types::ForgeMethod;
+    use serde_json::Value;
+
+    let crate::git::types::ForgeRequest { method, path, body } = req;
+
+    let is_merge = method == ForgeMethod::Put && path.ends_with("/merge");
+    if is_merge {
+        let mut out = serde_json::Map::new();
+        if let Some(Value::Object(src)) = &body {
+            if let Some(Value::String(m)) = src.get("merge_method") {
+                let door = if m == "rebase" {
+                    "rebase-merge"
+                } else {
+                    m.as_str()
+                };
+                out.insert("Do".into(), Value::String(door.to_string()));
+            }
+            if let Some(t) = src.get("commit_title") {
+                out.insert("MergeTitleField".into(), t.clone());
+            }
+            if let Some(msg) = src.get("commit_message") {
+                out.insert("MergeMessageField".into(), msg.clone());
+            }
+        }
+        if !out.contains_key("Do") {
+            out.insert("Do".into(), Value::String("merge".into()));
+        }
+        return crate::git::types::ForgeRequest {
+            method: ForgeMethod::Post,
+            path,
+            body: Some(Value::Object(out)),
+        };
+    }
+
+    let mut body = body;
+    if let Some(Value::Object(map)) = &mut body {
+        map.remove("state_reason");
+        if let Some(Value::String(event)) = map.get_mut("event")
+            && event == "APPROVE"
+        {
+            *event = "APPROVED".to_string();
+        }
+    }
+
+    crate::git::types::ForgeRequest { method, path, body }
 }
 
 #[cfg(test)]
@@ -238,6 +298,78 @@ mod tests {
     use super::*;
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn translate_merge_maps_method_verb_and_body_keys() {
+        use crate::git::types::{ForgeMethod, ForgeRequest};
+        let req = ForgeRequest {
+            method: ForgeMethod::Put,
+            path: "repos/o/r/pulls/5/merge".into(),
+            body: Some(serde_json::json!({
+                "merge_method": "squash",
+                "commit_title": "feat: x (#5)",
+                "commit_message": "- abc"
+            })),
+        };
+        let out = translate_to_gitea(req);
+        assert_eq!(out.method, ForgeMethod::Post);
+        let body = out.body.unwrap();
+        assert_eq!(body["Do"], "squash");
+        assert_eq!(body["MergeTitleField"], "feat: x (#5)");
+        assert_eq!(body["MergeMessageField"], "- abc");
+        assert!(body.get("merge_method").is_none());
+    }
+
+    #[test]
+    fn translate_merge_rebase_becomes_rebase_merge() {
+        use crate::git::types::{ForgeMethod, ForgeRequest};
+        let req = ForgeRequest {
+            method: ForgeMethod::Put,
+            path: "repos/o/r/pulls/5/merge".into(),
+            body: Some(serde_json::json!({ "merge_method": "rebase" })),
+        };
+        let out = translate_to_gitea(req);
+        assert_eq!(out.body.unwrap()["Do"], "rebase-merge");
+    }
+
+    #[test]
+    fn translate_strips_issue_state_reason() {
+        use crate::git::types::{ForgeMethod, ForgeRequest};
+        let req = ForgeRequest {
+            method: ForgeMethod::Patch,
+            path: "repos/o/r/issues/12".into(),
+            body: Some(serde_json::json!({ "state": "closed", "state_reason": "not_planned" })),
+        };
+        let out = translate_to_gitea(req);
+        let body = out.body.unwrap();
+        assert_eq!(body["state"], "closed");
+        assert!(body.get("state_reason").is_none());
+    }
+
+    #[test]
+    fn translate_review_approve_becomes_approved() {
+        use crate::git::types::{ForgeMethod, ForgeRequest};
+        let req = ForgeRequest {
+            method: ForgeMethod::Post,
+            path: "repos/o/r/pulls/5/reviews".into(),
+            body: Some(serde_json::json!({ "event": "APPROVE", "body": "lgtm" })),
+        };
+        let out = translate_to_gitea(req);
+        assert_eq!(out.body.unwrap()["event"], "APPROVED");
+    }
+
+    #[test]
+    fn translate_pull_close_passes_through_untouched() {
+        use crate::git::types::{ForgeMethod, ForgeRequest};
+        let req = ForgeRequest {
+            method: ForgeMethod::Patch,
+            path: "repos/o/r/pulls/5".into(),
+            body: Some(serde_json::json!({ "state": "closed" })),
+        };
+        let out = translate_to_gitea(req);
+        assert_eq!(out.method, ForgeMethod::Patch);
+        assert_eq!(out.body.unwrap()["state"], "closed");
+    }
 
     // Regression: real Gitea `/user` returns BOTH `login` and `username`
     // (same value); parsing must not fail with "duplicate field". Forgejo/older

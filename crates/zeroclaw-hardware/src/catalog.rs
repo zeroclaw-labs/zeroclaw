@@ -1,9 +1,4 @@
 //! Canonical hardware tool-name and capability catalog.
-//!
-//! Single source of truth for the names the agent sees and the docs render.
-//! `fn name()` impls and the mdBook hardware snippets both read these constants
-//! so a rename lands in one place and the rendered tables follow on the next
-//! docs build. Non-gated so xtask can walk it without the `hardware` feature.
 
 /// Built-in hardware tools always present with the `hardware` feature.
 pub const BASE_TOOLS: &[&str] = &[

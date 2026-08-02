@@ -1,9 +1,4 @@
 //! The evaluation case format — JSON trace fixtures for deterministic replay.
-//!
-//! Phase 0 cases are [`LlmTrace`] fixtures: a sequence of conversation turns where
-//! each turn lists the scripted LLM response steps, plus declarative [`TraceExpects`]
-//! that the run is graded against. The format is intentionally a superset target —
-//! later phases extend it with setup (seeded workspace/memory) and richer graders.
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};

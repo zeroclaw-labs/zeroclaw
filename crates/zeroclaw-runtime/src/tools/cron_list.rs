@@ -3,7 +3,7 @@ use crate::cron;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::Config;
 
 pub struct CronListTool {
@@ -38,7 +38,7 @@ impl Tool for CronListTool {
         if !self.config.scheduler.enabled {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("cron is disabled by config (scheduler.enabled=false)".to_string()),
             });
         }
@@ -51,12 +51,13 @@ impl Tool for CronListTool {
                         .iter()
                         .map(cron_job_output)
                         .collect::<serde_json::Result<Vec<_>>>()?,
-                )?,
+                )?
+                .into(),
                 error: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(e.to_string()),
             }),
         }
