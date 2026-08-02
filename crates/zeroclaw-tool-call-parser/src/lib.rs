@@ -2255,7 +2255,10 @@ mod terminal_marker_strip_tests {
 
     #[test]
     fn strips_stacked_markers_with_whitespace() {
-        assert_eq!(strip_trailing_terminal_markers("Summary<eom>\n<|eom|>"), "Summary");
+        assert_eq!(
+            strip_trailing_terminal_markers("Summary<eom>\n<|eom|>"),
+            "Summary"
+        );
     }
 
     #[test]
