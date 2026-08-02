@@ -46,6 +46,20 @@ tokio = { version = "1.50", default-features = false, features = [
 ] }
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
+sha2 = "0.10"
+hex = "0.4"
+# Public roots for the outer-mTLS variant when a client also presents an outer
+# cert against a public-CA relay (the plain default still uses tungstenite's
+# built-in roots with no client cert).
+webpki-roots = "0.26"
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "tls12", "ring"] }
+# Client-side enrollment uses local P-256 CSR generation and relay wire helpers
+# so zerocode remains an RPC-only surface and does not link zeroclaw-* crates.
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem", "x509-parser"] }
+# Wipe the in-memory client private key on drop (it is generated locally, written
+# 0600, and never transmitted).
+zeroize = "1.8"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 pulldown-cmark = { version = "0.13", default-features = false }
 mime_guess = "2"
