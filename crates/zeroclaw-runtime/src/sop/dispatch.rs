@@ -47,6 +47,199 @@ pub enum DispatchResult {
     NoMatch,
 }
 
+/// Why a fan-in event could not enter the shared SOP dispatch path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SopIngressUnavailable {
+    MissingEngine,
+    MissingAudit,
+    MissingEngineAndAudit,
+    EnginePoisoned,
+}
+
+impl SopIngressUnavailable {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingEngine => "missing_engine",
+            Self::MissingAudit => "missing_audit",
+            Self::MissingEngineAndAudit => "missing_engine_and_audit",
+            Self::EnginePoisoned => "engine_poisoned",
+        }
+    }
+}
+
+/// Result of passing one external delivery through [`SopIngress`].
+#[derive(Debug, Clone)]
+pub enum SopIngressOutcome {
+    /// No loaded SOP declares a trigger for this source, so no event was built.
+    NotInterested,
+    /// The source requires SOP runtime handles that are unavailable.
+    Unavailable(SopIngressUnavailable),
+    /// The event reached the matcher and produced the normal dispatch results.
+    Dispatched(Vec<DispatchResult>),
+}
+
+/// Borrowed, per-call adapter from transport deliveries into canonical SOP events.
+///
+/// This is the ingress boundary for untrusted fan-in sources. Transport adapters
+/// retain ownership of protocol parsing and identifiers; this adapter owns handle
+/// validation, source-interest gating, input capping, event stamping, dispatch,
+/// and headless result diagnostics. It borrows the daemon's canonical engine and
+/// audit handles and does not cache config or SOP state.
+pub struct SopIngress<'a> {
+    engine: Option<&'a Arc<Mutex<SopEngine>>>,
+    audit: Option<&'a SopAuditLogger>,
+}
+
+impl<'a> SopIngress<'a> {
+    #[must_use]
+    pub fn new(
+        engine: Option<&'a Arc<Mutex<SopEngine>>>,
+        audit: Option<&'a SopAuditLogger>,
+    ) -> Self {
+        Self { engine, audit }
+    }
+
+    /// Lift one untrusted transport delivery into the shared SOP path.
+    pub async fn dispatch(
+        &self,
+        source: SopTriggerSource,
+        topic: Option<&str>,
+        payload: Option<&str>,
+        target_sop: Option<&str>,
+        dedup: Option<(String, bool)>,
+    ) -> SopIngressOutcome {
+        let Some(engine) = self.engine else {
+            let reason = if self.audit.is_some() {
+                SopIngressUnavailable::MissingEngine
+            } else {
+                SopIngressUnavailable::MissingEngineAndAudit
+            };
+            log_ingress_unavailable(source, reason, topic);
+            return SopIngressOutcome::Unavailable(reason);
+        };
+
+        let max_bytes = match engine.lock() {
+            Ok(eng) => {
+                if !eng.wants_source(source) {
+                    return SopIngressOutcome::NotInterested;
+                }
+                eng.config().untrusted_payload_max_bytes
+            }
+            Err(e) => {
+                let reason = SopIngressUnavailable::EnginePoisoned;
+                crate::health::mark_component_error(
+                    "sop_dispatch",
+                    format!("SOP engine lock poisoned: {e}"),
+                );
+                log_ingress_unavailable(source, reason, topic);
+                return SopIngressOutcome::Unavailable(reason);
+            }
+        };
+
+        let Some(audit) = self.audit else {
+            let reason = SopIngressUnavailable::MissingAudit;
+            log_ingress_unavailable(source, reason, topic);
+            return SopIngressOutcome::Unavailable(reason);
+        };
+
+        SopIngressOutcome::Dispatched(
+            dispatch_untrusted_fan_in_inner(
+                engine,
+                audit,
+                PreparedSopIngress {
+                    source,
+                    topic,
+                    payload,
+                    target_sop,
+                    dedup,
+                    max_bytes,
+                },
+            )
+            .await,
+        )
+    }
+}
+
+/// Log a dropped ingress event. `topic` carries the channel/alias attribution
+/// (e.g. "channel/alias") so operators can identify which ingress instance
+/// failed; `payload` is never passed here or logged, since it is untrusted.
+fn log_ingress_unavailable(
+    source: SopTriggerSource,
+    reason: SopIngressUnavailable,
+    topic: Option<&str>,
+) {
+    let mut attrs = ::serde_json::json!({
+        "source": source.to_string(),
+        "reason": reason.as_str(),
+    });
+    if let Some(topic) = topic {
+        attrs["topic"] = ::serde_json::Value::String(topic.to_string());
+    }
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(attrs),
+        "SOP ingress: dropping event because required runtime handles are unavailable"
+    );
+}
+
+// ── Trigger-source drift guard ───────────────────────────────────
+
+/// How a [`SopTriggerSource`] variant currently reaches the SOP matcher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SopIngressKind {
+    /// Reaches `dispatch_sop_event_filtered` through the borrowed, optional-handle
+    /// [`SopIngress`] adapter (or its `dispatch_untrusted_fan_in` wrapper), which owns
+    /// handle validation and source-interest gating for untrusted transport fan-in.
+    SharedIngress,
+    /// Reaches the matcher through a dedicated internal call path that already owns
+    /// non-optional engine/audit handles (e.g. the daemon-owned cron tick, or the
+    /// `sop_execute` tool's direct `start_run`), so it never passes through `SopIngress`.
+    DedicatedInternalDispatch,
+    /// Defined and matched, but no live producer feeds it yet (see the doc comment
+    /// on the corresponding `SopTrigger` variant).
+    NotYetLive,
+}
+
+/// Classify every [`SopTriggerSource`] as [`SopIngressKind::SharedIngress`],
+/// [`SopIngressKind::DedicatedInternalDispatch`], or [`SopIngressKind::NotYetLive`].
+///
+/// Deliberately has NO wildcard arm: adding a new `SopTriggerSource` variant without
+/// classifying it here is a compile error. That compile-time failure is the drift
+/// guard - it forces a conscious decision about how a new trigger source enters (or
+/// does not yet enter) the SOP dispatch path, instead of silently falling through.
+pub fn ingress_kind(source: SopTriggerSource) -> SopIngressKind {
+    match source {
+        // Routed through `SopIngress` by the MQTT listener (orchestrator/mqtt.rs).
+        SopTriggerSource::Mqtt => SopIngressKind::SharedIngress,
+        // `SopTrigger::Webhook` doc: "Defined and matched, but no live route feeds it."
+        SopTriggerSource::Webhook => SopIngressKind::NotYetLive,
+        // `check_sop_cron_triggers` calls `dispatch_sop_event` directly with the
+        // daemon's owned, non-optional engine/audit handles; never through `SopIngress`.
+        SopTriggerSource::Cron => SopIngressKind::DedicatedInternalDispatch,
+        // `SopTrigger::Peripheral` doc: "no peripheral listener feeds it"; the
+        // `dispatch_peripheral_signal` helper exists but has no live caller.
+        SopTriggerSource::Peripheral => SopIngressKind::NotYetLive,
+        // Routed through `dispatch_untrusted_fan_in` (-> `SopIngress`) by the
+        // filesystem watcher (channels/src/filesystem.rs).
+        SopTriggerSource::Filesystem => SopIngressKind::SharedIngress,
+        // `CalendarPoller::detect_no_shows` builds events but has no live caller that
+        // dispatches them yet (`SopTrigger::Calendar` doc: "no poller feeds it live").
+        SopTriggerSource::Calendar => SopIngressKind::NotYetLive,
+        // Routed through `SopIngress` by both channel-orchestrator call sites
+        // (`process_channel_message_body` and `dispatch_channel_sop_event`).
+        SopTriggerSource::Channel => SopIngressKind::SharedIngress,
+        // Agent-initiated via the `sop_execute` tool, which calls `engine.start_run`
+        // directly - bypassing trigger matching and `SopIngress` entirely. Per its
+        // doc comment: "Not an external fan-in."
+        SopTriggerSource::Manual => SopIngressKind::DedicatedInternalDispatch,
+        // Routed through `dispatch_untrusted_fan_in` (-> `SopIngress`) by the AMQP
+        // consumer (channels/src/amqp.rs).
+        SopTriggerSource::Amqp => SopIngressKind::SharedIngress,
+    }
+}
+
 // ── Action helpers ──────────────────────────────────────────────
 
 /// Extract the `run_id` from any `SopRunAction` variant.
@@ -904,12 +1097,9 @@ pub fn results_need_redelivery(results: &[DispatchResult]) -> bool {
             .any(|r| matches!(r, DispatchResult::Started { .. }))
 }
 
-/// Headless fan-in chokepoint for untrusted external events (channel
-/// messages, AMQP deliveries, ...): caps oversized topic/payload at the
-/// configured `untrusted_payload_max_bytes` (with an explicit truncation
-/// marker), stamps the event, dispatches it against loaded SOP triggers,
-/// and audits the results. Callers should gate on
-/// `SopEngine::wants_source` first to skip the work when no SOP listens.
+/// Compatibility wrapper for fan-in sources that already require concrete
+/// engine and audit handles. New or handle-optional sources should use
+/// [`SopIngress`] so missing handles and source-interest gating share one path.
 pub async fn dispatch_untrusted_fan_in(
     engine: &Arc<Mutex<SopEngine>>,
     audit: &SopAuditLogger,
@@ -926,23 +1116,38 @@ pub async fn dispatch_untrusted_fan_in(
     // transports without a stable per-message id or without redelivery (a no-op).
     dedup: Option<(String, bool)>,
 ) -> Vec<DispatchResult> {
-    let max_bytes = match engine.lock() {
-        Ok(eng) => eng.config().untrusted_payload_max_bytes,
-        Err(e) => {
-            crate::health::mark_component_error(
-                "sop_dispatch",
-                format!("SOP engine lock poisoned: {e}"),
-            );
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", e), "source": source.to_string()})),
-                "SOP fan-in: engine lock poisoned while reading SOP safety config"
-            );
-            return vec![];
-        }
-    };
+    match SopIngress::new(Some(engine), Some(audit))
+        .dispatch(source, topic, payload, None, dedup)
+        .await
+    {
+        SopIngressOutcome::Dispatched(results) => results,
+        SopIngressOutcome::NotInterested => vec![DispatchResult::NoMatch],
+        SopIngressOutcome::Unavailable(_) => vec![],
+    }
+}
+
+struct PreparedSopIngress<'a> {
+    source: SopTriggerSource,
+    topic: Option<&'a str>,
+    payload: Option<&'a str>,
+    target_sop: Option<&'a str>,
+    dedup: Option<(String, bool)>,
+    max_bytes: usize,
+}
+
+async fn dispatch_untrusted_fan_in_inner(
+    engine: &Arc<Mutex<SopEngine>>,
+    audit: &SopAuditLogger,
+    ingress: PreparedSopIngress<'_>,
+) -> Vec<DispatchResult> {
+    let PreparedSopIngress {
+        source,
+        topic,
+        payload,
+        target_sop,
+        dedup,
+        max_bytes,
+    } = ingress;
     let (topic, topic_truncated) = match topic {
         Some(t) => {
             let (capped, truncated) = crate::security::cap_untrusted(t, max_bytes);
@@ -981,7 +1186,7 @@ pub async fn dispatch_untrusted_fan_in(
         engine,
         audit,
         event,
-        None,
+        target_sop,
         dedup.as_ref().map(|(k, r)| (k.as_str(), *r)),
     )
     .await;
@@ -1492,6 +1697,200 @@ mod tests {
         let results = dispatch_sop_event(&engine, &audit, event).await;
         assert_eq!(results.len(), 1);
         assert!(matches!(&results[0], DispatchResult::NoMatch));
+    }
+
+    #[tokio::test]
+    async fn ingress_reports_missing_handles_instead_of_silently_succeeding() {
+        let missing_both = SopIngress::new(None, None)
+            .dispatch(
+                SopTriggerSource::Channel,
+                Some("git.main:push"),
+                Some("{}"),
+                None,
+                None,
+            )
+            .await;
+        assert!(matches!(
+            missing_both,
+            SopIngressOutcome::Unavailable(SopIngressUnavailable::MissingEngineAndAudit)
+        ));
+
+        let audit = test_audit();
+        let missing_engine = SopIngress::new(None, Some(&audit))
+            .dispatch(
+                SopTriggerSource::Channel,
+                Some("git.main:push"),
+                Some("{}"),
+                None,
+                None,
+            )
+            .await;
+        assert!(matches!(
+            missing_engine,
+            SopIngressOutcome::Unavailable(SopIngressUnavailable::MissingEngine)
+        ));
+
+        let engine = test_engine(vec![test_sop(
+            "channel-sop",
+            vec![SopTrigger::Channel {
+                channel: "git".into(),
+                alias: Some("main".into()),
+                condition: None,
+            }],
+        )]);
+        let missing_audit = SopIngress::new(Some(&engine), None)
+            .dispatch(
+                SopTriggerSource::Channel,
+                Some("git.main:push"),
+                Some("{}"),
+                None,
+                None,
+            )
+            .await;
+        assert!(matches!(
+            missing_audit,
+            SopIngressOutcome::Unavailable(SopIngressUnavailable::MissingAudit)
+        ));
+        assert!(engine.lock().unwrap().active_runs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn ingress_maps_channel_and_mqtt_deliveries_to_canonical_events() {
+        let channel_engine = test_engine(vec![test_sop(
+            "channel-sop",
+            vec![SopTrigger::Channel {
+                channel: "telegram".into(),
+                alias: Some("alerts".into()),
+                condition: None,
+            }],
+        )]);
+        let channel_audit = test_audit();
+        let channel_outcome = SopIngress::new(Some(&channel_engine), Some(&channel_audit))
+            .dispatch(
+                SopTriggerSource::Channel,
+                Some("telegram/alerts"),
+                Some("deploy"),
+                None,
+                None,
+            )
+            .await;
+        assert!(matches!(
+            channel_outcome,
+            SopIngressOutcome::Dispatched(ref results)
+                if matches!(results.as_slice(), [DispatchResult::Started { .. }])
+        ));
+        let channel_event = channel_engine
+            .lock()
+            .unwrap()
+            .active_runs()
+            .values()
+            .next()
+            .unwrap()
+            .trigger_event
+            .clone();
+        assert_eq!(channel_event.source, SopTriggerSource::Channel);
+        assert_eq!(channel_event.topic.as_deref(), Some("telegram/alerts"));
+        assert_eq!(channel_event.payload.as_deref(), Some("deploy"));
+
+        let mqtt_engine = test_engine(vec![test_sop(
+            "mqtt-sop",
+            vec![SopTrigger::Mqtt {
+                topic: "sensors/temperature".into(),
+                condition: None,
+            }],
+        )]);
+        let mqtt_audit = test_audit();
+        let mqtt_outcome = SopIngress::new(Some(&mqtt_engine), Some(&mqtt_audit))
+            .dispatch(
+                SopTriggerSource::Mqtt,
+                Some("sensors/temperature"),
+                Some("21.5"),
+                None,
+                None,
+            )
+            .await;
+        assert!(matches!(
+            mqtt_outcome,
+            SopIngressOutcome::Dispatched(ref results)
+                if matches!(results.as_slice(), [DispatchResult::Started { .. }])
+        ));
+        let mqtt_event = mqtt_engine
+            .lock()
+            .unwrap()
+            .active_runs()
+            .values()
+            .next()
+            .unwrap()
+            .trigger_event
+            .clone();
+        assert_eq!(mqtt_event.source, SopTriggerSource::Mqtt);
+        assert_eq!(mqtt_event.topic.as_deref(), Some("sensors/temperature"));
+        assert_eq!(mqtt_event.payload.as_deref(), Some("21.5"));
+    }
+
+    #[tokio::test]
+    async fn ingress_preserves_targeted_dispatch_and_no_match_results() {
+        let engine = test_engine(vec![
+            test_sop(
+                "alpha",
+                vec![SopTrigger::Channel {
+                    channel: "git".into(),
+                    alias: Some("main".into()),
+                    condition: None,
+                }],
+            ),
+            test_sop(
+                "beta",
+                vec![SopTrigger::Channel {
+                    channel: "git".into(),
+                    alias: Some("main".into()),
+                    condition: None,
+                }],
+            ),
+        ]);
+        let audit = test_audit();
+
+        let targeted = SopIngress::new(Some(&engine), Some(&audit))
+            .dispatch(
+                SopTriggerSource::Channel,
+                Some("git.main:push"),
+                Some("{}"),
+                Some("beta"),
+                None,
+            )
+            .await;
+        assert!(matches!(
+            targeted,
+            SopIngressOutcome::Dispatched(ref results)
+                if matches!(results.as_slice(), [DispatchResult::Started { sop_name, .. }] if sop_name == "beta")
+        ));
+
+        let no_match = SopIngress::new(Some(&engine), Some(&audit))
+            .dispatch(
+                SopTriggerSource::Channel,
+                Some("slack/alerts"),
+                Some("{}"),
+                None,
+                None,
+            )
+            .await;
+        assert!(matches!(
+            no_match,
+            SopIngressOutcome::Dispatched(ref results)
+                if matches!(results.as_slice(), [DispatchResult::NoMatch])
+        ));
+
+        let uninterested_engine = test_engine(vec![test_sop("manual", vec![SopTrigger::Manual])]);
+        let uninterested = SopIngress::new(Some(&uninterested_engine), Some(&audit))
+            .dispatch(
+                SopTriggerSource::Mqtt,
+                Some("sensors/temperature"),
+                Some("21.5"),
+                None,
+                None,
+            )
+            .await;
+        assert!(matches!(uninterested, SopIngressOutcome::NotInterested));
     }
 
     #[tokio::test]
@@ -2721,5 +3120,27 @@ mod tests {
             !results_need_redelivery(&second),
             "a coalesced trigger was absorbed, not lost -> acked"
         );
+    }
+
+    /// Drift guard: every `SopTriggerSource` variant must have a classification.
+    /// `ingress_kind` has no wildcard match arm, so a new variant fails to compile
+    /// until it is classified there; this test documents the iterator side of that
+    /// contract by asserting each variant actually resolves to a `SopIngressKind`.
+    #[test]
+    fn every_trigger_source_has_an_ingress_classification() {
+        use strum::IntoEnumIterator;
+
+        for source in SopTriggerSource::iter() {
+            let kind = ingress_kind(source);
+            assert!(
+                matches!(
+                    kind,
+                    SopIngressKind::SharedIngress
+                        | SopIngressKind::DedicatedInternalDispatch
+                        | SopIngressKind::NotYetLive
+                ),
+                "SopTriggerSource::{source} classified as {kind:?}"
+            );
+        }
     }
 }

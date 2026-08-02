@@ -9,7 +9,7 @@ use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS, Transport};
 
 use zeroclaw_config::schema::MqttConfig;
 use zeroclaw_runtime::sop::audit::SopAuditLogger;
-use zeroclaw_runtime::sop::dispatch::dispatch_untrusted_fan_in;
+use zeroclaw_runtime::sop::dispatch::SopIngress;
 use zeroclaw_runtime::sop::engine::SopEngine;
 use zeroclaw_runtime::sop::types::SopTriggerSource;
 
@@ -69,15 +69,15 @@ pub async fn run_mqtt_sop_listener(
         match eventloop.poll().await {
             Ok(Event::Incoming(Packet::Publish(msg))) => {
                 let payload_raw = String::from_utf8_lossy(&msg.payload);
-                dispatch_untrusted_fan_in(
-                    &engine,
-                    &audit,
-                    SopTriggerSource::Mqtt,
-                    Some(&msg.topic),
-                    Some(&payload_raw),
-                    None,
-                )
-                .await;
+                SopIngress::new(Some(&engine), Some(audit.as_ref()))
+                    .dispatch(
+                        SopTriggerSource::Mqtt,
+                        Some(&msg.topic),
+                        Some(&payload_raw),
+                        None,
+                        None,
+                    )
+                    .await;
             }
             Ok(Event::Incoming(Packet::ConnAck(_))) => {
                 zeroclaw_runtime::health::mark_component_ok("mqtt");
