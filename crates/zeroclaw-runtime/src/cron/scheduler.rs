@@ -78,7 +78,11 @@ impl AnnounceDecision {
 
 /// Decide whether an announce-mode output should be delivered or suppressed.
 /// Suppresses only the *quiet* `NO_REPLY` forms (see [`is_no_reply_sentinel`]);
-/// failure/refusal kinds and all real content are delivered.
+/// failure/refusal kinds and all real content are delivered. Empty output is
+/// deliverable here on purpose: a cron job that produces nothing still has to
+/// surface a delivery failure to the operator. The heartbeat worker applies its
+/// own extra empty-output guard, because there "nothing to say" means silence
+/// toward a human rather than a missing operator signal.
 #[must_use]
 pub fn announce_delivery_decision(output: &str) -> AnnounceDecision {
     if is_no_reply_sentinel(output) {
@@ -2507,21 +2511,41 @@ mod tests {
         }
     }
 
+    /// Mirrors the heartbeat worker's suppression decision (daemon/mod.rs).
+    /// The worker suppresses when the announcement is empty OR when
+    /// `announce_delivery_decision` says so, locking the two user-visible
+    /// heartbeat behaviors from #2128: a `NO_REPLY` heartbeat sends nothing,
+    /// while real output still delivers. Empty output is checked at the worker
+    /// rather than here, because the cron announce site must still attempt
+    /// delivery of an empty run to surface failures to the operator.
     #[test]
     fn heartbeat_announce_decision_matches_worker_behavior() {
+        // Replicates `suppress_delivery` in the heartbeat worker.
+        fn heartbeat_delivers(output: &str) -> bool {
+            !output.trim().is_empty() && announce_delivery_decision(output).should_deliver()
+        }
+
         // NO_REPLY heartbeat: suppressed.
-        assert!(!announce_delivery_decision("NO_REPLY").should_deliver());
-        assert!(!announce_delivery_decision("NO_REPLY[INFO]: all good").should_deliver());
+        assert!(!heartbeat_delivers("NO_REPLY"));
+        assert!(!heartbeat_delivers("NO_REPLY[INFO]: all good"));
         // Non-sentinel heartbeat output: delivered.
-        assert!(announce_delivery_decision("disk usage 42%").should_deliver());
-        // Empty-output fallback string the worker builds: must deliver.
+        assert!(heartbeat_delivers("disk usage 42%"));
+        // Empty output: the agent had nothing to say, so nothing is sent. The
+        // worker no longer synthesizes a "task completed" line, which used to
+        // leak the internal task text to whoever the heartbeat targets.
         assert!(
-            announce_delivery_decision("💓 heartbeat task completed: db health").should_deliver(),
-            "the empty-output heartbeat fallback must never be mistaken for a sentinel"
+            !heartbeat_delivers(""),
+            "empty heartbeat output must stay silent, not become an announcement"
+        );
+        assert!(
+            !heartbeat_delivers("   \n  "),
+            "whitespace-only heartbeat output must stay silent"
         );
         // Failure/refusal kinds: delivered (operator-visible).
-        assert!(announce_delivery_decision("NO_REPLY[FAIL]: db timed out").should_deliver());
-        assert!(announce_delivery_decision("NO_REPLY[REFUSE]: blocked by policy").should_deliver());
+        assert!(heartbeat_delivers("NO_REPLY[FAIL]: db timed out"));
+        assert!(heartbeat_delivers("NO_REPLY[REFUSE]: blocked by policy"));
+        // The shared decision keeps empty output deliverable for cron.
+        assert!(announce_delivery_decision("").should_deliver());
     }
 
     #[tokio::test]

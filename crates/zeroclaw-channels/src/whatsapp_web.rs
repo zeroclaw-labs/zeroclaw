@@ -808,33 +808,33 @@ impl WhatsAppWebChannel {
         use wacore::proto_helpers::MessageExt;
         let base = msg.get_base_message();
 
-        if let Some(ref ext) = base.extended_text_message
-            && let Some(ref ctx) = ext.context_info
+        if let Some(ext) = base.extended_text_message.as_option()
+            && let Some(ctx) = ext.context_info.as_option()
         {
             return Some(ctx);
         }
-        if let Some(ref img) = base.image_message
-            && let Some(ref ctx) = img.context_info
+        if let Some(img) = base.image_message.as_option()
+            && let Some(ctx) = img.context_info.as_option()
         {
             return Some(ctx);
         }
-        if let Some(ref vid) = base.video_message
-            && let Some(ref ctx) = vid.context_info
+        if let Some(vid) = base.video_message.as_option()
+            && let Some(ctx) = vid.context_info.as_option()
         {
             return Some(ctx);
         }
-        if let Some(ref doc) = base.document_message
-            && let Some(ref ctx) = doc.context_info
+        if let Some(doc) = base.document_message.as_option()
+            && let Some(ctx) = doc.context_info.as_option()
         {
             return Some(ctx);
         }
-        if let Some(ref aud) = base.audio_message
-            && let Some(ref ctx) = aud.context_info
+        if let Some(aud) = base.audio_message.as_option()
+            && let Some(ctx) = aud.context_info.as_option()
         {
             return Some(ctx);
         }
-        if let Some(ref stk) = base.sticker_message
-            && let Some(ref ctx) = stk.context_info
+        if let Some(stk) = base.sticker_message.as_option()
+            && let Some(ctx) = stk.context_info.as_option()
         {
             return Some(ctx);
         }
@@ -846,7 +846,7 @@ impl WhatsAppWebChannel {
     fn extract_quoted_message(
         msg: &waproto::whatsapp::Message,
     ) -> Option<&waproto::whatsapp::Message> {
-        Self::extract_context_info(msg).and_then(|ctx| ctx.quoted_message.as_deref())
+        Self::extract_context_info(msg).and_then(|ctx| ctx.quoted_message.as_option())
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -916,7 +916,7 @@ impl WhatsAppWebChannel {
 
         let base = msg.get_base_message();
 
-        if let Some(ref image) = base.image_message {
+        if let Some(image) = base.image_message.as_option() {
             let mime = image
                 .mimetype
                 .clone()
@@ -927,7 +927,7 @@ impl WhatsAppWebChannel {
             );
             Self::push_downloaded_attachment(
                 client,
-                image.as_ref() as &dyn Downloadable,
+                image as &dyn Downloadable,
                 file_name,
                 Some(mime),
                 attachments,
@@ -935,7 +935,7 @@ impl WhatsAppWebChannel {
             .await;
         }
 
-        if let Some(ref video) = base.video_message {
+        if let Some(video) = base.video_message.as_option() {
             let mime = video
                 .mimetype
                 .clone()
@@ -946,7 +946,7 @@ impl WhatsAppWebChannel {
             );
             Self::push_downloaded_attachment(
                 client,
-                video.as_ref() as &dyn Downloadable,
+                video as &dyn Downloadable,
                 file_name,
                 Some(mime),
                 attachments,
@@ -954,7 +954,7 @@ impl WhatsAppWebChannel {
             .await;
         }
 
-        if include_audio && let Some(ref audio) = base.audio_message {
+        if include_audio && let Some(audio) = base.audio_message.as_option() {
             let mime = audio
                 .mimetype
                 .clone()
@@ -965,7 +965,7 @@ impl WhatsAppWebChannel {
             );
             Self::push_downloaded_attachment(
                 client,
-                audio.as_ref() as &dyn Downloadable,
+                audio as &dyn Downloadable,
                 file_name,
                 Some(mime),
                 attachments,
@@ -973,7 +973,7 @@ impl WhatsAppWebChannel {
             .await;
         }
 
-        if let Some(ref sticker) = base.sticker_message {
+        if let Some(sticker) = base.sticker_message.as_option() {
             let mime = sticker
                 .mimetype
                 .clone()
@@ -984,7 +984,7 @@ impl WhatsAppWebChannel {
             );
             Self::push_downloaded_attachment(
                 client,
-                sticker.as_ref() as &dyn Downloadable,
+                sticker as &dyn Downloadable,
                 file_name,
                 Some(mime),
                 attachments,
@@ -1005,7 +1005,7 @@ impl WhatsAppWebChannel {
         // A reaction arrives as a message carrying `reaction_message`, not as a
         // distinct event. Without this branch it renders as empty content and
         // the agent never learns that someone reacted to it.
-        if let Some(ref reaction) = base.reaction_message {
+        if let Some(reaction) = base.reaction_message.as_option() {
             let emoji = reaction.text.as_deref().unwrap_or("");
             return if emoji.is_empty() {
                 "[Reaction removed]".to_string()
@@ -1016,7 +1016,7 @@ impl WhatsAppWebChannel {
         // Poll votes are encrypted; the option text is only recoverable with the
         // poll's message secret. Surface the event so the agent can respond to
         // the fact of a vote even when the choice stays opaque.
-        if let Some(ref poll) = base.poll_creation_message {
+        if let Some(poll) = base.poll_creation_message.as_option() {
             let name = poll.name.as_deref().unwrap_or("");
             return if name.is_empty() {
                 "[Poll]".to_string()
@@ -1024,10 +1024,10 @@ impl WhatsAppWebChannel {
                 format!("[Poll: {name}]")
             };
         }
-        if base.poll_update_message.is_some() {
+        if base.poll_update_message.is_set() {
             return "[Poll vote]".to_string();
         }
-        if let Some(ref contact) = base.contact_message {
+        if let Some(contact) = base.contact_message.as_option() {
             let name = contact.display_name.as_deref().unwrap_or("");
             return if name.is_empty() {
                 "[Contact]".to_string()
@@ -1035,27 +1035,27 @@ impl WhatsAppWebChannel {
                 format!("[Contact: {name}]")
             };
         }
-        if let Some(ref contacts) = base.contacts_array_message {
+        if let Some(contacts) = base.contacts_array_message.as_option() {
             return format!("[{} contacts]", contacts.contacts.len());
         }
         // Round "video note" messages: a distinct social gesture from a plain
         // video, so it is labelled distinctly.
-        if base.ptv_message.is_some() {
+        if base.ptv_message.is_set() {
             return "[Video note]".to_string();
         }
-        if base.sticker_message.is_some() {
+        if base.sticker_message.is_set() {
             return "[Sticker]".to_string();
         }
-        if base.image_message.is_some() {
+        if base.image_message.is_set() {
             return "[Image]".to_string();
         }
-        if base.video_message.is_some() {
+        if base.video_message.is_set() {
             return "[Video]".to_string();
         }
-        if base.document_message.is_some() {
+        if base.document_message.is_set() {
             return "[Document]".to_string();
         }
-        if let Some(ref loc) = base.location_message {
+        if let Some(loc) = base.location_message.as_option() {
             // Live locations are silently ignored — they stream
             // periodic updates and have no meaningful static content.
             if loc.is_live == Some(true) {
@@ -1251,26 +1251,27 @@ impl WhatsAppWebChannel {
         #[allow(clippy::cast_possible_truncation)]
         let estimated_seconds = std::cmp::max(1, (upload.file_length / 4000) as u32);
 
-        // whatsapp-rust 0.6: UploadResponse cryptographic fields became
-        // `[u8; 32]` for type safety. Pull the Vec<u8> copies before
-        // consuming the strings so the partial-move on `upload.direct_path`
-        // doesn't bite.
-        let media_key = upload.media_key_vec();
-        let file_enc_sha256 = upload.file_enc_sha256_vec();
-        let file_sha256 = upload.file_sha256_vec();
+        // UploadResponse cryptographic fields are `[u8; 32]`. Pull the Vec<u8>
+        // copies before consuming the strings so the partial-move on
+        // `upload.direct_path` doesn't bite.
+        let media_key = upload.media_key.to_vec();
+        let file_enc_sha256 = upload.file_enc_sha256.to_vec();
+        let file_sha256 = upload.file_sha256.to_vec();
         let voice_msg = waproto::whatsapp::Message {
-            audio_message: Some(Box::new(waproto::whatsapp::message::AudioMessage {
-                url: Some(upload.url),
-                direct_path: Some(upload.direct_path),
-                media_key: Some(media_key),
-                file_enc_sha256: Some(file_enc_sha256),
-                file_sha256: Some(file_sha256),
-                file_length: Some(upload.file_length),
-                mimetype: Some("audio/ogg; codecs=opus".to_string()),
-                ptt: Some(true),
-                seconds: Some(estimated_seconds),
-                ..Default::default()
-            })),
+            audio_message: waproto::buffa::MessageField::some(
+                waproto::whatsapp::message::AudioMessage {
+                    url: Some(upload.url),
+                    direct_path: Some(upload.direct_path),
+                    media_key: Some(media_key),
+                    file_enc_sha256: Some(file_enc_sha256),
+                    file_sha256: Some(file_sha256),
+                    file_length: Some(upload.file_length),
+                    mimetype: Some("audio/ogg; codecs=opus".to_string()),
+                    ptt: Some(true),
+                    seconds: Some(estimated_seconds),
+                    ..Default::default()
+                },
+            ),
             ..Default::default()
         };
 
@@ -1320,41 +1321,13 @@ impl WhatsAppWebChannel {
             .await
             .map_err(|e| anyhow::Error::msg(format!("WhatsApp media upload failed: {e}")))?;
 
-        let media_key = upload.media_key_vec();
-        let file_enc_sha256 = upload.file_enc_sha256_vec();
-        let file_sha256 = upload.file_sha256_vec();
+        let media_key = upload.media_key.to_vec();
+        let file_enc_sha256 = upload.file_enc_sha256.to_vec();
+        let file_sha256 = upload.file_sha256.to_vec();
         let outgoing = match marker.kind {
             WhatsAppMediaKind::Image => waproto::whatsapp::Message {
-                image_message: Some(Box::new(waproto::whatsapp::message::ImageMessage {
-                    url: Some(upload.url),
-                    direct_path: Some(upload.direct_path),
-                    media_key: Some(media_key),
-                    file_enc_sha256: Some(file_enc_sha256),
-                    file_sha256: Some(file_sha256),
-                    file_length: Some(upload.file_length),
-                    mimetype: Some(mime),
-                    ..Default::default()
-                })),
-                ..Default::default()
-            },
-            WhatsAppMediaKind::Video => waproto::whatsapp::Message {
-                video_message: Some(Box::new(waproto::whatsapp::message::VideoMessage {
-                    url: Some(upload.url),
-                    direct_path: Some(upload.direct_path),
-                    media_key: Some(media_key),
-                    file_enc_sha256: Some(file_enc_sha256),
-                    file_sha256: Some(file_sha256),
-                    file_length: Some(upload.file_length),
-                    mimetype: Some(mime),
-                    ..Default::default()
-                })),
-                ..Default::default()
-            },
-            WhatsAppMediaKind::Audio | WhatsAppMediaKind::Voice => {
-                #[allow(clippy::cast_possible_truncation)]
-                let estimated_seconds = std::cmp::max(1, (upload.file_length / 4000) as u32);
-                waproto::whatsapp::Message {
-                    audio_message: Some(Box::new(waproto::whatsapp::message::AudioMessage {
+                image_message: waproto::buffa::MessageField::some(
+                    waproto::whatsapp::message::ImageMessage {
                         url: Some(upload.url),
                         direct_path: Some(upload.direct_path),
                         media_key: Some(media_key),
@@ -1362,10 +1335,44 @@ impl WhatsAppWebChannel {
                         file_sha256: Some(file_sha256),
                         file_length: Some(upload.file_length),
                         mimetype: Some(mime),
-                        ptt: Some(matches!(marker.kind, WhatsAppMediaKind::Voice)),
-                        seconds: Some(estimated_seconds),
                         ..Default::default()
-                    })),
+                    },
+                ),
+                ..Default::default()
+            },
+            WhatsAppMediaKind::Video => waproto::whatsapp::Message {
+                video_message: waproto::buffa::MessageField::some(
+                    waproto::whatsapp::message::VideoMessage {
+                        url: Some(upload.url),
+                        direct_path: Some(upload.direct_path),
+                        media_key: Some(media_key),
+                        file_enc_sha256: Some(file_enc_sha256),
+                        file_sha256: Some(file_sha256),
+                        file_length: Some(upload.file_length),
+                        mimetype: Some(mime),
+                        ..Default::default()
+                    },
+                ),
+                ..Default::default()
+            },
+            WhatsAppMediaKind::Audio | WhatsAppMediaKind::Voice => {
+                #[allow(clippy::cast_possible_truncation)]
+                let estimated_seconds = std::cmp::max(1, (upload.file_length / 4000) as u32);
+                waproto::whatsapp::Message {
+                    audio_message: waproto::buffa::MessageField::some(
+                        waproto::whatsapp::message::AudioMessage {
+                            url: Some(upload.url),
+                            direct_path: Some(upload.direct_path),
+                            media_key: Some(media_key),
+                            file_enc_sha256: Some(file_enc_sha256),
+                            file_sha256: Some(file_sha256),
+                            file_length: Some(upload.file_length),
+                            mimetype: Some(mime),
+                            ptt: Some(matches!(marker.kind, WhatsAppMediaKind::Voice)),
+                            seconds: Some(estimated_seconds),
+                            ..Default::default()
+                        },
+                    ),
                     ..Default::default()
                 }
             }
@@ -1376,18 +1383,20 @@ impl WhatsAppWebChannel {
                     .unwrap_or("attachment")
                     .to_string();
                 waproto::whatsapp::Message {
-                    document_message: Some(Box::new(waproto::whatsapp::message::DocumentMessage {
-                        url: Some(upload.url),
-                        direct_path: Some(upload.direct_path),
-                        media_key: Some(media_key),
-                        file_enc_sha256: Some(file_enc_sha256),
-                        file_sha256: Some(file_sha256),
-                        file_length: Some(upload.file_length),
-                        mimetype: Some(mime),
-                        file_name: Some(file_name.clone()),
-                        title: Some(file_name),
-                        ..Default::default()
-                    })),
+                    document_message: waproto::buffa::MessageField::some(
+                        waproto::whatsapp::message::DocumentMessage {
+                            url: Some(upload.url),
+                            direct_path: Some(upload.direct_path),
+                            media_key: Some(media_key),
+                            file_enc_sha256: Some(file_enc_sha256),
+                            file_sha256: Some(file_sha256),
+                            file_length: Some(upload.file_length),
+                            mimetype: Some(mime),
+                            file_name: Some(file_name.clone()),
+                            title: Some(file_name),
+                            ..Default::default()
+                        },
+                    ),
                     ..Default::default()
                 }
             }
@@ -1408,13 +1417,15 @@ impl WhatsAppWebChannel {
         loc: &WhatsAppLocation,
     ) -> Result<()> {
         let outgoing = waproto::whatsapp::Message {
-            location_message: Some(Box::new(waproto::whatsapp::message::LocationMessage {
-                degrees_latitude: Some(loc.lat),
-                degrees_longitude: Some(loc.lng),
-                name: loc.name.clone(),
-                address: loc.address.clone(),
-                ..Default::default()
-            })),
+            location_message: waproto::buffa::MessageField::some(
+                waproto::whatsapp::message::LocationMessage {
+                    degrees_latitude: Some(loc.lat),
+                    degrees_longitude: Some(loc.lng),
+                    name: loc.name.clone(),
+                    address: loc.address.clone(),
+                    ..Default::default()
+                },
+            ),
             ..Default::default()
         };
         Box::pin(client.send_message(to.clone(), outgoing))
@@ -2233,7 +2244,7 @@ impl Channel for WhatsAppWebChannel {
             let announce_presence = self.announce_presence;
 
             let mut builder = Bot::builder()
-                .with_backend(backend)
+                .with_backend_arc(backend.clone())
                 .with_transport_factory(transport_factory)
                 .with_http_client(http_client)
                 .with_runtime(TokioRuntime)
@@ -2270,7 +2281,12 @@ impl Channel for WhatsAppWebChannel {
                         // per so we match against `&*event` to get a
                         // `&Event` reference and bind variant fields by ref.
                         match &*event {
-                            Event::Message(msg, info) => {
+                            Event::Messages(batch) => {
+                                // Upstream now batches decrypted inbound messages; each item is
+                                // processed in arrival order exactly as the single-message event was.
+                                for inbound in batch.iter() {
+                                    let msg = &inbound.message;
+                                    let info = &inbound.info;
                                 let sender_jid = info.source.sender.clone();
                                 let sender_alt = info.source.sender_alt.clone();
                                 let sender = sender_jid.user().to_string();
@@ -2308,7 +2324,9 @@ impl Channel for WhatsAppWebChannel {
                                         stanza_id: info.id.to_string(),
                                         chat: chat.clone(),
                                         sender: sender_jid.to_string(),
-                                        sender_phone: mapped_phone.clone(),
+                                        sender_phone: mapped_phone
+                                            .as_deref()
+                                            .map(str::to_string),
                                         is_group: info.source.is_group,
                                         is_from_me: info.source.is_from_me,
                                         is_status: {
@@ -2357,7 +2375,7 @@ impl Channel for WhatsAppWebChannel {
                                             .with_attrs(::serde_json::json!({ "chat": chat })),
                                         "dropping group message: chat not in allowed_groups"
                                     );
-                                    return;
+                                    continue;
                                 }
 
                                 // ── Personal-mode chat-type policy filtering ──
@@ -2375,7 +2393,7 @@ impl Channel for WhatsAppWebChannel {
                                     if is_self_chat {
                                         if !wa_self_chat_mode {
                                             ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "ignoring self-chat message (self_chat_mode=false)");
-                                            return;
+                                            continue;
                                         }
                                         // self_chat_mode=true: always process, skip further policy checks.
                                     } else if info.source.is_from_me
@@ -2387,12 +2405,12 @@ impl Channel for WhatsAppWebChannel {
                                         )
                                     {
                                         ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"chat": chat, "sender": sender})), "ignoring fromMe message outside self-chat thread (chat=, sender=)");
-                                        return;
+                                        continue;
                                     } else if is_group {
                                         match wa_group_policy {
                                             zeroclaw_config::schema::WhatsAppChatPolicy::Ignore => {
                                                 ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "ignoring group message (group_policy=ignore)");
-                                                return;
+                                                continue;
                                             }
                                             zeroclaw_config::schema::WhatsAppChatPolicy::All => {
                                                 // allow unconditionally
@@ -2404,7 +2422,7 @@ impl Channel for WhatsAppWebChannel {
                                                         mapped_phone.as_deref(),
                                                     );
                                                     ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("message from unrecognized sender not in allowed list (candidates_count={}){}", sender_candidates.len(), lid_diag));
-                                                    return;
+                                                    continue;
                                                 }
                                             }
                                         }
@@ -2413,7 +2431,7 @@ impl Channel for WhatsAppWebChannel {
                                         match wa_dm_policy {
                                             zeroclaw_config::schema::WhatsAppChatPolicy::Ignore => {
                                                 ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "ignoring DM (dm_policy=ignore)");
-                                                return;
+                                                continue;
                                             }
                                             zeroclaw_config::schema::WhatsAppChatPolicy::All => {
                                                 // allow unconditionally
@@ -2425,7 +2443,7 @@ impl Channel for WhatsAppWebChannel {
                                                         mapped_phone.as_deref(),
                                                     );
                                                     ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("message from unrecognized sender not in allowed list (candidates_count={}){}", sender_candidates.len(), lid_diag));
-                                                    return;
+                                                    continue;
                                                 }
                                             }
                                         }
@@ -2444,7 +2462,7 @@ impl Channel for WhatsAppWebChannel {
                                         .mark_as_read(
                                             &info.source.chat,
                                             sender_for_receipt.as_ref(),
-                                            vec![info.id.to_string()],
+                                            &[info.id.as_ref()],
                                         )
                                         .await
                                     {
@@ -2491,11 +2509,11 @@ impl Channel for WhatsAppWebChannel {
                                             passive_context = true;
                                         } else if !addressed {
                                             ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "ignoring group message not addressed to bot");
-                                            return;
+                                            continue;
                                         }
                                     } else {
                                         ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "mention_only active but bot identity unknown, skipping group msg");
-                                        return;
+                                        continue;
                                     }
                                 }
 
@@ -2522,7 +2540,7 @@ impl Channel for WhatsAppWebChannel {
                                 if passive_context {
                                     if content.is_empty() {
                                         ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("ignoring empty passive group context from {}", normalized));
-                                        return;
+                                        continue;
                                     }
                                     Self::send_inbound_channel_message(
                                         &tx_inner,
@@ -2536,13 +2554,15 @@ impl Channel for WhatsAppWebChannel {
                                         Self::inbound_message_id(info),
                                     )
                                     .await;
-                                    return;
+                                    continue;
                                 }
 
                                 // Attempt voice note transcription (ptt = push-to-talk = voice note).
                                 // When `transcribe_non_ptt_audio` is enabled in the transcription
                                 // config, also transcribe forwarded / regular audio messages.
-                                let voice_text = if let Some(ref audio) = msg.audio_message {
+                                let voice_text = if let Some(audio) =
+                                    msg.audio_message.as_option()
+                                {
                                     let is_ptt = audio.ptt == Some(true);
                                     let non_ptt_enabled = transcription_config
                                         .as_ref()
@@ -2577,7 +2597,7 @@ impl Channel for WhatsAppWebChannel {
 
                                 if content.is_empty() {
                                     ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("ignoring empty or non-text message from {}", normalized));
-                                    return;
+                                    continue;
                                 }
 
                                 if !passive_from_mention_gating_possible {
@@ -2590,7 +2610,7 @@ impl Channel for WhatsAppWebChannel {
                                         Some(c) => c,
                                         None => {
                                             ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"normalized": normalized})), "message from did not match mention patterns, dropping");
-                                            return;
+                                            continue;
                                         }
                                     };
                                 }
@@ -2627,6 +2647,7 @@ impl Channel for WhatsAppWebChannel {
                                     Self::inbound_message_id(info),
                                 )
                                 .await;
+                                }
                             }
                             Event::Connected(_) => {
                                 crate::login_events::LoginEvent::Connected.emit(
@@ -2637,8 +2658,7 @@ impl Channel for WhatsAppWebChannel {
                                 WhatsAppWebChannel::reset_retry(&retry_count);
                                 let device = client
                                     .persistence_manager()
-                                    .get_device_snapshot()
-                                    .await;
+                                    .get_device_snapshot();
 
                                 // Without an explicit presence announcement the
                                 // account stays invisible and typing indicators
@@ -2657,6 +2677,9 @@ impl Channel for WhatsAppWebChannel {
 
                                 // Resolve bot identity from the device store
                                 if mention_only {
+                                    let device = client
+                                        .persistence_manager()
+                                        .get_device_snapshot();
                                     if let Some(ref pn) = device.pn
                                         && let Some(digits) =
                                             Self::store_jid_digits(&bot_phone_inner, pn.user())
@@ -2702,18 +2725,22 @@ impl Channel for WhatsAppWebChannel {
                             Event::StreamError(stream_error) => {
                                 ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure), &format!("stream error: {:?}", stream_error));
                             }
-                            Event::PairingCode { code, .. } => {
+                            Event::PairingCode(pairing) => {
+                                let code = &pairing.code;
                                 crate::login_events::LoginEvent::PairCode { code: code.as_str() }
                                     .emit(
                                     "whatsapp",
                                     alias.as_ref(),
                                     "WhatsApp Web pair code received — enter it in WhatsApp > Linked Devices",
                                 );
+                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "pair code received");
+                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Link your phone by entering this code in WhatsApp > Linked Devices");
                                 eprintln!();
                                 eprintln!("pair code: {code}");
                                 eprintln!();
                             }
-                            Event::PairingQrCode { code, .. } => {
+                            Event::PairingQrCode(pairing) => {
+                                let code = &pairing.code;
                                 crate::login_events::LoginEvent::Qr {
                                     payload: code.as_str(),
                                     image_url: None,
@@ -2725,6 +2752,7 @@ impl Channel for WhatsAppWebChannel {
                                     alias.as_ref(),
                                     "WhatsApp Web QR code received (scan with WhatsApp > Linked Devices)",
                                 );
+                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "WhatsApp Web QR code received (scan with WhatsApp > Linked Devices)");
                                 match Self::render_pairing_qr(code) {
                                     Ok(rendered) => {
                                         eprintln!();
@@ -2768,11 +2796,13 @@ impl Channel for WhatsAppWebChannel {
                 );
             }
 
-            let mut bot = builder.build().await?;
+            let bot = builder.build().await?;
             *self.client.lock() = Some(bot.client());
 
-            // Run the bot
-            let bot_handle = bot.run().await?;
+            // `Bot::run` now consumes the bot and drives the loop on the
+            // current task; `spawn` is the background counterpart that still
+            // hands back a handle to abort and await.
+            let bot_handle = bot.spawn();
 
             // Store the bot handle for later shutdown
             *self.bot_handle.lock() = Some(bot_handle);
@@ -2803,11 +2833,10 @@ impl Channel for WhatsAppWebChannel {
                 let _ = handle.await;
             }
 
-            // Drop bot/device so the SQLite connection is closed
-            // before we remove session files (releases WAL/SHM locks).
-            // `backend` was moved into the builder, so dropping `bot`
-            // releases the last Arc reference to the storage backend.
-            drop(bot);
+            // Drop the device so the SQLite connection is closed before we
+            // remove session files (releases WAL/SHM locks). `backend` was moved
+            // into the builder and then into the spawned bot, so awaiting and
+            // dropping the handle above released the last storage reference.
             drop(device);
 
             if should_reconnect {
@@ -2997,7 +3026,10 @@ impl Channel for WhatsAppWebChannel {
 
         // Defaults match WA Web's own text-status composer.
         const DEFAULT_STATUS_BACKGROUND_ARGB: u32 = 0xFF31_5575;
-        const DEFAULT_STATUS_FONT: i32 = 0;
+        // `send_text` now takes the generated enum rather than its wire value;
+        // SYSTEM is the 0 this previously passed.
+        const DEFAULT_STATUS_FONT: waproto::whatsapp::message::extended_text_message::FontType =
+            waproto::whatsapp::message::extended_text_message::FontType::SYSTEM;
 
         let result = client
             .status()
@@ -3795,10 +3827,12 @@ mod tests {
         // rendered as empty content, so the agent could not tell it had been
         // reacted to at all.
         let reacted = waproto::whatsapp::Message {
-            reaction_message: Some(waproto::whatsapp::message::ReactionMessage {
-                text: Some("\u{1F44D}".to_string()),
-                ..Default::default()
-            }),
+            reaction_message: waproto::buffa::MessageField::some(
+                waproto::whatsapp::message::ReactionMessage {
+                    text: Some("\u{1F44D}".to_string()),
+                    ..Default::default()
+                },
+            ),
             ..Default::default()
         };
         assert_eq!(
@@ -3808,10 +3842,12 @@ mod tests {
 
         // An empty emoji is WhatsApp's reaction-removal.
         let removed = waproto::whatsapp::Message {
-            reaction_message: Some(waproto::whatsapp::message::ReactionMessage {
-                text: Some(String::new()),
-                ..Default::default()
-            }),
+            reaction_message: waproto::buffa::MessageField::some(
+                waproto::whatsapp::message::ReactionMessage {
+                    text: Some(String::new()),
+                    ..Default::default()
+                },
+            ),
             ..Default::default()
         };
         assert_eq!(
@@ -3824,12 +3860,12 @@ mod tests {
     #[cfg(feature = "whatsapp-web")]
     fn media_fallback_labels_polls_and_contacts() {
         let poll = waproto::whatsapp::Message {
-            poll_creation_message: Some(Box::new(
+            poll_creation_message: waproto::buffa::MessageField::some(
                 waproto::whatsapp::message::PollCreationMessage {
                     name: Some("Lunch?".to_string()),
                     ..Default::default()
                 },
-            )),
+            ),
             ..Default::default()
         };
         assert_eq!(
@@ -3838,10 +3874,12 @@ mod tests {
         );
 
         let contact = waproto::whatsapp::Message {
-            contact_message: Some(Box::new(waproto::whatsapp::message::ContactMessage {
-                display_name: Some("Ada".to_string()),
-                ..Default::default()
-            })),
+            contact_message: waproto::buffa::MessageField::some(
+                waproto::whatsapp::message::ContactMessage {
+                    display_name: Some("Ada".to_string()),
+                    ..Default::default()
+                },
+            ),
             ..Default::default()
         };
         assert_eq!(
@@ -3856,10 +3894,12 @@ mod tests {
         // The fallback must only fill in for empty bodies; a caption or text
         // body always wins over a synthetic label.
         let captioned = waproto::whatsapp::Message {
-            reaction_message: Some(waproto::whatsapp::message::ReactionMessage {
-                text: Some("\u{1F44D}".to_string()),
-                ..Default::default()
-            }),
+            reaction_message: waproto::buffa::MessageField::some(
+                waproto::whatsapp::message::ReactionMessage {
+                    text: Some("\u{1F44D}".to_string()),
+                    ..Default::default()
+                },
+            ),
             ..Default::default()
         };
         assert_eq!(
@@ -4250,20 +4290,22 @@ mod tests {
         mentioned_jids: &[&str],
     ) -> waproto::whatsapp::Message {
         waproto::whatsapp::Message {
-            extended_text_message: Some(Box::new(
+            extended_text_message: waproto::buffa::MessageField::some(
                 waproto::whatsapp::message::ExtendedTextMessage {
                     text: Some("expand the previous response".to_string()),
-                    context_info: Some(Box::new(waproto::whatsapp::ContextInfo {
-                        participant: Some(participant.to_string()),
-                        mentioned_jid: mentioned_jids
-                            .iter()
-                            .map(|jid| (*jid).to_string())
-                            .collect(),
-                        ..Default::default()
-                    })),
+                    context_info: waproto::buffa::MessageField::some(
+                        waproto::whatsapp::ContextInfo {
+                            participant: Some(participant.to_string()),
+                            mentioned_jid: mentioned_jids
+                                .iter()
+                                .map(|jid| (*jid).to_string())
+                                .collect(),
+                            ..Default::default()
+                        },
+                    ),
                     ..Default::default()
                 },
-            )),
+            ),
             ..Default::default()
         }
     }
@@ -4274,15 +4316,19 @@ mod tests {
         quoted_message: Option<waproto::whatsapp::Message>,
     ) -> waproto::whatsapp::Message {
         waproto::whatsapp::Message {
-            sticker_message: Some(Box::new(waproto::whatsapp::message::StickerMessage {
-                mimetype: Some("image/webp".to_string()),
-                context_info: Some(Box::new(waproto::whatsapp::ContextInfo {
-                    participant: Some(participant.to_string()),
-                    quoted_message: quoted_message.map(Box::new),
+            sticker_message: waproto::buffa::MessageField::some(
+                waproto::whatsapp::message::StickerMessage {
+                    mimetype: Some("image/webp".to_string()),
+                    context_info: waproto::buffa::MessageField::some(
+                        waproto::whatsapp::ContextInfo {
+                            participant: Some(participant.to_string()),
+                            quoted_message: quoted_message.into(),
+                            ..Default::default()
+                        },
+                    ),
                     ..Default::default()
-                })),
-                ..Default::default()
-            })),
+                },
+            ),
             ..Default::default()
         }
     }
@@ -4290,17 +4336,21 @@ mod tests {
     #[cfg(feature = "whatsapp-web")]
     fn image_mention(mentioned_jids: &[&str]) -> waproto::whatsapp::Message {
         waproto::whatsapp::Message {
-            image_message: Some(Box::new(waproto::whatsapp::message::ImageMessage {
-                mimetype: Some("image/jpeg".to_string()),
-                context_info: Some(Box::new(waproto::whatsapp::ContextInfo {
-                    mentioned_jid: mentioned_jids
-                        .iter()
-                        .map(|jid| (*jid).to_string())
-                        .collect(),
+            image_message: waproto::buffa::MessageField::some(
+                waproto::whatsapp::message::ImageMessage {
+                    mimetype: Some("image/jpeg".to_string()),
+                    context_info: waproto::buffa::MessageField::some(
+                        waproto::whatsapp::ContextInfo {
+                            mentioned_jid: mentioned_jids
+                                .iter()
+                                .map(|jid| (*jid).to_string())
+                                .collect(),
+                            ..Default::default()
+                        },
+                    ),
                     ..Default::default()
-                })),
-                ..Default::default()
-            })),
+                },
+            ),
             ..Default::default()
         }
     }
@@ -4502,16 +4552,18 @@ mod tests {
     #[cfg(feature = "whatsapp-web")]
     fn extract_quoted_message_reads_media_context_info() {
         let quoted = waproto::whatsapp::Message {
-            image_message: Some(Box::new(waproto::whatsapp::message::ImageMessage {
-                mimetype: Some("image/png".to_string()),
-                ..Default::default()
-            })),
+            image_message: waproto::buffa::MessageField::some(
+                waproto::whatsapp::message::ImageMessage {
+                    mimetype: Some("image/png".to_string()),
+                    ..Default::default()
+                },
+            ),
             ..Default::default()
         };
         let msg = sticker_reply("200@lid", Some(quoted));
         let quoted = WhatsAppWebChannel::extract_quoted_message(&msg)
             .expect("sticker reply should expose the quoted message");
-        assert!(quoted.image_message.is_some());
+        assert!(quoted.image_message.as_option().is_some());
     }
 
     #[test]
@@ -4542,12 +4594,14 @@ mod tests {
     #[cfg(feature = "whatsapp-web")]
     fn media_fallback_content_parses_static_location() {
         let msg = waproto::whatsapp::Message {
-            location_message: Some(Box::new(waproto::whatsapp::message::LocationMessage {
-                degrees_latitude: Some(40.7128),
-                degrees_longitude: Some(-74.0060),
-                name: Some("NYC".into()),
-                ..Default::default()
-            })),
+            location_message: waproto::buffa::MessageField::some(
+                waproto::whatsapp::message::LocationMessage {
+                    degrees_latitude: Some(40.7128),
+                    degrees_longitude: Some(-74.0060),
+                    name: Some("NYC".into()),
+                    ..Default::default()
+                },
+            ),
             ..Default::default()
         };
         assert_eq!(
@@ -4560,12 +4614,14 @@ mod tests {
     #[cfg(feature = "whatsapp-web")]
     fn media_fallback_content_skips_live_location() {
         let msg = waproto::whatsapp::Message {
-            location_message: Some(Box::new(waproto::whatsapp::message::LocationMessage {
-                degrees_latitude: Some(40.7128),
-                degrees_longitude: Some(-74.0060),
-                is_live: Some(true),
-                ..Default::default()
-            })),
+            location_message: waproto::buffa::MessageField::some(
+                waproto::whatsapp::message::LocationMessage {
+                    degrees_latitude: Some(40.7128),
+                    degrees_longitude: Some(-74.0060),
+                    is_live: Some(true),
+                    ..Default::default()
+                },
+            ),
             ..Default::default()
         };
         assert_eq!(
@@ -4579,11 +4635,13 @@ mod tests {
     fn media_fallback_content_skips_missing_coordinates() {
         // Missing longitude — should silently drop, not fabricate 0,0
         let msg = waproto::whatsapp::Message {
-            location_message: Some(Box::new(waproto::whatsapp::message::LocationMessage {
-                degrees_latitude: Some(40.7128),
-                degrees_longitude: None,
-                ..Default::default()
-            })),
+            location_message: waproto::buffa::MessageField::some(
+                waproto::whatsapp::message::LocationMessage {
+                    degrees_latitude: Some(40.7128),
+                    degrees_longitude: None,
+                    ..Default::default()
+                },
+            ),
             ..Default::default()
         };
         assert_eq!(
@@ -4592,11 +4650,13 @@ mod tests {
         );
         // Missing latitude
         let msg = waproto::whatsapp::Message {
-            location_message: Some(Box::new(waproto::whatsapp::message::LocationMessage {
-                degrees_latitude: None,
-                degrees_longitude: Some(-74.0060),
-                ..Default::default()
-            })),
+            location_message: waproto::buffa::MessageField::some(
+                waproto::whatsapp::message::LocationMessage {
+                    degrees_latitude: None,
+                    degrees_longitude: Some(-74.0060),
+                    ..Default::default()
+                },
+            ),
             ..Default::default()
         };
         assert_eq!(

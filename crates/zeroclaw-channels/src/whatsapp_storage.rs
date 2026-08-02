@@ -14,8 +14,6 @@ use std::sync::Arc;
 #[cfg(feature = "whatsapp-web")]
 use bytes::Bytes;
 #[cfg(feature = "whatsapp-web")]
-use prost::Message;
-#[cfg(feature = "whatsapp-web")]
 use wacore::appstate::hash::HashState;
 #[cfg(feature = "whatsapp-web")]
 use wacore::appstate::processor::AppStateMutationMAC;
@@ -555,6 +553,21 @@ impl SignalStore for RusqliteStore {
         }
     }
 
+    /// UPDATE-only on purpose: a pre-key consumed between the upload snapshot
+    /// and this call must stay deleted rather than be resurrected by an upsert.
+    async fn mark_prekeys_uploaded(&self, ids: &[u32]) -> wacore::store::error::Result<()> {
+        let conn = self.conn.lock();
+
+        for id in ids {
+            to_store_err!(execute: conn.execute(
+                "UPDATE prekeys SET uploaded = 1 WHERE id = ?1 AND device_id = ?2",
+                params![id, self.device_id],
+            ))?;
+        }
+
+        Ok(())
+    }
+
     async fn remove_prekey(&self, id: u32) -> wacore::store::error::Result<()> {
         let conn = self.conn.lock();
         to_store_err!(execute: conn.execute(
@@ -782,6 +795,17 @@ impl AppSyncStore for RusqliteStore {
         }
 
         Ok(())
+    }
+
+    /// Called on snapshot re-sync: the MAC store is rebuilt from the snapshot to
+    /// match the ltHash baseline, and leftover entries would corrupt the next
+    /// patch's ltHash.
+    async fn clear_mutation_macs(&self, name: &str) -> wacore::store::error::Result<()> {
+        let conn = self.conn.lock();
+        to_store_err!(execute: conn.execute(
+            "DELETE FROM app_state_mutation_macs WHERE name = ?1 AND device_id = ?2",
+            params![name, self.device_id],
+        ))
     }
 
     /// Get the most recently stored app state sync key ID.
@@ -1349,15 +1373,22 @@ impl ProtocolStore for RusqliteStore {
         Ok(result)
     }
 
+    /// A row survives while either window is still live — the received token or
+    /// the sender bucket — so recent sender state is never dropped just because
+    /// the received token expired.
     async fn delete_expired_tc_tokens(
         &self,
-        cutoff_timestamp: i64,
+        token_cutoff: i64,
+        sender_cutoff: i64,
     ) -> wacore::store::error::Result<u32> {
         let conn = self.conn.lock();
         let deleted = conn
             .execute(
-                "DELETE FROM tc_tokens WHERE token_timestamp < ?1 AND device_id = ?2",
-                params![cutoff_timestamp, self.device_id],
+                "DELETE FROM tc_tokens
+                 WHERE device_id = ?3
+                   AND (length(token) = 0 OR token_timestamp < ?1)
+                   AND (sender_timestamp IS NULL OR sender_timestamp < ?2)",
+                params![token_cutoff, sender_cutoff, self.device_id],
             )
             .map_err(|e| {
                 wacore::store::error::StoreError::Database(
@@ -1486,7 +1517,10 @@ impl DeviceStoreTrait for RusqliteStore {
 
         // Safety: device account data is stored to DB only; to_store_err! converts
         // rusqlite errors without logging parameter values.
-        let account = device.account.as_ref().map(|a| a.encode_to_vec());
+        let account = device
+            .account
+            .as_ref()
+            .map(|a| waproto::codec::adv_signed_device_identity_to_vec(a));
 
         let server_cert_chain_blob = device
             .server_cert_chain
@@ -1598,7 +1632,7 @@ impl DeviceStoreTrait for RusqliteStore {
                     // Upstream now stores the identity behind an `Arc` so the
                     // decoded value can be shared without re-decoding.
                     Some(std::sync::Arc::new(
-                        waproto::whatsapp::AdvSignedDeviceIdentity::decode(&*bytes)
+                        waproto::codec::adv_signed_device_identity_decode(&bytes)
                             .map_err(to_rusqlite_err)?,
                     ))
                 } else {
@@ -1844,7 +1878,7 @@ mod tests {
             .await
             .unwrap();
 
-        let deleted = ProtocolStore::delete_expired_tc_tokens(&store, 100)
+        let deleted = ProtocolStore::delete_expired_tc_tokens(&store, 100, 100)
             .await
             .unwrap();
         assert_eq!(deleted, 1);
@@ -1871,10 +1905,10 @@ mod tests {
         let store = RusqliteStore::new(tmp.path()).unwrap();
 
         let entry = |expires_at: i64, message_ts: i64| MsgSecretEntry {
-            chat: "120363000000000000@g.us".to_string(),
-            sender: "15551234567@s.whatsapp.net".to_string(),
-            msg_id: "3EB0F1C2".to_string(),
-            secret: vec![7u8; 32],
+            chat: "120363000000000000@g.us".into(),
+            sender: "15551234567@s.whatsapp.net".into(),
+            msg_id: "3EB0F1C2".into(),
+            secret: [7u8; 32],
             expires_at,
             message_ts,
         };
@@ -1940,10 +1974,10 @@ mod tests {
         MsgSecretStore::put_msg_secrets(
             &store,
             vec![MsgSecretEntry {
-                chat: "status@broadcast".to_string(),
-                sender: "15551234567@s.whatsapp.net".to_string(),
-                msg_id: "STATUS1".to_string(),
-                secret: vec![1u8; 32],
+                chat: "status@broadcast".into(),
+                sender: "15551234567@s.whatsapp.net".into(),
+                msg_id: "STATUS1".into(),
+                secret: [1u8; 32],
                 expires_at: 0,
                 message_ts: 500,
             }],

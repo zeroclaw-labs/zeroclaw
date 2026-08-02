@@ -133,6 +133,40 @@ impl HeartbeatMetrics {
     }
 }
 
+/// Spread a heartbeat interval randomly around its nominal value.
+///
+/// A heartbeat that fires on an exact clock (every 2 minutes, forever) is a
+/// documented bot-detection signal on consumer messaging platforms — humans do
+/// not act on a metronome. `fraction` is the caller's source of randomness in
+/// `[0.0, 1.0)`, kept as a parameter so the spread is deterministic under test.
+/// `spread_pct` is the half-width of the window as a percentage of `minutes`,
+/// so 25 turns a 60-minute interval into a uniform draw over 45..=75 minutes.
+///
+/// The result is clamped to at least 1 minute: a jittered interval must never
+/// collapse to zero and spin the worker.
+#[must_use]
+pub fn apply_interval_jitter(minutes: u32, spread_pct: u32, fraction: f64) -> u32 {
+    if minutes == 0 || spread_pct == 0 {
+        return minutes.max(1);
+    }
+    let spread = f64::from(minutes) * f64::from(spread_pct.min(100)) / 100.0;
+    // Map [0,1) onto [-spread, +spread).
+    let offset = spread.mul_add(2.0 * fraction.clamp(0.0, 1.0), -spread);
+    let jittered = (f64::from(minutes) + offset).round();
+    if jittered < 1.0 {
+        1
+    } else {
+        // Saturates rather than wrapping on absurd configured intervals.
+        u32::try_from(jittered as i64).unwrap_or(u32::MAX).max(1)
+    }
+}
+
+/// Compute the adaptive interval for the next heartbeat tick.
+///
+/// Strategy:
+/// - On failures: exponential back-off `base * 2^failures` capped at `max_interval`.
+/// - When high-priority tasks are present: use `min_interval` for faster reaction.
+/// - Otherwise: use `base_interval`.
 pub fn compute_adaptive_interval(
     base_minutes: u32,
     min_minutes: u32,
@@ -845,6 +879,53 @@ mod tests {
     fn adaptive_backoff_respects_min() {
         // Even with failures, must be >= min
         assert!(compute_adaptive_interval(5, 10, 120, 0, false) >= 10);
+    }
+
+    // ── Interval jitter ─────────────────────────────────────────
+
+    #[test]
+    fn jitter_midpoint_returns_nominal_interval() {
+        // fraction 0.5 is the centre of the window: no displacement.
+        assert_eq!(apply_interval_jitter(60, 25, 0.5), 60);
+    }
+
+    #[test]
+    fn jitter_spans_the_configured_window() {
+        // 25% of 60 = 15 minutes either side.
+        assert_eq!(apply_interval_jitter(60, 25, 0.0), 45);
+        assert_eq!(apply_interval_jitter(60, 25, 0.999), 75);
+    }
+
+    #[test]
+    fn jitter_never_collapses_to_zero() {
+        // A 1-minute interval with maximum spread must still tick.
+        assert!(apply_interval_jitter(1, 100, 0.0) >= 1);
+        assert!(apply_interval_jitter(2, 100, 0.0) >= 1);
+    }
+
+    #[test]
+    fn jitter_disabled_is_identity() {
+        assert_eq!(apply_interval_jitter(30, 0, 0.0), 30);
+        assert_eq!(apply_interval_jitter(30, 0, 0.999), 30);
+    }
+
+    #[test]
+    fn jitter_tolerates_out_of_range_fraction() {
+        // Callers feeding a bad RNG must not produce a wild interval.
+        assert_eq!(apply_interval_jitter(60, 25, -5.0), 45);
+        assert_eq!(apply_interval_jitter(60, 25, 5.0), 75);
+    }
+
+    #[test]
+    fn jitter_actually_varies_across_draws() {
+        // The whole point is that consecutive intervals are not identical.
+        let draws: std::collections::HashSet<u32> = (0..20)
+            .map(|i| apply_interval_jitter(60, 25, f64::from(i) / 20.0))
+            .collect();
+        assert!(
+            draws.len() > 5,
+            "jitter must spread intervals, got {draws:?}"
+        );
     }
 
     // ── Engine metrics accessor ─────────────────────────────────

@@ -48,10 +48,24 @@ def is_additive(upstream, ours, base):
     return all(l in upstream for l in base_set) and all(l in ours for l in base_set)
 
 
+def balanced(lines):
+    """Rough delimiter balance over a set of lines.
+
+    Not a parser: string literals and comments can skew it. It is used only to
+    compare a file against itself before and after a rewrite, where any skew is
+    identical on both sides and cancels out.
+    """
+    text = "\n".join(lines)
+    return (text.count("{") - text.count("}"),
+            text.count("(") - text.count(")"),
+            text.count("[") - text.count("]"))
+
+
 def main(paths):
     failed = False
     for path in paths:
-        lines = open(path, errors="replace").read().splitlines()
+        original = open(path, errors="replace").read().splitlines()
+        lines = list(original)
         found = regions(lines)
         if not found:
             continue
@@ -77,6 +91,30 @@ def main(paths):
             upstream = lines[r["start"] + 1:up_end]
             ours = lines[r["sep"] + 1:r["end"]]
             lines[r["start"]:r["end"] + 1] = upstream + ours
+
+        # Concatenating two hunks can splice one side into the middle of the
+        # other's unfinished expression — a `mod` block landing inside an open
+        # `assert!(` produced a file that could not be parsed at all.
+        #
+        # Comparing the joined file against itself proves nothing: both sides
+        # carry the same skew and it cancels. The real question is whether the
+        # JOINED hunk is a well-formed replacement, so each hunk is measured on
+        # its own. Two hunks that are individually balanced concatenate safely;
+        # if either leaves a delimiter open, gluing them interleaves two
+        # unfinished expressions and the result cannot parse.
+        spliced = []
+        for r in found:
+            up_end = r["base"] if r["base"] is not None else r["sep"]
+            upstream = original[r["start"] + 1:up_end]
+            ours = original[r["sep"] + 1:r["end"]]
+            if balanced(upstream) != (0, 0, 0) or balanced(ours) != (0, 0, 0):
+                spliced.append(r["start"] + 1)
+        if spliced:
+            print(f"NEEDS REVIEW {path}: hunk(s) at line(s) "
+                  f"{', '.join(map(str, spliced))} leave delimiters open; "
+                  f"joining them would splice one into the other")
+            failed = True
+            continue
 
         open(path, "w").write("\n".join(lines) + "\n")
         print(f"resolved {path}: {len(found)} additive conflict(s)")

@@ -10696,9 +10696,6 @@ pub struct MemoryConfig {
     /// MMR relevance-vs-diversity weight, where 1.0 means relevance-only.
     #[serde(default = "default_mmr_lambda")]
     pub mmr_lambda: f64,
-    /// Importance weight used by the recall blend.
-    #[serde(default = "default_importance_weight")]
-    pub importance_weight: f64,
     /// Recency weight used by the recall blend.
     #[serde(default = "default_recency_weight")]
     pub recency_weight: f64,
@@ -11145,9 +11142,6 @@ fn default_vector_weight() -> f64 {
 fn default_keyword_weight() -> f64 {
     0.3
 }
-fn default_importance_weight() -> f64 {
-    0.2
-}
 fn default_min_relevance_score() -> f64 {
     0.4
 }
@@ -11205,7 +11199,6 @@ impl Default for MemoryConfig {
             rerank_threshold: default_rerank_threshold(),
             rerank_strategy: default_rerank_strategy(),
             mmr_lambda: default_mmr_lambda(),
-            importance_weight: default_importance_weight(),
             recency_weight: default_recency_weight(),
             fts_early_return_score: default_fts_early_return_score(),
             default_namespace: default_namespace(),
@@ -12539,6 +12532,12 @@ pub struct HeartbeatConfig {
     /// high-priority tasks. Default: `false`.
     #[serde(default)]
     pub adaptive: bool,
+    /// Randomly spread each tick by ±this percentage of the interval, so the
+    /// heartbeat does not fire on an exact clock. Perfectly periodic activity
+    /// is a bot signature on consumer messaging platforms. `0` disables the
+    /// spread. Default: `20`.
+    #[serde(default = "default_heartbeat_jitter_pct")]
+    pub jitter_pct: u32,
     /// Minimum interval in minutes when adaptive mode is enabled. Default: `5`.
     #[serde(default = "default_heartbeat_min_interval")]
     pub min_interval_minutes: u32,
@@ -12582,6 +12581,10 @@ fn default_two_phase() -> bool {
     true
 }
 
+fn default_heartbeat_jitter_pct() -> u32 {
+    20
+}
+
 fn default_heartbeat_min_interval() -> u32 {
     5
 }
@@ -12609,6 +12612,7 @@ impl Default for HeartbeatConfig {
             target: None,
             to: None,
             adaptive: false,
+            jitter_pct: default_heartbeat_jitter_pct(),
             min_interval_minutes: default_heartbeat_min_interval(),
             max_interval_minutes: default_heartbeat_max_interval(),
             deadman_timeout_minutes: 0,

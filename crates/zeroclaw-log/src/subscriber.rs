@@ -359,6 +359,11 @@ mod tests {
         assert!(
             !out.contains(F_EPHEMERAL_ATTRS),
             "bool-recorded ephemeral field leaked: {out:?}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod log_bridge_tests {
     /// Dependencies that emit through the `log` crate must reach the
     /// tracing subscriber. `whatsapp-rust` reports the WhatsApp Web pair

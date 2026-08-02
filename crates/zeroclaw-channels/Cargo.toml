@@ -130,23 +130,39 @@ rand = "0.10"
 webpki-roots = "1.0.6"
 tokio-socks = "0.5"
 
-# WhatsApp Web (optional). Pinned to oxidezap/whatsapp-rust @ c6385d0b60
-# until upstream ships 0.6.1 to crates.io.
+# WhatsApp Web (optional)
+# Upstream crates from oxidezap/whatsapp-rust, pinned to commit 13fce2f.
+# Pinning via a plain `git` source (not `[patch.crates-io]`) keeps the
+# workspace buildable until oxidezap publishes the fix as 0.6.1, at which
+# point this block reverts to versioned crates.io deps.
 #
-# Ahead of upstream's cbcdd2a: c6385d0b60 carries Client::send_reaction, which
-# this commit's reaction support calls directly. A later commit in this layer
-# moves to 13fce2f for the pair-code and history-sync fixes.
-whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "c6385d0b60", optional = true, default-features = false, features = [
+# Commit history:
+# - 9734fb2: MSRV fix for `if let` guard (wacore/src/history_sync.rs:93)
+#            stable only on Rust 1.94+; ZeroClaw MSRV is 1.96.1 so this is
+#            well within the supported baseline.
+#            Fixes the post-2026-04-24 WhatsApp Web protocol break (#6246).
+# - cbcdd2a: PR #636 fix for LID namespace conversion. Fixes ACK 400
+#            "server requires all participants to share the same JID
+#            namespace" error when sending DMs to LID-addressed recipients.
+# - d394551: PR #976 sends `link_code_pairing_nonce` as the raw byte 0x00
+#            instead of ASCII '0' (0x30). The old byte made the server
+#            reject the whole companion_hello IQ with 400 bad-request, so
+#            pair-code login was impossible. Carried locally as a vendored
+#            `[patch]` until this pin bump; the vendor tree is now deleted.
+# - 13fce2f: current upstream main. Also brings #1202 (IQ parser reports the
+#            `<error>` detail it used to drop), which is exactly the
+#            diagnostic that was missing while debugging the pair-code 400.
+whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "13fce2f07dd9c6802716401b7b3841af48909a84", optional = true, default-features = false, features = [
   "tokio-runtime",
 ] }
-wacore = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "c6385d0b60", optional = true, default-features = false }
-wacore-binary = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "c6385d0b60", optional = true, default-features = false }
-waproto = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "c6385d0b60", optional = true, default-features = false }
+wacore = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "13fce2f07dd9c6802716401b7b3841af48909a84", optional = true, default-features = false }
+wacore-binary = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "13fce2f07dd9c6802716401b7b3841af48909a84", optional = true, default-features = false }
+waproto = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "13fce2f07dd9c6802716401b7b3841af48909a84", optional = true, default-features = false }
 serde-big-array = { version = "0.5", optional = true }
 
 cpal = { version = "0.15", optional = true }
-whatsapp-rust-ureq-http-client = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "c6385d0b60", optional = true }
-whatsapp-rust-tokio-transport = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "c6385d0b60", optional = true, default-features = false }
+whatsapp-rust-ureq-http-client = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "13fce2f07dd9c6802716401b7b3841af48909a84", optional = true }
+whatsapp-rust-tokio-transport = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "13fce2f07dd9c6802716401b7b3841af48909a84", optional = true, default-features = false }
 qrcode = { version = "0.14", optional = true }
 # `bytes` is required for the `Bytes` return types in wacore 0.6 storage
 # traits (SignalStore::get_session / load_prekey). Feature-gated to

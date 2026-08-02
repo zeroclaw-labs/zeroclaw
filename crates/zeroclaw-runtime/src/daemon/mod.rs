@@ -1679,13 +1679,25 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                             .await;
                     }
 
-                    let announcement = if output.trim().is_empty() {
-                        format!("💓 heartbeat task completed: {}", task.text)
-                    } else {
-                        output
-                    };
-                    let suppress_delivery =
-                        !crate::cron::scheduler::announce_delivery_decision(&announcement)
+                    // An empty output means the agent produced nothing to say.
+                    // Delivering a synthesized "task completed" line here would
+                    // push the raw `task.text` — internal operator wording, and
+                    // on a user-facing channel a leak of the agent's own
+                    // scaffolding — to whoever the heartbeat targets. The
+                    // completion is already durably recorded by `record_run`
+                    // above, so silence loses no operator-visible information.
+                    let announcement = output;
+                    // Skip delivery when the heartbeat agent signalled "nothing
+                    // to report" via the quiet NO_REPLY sentinel. Without this
+                    // guard the literal sentinel string is announced to the
+                    // channel (zeroclaw-labs/zeroclaw#2128). Empty output is
+                    // suppressed by the same decision (it is not deliverable),
+                    // so checking the final announcement is sufficient.
+                    // Failure/refusal kinds
+                    // (`NO_REPLY[FAIL]` / `NO_REPLY[REFUSE]`) are delivered, not
+                    // suppressed — they carry operator-visible meaning.
+                    let suppress_delivery = announcement.trim().is_empty()
+                        || !crate::cron::scheduler::announce_delivery_decision(&announcement)
                             .should_deliver();
                     if suppress_delivery {
                         ::zeroclaw_log::record!(
@@ -1790,18 +1802,28 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
         }
 
         // Compute next sleep interval
-        if adaptive {
+        let next_interval = if adaptive {
             let failures = metrics.lock().consecutive_failures;
-            sleep_mins = compute_adaptive_interval(
+            compute_adaptive_interval(
                 base_interval,
                 config.heartbeat.min_interval_minutes,
                 config.heartbeat.max_interval_minutes,
                 failures,
                 has_high_priority,
-            );
+            )
         } else {
-            sleep_mins = base_interval;
-        }
+            base_interval
+        };
+        // Spread the next tick so the heartbeat does not fire on an exact
+        // clock. Consumer messaging platforms treat perfectly periodic
+        // activity as a bot signature, and a heartbeat that can message a
+        // real person is exactly that traffic. Randomness is drawn here and
+        // passed in, keeping the arithmetic deterministic under test.
+        sleep_mins = crate::heartbeat::engine::apply_interval_jitter(
+            next_interval,
+            config.heartbeat.jitter_pct,
+            rand::random::<f64>(),
+        );
     }
 }
 
