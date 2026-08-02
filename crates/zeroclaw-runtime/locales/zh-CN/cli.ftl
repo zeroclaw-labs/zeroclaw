@@ -939,3 +939,34 @@ sop-rpc-decision-invalid-state = 运行 {$run_id} 无法在当前状态下完成
 sop-rpc-decision-unauthorized = RPC 主体无权对该 SOP 步骤作出决策。
 sop-rpc-policy-missing = 未配置 SOP 审批策略“{$name}”。
 sop-rpc-policy-unavailable = 暂停的 SOP 策略不可用：{$reason}。
+
+# ── Tool approval (channels, #9409) ──
+# Human-visible copy for the operator-facing tool-approval prompt, shared
+# across the button adapters (Telegram, Discord, Slack) and the text-reply
+# adapters (Matrix, Signal, WhatsApp, Slack polling fallback). Approval
+# TOKENS, `callback_data`/`custom_id`/`action_id` values, and the reply
+# KEYWORDS parsed by `util::parse_approval_reply` (yes/y/approve, no/n/deny,
+# always) stay hardcoded ASCII in Rust — only the surrounding prose is
+# localized here.
+channel-approval-heading = 需要工具批准
+channel-approval-heading-shout = 需要批准
+channel-approval-tool-label = 工具
+channel-approval-args-label = 参数
+channel-approval-btn-approve = 批准
+channel-approval-btn-deny = 拒绝
+channel-approval-btn-always = 始终
+channel-approval-tap-instruction = 点击下方按钮：
+channel-approval-reply-instruction-yesno = 回复：“{ $yes_command }”、“{ $no_command }” 或 “{ $always_command }”
+channel-approval-reply-instruction-approve-deny = 回复 `{ $approve_command }` / `{ $deny_command }` / `{ $always_command }`。
+channel-telegram-approval-ack-approved = 已批准
+channel-telegram-approval-ack-always-approved = 已始终批准
+channel-telegram-approval-ack-denied = 已拒绝
+channel-telegram-approval-ack-unknown = 未知操作
+channel-discord-approval-btn-allow-once = 仅本次允许
+channel-discord-approval-btn-allow-session = 本会话允许
+channel-discord-approval-btn-allow-always = 始终允许
+channel-approval-title = 批准 { $tool }？
+channel-approval-opt-allow-once = 仅本次允许
+channel-approval-opt-allow-always = 始终允许
+channel-approval-opt-reject = 拒绝
+channel-approval-opt-reject-with-edit = 编辑后拒绝

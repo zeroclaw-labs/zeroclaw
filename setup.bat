@@ -7,7 +7,7 @@ setlocal enabledelayedexpansion
 :: Usage: setup.bat [--prebuilt | --minimal | --dist | --default | --all | --dry-run | --help]
 :: ============================================================================
 
-set "VERSION=0.8.3"
+set "VERSION=0.8.4"
 set "RUST_MIN_VERSION=1.87"
 set "TARGET=x86_64-pc-windows-msvc"
 set "REPO=https://github.com/zeroclaw-labs/zeroclaw"

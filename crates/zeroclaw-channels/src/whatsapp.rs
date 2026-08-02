@@ -805,9 +805,10 @@ impl Channel for WhatsAppChannel {
             map.insert(token.clone(), tx_approval);
         }
 
-        let text = format!(
-            "APPROVAL REQUIRED [{}]\nTool: {}\nArgs: {}\n\nReply: \"{} yes\", \"{} no\", or \"{} always\"",
-            token, request.tool_name, request.arguments_summary, token, token, token
+        let text = crate::util::build_yesno_approval_prompt(
+            &token,
+            &request.tool_name,
+            &request.arguments_summary,
         );
         self.send(&SendMessage::new(text, recipient)).await?;
 
