@@ -73,6 +73,18 @@ that validates the following **offline / unit-level** behavior:
 The smoke test does **not** start a ZeroClaw daemon, exchange a pairing
 code, or call any gateway endpoint over HTTP.
 
+## Verified Feature Coverage
+
+The ZEGA AI integration bridges ZeroClaw runtime capabilities to provide a self-hosted AI agent merchant terminal with the following upstream feature support:
+
+- **Keyless Tier 1 Custody:** Zero private keys stored server-side. Mobile and browser wallets (Phantom, Solflare) sign transactions client-side.
+- **Directory-Based SOP Engine:** Executes multi-step procedures (`docs/zeroclaw/sops/*`) with cron scheduling, trigger filtering, and human approval gates (`kind: checkpoint`).
+- **MCP Client Proxy:** Proxies Helius DAS RPC tools (SSE transport) and SendAI Solana execution tools (STDIO transport) with strict tool namespacing (`server__tool`).
+- **Relationship Memory Graph:** Structured knowledge graph tracking CRM connections (`client`, `contact`, `pattern`, `decision`) persisted to Supabase PostgreSQL.
+- **Webhook Inbound Security:** Validates inbound webhooks via `X-Webhook-Signature: sha256=<HMAC-SHA256>` calculated with `ZEROCLAW_WEBHOOK_SECRET`.
+- **Solana Pay Reference Tracking:** Automatically attaches unique cryptographic reference keys (`&reference=RefXXXXXXX`) to generated Solana Pay URIs.
+- **Real-Time Devnet RPC Reconciliation:** Polling engine querying `getSignaturesForAddress` on Solana Devnet RPC to reconcile confirmed on-chain transaction signatures into the UI.
+
 ## External reference
 
 For source code and monorepo details, visit the
