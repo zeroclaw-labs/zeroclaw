@@ -1,11 +1,10 @@
 //! Hardware board info tool — returns chip name, architecture, memory map for Telegram/agent.
-//!
 //! Use when user asks "what board do I have?", "board info", "connected hardware", etc.
 //! Uses probe-rs for Nucleo when available; otherwise static datasheet info.
 
 use async_trait::async_trait;
 use serde_json::json;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 
 /// Static board info (datasheets). Used when probe-rs is unavailable.
 const BOARD_INFO: &[(&str, &str, &str)] = &[
@@ -98,7 +97,7 @@ impl Tool for HardwareBoardInfoTool {
         if self.boards.is_empty() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(
                     "No peripherals configured. Add boards to config.toml [peripherals.boards]."
                         .into(),
@@ -119,7 +118,7 @@ impl Tool for HardwareBoardInfoTool {
                 Ok(info) => {
                     return Ok(ToolResult {
                         success: true,
-                        output: info,
+                        output: info.into(),
                         error: None,
                     });
                 }
@@ -149,7 +148,7 @@ impl Tool for HardwareBoardInfoTool {
 
         Ok(ToolResult {
             success: true,
-            output,
+            output: output.into(),
             error: None,
         })
     }

@@ -33,11 +33,19 @@ Each agent has its own `Arc<dyn Memory>` instance. The factory (`zeroclaw_memory
 
 Cross-backend cross-agent memory is not supported: the schema validator at config load rejects `read_memory_from` entries that point at a sibling on a different backend.
 
+## Rename and delete lifecycle
+
+Use the gateway dashboard's agent controls or the dedicated `zeroclaw agents` CLI for rename and delete. In the standard build with `gateway` and `agent-runtime` enabled, both surfaces run the reference and owned-state cascades; directly removing or re-keying `agents.<alias>` in TOML or through a generic config setter does not. A reduced-feature CLI still updates config references but warns that owned state was not cascaded, so use a build with both features enabled for lifecycle operations.
+
+Both operations make the config change durable before running owned-state side effects. Rename rewrites config references first, then moves the default per-alias workspace and re-points memory, cron, ACP, and session state. Delete first refuses hard references and live ACP sessions, then removes the config entry and soft references before attempting workspace archival, owned-state export and cleanup, and session-attribution clearing.
+
+The post-persist side effects are best-effort and report surfaced failures, but archive-file write failures may appear only in gateway logs. Rename warnings call for retrying the same gateway API rename to converge residue left under the old alias. After deletion, verify the archive contents and logs before relying on the archive for recovery. Automated restore is not supported.
+
+See [Multi-agent setup walkthrough](../contributing/multi-agent-setup.md#rename-an-agent) for the current controls, blockers, archive layout, and operator checks.
+
 ## Not supported today
 
 1. Cross-backend cross-agent memory access (e.g. SQLite agent reading a Postgres agent's rows).
-2. Agent rename (the `agents.id` UUID indirection is the rename-ready foundation, but no CLI/UI surface exists).
-3. Pre-delete archive and restore.
-4. Per-agent secret namespacing: there is a single workspace-wide `SecretStore`.
-5. Lucid wire-format extensions for cross-agent scoping.
-6. A dedicated `zeroclaw agents` management CLI for creating/deleting/listing agents.
+2. Automated restore from an agent deletion archive.
+3. Per-agent secret namespacing: there is a single workspace-wide `SecretStore`.
+4. Lucid wire-format extensions for cross-agent scoping.

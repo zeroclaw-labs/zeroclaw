@@ -39,30 +39,10 @@ use super::schema::{
     OpenAITtsProviderConfig, PiperTtsProviderConfig, TtsProviderConfig as TtsBaseConfig,
 };
 
-// ── Per-category typed alias-ref newtypes ────────────────────────────────
-//
-// Every per-agent provider field is a reference into a specific configured
-// `[providers.<category>.<type>.<alias>]` (or `[channels.<type>.<alias>]`)
-// entry. The newtype carries the category at the type level — readers know
-// `agent.tts_provider: TtsProviderRef` is a TTS-provider reference, not a
-// free string, just by looking at the field declaration.
-//
-// `#[serde(transparent)]` keeps the on-disk TOML shape identical to the
-// previous `String` field. `Deref<Target = str>` and `AsRef<str>` keep
-// every `.is_empty()` / `.split_once('.')` / `.eq_ignore_ascii_case` /
-// `&value[..]` consumer working unchanged. Assignment from a string literal
-// goes through `.into()` (`From<&str>` / `From<String>`).
-//
-// Validation that each non-empty ref resolves to a configured alias lives
-// in `Config::validate()` (see `agent.tts_provider` / `agent.transcription_provider`
-// blocks in schema.rs); the newtype's job is to encode the *category* in
-// the type, not the existence — both layers reinforce each other.
-
 #[macro_export]
 macro_rules! define_provider_ref {
     ($name:ident, $category_doc:literal) => {
         #[doc = concat!("Reference to a configured `[", $category_doc, ".<type>.<alias>]` entry.")]
-        ///
         /// Empty value means "no preference" (opt-out). Non-empty values must
         /// resolve to a configured alias; `Config::validate()` enforces this.
         #[derive(
@@ -158,28 +138,8 @@ define_provider_ref!(ChannelRef, "channels");
 define_provider_ref!(RiskProfileRef, "risk_profiles");
 define_provider_ref!(RuntimeProfileRef, "runtime_profiles");
 
-/// Hard ceiling on `providers.models.<alias>.fallback` chain depth. The cycle
-/// guard only bounds chains that loop; a long acyclic chain would otherwise
-/// recurse one stack frame per alias at config-load and build time, turning a
-/// pathological config into a startup stack overflow. Both the validation walk
-/// and the runtime build walk stop descending past this depth and prune the
-/// rest of the branch.
 pub const MAX_FALLBACK_DEPTH: usize = 3;
 
-/// Macro that expands to a single source of truth for the per-provider-type
-/// slot list on `ModelProviders`. Every helper that needs to walk every slot
-/// (`find`, `iter_entries`, `is_empty`, etc.) goes through this
-/// macro so adding a new model_provider type is a one-line addition here, not a
-/// shotgun edit across multiple helpers.
-///
-/// Each row is `(field_ident, provider_type_str, FamilyConfigType)`. The
-/// `provider_type_str` is the canonical TOML outer key, identical to the
-/// field name with hyphens forbidden (the schema uses underscores).
-///
-/// Exported so that downstream crates (notably `zeroclaw-providers`) can
-/// drive their own dispatch from the same single source of truth — adding
-/// a family is one row here and one trait impl in providers; missing the
-/// impl fails to compile when downstream macro consumers expand.
 #[macro_export]
 macro_rules! for_each_model_provider_slot {
     ($mac:ident) => {
@@ -262,19 +222,7 @@ macro_rules! for_each_model_provider_slot {
 
 macro_rules! emit_model_providers_struct {
     ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
-        /// Typed model provider container — one slot per canonical model_provider type.
-        ///
-        /// Replaces the `HashMap<String, HashMap<String, ModelProviderConfig>>`
-        /// with a typed struct so each family's per-alias map carries its own
-        /// typed config (with the family's `*Endpoint` enum and family-specific
-        /// extras visible at the type level).
-        ///
-        /// TOML shape is preserved byte-identical: each named field deserializes
-        /// from the same `[providers.models.<type>.<alias>]` block as before.
-        ///
-        /// Adding a new model_provider family means: define the typed config in
-        /// `schema.rs`, then add one row to `for_each_model_provider_slot!`,
-        /// and every helper picks up the new slot automatically.
+        /// Typed model provider container with one alias map per provider family.
         #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
         #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
         #[prefix = "providers.models"]
@@ -290,16 +238,6 @@ macro_rules! emit_model_providers_struct {
 for_each_model_provider_slot!(emit_model_providers_struct);
 
 impl ModelProviders {
-    /// Iterate every entry across every typed slot, yielding
-    /// `(provider_type, alias, &base)` triples. Use this when consumer code
-    /// needs to walk every model model_provider entry without caring about family.
-    ///
-    /// Materializes through a `Vec` rather than chaining iterators directly:
-    /// with ~60 typed slots the deeply-nested `Chain<Chain<...>>` type blows
-    /// up rustc's `Freeze` trait-resolution recursion limit. The collection
-    /// cost is negligible (entries are sparse — most slots are empty in any
-    /// real config). Returned as `impl Iterator` so call sites can chain
-    /// `.next()`, `.filter_map()`, etc. without changes.
     pub fn iter_entries(&self) -> impl Iterator<Item = (&'static str, &str, &ModelProviderConfig)> {
         let mut out: Vec<(&'static str, &str, &ModelProviderConfig)> = Vec::new();
         macro_rules! emit_iter {
@@ -365,11 +303,6 @@ impl ModelProviders {
         for_each_model_provider_slot!(emit_get)
     }
 
-    /// Resolve a name that is either a bare `<alias>` or a `<kind>.<alias>` pair
-    /// to its `(kind, alias, &config)`. A bare alias is matched across every
-    /// family; ambiguity (same alias under multiple kinds) returns `None` so the
-    /// caller can ask the user to qualify it. Registry-driven via
-    /// `for_each_model_provider_slot!`.
     pub fn find_by_name(&self, name: &str) -> Option<(&'static str, String, &ModelProviderConfig)> {
         if let Some((kind, alias)) = name.split_once('.') {
             macro_rules! emit_dotted {
@@ -399,11 +332,6 @@ impl ModelProviders {
         hit
     }
 
-    /// Get-or-create the shared base config for a `<provider_type>.<alias>`
-    /// pair, returning a mutable reference. Used by tools that mutate
-    /// generic baseline fields (model, temperature, api_key) without caring
-    /// about the family's specific extras. Returns `None` for unknown
-    /// model_provider types.
     pub fn ensure(&mut self, family: &str, alias: &str) -> Option<&mut ModelProviderConfig> {
         macro_rules! emit_ensure {
             ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
@@ -784,23 +712,7 @@ mod tests {
     }
 }
 
-/// Top-level wrapper for every provider category. TOML root sees a
-/// single `[providers]` table with one sub-key per category:
-///
-/// ```toml
-/// [providers.models.anthropic.default]
-/// api_key = "..."
-///
-/// [providers.tts.openai.default]
-/// api_key = "..."
-///
-/// [providers.transcription.groq.default]
-/// api_key = "..."
-/// ```
-///
-/// Each category keeps its own typed-slot internals (so per-family
-/// endpoints and extras stay validated at the type level); this
-/// wrapper just gives them a shared top-level home.
+/// Top-level wrapper for every configured provider category.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "providers"]
@@ -820,23 +732,6 @@ pub struct Providers {
     #[nested]
     pub transcription: TranscriptionProviders,
 }
-
-// ── Cost-rate wrappers ──────────────────────────────────────────────────────
-//
-// Same per-provider-type slot layout as the typed-provider wrappers above,
-// but the value type is the per-resource rate struct instead of the
-// per-alias provider config. Each subsection's TOML path mirrors its
-// `[providers.*]` counterpart with the trailing `<alias>` segment replaced
-// by the resource the rate prices (model id, voice id, etc.).
-//
-// DRY:
-//   - `ModelCostRatesByProvider` consumes the same `for_each_model_provider_slot!`
-//     macro as `ModelProviders`, so adding a new provider type updates
-//     both structs from a single edit.
-//   - `TtsCostRatesByProvider` and `TranscriptionCostRatesByProvider`
-//     mirror their `TtsProviders` / `TranscriptionProviders` slot lists
-//     by hand (those wrappers are themselves hand-rolled because the
-//     closed family lists were small enough to not warrant a macro).
 
 macro_rules! emit_model_cost_rates_struct {
     ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {

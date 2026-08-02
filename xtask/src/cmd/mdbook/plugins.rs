@@ -2,18 +2,6 @@
 //! the WIT contracts (`wit/v0/*.wit`) and the registry install cap
 //! (`src/plugin_registry.rs`). The contracts are the single source of truth;
 //! the docs render whatever they carry so a flag or function added to a world
-//! reflows the rendered counts on the next build with no hand edit. Also
-//! fails the build if a WIT capability flag is missing from its guide's
-//! capability table.
-//!
-//! Outputs (gitignored, derived, spliced inline mid-sentence so they carry no
-//! header comment and no trailing newline):
-//!   docs/book/src/_snippets/plugin-channel-flag-count.md
-//!   docs/book/src/_snippets/plugin-channel-func-count.md
-//!   docs/book/src/_snippets/plugin-channel-required-count.md
-//!   docs/book/src/_snippets/plugin-channel-multi-delay-default-ms.md
-//!   docs/book/src/_snippets/plugin-memory-flag-count.md
-//!   docs/book/src/_snippets/plugin-archive-max-mib.md
 
 use anyhow::{Context, Result, bail};
 use std::path::Path;

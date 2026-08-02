@@ -90,12 +90,6 @@ pub fn strip_tool_call_tags(message: &str) -> String {
         }
     }
 
-    // Does the tag structure run to the end of the message? A *real* truncated
-    // tool call is the model getting cut off, so the unterminated structure is
-    // the last thing in the message. If natural-language prose resumes after the
-    // tags, this is an inline *example* (the model is discussing tool calls), not
-    // a truncation — so we should keep it. Bias toward keeping: a little leaked
-    // XML beats eating the user's text.
     fn tool_structure_runs_to_end(inner: &str) -> bool {
         let mut rest = inner.trim_start();
         // Consume a run of `<...>` tags (and whitespace between them).
@@ -171,14 +165,6 @@ pub fn strip_tool_call_tags(message: &str) -> String {
             continue;
         }
 
-        // Unterminated open tag with no parseable JSON body. Drop the broken
-        // tail ONLY when it looks like tool-call structure (`<invoke>` /
-        // `<parameter>` / `<tool*>` / `<function*>` / `{` / `[`) AND that
-        // structure runs to the end of the message — i.e. a real truncation
-        // where the model was cut off mid-call. If prose resumes after the
-        // structure, the model is showing an *example*, not making a call, so
-        // keep it verbatim (a little leaked XML beats eating the user's reply).
-        // Text that merely mentions a tag is likewise kept.
         let inner = after_open.trim_start();
         let inner_lower = inner.to_ascii_lowercase();
         let looks_like_tool_structure = inner_lower.starts_with("<invoke")
@@ -222,11 +208,6 @@ pub fn parse_attachment_markers(message: &str) -> (String, Vec<(String, String)>
     parse_attachment_markers_of_kinds(message, ATTACHMENT_KINDS)
 }
 
-/// Like [`parse_attachment_markers`], but extracts only the given `kinds`;
-/// markers of any other kind stay in the cleaned text. Lets a channel that
-/// handles a subset of the marker grammar (e.g. the WhatsApp Cloud API
-/// backend, which delivers only `LOCATION`) extract what it can send without
-/// stripping markers it cannot.
 pub(crate) fn parse_attachment_markers_of_kinds(
     message: &str,
     kinds: &[&str],
@@ -285,16 +266,6 @@ pub(crate) struct WhatsAppLocation {
 
 #[cfg(any(feature = "whatsapp-web", feature = "channel-whatsapp-cloud", test))]
 impl WhatsAppLocation {
-    /// Parse a `[LOCATION:...]` marker target.
-    ///
-    /// Format: `lat,lng`, `lat,lng,name`, or `lat,lng,name,address`.
-    ///
-    /// `name` is a single comma-delimited field by default, but may be
-    /// double-quoted to include commas (e.g. `"ACME, Inc."`). `address` is the
-    /// trailing field and may contain commas freely — no quoting needed.
-    /// Coordinates outside the WGS84 range are rejected so a malformed marker
-    /// never sends a bogus pin; each backend's send path turns that rejection
-    /// into a counted delivery failure.
     pub(crate) fn parse(target: &str) -> Option<Self> {
         // Extract the next field.  If the trimmed input starts with `"` the
         // field runs to the closing `"` and may contain commas; otherwise the
@@ -356,12 +327,6 @@ pub(crate) fn format_location_content(lat: f64, lng: f64, name: Option<&str>) ->
     }
 }
 
-/// Generate a short 6-character lowercase alphanumeric approval token.
-///
-/// Uses the full `[a-z0-9]` alphabet (36 options per position, 36^6 ≈ 2.2B
-/// combinations) — not UUID hex (which would give only 16^6 ≈ 16.7M and
-/// would materially weaken the WhatsApp no-per-sender-check design
-/// described in the PR #6010 security note).
 #[cfg(any(
     feature = "channel-discord",
     feature = "channel-signal",
@@ -379,11 +344,6 @@ pub(crate) fn new_approval_token() -> String {
         .collect()
 }
 
-/// Parse an approval reply of the form `"TOKEN yes|no|always ..."`.
-///
-/// Returns `Some((token, response))` when the text begins with a 6-character
-/// alphanumeric token followed by a recognised action word. Returns `None`
-/// for any other input so normal messages are not intercepted.
 pub fn parse_approval_reply(
     text: &str,
 ) -> Option<(String, zeroclaw_api::channel::ChannelApprovalResponse)> {

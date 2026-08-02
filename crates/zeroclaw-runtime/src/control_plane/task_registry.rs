@@ -1,22 +1,7 @@
 //! The durable task/run registry contract — EPIC A's stable seam.
-//!
-//! One trait, backed once by SQLite (`task_store_sqlite.rs`), that every
-//! spawned/delegated/peer-driven unit of work registers into. This supersedes the
-//! flat-file `BackgroundDelegateResult`/`BackgroundTaskStatus`
-//! (`tools/delegate.rs`) by adding the terminal-loss states it cannot represent
-//! and an out-of-band reconcile seam the reaper drives.
-//!
-//! Downstream epics EXTEND this surface — EPIC E adds a `RemoteTurn` kind, EPIC C
-//! consumes `delivered`/`idem_key`, EPIC D stamps a principal — by adding a field
-//! or a trait impl, never by re-opening the supervision logic.
 
 use serde::{Deserialize, Serialize};
 
-/// Discriminates which producer registered a unit of work.
-///
-/// This is the task's durable domain type, not a status bucket. Goal mode, for
-/// example, is a task kind because it owns a goal extension row, while `Paused`
-/// is still just a lifecycle status on [`TaskRecord`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskKind {
@@ -32,12 +17,6 @@ pub enum TaskKind {
     // EPIC E: RemoteTurn
 }
 
-/// Canonical lifecycle state for every supervised task.
-///
-/// Feature-specific extension tables may explain why a task is paused or what
-/// work it represents, but they must not duplicate terminal/lifecycle state.
-/// The `snake_case` repr keeps on-disk JSON stable: legacy
-/// `running|completed|failed|cancelled` values still parse unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
@@ -73,13 +52,6 @@ impl TaskStatus {
     }
 }
 
-/// Canonical durable task record.
-///
-/// This row is the source of truth for lifecycle, ownership, routing,
-/// principal, and parentage across all task kinds. Feature-specific modules may
-/// add extension rows keyed by `id`, but must not copy these facts into those
-/// rows. New fields are `#[serde(default)]` so pre-existing on-disk payloads
-/// load unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskRecord {
     /// Stable task id. Producers validate it at registration boundaries.
@@ -99,7 +71,6 @@ pub struct TaskRecord {
     #[serde(default)]
     pub owner_boot_id: String,
     /// Optional owner heartbeat timestamp in RFC3339 form.
-    ///
     /// Only tasks that actively heartbeat may be timed out by heartbeat age; an
     /// absent heartbeat is not a derived runtime duration.
     #[serde(default)]
@@ -111,7 +82,6 @@ pub struct TaskRecord {
     #[serde(default)]
     pub parent_id: Option<String>,
     /// Trusted route/reply target that originated the task.
-    ///
     /// Goal admission and visibility checks use this canonical route instead of
     /// trusting model-supplied task selectors.
     #[serde(default)]
@@ -122,12 +92,6 @@ pub struct TaskRecord {
     /// Optional idempotency key for completion/delivery operations.
     #[serde(default)]
     pub idem_key: Option<String>,
-    /// EPIC D attribution (Principal co-design `COORD-principal-contract.md` §7/R3): the
-    /// authenticated `Principal.id` that originated this run. Additive and unstamped today:
-    /// stored as `Option<String>` (a serialization-friendly primitive) and left `None` until
-    /// EPIC D wires population from the now-landed `zeroclaw_api::principal::PrincipalId`; the
-    /// type swaps to `Option<PrincipalId>` as part of that wiring.
-    /// It resolves to the carried `Principal.id` (never a bare principal-`None`).
     #[serde(default)]
     pub principal_id: Option<String>,
     /// Task registration/start timestamp in RFC3339 form.
@@ -153,11 +117,6 @@ pub trait TaskRegistry: Send + Sync {
         output: Option<String>,
         error: Option<String>,
     ) -> anyhow::Result<()>;
-    /// Claim a resumable task for the current daemon owner.
-    ///
-    /// This updates the canonical ownership fields on [`TaskRecord`]. It does
-    /// not create a secondary ownership cache; callers use it when a durable
-    /// paused task becomes eligible to run under a new daemon boot.
     async fn claim_owner(
         &self,
         id: &str,

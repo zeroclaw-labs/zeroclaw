@@ -33,6 +33,7 @@ pub(crate) fn record_llm_failure(
         output_tokens: None,
         channel: Some(ctx.channel_name.to_string()),
         agent_alias: ctx.agent_alias.map(|s| s.to_string()),
+        parent_agent_alias: ctx.parent_agent_alias.map(|s| s.to_string()),
         turn_id: Some(ctx.turn_id.to_string()),
         // Error path: no prompt/completion content captured.
         messages: None,
@@ -53,15 +54,6 @@ pub(crate) fn record_llm_failure(
     );
 }
 
-/// Context overflow recovery: trim history and retry.
-///
-/// Returns `true` when the history was trimmed and the caller should
-/// `continue` the loop; the orchestrator keeps
-/// `if recovered { continue; } return Err(e);` inline.
-///
-/// Emits `TurnEvent::HistoryTrimmed` and `ObserverEvent::HistoryTrimmed` on the
-/// trimmed branch so the 400-recovery cut is never silent to ACP / WS / SSE
-/// subscribers, matching the preemptive turn-boundary path.
 pub(crate) async fn try_recover_context_overflow(
     history: &mut Vec<ChatMessage>,
     e: &anyhow::Error,
@@ -138,17 +130,6 @@ pub(crate) async fn try_recover_context_overflow(
             return true;
         }
 
-        // Nothing left to trim — truly unrecoverable. When the system prompt +
-        // inlined tool definitions alone dominate the budget, the single
-        // remaining turn can never fit no matter how much history is dropped;
-        // surface the actionable root cause and remedy instead of a generic
-        // unrecoverable error (#5808).
-        // Gate on the resolved effective budget (the same `N` the message
-        // displays), not the local 2/3-of-current recovery budget — otherwise a
-        // provider whose real window is below the configured budget could fire a
-        // message stating floor >= N while numerically floor < N. The recovery
-        // trim above still uses the local `budget`; only the remediation
-        // predicate and the displayed value key on the resolved budget (#5808).
         let system_floor = crate::agent::history::estimate_system_floor_tokens(history);
         if system_floor >= context_token_budget {
             ::zeroclaw_log::record!(
@@ -233,7 +214,7 @@ mod tests {
 
     #[tokio::test]
     async fn floor_exceeds_budget_single_turn_does_not_recover() {
-        // #5808 regression: the system prompt + tool definitions alone dominate
+        // the system prompt + tool definitions alone dominate
         // the budget and only one turn exists. Recovery must NOT loop — it
         // returns false (nothing left to drop) so the caller breaks instead of
         // re-running the same turn forever.

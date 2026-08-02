@@ -1,8 +1,4 @@
 //! Channel room-management tool.
-//!
-//! Exposes channel-backed room creation and user invites to agents without
-//! storing channel configuration or Matrix-specific state in the tool. The tool
-//! late-resolves the active channel handle and calls the [`Channel`] trait.
 
 use crate::ask_user::ChannelMapHandle;
 use async_trait::async_trait;
@@ -12,7 +8,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 use zeroclaw_api::channel::{Channel, RoomCreationOptions, RoomVisibility};
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::{SecurityPolicy, ToolOperation};
 
 const TOOL_DESCRIPTION_KEY: &str = "tool-channel-room";
@@ -133,7 +129,7 @@ impl Tool for ChannelRoomTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(tool_msg_with_args(
                     "tool-channel-room-error-security",
                     &[("err", &error)],
@@ -149,7 +145,7 @@ impl Tool for ChannelRoomTool {
             Err(error) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(error),
                 });
             }
@@ -194,14 +190,15 @@ async fn create_room(
                 "channel": channel_name,
                 "room_id": room_id,
             })
-            .to_string(),
+            .to_string()
+            .into(),
             error: None,
         }),
         Err(error) => {
             let error = error.to_string();
             Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(tool_msg_with_args(
                     "tool-channel-room-error-create-failed",
                     &[("err", &error)],
@@ -228,14 +225,15 @@ async fn invite_user(
                 "room_id": room_id,
                 "user_id": user_id,
             })
-            .to_string(),
+            .to_string()
+            .into(),
             error: None,
         }),
         Err(error) => {
             let error = error.to_string();
             Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(tool_msg_with_args(
                     "tool-channel-room-error-invite-failed",
                     &[("err", &error)],

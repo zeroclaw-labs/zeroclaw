@@ -14,13 +14,6 @@ use std::collections::HashSet;
 use std::time::Duration;
 use zeroclaw_tool_call_parser::{ParsedToolCall, canonicalize_json_for_tool_signature};
 
-/// The prepared subset of one round's tool calls.
-///
-/// `ordered_results` has one slot per incoming call; prep fills the slots for
-/// calls that never execute (hook-cancelled, denied, replaced, deduplicated)
-/// and post-exec fills the rest, so result ordering always matches the
-/// model's call ordering. `seen_tool_signatures` stays owned by the loop
-/// skeleton (reset per iteration) and is threaded in as `&mut`.
 pub(crate) struct PreparedToolCalls {
     pub(crate) ordered_results: Vec<Option<(String, Option<String>, ToolExecutionOutcome)>>,
     pub(crate) executable_indices: Vec<usize>,
@@ -71,6 +64,7 @@ async fn record_duplicate_tool_call(
         error_reason: Some(duplicate),
         duration: Duration::ZERO,
         receipt: None,
+        output_data: None,
     }
 }
 
@@ -132,6 +126,7 @@ pub(crate) async fn prepare_tool_calls(
                         error_reason: Some(reason),
                         duration: Duration::ZERO,
                         receipt: None,
+                        output_data: None,
                     };
                     // Streaming consumers still see the call and its
                     // hook-cancel outcome as a ToolCall/ToolResult pair,

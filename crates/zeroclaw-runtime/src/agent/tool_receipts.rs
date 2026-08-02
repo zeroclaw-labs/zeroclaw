@@ -1,11 +1,4 @@
 //! HMAC-SHA256 tool execution receipts for hallucination detection.
-//!
-//! When enabled, every tool execution produces a cryptographic receipt that
-//! proves the tool actually ran. The LLM cannot forge valid receipts because
-//! it doesn't know the ephemeral session key.
-//!
-//! Based on: Basu, A. (2026). "Tool Receipts, Not Zero-Knowledge Proofs:
-//! Practical Hallucination Detection for AI Agents." arXiv:2603.10060
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -40,14 +33,12 @@ impl ReceiptGenerator {
         Self { key }
     }
 
-    /// Create a generator with a known key (for testing).
     #[cfg(test)]
     pub fn with_key(key: Vec<u8>) -> Self {
         Self { key }
     }
 
     /// Generate a receipt for a tool execution.
-    ///
     /// The receipt encodes: tool_name | args_hash | result_hash | timestamp
     /// into an HMAC-SHA256 digest, formatted as `zc-receipt-{timestamp}-{hash}`.
     pub fn generate(
@@ -74,7 +65,6 @@ impl ReceiptGenerator {
     }
 
     /// Verify a receipt against the expected tool execution parameters.
-    ///
     /// Parses the timestamp from the receipt string, recomputes the HMAC,
     /// and compares. Returns `false` for malformed, tampered, or fabricated receipts.
     pub fn verify(

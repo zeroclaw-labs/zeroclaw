@@ -12,11 +12,12 @@ When definitions conflict, update the source file first, then sync this page.
 
 Labels are portable metadata. They should answer what kind of work this is, what code area it touches, how risky it is to review, and whether stale policy or triage policy needs special handling.
 
-When Project board automation is added, use it as an automated planning board,
-not as a second PR review queue. The board should answer slower-moving planning
-questions: what is ready to pick up, what routing evidence keeps it active,
-what tracker or milestone it belongs to, and what is blocked. Native GitHub PR
-state should continue to answer fast-moving review and merge questions.
+Project board automation is a planning aid, not a second PR review queue. The
+current issue-dashboard planner is manual and report-only. The board should
+answer slower-moving planning questions: what is ready to pick up, what routing
+evidence keeps it active, what tracker or milestone it belongs to, and what is
+blocked. Native GitHub PR state should continue to answer fast-moving review and
+merge questions.
 
 Keep the split based on update frequency:
 
@@ -104,6 +105,7 @@ Applied automatically by `pr-path-labeler.yml`. Globs live in `.github/labeler.y
 | `dependencies` | `Cargo.toml`, `Cargo.lock`, `deny.toml`, `.github/dependabot.yml` |
 | `ci` | `.github/codeql/**`, `.github/workflows/**`, `.github/*.yaml`, `.github/*.yml`, `.github/*.json`, `.githooks/**` |
 | `core` | `src/*.rs` |
+| `cli` | `src/main.rs`, `src/lib.rs`, `src/commands/**`, `src/alias_cli/**`, `src/cli_input.rs`, `crates/zeroclaw-commands/**`, `crates/zeroclaw-runtime/src/cli_input.rs` |
 | `agent` | `src/agent/**`, `crates/zeroclaw-runtime/src/agent/**` |
 | `channel` | `src/channels/**`, `crates/zeroclaw-channels/src/**` |
 | `gateway` | `src/gateway/**`, `crates/zeroclaw-gateway/src/**` |
@@ -118,6 +120,10 @@ Applied automatically by `pr-path-labeler.yml`. Globs live in `.github/labeler.y
 | `security` | `src/security/**`, `crates/zeroclaw-runtime/src/security/**` |
 | `runtime` | `src/runtime/**`, `crates/zeroclaw-runtime/src/**` |
 | `quickstart` | `crates/zeroclaw-runtime/src/quickstart/**`, `crates/zeroclaw-gateway/src/api_quickstart.rs`, `apps/zerocode/src/quickstart_pane.rs`, `web/src/pages/quickstart/**` |
+| `desktop` | `apps/tauri/**` |
+| `hardware` | `src/hardware/**`, `crates/zeroclaw-hardware/**`, `crates/robot-kit/**`, `crates/aardvark-sys/**`, `firmware/**` |
+| `web` | `web/**` |
+| `zerocode` | `apps/zerocode/**` |
 | `provider` | `src/providers/**`, `crates/zeroclaw-providers/src/**` |
 | `service` | `src/service/**`, `crates/zeroclaw-runtime/src/service/**` |
 | `skillforge` | `src/skillforge/**`, `crates/zeroclaw-runtime/src/skillforge/**` |
@@ -155,6 +161,23 @@ Scoped path labels do not guarantee a same-prefix base label. Because `pr-path-l
 ### Manual component labels
 
 Some scoped component labels are manual routing labels rather than synchronized path labels.
+
+`domain:architecture` identifies cross-component ownership, source-of-truth, dependency-direction, interface/contract, and architecture-decision work. Do not apply it merely because an issue is an RFC.
+
+`domain:security` identifies cross-cutting trust-boundary or security-impact work, including work outside the base `security` source paths. These domain labels remain manual because path matching cannot infer architectural or security impact reliably.
+
+The following duplicate domain and product-surface labels are pending retirement. Do not apply them to new work. They remain live only until a separate exact operation packet migrates any remaining open references and deletes the definitions.
+
+| Retiring label | Canonical replacement |
+|---|---|
+| `domain:channels` | `channel` plus the applicable `channel:*` label |
+| `domain:ci` | `type:ci`; add path-owned `ci` only when the changed files match its automation contract |
+| `domain:code-quality` | Concrete scope labels plus `type:refactor` when applicable |
+| `domain:deps` | `dependencies` and/or `type:dependencies` |
+| `domain:web-fetch` | `tool:web` |
+| `tauri` | `desktop`; Tauri remains an implementation detail in paths and titles |
+
+The retained product labels are intentionally distinct. `cli` is the end-user command-line surface, while `channel:cli` is the interactive CLI chat channel. `web` is the browser dashboard and web-chat product, while `tool:web` is the agent's web-fetch/search tool group. `zerocode` is the ZeroCode terminal application, `hardware` covers the host integrations, support crates, and firmware tree, and `desktop` is the Tauri desktop product. Use the applicable tool or product label for native computer-use work outside `apps/tauri/**`; do not apply synchronized `desktop` manually to a PR whose paths do not match.
 
 `agent:prompt` is for provider-visible prompt, context, and response-guidance policy. Use it when the work is about system-prompt content, tool-call formatting guidance, prompt-cache-sensitive context, channel response guidance, or other model-visible instruction surfaces that cross the base `agent`, `channel`, `memory`, `provider`, or `runtime` labels. Apply it in addition to applicable base or scope labels; it does not replace them. Do not apply it to every `crates/zeroclaw-runtime/src/agent/**` change; use the base `agent` label for ordinary agent runtime changes.
 
@@ -201,6 +224,7 @@ Each channel gets a `channel:<name>` label in addition to the base `channel` lab
 | `channel:telegram` | `telegram.rs` |
 | `channel:twitter` | `twitter.rs` |
 | `channel:wati` | `wati.rs` |
+| `channel:wechat` | `crates/zeroclaw-channels/src/wechat.rs` |
 | `channel:webhook` | `webhook.rs` |
 | `channel:wecom` | `wecom.rs`, `wecom_ws.rs` |
 | `channel:whatsapp` | `whatsapp.rs`, `whatsapp_storage.rs`, `whatsapp_web.rs` |
@@ -287,6 +311,8 @@ New or manual applications should use the canonical no-space labels below. Exist
 
 High-risk paths (canonical set; other maintainer pages reference this list): `crates/zeroclaw-runtime/src/**`, `crates/zeroclaw-gateway/src/**`, `crates/zeroclaw-tools/src/**`, `crates/zeroclaw-runtime/src/security/**`, `.github/workflows/**`.
 
+Apply `risk:high` to any PR that raises the workspace MSRV, pinned Rust toolchain, generated installer/Docker toolchain baseline, or release workflow toolchain floor. Do not downgrade the risk just because the diff looks like CI, dependency, or docs housekeeping: a higher required Rust version affects downstream source builds, distro packages, container builds, and users pinned to older toolchains.
+
 When uncertain, treat as higher risk.
 
 ## Contributor tier labels
@@ -300,6 +326,17 @@ Defined in `.github/label-policy.json`. Based on the author's merged PR count qu
 | `principal contributor` | 20 |
 | `distinguished contributor` | 50 |
 
+## Priority labels
+
+Priority labels express maintainer scheduling urgency, not ownership or implementation status. Apply them manually and revisit them when the issue's impact or release context changes.
+
+| Label | Meaning |
+|---|---|
+| `priority:p0` | Immediate blocker requiring urgent maintainer attention; excluded from issue stale handling while the priority remains current |
+| `priority:p1` | High-priority work to schedule ahead of the normal queue |
+| `priority:p2` | Medium-priority work with a clear maintainer interest |
+| `priority:p3` | Lower-priority tracked work without an urgent scheduling commitment |
+
 ## Status labels
 
 Track lifecycle state of RFCs and tracked work items. Applied manually unless a maintained workflow says otherwise.
@@ -309,8 +346,20 @@ Track lifecycle state of RFCs and tracked work items. Applied manually unless a 
 | `status:accepted` | RFC or work item ratified by the team. This does not exempt the issue from stale handling by itself. |
 | `status:blocked` | Work is valid but waiting on an external dependency, maintainer decision, or linked prerequisite. Exempt from stale while the blocker is recorded and unresolved. Do not pair with `status:no-stale` for the same blocker. |
 | `status:in-progress` | An open PR is actively targeting this issue. Reconcile against live PR state during stale passes; the label is not a permanent exemption after the PR closes. |
-| `status:stale` | No author activity for the stale window; may close if not refreshed |
+| `status:stale` | Issue is in the response window defined by the [issue stale policy](#issue-stale-policy) |
 | `status:no-stale` | Explicit stale exemption for accepted or otherwise long-lived work that is not already protected by another stale exclusion. Target policy: use only when the [Project board contract](./pr-workflow.md#issue-routing-evidence) has a contributor-visible stale-exemption reason and routing evidence. Active release trackers and active RFC or design trackers may use the tracker itself as the visible reason and routing surface while they remain active; revisit them when the milestone closes, the tracker drifts from live state, the RFC reaches a decision, is superseded, or closes, or the issue stops representing an active project decision surface. Existing exemptions missing those facts should be audited and repaired before stale sweeps stop honoring them. |
+
+## Issue stale policy
+
+This section is the canonical operational source for issue stale timing, qualifying activity, exclusions, and re-engagement. Other maintainer docs and skills should link here instead of copying these rules.
+
+- **Entry window:** Apply `status:stale` once 15 or more days have elapsed without qualifying activity.
+- **Response window:** Close only when 15 or more days have elapsed since `status:stale` was applied and no qualifying activity occurred afterward.
+- **Qualifying activity:** A substantive comment that demonstrates current relevance. It must confirm the issue on a current release or commit, explain why the issue is version-independent, or add useful evidence such as a reproduction, logs or error details, environment information, a concrete affected use case, regression confirmation, or a workaround. A generic `+1`, administrative comment, label change, bot event, or link event does not qualify.
+- **Exclusions:** Do not apply stale handling to `priority:p0`, `type:rfc`, `status:no-stale`, an issue with an open linked PR, an issue with 10 or more 👍 reactions on the opening post, or `status:blocked` while a recorded blocker remains unresolved. If an exclusion begins while an issue carries `status:stale`, remove the stale label. When the exclusion ends, restart the entry clock from that date.
+- **Re-engagement:** Remove `status:stale` when qualifying activity occurs after the label was applied or when the issue is reopened. Reset the clock from that activity or reopen date. After a stale closure, qualifying new evidence in a comment is grounds for a maintainer to reopen the issue and remove `status:stale`; the commenter may instead open a new issue with the updated context.
+
+`stale-candidate` is separate: it is the dormant-PR backlog-pruning signal and does not replace `status:stale` for issues.
 
 ## Resolution labels
 
@@ -334,8 +383,18 @@ Applied manually: the auto-response automation that used to handle these was rem
 |---|---|
 | `r:needs-repro` | Incomplete bug report; request a deterministic repro |
 | `r:support` | Usage / help item better handled outside the bug backlog |
-| `needs-author-action` | Author response is needed before maintainers can continue the review or merge path. For PRs, this is not a stale warning by itself. |
-| `stale-candidate` | Dormant PR or issue that is a candidate for closing. For PRs, follow the stale ramp in [Reviewer Playbook → PR backlog pruning](./reviewer-playbook.md#pr-backlog-pruning). |
+| `needs-author-action` | Author response is needed before maintainers can continue the review or merge path. For PRs, apply this with request-changes reviews when the next step is on the author, and remove it when the author pushes a substantive update or provides requested information. This is not a stale warning by itself. |
+| `stale-candidate` | Dormant PR that is a candidate for closing. Follow the stale ramp in [Reviewer Playbook → PR backlog pruning](./reviewer-playbook.md#pr-backlog-pruning). Issue stale passes use `status:stale` instead. |
+
+## Workflow labels
+
+Applied manually to make cross-artifact coordination visible. These labels do not imply ownership, acceptance, or stale protection.
+
+| Label | Purpose |
+|---|---|
+| `follow-up` | Scope deliberately carved out from a parent issue or PR; link the parent so the relationship is visible |
+| `release-gate` | Finding or work item that must be reconciled for the named release gate |
+| `stacked` | PR depends on another PR; include an explicit `Depends on #...` reference and merge it after its base |
 
 ## Community pickup labels
 

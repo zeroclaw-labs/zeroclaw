@@ -1,26 +1,6 @@
-//! Regression coverage for #7733 at the channels-orchestrator MCP
+//! Regression coverageat the channels-orchestrator MCP
 //! connection site (`crates/zeroclaw-channels/src/orchestrator/mod.rs`,
 //! search for `mcp_servers_for_agent`).
-//!
-//! The orchestrator's `handle_channel_message` requires a fully-built
-//! runtime context that is heavy to fixture from an integration test
-//! (see the comment at the top of
-//! `proof_orchestrator_session_context.rs` for the same reasoning).
-//! This file therefore guards the contract two ways:
-//!
-//! 1. **Resolver pin** — exercises `Config::mcp_servers_for_agent`, the
-//!    function the orchestrator now calls. If that resolver's
-//!    secure-by-default semantics ever weaken, this test fails inside
-//!    this crate's suite, not just in the config crate.
-//! 2. **Compile-time witness** — a tiny dead function that simply
-//!    forwards to `config.mcp_servers_for_agent(alias)`. If a future
-//!    refactor renames or removes that symbol, this file stops
-//!    compiling and forces reviewers to update the orchestrator call
-//!    site at the same time.
-//!
-//! Behavioral end-to-end coverage of the unscoped-agent zero-MCP path
-//! lives in `crates/zeroclaw-runtime/src/rpc/dispatch.rs::tests::`
-//! `chat_session_new_omits_mcp_tools_when_agent_has_no_bundles_*`.
 
 use std::collections::HashMap;
 
@@ -94,7 +74,7 @@ fn make_two_agent_config() -> Config {
 fn resolver_grants_only_to_granted_agent_under_two_agent_config() {
     // The orchestrator now calls `config.mcp_servers_for_agent(alias)`.
     // Pin its semantics here: `granted` gets `remote`, `unscoped` gets
-    // zero. If this flips, the orchestrator's #7733 fix has regressed
+    // zero. If this flips, the orchestrator'sfix has regressed
     // at the contract level.
     let config = make_two_agent_config();
 

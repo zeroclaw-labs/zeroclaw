@@ -1,9 +1,4 @@
 //! Minimal GitHub REST client for the provider.
-//!
-//! Typed wrappers over the handful of endpoints the channel uses. Every
-//! method takes its auth credential (app JWT or installation token) as
-//! an argument; this module knows nothing about how credentials are
-//! minted, and nothing about polling or message mapping.
 
 use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
@@ -15,17 +10,17 @@ use super::payloads::{
 };
 use crate::git::types::{GitChannelError, IssueRef, RepoRef};
 
-/// Pages followed per list call. GitHub paginates list endpoints with a
-/// `Link: rel="next"` header; following it keeps a single 100-item page
-/// from starving a cursor that advances on the newest returned item — the
-/// busy-repo livelock where >100 items match `since` on one page, the
-/// newest sort off the page, and the cursor never reaches them. The cap
-/// bounds one poll tick's fetch: ascending streams still make forward
-/// progress across ticks, and a truncation is logged.
 const MAX_PAGES_PER_POLL: usize = 20;
 
+/// Pin a raw forge-call path under the configured API base. The leading-slash
+/// trim keeps `format!` from producing `base//path`; because the path is always
+/// appended after `base/`, no absolute URL, protocol-relative `//host`, or
+/// `..` sequence in `path` can redirect the request to a different origin.
+fn forge_url(base: &str, path: &str) -> String {
+    format!("{}/{}", base, path.trim_start_matches('/'))
+}
+
 /// Extract the `rel="next"` URL from a GitHub `Link` header, if present.
-///
 /// Example header value:
 /// `<https://api.github.com/…?page=2>; rel="next", <…?page=9>; rel="last"`.
 fn next_page_url(headers: &reqwest::header::HeaderMap) -> Option<String> {
@@ -55,7 +50,6 @@ impl GithubApi {
         }
     }
 
-    /// Point the client at a mock server instead of api.github.com.
     #[cfg(test)]
     pub(crate) fn with_base(base: String) -> Self {
         Self {
@@ -116,13 +110,6 @@ impl GithubApi {
         Err(Self::error_from(endpoint, resp).await)
     }
 
-    /// GET a list endpoint, following `Link: rel="next"` pagination and
-    /// concatenating the pages (bounded by [`MAX_PAGES_PER_POLL`]).
-    /// `extract` pulls the item vec out of each decoded page body, so both
-    /// bare-array endpoints (`|page| page`) and envelope endpoints
-    /// (`{ workflow_runs: [...] }`) share one pager. Following pagination
-    /// is what stops a full first page from livelocking a cursor that
-    /// advances on the newest returned item.
     async fn get_paged<P, T>(
         &self,
         endpoint: &str,
@@ -309,15 +296,6 @@ impl GithubApi {
         .await
     }
 
-    /// `GET /repos/{owner}/{repo}/issues?since=…` — issues and PRs
-    /// (opening posts plus close/merge transitions), oldest-updated first.
-    /// `since` filters on `updated_at`, so the stream is sorted by
-    /// `updated` and the caller advances its cursor on `updated_at` too
-    /// (see `fetch_issues`): sort, filter, and cursor share one dimension,
-    /// which is what guarantees the per-poll page cap cannot starve later
-    /// pages. Sorting by `created` instead let an old item whose
-    /// `updated_at` matches `since` but whose `created_at` predates the
-    /// cursor saturate the leading pages and stall the watermark forever.
     pub async fn list_issues_since(
         &self,
         token: &str,
@@ -538,11 +516,37 @@ impl GithubApi {
         )
         .await
     }
+
+    /// Low-level authed call: build `{base}/{path}`, attach `token`, send, and
+    /// return the raw status + decoded JSON body (Null when empty). Non-2xx is
+    /// returned, not raised, so the caller inspects GitHub's error envelope.
+    pub async fn forge_call(
+        &self,
+        token: &str,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> Result<(u16, serde_json::Value), GitChannelError> {
+        let url = forge_url(&self.base, path);
+        let mut req = self.request(method, url, token);
+        if let Some(payload) = body {
+            req = req.json(payload);
+        }
+        let resp = req.send().await?;
+        let status = resp.status().as_u16();
+        let text = resp.text().await?;
+        let value = if text.trim().is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text))
+        };
+        Ok((status, value))
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::next_page_url;
+    use super::{forge_url, next_page_url};
 
     fn headers(link: &str) -> reqwest::header::HeaderMap {
         let mut h = reqwest::header::HeaderMap::new();
@@ -569,5 +573,24 @@ mod tests {
         assert!(next_page_url(&h).is_none());
         // No Link header at all.
         assert!(next_page_url(&reqwest::header::HeaderMap::new()).is_none());
+    }
+
+    #[test]
+    fn forge_url_pins_raw_path_to_configured_base() {
+        let base = "https://api.github.com";
+        assert_eq!(
+            forge_url(base, "repos/o/r/issues/1"),
+            "https://api.github.com/repos/o/r/issues/1"
+        );
+        assert_eq!(
+            forge_url(base, "/repos/o/r/issues/1"),
+            "https://api.github.com/repos/o/r/issues/1"
+        );
+        // An absolute URL in the path is appended, not honored as an origin.
+        assert!(forge_url(base, "https://evil.test/x").starts_with("https://api.github.com/"));
+        // A protocol-relative path stays under the base host.
+        assert!(forge_url(base, "//evil.test/x").starts_with("https://api.github.com/"));
+        // Traversal segments do not escape the base scheme+host in the string.
+        assert!(forge_url(base, "../../../evil.test").starts_with("https://api.github.com/"));
     }
 }

@@ -302,8 +302,8 @@ install_prebuilt() {
   printf "%s\n" "$(bold "Installing ZeroClaw ${version} (pre-built)")"
   info "Platform: $triple"
   info "Source:   $asset_url"
-  info "Channels: pre-built binaries ship the full distribution channel set (all channels, no heavyweight extras)."
-  info "For heavyweight extras excluded from the distribution set (e.g. whatsapp-web), build from source with --preset full."
+  info "Channels: pre-built binaries ship the lean standard distribution set; availability is target-specific."
+  info "Run 'zeroclaw channel list' to inspect this binary. For other channels such as Slack, build from source with --preset full."
   echo
 
   # Resolve platform-correct web data directory to match gateway auto-detect
@@ -665,6 +665,16 @@ install_web_dist() {
   fi
   mkdir -p "$web_data_dir"
   cp -r "$src_dist/." "$web_data_dir/"
+  # Prune files the fresh build no longer ships. Copy-then-prune keeps
+  # index.html present throughout, so a running gateway never 503s
+  # mid-install, while stale hashed chunks still get removed.
+  (
+    cd "$web_data_dir" || exit 0
+    find . -type f | while IFS= read -r f; do
+      [ -f "$src_dist/$f" ] || rm -f "$f"
+    done
+    find . -depth -type d -empty -exec rmdir {} \; 2>/dev/null
+  )
   info "Web dashboard installed to $web_data_dir"
 }
 

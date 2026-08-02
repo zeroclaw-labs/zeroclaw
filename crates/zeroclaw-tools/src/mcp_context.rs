@@ -10,11 +10,6 @@ use crate::tool_search::ToolAccessPolicy;
 use std::sync::Arc;
 use zeroclaw_config::schema::McpServerConfig;
 
-/// Read each server's `pinned_resources` once and build a system-prompt section
-/// of provenance-wrapped resource blocks. Pins are skipped (with a logged
-/// warning) when: the server is not connected, did not advertise resources, the
-/// read fails, or the access `policy` denies the prefixed uri. Returns an empty
-/// string when nothing is injected.
 pub async fn build_pinned_resources_section(
     registry: &Arc<McpRegistry>,
     configs: &[McpServerConfig],

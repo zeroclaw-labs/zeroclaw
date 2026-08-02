@@ -1,5 +1,4 @@
 //! Look Tool - Camera capture + vision model description
-//!
 //! Captures an image from the camera and optionally describes it
 //! using a local vision model (LLaVA, Moondream) via Ollama.
 

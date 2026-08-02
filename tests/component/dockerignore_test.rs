@@ -1,10 +1,4 @@
 //! Tests to verify .dockerignore excludes sensitive paths from Docker build context.
-//!
-//! These tests validate that:
-//! 1. The .dockerignore file exists
-//! 2. All security-critical paths are excluded
-//! 3. All build-essential paths are NOT excluded
-//! 4. Pattern syntax is valid
 
 use std::path::Path;
 

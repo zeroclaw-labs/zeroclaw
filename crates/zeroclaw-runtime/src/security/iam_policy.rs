@@ -1,5 +1,4 @@
 //! IAM-aware policy enforcement for Nevis role-to-permission mapping.
-//!
 //! Evaluates tool and workspace access based on Nevis roles using a
 //! deny-by-default policy model. All policy decisions are audit-logged.
 
@@ -36,7 +35,6 @@ impl PolicyDecision {
 }
 
 /// IAM policy engine that maps Nevis roles to ZeroClaw tool permissions.
-///
 /// Deny-by-default: if no role mapping grants access, the request is denied.
 #[derive(Debug, Clone)]
 pub struct IamPolicy {
@@ -58,7 +56,6 @@ struct CompiledRole {
 
 impl IamPolicy {
     /// Build a policy from role mappings (typically from config).
-    ///
     /// Returns an error if duplicate normalized role names are detected,
     /// since silent last-wins overwrites can accidentally broaden or revoke access.
     pub fn from_mappings(mappings: &[RoleMapping]) -> Result<Self> {
@@ -116,7 +113,6 @@ impl IamPolicy {
     }
 
     /// Evaluate whether an identity is allowed to use a specific tool.
-    ///
     /// Deny-by-default: returns `Deny` unless at least one of the identity's
     /// roles grants access to the requested tool.
     pub fn evaluate_tool_access(
@@ -149,7 +145,6 @@ impl IamPolicy {
     }
 
     /// Evaluate whether an identity is allowed to access a specific workspace.
-    ///
     /// Deny-by-default: returns `Deny` unless at least one of the identity's
     /// roles grants access to the requested workspace.
     pub fn evaluate_workspace_access(

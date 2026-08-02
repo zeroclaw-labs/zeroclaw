@@ -1,9 +1,4 @@
 //! JSONL-based session persistence for channel conversations.
-//!
-//! Each session (keyed by `channel_sender` or `channel_thread_sender`) is stored
-//! as an append-only JSONL file in `{workspace}/sessions/`. Messages are appended
-//! one-per-line as JSON, never modifying old lines. On daemon restart, sessions
-//! are loaded from disk to restore conversation context.
 
 use crate::session_backend::SessionBackend;
 use std::io::{BufRead, Write};
@@ -72,7 +67,6 @@ impl SessionStore {
     }
 
     /// Remove the last message from a session's JSONL file.
-    ///
     /// Rewrite approach: load all messages, drop the last, rewrite. This is
     /// O(n) but rollbacks are rare.
     pub fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
@@ -163,11 +157,6 @@ impl SessionBackend for SessionStore {
         self.list_sessions()
     }
 
-    /// Override the trait default so JSONL-backed channel hydration picks
-    /// the most-recent sessions when truncating to MAX_CONVERSATION_SENDERS.
-    /// The trait default stamps every key with `Utc::now()`, which makes
-    /// the orchestrator's `sort_by_key(|m| Reverse(m.last_activity))`
-    /// arbitrary once more than that many sessions are persisted.
     fn list_sessions_with_metadata(&self) -> Vec<crate::session_backend::SessionMetadata> {
         use chrono::{DateTime, Utc};
         self.list_sessions()
@@ -205,7 +194,7 @@ impl SessionBackend for SessionStore {
     }
 
     /// Quick existence probe mirroring how `delete_session` decides whether
-    /// the session is on disk (#7126). Checking file presence is the same
+    /// the session is on disk Checking file presence is the same
     /// O(1) `stat` that `delete_session` itself performs.
     fn session_exists(&self, session_key: &str) -> bool {
         self.session_path(session_key).exists()
@@ -498,7 +487,7 @@ mod tests {
         assert!(backend.load("trait_delete").is_empty());
     }
 
-    // ── session_exists (#7126) ─────────────────────────────────────
+    // ── session_exists─────────────────────────────────────
     #[test]
     fn session_exists_tracks_lifecycle() {
         let tmp = TempDir::new().unwrap();

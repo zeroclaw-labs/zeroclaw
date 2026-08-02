@@ -15,11 +15,6 @@ const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 /// Monotonic counter to ensure unique message IDs under burst traffic.
 static MSG_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// IRC over TLS channel.
-///
-/// Connects to an IRC server using TLS, joins configured channels,
-/// and forwards PRIVMSG messages to the `ZeroClaw` message bus.
-/// Supports both channel messages and private messages (DMs).
 pub struct IrcChannel {
     server: String,
     port: u16,
@@ -69,7 +64,6 @@ struct IrcMessage {
 
 impl IrcMessage {
     /// Parse a raw IRC line into an `IrcMessage`.
-    ///
     /// IRC format: `[:<prefix>] <command> [<params>] [:<trailing>]`
     fn parse(line: &str) -> Option<Self> {
         let line = line.trim_end_matches(['\r', '\n']);
@@ -154,16 +148,6 @@ fn encode_sasl_plain(nick: &str, password: &str) -> String {
     out
 }
 
-/// Split a message into lines safe for IRC transmission.
-///
-/// IRC is a line-based protocol — `\r\n` terminates each command, so any
-/// newline inside a PRIVMSG payload would truncate the message and turn the
-/// remainder into garbled/invalid IRC commands.
-///
-/// This function:
-/// 1. Splits on `\n` (and strips `\r`) so each logical line becomes its own PRIVMSG.
-/// 2. Splits any line that exceeds `max_bytes` at a safe UTF-8 boundary.
-/// 3. Skips empty lines to avoid sending blank PRIVMSGs.
 fn split_message(message: &str, max_bytes: usize) -> Vec<String> {
     let mut chunks = Vec::new();
 
@@ -396,14 +380,6 @@ impl Channel for IrcChannel {
         "irc"
     }
 
-    /// IRC echoes the bot's own PRIVMSGs back through the same socket
-    /// for any channel the bot is JOINed to. Returning the configured
-    /// nickname here engages the SDK self-loop guard so those echoes
-    /// drop before reaching the agent loop. The nickname is set at
-    /// construction (`config.nickname`) and used as the preferred nick
-    /// during NICK negotiation; if the server forces a different nick
-    /// (collision fallback in `listen`), the agent-loop fallback
-    /// catches the gap.
     fn self_handle(&self) -> Option<String> {
         Some(self.nickname.clone())
     }
@@ -472,7 +448,7 @@ impl Channel for IrcChannel {
         )
         .await?;
 
-        // Store writer for send()
+        // Store writer for send
         {
             let mut guard = self.writer.lock().await;
             *guard = Some(writer);
