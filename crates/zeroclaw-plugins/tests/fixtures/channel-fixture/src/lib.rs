@@ -31,8 +31,12 @@ mod component {
             "channel-fixture".to_string()
         }
 
-        fn configure(_config: String) -> Result<(), String> {
-            Ok(())
+        fn configure(config: String) -> Result<(), String> {
+            if config == r#"{"retry_count":5}"# {
+                Ok(())
+            } else {
+                Err("expected typed retry_count config".to_string())
+            }
         }
 
         fn send(_message: SendMessage) -> Result<(), String> {
