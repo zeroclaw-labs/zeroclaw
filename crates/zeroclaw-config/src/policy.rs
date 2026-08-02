@@ -1132,12 +1132,34 @@ fn command_basename(raw: &str) -> &str {
     after_fwd.rsplit('\\').next().unwrap_or(after_fwd)
 }
 
+fn path_resolves_within(path: &Path, root: &Path) -> bool {
+    path.canonicalize()
+        .is_ok_and(|resolved| resolved.starts_with(root))
+}
+
+fn python_package_path_is_safe(components: &[&str], workspace: &Path) -> bool {
+    let mut package_dir = workspace.to_path_buf();
+    for component in components {
+        package_dir.push(component);
+        if !path_resolves_within(&package_dir, workspace) {
+            return false;
+        }
+
+        let initializer = package_dir.join("__init__.py");
+        if initializer.exists() && !path_resolves_within(&initializer, workspace) {
+            return false;
+        }
+    }
+    true
+}
+
 fn python_module_is_safe(module: &str, workspace_dir: &Path) -> bool {
     if matches!(module, "unittest" | "pytest" | "mypy" | "json.tool") {
         return true;
     }
 
-    let valid_local_name = module.split('.').all(|component| {
+    let components = module.split('.').collect::<Vec<_>>();
+    let valid_local_name = components.iter().all(|component| {
         let mut chars = component.chars();
         chars
             .next()
@@ -1151,13 +1173,24 @@ fn python_module_is_safe(module: &str, workspace_dir: &Path) -> bool {
     let Ok(workspace) = workspace_dir.canonicalize() else {
         return false;
     };
-    let relative = module.replace('.', std::path::MAIN_SEPARATOR_STR);
-    let module_file = workspace.join(format!("{relative}.py"));
-    let package_entrypoint = workspace.join(relative).join("__main__.py");
-    [module_file, package_entrypoint]
+    let Some((leaf, parents)) = components.split_last() else {
+        return false;
+    };
+    if !python_package_path_is_safe(parents, &workspace) {
+        return false;
+    }
+
+    let parent_dir = parents
         .iter()
-        .filter_map(|candidate| candidate.canonicalize().ok())
-        .any(|candidate| candidate.starts_with(&workspace))
+        .fold(workspace.clone(), |path, component| path.join(component));
+    let module_file = parent_dir.join(format!("{leaf}.py"));
+    if path_resolves_within(&module_file, &workspace) {
+        return true;
+    }
+
+    let package_components = components.as_slice();
+    python_package_path_is_safe(package_components, &workspace)
+        && path_resolves_within(&parent_dir.join(leaf).join("__main__.py"), &workspace)
 }
 
 fn python_args_safe(args: &[String], workspace_dir: &Path) -> bool {
@@ -1563,7 +1596,7 @@ impl SecurityPolicy {
                             || arg.starts_with("alias.")
                     })
             }
-            "python" | "python3" => python_args_safe(args, &self.workspace_dir),
+            "python" | "python3" => python_args_safe(args_cased, &self.workspace_dir),
             "node" => {
                 // -e/--eval evaluates argument as JavaScript
                 // -p/--print same as --eval but prints the result
@@ -3591,6 +3624,7 @@ mod tests {
         assert!(p.is_command_allowed("python3 -m pytest"));
         assert!(p.is_command_allowed("python3 -m mypy src/"));
         assert!(p.is_command_allowed("python3 -m json.tool package.json"));
+        assert!(!p.is_command_allowed("python3 -m PyTeSt"));
     }
 
     #[test]
@@ -3608,6 +3642,30 @@ mod tests {
         assert!(p.is_command_allowed("python3 -mreceipt"));
         assert!(!p.is_command_allowed("python3 -m missing_package"));
         assert!(!p.is_command_allowed("python3 -m ../receipt"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn python_local_module_rejects_symlinked_package_escape() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let outside = tempfile::tempdir().expect("outside directory");
+        std::fs::write(workspace.path().join("task.py"), "print('safe')\n")
+            .expect("workspace module");
+        std::fs::write(outside.path().join("__init__.py"), "print('outside')\n")
+            .expect("outside package initializer");
+        std::os::unix::fs::symlink(
+            workspace.path().join("task.py"),
+            outside.path().join("task.py"),
+        )
+        .expect("module symlink");
+        std::os::unix::fs::symlink(outside.path(), workspace.path().join("receipt"))
+            .expect("package symlink");
+        let p = SecurityPolicy {
+            workspace_dir: workspace.path().to_path_buf(),
+            ..default_policy()
+        };
+
+        assert!(!p.is_command_allowed("python3 -m receipt.task"));
     }
 
     #[test]
