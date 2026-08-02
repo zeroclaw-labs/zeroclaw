@@ -111,7 +111,7 @@ pub struct ImageGenTool {
     /// written inside the container but invisible on the host and discarded at
     /// session end. When `false`, a successful generation carries a loud
     /// ephemeral-workspace warning. Mirrors
-    /// [`super::file_write::FileWriteTool`]. See issue #4627.
+    /// [`super::file_write::FileWriteTool`].
     persistent_writes: bool,
 }
 
