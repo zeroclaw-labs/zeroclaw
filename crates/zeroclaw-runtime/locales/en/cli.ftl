@@ -1081,3 +1081,6 @@ sop-rpc-decision-invalid-state = Run {$run_id} cannot be resolved in its current
 sop-rpc-decision-unauthorized = The RPC principal is not authorized to resolve this SOP step.
 sop-rpc-policy-missing = SOP approval policy '{$name}' is not configured.
 sop-rpc-policy-unavailable = The parked SOP policy is unavailable: {$reason}.
+
+# ── Evaluation harness ──
+cli-eval-failed-case-records =   failed-case records: {$dir}/
