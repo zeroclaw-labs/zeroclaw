@@ -900,7 +900,9 @@ mod tests {
     /// End-to-end regression for the shell workspace-boundary bypass: driving
     /// the REAL wrapped shell tool, a write through an in-workspace symlink
     /// pointing outside must be refused before the command runs, and nothing may
-    /// be created at the target - the same boundary the file tools enforce.
+    /// be created at the target. This covers only the direct path-shaped
+    /// redirect form the static scan can see; dynamic forms (scripts,
+    /// expansion, races) are outside this layer.
     #[cfg(unix)]
     #[tokio::test]
     async fn shell_blocks_symlink_escape_end_to_end() {

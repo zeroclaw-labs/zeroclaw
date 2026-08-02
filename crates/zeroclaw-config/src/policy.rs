@@ -4845,11 +4845,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Regression for the shell workspace-boundary bypass: a command path
-    /// argument that reaches outside the workspace through an in-workspace
-    /// symlink must be blocked, exactly as the file tools block it. The leaf may
-    /// not exist yet (the command is about to create it), so resolution must
-    /// follow the symlinked ancestor.
+    /// Regression for the shell workspace-boundary bypass: a direct path-shaped
+    /// command argument that reaches outside the workspace through an
+    /// in-workspace symlink must be blocked. The leaf may not exist yet (the
+    /// command is about to create it), so resolution must follow the symlinked
+    /// ancestor.
     #[cfg(unix)]
     #[test]
     fn forbidden_path_argument_blocks_symlink_escape() {
