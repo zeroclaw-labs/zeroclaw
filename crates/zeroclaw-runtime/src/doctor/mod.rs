@@ -2384,16 +2384,22 @@ mod tests {
             "daemon diagnostics must survive probe timeout"
         );
 
-        // The timeout warning must be present.
-        let timeout_warning = results.iter().find(|r| {
-            r.category == "doctor"
-                && r.severity == Severity::Warn
-                && r.message.contains("timed out")
-        });
+        // The timeout warning must be present and resolve to the localized
+        // probe-timeout copy, independent of the ambient locale.
+        let expected_warning =
+            crate::i18n::get_required_cli_string("cli-doctor-probe-timeout-message");
+        assert!(
+            !expected_warning.contains("{cli-doctor-probe-timeout-message}"),
+            "probe-timeout key must resolve in the active locale"
+        );
+        let timeout_warning = results.iter().find(|r| r.message == expected_warning);
         assert!(
             timeout_warning.is_some(),
             "probe timeout must append a timeout warning to results"
         );
+        let timeout_warning = timeout_warning.expect("checked above");
+        assert_eq!(timeout_warning.category, "doctor");
+        assert_eq!(timeout_warning.severity, Severity::Warn);
 
         // timed_out_phase must identify the probe phase.
         assert_eq!(
@@ -2414,9 +2420,12 @@ mod tests {
         let (results, timed_out_phase) =
             run_structured_with_timeout(&config, Duration::from_secs(5)).await;
 
-        // No timeout warning should be present.
+        // No timeout warning should be present (compared via the same Fluent
+        // lookup the production path uses, so the check is locale-independent).
+        let expected_warning =
+            crate::i18n::get_required_cli_string("cli-doctor-probe-timeout-message");
         assert!(
-            !results.iter().any(|r| r.message.contains("timed out")),
+            !results.iter().any(|r| r.message == expected_warning),
             "under-deadline run must not append timeout warning"
         );
 

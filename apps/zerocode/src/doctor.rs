@@ -253,7 +253,7 @@ impl Doctor {
 
             // Surface the resolved active log path first when the daemon
             // advertised one — it is the operator's primary entry point for
-            // post-mortem log navigation (8650).
+            // post-mortem log navigation.
             if let Some(log_path) = self.result.as_ref().and_then(|r| r.log_path.as_deref()) {
                 out.push(Line::from(Span::styled(
                     crate::i18n::t_args("zc-doctor-log-path", &[("path", log_path)]),
@@ -840,9 +840,9 @@ mod tests {
 
     /// Render Doctor with `log_persistence = "file"` and a long realistic
     /// resolved path. Asserts the path appears in the detail panel buffer
-    /// (the operator's discoverability contract from 8650) and dumps the
-    /// rendered buffer to stdout so `cargo test -- --nocapture` produces a
-    /// capture suitable for pasting into the PR as first-hand evidence.
+    /// (the operator's discoverability contract) and dumps the rendered
+    /// buffer to stdout so `cargo test -- --nocapture` produces a capture
+    /// that documents the exact rendered layout.
     #[tokio::test]
     async fn render_screenshot_log_path_file() {
         use ratatui::{Terminal, backend::TestBackend};

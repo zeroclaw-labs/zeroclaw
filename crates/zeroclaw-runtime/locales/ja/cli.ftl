@@ -952,7 +952,7 @@ cli-doctor-context-window-unset = {$provider_ref}: context_window が未設定�
 
 # Doctor probe timeout warning — shown when model probing times out but prior
 # diagnostics (config, workspace, daemon) are preserved and returned.
-cli-doctor-probe-timeout-message = Model probing timed out. Some provider catalogs may be unreachable. You can retry Doctor to refresh.
+cli-doctor-probe-timeout-message = モデル調査がタイムアウトしました。一部のプロバイダーカタログに到達できない可能性があります。Doctor を再実行して更新できます。
 
 # ── Degraded config sections (doctor diagnose, #8835) ──
 cli-doctor-degraded-security = セキュリティ上重要な設定セクション `{$path}` が無効なため、デーモンを起動できるようデフォルト値にリセットされました。実行中のセキュリティ設定は意図したものより弱くなっている可能性があります。`zeroclaw config migrate` を実行してパースエラーを確認し、ファイルを修復してください。

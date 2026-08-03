@@ -159,6 +159,9 @@ zc-doctor-detail-title = Détail
 zc-doctor-no-selection = Aucun diagnostic sélectionné
 zc-doctor-label-message = Message
 zc-doctor-help-mouse = Souris : cliquer pour filtrer/sélectionner, molette de défilement
+zc-doctor-error-daemon-timeout = La vérification Doctor a expiré. Le daemon est peut-être occupé, injoignable ou en train de traiter une requête de longue durée. Réessayez ou vérifiez la connectivité du daemon.
+zc-doctor-partial-banner = ⚠ Résultats partiels : la vérification des modèles a expiré
+zc-doctor-partial-hint = Certains catalogues de fournisseurs n'ont pas pu être atteints. Les résultats des vérifications de configuration, d'espace de travail et de daemon sont affichés ci-dessous. Appuyez sur la touche d'actualisation pour réessayer.
 zc-dashboard-tab-overview = Aperçu
 zc-dashboard-tab-sessions = Sessions
 zc-dashboard-tab-agents = Agents
@@ -497,5 +500,4 @@ zc-config-footer-action-help = aide
 zc-config-footer-action-new-line = nouvelle ligne
 zc-config-field-edit-hint = { $keys } → appuyez pour modifier
 
-# Doctor probe timeout warning — shown when model probing times out
-zc-doctor-probe-timeout-message = Model probing timed out. Some provider catalogs may be unreachable. You can retry Doctor to refresh.
+zc-doctor-log-path = log : { $path }

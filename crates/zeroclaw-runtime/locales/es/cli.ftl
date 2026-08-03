@@ -952,7 +952,7 @@ cli-doctor-context-window-unset = {$provider_ref}: no se configuró context_wind
 
 # Doctor probe timeout warning — shown when model probing times out but prior
 # diagnostics (config, workspace, daemon) are preserved and returned.
-cli-doctor-probe-timeout-message = Model probing timed out. Some provider catalogs may be unreachable. You can retry Doctor to refresh.
+cli-doctor-probe-timeout-message = La comprobación de modelos agotó el tiempo de espera. Es posible que algunos catálogos de proveedores no estén accesibles. Puede volver a ejecutar Doctor para actualizar.
 
 # ── Degraded config sections (doctor diagnose, #8835) ──
 cli-doctor-degraded-security = Sección de configuración CRÍTICA PARA LA SEGURIDAD `{$path}` no es válida y se restableció a sus valores predeterminados para que el daemon pueda arrancar; la postura en ejecución puede ser MÁS DÉBIL de lo previsto. Ejecute `zeroclaw config migrate` para ver el error de análisis y luego repare el archivo.
