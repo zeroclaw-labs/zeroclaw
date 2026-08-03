@@ -2599,6 +2599,40 @@ impl Channel for WhatsAppWebChannel {
                                     content = format!("[Status] {content}");
                                 }
 
+                                // A message can arrive as a *revision* of one
+                                // already delivered: `edit` carries the revoke
+                                // and edit attributes WhatsApp puts on the
+                                // stanza. Ignoring it — which this channel did
+                                // — means the agent answers text the person has
+                                // since corrected, and never learns they took
+                                // something back. Both read as the agent not
+                                // paying attention, because from the other side
+                                // that is exactly what it looks like: their
+                                // screen shows "you deleted this message" while
+                                // the reply quotes what they deleted.
+                                //
+                                // Marked inline rather than dropped. The agent
+                                // needs to know a revision happened to react
+                                // like a person would; silently swallowing the
+                                // event would leave it responding to a message
+                                // that, on her screen, no longer exists.
+                                match info.edit {
+                                    wacore::types::message::EditAttribute::SenderRevoke
+                                    | wacore::types::message::EditAttribute::AdminRevoke => {
+                                        content = "[La otra persona borró un mensaje que te había enviado. No sabes qué decía. Reacciona como reaccionarías si alguien se arrepiente de algo que te escribió — sin dramatizar y sin exigir explicaciones.]".to_string();
+                                    }
+                                    wacore::types::message::EditAttribute::MessageEdit
+                                    | wacore::types::message::EditAttribute::AdminEdit => {
+                                        content = format!(
+                                            "[Mensaje corregido — esta es la versión buena, responde a ésta] {content}"
+                                        );
+                                    }
+                                    // `PinInChat` is a pin/unpin, not a content
+                                    // revision, and `Empty`/`Unknown` are
+                                    // ordinary messages.
+                                    _ => {}
+                                }
+
                                 ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("WhatsApp Web message received (sender_len={}, chat_len={}, content_len={})", sender.len(), chat.len(), content.len()));
                                 ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("WhatsApp Web message content: {}", content));
 
@@ -3491,6 +3525,50 @@ mod tests {
 
     #[cfg(feature = "whatsapp-web")]
     #[test]
+    fn revision_attributes_are_distinguished_from_ordinary_messages() {
+        use wacore::types::message::EditAttribute;
+
+        // The channel used to ignore `info.edit` entirely, so a revoke looked
+        // like a normal message and an edit looked like a brand-new one. These
+        // are the wire values that must be treated as revisions.
+        for attr in [
+            EditAttribute::SenderRevoke,
+            EditAttribute::AdminRevoke,
+            EditAttribute::MessageEdit,
+            EditAttribute::AdminEdit,
+        ] {
+            assert!(
+                matches!(
+                    attr,
+                    EditAttribute::SenderRevoke
+                        | EditAttribute::AdminRevoke
+                        | EditAttribute::MessageEdit
+                        | EditAttribute::AdminEdit
+                ),
+                "revision attribute must be recognised"
+            );
+        }
+
+        // A pin is not a content revision: treating it as one would rewrite an
+        // ordinary message's text every time someone pinned something.
+        assert!(!matches!(
+            EditAttribute::PinInChat,
+            EditAttribute::SenderRevoke
+                | EditAttribute::AdminRevoke
+                | EditAttribute::MessageEdit
+                | EditAttribute::AdminEdit
+        ));
+        assert!(!matches!(
+            EditAttribute::Empty,
+            EditAttribute::SenderRevoke
+                | EditAttribute::AdminRevoke
+                | EditAttribute::MessageEdit
+                | EditAttribute::AdminEdit
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
     fn device_suffix_is_not_part_of_the_phone_number() {
         // Regression: an inbound JID's user part carries the device id
         // (`<number>:<device>`). Folding that into the digits appended the
