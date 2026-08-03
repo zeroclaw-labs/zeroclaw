@@ -267,6 +267,16 @@ pub struct WhatsAppWebChannel {
     /// connect, the linked account is persisted into `peer_groups` through
     /// `crate::identity_persist` (no channel-local allowlist cache).
     persist: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    /// Session backend used to persist turns recovered from a history sync.
+    /// `None` when session persistence is off — history is then decoded,
+    /// counted and dropped, exactly as before.
+    #[cfg(feature = "whatsapp-web")]
+    history_sessions: Option<Arc<dyn zeroclaw_infra::session_backend::SessionBackend>>,
+    /// The same claim ledger the live path writes to. Recovered turns are
+    /// claimed against it so a message the agent already answered is never
+    /// re-imported as history.
+    #[cfg(feature = "whatsapp-web")]
+    history_claims: Option<Arc<crate::processed_messages::ProcessedMessageStore>>,
 }
 
 impl WhatsAppWebChannel {
@@ -336,6 +346,10 @@ impl WhatsAppWebChannel {
             announce_presence: false,
             send_read_receipts: false,
             inbound_transcript_path: None,
+            #[cfg(feature = "whatsapp-web")]
+            history_sessions: None,
+            #[cfg(feature = "whatsapp-web")]
+            history_claims: None,
         }
     }
 
@@ -390,6 +404,43 @@ impl WhatsAppWebChannel {
     pub fn with_workspace_dir(mut self, dir: PathBuf) -> Self {
         self.workspace_dir = Some(dir);
         self
+    }
+
+    /// Give the channel the stores it needs to persist recovered history.
+    ///
+    /// Both are `Arc` handles to the objects the orchestrator already built
+    /// (`mod.rs` session backend + processed-message store), not copies of
+    /// their state: the history importer must claim messages against the very
+    /// same ledger the live path writes to, or a message the agent already
+    /// answered would be re-imported as history. Passing the handles through
+    /// keeps one source of truth for both "what has been said" and "what has
+    /// been acted on".
+    #[cfg(feature = "whatsapp-web")]
+    pub fn with_history_stores(
+        mut self,
+        sessions: Arc<dyn zeroclaw_infra::session_backend::SessionBackend>,
+        claims: Arc<crate::processed_messages::ProcessedMessageStore>,
+    ) -> Self {
+        self.history_sessions = Some(sessions);
+        self.history_claims = Some(claims);
+        self
+    }
+
+    /// Same as [`Self::with_history_stores`] for call sites that may not have
+    /// the stores. History import needs *both*: a session backend with no
+    /// claim ledger would re-import the whole thread on every sync, and a
+    /// ledger with nowhere to write is pointless. Anything less than both is
+    /// treated as "not configured" rather than half-enabled.
+    #[cfg(feature = "whatsapp-web")]
+    pub fn with_optional_history_stores(
+        self,
+        sessions: Option<Arc<dyn zeroclaw_infra::session_backend::SessionBackend>>,
+        claims: Option<Arc<crate::processed_messages::ProcessedMessageStore>>,
+    ) -> Self {
+        match (sessions, claims) {
+            (Some(s), Some(c)) => self.with_history_stores(s, c),
+            _ => self,
+        }
     }
 
     /// Configure voice transcription (STT) for incoming voice notes.
@@ -2327,6 +2378,11 @@ impl Channel for WhatsAppWebChannel {
             let transcript_path_inner = self.inbound_transcript_path.clone().map(Arc::new);
             let send_read_receipts = self.send_read_receipts;
             let announce_presence = self.announce_presence;
+            let history_sessions_outer = self.history_sessions.clone();
+            let history_claims_outer = self.history_claims.clone();
+            // The channel scope the orchestrator uses to key sessions, so
+            // recovered turns land in the bucket live messages already use.
+            let history_scope = Arc::new(format!("whatsapp.{}", self.alias));
 
             let mut builder = Bot::builder()
                 .with_backend_arc(backend.clone())
@@ -2384,6 +2440,9 @@ impl Channel for WhatsAppWebChannel {
                     let passive_group_context = passive_group_context;
                     let bot_phone_inner = bot_phone_clone.clone();
                     let bot_lid_inner = bot_lid_clone.clone();
+                    let history_sessions_inner = history_sessions_outer.clone();
+                    let history_claims_inner = history_claims_outer.clone();
+                    let history_scope_inner = history_scope.clone();
                     let wa_dm_mention_patterns = wa_dm_mention_patterns.clone();
                     let wa_group_mention_patterns = wa_group_mention_patterns.clone();
                     let allowed_groups_resolver = Arc::clone(&allowed_groups_resolver);
@@ -2869,22 +2928,43 @@ impl Channel for WhatsAppWebChannel {
                                 // agent needs to not answer as though nothing
                                 // had been said.
                                 //
-                                // Only the shape is logged, never message
-                                // content: this is someone's private thread, and
-                                // a log line is the easiest place for it to leak.
-                                let count = crate::whatsapp_history::count_storable_turns(sync);
+                                // Only counts and shapes are logged, never
+                                // message content: this is someone's private
+                                // thread, and a log line is the easiest place
+                                // for it to leak.
+                                let turns = crate::whatsapp_history::extract_turns(
+                                    sync,
+                                    &history_scope_inner,
+                                );
+                                let stored = match (
+                                    history_sessions_inner.as_ref(),
+                                    history_claims_inner.as_ref(),
+                                ) {
+                                    (Some(sessions), Some(claims)) => {
+                                        crate::whatsapp_history::persist_turns(
+                                            &turns,
+                                            &history_scope_inner,
+                                            claims,
+                                            sessions.as_ref(),
+                                        )
+                                    }
+                                    // Session persistence is off; decode and
+                                    // count so the log still shows history
+                                    // arrived, but there is nowhere to put it.
+                                    _ => 0,
+                                };
                                 ::zeroclaw_log::record!(
                                     INFO,
                                     ::zeroclaw_log::Event::new(
                                         module_path!(),
                                         ::zeroclaw_log::Action::Note
-                                    ),
-                                    &format!(
-                                        "history sync received: type={} progress={:?} storable_turns={}",
-                                        sync.sync_type(),
-                                        sync.progress(),
-                                        count
                                     )
+                                    .with_attrs(::serde_json::json!({
+                                        "sync_type": format!("{:?}", sync.sync_type()),
+                                        "recovered": turns.len(),
+                                        "stored": stored,
+                                    })),
+                                    "history sync received"
                                 );
                             }
                             Event::LoggedOut(_) => {

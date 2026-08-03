@@ -8503,7 +8503,7 @@ pub fn build_channel_map(
     config: &Config,
 ) -> HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>> {
     let config_arc = Arc::new(RwLock::new(config.clone()));
-    let configured = collect_configured_channels(&config_arc, "", &[], None, None);
+    let configured = collect_configured_channels(&config_arc, "", &[], None, None, None, None);
     configured_channel_map(&configured)
 }
 
@@ -8516,7 +8516,7 @@ pub fn register_channels_for_tools(
     escalate_handle: &Option<tools::PerToolChannelHandle>,
 ) -> Vec<String> {
     let config_arc = Arc::new(RwLock::new(config.clone()));
-    let configured = collect_configured_channels(&config_arc, "", &[], None, None);
+    let configured = collect_configured_channels(&config_arc, "", &[], None, None, None, None);
 
     let handles = [
         ask_user_handle.as_ref(),
@@ -8555,9 +8555,17 @@ fn collect_configured_channels(
     tool_specs: &[(String, String)],
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    // Handles to the runtime's stores, threaded through so the WhatsApp
+    // history importer writes to the same session backend the agent reads and
+    // claims against the same ledger the live path writes. `None` on the
+    // diagnostic call paths (doctor, health check), which build throwaway
+    // channels that never receive a history sync.
+    session_store: Option<Arc<dyn zeroclaw_infra::session_backend::SessionBackend>>,
+    processed_messages: Option<Arc<crate::processed_messages::ProcessedMessageStore>>,
 ) -> Vec<ConfiguredChannel> {
     let _ = matrix_skip_context;
     let _ = tool_specs;
+    let _ = (&session_store, &processed_messages);
     #[cfg(not(feature = "channel-amqp"))]
     let _ = (&sop_engine, &sop_audit);
     #[allow(unused_mut)]
@@ -9125,7 +9133,11 @@ fn collect_configured_channels(
                                 .with_tts(&config)
                                 .with_workspace_dir(workspace_dir)
                                 .with_dm_mention_patterns(wa.dm_mention_patterns.clone())
-                                .with_group_mention_patterns(wa.group_mention_patterns.clone()),
+                                .with_group_mention_patterns(wa.group_mention_patterns.clone())
+                                .with_optional_history_stores(
+                                    session_store.clone(),
+                                    processed_messages.clone(),
+                                ),
                             ),
                             wa,
                         ),
@@ -10197,7 +10209,8 @@ fn no_real_time_channels_message() -> &'static str {
 pub async fn doctor_channels(config: Config) -> Result<()> {
     let config_arc = Arc::new(RwLock::new(config));
     #[allow(unused_mut)]
-    let mut channels = collect_configured_channels(&config_arc, "health check", &[], None, None);
+    let mut channels =
+        collect_configured_channels(&config_arc, "health check", &[], None, None, None, None);
 
     #[cfg(feature = "channel-nostr")]
     {
@@ -10894,6 +10907,39 @@ pub async fn start_channels(
             system_prompt.push_str(zeroclaw_runtime::agent::tool_receipts::SYSTEM_PROMPT_ADDENDUM);
         }
 
+        // === First iteration only: set up shared channel infrastructure ===
+        //
+        // We collect channels here (using *this* agent's `tool_specs`, since
+        // the loop puts the primary agent first) and stash the
+        // `channels_by_name` registry so subsequent iterations can populate
+        // their tool handles without re-building Discord/Telegram/etc.
+        // sockets. The first agent's `tool_specs` wire Telegram-style slash
+        // commands; multi-agent installs that want per-bot command sets
+        // require a future per-channel `tool_specs` lookup (tracked
+        // alongside the per-channel ChannelRuntimeContext follow-up).
+        // Durable duplicate guard, opened once and shared by every inbound
+        // message *and* by the WhatsApp history importer. Both must claim
+        // against the same ledger: a message the agent answered live has to
+        // look "already seen" to the importer, or a re-pair would replay it as
+        // history. On failure we log and continue with `None` — losing
+        // duplicate protection is bad, refusing to start the channel is worse.
+        let processed_messages_store =
+            match crate::processed_messages::ProcessedMessageStore::open_in_state_dir(
+                &config.data_dir.join("state"),
+            ) {
+                Ok(store) => Some(Arc::new(store)),
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+                        "could not open processed-message store; duplicate protection disabled"
+                    );
+                    None
+                }
+            };
+
         if channels_by_name_shared.is_none() {
             if !skills.is_empty() {
                 println!(
@@ -10913,6 +10959,8 @@ pub async fn start_channels(
                 &tool_specs,
                 sop_engine.clone(),
                 sop_audit.clone(),
+                shared_session_store.clone(),
+                processed_messages_store.clone(),
             );
 
             #[cfg(feature = "channel-nostr")]
@@ -11163,29 +11211,10 @@ pub async fn start_channels(
             query_classification: config.query_classification.clone(),
             ack_reactions: config.channels.ack_reactions,
             show_tool_calls: config.channels.show_tool_calls,
-            // Durable duplicate guard. Opened once per runtime context and
-            // shared by every inbound message. On failure we log and continue
-            // with `None`: losing duplicate protection is bad, but refusing to
-            // start the channel over it would be worse.
-            processed_messages:
-                match crate::processed_messages::ProcessedMessageStore::open_in_state_dir(
-                    &config.data_dir.join("state"),
-                ) {
-                    Ok(store) => Some(Arc::new(store)),
-                    Err(e) => {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Fail
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({ "error": format!("{e}") })),
-                            "could not open processed-message store; duplicate protection disabled"
-                        );
-                        None
-                    }
-                },
+            // Durable duplicate guard, opened once above and shared by every
+            // inbound message *and* by the WhatsApp history importer, so both
+            // claim against one ledger (AGENTS.md single-source-of-truth rule).
+            processed_messages: processed_messages_store.clone(),
             session_store: shared_session_store.clone(),
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(&risk_profile)),
             activated_tools: ch_activated_handle,
@@ -24003,7 +24032,8 @@ This is an example JSON object for profile settings."#;
         );
 
         let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let channels =
+            collect_configured_channels(&config_arc, "test", &[], None, None, None, None);
 
         assert!(
             channels
@@ -24053,7 +24083,8 @@ This is an example JSON object for profile settings."#;
         );
 
         let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let channels =
+            collect_configured_channels(&config_arc, "test", &[], None, None, None, None);
 
         assert!(
             channels
@@ -24089,7 +24120,8 @@ This is an example JSON object for profile settings."#;
         );
 
         let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let channels =
+            collect_configured_channels(&config_arc, "test", &[], None, None, None, None);
 
         assert!(
             !channels.iter().any(|entry| entry.display_name == "Discord"),
@@ -24120,7 +24152,8 @@ This is an example JSON object for profile settings."#;
         );
 
         let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let channels =
+            collect_configured_channels(&config_arc, "test", &[], None, None, None, None);
 
         assert!(
             channels.iter().any(|entry| entry.display_name == "Discord"),
@@ -24170,7 +24203,8 @@ This is an example JSON object for profile settings."#;
         );
 
         let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let channels =
+            collect_configured_channels(&config_arc, "test", &[], None, None, None, None);
 
         let discord_channels: Vec<_> = channels
             .iter()
@@ -24458,7 +24492,8 @@ This is an example JSON object for profile settings."#;
         );
 
         let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let channels =
+            collect_configured_channels(&config_arc, "test", &[], None, None, None, None);
         assert!(
             !channels.iter().any(|entry| entry.display_name == "Email"),
             "email with no agent reference should not be collected"
@@ -24475,7 +24510,8 @@ This is an example JSON object for profile settings."#;
         );
 
         let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let channels =
+            collect_configured_channels(&config_arc, "test", &[], None, None, None, None);
         assert!(
             !channels
                 .iter()
@@ -29020,7 +29056,8 @@ mod omitted_feature_tests {
             },
         );
         let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let channels =
+            collect_configured_channels(&config_arc, "test", &[], None, None, None, None);
         assert!(
             channels.iter().all(|c| c.display_name != "Telegram"),
             "Telegram must be absent from collect_configured_channels when \

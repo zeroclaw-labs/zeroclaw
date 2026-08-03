@@ -26,6 +26,13 @@ pub struct RecoveredTurn {
     /// WhatsApp's own id for this message. Stable across syncs and devices —
     /// the reason a re-import is a no-op rather than a duplicate.
     pub message_id: String,
+    /// The message's sender as the live path sees it (`ChannelMessage::sender`).
+    ///
+    /// Carried separately from `session_key` because the claim key the live
+    /// path writes is built from the raw sender, not the derived key. Reusing
+    /// that exact shape is what lets an import recognise a message the agent
+    /// already answered.
+    pub sender: String,
     /// Conversation this turn belongs to, already sanitized to match the key
     /// the orchestrator builds for live messages.
     pub session_key: String,
@@ -78,17 +85,110 @@ pub fn role_for(from_me: bool) -> &'static str {
     if from_me { "assistant" } else { "user" }
 }
 
-/// Count the turns in a history-sync payload that are worth storing.
+/// Extract every storable turn from a history-sync payload.
 ///
 /// Streams the payload conversation by conversation instead of decoding it
-/// whole: a sync can be several megabytes, and the count needs none of it
-/// resident. Conversations that fail to decode are skipped rather than
-/// aborting the walk — a malformed entry should cost its own turns, not the
-/// entire recovered history.
+/// whole: a sync runs to megabytes and nothing here needs all of it resident.
+/// Conversations that fail to decode are skipped rather than aborting the walk
+/// — a malformed entry should cost its own turns, not the entire recovered
+/// history.
 ///
-/// Returns a count and nothing else on purpose. It answers "did the platform
-/// actually send us usable history, and how much" without any message text
-/// crossing into a log line or a caller that might print it.
+/// Turns come back in the payload's own order. Ordering by timestamp is left
+/// to the caller, which has to merge these with whatever the session already
+/// holds anyway.
+#[cfg(feature = "whatsapp-web")]
+pub fn extract_turns(
+    sync: &wacore::types::events::LazyHistorySync,
+    channel_scope: &str,
+) -> Vec<RecoveredTurn> {
+    let mut stream = sync.stream();
+    let mut turns = Vec::new();
+    while let Ok(Some(conversation)) = stream.next_conversation() {
+        for entry in &conversation.messages {
+            let Some(info) = entry.message.as_option() else {
+                continue;
+            };
+            let Some(key) = info.key.as_option() else {
+                continue;
+            };
+            let text = message_text(info);
+            if !is_storable(key.id.as_deref(), info.message_timestamp, &text) {
+                continue;
+            }
+            // Both are Some — is_storable just checked.
+            let (Some(message_id), Some(timestamp_secs)) =
+                (key.id.as_deref(), info.message_timestamp)
+            else {
+                continue;
+            };
+            // `conversation.id` is the chat's JID, which is what the live path
+            // uses as reply_target. The peer's own JID is the sender: in a DM
+            // they are the same conversation, but the session key keeps both
+            // positions, so they are passed separately rather than assumed.
+            let sender = key
+                .participant
+                .as_deref()
+                .unwrap_or(conversation.id.as_str());
+            turns.push(RecoveredTurn {
+                message_id: message_id.to_string(),
+                sender: sender.to_string(),
+                session_key: session_key_for_chat(channel_scope, &conversation.id, sender),
+                role: role_for(key.from_me.unwrap_or(false)),
+                content: text,
+                timestamp_secs,
+            });
+        }
+    }
+    turns
+}
+
+/// Persist recovered turns into the session store, skipping any already seen.
+///
+/// Idempotency is delegated to [`ProcessedMessageStore`], which already answers
+/// "have I acted on this message" for the live path with an atomic
+/// INSERT-OR-IGNORE. Re-deriving that from message content here would be a
+/// second copy of the same fact, and the two would drift the moment either
+/// changed. The key is built the same way the live path builds it, so a
+/// message the agent already answered is not re-imported as history.
+///
+/// One deliberate difference from the live path: a storage fault means *skip*,
+/// not *import*. `claim` fails open because a broken store must not leave the
+/// agent mute — answering twice beats never answering. Importing history
+/// inverts that trade: failing open would replay an entire conversation into
+/// the agent's context, so a fault here costs one missing old turn instead.
+///
+/// Returns how many turns were newly stored.
+#[cfg(feature = "whatsapp-web")]
+pub fn persist_turns(
+    turns: &[RecoveredTurn],
+    channel: &str,
+    store: &crate::processed_messages::ProcessedMessageStore,
+    session_store: &dyn zeroclaw_infra::session_backend::SessionBackend,
+) -> usize {
+    use crate::processed_messages::{ClaimOutcome, ProcessedMessageStore};
+
+    let mut stored = 0usize;
+    for turn in turns {
+        let key = ProcessedMessageStore::key_for(channel, &turn.sender, &turn.message_id);
+        if !matches!(store.claim_with_status(&key), ClaimOutcome::Claimed) {
+            continue;
+        }
+        let message = zeroclaw_api::model_provider::ChatMessage {
+            role: turn.role.to_string(),
+            content: turn.content.clone(),
+        };
+        if session_store.append(&turn.session_key, &message).is_ok() {
+            stored += 1;
+        }
+    }
+    stored
+}
+
+/// Count the turns in a history-sync payload that are worth storing.
+///
+/// Returns a count and nothing else on purpose: it answers "did the platform
+/// send usable history, and how much" for a log line, without any message text
+/// crossing into a caller that might print it.
 #[cfg(feature = "whatsapp-web")]
 pub fn count_storable_turns(sync: &wacore::types::events::LazyHistorySync) -> usize {
     let mut stream = sync.stream();
@@ -183,5 +283,93 @@ mod tests {
     #[test]
     fn a_complete_text_message_is_storable() {
         assert!(is_storable(Some("ABC123"), Some(1_754_170_320), "hola"));
+    }
+
+    /// The property the whole design rests on: importing the same history
+    /// twice must not double the conversation. Proven end to end against the
+    /// real stores rather than by inspecting the claim logic, because the
+    /// guarantee lives in SQLite's uniqueness constraint, not in this code.
+    #[cfg(feature = "whatsapp-web")]
+    #[test]
+    fn re_importing_the_same_turns_stores_nothing_the_second_time() {
+        use crate::processed_messages::ProcessedMessageStore;
+        use zeroclaw_infra::session_store::SessionStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let claims = ProcessedMessageStore::open_in_state_dir(dir.path()).unwrap();
+        let sessions = SessionStore::new(dir.path()).unwrap();
+
+        let turns = vec![
+            RecoveredTurn {
+                message_id: "MSG_A".into(),
+                sender: "76188559093817@lid".into(),
+                session_key: "whatsapp_default_chat_peer".into(),
+                role: "user",
+                content: "hola".into(),
+                timestamp_secs: 1_754_170_320,
+            },
+            RecoveredTurn {
+                message_id: "MSG_B".into(),
+                sender: "76188559093817@lid".into(),
+                session_key: "whatsapp_default_chat_peer".into(),
+                role: "assistant",
+                content: "hey".into(),
+                timestamp_secs: 1_754_170_380,
+            },
+        ];
+
+        let first = persist_turns(&turns, "whatsapp", &claims, &sessions);
+        let second = persist_turns(&turns, "whatsapp", &claims, &sessions);
+        let third = persist_turns(&turns, "whatsapp", &claims, &sessions);
+
+        assert_eq!(first, 2, "a fresh import must store every turn");
+        assert_eq!(second, 0, "re-importing must store nothing");
+        assert_eq!(third, 0, "and must keep storing nothing");
+        assert_eq!(
+            sessions.load("whatsapp_default_chat_peer").len(),
+            2,
+            "the conversation must hold one copy of each turn, not three"
+        );
+    }
+
+    /// A message the agent already answered live must not come back as
+    /// history: the live path claims under the same key, so the import sees it
+    /// as known. This is why idempotency is delegated to the existing store
+    /// instead of a fingerprint derived here.
+    #[cfg(feature = "whatsapp-web")]
+    #[test]
+    fn a_turn_already_claimed_by_the_live_path_is_not_re_imported() {
+        use crate::processed_messages::ProcessedMessageStore;
+        use zeroclaw_infra::session_store::SessionStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let claims = ProcessedMessageStore::open_in_state_dir(dir.path()).unwrap();
+        let sessions = SessionStore::new(dir.path()).unwrap();
+
+        // The live path claims the message when it answers it.
+        let live_key = ProcessedMessageStore::key_for("whatsapp", "76188559093817@lid", "MSG_LIVE");
+        assert!(
+            claims.claim(&live_key),
+            "live path claims the message first"
+        );
+
+        let turns = vec![RecoveredTurn {
+            message_id: "MSG_LIVE".into(),
+            sender: "76188559093817@lid".into(),
+            session_key: "whatsapp_default_chat_peer".into(),
+            role: "user",
+            content: "hola".into(),
+            timestamp_secs: 1_754_170_320,
+        }];
+
+        assert_eq!(
+            persist_turns(&turns, "whatsapp", &claims, &sessions),
+            0,
+            "a turn the agent already handled must not be imported again"
+        );
+        assert!(
+            sessions.load("whatsapp_default_chat_peer").is_empty(),
+            "nothing should have been written"
+        );
     }
 }
