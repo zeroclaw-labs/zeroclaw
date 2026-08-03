@@ -248,6 +248,34 @@ impl RusqliteStore {
                 PRIMARY KEY (id, device_id)
             );
 
+            -- Decrypted inbound messages awaiting a durability-hook commit.
+            --
+            -- This is the buffer that lets the transport ack be deferred. The
+            -- SDK acks a message as soon as it decrypts it unless an
+            -- `InboundDurabilityHook` is registered, and that ack tells the
+            -- server to drop the message from its offline queue — so a daemon
+            -- that dies between ack and reply loses the message permanently.
+            -- With this table present the SDK buffers first and acks only after
+            -- the hook returns Ok, making inbound delivery at-least-once and
+            -- letting messages that arrived while the daemon was down be
+            -- redelivered on the next connect.
+            --
+            -- Scoped by (chat, sender, id) because stanza ids are only unique
+            -- within a (chat, sender) pair: two chats can reuse the same id.
+            -- Rows are deleted once their hook commits; `delete_expired_...`
+            -- sweeps anything left behind by a crash.
+            CREATE TABLE IF NOT EXISTS pending_inbound (
+                chat        TEXT NOT NULL,
+                sender      TEXT NOT NULL,
+                id          TEXT NOT NULL,
+                message     BLOB NOT NULL,
+                stored_at   INTEGER NOT NULL,
+                device_id   INTEGER NOT NULL,
+                PRIMARY KEY (chat, sender, id, device_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_pending_inbound_stored_at
+                ON pending_inbound (stored_at);
+
             -- Sender keys for group messaging
             CREATE TABLE IF NOT EXISTS sender_keys (
                 address TEXT NOT NULL,
@@ -975,6 +1003,101 @@ impl wacore::store::traits::MsgSecretStore for RusqliteStore {
 
 #[async_trait]
 impl ProtocolStore for RusqliteStore {
+    // --- Pending inbound buffer (durability-hook support) ---
+    //
+    // `ProtocolStore` ships default bodies for these four that return
+    // `unsupported_pending_inbound()`. That default is deliberately fail-closed:
+    // with a durability hook registered, an unsupported backend errors and
+    // leaves the message unacked rather than silently degrading to
+    // at-most-once. The practical effect is that the channel stops acking
+    // anything — so a hook without these methods is worse than no hook at all.
+    //
+    // Implementing them here is what makes `InboundDurabilityHook` usable, and
+    // therefore what lets a message that arrived while the daemon was down be
+    // redelivered instead of lost.
+
+    async fn store_pending_inbound(
+        &self,
+        chat: &str,
+        sender: &str,
+        id: &str,
+        message: &[u8],
+    ) -> wacore::store::error::Result<()> {
+        let conn = self.conn.lock();
+        // REPLACE, not IGNORE: a redelivery re-buffers the same key and the
+        // freshest decrypted bytes are the ones worth replaying.
+        to_store_err!(conn.execute(
+            "INSERT OR REPLACE INTO pending_inbound
+                 (chat, sender, id, message, stored_at, device_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                chat,
+                sender,
+                id,
+                message,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0),
+                self.device_id
+            ],
+        ))?;
+        Ok(())
+    }
+
+    async fn get_pending_inbound(
+        &self,
+        chat: &str,
+        sender: &str,
+        id: &str,
+    ) -> wacore::store::error::Result<Option<Vec<u8>>> {
+        let conn = self.conn.lock();
+        let mut stmt = to_store_err!(conn.prepare(
+            "SELECT message FROM pending_inbound
+             WHERE chat = ?1 AND sender = ?2 AND id = ?3 AND device_id = ?4"
+        ))?;
+        let mut rows = to_store_err!(stmt.query(params![chat, sender, id, self.device_id]))?;
+        match to_store_err!(rows.next())? {
+            Some(row) => Ok(Some(to_store_err!(row.get::<_, Vec<u8>>(0))?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn delete_pending_inbound(
+        &self,
+        chat: &str,
+        sender: &str,
+        id: &str,
+    ) -> wacore::store::error::Result<()> {
+        let conn = self.conn.lock();
+        to_store_err!(conn.execute(
+            "DELETE FROM pending_inbound
+             WHERE chat = ?1 AND sender = ?2 AND id = ?3 AND device_id = ?4",
+            params![chat, sender, id, self.device_id],
+        ))?;
+        Ok(())
+    }
+
+    async fn delete_expired_pending_inbound(
+        &self,
+        cutoff_timestamp: i64,
+    ) -> wacore::store::error::Result<u32> {
+        let conn = self.conn.lock();
+        let removed = to_store_err!(conn.execute(
+            "DELETE FROM pending_inbound WHERE stored_at < ?1 AND device_id = ?2",
+            params![cutoff_timestamp, self.device_id],
+        ))?;
+        Ok(removed as u32)
+    }
+
+    // --- Per-Device Sender Key Tracking ---
+    //
+    // Replaces the wacore 0.2 SKDM-recipients model with WA Web's
+    // `participant.senderKey` map. Tracks per-device `(has_key)` status:
+    // `true` = SKDM already distributed, `false` = needs fresh SKDM.
+    // The legacy `skdm_recipients` table is kept around (no migration drops it)
+    // but is no longer read or written.
+
     async fn get_sender_key_devices(
         &self,
         group_jid: &str,
@@ -1852,6 +1975,93 @@ mod tests {
             .expect("expected pn mapping to be present");
         assert_eq!(loaded_by_pn.learning_source, entry.learning_source);
         assert_eq!(loaded_by_pn.updated_at, entry.updated_at);
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    #[tokio::test]
+    async fn pending_inbound_round_trips_and_expires() {
+        // Guards the fix for a real outage: with an `InboundDurabilityHook`
+        // registered, a backend missing these methods returns
+        // `unsupported_pending_inbound()` and the SDK — fail-closed by design —
+        // stops acking, which silently wedges the whole channel. Anything that
+        // breaks this round-trip breaks inbound delivery, so assert the shape
+        // the SDK actually relies on.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = RusqliteStore::new(tmp.path()).unwrap();
+
+        let (chat, sender, id) = ("15550000009@s.whatsapp.net", "15550000009", "STANZA1");
+
+        // Absent before anything is stored.
+        assert!(
+            ProtocolStore::get_pending_inbound(&store, chat, sender, id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        ProtocolStore::store_pending_inbound(&store, chat, sender, id, &[7, 8, 9])
+            .await
+            .unwrap();
+        assert_eq!(
+            ProtocolStore::get_pending_inbound(&store, chat, sender, id)
+                .await
+                .unwrap(),
+            Some(vec![7, 8, 9])
+        );
+
+        // Scoping is per (chat, sender, id): stanza ids repeat across chats, so
+        // a lookup in a different chat must not see this buffered message.
+        assert!(
+            ProtocolStore::get_pending_inbound(&store, "other@s.whatsapp.net", sender, id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // A redelivery re-buffers the same key; the newest bytes win.
+        ProtocolStore::store_pending_inbound(&store, chat, sender, id, &[1, 2])
+            .await
+            .unwrap();
+        assert_eq!(
+            ProtocolStore::get_pending_inbound(&store, chat, sender, id)
+                .await
+                .unwrap(),
+            Some(vec![1, 2])
+        );
+
+        // Committing the hook removes the buffered copy.
+        ProtocolStore::delete_pending_inbound(&store, chat, sender, id)
+            .await
+            .unwrap();
+        assert!(
+            ProtocolStore::get_pending_inbound(&store, chat, sender, id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // The sweep only reaps rows older than the cutoff; a row stored now
+        // must survive a cutoff in the past.
+        ProtocolStore::store_pending_inbound(&store, chat, sender, "STANZA2", &[3])
+            .await
+            .unwrap();
+        assert_eq!(
+            ProtocolStore::delete_expired_pending_inbound(&store, 1)
+                .await
+                .unwrap(),
+            0
+        );
+        let future = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            + 60;
+        assert_eq!(
+            ProtocolStore::delete_expired_pending_inbound(&store, future)
+                .await
+                .unwrap(),
+            1
+        );
     }
 
     #[cfg(feature = "whatsapp-web")]

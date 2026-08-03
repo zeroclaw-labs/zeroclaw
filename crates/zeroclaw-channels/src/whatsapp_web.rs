@@ -130,6 +130,53 @@ impl WhatsAppMessageRef {
 }
 
 #[cfg(feature = "whatsapp-web")]
+/// Gates the transport ack on the SDK having durably buffered the batch.
+///
+/// Registering this is what flips inbound delivery from at-most-once to
+/// at-least-once: the SDK buffers the decrypted batch, awaits this hook, and
+/// acks only on `Ok`. Unacked messages are redelivered on the next connect,
+/// which is what lets the agent pick up messages that arrived while the daemon
+/// was down instead of losing them.
+///
+/// This implementation deliberately does no work of its own. The durable buffer
+/// belongs to the SDK's `ProtocolStore` (implemented for `RusqliteStore` in
+/// `whatsapp_storage.rs`) — writing our own copy here would duplicate that
+/// state and invite the two to drift. Returning `Ok` means "the SDK's buffer
+/// write succeeded, go ahead and ack"; the at-most-once-per-message guarantee
+/// for *acting* on a message lives in `ProcessedMessageStore`, which claims
+/// each one under the same `(chat, sender, id)` key this hook's contract
+/// requires.
+///
+/// Returning `Err` would suppress the acks and force a redelivery loop for a
+/// batch the SDK already persisted, so there is nothing to fail on here.
+struct InboundBufferHook;
+
+#[cfg(feature = "whatsapp-web")]
+#[async_trait::async_trait]
+impl whatsapp_rust::InboundDurabilityHook for InboundBufferHook {
+    async fn on_messages(
+        &self,
+        _client: std::sync::Arc<whatsapp_rust::client::Client>,
+        batch: &[whatsapp_rust::types::durability_hook::InboundMessage],
+    ) -> anyhow::Result<()> {
+        // Deliberately no persistence of our own: see the type's doc comment.
+        // Recorded at DEBUG so an offline drain is visible when diagnosing a
+        // "the agent never answered me" report, using only the batch size —
+        // never message content.
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Success),
+            format!(
+                "inbound batch buffered ({} message(s)); acking",
+                batch.len()
+            )
+        );
+        Ok(())
+    }
+}
+
+#[cfg(feature = "whatsapp-web")]
 pub struct WhatsAppWebChannel {
     /// Session database path
     session_path: String,
@@ -2253,6 +2300,34 @@ impl Channel for WhatsAppWebChannel {
                         .with_os("ZeroClaw")
                         .with_platform_type(PlatformType::Desktop),
                 )
+                // Defer the transport ack until the SDK has durably buffered the
+                // batch, turning inbound delivery from at-most-once into
+                // at-least-once.
+                //
+                // Without a hook the SDK acks as soon as it decrypts, and that
+                // ack tells WhatsApp to drop the message from its offline queue.
+                // A daemon that dies between ack and reply — crash, restart,
+                // redeploy — loses the message for good: the person waiting
+                // never gets an answer and never learns why. With a hook
+                // registered the batch is buffered first and acked only when the
+                // hook returns `Ok`, so anything unacked is redelivered on the
+                // next connect and messages that arrived while the daemon was
+                // down get drained on reconnect.
+                //
+                // Requires the `ProtocolStore` pending-inbound methods, which
+                // `RusqliteStore` implements (`whatsapp_storage.rs`). They are
+                // not optional: the trait's defaults are fail-closed, and the
+                // client builder probes them with a store/get/delete round-trip
+                // at construction — a backend that fails the probe aborts client
+                // construction with `UnsupportedDurabilityBackend`, so the
+                // channel never connects at all.
+                //
+                // At-least-once means replays are expected. `ProcessedMessageStore`
+                // already guards that: it claims each message under a
+                // `(channel, sender, id)` primary key before the agent runs,
+                // which is exactly the dedupe key this hook's contract requires
+                // (stanza ids are only unique within a `(chat, sender)` pair).
+                .with_inbound_durability_hook(InboundBufferHook)
                 .on_event({
                     let alias = Arc::clone(&alias);
                     move |event, client| {
