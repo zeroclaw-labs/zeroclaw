@@ -2860,6 +2860,33 @@ impl Channel for WhatsAppWebChannel {
                                     }
                                 }
                             }
+                            Event::HistorySync(sync) => {
+                                // WhatsApp delivers the real thread here — on
+                                // pairing, and in reply to fetch_message_history.
+                                // Until this arm existed the payload was decoded
+                                // by the library and dropped, so every re-pair
+                                // silently discarded the conversation history the
+                                // agent needs to not answer as though nothing
+                                // had been said.
+                                //
+                                // Only the shape is logged, never message
+                                // content: this is someone's private thread, and
+                                // a log line is the easiest place for it to leak.
+                                let count = crate::whatsapp_history::count_storable_turns(sync);
+                                ::zeroclaw_log::record!(
+                                    INFO,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
+                                    ),
+                                    &format!(
+                                        "history sync received: type={} progress={:?} storable_turns={}",
+                                        sync.sync_type(),
+                                        sync.progress(),
+                                        count
+                                    )
+                                );
+                            }
                             Event::LoggedOut(_) => {
                                 session_revoked.store(true, std::sync::atomic::Ordering::Relaxed);
                                 crate::login_events::LoginEvent::LoggedOut.emit(

@@ -101,6 +101,7 @@ pub mod wecom;
 pub mod wecom_ws;
 #[cfg(any(feature = "channel-whatsapp-cloud", feature = "whatsapp-web"))]
 pub mod whatsapp;
+pub mod whatsapp_history;
 #[cfg(feature = "whatsapp-web")]
 pub mod whatsapp_storage;
 #[cfg(feature = "whatsapp-web")]
