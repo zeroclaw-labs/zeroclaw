@@ -1,4 +1,4 @@
-# PR #8877 Fix Plan — Sidebar Compact Viewport Overflow
+# PR #8877 Fix Plan: Sidebar Compact Viewport Overflow
 
 ## Problem Summary
 
@@ -264,16 +264,16 @@ test('sidebar rail has no horizontal overflow at 800x500', async ({ page }) => {
 ```
 
 **Evidence to capture**:
-1. `compact-viewport-800x500.png` — rail at 800×500, showing no horizontal scrollbar
-2. `compact-viewport-tooltip.png` — tooltip visible at 800×500
-3. `measurements-compact.json` — `scrollWidth`, `clientWidth`, `overflowX` values
+1. `compact-viewport-800x500.png`: rail at 800×500, showing no horizontal scrollbar
+2. `compact-viewport-tooltip.png`: tooltip visible at 800×500
+3. `measurements-compact.json`: `scrollWidth`, `clientWidth`, `overflowX` values
 
 ### Step 5: Update PR Body
 
 Add a "Round 4" section to the PR body:
 
 ```markdown
-## Round 4 — Compact Viewport Fix
+## Round 4: Compact Viewport Fix
 
 ### What changed
 - Rebased onto `master` to resolve conflicts (merged `SidebarNavLink`, `activePath` routing, new nav items)
