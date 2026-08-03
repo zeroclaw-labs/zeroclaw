@@ -598,6 +598,23 @@ pub enum MigrateCommands {
     },
 }
 
+/// Reject a `--to` value that is shaped like a flag.
+///
+/// `--to` opts into `allow_hyphen_values` so hyphen-led recipients parse, which
+/// otherwise lets a forgotten value consume the next flag: `--to --thread t-1`
+/// would take `--thread` as the recipient and then fail on the positional
+/// argument. Rejecting a `--` prefix keeps that mistake legible while leaving
+/// every real recipient shape (`-100…`, `-100…:42`) accepted.
+fn parse_delivery_recipient(raw: &str) -> Result<String, String> {
+    if raw.starts_with("--") {
+        return Err(format!(
+            "`{raw}` looks like a flag, not a recipient; \
+             if a recipient really starts with `--`, pass it as `--to={raw}`"
+        ));
+    }
+    Ok(raw.to_string())
+}
+
 /// Shared delivery flags for the cron creation and update subcommands.
 ///
 /// Flattened into `add`, `add-at`, `add-every`, `once`, and `update` so a job's
@@ -612,7 +629,19 @@ pub struct CronDeliveryArgs {
     #[arg(long = "channel")]
     pub delivery_channel: Option<String>,
     /// Target chat/recipient id for the channel (e.g. a Telegram chat id).
-    #[arg(long = "to")]
+    ///
+    /// `allow_hyphen_values` is required because supported recipients start with
+    /// a hyphen: Telegram group and channel ids are negative (`-100…`), and a
+    /// forum topic target is `chat:thread` (`-100…:42`), which is hyphen-led but
+    /// not a number. Without it clap treats the value as a flag and exits before
+    /// any delivery validation runs, leaving only the undocumented `--to=<value>`
+    /// form working.
+    ///
+    /// `allow_negative_numbers` is not enough: it accepts `-100…` but still
+    /// rejects the `chat:thread` form. The broader setting alone would let a
+    /// forgotten value swallow the following flag, so `parse_delivery_recipient`
+    /// rejects `--`-prefixed values and names the offending token.
+    #[arg(long = "to", allow_hyphen_values = true, value_parser = parse_delivery_recipient)]
     pub delivery_to: Option<String>,
     /// Optional thread/conversation id, for channels that route on it (webhook).
     #[arg(long = "thread")]

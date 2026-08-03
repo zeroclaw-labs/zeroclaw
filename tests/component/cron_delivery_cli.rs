@@ -276,3 +276,129 @@ fn cron_update_patches_delivery_without_dropping_unspecified_fields() {
     assert_eq!(untouched.delivery.channel.as_deref(), Some("slack"));
     assert_eq!(untouched.delivery.to.as_deref(), Some("222"));
 }
+
+/// Regression: Telegram group and channel ids are negative (`-100…`), and clap
+/// treats a hyphen-prefixed token as a flag unless the argument opts out. Before
+/// `allow_negative_numbers`, `--to -100123456` exited 2 with
+/// `unexpected argument '-1' found` before any cron validation ran, so the
+/// advertised `--to <DELIVERY_TO>` form was unusable for the most common
+/// Telegram target and only the undocumented `--to=` form worked.
+///
+/// The flag is shared by `add`, `add-at`, `add-every`, `once` and `update`, so
+/// this covers create and update; the parse happens in the same flattened struct
+/// for all five.
+#[test]
+fn cron_delivery_accepts_negative_telegram_chat_id() {
+    let dir = tempfile::tempdir().expect("temp config dir");
+    let config_dir = dir.path();
+    std::fs::write(config_dir.join("config.toml"), CONFIG_TOML).expect("write config");
+
+    // Create with a negative id in the normal separate-token form.
+    let add = run(
+        config_dir,
+        &[
+            "cron",
+            "add",
+            "*/5 * * * *",
+            "--agent",
+            "default",
+            "--channel",
+            "telegram",
+            "--to",
+            "-100123456",
+            "echo hi",
+        ],
+    );
+    assert_ok(&add, "cron add with a negative Telegram chat id");
+    assert!(
+        stdout_of(&add).contains("telegram → -100123456"),
+        "the negative id must survive to the confirmation line:\n{}",
+        stdout_of(&add)
+    );
+
+    let id = job_id_from(&add);
+    assert_eq!(
+        stored_job(config_dir, &id).delivery.to.as_deref(),
+        Some("-100123456"),
+        "the negative id must be persisted verbatim"
+    );
+
+    // And on the update path, which shares the flattened argument struct.
+    let update = run(
+        config_dir,
+        &[
+            "cron",
+            "update",
+            &id,
+            "--agent",
+            "default",
+            "--to",
+            "-100999888",
+        ],
+    );
+    assert_ok(&update, "cron update with a negative Telegram chat id");
+    assert_eq!(
+        stored_job(config_dir, &id).delivery.to.as_deref(),
+        Some("-100999888")
+    );
+
+    // A forum topic target is `chat:thread`, hyphen-led but not a number, which
+    // is why `allow_negative_numbers` alone is insufficient.
+    let composite = run(
+        config_dir,
+        &[
+            "cron",
+            "add",
+            "*/13 * * * *",
+            "--agent",
+            "default",
+            "--channel",
+            "telegram",
+            "--to",
+            "-100123456:42",
+            "echo topic",
+        ],
+    );
+    assert_ok(&composite, "cron add with a chat:thread target");
+    assert_eq!(
+        stored_job(config_dir, &job_id_from(&composite))
+            .delivery
+            .to
+            .as_deref(),
+        Some("-100123456:42")
+    );
+
+    // `allow_hyphen_values` alone would consume `--thread` as the recipient here
+    // and then fail on the positional argument. The value parser keeps the
+    // mistake legible by naming the offending token.
+    let flag_shaped = run(
+        config_dir,
+        &[
+            "cron",
+            "add",
+            "*/5 * * * *",
+            "--agent",
+            "default",
+            "--channel",
+            "telegram",
+            "--to",
+            "--thread",
+            "t-1",
+            "echo hi",
+        ],
+    );
+    assert!(
+        !flag_shaped.status.success(),
+        "--to with a following flag must not be accepted\nstdout:\n{}",
+        stdout_of(&flag_shaped)
+    );
+    let flag_shaped_stderr = stderr_of(&flag_shaped);
+    assert!(
+        flag_shaped_stderr.contains("looks like a flag, not a recipient"),
+        "the error must name the offending token rather than the positional:\n{flag_shaped_stderr}"
+    );
+    assert!(
+        flag_shaped_stderr.contains("--thread"),
+        "the error must quote the token that was mistaken for a value:\n{flag_shaped_stderr}"
+    );
+}
