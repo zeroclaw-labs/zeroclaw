@@ -427,6 +427,19 @@ async fn write_daily_history(
     }
 }
 
+/// Test-only hook exposing the private `write_daily_history` daily-dedup path
+/// (which routes through `Memory::list_own_daily_history`) so sibling modules'
+/// tests (e.g. the `AgentScopedMemory` B1 regression) can drive the real
+/// per-turn Daily write gate against a wrapped backend.
+#[cfg(test)]
+pub(crate) async fn consolidate_daily_history_for_test(
+    memory: &dyn Memory,
+    memory_config: &MemoryConfig,
+    history_entry: &str,
+) -> anyhow::Result<()> {
+    write_daily_history(memory, memory_config, history_entry).await
+}
+
 /// Store atomic facts extracted from a turn as individual Core memories,
 /// reusing the same policy/dedup/merge/supersede path as the core update.
 /// Only called when `consolidation_extract_facts` is enabled; kind tagging
