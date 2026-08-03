@@ -7061,17 +7061,17 @@ async fn run_message_dispatch_loop(
                 // Moved, not copied: the inbound message this burst supersedes is
                 // dropped, so the merged payload becomes the only owner of these
                 // attachments rather than a second copy of live state.
-                let pending_attachments = std::mem::take(&mut msg.attachments);
+                let burst_part = zeroclaw_infra::debounce::BurstPart {
+                    content: msg.content.clone(),
+                    attachments: std::mem::take(&mut msg.attachments),
+                    passive_context: msg.passive_context,
+                    explicitly_addressed: msg.explicitly_addressed,
+                };
                 match ctx
                     .debouncer
-                    .debounce_with_window(
-                        &debounce_key,
-                        &msg.content,
-                        pending_attachments,
-                        debounce_window,
-                    )
-                .await
-            {
+                    .debounce_with_window(&debounce_key, burst_part, debounce_window)
+                    .await
+                {
                 zeroclaw_infra::debounce::DebounceResult::Pending(rx) => {
                     // Spawn a lightweight task that waits for the debounce window
                     // to expire, then feeds the combined message through the normal
@@ -7095,6 +7095,13 @@ async fn run_message_dispatch_loop(
                         // handed, because the message carrying the image is
                         // exactly the one the merge supersedes.
                         debounce_msg.attachments = merged.attachments;
+                        // Routing flags come from the merge, not from whichever
+                        // message happened to arrive last. Under a room-wide
+                        // burst key the parts can be from different people, so
+                        // the last arrival is not entitled to decide whether
+                        // the burst earns a turn.
+                        debounce_msg.passive_context = merged.passive_context;
+                        debounce_msg.explicitly_addressed = merged.explicitly_addressed;
                         ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"channel": debounce_msg.channel, "sender": debounce_msg.sender, "attachments_count": debounce_msg.attachments.len()})), "Debounced message ready — dispatching combined message");
 
                         let permit = match debounce_semaphore.acquire_owned().await {
@@ -7117,6 +7124,8 @@ async fn run_message_dispatch_loop(
                     let mut m = msg;
                     m.content = merged.content;
                     m.attachments = merged.attachments;
+                    m.passive_context = merged.passive_context;
+                    m.explicitly_addressed = merged.explicitly_addressed;
                     m
                 }
             }
