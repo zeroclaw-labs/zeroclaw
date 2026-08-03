@@ -59,20 +59,78 @@ fn encode_segment(segment: &str) -> String {
     urlencoding::encode(segment).into_owned()
 }
 
-/// Maximum number of bytes of a remote error body echoed into an error message.
-/// Remote bodies are attacker/operator-influenced and may contain secrets or
-/// large payloads, so they are truncated before surfacing.
+/// Maximum number of characters of a remote error body echoed into an error
+/// message. Remote bodies are attacker/operator-influenced and may contain
+/// secrets or large payloads, so they are truncated before surfacing.
 const MAX_REMOTE_ERROR_BODY: usize = 512;
 
+/// Hard cap on the number of raw bytes READ from a remote ERROR body before it
+/// is turned into a bounded snippet. Whitespace collapse can only shrink the
+/// text, so reading this many bytes always suffices to fill the
+/// [`MAX_REMOTE_ERROR_BODY`]-char snippet while refusing to buffer a
+/// gigabyte-sized error stream into memory.
+const MAX_ERROR_BODY_BYTES: usize = 8 * 1024;
+
+/// Hard cap on the number of raw bytes READ from a remote SUCCESS body (recall
+/// / list / count JSON) before parsing. A well-formed response for a bounded
+/// `top_k` stays far under this; a body that exceeds it is treated as a
+/// malfunctioning/hostile endpoint and refused rather than materialized, so a
+/// server that streams an unbounded body within the request timeout cannot
+/// exhaust process memory.
+const MAX_REMOTE_BODY_BYTES: usize = 1024 * 1024;
+
+/// Stream a response body chunk-by-chunk, accumulating at most `cap` bytes and
+/// STOPPING as soon as the cap is reached. Returns the (capped) bytes plus
+/// whether the body was truncated (i.e. more data existed beyond the cap).
+///
+/// This is the memory-safety boundary for remote reads: unlike
+/// `Response::text()` / `Response::json()` in the pinned reqwest, which collect
+/// the entire body before decoding, this pulls chunks and bails out at the cap,
+/// so a huge or never-ending body streamed within the request timeout can
+/// allocate at most `cap` bytes here.
+async fn read_body_capped(mut resp: reqwest::Response, cap: usize) -> Result<(Vec<u8>, bool)> {
+    let mut buf = Vec::new();
+    let mut truncated = false;
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .context("hindsight response stream failed")?
+    {
+        if chunk.is_empty() {
+            continue;
+        }
+        let remaining = cap.saturating_sub(buf.len());
+        if remaining == 0 {
+            // Already at the cap and the server still has more to send: stop
+            // reading (dropping `resp` closes the connection) instead of
+            // buffering the rest.
+            truncated = true;
+            break;
+        }
+        if chunk.len() > remaining {
+            buf.extend_from_slice(&chunk[..remaining]);
+            truncated = true;
+            break;
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok((buf, truncated))
+}
+
 /// Read a failed response's body and reduce it to a bounded, single-line
-/// snippet safe to embed in an error message. Collapses whitespace/newlines and
-/// truncates to [`MAX_REMOTE_ERROR_BODY`] so a large or multi-line remote body
-/// cannot flood logs or smuggle control characters into the error surface.
+/// snippet safe to embed in an error message. Streams at most
+/// [`MAX_ERROR_BODY_BYTES`] (so a huge error body is never fully buffered),
+/// collapses whitespace/newlines, and truncates to [`MAX_REMOTE_ERROR_BODY`]
+/// chars so the remote body cannot flood logs, exhaust memory, or smuggle
+/// control characters into the error surface.
 async fn bounded_error_body(resp: reqwest::Response) -> String {
-    let raw = resp.text().await.unwrap_or_default();
+    let (bytes, over_cap) = read_body_capped(resp, MAX_ERROR_BODY_BYTES)
+        .await
+        .unwrap_or_default();
+    let raw = String::from_utf8_lossy(&bytes);
     let collapsed: String = raw.split_whitespace().collect::<Vec<_>>().join(" ");
-    if collapsed.len() > MAX_REMOTE_ERROR_BODY {
-        let mut end = MAX_REMOTE_ERROR_BODY;
+    if over_cap || collapsed.len() > MAX_REMOTE_ERROR_BODY {
+        let mut end = MAX_REMOTE_ERROR_BODY.min(collapsed.len());
         while !collapsed.is_char_boundary(end) {
             end -= 1;
         }
@@ -80,6 +138,24 @@ async fn bounded_error_body(resp: reqwest::Response) -> String {
     } else {
         collapsed
     }
+}
+
+/// Read a successful response body under the [`MAX_REMOTE_BODY_BYTES`] cap and
+/// deserialize it as `T`. Enforces the byte cap while STREAMING (before any
+/// JSON materialization) so a malfunctioning/hostile endpoint cannot exhaust
+/// memory with an oversized success body; an over-cap body is refused with
+/// `context` rather than parsed.
+async fn read_json_capped<T: serde::de::DeserializeOwned>(
+    resp: reqwest::Response,
+    context: &'static str,
+) -> Result<T> {
+    let (bytes, over_cap) = read_body_capped(resp, MAX_REMOTE_BODY_BYTES).await?;
+    if over_cap {
+        anyhow::bail!(
+            "{context}: response body exceeded the {MAX_REMOTE_BODY_BYTES}-byte cap and was refused"
+        );
+    }
+    serde_json::from_slice(&bytes).context(context)
 }
 
 /// Build the shared `reqwest::Client` with a per-request timeout so every
@@ -286,10 +362,8 @@ impl HindsightMemory {
             let body = bounded_error_body(resp).await;
             anyhow::bail!("hindsight recall returned HTTP {status}: {body}");
         }
-        let parsed: RecallResponse = resp
-            .json()
-            .await
-            .context("hindsight recall returned unparseable JSON")?;
+        let parsed: RecallResponse =
+            read_json_capped(resp, "hindsight recall returned unparseable JSON").await?;
         Ok(parsed
             .results
             .into_iter()
@@ -314,10 +388,8 @@ impl HindsightMemory {
             let body = bounded_error_body(resp).await;
             anyhow::bail!("hindsight list returned HTTP {status}: {body}");
         }
-        let parsed: ListResponse = resp
-            .json()
-            .await
-            .context("hindsight list returned unparseable JSON")?;
+        let parsed: ListResponse =
+            read_json_capped(resp, "hindsight list returned unparseable JSON").await?;
         Ok(parsed
             .items
             .into_iter()
@@ -816,10 +888,15 @@ impl Memory for HindsightMemory {
         if !resp.status().is_success() {
             return Ok(0);
         }
-        let parsed: ListResponse = resp.json().await.unwrap_or(ListResponse {
-            items: Vec::new(),
-            total: None,
-        });
+        // Cap the count body too: a hostile list endpoint must not exhaust
+        // memory here either. A parse/over-cap failure degrades to 0.
+        let parsed: ListResponse =
+            read_json_capped(resp, "hindsight count returned unparseable JSON")
+                .await
+                .unwrap_or(ListResponse {
+                    items: Vec::new(),
+                    total: None,
+                });
         Ok(parsed.total.map_or(parsed.items.len(), |t| {
             usize::try_from(t).unwrap_or(usize::MAX)
         }))
@@ -1866,6 +1943,129 @@ mod tests {
             ids,
             vec!["mine"],
             "paging must surface the valid row ranked below the first page: {ids:?}"
+        );
+    }
+
+    // ── B2: byte-cap remote bodies while STREAMING, before materialization ──
+
+    /// Core regression: `read_body_capped` must STOP reading at the cap. Proven
+    /// by asserting on BYTES CONSUMED (the returned buffer length) rather than
+    /// any final decoded string: a body far larger than the cap yields exactly
+    /// `cap` bytes and the `truncated` flag, so at most `cap` bytes are ever
+    /// accumulated regardless of how much the server streams.
+    #[tokio::test]
+    async fn read_body_capped_stops_at_the_cap() {
+        let server = MockServer::start().await;
+        // The server offers 2 MiB; the cap is 64 KiB. If reading did not stop
+        // at the cap, the buffer would balloon to the full body.
+        let cap = 64 * 1024;
+        let huge = "X".repeat(2 * 1024 * 1024);
+        Mock::given(method("GET"))
+            .and(path("/big"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(huge))
+            .mount(&server)
+            .await;
+
+        let resp = reqwest::Client::new()
+            .get(format!("{}/big", server.uri()))
+            .send()
+            .await
+            .expect("request should succeed");
+        let (bytes, truncated) = read_body_capped(resp, cap)
+            .await
+            .expect("capped read should succeed");
+        assert!(truncated, "an over-cap body must report truncation");
+        assert_eq!(
+            bytes.len(),
+            cap,
+            "reading must STOP at the cap: consumed {} bytes, cap {cap}",
+            bytes.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn read_body_capped_returns_full_small_body() {
+        // A body under the cap is returned whole and not marked truncated.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/small"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("tiny-body"))
+            .mount(&server)
+            .await;
+
+        let resp = reqwest::Client::new()
+            .get(format!("{}/small", server.uri()))
+            .send()
+            .await
+            .expect("request should succeed");
+        let (bytes, truncated) = read_body_capped(resp, MAX_REMOTE_BODY_BYTES)
+            .await
+            .expect("capped read should succeed");
+        assert!(!truncated, "a small body must not be marked truncated");
+        assert_eq!(bytes, b"tiny-body");
+    }
+
+    /// The SUCCESS JSON path must refuse an oversized body BEFORE parsing it,
+    /// so a malfunctioning endpoint that streams a huge (even valid-looking)
+    /// JSON body within the timeout cannot materialize it into memory. The
+    /// oversized body here is > MAX_REMOTE_BODY_BYTES; recall must error with
+    /// the cap message instead of decoding it.
+    #[tokio::test]
+    async fn recall_refuses_oversized_success_body_before_parsing() {
+        let server = MockServer::start().await;
+        // A syntactically valid JSON object padded far past the 1 MiB cap. If
+        // the cap were applied only after buffering, this whole body would be
+        // read and parsed; instead the streaming cap trips first.
+        let padding = "A".repeat(MAX_REMOTE_BODY_BYTES + 512 * 1024);
+        let body = format!(r#"{{"results": [], "junk": "{padding}"}}"#);
+        Mock::given(method("POST"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/recall"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&server)
+            .await;
+
+        let mem = memory_for(&server.uri(), "zeroclaw-test");
+        let err = mem
+            .recall("otter", 3, None, None, None)
+            .await
+            .expect_err("an oversized success body must be refused, not parsed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cap") && msg.contains("refused"),
+            "oversized body must be refused at the streaming cap: {msg}"
+        );
+    }
+
+    /// The ERROR path must also stop reading at its (smaller) cap: a huge error
+    /// body is bounded without buffering the whole stream. Proven via the
+    /// helper's byte accounting plus the surfaced snippet staying bounded.
+    #[tokio::test]
+    async fn error_body_is_capped_while_streaming() {
+        let server = MockServer::start().await;
+        // 4 MiB error body, far beyond the 8 KiB error cap.
+        let huge = "E".repeat(4 * 1024 * 1024);
+        Mock::given(method("POST"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/recall"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(huge))
+            .mount(&server)
+            .await;
+
+        let mem = memory_for(&server.uri(), "zeroclaw-test");
+        let err = mem
+            .recall("otter", 3, None, None, None)
+            .await
+            .expect_err("a 500 must surface as an error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("truncated"),
+            "error body must be truncated: {msg}"
+        );
+        // The surfaced message stays tiny (bounded snippet), proving the 4 MiB
+        // body was not materialized into the error string.
+        assert!(
+            msg.len() < 700,
+            "error message must stay bounded regardless of body size: {}",
+            msg.len()
         );
     }
 }
