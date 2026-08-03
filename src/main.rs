@@ -3549,6 +3549,19 @@ async fn async_main(command: clap::Command) -> Result<()> {
     }
     #[cfg(feature = "agent-runtime")]
     observability::runtime_trace::init_from_config(&config.observability, &config.data_dir);
+    // Config load happens once per process for every command, and the trace
+    // sink exists from the line above, so this reaches an operator whichever
+    // entry point they used. Emitting it during tool-registry assembly instead
+    // would repeat on gateway requests and nested SOP or delegation rebuilds.
+    #[cfg(feature = "agent-runtime")]
+    if config.verifiable_intent.enabled {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "verifiable_intent: vi_verify is not registered as a model-callable tool because no credential chain verifier exists yet (see #9328)"
+        );
+    }
     #[cfg(feature = "agent-runtime")]
     if config.security.otp.enabled {
         let config_dir = config

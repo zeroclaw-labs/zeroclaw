@@ -1430,18 +1430,12 @@ pub fn all_tools_with_runtime(
         Some(parent_tools)
     };
 
-    // `vi_verify` is not model-callable while no chain verifier exists: it checked
+    // `vi_verify` is deliberately absent while no chain verifier exists: it checked
     // caller-supplied constraints against a caller-supplied fulfillment with nothing
-    // establishing that either came from a signed credential. Register it again only
-    // behind a verify-and-evaluate path that consumes a verified chain result.
-    if root_config.verifiable_intent.enabled {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-            "verifiable_intent: vi_verify is not registered as a model-callable tool because no credential chain verifier exists yet (see #9328)"
-        );
-    }
+    // establishing that either came from a signed credential. The operator-facing
+    // notice lives at config load, since this function also runs per gateway request
+    // and per nested registry rebuild. Register it again only behind a
+    // verify-and-evaluate path that consumes a verified chain result.
 
     // ── WASM plugin tools (requires plugins-wasm feature) ──
     #[cfg(feature = "plugins-wasm")]
