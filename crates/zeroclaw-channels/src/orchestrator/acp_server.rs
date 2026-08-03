@@ -745,7 +745,7 @@ impl AcpServer {
         // by default to keep `session/new` prompt; on to load this agent's
         // `mcp_bundles` tools. Runs without the sessions lock held (see above).
         let enable_mcp = config.agent(&agent_alias).is_some_and(|a| a.acp_enable_mcp);
-        let agent = match self
+        let mut agent = match self
             .build_agent(
                 &config,
                 &agent_alias,
@@ -802,8 +802,8 @@ impl AcpServer {
 
         // Wire an ACP back-channel so tools like `ask_user`,
         // `escalate_to_human`, and `reaction` can talk to the IDE/CLI client
-        // for this session. Registered as `"acp"`; resolved by name when the
-        // agent picks a channel.
+        // for this session. Registered as `"acp"`; channel_name must match so
+        // interactive tools default here instead of an arbitrary map entry.
         let acp_channel = Arc::new(AcpChannel::new(
             "acp",
             session_id.clone(),
@@ -811,6 +811,7 @@ impl AcpServer {
             Duration::from_secs(self.acp_config.session_timeout_secs),
             *self.client_elicitation_caps.read().unwrap(),
         ));
+        agent.set_channel_name("acp".to_string());
         agent.channel_handles().register_channel("acp", acp_channel);
 
         // Persist before publishing the session, so a failed write never
@@ -1041,6 +1042,7 @@ impl AcpServer {
             Duration::from_secs(self.acp_config.session_timeout_secs),
             *self.client_elicitation_caps.read().unwrap(),
         ));
+        agent.set_channel_name("acp".to_string());
         agent.channel_handles().register_channel("acp", acp_channel);
 
         let now = Instant::now();
@@ -1240,6 +1242,7 @@ impl AcpServer {
             Duration::from_secs(self.acp_config.session_timeout_secs),
             *self.client_elicitation_caps.read().unwrap(),
         ));
+        agent.set_channel_name("acp".to_string());
         agent.channel_handles().register_channel("acp", acp_channel);
 
         let now = Instant::now();

@@ -209,18 +209,25 @@ fn json_value_to_setprop_string(
     value: &serde_json::Value,
     config: &Config,
     path: &str,
+    op_index: usize,
+    json: bool,
 ) -> Result<String> {
     let kind = config_patch_prop_kind(config, path);
-    zeroclaw_config::typed_value::coerce_for_set_prop(value, kind).map_err(|e| {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(::serde_json::json!({"path": path, "error": e.message.clone()})),
-            "config patch coercion rejected JSON value"
-        );
-        anyhow::Error::msg(e.message)
-    })
+    match zeroclaw_config::typed_value::coerce_for_set_prop(value, kind) {
+        Ok(value_str) => Ok(value_str),
+        Err(err) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"path": path, "error": err.message.clone()})),
+                "config patch coercion rejected JSON value"
+            );
+            let err = err.with_path(path).with_op_index(op_index);
+            let human = err.message.clone();
+            config_patch_fail_json_or_human(json, err, human)
+        }
+    }
 }
 
 fn config_patch_map_prop_error(err: anyhow::Error, path: &str, op_index: usize) -> ConfigApiError {
@@ -5848,28 +5855,38 @@ async fn async_main(command: clap::Command) -> Result<()> {
 
                     let result_entry: serde_json::Value = match op_name {
                         "add" | "replace" => {
-                            let value = op.get("value").ok_or_else(|| {
-                                ::zeroclaw_log::record!(
-                                    WARN,
-                                    ::zeroclaw_log::Event::new(
-                                        module_path!(),
-                                        ::zeroclaw_log::Action::Reject
-                                    )
-                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                    .with_attrs(
-                                        ::serde_json::json!({
-                                            "op": op_name,
-                                            "op_index": idx,
-                                            "path": path,
-                                        })
-                                    ),
-                                    "config patch op rejected: missing `value` field"
-                                );
-                                anyhow::Error::msg(format!(
-                                    "op[{idx}] `{op_name}` on `{path}`: missing `value` field"
-                                ))
-                            })?;
-                            let value_str = json_value_to_setprop_string(value, &config, &path)?;
+                            let value = match op.get("value") {
+                                Some(value) => value,
+                                None => {
+                                    ::zeroclaw_log::record!(
+                                        WARN,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Reject
+                                        )
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                        .with_attrs(
+                                            ::serde_json::json!({
+                                                "op": op_name,
+                                                "op_index": idx,
+                                                "path": path,
+                                            })
+                                        ),
+                                        "config patch op rejected: missing `value` field"
+                                    );
+                                    let message = format!(
+                                        "op[{idx}] `{op_name}` on `{path}`: missing `value` field"
+                                    );
+                                    let api_err = config_patch_json_value_type_error(
+                                        message.clone(),
+                                        Some(path.clone()),
+                                        Some(idx),
+                                    );
+                                    config_patch_fail_json_or_human(json, api_err, message)?
+                                }
+                            };
+                            let value_str =
+                                json_value_to_setprop_string(value, &config, &path, idx, json)?;
                             match config.set_prop_persistent(&path, &value_str) {
                                 Ok(()) => {}
                                 Err(err) => {
@@ -7055,7 +7072,10 @@ fn paircode_no_code_message(
 
     lines.push(String::new());
     lines.push("To inspect the running gateway:".into());
-    lines.push(format!("    open http://{host}:{port}"));
+    lines.push(format!(
+        "    open http://{}:{port}",
+        gateway_browser_host(host)
+    ));
     indent_paircode_lines(lines)
 }
 
@@ -7995,6 +8015,14 @@ fn is_default_gateway_addr(host: &str, port: u16, default_host: &str, default_po
     host == default_host && port == default_port
 }
 
+fn gateway_browser_host(host: &str) -> &str {
+    match host {
+        "0.0.0.0" => "127.0.0.1",
+        "::" | "[::]" => "[::1]",
+        _ => host,
+    }
+}
+
 fn gateway_addr_in_use_message(
     host: &str,
     port: u16,
@@ -8011,7 +8039,10 @@ fn gateway_addr_in_use_message(
     ];
 
     if is_default_gateway_addr(host, port, default_host, default_port) {
-        lines.push(format!("    open http://{host}:{port}"));
+        lines.push(format!(
+            "    open http://{}:{port}",
+            gateway_browser_host(host)
+        ));
     }
 
     lines.push(gateway_paircode_recovery_command(
@@ -8711,6 +8742,31 @@ mod tests {
 
     #[test]
     #[cfg(feature = "agent-runtime")]
+    fn paircode_no_code_message_uses_loopback_browser_hint_for_wildcard_hosts() {
+        let default = config::GatewayConfig::default();
+
+        for (host, browser_host) in [("0.0.0.0", "127.0.0.1"), ("::", "[::1]"), ("[::]", "[::1]")] {
+            let msg = paircode_no_code_message(
+                host,
+                9001,
+                &default.host,
+                default.port,
+                &PaircodeAction::Show,
+                true,
+                None,
+            );
+
+            assert!(
+                msg.contains(&format!("open http://{browser_host}:9001")),
+                "{msg}"
+            );
+            assert!(msg.contains(&format!("--port 9001 --host {host}")), "{msg}");
+            assert!(!msg.contains(&format!("open http://{host}:9001")), "{msg}");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
     fn paircode_no_code_message_omits_configured_default_host_port() {
         let msg = paircode_no_code_message(
             "192.168.1.20",
@@ -8774,6 +8830,19 @@ mod tests {
         assert!(msg.contains("zeroclaw gateway get-paircode --port 9001 --host 0.0.0.0"));
         assert!(msg.contains("zeroclaw gateway start --port 9002 --host 0.0.0.0"));
         assert!(msg.contains("lsof -nP -iTCP:9001 -sTCP:LISTEN"));
+    }
+
+    #[test]
+    fn gateway_addr_in_use_message_uses_loopback_browser_hint_for_wildcard_default() {
+        for (host, browser_host) in [("0.0.0.0", "127.0.0.1"), ("::", "[::1]"), ("[::]", "[::1]")] {
+            let msg = gateway_addr_in_use_message(host, 9001, host, 9001, None);
+
+            assert!(
+                msg.contains(&format!("open http://{browser_host}:9001")),
+                "{msg}"
+            );
+            assert!(!msg.contains(&format!("open http://{host}:9001")), "{msg}");
+        }
     }
 
     #[test]

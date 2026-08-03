@@ -24,6 +24,7 @@ ignore = [
     # (graph-aware) tolerates. Reconcile and remediate per #8519.
     # RUSTSEC-2026-0149, -0182, -0188 cleared by wasmtime/wasmtime-wasi 43 -> 45.0.3
     # bump in crates/zeroclaw-plugins. Resolved by #8542.
+    "RUSTSEC-2026-0222",  # wasmtime Store type-index confusion between engines; single-Engine plugin runtime is not exposed; no patched 45.x, remediation is the 46/47 bump; tracking #8519
     # GTK3 stack unmaintained via zeroclaw-desktop (tauri -> webkit2gtk); tracking #8519
     "RUSTSEC-2024-0411",  # gdkwayland-sys unmaintained gtk-rs GTK3 bindings; tracking #8519
     "RUSTSEC-2024-0412",  # gdk unmaintained gtk-rs GTK3 bindings; tracking #8519

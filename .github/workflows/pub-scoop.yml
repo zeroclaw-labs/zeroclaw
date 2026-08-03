@@ -80,9 +80,13 @@ jobs:
           fi
 
           version="${RELEASE_TAG#v}"
-          asset_name="zeroclaw-x86_64-pc-windows-msvc.zip"
-          zip_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/zeroclaw-x86_64-pc-windows-msvc.zip"
-          sums_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/SHA256SUMS"
+          if ! metadata="$(bash scripts/release/scoop_metadata.sh dist/scoop/zeroclaw.json "$version")"; then
+            echo "::error::could not derive Scoop release metadata from the canonical manifest"
+            exit 1
+          fi
+          zip_url="$(jq -er '.zip_url' <<<"$metadata")"
+          asset_name="$(jq -er '.asset_name' <<<"$metadata")"
+          sums_url="$(jq -er '.sums_url' <<<"$metadata")"
 
           sha256="$(curl -fsSL "$sums_url" | awk -v asset="$asset_name" '$2 == asset {print $1}')"
 

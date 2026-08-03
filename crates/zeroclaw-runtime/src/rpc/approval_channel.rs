@@ -73,6 +73,15 @@ impl Channel for RpcApprovalChannel {
         Ok(())
     }
 
+    /// `send` above is a deliberate no-op: the Code tab renders agent output
+    /// from the RPC turn stream, not from generic channel sends. Declaring it
+    /// here lets surfaces that must genuinely deliver (`poll`'s text fallback,
+    /// `escalate_to_human`) refuse this channel instead of reporting success
+    /// for a message the user never saw.
+    fn supports_outbound_send(&self) -> bool {
+        false
+    }
+
     async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         anyhow::bail!("RpcApprovalChannel.listen is not supported")
     }

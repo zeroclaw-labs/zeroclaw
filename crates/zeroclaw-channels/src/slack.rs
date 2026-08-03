@@ -15,6 +15,7 @@ use zeroclaw_api::channel::{
     Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
 };
 use zeroclaw_api::media::MediaAttachment;
+use zeroclaw_runtime::i18n;
 
 #[derive(Clone)]
 struct CachedSlackDisplayName {
@@ -5177,21 +5178,27 @@ impl Channel for SlackChannel {
         // Socket Mode: send interactive Block Kit buttons.
         // Polling mode: send plain text with token-echo instructions.
         let send_result = if self.app_token.is_some() {
+            let heading = i18n::get_required_cli_string("channel-approval-heading-shout");
+            let tool_label = i18n::get_required_cli_string("channel-approval-tool-label");
+            let args_label = i18n::get_required_cli_string("channel-approval-args-label");
+            let btn_approve = i18n::get_required_cli_string("channel-approval-btn-approve");
+            let btn_deny = i18n::get_required_cli_string("channel-approval-btn-deny");
+            let btn_always = i18n::get_required_cli_string("channel-approval-btn-always");
             let body = serde_json::json!({
                 "channel": recipient,
-                "text": format!("APPROVAL REQUIRED [{token}]\nTool: {}\nArgs: {}", request.tool_name, request.arguments_summary),
+                "text": format!("{heading} [{token}]\n{tool_label}: {}\n{args_label}: {}", request.tool_name, request.arguments_summary),
                 "blocks": [{
                     "type": "section",
                     "text": {
                         "type": "mrkdwn",
-                        "text": format!("*APPROVAL REQUIRED* [`{token}`]\n*Tool:* `{}`\n*Args:* {}", request.tool_name, request.arguments_summary),
+                        "text": format!("*{heading}* [`{token}`]\n*{tool_label}:* `{}`\n*{args_label}:* {}", request.tool_name, request.arguments_summary),
                     }
                 }, {
                     "type": "actions",
                     "elements": [
-                        { "type": "button", "text": { "type": "plain_text", "text": "Approve" }, "action_id": format!("approval_{token}_approve"), "style": "primary" },
-                        { "type": "button", "text": { "type": "plain_text", "text": "Deny" }, "action_id": format!("approval_{token}_deny"), "style": "danger" },
-                        { "type": "button", "text": { "type": "plain_text", "text": "Always" }, "action_id": format!("approval_{token}_always") },
+                        { "type": "button", "text": { "type": "plain_text", "text": btn_approve }, "action_id": format!("approval_{token}_approve"), "style": "primary" },
+                        { "type": "button", "text": { "type": "plain_text", "text": btn_deny }, "action_id": format!("approval_{token}_deny"), "style": "danger" },
+                        { "type": "button", "text": { "type": "plain_text", "text": btn_always }, "action_id": format!("approval_{token}_always") },
                     ]
                 }]
             });
@@ -5205,9 +5212,10 @@ impl Channel for SlackChannel {
                 .map_err(anyhow::Error::from)
         } else {
             self.send(&SendMessage::new(
-                format!(
-                    "APPROVAL REQUIRED [{token}]\nTool: {}\nArgs: {}\n\nReply: \"{token} yes\", \"{token} no\", or \"{token} always\"",
-                    request.tool_name, request.arguments_summary,
+                crate::util::build_yesno_approval_prompt(
+                    &token,
+                    &request.tool_name,
+                    &request.arguments_summary,
                 ),
                 recipient,
             ))

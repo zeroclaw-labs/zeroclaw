@@ -1516,7 +1516,7 @@ fn build_curl_command(url: &str) -> Option<String> {
         return None;
     }
 
-    let escaped = url.replace('\'', r#"'\\''"#);
+    let escaped = url.replace('\'', r#"'"'"'"#);
     Some(format!("curl -s '{}'", escaped))
 }
 
@@ -1629,15 +1629,14 @@ fn parse_glm_shortened_body(body: &str) -> Option<ParsedToolCall> {
             .trim_end_matches('/')
             .trim();
         (tool, attrs)
-    } else if let Some(gt_pos) = body.find('>') {
+    } else {
+        let gt_pos = body.find('>')?;
         // GLM shortened: `tool_name>value`
         let tool = body[..gt_pos].trim();
         let value = body[gt_pos + 1..].trim();
         // Strip trailing self-close markers that some models emit
         let value = value.trim_end_matches("/>").trim_end_matches('/').trim();
         (tool, value)
-    } else {
-        return None;
     };
 
     // Validate tool name: must be alphanumeric + underscore only
@@ -3606,12 +3605,18 @@ Done."#;
         let calls = parse_glm_style_tool_calls(response);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "shell");
-        assert!(calls[0].1["command"].as_str().unwrap().contains("curl"));
-        assert!(
-            calls[0].1["command"]
-                .as_str()
-                .unwrap()
-                .contains("example.com")
+        assert_eq!(calls[0].1["command"], "curl -s 'https://example.com'");
+    }
+
+    #[test]
+    fn parse_glm_style_quotes_url_apostrophes_and_metacharacters() {
+        let calls =
+            parse_glm_style_tool_calls("browser_open/url>https://example.com/it's;still=one");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "shell");
+        assert_eq!(
+            calls[0].1["command"],
+            r#"curl -s 'https://example.com/it'"'"'s;still=one'"#
         );
     }
 
