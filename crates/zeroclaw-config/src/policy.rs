@@ -1264,6 +1264,48 @@ impl SecurityPolicy {
         None
     }
 
+    /// Shell-aware Medium-risk classification of a single `git` command segment.
+    ///
+    /// `command_risk_level` word-splits each segment on whitespace, which
+    /// fragments a quoted or escaped global-option value: `git -C "/repo with
+    /// spaces" commit` naively tokenizes to `-C`, `"/repo`, `with`, `spaces"`,
+    /// `commit`, so `git_subcommand` reads `with` as the verb and misses the
+    /// real `commit` — letting a write skip the medium-risk approval gate.
+    /// Re-tokenize the segment with shell quoting rules so the value stays a
+    /// single token and the subcommand the shell would actually run is
+    /// resolved. A segment that cannot be tokenized (unbalanced quotes) is
+    /// treated conservatively as a write, so a malformed command can never slip
+    /// under the gate.
+    fn git_segment_is_write(segment: &str) -> bool {
+        let Some(tokens) = shlex::split(segment) else {
+            return true; // ambiguous parse → conservative Medium
+        };
+        // tokens[0] is the `git` executable; classify the verb the shell would
+        // run, past any leading global options.
+        let args: Vec<String> = tokens
+            .into_iter()
+            .skip(1)
+            .map(|t| t.to_ascii_lowercase())
+            .collect();
+        Self::git_subcommand(&args).is_some_and(|verb| {
+            matches!(
+                verb,
+                "commit"
+                    | "push"
+                    | "reset"
+                    | "clean"
+                    | "rebase"
+                    | "merge"
+                    | "cherry-pick"
+                    | "revert"
+                    | "branch"
+                    | "checkout"
+                    | "switch"
+                    | "tag"
+            )
+        })
+    }
+
     pub fn command_risk_level(&self, command: &str) -> CommandRiskLevel {
         let mut saw_medium = false;
 
@@ -1342,23 +1384,7 @@ impl SecurityPolicy {
 
             // Medium-risk commands (state-changing, but not inherently destructive)
             let medium = match base {
-                "git" => Self::git_subcommand(&args).is_some_and(|verb| {
-                    matches!(
-                        verb,
-                        "commit"
-                            | "push"
-                            | "reset"
-                            | "clean"
-                            | "rebase"
-                            | "merge"
-                            | "cherry-pick"
-                            | "revert"
-                            | "branch"
-                            | "checkout"
-                            | "switch"
-                            | "tag"
-                    )
-                }),
+                "git" => Self::git_segment_is_write(cmd_part),
                 "npm" | "pnpm" | "yarn" => args.first().is_some_and(|verb| {
                     matches!(
                         verb.as_str(),
@@ -3088,6 +3114,47 @@ mod tests {
         assert_eq!(v("--no-pager -C /repo log").as_deref(), Some("log"));
         assert_eq!(v("-C /repo").as_deref(), None); // options only, no subcommand
         assert_eq!(v("").as_deref(), None);
+    }
+
+    #[test]
+    fn quoted_path_write_git_is_gated_at_the_enforcement_boundary() {
+        // The write verb hides behind a quoted (or escaped) `-C` / `--git-dir`
+        // value that naive whitespace splitting fragments. Drive the real
+        // approval decision through `validate_command_execution`, not just
+        // helper tokens: an unapproved quoted-path write must be REJECTED, the
+        // approved form must classify Medium, and the matching quoted-path read
+        // must stay Low and need no approval. This proves the classifier is
+        // wired to the enforcement boundary.
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into()],
+            // Preconditions the medium gate depends on (also the defaults):
+            autonomy: AutonomyLevel::Supervised,
+            require_approval_for_medium_risk: true,
+            ..SecurityPolicy::default()
+        };
+
+        for write in [
+            r#"git -C "/repo with spaces" commit -m x"#,
+            r"git -C /repo\ with\ spaces commit",
+            r#"git --git-dir "/r with spaces/.git" push"#,
+        ] {
+            assert!(
+                p.validate_command_execution(write, false).is_err(),
+                "unapproved quoted/escaped-path write-git must be rejected: {write}"
+            );
+            assert_eq!(
+                p.validate_command_execution(write, true),
+                Ok(CommandRiskLevel::Medium),
+                "approved quoted/escaped-path write-git must classify Medium: {write}"
+            );
+        }
+
+        // The corresponding quoted-path read stays Low and needs no approval.
+        assert_eq!(
+            p.validate_command_execution(r#"git -C "/repo with spaces" status"#, false),
+            Ok(CommandRiskLevel::Low),
+            "quoted-path read-git must remain Low"
+        );
     }
 
     #[test]
