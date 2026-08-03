@@ -1858,6 +1858,128 @@ fn resolve_heartbeat_delivery(config: &Config) -> Result<Option<(String, String)
 
 const HEARTBEAT_SESSION_CONTEXT_MESSAGES: usize = 20;
 
+/// Pick the session that belongs to the heartbeat's `channel`/`to` target.
+///
+/// The heartbeat is configured with a delivery address (`to = "…@lid"`), not
+/// with a session key, and the two are not the same string: a session key is
+/// built from the channel scope, the reply target and the normalized sender
+/// (`conversation_history_key`). So the address has to be matched against the
+/// keys the store actually holds.
+///
+/// Matching is on digits, not on the raw text, and that is the point. Phone
+/// numbers reach this code in several spellings — `@lid` vs `@s.whatsapp.net`,
+/// with or without a device suffix, and (for Mexican mobiles) with or without
+/// the legacy `1` after the country code. A change to sender normalization
+/// therefore changes the session key for the same human, orphaning the history
+/// written before it: the agent would greet a long-standing contact with an
+/// empty conversation. Comparing digit suffixes keeps old and new keys pointing
+/// at the same person, so a normalization fix never costs anyone their history.
+///
+/// When several keys match (exactly the old-format/new-format case), the one
+/// with the most recent activity wins, and the older key's messages stay
+/// readable where they are rather than being rewritten.
+fn heartbeat_session_key(
+    backend: &std::sync::Arc<dyn zeroclaw_infra::session_backend::SessionBackend>,
+    channel: &str,
+    to: &str,
+) -> Option<String> {
+    /// Trailing digits of an address, ignoring any `@server` part and any
+    /// device suffix, so `5215551234567:23@s.whatsapp.net`, `5215551234567`
+    /// and a session key ending in `_525551234567` all reduce to comparable
+    /// digit strings.
+    fn digits_of(value: &str) -> String {
+        value
+            .split('@')
+            .next()
+            .unwrap_or(value)
+            .split(':')
+            .next()
+            .unwrap_or(value)
+            .chars()
+            .filter(char::is_ascii_digit)
+            .collect()
+    }
+
+    /// Whether two digit strings denote the same person.
+    ///
+    /// The national number (last [`NATIONAL_NUMBER_DIGITS`]) must match
+    /// exactly, and the country prefixes must be compatible: either identical,
+    /// or one carrying a single extra *trunk* digit the other omits.
+    ///
+    /// That trunk digit is why a suffix comparison is not enough. Mexico's
+    /// legacy `1` and Argentina's `9` sit *between* the country code and the
+    /// national number (`52|1|5551234567`), not in front of it, so the longer
+    /// spelling is not a suffix of the shorter one. Comparing the tail alone
+    /// silently fails to match a person with themselves.
+    ///
+    /// Country prefixes are compared rather than ignored so that two different
+    /// people who happen to share a national number — a Mexican `+52` and a US
+    /// `+1` line, say — never resolve to one session. Getting that wrong would
+    /// feed one person's conversation into another's context.
+    fn same_number(a: &str, b: &str) -> bool {
+        const NATIONAL_NUMBER_DIGITS: usize = 10;
+
+        if a.len() < NATIONAL_NUMBER_DIGITS || b.len() < NATIONAL_NUMBER_DIGITS {
+            return false;
+        }
+        let (a_head, a_national) = a.split_at(a.len() - NATIONAL_NUMBER_DIGITS);
+        let (b_head, b_national) = b.split_at(b.len() - NATIONAL_NUMBER_DIGITS);
+        if a_national != b_national {
+            return false;
+        }
+        if a_head == b_head {
+            return true;
+        }
+
+        // Require both sides to name a country: a bare national number could
+        // belong to any of them.
+        let (shorter, longer) = if a_head.len() < b_head.len() {
+            (a_head, b_head)
+        } else {
+            (b_head, a_head)
+        };
+        !shorter.is_empty()
+            && longer.len() == shorter.len() + 1
+            && longer.starts_with(shorter)
+    }
+
+    let target_digits = digits_of(to);
+    if target_digits.is_empty() {
+        return None;
+    }
+
+    let channel_prefix = format!("{channel}_");
+    let mut candidates: Vec<(String, Option<chrono::DateTime<chrono::Utc>>)> = backend
+        .list_sessions()
+        .into_iter()
+        .filter(|key| key.starts_with(&channel_prefix))
+        .filter(|key| {
+            let key_digits = digits_of(key.rsplit('_').next().unwrap_or_default());
+            !key_digits.is_empty() && same_number(&key_digits, &target_digits)
+        })
+        .map(|key| {
+            let last_activity = backend
+                .load_with_timestamps(&key)
+                .iter()
+                .rev()
+                .find_map(|m| m.created_at);
+            (key, last_activity)
+        })
+        .collect();
+
+    if candidates.len() > 1 {
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"matches": candidates.len()})),
+            "heartbeat session context: several session keys map to this target, using the most recent"
+        );
+    }
+
+    candidates.sort_by_key(|(_, last_activity)| *last_activity);
+    candidates.pop().map(|(key, _)| key)
+}
+
 fn load_heartbeat_session_context(config: &Config) -> Option<String> {
     use zeroclaw_providers::traits::ChatMessage;
 
@@ -1886,45 +2008,55 @@ fn load_heartbeat_session_context(config: &Config) -> Option<String> {
 
     let sessions_dir = config.data_dir.join("sessions");
 
-    // Find the most recently modified JSONL file that belongs to this target.
-    // Matches both `{channel}_{to}.jsonl` and `{channel}_{anything}_{to}.jsonl`.
-    let prefix = format!("{channel}_");
-    let suffix = format!("_{to}.jsonl");
-    let exact = format!("{channel}_{to}.jsonl");
-    let mid_prefix = format!("{channel}_{to}_");
+    // Resolve the conversation from the session backend rather than from files
+    // on disk. This used to scan `sessions/` for `{channel}_..._{to}.jsonl`,
+    // which silently stopped matching anything once sessions moved into
+    // `sessions.db`: the directory holds no `.jsonl` at all, so the function
+    // returned `None` on every tick and the heartbeat had never once seen a
+    // conversation. It still ran, still "decided" not to write, and looked
+    // healthy doing it — the agent was choosing blind.
+    //
+    // The store is the single source of truth for session content, so ask it.
+    // JSONL sessions written by older builds are still readable through the
+    // same trait, so nothing that worked before stops working.
+    let backend: std::sync::Arc<dyn zeroclaw_infra::session_backend::SessionBackend> =
+        match zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(&config.data_dir) {
+            Ok(sqlite) => std::sync::Arc::new(sqlite),
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+                    "heartbeat session context: session backend unavailable"
+                );
+                match zeroclaw_infra::session_store::SessionStore::new(&sessions_dir) {
+                    Ok(files) => std::sync::Arc::new(files),
+                    Err(_) => return None,
+                }
+            }
+        };
 
-    let path = std::fs::read_dir(&sessions_dir)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            let name = e.file_name();
-            let name = name.to_string_lossy();
-            name.ends_with(".jsonl")
-                && (name == exact
-                    || (name.starts_with(&prefix) && name.ends_with(&suffix))
-                    || name.starts_with(&mid_prefix))
-        })
-        .max_by_key(|e| {
-            e.metadata()
-                .and_then(|m| m.modified())
-                .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-        })
-        .map(|e| e.path())?;
-
-    if !path.exists() {
+    let session_key = heartbeat_session_key(&backend, channel, to)?;
+    let messages = backend.load_with_timestamps(&session_key);
+    if messages.is_empty() {
         ::zeroclaw_log::record!(
             DEBUG,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                 .with_attrs(::serde_json::json!({"channel": channel, "to": to})),
-            "heartbeat session context: no session file found"
+            "heartbeat session context: session is empty"
         );
         return None;
     }
 
-    let messages = load_jsonl_messages(&path);
-    if messages.is_empty() {
-        return None;
-    }
+    // Keep the newest message's own timestamp: it is what "how long has she
+    // been waiting" is measured from. The previous implementation used the
+    // session file's mtime, which a compaction or an unrelated write silently
+    // resets — the agent would then believe a day-old conversation had just
+    // happened.
+    let last_message_at = messages.iter().rev().find_map(|m| m.created_at);
+
+    let messages: Vec<ChatMessage> = messages.into_iter().map(|m| m.message).collect();
 
     let recent: Vec<&ChatMessage> = messages
         .iter()
@@ -1950,11 +2082,12 @@ fn load_heartbeat_session_context(config: &Config) -> Option<String> {
         return None;
     }
 
-    // Use the session file's mtime as a proxy for when the last message arrived.
-    let last_message_age = std::fs::metadata(&path)
-        .ok()
-        .and_then(|m| m.modified().ok())
-        .and_then(|mtime| mtime.elapsed().ok());
+    // Age measured from the message's own timestamp (see above); backends that
+    // don't persist one simply omit the note rather than guess.
+    let last_message_age = last_message_at.and_then(|at| {
+        let secs = chrono::Utc::now().signed_duration_since(at).num_seconds();
+        u64::try_from(secs).ok().map(std::time::Duration::from_secs)
+    });
 
     let silence_note = match last_message_age {
         Some(age) => {
@@ -1980,7 +2113,7 @@ fn load_heartbeat_session_context(config: &Config) -> Option<String> {
         &format!(
             "💓 Heartbeat session context: {} messages from {}, silence: {}",
             recent.len(),
-            path.display().to_string(),
+            session_key,
             silence_note.trim()
         )
     );
@@ -2102,6 +2235,154 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
     use zeroclaw_config::schema::MattermostListenMode;
+
+    /// Build a SQLite-backed session store holding the given `(key, role, text)`
+    /// rows, so the heartbeat's session lookup is exercised against the same
+    /// backend production uses.
+    fn session_backend_with(
+        data_dir: &std::path::Path,
+        rows: &[(&str, &str, &str)],
+    ) -> std::sync::Arc<dyn zeroclaw_infra::session_backend::SessionBackend> {
+        use zeroclaw_infra::session_backend::SessionBackend as _;
+        use zeroclaw_providers::traits::ChatMessage;
+        let backend = zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(data_dir).unwrap();
+        for (key, role, text) in rows {
+            let message = match *role {
+                "user" => ChatMessage::user(*text),
+                _ => ChatMessage::assistant(*text),
+            };
+            backend.append(key, &message).unwrap();
+        }
+        std::sync::Arc::new(backend)
+    }
+
+    #[test]
+    fn heartbeat_finds_the_session_for_its_delivery_address() {
+        // The heartbeat is configured with an address (`to = "…@lid"`), never
+        // with a session key, so the address has to be matched against the keys
+        // the store holds. This lookup previously scanned the sessions
+        // directory for `.jsonl` files; once sessions moved into `sessions.db`
+        // that matched nothing at all, and the heartbeat silently ran without
+        // ever seeing a conversation.
+        let tmp = TempDir::new().unwrap();
+        let backend = session_backend_with(
+            tmp.path(),
+            &[
+                ("whatsapp_default_76188559093817_lid__525551234567", "user", "hola"),
+                ("whatsapp_default_99999999999999_lid__525559999999", "user", "otro chat"),
+            ],
+        );
+
+        let found = heartbeat_session_key(&backend, "whatsapp", "5215551234567@lid");
+        assert_eq!(
+            found.as_deref(),
+            Some("whatsapp_default_76188559093817_lid__525551234567"),
+            "the session for this address must be found"
+        );
+    }
+
+    #[test]
+    fn a_normalization_change_does_not_orphan_existing_history() {
+        // Sender normalization is part of the session key, so fixing it (for
+        // instance folding the legacy `1` in Mexican mobile numbers) changes
+        // the key for the same person. Matching on raw strings would leave the
+        // old conversation stranded and greet a long-standing contact with an
+        // empty history. Both spellings must resolve, and the most recently
+        // active one wins.
+        let tmp = TempDir::new().unwrap();
+        let backend = session_backend_with(
+            tmp.path(),
+            &[
+                // pre-fix key: number carries the Mexican `1`
+                ("whatsapp_default_76188559093817_lid__5215551234567", "user", "viejo"),
+                // post-fix key: same human, folded number, newer
+                ("whatsapp_default_76188559093817_lid__525551234567", "user", "nuevo"),
+            ],
+        );
+
+        let found = heartbeat_session_key(&backend, "whatsapp", "5215551234567@lid")
+            .expect("both spellings denote the same person");
+        assert!(
+            backend
+                .load(&found)
+                .iter()
+                .any(|m| m.content.contains("nuevo")),
+            "the most recently active key wins, got {found}"
+        );
+    }
+
+    #[test]
+    fn a_different_number_is_never_matched() {
+        // Suffix matching must not be so loose that another contact's session
+        // answers for this one — that would leak one person's conversation
+        // into another's heartbeat context.
+        let tmp = TempDir::new().unwrap();
+        let backend = session_backend_with(
+            tmp.path(),
+            &[("whatsapp_default_11111111111111_lid__525557654321", "user", "ajeno")],
+        );
+
+        assert_eq!(
+            heartbeat_session_key(&backend, "whatsapp", "5215551234567@lid"),
+            None,
+            "an unrelated number must not match"
+        );
+    }
+
+    #[test]
+    fn a_foreign_number_sharing_the_national_digits_is_never_matched() {
+        // Two countries can issue the same ten national digits. Matching on the
+        // tail alone would hand a Mexican contact's heartbeat the conversation
+        // of a US or UK line — one person's messages surfacing in another
+        // person's context. The country prefix has to be compared, not skipped.
+        let tmp = TempDir::new().unwrap();
+        let backend = session_backend_with(
+            tmp.path(),
+            &[
+                ("whatsapp_default_22222222222222_lid__15551234567", "user", "US +1"),
+                ("whatsapp_default_33333333333333_lid__445551234567", "user", "UK +44"),
+            ],
+        );
+
+        assert_eq!(
+            heartbeat_session_key(&backend, "whatsapp", "5215551234567@lid"),
+            None,
+            "same national digits under a different country code is a different person"
+        );
+    }
+
+    #[test]
+    fn an_argentinian_trunk_digit_is_folded_like_the_mexican_one() {
+        // Argentina's mobile `9` sits in the same position as Mexico's `1`
+        // (`54|9|…`), so the rule is written around "one extra trunk digit
+        // after the country code" rather than hardcoding a single country.
+        let tmp = TempDir::new().unwrap();
+        let backend = session_backend_with(
+            tmp.path(),
+            &[("whatsapp_default_44444444444444_lid__545551234567", "user", "hola")],
+        );
+
+        assert_eq!(
+            heartbeat_session_key(&backend, "whatsapp", "5495551234567@lid").as_deref(),
+            Some("whatsapp_default_44444444444444_lid__545551234567"),
+            "both Argentinian spellings denote the same person"
+        );
+    }
+
+    #[test]
+    fn a_session_from_another_channel_is_never_matched() {
+        let tmp = TempDir::new().unwrap();
+        let backend = session_backend_with(
+            tmp.path(),
+            &[("telegram_default_76188559093817_lid__525551234567", "user", "otro canal")],
+        );
+
+        assert_eq!(
+            heartbeat_session_key(&backend, "whatsapp", "5215551234567@lid"),
+            None,
+            "channel prefix must be respected"
+        );
+    }
 
     fn test_config(tmp: &TempDir) -> Config {
         let config = Config {
