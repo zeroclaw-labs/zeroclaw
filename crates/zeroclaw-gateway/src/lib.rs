@@ -440,10 +440,33 @@ fn default_agent_alias(config: &Config) -> Option<String> {
         .min()
 }
 
+/// Owned guard for [`AppState::config_write_lock`]. Owned (not borrowed) so
+/// a handler can release it explicitly at its commit point, or pass it by
+/// value into a delegated helper without lifetime coupling.
+pub(crate) type ConfigWriteGuard = tokio::sync::OwnedMutexGuard<()>;
+
 /// Shared state for all axum handlers
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<RwLock<Config>>,
+
+    /// Serializes the read-mutate-save-swap critical section of every HTTP
+    /// handler that mutates `config` (per-property PUT/DELETE/PATCH, map-key
+    /// create/delete/rename, channel bind, config migrate, section select,
+    /// quickstart apply, cron settings patch, pairing-token persistence). A
+    /// tokio mutex, not `parking_lot`, because the guard must survive the
+    /// `.await` on config-save I/O. Mirrors
+    /// `RpcContext::config_write_lock` in the RPC path.
+    ///
+    /// Invariant: every mutation of `config` must happen while holding this
+    /// mutex, acquired before the first `config` read-for-modify and held
+    /// through the swap that installs the mutated snapshot. Never acquire it
+    /// while holding a `config` guard — lock order is this mutex first,
+    /// `config` second, always. A writer that bypasses this lock and swaps
+    /// the live config while a concurrent writer's save is in flight loses
+    /// that writer's change — clobbered in memory and, if its save hadn't
+    /// landed yet, on disk too.
+    pub config_write_lock: Arc<tokio::sync::Mutex<()>>,
     pub model_provider: Arc<dyn ModelProvider>,
     pub model: String,
     /// `None` means "let the provider decide" — required for models
@@ -1550,6 +1573,7 @@ pub async fn run_gateway(
 
     let state = AppState {
         config: config_state,
+        config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
         model_provider,
         model,
         temperature,
@@ -2319,8 +2343,12 @@ async fn handle_pair(
                     return (StatusCode::INTERNAL_SERVER_ERROR, Json(body));
                 }
             }
-            if let Err(err) =
-                Box::pin(persist_pairing_tokens(state.config.clone(), &state.pairing)).await
+            if let Err(err) = Box::pin(persist_pairing_tokens(
+                state.config.clone(),
+                &state.pairing,
+                state.config_write_lock.clone(),
+            ))
+            .await
             {
                 ::zeroclaw_log::record!(
                     ERROR,
@@ -2378,7 +2406,16 @@ async fn handle_pair(
 pub(crate) async fn persist_pairing_tokens(
     config: Arc<RwLock<Config>>,
     pairing: &PairingGuard,
+    config_write_lock: Arc<tokio::sync::Mutex<()>>,
 ) -> Result<()> {
+    // Self-contained: no caller pre-reads config for modify, so this
+    // acquires the witness itself rather than taking it as a param. Held
+    // across the whole read-modify-save-swap below.
+    let _guard = Arc::clone(&config_write_lock).lock_owned().await;
+    debug_assert!(
+        config_write_lock.try_lock().is_err(),
+        "persist_pairing_tokens must hold config_write_lock across its read-modify-save-swap"
+    );
     let paired_tokens = pairing.tokens();
     // This is needed because parking_lot's guard is not Send so we clone the inner
     // this should be removed once async mutexes are used everywhere
@@ -4018,7 +4055,13 @@ async fn handle_admin_paircode_new(
                     return Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(body)));
                 }
             }
-            if let Err(e) = persist_pairing_tokens(state.config.clone(), &state.pairing).await {
+            if let Err(e) = persist_pairing_tokens(
+                state.config.clone(),
+                &state.pairing,
+                state.config_write_lock.clone(),
+            )
+            .await
+            {
                 let body = serde_json::json!({
                     "success": false,
                     "pairing_required": true,
@@ -4069,7 +4112,13 @@ async fn handle_admin_paircode_new(
                 }
             };
             state.pairing.revoke_token_hash(&token_hash);
-            if let Err(e) = persist_pairing_tokens(state.config.clone(), &state.pairing).await {
+            if let Err(e) = persist_pairing_tokens(
+                state.config.clone(),
+                &state.pairing,
+                state.config_write_lock.clone(),
+            )
+            .await
+            {
                 let body = serde_json::json!({
                     "success": false,
                     "pairing_required": true,
@@ -4415,6 +4464,7 @@ mod tests {
         let registry = with_registry.then(|| Arc::new(api_pairing::DeviceRegistry::new(&data_dir)));
         AppState {
             config: Arc::new(RwLock::new(config)),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider: Arc::new(MockModelProvider::default()),
             model: "test-model".into(),
             temperature: None,
@@ -5044,6 +5094,7 @@ mod tests {
     async fn metrics_endpoint_returns_hint_when_prometheus_is_disabled() {
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider: Arc::new(MockModelProvider::default()),
             model: "test-model".into(),
             temperature: None,
@@ -5132,6 +5183,7 @@ mod tests {
         let observer: Arc<dyn zeroclaw_runtime::observability::Observer> = Arc::new(prom);
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider: Arc::new(MockModelProvider::default()),
             model: "test-model".into(),
             temperature: None,
@@ -5354,9 +5406,14 @@ mod tests {
         assert!(guard.is_authenticated(&token));
 
         let shared_config = Arc::new(RwLock::new(config));
-        Box::pin(persist_pairing_tokens(shared_config.clone(), &guard))
-            .await
-            .unwrap();
+        let config_write_lock = Arc::new(tokio::sync::Mutex::new(()));
+        Box::pin(persist_pairing_tokens(
+            shared_config.clone(),
+            &guard,
+            config_write_lock,
+        ))
+        .await
+        .unwrap();
 
         // In-memory tokens should remain as plaintext 64-char hex hashes.
         let plaintext = {
@@ -5375,6 +5432,81 @@ mod tests {
         assert!(
             zeroclaw_runtime::security::SecretStore::is_encrypted(on_disk),
             "paired_token should be encrypted on disk"
+        );
+    }
+
+    /// Unlike the `persist_and_swap` callers (which pre-acquire the witness
+    /// before their own read-for-modify), `persist_pairing_tokens` acquires
+    /// `config_write_lock` internally since it is self-contained. This
+    /// proves that internal acquisition still serializes it against a
+    /// second, concurrent config mutation the same way. A single Pending
+    /// poll wouldn't distinguish "blocked on `config_write_lock`" from
+    /// "transiently Pending on unrelated I/O", so this polls repeatedly
+    /// with a no-op waker while the witness stays held and asserts the
+    /// future never completes -- proving it stays parked on the lock for as
+    /// long as it's held. Once the lock is released both changes land —
+    /// neither clobbers the other.
+    #[tokio::test]
+    async fn persist_pairing_tokens_serializes_against_concurrent_config_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = Config {
+            config_path: temp.path().join("config.toml"),
+            data_dir: temp.path().join("workspace"),
+            ..Default::default()
+        };
+        config.save().await.unwrap();
+
+        let guard = PairingGuard::new(true, &[]);
+        let code = guard.pairing_code().unwrap();
+        let token = guard.try_pair(&code, "test_client").await.unwrap().unwrap();
+        assert!(guard.is_authenticated(&token));
+
+        let shared_config = Arc::new(RwLock::new(config));
+        let config_write_lock = Arc::new(tokio::sync::Mutex::new(()));
+
+        // Simulate another in-flight config mutation already holding the
+        // witness for its own read-mutate-save-swap section.
+        let held_guard = Arc::clone(&config_write_lock).lock_owned().await;
+
+        let mut persist_fut = Box::pin(persist_pairing_tokens(
+            shared_config.clone(),
+            &guard,
+            config_write_lock.clone(),
+        ));
+
+        // Bounded, sleep-free: `persist_pairing_tokens` acquires the witness
+        // as its very first action, so poll with a no-op waker 50 times
+        // while `held_guard` stays live and assert Pending every time,
+        // rather than resolving synchronously or racing ahead after a
+        // single yield.
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        for _ in 0..50 {
+            assert!(
+                std::future::Future::poll(persist_fut.as_mut(), &mut cx).is_pending(),
+                "persist_pairing_tokens must stay parked on config_write_lock \
+                 acquisition for as long as another writer holds it"
+            );
+        }
+
+        // Land a distinct, concurrent write directly on live config while
+        // persist_pairing_tokens is parked waiting for the lock.
+        shared_config.write().gateway.port = 55555;
+
+        drop(held_guard);
+        persist_fut
+            .await
+            .expect("persist_pairing_tokens must still succeed once unblocked");
+
+        let live = shared_config.read();
+        assert_eq!(
+            live.gateway.port, 55555,
+            "the concurrent writer's change must survive — no lost update"
+        );
+        assert_eq!(
+            live.gateway.paired_tokens.len(),
+            1,
+            "persist_pairing_tokens' own token write must also land"
         );
     }
 
@@ -5727,6 +5859,7 @@ mod tests {
 
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -5833,6 +5966,7 @@ mod tests {
 
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -5954,6 +6088,7 @@ mod tests {
 
         let state = AppState {
             config: Arc::new(RwLock::new(config)),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
             model: "startup-model".into(),
             temperature: None,
@@ -6055,6 +6190,7 @@ mod tests {
 
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -6175,6 +6311,7 @@ mod tests {
 
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -6261,6 +6398,7 @@ mod tests {
 
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -6352,6 +6490,7 @@ mod tests {
 
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -6450,6 +6589,7 @@ mod tests {
 
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -6546,6 +6686,7 @@ mod tests {
 
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -6698,6 +6839,7 @@ mod tests {
 
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider: provider,
             model: "test-model".into(),
             temperature: None,
@@ -7541,6 +7683,7 @@ mod tests {
 
         AppState {
             config: Arc::new(RwLock::new(Config::default())),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -7628,6 +7771,7 @@ mod tests {
 
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -7789,6 +7933,7 @@ mod tests {
         let mem: Arc<dyn Memory> = Arc::new(MockMemory);
         AppState {
             config: Arc::new(RwLock::new(Config::default())),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
             model: "test-model".into(),
             temperature: None,

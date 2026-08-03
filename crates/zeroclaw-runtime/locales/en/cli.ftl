@@ -941,6 +941,8 @@ channel-runtime-model-empty = Model ID cannot be empty. Use `/model <model-id>`.
 channel-runtime-model-switched = Model switched to `{ $model }` (model_provider: `{ $provider }`). Context preserved.
 channel-runtime-agent-scope-rejected = Sender `{ $sender }` is not authorized for `/model --agent` on agent `{ $agent }`. Use `/model --user { $model }` for a session-only override, or ask an admin to mark a peer group `admin_for_agent_scope = true` with you as a member.
 channel-runtime-request-timeout = ⚠️ Request timed out while waiting for the model. Please try again.
+channel-runtime-no-reply-refused = 🚫 I can't help with that request.
+channel-runtime-no-reply-failed = ⚠️ I couldn't complete that request.
 channel-runtime-current-model-status =
     Current model_provider: `{ $provider }`
     Current model: `{ $model }`
@@ -1081,3 +1083,34 @@ sop-rpc-decision-invalid-state = Run {$run_id} cannot be resolved in its current
 sop-rpc-decision-unauthorized = The RPC principal is not authorized to resolve this SOP step.
 sop-rpc-policy-missing = SOP approval policy '{$name}' is not configured.
 sop-rpc-policy-unavailable = The parked SOP policy is unavailable: {$reason}.
+
+# ── Tool approval (channels, #9409) ──
+# Human-visible copy for the operator-facing tool-approval prompt, shared
+# across the button adapters (Telegram, Discord, Slack) and the text-reply
+# adapters (Matrix, Signal, WhatsApp, Slack polling fallback). Approval
+# TOKENS, `callback_data`/`custom_id`/`action_id` values, and the reply
+# KEYWORDS parsed by `util::parse_approval_reply` (yes/y/approve, no/n/deny,
+# always) stay hardcoded ASCII in Rust — only the surrounding prose is
+# localized here.
+channel-approval-heading = Tool approval required
+channel-approval-heading-shout = APPROVAL REQUIRED
+channel-approval-tool-label = Tool
+channel-approval-args-label = Args
+channel-approval-btn-approve = Approve
+channel-approval-btn-deny = Deny
+channel-approval-btn-always = Always
+channel-approval-tap-instruction = Tap a button below:
+channel-approval-reply-instruction-yesno = Reply: "{ $yes_command }", "{ $no_command }", or "{ $always_command }"
+channel-approval-reply-instruction-approve-deny = Reply `{ $approve_command }` / `{ $deny_command }` / `{ $always_command }`.
+channel-telegram-approval-ack-approved = Approved
+channel-telegram-approval-ack-always-approved = Always approved
+channel-telegram-approval-ack-denied = Denied
+channel-telegram-approval-ack-unknown = Unknown action
+channel-discord-approval-btn-allow-once = Allow once
+channel-discord-approval-btn-allow-session = Allow this session
+channel-discord-approval-btn-allow-always = Always allow
+channel-approval-title = Approve { $tool }?
+channel-approval-opt-allow-once = Allow once
+channel-approval-opt-allow-always = Always allow
+channel-approval-opt-reject = Reject
+channel-approval-opt-reject-with-edit = Reject with edit

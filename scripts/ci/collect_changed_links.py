@@ -22,6 +22,7 @@ GENERATED_DOC_TARGETS = {
     "docs/book/src/reference/cli.md",
     "docs/book/src/reference/config.md",
 }
+MDBOOK_SOURCE_ROOT = Path("docs/book/src")
 
 
 def run_git(args: list[str]) -> subprocess.CompletedProcess[str]:
@@ -135,6 +136,17 @@ def split_link_targets(targets: list[str]) -> tuple[list[str], list[str]]:
         else:
             local_links.append(target)
     return http_links, local_links
+
+
+def mdbook_link_escapes_source(source_path: str, target: str) -> bool:
+    if target.startswith(("http://", "https://")):
+        return False
+
+    source = Path(source_path)
+    if not source.is_relative_to(MDBOOK_SOURCE_ROOT):
+        return False
+
+    return not Path(target).is_relative_to(MDBOOK_SOURCE_ROOT)
 
 
 def check_local_targets(local_links: list[str]) -> bool:
@@ -264,11 +276,19 @@ def main() -> int:
 
     unique_links: list[str] = []
     seen: set[str] = set()
+    invalid_mdbook_links: list[tuple[str, str]] = []
+    seen_invalid_mdbook_links: set[tuple[str, str]] = set()
     for path in existing_files:
         source_contexts = include_contexts_for(path)
         for line in added_lines_for_file(base_sha, path):
             for source_path in source_contexts:
                 for link in extract_links(line, source_path):
+                    if mdbook_link_escapes_source(source_path, link):
+                        invalid_link = (source_path, link)
+                        if invalid_link not in seen_invalid_mdbook_links:
+                            seen_invalid_mdbook_links.add(invalid_link)
+                            invalid_mdbook_links.append(invalid_link)
+                        continue
                     if link not in seen:
                         seen.add(link)
                         unique_links.append(link)
@@ -284,8 +304,15 @@ def main() -> int:
         )
 
     print(f"Collected {len(unique_links)} added link(s) from {len(existing_files)} docs file(s).")
-    if args.check_local_targets and not check_local_targets(local_links):
-        return 1
+    if args.check_local_targets:
+        valid = check_local_targets(local_links)
+        if invalid_mdbook_links:
+            print("Relative mdBook link target(s) outside docs/book/src:")
+            for source_path, target in invalid_mdbook_links:
+                print(f"  {source_path} -> {target}")
+            valid = False
+        if not valid:
+            return 1
     return 0
 
 
