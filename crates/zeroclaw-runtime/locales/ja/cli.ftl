@@ -669,7 +669,11 @@ cli-status-model = {"   "}モデル:         {$model}
 cli-status-observability = 📊 可観測性:  {$v}
 cli-status-trace-storage = 🧾 トレースストレージ:  {$mode} ({$path})
 cli-status-agents = 🛡️  エージェント:        {$v}
+cli-status-agent-risk-profile = {$alias}={$level}
+cli-status-agent-no-risk-profile-summary = {$alias}=<risk_profile なし>
 cli-status-runtime = ⚙️  ランタイム:       {$v}
+cli-status-web-ui-found = 🌐 Web UI:        検出 ({$path})
+cli-status-web-ui-missing = 🌐 Web UI:        未検出
 cli-status-heartbeat = 💓 ハートビート:      {$v}
 cli-status-heartbeat-every-minutes = {$minutes}分ごと
 cli-status-memory = 🧠 メモリ:         {$backend} (自動保存: {$auto_save})
@@ -697,6 +701,8 @@ cli-status-word-off = オフ
 cli-status-word-none = (なし)
 cli-status-word-configured = 設定済み
 cli-status-word-not-configured = 未設定
+cli-status-channel-configured = ✅ {$status}
+cli-status-channel-not-configured = ❌ {$status}
 cli-status-channel-not-compiled = 🚫 設定済み、未コンパイル
 cli-desktop-not-installed = ZeroClaw コンパニオンアプリがインストールされていません。
 cli-desktop-blurb1 = コンパニオンアプリは軽量なメニューバーアプリで、

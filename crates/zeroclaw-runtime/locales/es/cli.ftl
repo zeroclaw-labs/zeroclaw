@@ -669,7 +669,11 @@ cli-status-model = {"   "}Modelo:         {$model}
 cli-status-observability = 📊 Observabilidad:  {$v}
 cli-status-trace-storage = 🧾 Almacenamiento de trazas:  {$mode} ({$path})
 cli-status-agents = 🛡️  Agentes:        {$v}
+cli-status-agent-risk-profile = {$alias}={$level}
+cli-status-agent-no-risk-profile-summary = {$alias}=<sin risk_profile>
 cli-status-runtime = ⚙️  Entorno de ejecución:       {$v}
+cli-status-web-ui-found = 🌐 Web UI:        ENCONTRADO ({$path})
+cli-status-web-ui-missing = 🌐 Web UI:        FALTA
 cli-status-heartbeat = 💓 Latido:      {$v}
 cli-status-heartbeat-every-minutes = cada {$minutes}min
 cli-status-memory = 🧠 Memoria:         {$backend} (autoguardado: {$auto_save})
@@ -697,6 +701,8 @@ cli-status-word-off = desactivado
 cli-status-word-none = (ninguno)
 cli-status-word-configured = configurado
 cli-status-word-not-configured = no configurado
+cli-status-channel-configured = ✅ {$status}
+cli-status-channel-not-configured = ❌ {$status}
 cli-status-channel-not-compiled = 🚫 configurado, no compilado
 cli-desktop-not-installed = La aplicación complementaria de ZeroClaw no está instalada.
 cli-desktop-blurb1 = La aplicación complementaria es una ligera app de la barra de menú que
