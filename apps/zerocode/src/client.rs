@@ -474,6 +474,7 @@ impl std::error::Error for DaemonInitializeTimeout {}
 #[derive(Debug)]
 struct InitializeResponse {
     server_version: String,
+    server_pid: Option<u32>,
     tui_id: Option<String>,
     tui_sig: Option<String>,
 }
@@ -490,6 +491,10 @@ fn parse_initialize_response(resp: &Value) -> Result<InitializeResponse> {
 
     Ok(InitializeResponse {
         server_version,
+        server_pid: resp
+            .get("server_pid")
+            .and_then(Value::as_u64)
+            .and_then(|pid| u32::try_from(pid).ok()),
         tui_id: resp.get("tui_id").and_then(Value::as_str).map(String::from),
         tui_sig: resp
             .get("tui_sig")
@@ -574,6 +579,8 @@ pub struct RpcClient {
     _read_task: tokio::task::JoinHandle<()>,
     _router_task: tokio::task::JoinHandle<()>,
     pub server_version: String,
+    /// OS process ID reported by the daemon during initialize.
+    pub server_pid: Option<u32>,
     notifications_bcast: broadcast::Sender<RpcNotification>,
     /// Broadcast channel for server-initiated requests that expect a
     /// response (today: `elicitation/create`). The Chat widget for the
@@ -712,6 +719,7 @@ impl RpcClient {
             _read_task: read_task,
             _router_task: router_task,
             server_version: init.server_version,
+            server_pid: init.server_pid,
             notifications_bcast: notif_tx,
             inbound_requests_bcast: inbound_tx,
             connection_state: conn_state,
@@ -860,6 +868,7 @@ impl RpcClient {
             _read_task: read_task,
             _router_task: router_task,
             server_version: init.server_version,
+            server_pid: init.server_pid,
             notifications_bcast: notif_tx,
             inbound_requests_bcast: inbound_tx,
             connection_state: conn_state,
@@ -1689,6 +1698,7 @@ impl RpcClient {
             _read_task: tokio::spawn(async {}),
             _router_task: tokio::spawn(async {}),
             server_version: "test".to_string(),
+            server_pid: None,
             notifications_bcast: notif_tx,
             inbound_requests_bcast: inbound_tx,
             connection_state: Arc::new(Mutex::new(ConnectionState::Connected)),
@@ -1725,14 +1735,26 @@ mod initialize_version_tests {
     fn initialize_response_accepts_matching_server_version() {
         let parsed = parse_initialize_response(&json!({
             "server_version": env!("CARGO_PKG_VERSION"),
+            "server_pid": 42,
             "tui_id": "tui_1",
             "tui_sig": "sig_1"
         }))
         .unwrap();
 
         assert_eq!(parsed.server_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(parsed.server_pid, Some(42));
         assert_eq!(parsed.tui_id.as_deref(), Some("tui_1"));
         assert_eq!(parsed.tui_sig.as_deref(), Some("sig_1"));
+    }
+
+    #[test]
+    fn initialize_response_allows_missing_server_pid_for_compatibility() {
+        let parsed = parse_initialize_response(&json!({
+            "server_version": env!("CARGO_PKG_VERSION")
+        }))
+        .unwrap();
+
+        assert_eq!(parsed.server_pid, None);
     }
 
     #[test]

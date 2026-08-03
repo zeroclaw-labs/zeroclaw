@@ -983,8 +983,12 @@ impl LarkChannel {
         format!("{}/bot/v3/info", self.api_base())
     }
 
-    fn send_message_url(&self) -> String {
-        format!("{}/im/v1/messages?receive_id_type=chat_id", self.api_base())
+    fn send_message_url(&self, receive_id: &str) -> String {
+        format!(
+            "{}/im/v1/messages?receive_id_type={}",
+            self.api_base(),
+            lark_receive_id_type_for(receive_id)
+        )
     }
 
     /// PATCH endpoint for updating the content of a previously-sent message
@@ -2299,7 +2303,7 @@ impl LarkChannel {
             "msg_type": media.msg_type,
             "content": media.content.to_string(),
         });
-        let url = self.send_message_url();
+        let url = self.send_message_url(recipient);
         self.send_json_with_token_refresh(&url, token, &body, "media send")
             .await
     }
@@ -2571,7 +2575,7 @@ impl Channel for LarkChannel {
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let mut token = self.get_tenant_access_token().await?;
-        let url = self.send_message_url();
+        let url = self.send_message_url(&message.recipient);
         let (text_content, raw_markers) = super::util::parse_attachment_markers(&message.content);
         let markers = raw_markers
             .into_iter()
@@ -2856,10 +2860,10 @@ impl Channel for LarkChannel {
             build_approval_card(&approval_id, &request.tool_name, &request.arguments_summary);
 
         let token = self.get_tenant_access_token().await?;
-        let url = self.send_message_url();
+        let url = self.send_message_url(recipient);
         let body = serde_json::json!({
             "receive_id": recipient,
-            "receive_id_type": "chat_id",
+            "receive_id_type": lark_receive_id_type_for(recipient),
             "msg_type": "interactive",
             "content": serde_json::to_string(&card)?,
         });
@@ -2929,7 +2933,7 @@ impl Channel for LarkChannel {
             LARK_CARD_MARKDOWN_MAX_BYTES,
         );
         let body = build_interactive_card_body(&message.recipient, &placeholder);
-        let url = self.send_message_url();
+        let url = self.send_message_url(&message.recipient);
 
         let (status, response) = match self.patch_or_send_once(&url, &body, false).await {
             Ok(r) => r,
@@ -3041,7 +3045,7 @@ impl Channel for LarkChannel {
         self.patch_card_content(message_id, first).await?;
 
         if chunks.len() > 1 {
-            let url = self.send_message_url();
+            let url = self.send_message_url(recipient);
             for chunk in &chunks[1..] {
                 let body = build_interactive_card_body(recipient, chunk);
                 self.send_json_with_token_refresh(&url, &mut token, &body, "finalize_draft chunk")
@@ -3649,6 +3653,27 @@ fn lark_detect_image_mime(content_type: Option<&str>, bytes: &[u8]) -> Option<St
         .and_then(|ct| ct.split(';').next())
         .map(|ct| ct.trim().to_lowercase())
         .filter(|ct| ct.starts_with("image/"))
+}
+
+/// Pick the Lark `receive_id_type` query value from a recipient id's prefix.
+/// Lark's send API requires `receive_id_type` to match the id kind, else it
+/// rejects with error 230001 `invalid receive_id`. `oc_`→chat_id (group/DM
+/// chat), `ou_`→open_id (per-app user id), `on_`→union_id, an id containing
+/// `@`→email; anything else defaults to chat_id for back-compat with callers
+/// that pass a bare chat id. Lets the agent direct-send a member by open_id
+/// (from the roster) without first knowing their chat_id.
+fn lark_receive_id_type_for(receive_id: &str) -> &'static str {
+    if receive_id.starts_with("ou_") {
+        "open_id"
+    } else if receive_id.starts_with("on_") {
+        "union_id"
+    } else if receive_id.starts_with("oc_") {
+        "chat_id"
+    } else if receive_id.contains('@') {
+        "email"
+    } else {
+        "chat_id"
+    }
 }
 
 /// Check if a filename looks like a text file based on extension.
@@ -5773,7 +5798,10 @@ mod tests {
             .await
             .expect("unknown approval id should not error");
     }
-    async fn mount_lark_token_and_send_mocks(mock_server: &wiremock::MockServer) {
+    async fn mount_lark_token_and_send_mocks(
+        mock_server: &wiremock::MockServer,
+        receive_id_type: &'static str,
+    ) {
         use wiremock::matchers::{method, path, query_param};
         use wiremock::{Mock, ResponseTemplate};
 
@@ -5789,7 +5817,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/im/v1/messages"))
-            .and(query_param("receive_id_type", "chat_id"))
+            .and(query_param("receive_id_type", receive_id_type))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "code": 0,
                 "data": { "message_id": "om_test_message_id" }
@@ -5801,6 +5829,7 @@ mod tests {
 
     async fn assert_send_body_matches_recipient_and_text(
         mock_server: &wiremock::MockServer,
+        expected_receive_id_type: &str,
         expected_recipient: &str,
         expected_text: &str,
     ) {
@@ -5814,8 +5843,8 @@ mod tests {
             .expect("expected at least one POST /im/v1/messages");
         assert_eq!(
             send_request.url.query(),
-            Some("receive_id_type=chat_id"),
-            "send URL must carry receive_id_type=chat_id query param"
+            Some(format!("receive_id_type={expected_receive_id_type}").as_str()),
+            "send URL must carry the expected receive_id_type query param"
         );
         let body: serde_json::Value =
             serde_json::from_slice(&send_request.body).expect("send body should be valid JSON");
@@ -5841,7 +5870,7 @@ mod tests {
     #[tokio::test]
     async fn lark_send_via_from_config_emits_post_to_messages_endpoint() {
         let mock_server = wiremock::MockServer::start().await;
-        mount_lark_token_and_send_mocks(&mock_server).await;
+        mount_lark_token_and_send_mocks(&mock_server, "chat_id").await;
 
         let config = zeroclaw_config::schema::LarkConfig {
             enabled: true,
@@ -5867,6 +5896,7 @@ mod tests {
 
         assert_send_body_matches_recipient_and_text(
             &mock_server,
+            "chat_id",
             "oc_test_chat_id",
             "hi from cron",
         )
@@ -5876,7 +5906,7 @@ mod tests {
     #[tokio::test]
     async fn feishu_send_via_from_config_emits_post_to_messages_endpoint() {
         let mock_server = wiremock::MockServer::start().await;
-        mount_lark_token_and_send_mocks(&mock_server).await;
+        mount_lark_token_and_send_mocks(&mock_server, "chat_id").await;
 
         let config = zeroclaw_config::schema::LarkConfig {
             enabled: true,
@@ -5903,7 +5933,38 @@ mod tests {
 
         assert_send_body_matches_recipient_and_text(
             &mock_server,
+            "chat_id",
             "oc_test_chat_id",
+            "hi from cron",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn lark_send_uses_open_id_for_open_id_recipient() {
+        let mock_server = wiremock::MockServer::start().await;
+        mount_lark_token_and_send_mocks(&mock_server, "open_id").await;
+
+        let config = zeroclaw_config::schema::LarkConfig {
+            enabled: true,
+            use_feishu: false,
+            app_id: "cli_test_app_id".to_string(),
+            app_secret: "test_app_secret".to_string(),
+            approval_timeout_secs: 300,
+            ..Default::default()
+        };
+        let mut ch = LarkChannel::from_config(&config, "test_alias", resolver_from(vec![]));
+        ch.api_base_override = Some(mock_server.uri());
+
+        let message = SendMessage::new("hi from cron", "ou_test_user_id");
+        Channel::send(&ch, &message)
+            .await
+            .expect("Channel::send should succeed for an open_id recipient");
+
+        assert_send_body_matches_recipient_and_text(
+            &mock_server,
+            "open_id",
+            "ou_test_user_id",
             "hi from cron",
         )
         .await;
@@ -6678,5 +6739,17 @@ mod tests {
 
         drop(post_glance_mock);
         drop(delete_glance_mock);
+    }
+
+    #[test]
+    fn lark_receive_id_type_for_maps_by_prefix() {
+        // The bug this fixes: sending to an ou_ open_id under a hardcoded
+        // chat_id type made Lark reject with 230001 invalid receive_id.
+        assert_eq!(lark_receive_id_type_for("ou_89a84151d20fe403"), "open_id");
+        assert_eq!(lark_receive_id_type_for("oc_4b82b8d4c677107c"), "chat_id");
+        assert_eq!(lark_receive_id_type_for("on_uniontestid"), "union_id");
+        assert_eq!(lark_receive_id_type_for("alice@example.com"), "email");
+        // Bare/unknown ids keep the historical chat_id default.
+        assert_eq!(lark_receive_id_type_for("bare_chat_id"), "chat_id");
     }
 }

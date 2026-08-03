@@ -857,6 +857,11 @@ pub async fn handle_section_select(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "default".to_string());
 
+    // Held through the swap at the end of this handler so a concurrent
+    // config writer can't land between this read and the save below.
+    let _cfg_guard = std::sync::Arc::clone(&state.config_write_lock)
+        .lock_owned()
+        .await;
     let mut working = state.config.read().clone();
 
     use zeroclaw_config::sections::Section;
@@ -1261,6 +1266,7 @@ mod tests {
             std::sync::Arc::new(zeroclaw_memory::NoneMemory::new("none"));
         AppState {
             config: std::sync::Arc::new(parking_lot::RwLock::new(config)),
+            config_write_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             model_provider: std::sync::Arc::new(crate::UnconfiguredModelProvider),
             model: "test-model".to_string(),
             temperature: None,

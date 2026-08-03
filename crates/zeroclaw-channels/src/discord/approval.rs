@@ -72,14 +72,23 @@ impl ApprovalDecision {
         }
     }
 
-    /// Button face + style for this decision.
-    fn label_style(self) -> (&'static str, ButtonStyle) {
-        match self {
-            ApprovalDecision::AllowOnce => ("Allow once", ButtonStyle::Success),
-            ApprovalDecision::AllowSession => ("Allow this session", ButtonStyle::Primary),
-            ApprovalDecision::AllowAlways => ("Always allow", ButtonStyle::Secondary),
-            ApprovalDecision::Deny => ("Deny", ButtonStyle::Danger),
-        }
+    /// Button face + style for this decision. The face text is resolved
+    /// through the runtime Fluent catalogue; the `en` values are unchanged
+    /// ("Allow once" / "Allow this session" / "Always allow" / "Deny").
+    fn label_style(self) -> (String, ButtonStyle) {
+        let key = match self {
+            ApprovalDecision::AllowOnce => "channel-discord-approval-btn-allow-once",
+            ApprovalDecision::AllowSession => "channel-discord-approval-btn-allow-session",
+            ApprovalDecision::AllowAlways => "channel-discord-approval-btn-allow-always",
+            ApprovalDecision::Deny => "channel-approval-btn-deny",
+        };
+        let style = match self {
+            ApprovalDecision::AllowOnce => ButtonStyle::Success,
+            ApprovalDecision::AllowSession => ButtonStyle::Primary,
+            ApprovalDecision::AllowAlways => ButtonStyle::Secondary,
+            ApprovalDecision::Deny => ButtonStyle::Danger,
+        };
+        (zeroclaw_runtime::i18n::get_required_cli_string(key), style)
     }
 }
 

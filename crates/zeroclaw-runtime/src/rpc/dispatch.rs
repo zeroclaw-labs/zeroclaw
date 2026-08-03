@@ -914,6 +914,7 @@ impl RpcDispatcher {
         to_result(InitializeResult {
             protocol_version: RPC_PROTOCOL_VERSION,
             server_version: env!("CARGO_PKG_VERSION").to_string(),
+            server_pid: std::process::id(),
             tui_id: Some(tui_id),
             tui_sig,
             capabilities,
@@ -6786,6 +6787,7 @@ mod tests {
         let r = InitializeResult {
             protocol_version: 1,
             server_version: "0.1.0".into(),
+            server_pid: 42,
             tui_id: None,
             tui_sig: None,
             capabilities: vec![],
@@ -6793,6 +6795,7 @@ mod tests {
         let val = to_result(r).unwrap();
         assert_eq!(val["protocol_version"], 1);
         assert_eq!(val["server_version"], "0.1.0");
+        assert_eq!(val["server_pid"], 42);
     }
 
     #[test]

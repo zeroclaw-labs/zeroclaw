@@ -813,6 +813,8 @@ channel-runtime-model-empty = El ID del modelo no puede estar vacío. Usa `/mode
 channel-runtime-model-switched = Modelo cambiado a `{ $model }` (model_provider: `{ $provider }`). Contexto conservado.
 channel-runtime-agent-scope-rejected = El remitente `{ $sender }` no está autorizado para `/model --agent` en el agente `{ $agent }`. Usa `/model --user { $model }` para una anulación solo de la sesión, o pide a un administrador que marque un grupo de pares con `admin_for_agent_scope = true` contigo como miembro.
 channel-runtime-request-timeout = ⚠️ La solicitud agotó el tiempo de espera mientras se esperaba al modelo. Inténtalo de nuevo.
+channel-runtime-no-reply-refused = 🚫 No puedo ayudarte con esa solicitud.
+channel-runtime-no-reply-failed = ⚠️ No pude completar esa solicitud.
 channel-runtime-current-model-status =
     model_provider actual: `{ $provider }`
     Modelo actual: `{ $model }`
@@ -940,3 +942,34 @@ sop-rpc-decision-invalid-state = La ejecución {$run_id} no se puede resolver en
 sop-rpc-decision-unauthorized = La identidad RPC no está autorizada para resolver este paso de SOP.
 sop-rpc-policy-missing = La política de aprobación de SOP '{$name}' no está configurada.
 sop-rpc-policy-unavailable = La política del SOP en espera no está disponible: {$reason}.
+
+# ── Tool approval (channels, #9409) ──
+# Human-visible copy for the operator-facing tool-approval prompt, shared
+# across the button adapters (Telegram, Discord, Slack) and the text-reply
+# adapters (Matrix, Signal, WhatsApp, Slack polling fallback). Approval
+# TOKENS, `callback_data`/`custom_id`/`action_id` values, and the reply
+# KEYWORDS parsed by `util::parse_approval_reply` (yes/y/approve, no/n/deny,
+# always) stay hardcoded ASCII in Rust — only the surrounding prose is
+# localized here.
+channel-approval-heading = Se requiere aprobación de la herramienta
+channel-approval-heading-shout = APROBACIÓN REQUERIDA
+channel-approval-tool-label = Herramienta
+channel-approval-args-label = Argumentos
+channel-approval-btn-approve = Aprobar
+channel-approval-btn-deny = Denegar
+channel-approval-btn-always = Siempre
+channel-approval-tap-instruction = Toca un botón a continuación:
+channel-approval-reply-instruction-yesno = Responde: "{ $yes_command }", "{ $no_command }" o "{ $always_command }"
+channel-approval-reply-instruction-approve-deny = Responde con `{ $approve_command }` / `{ $deny_command }` / `{ $always_command }`.
+channel-telegram-approval-ack-approved = Aprobado
+channel-telegram-approval-ack-always-approved = Siempre aprobado
+channel-telegram-approval-ack-denied = Denegado
+channel-telegram-approval-ack-unknown = Acción desconocida
+channel-discord-approval-btn-allow-once = Permitir una vez
+channel-discord-approval-btn-allow-session = Permitir esta sesión
+channel-discord-approval-btn-allow-always = Permitir siempre
+channel-approval-title = ¿Aprobar { $tool }?
+channel-approval-opt-allow-once = Permitir una vez
+channel-approval-opt-allow-always = Permitir siempre
+channel-approval-opt-reject = Rechazar
+channel-approval-opt-reject-with-edit = Rechazar con edición

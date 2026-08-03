@@ -344,6 +344,14 @@ pub(crate) fn new_approval_token() -> String {
         .collect()
 }
 
+pub(crate) const APPROVAL_REPLY_YES: &str = "yes";
+pub(crate) const APPROVAL_REPLY_YES_SHORT: &str = "y";
+pub(crate) const APPROVAL_REPLY_APPROVE: &str = "approve";
+pub(crate) const APPROVAL_REPLY_NO: &str = "no";
+pub(crate) const APPROVAL_REPLY_NO_SHORT: &str = "n";
+pub(crate) const APPROVAL_REPLY_DENY: &str = "deny";
+pub(crate) const APPROVAL_REPLY_ALWAYS: &str = "always";
+
 pub fn parse_approval_reply(
     text: &str,
 ) -> Option<(String, zeroclaw_api::channel::ChannelApprovalResponse)> {
@@ -356,12 +364,82 @@ pub fn parse_approval_reply(
     }
     let action_word = parts.next()?.split_whitespace().next()?;
     let response = match action_word {
-        "yes" | "y" | "approve" => ChannelApprovalResponse::Approve,
-        "no" | "n" | "deny" => ChannelApprovalResponse::Deny,
-        "always" => ChannelApprovalResponse::AlwaysApprove,
+        APPROVAL_REPLY_YES | APPROVAL_REPLY_YES_SHORT | APPROVAL_REPLY_APPROVE => {
+            ChannelApprovalResponse::Approve
+        }
+        APPROVAL_REPLY_NO | APPROVAL_REPLY_NO_SHORT | APPROVAL_REPLY_DENY => {
+            ChannelApprovalResponse::Deny
+        }
+        APPROVAL_REPLY_ALWAYS => ChannelApprovalResponse::AlwaysApprove,
         _ => return None,
     };
     Some((token, response))
+}
+
+/// Localized text-reply approval prompt using yes/no/always reply keywords:
+/// Discord's plaintext fallback, Signal, WhatsApp, and Slack's polling-mode
+/// fallback all send this exact shape. The heading/labels/instruction come
+/// from the runtime Fluent catalogue; `token`/`tool_name`/`arguments_summary`
+/// are protocol-exact values echoed verbatim — never localized — so a locale
+/// switch cannot desync the prompt from [`parse_approval_reply`].
+#[cfg(any(
+    feature = "channel-discord",
+    feature = "channel-signal",
+    feature = "channel-slack",
+    feature = "channel-whatsapp-cloud",
+    feature = "whatsapp-web",
+    test
+))]
+pub(crate) fn build_yesno_approval_prompt(
+    token: &str,
+    tool_name: &str,
+    arguments_summary: &str,
+) -> String {
+    let heading = zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-heading-shout");
+    let tool_label = zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-tool-label");
+    let args_label = zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-args-label");
+    let yes_command = format!("{token} {APPROVAL_REPLY_YES}");
+    let no_command = format!("{token} {APPROVAL_REPLY_NO}");
+    let always_command = format!("{token} {APPROVAL_REPLY_ALWAYS}");
+    let reply = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+        "channel-approval-reply-instruction-yesno",
+        &[
+            ("yes_command", yes_command.as_str()),
+            ("no_command", no_command.as_str()),
+            ("always_command", always_command.as_str()),
+        ],
+    );
+    format!(
+        "{heading} [{token}]\n{tool_label}: {tool_name}\n{args_label}: {arguments_summary}\n\n{reply}"
+    )
+}
+
+/// Localized text-reply approval prompt using approve/deny/always reply
+/// keywords: Matrix's own reply parser (distinct from
+/// [`parse_approval_reply`]) expects this shape.
+#[cfg(any(feature = "channel-matrix", test))]
+pub(crate) fn build_approve_deny_approval_prompt(
+    token: &str,
+    tool_name: &str,
+    arguments_summary: &str,
+) -> String {
+    let heading = zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-heading-shout");
+    let tool_label = zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-tool-label");
+    let args_label = zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-args-label");
+    let approve_command = format!("{token} {APPROVAL_REPLY_APPROVE}");
+    let deny_command = format!("{token} {APPROVAL_REPLY_DENY}");
+    let always_command = format!("{token} {APPROVAL_REPLY_ALWAYS}");
+    let reply = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+        "channel-approval-reply-instruction-approve-deny",
+        &[
+            ("approve_command", approve_command.as_str()),
+            ("deny_command", deny_command.as_str()),
+            ("always_command", always_command.as_str()),
+        ],
+    );
+    format!(
+        "{heading} [{token}]\n{tool_label}: {tool_name}\n{args_label}: {arguments_summary}\n\n{reply}"
+    )
 }
 
 /// Generate a conversation history key from a channel message.
@@ -629,6 +707,129 @@ mod tests {
                 super::parse_approval_reply(input).is_none(),
                 "expected None for input {:?}",
                 input
+            );
+        }
+    }
+
+    #[test]
+    fn yesno_approval_prompt_keywords_still_parse_via_parse_approval_reply() {
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+
+        // Localization must not desync the prompt text from
+        // `parse_approval_reply`: whatever locale is active, the reply
+        // keywords embedded in the prompt prose must remain the literal
+        // ASCII words the parser expects. Exercises the exact prompt shared
+        // by Discord's plaintext fallback, Signal, WhatsApp, and Slack's
+        // polling-mode fallback.
+        let token = "ab12cd";
+        let prompt = super::build_yesno_approval_prompt(token, "shell", "ls -la");
+        assert!(
+            prompt.contains(token),
+            "prompt should echo the token verbatim; got {prompt:?}"
+        );
+        assert!(
+            prompt.contains("shell") && prompt.contains("ls -la"),
+            "prompt should echo the tool name and args verbatim; got {prompt:?}"
+        );
+
+        for (word, expected) in [
+            ("yes", ChannelApprovalResponse::Approve),
+            ("no", ChannelApprovalResponse::Deny),
+            ("always", ChannelApprovalResponse::AlwaysApprove),
+        ] {
+            let reply = format!("{token} {word}");
+            assert!(
+                prompt.contains(&reply),
+                "prompt should show the exact reply {reply:?}; got {prompt:?}"
+            );
+            let (parsed_token, response) = super::parse_approval_reply(&reply)
+                .unwrap_or_else(|| panic!("{reply:?} should parse"));
+            assert_eq!(parsed_token, token);
+            assert_eq!(response, expected);
+        }
+    }
+
+    #[test]
+    fn approve_deny_approval_prompt_matches_matrix_own_parser_keywords() {
+        // Same desync guard as above, for Matrix's `approve`/`deny`/`always`
+        // reply shape (Matrix uses its own parser, not
+        // `parse_approval_reply`, but the keyword contract is identical).
+        let token = "AB12CD34";
+        let prompt = super::build_approve_deny_approval_prompt(token, "shell", "ls -la");
+        assert!(prompt.contains(token));
+        for word in ["approve", "deny", "always"] {
+            let reply = format!("{token} {word}");
+            assert!(
+                prompt.contains(&reply),
+                "prompt should show the exact reply {reply:?}; got {prompt:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn literal_approval_keys_in_listed_adapter_sources_resolve() {
+        // Heuristic smoke guard for literal Fluent keys in the current
+        // adapter list. It complements, but does not replace, compile-time
+        // feature coverage or the explicit catalogue-key tests.
+        // `include_str!` embeds each source at compile time regardless of its
+        // `#[cfg(feature = ...)]`, so this always-compiled test can catch
+        // literal-key typos in feature-gated sources.
+        const SOURCES: &[&str] = &[
+            include_str!("telegram.rs"),
+            include_str!("discord/mod.rs"),
+            include_str!("discord/approval.rs"),
+            include_str!("slack.rs"),
+            include_str!("matrix.rs"),
+            include_str!("signal.rs"),
+            include_str!("whatsapp.rs"),
+            include_str!("acp_channel.rs"),
+            include_str!("util.rs"),
+        ];
+        let mut keys = std::collections::BTreeSet::new();
+        for src in SOURCES {
+            // Capture the quoted first argument of every runtime lookup call
+            // (`get_required_cli_string` also prefixes the `_with_args`
+            // form), keeping only approval keys.
+            for (idx, _) in src.match_indices("get_required_cli_string") {
+                let rest = &src[idx..];
+                let Some(open) = rest.find('"') else {
+                    continue;
+                };
+                let after = &rest[open + 1..];
+                let Some(close) = after.find('"') else {
+                    continue;
+                };
+                let key = &after[..close];
+                if key.starts_with("channel-") && key.contains("approval") {
+                    keys.insert(key.to_string());
+                }
+            }
+        }
+        assert!(
+            keys.len() >= 18,
+            "expected to scan the shared approval keys across adapters; found only {} ({keys:?}) — the scanner is likely broken",
+            keys.len()
+        );
+        for key in &keys {
+            // Supply dummy values for every arg any approval key might take.
+            // Fluent ignores args a message doesn't reference, so no-arg keys
+            // still resolve; arg-requiring messages resolved with no args
+            // would otherwise fail to format and false-positive here.
+            let resolved = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                key,
+                &[
+                    ("tool", "TOOL"),
+                    ("yes_command", "TKN yes"),
+                    ("no_command", "TKN no"),
+                    ("approve_command", "TKN approve"),
+                    ("deny_command", "TKN deny"),
+                    ("always_command", "TKN always"),
+                ],
+            );
+            assert_ne!(
+                resolved,
+                format!("{{{key}}}"),
+                "adapter source references Fluent key {key:?}, but it resolves to the missing-string sentinel (undefined or typo'd)"
             );
         }
     }
