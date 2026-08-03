@@ -25,6 +25,12 @@ struct ModelEntry {
     cost: Option<ModelCost>,
     #[serde(default)]
     limit: Option<ModelLimit>,
+    /// models.dev `modalities` block. Carries the per-model `input` and
+    /// `output` modality lists (e.g. `input: ["text", "image"]`). Previously
+    /// dropped during deserialization; per-model vision support is now
+    /// resolved through this field.
+    #[serde(default)]
+    modalities: Option<Modalities>,
 }
 
 /// models.dev `cost` block: USD per 1M tokens (the same unit ZeroClaw's rate
@@ -45,6 +51,28 @@ struct ModelCost {
 struct ModelLimit {
     #[serde(default)]
     context: Option<u64>,
+}
+
+/// models.dev `modalities` block — only the `input` dimension is consumed
+/// today. Membership of `"image"` in `input` is what callers use to decide
+/// whether a model can accept vision attachments; `output` (and any future
+/// modality vectors we do not yet read) are tolerated by `serde` defaults
+/// rather than deserialized into named fields.
+#[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
+struct Modalities {
+    #[serde(default)]
+    input: Vec<String>,
+}
+
+impl Modalities {
+    /// Whether this model advertises image input support. Conservative: only
+    /// an explicit `"image"` token in `input` flips it on. Malformed
+    /// catalog entries (missing `modalities` or empty `input`) yield
+    /// `false`; callers fall back to the family default in that case.
+    #[allow(dead_code)] // TODO: wire into provider.capabilities() and orchestrator supports_vision() call site (follow-up work)
+    fn supports_image_input(&self) -> bool {
+        self.input.iter().any(|m| m == "image")
+    }
 }
 
 pub(crate) type Catalog = HashMap<String, ProviderEntry>;
@@ -91,6 +119,17 @@ pub(crate) fn filter_models(catalog: &Catalog, provider_key: &str) -> Result<Vec
     Ok(ids)
 }
 
+/// Look up model IDs for a model_provider, keyed by `models.dev`'s model_provider name.
+///
+/// First call fetches the catalog; subsequent calls hit the cache. The
+/// returned list is sorted for stable menu rendering.
+///
+/// Attribution: the models.dev catalog is a global, pre-authentication
+/// metadata source with no concrete `Attributable` thing of its own.
+/// We wrap the body with `scope!(model_provider_type: "models_dev",
+/// model_provider_alias: "catalog", …)` so the `filter_models` warning
+/// (and any future record! inside `fetch_catalog`) lands with the
+/// model_provider_type and model_provider_alias slots populated.
 pub async fn list_models_for(provider_key: &str) -> Result<Vec<String>> {
     ::zeroclaw_log::scope!(
         model_provider_type: "models_dev",
@@ -128,6 +167,11 @@ pub async fn list_models_with_context_for(
     .await
 }
 
+/// Per-model pricing for one model_provider from a parsed catalog, as a
+/// `model_id -> ModelRates` map. Models with no `cost` block are omitted;
+/// like `rates_catalog`, this emptiness filter is load-bearing for downstream
+/// consumers. Pure, unit-testable without the network. Rates are USD per 1M
+/// tokens verbatim (no conversion).
 pub(crate) fn pricing_from_catalog(
     catalog: &Catalog,
     provider_key: &str,
@@ -187,6 +231,29 @@ pub(crate) fn context_windows_from_catalog(
         }
     }
     out
+}
+
+/// Per-model vision support resolved from the parsed catalog.
+///
+/// Returns `Some(true)` when the model is in the catalog and its
+/// `modalities.input` lists `"image"`. Returns `Some(false)` when the model
+/// is in the catalog but does not advertise image input. Returns `None`
+/// when the model isn't in the catalog, the provider key isn't, or the
+/// catalog entry has no `modalities` block at all — callers should fall
+/// back to the family default in that case.
+///
+/// Pure / sync / no network. This is the parser half of the modalities work;
+/// wiring the result into `provider.capabilities()` and the orchestrator
+/// `supports_vision()` call site is a separate follow-up change.
+#[allow(dead_code)] // TODO: wire into provider.capabilities() and orchestrator supports_vision() call site (follow-up work)
+pub(crate) fn model_supports_vision(
+    catalog: &Catalog,
+    provider_key: &str,
+    model_id: &str,
+) -> Option<bool> {
+    let entry = catalog.get(provider_key)?;
+    let model = entry.models.get(model_id)?;
+    Some(model.modalities.as_ref()?.supports_image_input())
 }
 
 #[cfg(test)]
@@ -329,6 +396,95 @@ mod tests {
         assert_eq!(
             context_windows_from_catalog(&catalog, "p").get("m"),
             Some(&4096)
+        );
+    }
+
+    #[test]
+    fn model_supports_vision_reads_modalities_input_image() {
+        // models.dev `modalities.input` advertises "image" for vision models
+        // and is absent for text-only models. The helper must read that field
+        // and return Some(bool) for cataloged models.
+        let raw = r#"{
+            "xai": {
+                "models": {
+                    "grok-2-vision": {"id": "grok-2-vision",
+                                      "modalities": {"input": ["text", "image"], "output": ["text"]}},
+                    "grok-4.3":     {"id": "grok-4.3",
+                                      "modalities": {"input": ["text"], "output": ["text"]}}
+                }
+            }
+        }"#;
+        let catalog = parse_catalog(raw.as_bytes()).unwrap();
+        assert_eq!(
+            model_supports_vision(&catalog, "xai", "grok-2-vision"),
+            Some(true)
+        );
+        assert_eq!(
+            model_supports_vision(&catalog, "xai", "grok-4.3"),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn model_supports_vision_returns_none_for_missing_modalities_block() {
+        // Old-shape entries (no `modalities` block) must yield None, not
+        // false — callers fall back to the family default in that case.
+        let raw = r#"{
+            "xai": {
+                "models": {
+                    "grok-4.3": {"id": "grok-4.3"}
+                }
+            }
+        }"#;
+        let catalog = parse_catalog(raw.as_bytes()).unwrap();
+        assert_eq!(model_supports_vision(&catalog, "xai", "grok-4.3"), None);
+    }
+
+    #[test]
+    fn model_supports_vision_returns_none_for_unknown_provider_or_model() {
+        let raw = r#"{
+            "xai": {
+                "models": {
+                    "grok-2-vision": {"id": "grok-2-vision",
+                                      "modalities": {"input": ["text", "image"], "output": ["text"]}}
+                }
+            }
+        }"#;
+        let catalog = parse_catalog(raw.as_bytes()).unwrap();
+        // Unknown model id within a known provider.
+        assert_eq!(model_supports_vision(&catalog, "xai", "grok-99"), None);
+        // Unknown provider key.
+        assert_eq!(
+            model_supports_vision(&catalog, "absent", "grok-2-vision"),
+            None
+        );
+    }
+
+    #[test]
+    fn model_supports_vision_does_not_match_non_image_modality_aliases() {
+        // Defensive: only an exact "image" token in `input` flips vision on.
+        // "images" (plural) and "image_url" (a wire-format alias used in
+        // OpenAI's request shape) must NOT count — they are not what
+        // models.dev emits and a future schema drift should surface as a
+        // false negative, not a silent true.
+        let raw = r#"{
+            "fake": {
+                "models": {
+                    "alias-1": {"id": "alias-1",
+                                "modalities": {"input": ["text", "images"], "output": ["text"]}},
+                    "alias-2": {"id": "alias-2",
+                                "modalities": {"input": ["text", "image_url"], "output": ["text"]}}
+                }
+            }
+        }"#;
+        let catalog = parse_catalog(raw.as_bytes()).unwrap();
+        assert_eq!(
+            model_supports_vision(&catalog, "fake", "alias-1"),
+            Some(false)
+        );
+        assert_eq!(
+            model_supports_vision(&catalog, "fake", "alias-2"),
+            Some(false)
         );
     }
 }
