@@ -1394,7 +1394,8 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            err.to_string().contains("Failed to read edge-tts output file"),
+            err.to_string()
+                .contains("Failed to read edge-tts output file"),
             "expected output-read failure, got: {err}"
         );
         assert_eq!(
