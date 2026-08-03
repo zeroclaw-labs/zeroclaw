@@ -32,7 +32,10 @@ name: build-and-deploy
 
 on:
   push:
-    branches: [master, 'feat/**', 'fix/**']
+    # `stable-track-*` is the production layer: our commits rebased onto an
+    # upstream *tag*, never onto rolling master. Feature branches build too so a
+    # change is validated before it joins the layer.
+    branches: ['stable-track-*', 'feat/**', 'fix/**']
     paths:
       - 'crates/**'
       - 'src/**'
