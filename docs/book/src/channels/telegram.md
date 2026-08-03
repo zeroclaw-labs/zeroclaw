@@ -125,6 +125,52 @@ channel instance. This includes a wildcard peer group.
 > public bot with a suitably restricted agent; it is not a shortcut for private
 > setup.
 
+## Restricting which groups use the bot without pairing (`allowed_groups`)
+
+`allowed_groups` under `[channels.telegram.<alias>]` authorizes every member
+of a listed group to use the bot without individual pairing. Entries are
+Telegram chat IDs as numeric strings (e.g. `"-1001234567890"` for a
+supergroup). A wildcard `"*"` allows any group where the bot is present.
+
+```toml
+[channels.telegram.home]
+allowed_groups = ["-1001234567890", "-1009876543210"]
+```
+
+### Interaction with peer groups
+
+`allowed_groups` and peer-group `external_peers` are independent authorization
+sources. A sender passes the authorization check if they match either source.
+Any non-empty resolved external-peer set disables the one-time pairing flow for
+that channel instance.
+
+> [!CAUTION]
+> Each entry in `allowed_groups` grants every member of that group full access
+> to drive the agent and any tools its risk profile permits. The wildcard
+> `"*"` extends this grant to every group the bot is in. Use exact group IDs
+> or restrict the agent's tool set accordingly; this is not a shortcut for
+> private setup.
+
+### Interaction with `mention_only`
+
+When `mention_only` is true, the bot still requires a direct mention
+(`@bot_username`) or a reply to the bot's own message before responding,
+**even from authorized groups**. `allowed_groups` bypasses peer authorization
+and pairing, but not the mention gate. This keeps the bot quiet in busy
+shared group chats while still accepting authorized group members who
+explicitly address it.
+
+### Reload behavior
+
+`allowed_groups` is resolved live from the shared config on each message.
+Changes take effect immediately without restart: there is no construction-time
+snapshot.
+
+### Naming convention
+
+Telegram uses `allowed_groups`, matching the WhatsApp and WeCom channels. All
+three channels accept group chat IDs as a list of strings.
+
 ## 4. Start the channel and inspect it
 
 Use the full daemon for normal operation, the channel-only process for a

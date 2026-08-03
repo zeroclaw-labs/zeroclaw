@@ -2467,6 +2467,7 @@ mod tests {
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,
                 debounce_ms: None,
+                allowed_groups: vec![],
             },
         );
         assert!(has_supervised_channels(&config));
@@ -2710,6 +2711,7 @@ mod tests {
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,
                 debounce_ms: None,
+                allowed_groups: vec![],
             },
         );
 
@@ -2739,6 +2741,7 @@ mod tests {
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,
                 debounce_ms: None,
+                allowed_groups: vec![],
             },
         );
         // Inbound peer authorization lives in peer_groups in V3.
