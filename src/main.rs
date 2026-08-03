@@ -4131,6 +4131,19 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 Box::new(zeroclaw_channels::cli::CliChannel::new("cli"))
             }));
 
+            // Claim the workspace before any subsystem opens state inside it.
+            // Crash recovery treats a different boot_id as proof the previous
+            // owner is gone, so a second daemon reaps this one's live tasks;
+            // on a paired messaging channel, two processes opening the session
+            // store concurrently gets the device revoked.
+            //
+            // Taken once, outside the reload loop below: a reload rebuilds the
+            // in-process subsystems but the process — and therefore its claim
+            // on the workspace — is continuous. Released by the kernel when
+            // this process exits, however it exits.
+            let _workspace =
+                zeroclaw_runtime::workspace_lock::WorkspaceLock::acquire(&config.data_dir)?;
+
             // Wire peripheral tools from zeroclaw-hardware
             #[cfg(feature = "hardware")]
             zeroclaw_runtime::agent::loop_::register_peripheral_tools_fn(Box::new(|config| {
@@ -4927,6 +4940,14 @@ async fn async_main(command: clap::Command) -> Result<()> {
 
         Commands::Channel { channel_command } => match channel_command {
             ChannelCommands::Start => {
+                // Claim the workspace before opening anything inside it. A
+                // second process sharing this data_dir reaps the first one's
+                // live tasks and, on a paired messaging channel, gets the
+                // device revoked by opening the session store concurrently.
+                // Held for the lifetime of this command; released by the
+                // kernel when the process exits, however it exits.
+                let _workspace =
+                    zeroclaw_runtime::workspace_lock::WorkspaceLock::acquire(&config.data_dir)?;
                 #[cfg(feature = "hardware")]
                 zeroclaw_runtime::agent::loop_::register_peripheral_tools_fn(Box::new(|config| {
                     Box::pin(async move {
