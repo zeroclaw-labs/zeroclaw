@@ -246,8 +246,9 @@ async fn enforce_reported_budget(
     if context_token_budget == 0 || reported_input_tokens <= context_token_budget {
         return;
     }
+    let pre_trim_estimated = crate::agent::history::estimate_history_tokens(history);
     let taken = std::mem::take(history);
-    let result = crate::agent::history_trim::trim_to_reported_budget(
+    let mut result = crate::agent::history_trim::trim_to_reported_budget(
         taken,
         context_token_budget,
         reported_input_tokens,
@@ -255,6 +256,13 @@ async fn enforce_reported_budget(
     if result.trimmed {
         let mut trimmed = result.history;
         crate::agent::history_trim::insert_breadcrumb_deduped(&mut trimmed);
+        // Recompute the calibrated post-trim count from the final provider
+        // history (breadcrumb included) so `tokens_after` describes exactly
+        // what is sent, not the pre-breadcrumb kept set.
+        let ratio = reported_input_tokens as f64 / pre_trim_estimated.max(1) as f64;
+        result.tokens_after = (crate::agent::history::estimate_history_tokens(&trimmed) as f64
+            * ratio)
+            .round() as usize;
         *history = trimmed;
         if let Some(tx) = event_tx {
             let _ = tx
@@ -373,7 +381,9 @@ impl<'a> TurnState<'a> {
     /// Trim history to the given token budget, writing the result back
     /// into `self.history`.  Returns the trim metadata so the caller can
     /// emit log/observer events (the returned `history` field is empty —
-    /// it was consumed by the assignment to `self.history`).
+    /// it was consumed by the assignment to `self.history`). `tokens_after`
+    /// is recomputed from the final history so it includes the model-visible
+    /// breadcrumb and matches exactly what is sent to the provider.
     fn trim_to_budget(
         &mut self,
         context_token_budget: usize,
@@ -384,6 +394,7 @@ impl<'a> TurnState<'a> {
         let mut history = std::mem::take(&mut result.history);
         if result.trimmed {
             crate::agent::history_trim::insert_breadcrumb_deduped(&mut history);
+            result.tokens_after = crate::agent::history::estimate_history_tokens(&history);
         }
         *self.history = history;
         result
@@ -2611,6 +2622,91 @@ mod reported_budget_tests {
         enforce_reported_budget(&mut history, usize::MAX, 0, None, &NoopObserver).await;
         let after: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
         assert_eq!(after, before, "zero budget disables enforcement");
+    }
+
+    #[tokio::test]
+    async fn enforce_reports_tokens_after_matching_final_history() {
+        let mut history = big_history();
+        let estimated = crate::agent::history::estimate_history_tokens(&history);
+        let reported = estimated * 4;
+        let budget = reported / 2;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        enforce_reported_budget(&mut history, reported, budget, Some(&tx), &NoopObserver).await;
+
+        let event = rx
+            .recv()
+            .await
+            .expect("a trim must emit a HistoryTrimmed event");
+        let tokens_after = match event {
+            TurnEvent::HistoryTrimmed { tokens_after, .. } => {
+                tokens_after.expect("reported-budget trim must carry token accounting")
+            }
+            other => panic!("expected HistoryTrimmed, got {other:?}"),
+        };
+
+        // The breadcrumb must be part of the final provider history, and the
+        // emitted calibrated count must be computed from that final history.
+        let crumb = crate::agent::history_trim::breadcrumb();
+        assert!(
+            history
+                .iter()
+                .any(|m| m.content == crumb.content && m.role == crumb.role),
+            "final history must include the model-visible breadcrumb"
+        );
+        let ratio = reported as f64 / estimated.max(1) as f64;
+        let expected = (crate::agent::history::estimate_history_tokens(&history) as f64 * ratio)
+            .round() as u64;
+        assert_eq!(
+            tokens_after, expected,
+            "tokens_after must reflect the final provider history (breadcrumb included)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod trim_budget_tests {
+    use super::*;
+
+    fn boundary_history() -> Vec<ChatMessage> {
+        let big = "x".repeat(1000);
+        vec![
+            ChatMessage::system("s"),
+            ChatMessage::user(format!("old {big}")),
+            ChatMessage::assistant("old answer"),
+            ChatMessage::user("new"),
+            ChatMessage::assistant("ok"),
+        ]
+    }
+
+    #[test]
+    fn trim_to_budget_tokens_after_includes_breadcrumb() {
+        // System (5) + newest turn (10) fit the 20-token budget, but adding
+        // the model-visible breadcrumb (~17) pushes the final history over it.
+        let mut history = boundary_history();
+        let budget = 20;
+        let mut state = TurnState {
+            history: &mut history,
+            canonical: None,
+            synced: 0,
+        };
+        let result = state.trim_to_budget(budget);
+        assert!(result.trimmed, "budget must force a trim");
+        let final_tokens = crate::agent::history::estimate_history_tokens(&history);
+        assert_eq!(
+            result.tokens_after, final_tokens,
+            "tokens_after must describe the final provider history (breadcrumb included)"
+        );
+        assert!(
+            result.tokens_after > budget,
+            "the breadcrumb itself must push the kept history over budget ({final_tokens} > {budget})"
+        );
+        let crumb = crate::agent::history_trim::breadcrumb();
+        assert!(
+            history
+                .iter()
+                .any(|m| m.content == crumb.content && m.role == crumb.role),
+            "final history must include the model-visible breadcrumb"
+        );
     }
 }
 
