@@ -270,3 +270,261 @@ impl StreamThinkTagStripper {
         std::mem::take(&mut self.pending)
     }
 }
+
+#[cfg(test)]
+mod terminal_marker_stripper_tests {
+    use super::StreamTerminalMarkerStripper;
+
+    #[test]
+    fn strips_single_marker_at_end() {
+        let mut stripper = StreamTerminalMarkerStripper::new();
+        assert_eq!(stripper.push("Summary<eom>"), "");
+        assert_eq!(stripper.finish(), "Summary");
+    }
+
+    #[test]
+    fn strips_pipe_eom_marker_at_end() {
+        let mut stripper = StreamTerminalMarkerStripper::new();
+        assert_eq!(stripper.push("Summary<|eom|>"), "");
+        assert_eq!(stripper.finish(), "Summary");
+    }
+
+    #[test]
+    fn strips_stacked_markers_at_end() {
+        let mut stripper = StreamTerminalMarkerStripper::new();
+        assert_eq!(stripper.push("Summary<eom><|eom|>"), "");
+        assert_eq!(stripper.finish(), "Summary");
+    }
+
+    #[test]
+    fn preserves_inline_marker_with_text_after() {
+        let mut stripper = StreamTerminalMarkerStripper::new();
+        assert_eq!(
+            stripper.push("Text <eom> more text"),
+            "Text <eom> more text"
+        );
+        assert_eq!(stripper.finish(), "");
+    }
+
+    #[test]
+    fn handles_marker_split_across_chunks() {
+        let mut stripper = StreamTerminalMarkerStripper::new();
+        assert_eq!(stripper.push("Summary<"), "");
+        assert_eq!(stripper.push("eom>"), "");
+        assert_eq!(stripper.finish(), "Summary");
+    }
+
+    #[test]
+    fn handles_pipe_marker_split_across_chunks() {
+        let mut stripper = StreamTerminalMarkerStripper::new();
+        assert_eq!(stripper.push("Summary<|"), "");
+        assert_eq!(stripper.push("eom|>"), "");
+        assert_eq!(stripper.finish(), "Summary");
+    }
+
+    #[test]
+    fn handles_stacked_markers_split_across_chunks() {
+        let mut stripper = StreamTerminalMarkerStripper::new();
+        assert_eq!(stripper.push("Summary<eom>"), "");
+        assert_eq!(stripper.push("<|"), "");
+        assert_eq!(stripper.push("eom|>"), "");
+        assert_eq!(stripper.finish(), "Summary");
+    }
+
+    #[test]
+    fn preserves_inline_marker_then_strips_terminal() {
+        let mut stripper = StreamTerminalMarkerStripper::new();
+        assert_eq!(stripper.push("Text <eom> inline<eom>"), "Text <eom> inline");
+        assert_eq!(stripper.finish(), "");
+    }
+
+    #[test]
+    fn handles_whitespace_after_marker() {
+        let mut stripper = StreamTerminalMarkerStripper::new();
+        assert_eq!(stripper.push("Summary<eom>\n"), "");
+        assert_eq!(stripper.finish(), "Summary");
+    }
+
+    #[test]
+    fn handles_long_whitespace_after_stacked_markers() {
+        let mut stripper = StreamTerminalMarkerStripper::new();
+        assert_eq!(stripper.push("Summary<eom>           <|eom|>"), "");
+        assert_eq!(stripper.finish(), "Summary");
+    }
+
+    #[test]
+    fn empty_chunk_returns_empty() {
+        let mut stripper = StreamTerminalMarkerStripper::new();
+        assert_eq!(stripper.push(""), "");
+        assert_eq!(stripper.finish(), "");
+    }
+
+    #[test]
+    fn no_marker_passes_through() {
+        let mut stripper = StreamTerminalMarkerStripper::new();
+        assert_eq!(stripper.push("Normal text"), "Normal text");
+        assert_eq!(stripper.finish(), "");
+    }
+}
+
+/// Streaming-safe terminal marker stripper.
+///
+/// Strips trailing terminal markers (`<eom>`, `<|eom|>`) from streaming text chunks.
+/// Handles markers split across multiple chunks, stacked markers, and markers with
+/// arbitrary whitespace between them.
+///
+/// # State machine
+///
+/// The stripper maintains a `pending` buffer that accumulates text. When a complete
+/// marker is found at the end, it is held in `pending` until the next chunk arrives.
+/// If the next chunk is non-empty, the marker is released as inline text. If
+/// `finish()` is called, the marker is discarded as terminal.
+#[derive(Debug, Default)]
+pub(crate) struct StreamTerminalMarkerStripper {
+    pending: String,
+}
+
+impl StreamTerminalMarkerStripper {
+    pub(crate) fn new() -> Self {
+        Self {
+            pending: String::new(),
+        }
+    }
+
+    /// Push a chunk of text and return the visible text with terminal markers stripped.
+    pub(crate) fn push(&mut self, chunk: &str) -> String {
+        if chunk.is_empty() {
+            return String::new();
+        }
+
+        // Append the new chunk
+        self.pending.push_str(chunk);
+
+        // Check if pending ends with a complete marker (possibly with trailing whitespace)
+        let trimmed = self.pending.trim_end();
+
+        for marker in ["<|eom|>", "<eom>"] {
+            if trimmed.ends_with(marker) {
+                // Found a complete marker at the end
+                // Check if there's meaningful text after the last marker
+                // If the marker is at position 0 in trimmed, it's terminal
+                // If there's text before it, we need to check if that text ends with another marker
+
+                // Find the position of the last marker in trimmed
+                if let Some(marker_pos) = trimmed.rfind(marker) {
+                    // Check what's before this marker
+                    let before_marker = &trimmed[..marker_pos];
+
+                    // If before_marker is empty or only whitespace, this is a terminal marker
+                    if before_marker.trim().is_empty() {
+                        // Terminal marker - hold everything
+                        return String::new();
+                    }
+
+                    // There's text before the marker - check if it ends with another marker
+                    // If so, this is stacked terminal markers
+                    let before_trimmed = before_marker.trim_end();
+                    let is_stacked = ["<|eom|>", "<eom>"]
+                        .iter()
+                        .any(|m| before_trimmed.ends_with(m));
+
+                    if is_stacked {
+                        // Stacked terminal markers - hold everything
+                        return String::new();
+                    }
+
+                    // There's real text before the marker - this is an inline marker
+                    // But we still need to check if there's text AFTER the marker
+                    let after_marker_start = marker_pos + marker.len();
+                    let after_marker = &trimmed[after_marker_start..];
+
+                    if after_marker.trim().is_empty() {
+                        // Marker is at the end (possibly with whitespace) - terminal marker
+                        // Check if the text before contains an inline marker
+                        // If so, release the text up to (but not including) that inline marker
+                        // Otherwise, hold everything pending
+
+                        // Look for any marker in before_marker
+                        let has_inline_marker = ["<|eom|>", "<eom>"]
+                            .iter()
+                            .any(|m| before_marker.contains(m));
+
+                        if has_inline_marker {
+                            // There's an inline marker before this terminal marker
+                            // Release everything before the terminal marker
+                            let result = before_marker.to_string();
+                            // Hold the terminal marker and any trailing whitespace
+                            let hold_end =
+                                marker_pos + marker.len() + (self.pending.len() - trimmed.len());
+                            self.pending = self.pending[marker_pos..hold_end].to_string();
+                            return result;
+                        } else {
+                            // No inline marker - hold everything pending
+                            return String::new();
+                        }
+                    } else {
+                        // There's text after the marker - inline marker
+                        // Release everything (the marker is part of the inline text)
+                        let result = self.pending.clone();
+                        self.pending.clear();
+                        return result;
+                    }
+                }
+            }
+        }
+
+        // Check if pending ends with a partial marker prefix
+        // This handles cases like "Summary<" or "Summary<|" where the marker is split
+        for marker in ["<|eom|>", "<eom>"] {
+            for prefix_len in 1..marker.len() {
+                let prefix = &marker[..prefix_len];
+                if self.pending.ends_with(prefix) {
+                    // Found a partial marker - hold everything pending
+                    return String::new();
+                }
+            }
+        }
+
+        // No marker at all - release everything
+        let result = self.pending.clone();
+        self.pending.clear();
+        result
+    }
+
+    /// Finish the stream and return any remaining text.
+    /// Discards any trailing terminal markers.
+    pub(crate) fn finish(&mut self) -> String {
+        if self.pending.is_empty() {
+            return String::new();
+        }
+
+        // Strip trailing terminal markers (possibly with whitespace between them)
+        let mut result = self.pending.trim_end().to_string();
+
+        loop {
+            let original_len = result.len();
+            let trimmed = result.trim_end().to_string();
+
+            let mut found_marker = false;
+            for marker in ["<|eom|>", "<eom>"] {
+                if let Some(prefix) = trimmed.strip_suffix(marker) {
+                    result = prefix.to_string();
+                    found_marker = true;
+                    break;
+                }
+            }
+
+            // If no marker found but there was trailing whitespace, remove it
+            if !found_marker && trimmed.len() < original_len {
+                result = trimmed.clone();
+            }
+
+            // If nothing changed, we're done
+            if result.len() == trimmed.len() && !found_marker {
+                break;
+            }
+        }
+
+        result
+    }
+}

@@ -2,7 +2,7 @@
 
 use super::events::{DraftEvent, StreamDelta};
 use super::outcome::{StreamCancelledAfterOutput, StreamInterruptedAfterOutput, ToolLoopCancelled};
-use super::stream_guard::{StreamTextGuard, StreamThinkTagStripper};
+use super::stream_guard::{StreamTerminalMarkerStripper, StreamTextGuard, StreamThinkTagStripper};
 use anyhow::Result;
 use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
@@ -51,8 +51,9 @@ pub(crate) async fn consume_provider_streaming_response(
     );
     let mut outcome = StreamedChatOutcome::default();
     let mut delta_sender = on_delta;
-    let mut text_guard = StreamTextGuard::new(request_tools);
     let mut think_stripper = StreamThinkTagStripper::default();
+    let mut marker_stripper = StreamTerminalMarkerStripper::new();
+    let mut text_guard = StreamTextGuard::new(request_tools);
     // Correlates PreExecutedToolCall events with their later results so both
     // TurnEvents share a stable id (FIFO per tool name).
     let mut pre_executed_ids: std::collections::HashMap<
@@ -221,7 +222,8 @@ pub(crate) async fn consume_provider_streaming_response(
                     continue;
                 }
 
-                let Some(forward_text) = text_guard.push(&sanitized_delta) else {
+                let stripped = marker_stripper.push(&sanitized_delta);
+                let Some(forward_text) = text_guard.push(&stripped) else {
                     continue;
                 };
 
@@ -232,10 +234,20 @@ pub(crate) async fn consume_provider_streaming_response(
 
     let trailing_delta = think_stripper.finish();
     if !trailing_delta.is_empty() {
-        outcome.response_text.push_str(&trailing_delta);
+        let stripped = marker_stripper.push(&trailing_delta);
+        outcome.response_text.push_str(&stripped);
         if strict_tool_parsing {
-            forward_visible!(trailing_delta, false);
-        } else if let Some(forward_text) = text_guard.push(&trailing_delta) {
+            forward_visible!(stripped, false);
+        } else if let Some(forward_text) = text_guard.push(&stripped) {
+            forward_visible!(forward_text, false);
+        }
+    }
+
+    // Flush any remaining terminal markers
+    let remaining = marker_stripper.finish();
+    if !remaining.is_empty() {
+        outcome.response_text.push_str(&remaining);
+        if let Some(forward_text) = text_guard.push(&remaining) {
             forward_visible!(forward_text, false);
         }
     }

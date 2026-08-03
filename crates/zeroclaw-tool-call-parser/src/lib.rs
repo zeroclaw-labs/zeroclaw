@@ -33,6 +33,60 @@ fn parse_arguments_value(raw: Option<&serde_json::Value>) -> serde_json::Value {
     unwrap_nested_json_strings(initial)
 }
 
+/// Strip trailing terminal markers (`<eom>`, `<|eom|>`) from a response string.
+/// Handles stacked markers with arbitrary whitespace between them.
+///
+/// Terminal markers are protocol metadata that should not appear in user-visible text.
+/// This function iteratively removes trailing markers and whitespace until none remain.
+///
+/// # Examples
+///
+/// ```
+/// use zeroclaw_tool_call_parser::strip_trailing_terminal_markers;
+///
+/// assert_eq!(strip_trailing_terminal_markers("Summary<eom>"), "Summary");
+/// assert_eq!(strip_trailing_terminal_markers("Summary<|eom|>"), "Summary");
+/// assert_eq!(strip_trailing_terminal_markers("Summary<eom><|eom|>"), "Summary");
+/// assert_eq!(strip_trailing_terminal_markers("Summary<eom>  \n"), "Summary");
+/// assert_eq!(strip_trailing_terminal_markers("Summary<eom>           <|eom|>"), "Summary");
+/// assert_eq!(strip_trailing_terminal_markers("Text with <eom> inline"), "Text with <eom> inline");
+/// ```
+pub fn strip_trailing_terminal_markers(text: &str) -> String {
+    let mut result = text.to_string();
+
+    loop {
+        let original_len = result.len();
+        let trimmed = result.trim_end();
+
+        // Try to strip each known terminal marker
+        let mut new_result: Option<String> = None;
+
+        for marker in ["<|eom|>", "<eom>"] {
+            if let Some(suffix) = trimmed.strip_suffix(marker) {
+                new_result = Some(suffix.to_string());
+                break;
+            }
+        }
+
+        // If a marker was stripped, use the new result
+        if let Some(suffix) = new_result {
+            result = suffix;
+            continue;
+        }
+
+        // If no marker but there was whitespace, remove trailing whitespace
+        if trimmed.len() < original_len {
+            result = trimmed.to_string();
+            continue;
+        }
+
+        // If nothing changed, we're done
+        break;
+    }
+
+    result
+}
+
 /// Recursively unwrap stringified JSON objects/arrays nested inside tool arguments.
 /// Why: Gemini (and some other model_providers) sometimes double-encode nested object/array
 /// parameters as JSON strings inside the outer arguments payload, which breaks tools
@@ -4187,5 +4241,65 @@ Let me check the result."#;
         assert_eq!(default_param_for_tool("http_request"), "url");
         assert_eq!(default_param_for_tool("browser_open"), "url");
         assert_eq!(default_param_for_tool("unknown_tool"), "input");
+    }
+
+    #[test]
+    fn strip_trailing_terminal_markers_basic() {
+        assert_eq!(strip_trailing_terminal_markers("Summary<eom>"), "Summary");
+        assert_eq!(strip_trailing_terminal_markers("Summary<|eom|>"), "Summary");
+    }
+
+    #[test]
+    fn strip_trailing_terminal_markers_stacked() {
+        assert_eq!(
+            strip_trailing_terminal_markers("Summary<eom><|eom|>"),
+            "Summary"
+        );
+        assert_eq!(
+            strip_trailing_terminal_markers("Summary<|eom|><eom>"),
+            "Summary"
+        );
+    }
+
+    #[test]
+    fn strip_trailing_terminal_markers_with_whitespace() {
+        assert_eq!(
+            strip_trailing_terminal_markers("Summary<eom>  \n"),
+            "Summary"
+        );
+        assert_eq!(
+            strip_trailing_terminal_markers("Summary<eom>\t\n  "),
+            "Summary"
+        );
+        assert_eq!(
+            strip_trailing_terminal_markers("Summary<eom>           <|eom|>"),
+            "Summary"
+        );
+    }
+
+    #[test]
+    fn strip_trailing_terminal_markers_preserves_inline() {
+        assert_eq!(
+            strip_trailing_terminal_markers("Text with <eom> inline"),
+            "Text with <eom> inline"
+        );
+        assert_eq!(
+            strip_trailing_terminal_markers("Code: <|eom|> here"),
+            "Code: <|eom|> here"
+        );
+    }
+
+    #[test]
+    fn strip_trailing_terminal_markers_empty() {
+        assert_eq!(strip_trailing_terminal_markers(""), "");
+        assert_eq!(strip_trailing_terminal_markers("   "), "");
+        assert_eq!(strip_trailing_terminal_markers("<eom>"), "");
+    }
+
+    #[test]
+    fn strip_trailing_terminal_markers_marker_only_with_whitespace() {
+        assert_eq!(strip_trailing_terminal_markers("<eom>\n"), "");
+        assert_eq!(strip_trailing_terminal_markers("<|eom|>  "), "");
+        assert_eq!(strip_trailing_terminal_markers("<eom>\n<|eom|>"), "");
     }
 }
