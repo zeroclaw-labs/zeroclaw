@@ -33359,6 +33359,34 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         assert_description(&email, ".observer_mode", "never modifies any IMAP flag");
     }
 
+    #[test]
+    async fn agent_workspace_path_is_a_settable_property() {
+        let mut workspace = crate::multi_agent::AgentWorkspaceConfig::default();
+
+        let path = workspace
+            .prop_fields()
+            .into_iter()
+            .find(|field| field.name == "agent_workspace.path")
+            .expect("workspace path property");
+        assert_eq!(path.kind, crate::config::PropKind::String);
+        assert_eq!(path.display_value, crate::config::UNSET_DISPLAY);
+
+        workspace
+            .set_prop("agent_workspace.path", "/srv/zeroclaw/assistant")
+            .unwrap();
+        assert_eq!(
+            workspace.path,
+            Some(std::path::PathBuf::from("/srv/zeroclaw/assistant"))
+        );
+        assert_eq!(
+            workspace.get_prop("agent_workspace.path").unwrap(),
+            "/srv/zeroclaw/assistant"
+        );
+
+        workspace.set_prop("agent_workspace.path", "").unwrap();
+        assert_eq!(workspace.path, None);
+    }
+
     #[cfg(feature = "schema-export")]
     #[test]
     async fn generated_config_types_keep_schema_descriptions() {
