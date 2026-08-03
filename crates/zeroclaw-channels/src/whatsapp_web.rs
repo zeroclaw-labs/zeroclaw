@@ -500,12 +500,50 @@ impl WhatsAppWebChannel {
             .unwrap_or(trimmed)
             .trim();
 
+        // Strip the device suffix before touching digits. A JID's user part is
+        // rendered `<number>:<device>` (`5215551234567:23`), and the device is
+        // NOT part of the phone number — keeping it silently appends the device
+        // id to the number, so `5215551234567:23` normalized to
+        // `+521555123456723` and matched no allowlist entry. The sender is then
+        // rejected as unknown, the agent never answers, and the only trace is a
+        // log line saying the number is "not in allowed list" — while the
+        // operator looks at a config file that plainly contains it.
+        let user_part = user_part
+            .split_once(':')
+            .map(|(number, _device)| number)
+            .unwrap_or(user_part);
+
         let digits: String = user_part.chars().filter(|c| c.is_ascii_digit()).collect();
         if digits.is_empty() {
-            None
-        } else {
-            Some(format!("+{digits}"))
+            return None;
         }
+
+        Some(format!("+{}", Self::canonicalize_dialing_digits(&digits)))
+    }
+
+    /// Fold country-specific dialing variants onto one canonical form so an
+    /// allowlist entry and the wire format of the same number compare equal.
+    ///
+    /// Mexico (+52) is the case that matters here: WhatsApp delivers Mexican
+    /// mobile numbers with a legacy `1` after the country code
+    /// (`52 1 33 1234 5678`), while people write them — and E.164 defines them
+    /// — without it (`52 33 1234 5678`). Both denote the same phone. Comparing
+    /// them literally means an allowlist written the human way never matches
+    /// the sender, and every message from that person is dropped as
+    /// unrecognized.
+    ///
+    /// Kept deliberately narrow: only the `521` + 10-digit shape is folded,
+    /// which is unambiguous. Argentina's `+54 9` has the same history but is
+    /// left alone until there is a real number to verify against — guessing at
+    /// dialing plans is how you start dropping a different country's messages.
+    #[cfg(feature = "whatsapp-web")]
+    fn canonicalize_dialing_digits(digits: &str) -> String {
+        if let Some(rest) = digits.strip_prefix("521")
+            && rest.len() == 10
+        {
+            return format!("52{rest}");
+        }
+        digits.to_string()
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -3448,6 +3486,71 @@ mod tests {
             WhatsAppWebChannel::clear_persisted_session("")
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    #[test]
+    fn device_suffix_is_not_part_of_the_phone_number() {
+        // Regression: an inbound JID's user part carries the device id
+        // (`<number>:<device>`). Folding that into the digits appended the
+        // device to the number, so a sender whose number was plainly listed in
+        // the allowlist was rejected as unrecognized and the agent silently
+        // never answered them. Measured in production: every inbound message
+        // was dropped this way, for weeks, with no error anywhere.
+        assert_eq!(
+            WhatsAppWebChannel::normalize_phone_token("5215551234567:23@s.whatsapp.net"),
+            Some("+525551234567".to_string()),
+        );
+        // Same number without a device suffix must normalize identically.
+        assert_eq!(
+            WhatsAppWebChannel::normalize_phone_token("5215551234567@s.whatsapp.net"),
+            WhatsAppWebChannel::normalize_phone_token("5215551234567:23@s.whatsapp.net"),
+        );
+        // A bare LID keeps its digits: it is not a phone number and must not
+        // accidentally match a phone entry.
+        assert_eq!(
+            WhatsAppWebChannel::normalize_phone_token("142348218536170:23@lid"),
+            Some("+142348218536170".to_string()),
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn mexican_mobile_prefix_matches_however_it_is_written() {
+        // WhatsApp delivers Mexican mobiles as `52 1 <10 digits>`; humans write
+        // the allowlist as `+52 <10 digits>`. Both are the same phone, so an
+        // allowlist entry must match the wire format — otherwise every message
+        // from a Mexican contact is dropped as an unknown sender.
+        let from_wire =
+            WhatsAppWebChannel::normalize_phone_token("5215557654321:23@s.whatsapp.net");
+        let from_config = WhatsAppWebChannel::normalize_phone_token("+525557654321");
+        assert_eq!(from_wire, from_config);
+        assert_eq!(from_wire, Some("+525557654321".to_string()));
+
+        // And the allowlist check itself agrees, which is what actually gates
+        // delivery.
+        let allowed = vec!["+525557654321".to_string()];
+        assert!(WhatsAppWebChannel::is_number_allowed_for_list(
+            &allowed,
+            "5215557654321:23@s.whatsapp.net"
+        ));
+
+        // Narrow by design: only `521` + 10 digits folds. A 12-digit +52
+        // landline is untouched, and an unrelated country is never rewritten.
+        assert_eq!(
+            WhatsAppWebChannel::normalize_phone_token("525512345678"),
+            Some("+525512345678".to_string()),
+        );
+        assert_eq!(
+            WhatsAppWebChannel::normalize_phone_token("447974904995"),
+            Some("+447974904995".to_string()),
+        );
+        // A non-Mexican number that merely starts with 521 keeps its digits:
+        // the fold requires exactly 10 remaining digits.
+        assert_eq!(
+            WhatsAppWebChannel::normalize_phone_token("52112345"),
+            Some("+52112345".to_string()),
         );
     }
 
