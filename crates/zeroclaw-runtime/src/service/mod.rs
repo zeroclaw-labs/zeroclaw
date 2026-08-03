@@ -866,23 +866,35 @@ fn install_linux(config: &Config, init_system: InitSystem) -> Result<()> {
     }
 }
 
-fn install_linux_systemd(config: &Config) -> Result<()> {
-    let file = linux_service_file(config)?;
-    if let Some(parent) = file.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    let exe = std::env::current_exe().context("Failed to resolve current executable")?;
-    let unit = format!(
+/// Render the systemd user unit for the daemon.
+///
+/// Split out from the installer so the policy it encodes is reachable from a
+/// test. Asserting against a copy of the text pasted into the test proves only
+/// that the copy is intact; this renders the same string the installer writes.
+fn render_systemd_unit(exe: &str) -> String {
+    format!(
         "[Unit]\n\
          Description=ZeroClaw daemon\n\
          After=network.target\n\
+         # Bound the crash loop. `Restart=always` with a 30s gap and systemd's\n\
+         # default limit of 5 starts per 10s can never trip that limit, so a\n\
+         # daemon that dies on startup restarts forever. For a messaging agent\n\
+         # each restart is a reconnection the platform sees, and platforms\n\
+         # revoke accounts that reconnect like software rather than like a\n\
+         # phone. Ten failures inside an hour stops the unit and leaves it\n\
+         # failed, where an operator or a watchdog will notice it. Recover\n\
+         # with: systemctl --user reset-failed zeroclaw && ... start zeroclaw\n\
+         StartLimitIntervalSec=3600\n\
+         StartLimitBurst=10\n\
          \n\
          [Service]\n\
          Type=simple\n\
          ExecStart={exe} daemon\n\
          Restart=always\n\
-         RestartSec=3\n\
+         # Long enough that a genuine transient fault has cleared before the\n\
+         # retry, and that a real failure spends the burst budget over minutes\n\
+         # instead of seconds.\n\
+         RestartSec=30\n\
          # Ensure HOME is set so headless browsers can create profile/cache dirs.\n\
          Environment=HOME=%h\n\
          # Allow inheriting DISPLAY and XDG_RUNTIME_DIR from the user session\n\
@@ -890,9 +902,18 @@ fn install_linux_systemd(config: &Config) -> Result<()> {
          PassEnvironment=DISPLAY XDG_RUNTIME_DIR\n\
          \n\
          [Install]\n\
-         WantedBy=default.target\n",
-        exe = exe.display()
-    );
+         WantedBy=default.target\n"
+    )
+}
+
+fn install_linux_systemd(config: &Config) -> Result<()> {
+    let file = linux_service_file(config)?;
+    if let Some(parent) = file.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let exe = std::env::current_exe().context("Failed to resolve current executable")?;
+    let unit = render_systemd_unit(&exe.display().to_string());
 
     fs::write(&file, unit)?;
     let _ = run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]));
@@ -1908,6 +1929,58 @@ mod linux_service_tests {
         let path = file.to_string_lossy();
         assert!(path.ends_with(".config/systemd/user/zeroclaw.service"));
     }
+
+    /// Renders the real unit rather than a copy pasted into the test: a copy
+    /// asserts only that the copy is intact, and would keep passing while the
+    /// installer wrote something else entirely.
+    #[test]
+    fn systemd_unit_sets_home_and_passes_display_env() {
+        let unit = render_systemd_unit("/usr/local/bin/zeroclaw");
+        assert!(
+            unit.contains("Environment=HOME=%h"),
+            "systemd unit must set HOME for headless browser support"
+        );
+        assert!(
+            unit.contains("PassEnvironment=DISPLAY XDG_RUNTIME_DIR"),
+            "systemd unit must pass through display/runtime env vars"
+        );
+        assert!(
+            unit.contains("ExecStart=/usr/local/bin/zeroclaw daemon"),
+            "the resolved executable must reach ExecStart"
+        );
+    }
+
+    /// `Restart=always` without a reachable rate limit restarts a broken daemon
+    /// forever. Each restart is a device reconnection the messaging platform
+    /// sees, and platforms revoke accounts that reconnect like software; this
+    /// number was revoked after 23 restarts in ten hours.
+    ///
+    /// The limit must also be *reachable*: a burst of N over a window shorter
+    /// than N * RestartSec can never trip, which is the trap the previous
+    /// values fell into (5 starts per 10s with a 3s gap allows at most 4).
+    #[test]
+    fn systemd_unit_bounds_the_restart_loop() {
+        let unit = render_systemd_unit("/usr/local/bin/zeroclaw");
+
+        let field = |key: &str| -> u64 {
+            unit.lines()
+                .find_map(|l| l.trim().strip_prefix(key)?.parse().ok())
+                .unwrap_or_else(|| panic!("unit is missing a numeric {key} value"))
+        };
+
+        let burst = field("StartLimitBurst=");
+        let window_secs = field("StartLimitIntervalSec=");
+        let restart_secs = field("RestartSec=");
+
+        assert!(burst > 0, "a zero burst disables the limit entirely");
+        assert!(
+            burst * restart_secs < window_secs,
+            "the limit is unreachable: {burst} restarts {restart_secs}s apart span \
+             {}s, which never fits inside the {window_secs}s window, so a crash \
+             loop would restart forever",
+            burst * restart_secs
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2065,6 +2138,22 @@ mod service_helper_tests {
             script.contains("checkpath --directory --owner zeroclaw:zeroclaw"),
             "start_pre must ensure /var/lib/zeroclaw exists with correct ownership"
         );
+    }
+
+    #[test]
+    fn warn_if_binary_in_home_detects_home_path() {
+        use std::path::PathBuf;
+
+        let home_path = PathBuf::from("/home/user/.cargo/bin/zeroclaw");
+        assert!(home_path.to_string_lossy().contains("/home/"));
+        assert!(home_path.to_string_lossy().contains(".cargo/bin"));
+
+        let cargo_path = PathBuf::from("/home/user/.cargo/bin/zeroclaw");
+        assert!(cargo_path.to_string_lossy().contains(".cargo/bin"));
+
+        let system_path = PathBuf::from("/usr/local/bin/zeroclaw");
+        assert!(!system_path.to_string_lossy().contains("/home/"));
+        assert!(!system_path.to_string_lossy().contains(".cargo/bin"));
     }
 
     #[cfg(unix)]
