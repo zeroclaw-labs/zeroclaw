@@ -801,6 +801,34 @@ impl HindsightMemory {
         true
     }
 
+    /// Sort a merged, cross-tier entry set NEWEST FIRST with a TOTAL, reproducible
+    /// order, so truncating to a limit afterwards keeps the most recent rows
+    /// regardless of which tier (private/shared/system) they came from.
+    ///
+    /// Primary key: the RFC 3339 timestamp parsed to an instant, descending. A
+    /// row whose timestamp is empty or unparseable is treated as the OLDEST
+    /// (sorts last), so a row that cannot be dated never displaces a genuinely
+    /// recent row - and, critically, a parseable vs unparseable comparison is
+    /// decided by parse success rather than a meaningless lexical byte compare
+    /// (`"not-a-date"` must NOT outrank a real 2026 date). Deterministic
+    /// tiebreak, applied in order, so ties (equal instants, or two undatable
+    /// rows) still yield ONE stable order: (1) the row id ascending, then (2)
+    /// the content. Two rows are only truly equal when id and content match, so
+    /// the order is total and reproducible run to run rather than depending on
+    /// the banks' merge/append order.
+    fn sort_recent_stable(entries: &mut [MemoryEntry]) {
+        entries.sort_by(|a, b| {
+            let at = chrono::DateTime::parse_from_rfc3339(a.timestamp.trim()).ok();
+            let bt = chrono::DateTime::parse_from_rfc3339(b.timestamp.trim()).ok();
+            // Newest first. `Option` orders `None < Some`, which already places
+            // an undatable row (None) below any dated row; comparing b vs a then
+            // yields descending instants with undatable rows sinking to the end.
+            bt.cmp(&at)
+                .then_with(|| a.id.cmp(&b.id))
+                .then_with(|| a.content.cmp(&b.content))
+        });
+    }
+
     /// Apply the session and time discriminators to a fetched result set at
     /// the read boundary, then truncate to `limit`. The remote returned rows
     /// ranked by relevance (recall) or recency (list); this preserves that
@@ -946,13 +974,28 @@ impl Memory for HindsightMemory {
         // lexical comparison deeper in the filter.
         let window = TimeWindow::parse(since, until)?;
         let normalized = super::traits::normalize_recent_recall_query(query);
-        // Hindsight recall needs a query; for recent/empty queries fall back to
-        // list, which applies the same session gate.
+        // Recent/omitted (or bare `*`) recall: there is no query to rank by, so
+        // fall back to the recency-ordered `list` of every configured bank.
+        // `list` already applies the private session gate + category filter and
+        // merges the (session-less) shared/system tiers, so here we only bound
+        // by the optional time window.
         if normalized.trim().is_empty() {
-            return self
+            let mut entries: Vec<MemoryEntry> = self
                 .list(None, session_id)
-                .await
-                .map(|entries| Self::filter_scoped(entries, session_id, &window, effective_limit));
+                .await?
+                .into_iter()
+                .filter(|e| Self::passes_time_range(e, &window))
+                .collect();
+            // Merge before truncate: sort the MERGED set
+            // across all tiers by recency BEFORE truncating to `limit`. `list`
+            // appends private rows first, then shared, then system; truncating
+            // that raw order would let a private history of `limit`+ rows fill
+            // the budget and deterministically discard every newer shared/system
+            // row, hiding fresh cross-agent or system guidance. Sorting newest
+            // first here guarantees a newer shared/system row survives the cut.
+            Self::sort_recent_stable(&mut entries);
+            entries.truncate(effective_limit);
+            return Ok(entries);
         }
         // Hindsight has no server-side session/time predicate, so ENFORCE the
         // discriminators client-side at the read boundary. Without this, a
@@ -2507,5 +2550,113 @@ mod tests {
         assert!(texts.contains(&"private-hit"));
         assert!(texts.contains(&"shared-hit"));
         assert!(texts.contains(&"system-hit"));
+    }
+
+    /// Recent recall must merge every
+    /// tier and sort by recency BEFORE truncating to `limit`. Here the private
+    /// bank alone returns `limit` OLDER rows and the shared bank returns a
+    /// single NEWER row. The buggy behavior (append private-first, then
+    /// truncate) fills the whole budget with the older private rows and drops
+    /// the newer shared row; the fix sorts newest-first across tiers first, so
+    /// the newer shared row must survive the cut.
+    #[tokio::test]
+    async fn recent_recall_merges_tiers_by_recency_before_truncation() {
+        let server = MockServer::start().await;
+        let limit = 3;
+        // Private bank: `limit` rows, all OLDER than the shared row.
+        let private_items: Vec<_> = (0..limit)
+            .map(|i| {
+                json!({
+                    "id": format!("priv-{i}"),
+                    "text": format!("old-private-{i}"),
+                    "tags": ["zeroclaw", "core"],
+                    "mentioned_at": format!("2026-01-0{}T00:00:00Z", i + 1)
+                })
+            })
+            .collect();
+        Mock::given(method("GET"))
+            .and(path("/v1/default/banks/zeroclaw-and/memories/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "items": private_items,
+                "total": limit
+            })))
+            .mount(&server)
+            .await;
+        // Shared bank: one row NEWER than every private row.
+        Mock::given(method("GET"))
+            .and(path("/v1/default/banks/zeroclaw-house/memories/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "items": [
+                    { "id": "shared-new", "text": "fresh-shared-guidance",
+                      "tags": ["zeroclaw", "core"],
+                      "mentioned_at": "2026-08-01T00:00:00Z" }
+                ],
+                "total": 1
+            })))
+            .mount(&server)
+            .await;
+
+        let mem = memory_with_tiers(&server.uri(), Some("zeroclaw-house"), None);
+        // Bare `*` normalizes to the recent/empty query -> list-fallback path.
+        let hits = mem
+            .recall("*", limit, None, None, None)
+            .await
+            .expect("recent recall should succeed");
+
+        assert_eq!(hits.len(), limit, "must truncate to the limit");
+        let texts: Vec<&str> = hits.iter().map(|h| h.content.as_str()).collect();
+        assert!(
+            texts.contains(&"fresh-shared-guidance"),
+            "the NEWER shared row must survive truncation, not be starved by \
+             older private rows: {texts:?}"
+        );
+        // It is the newest overall, so it must sort to the front.
+        assert_eq!(
+            hits[0].content, "fresh-shared-guidance",
+            "newest-first ordering must place the fresh shared row at the top: {texts:?}"
+        );
+    }
+
+    /// The recency sort must be a TOTAL, reproducible order even when timestamps
+    /// tie or fail to parse: equal/empty timestamps fall back to id, then
+    /// content, so the same input always yields the same order regardless of the
+    /// banks' merge/append order.
+    #[test]
+    fn sort_recent_stable_is_total_and_reproducible() {
+        let mk = |id: &str, ts: &str, content: &str| MemoryEntry {
+            id: id.to_string(),
+            key: id.to_string(),
+            content: content.to_string(),
+            category: MemoryCategory::Core,
+            timestamp: ts.to_string(),
+            session_id: None,
+            score: None,
+            namespace: "default".to_string(),
+            importance: None,
+            superseded_by: None,
+            kind: None,
+            pinned: false,
+            tenant_id: None,
+            agent_alias: None,
+            agent_id: None,
+        };
+        // Two rows share a timestamp; one has an unparseable timestamp.
+        let base = vec![
+            mk("b", "2026-05-01T00:00:00Z", "z"),
+            mk("a", "2026-05-01T00:00:00Z", "y"),
+            mk("c", "not-a-date", "x"),
+            mk("d", "2026-09-01T00:00:00Z", "w"),
+        ];
+        let mut first = base.clone();
+        HindsightMemory::sort_recent_stable(&mut first);
+        // A different starting permutation must yield the SAME final order.
+        let mut second = base;
+        second.reverse();
+        HindsightMemory::sort_recent_stable(&mut second);
+        let ids = |v: &[MemoryEntry]| v.iter().map(|e| e.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&first), ids(&second), "order must be reproducible");
+        // Newest first (d), then the tie broken by id (a before b), then the
+        // unparseable timestamp last (c sorts oldest).
+        assert_eq!(ids(&first), vec!["d", "a", "b", "c"]);
     }
 }
