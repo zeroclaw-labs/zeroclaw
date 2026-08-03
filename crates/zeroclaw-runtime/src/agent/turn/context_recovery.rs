@@ -123,6 +123,13 @@ pub(crate) async fn try_recover_context_overflow(
                         dropped_messages,
                         kept_turns,
                         reason: reason.clone(),
+                        token_budget: Some(context_token_budget as u64),
+                        tokens_before: Some(tokens_now as u64),
+                        tokens_after: Some(tokens_after as u64),
+                        tokens_before_source: Some(
+                            zeroclaw_api::agent::TokenCountSource::Estimated,
+                        ),
+                        tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
                     })
                     .await;
             }
@@ -133,6 +140,11 @@ pub(crate) async fn try_recover_context_overflow(
                 channel: None,
                 agent_alias: None,
                 turn_id: None,
+                token_budget: Some(context_token_budget as u64),
+                tokens_before: Some(tokens_now as u64),
+                tokens_after: Some(tokens_after as u64),
+                tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
+                tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
             });
             return true;
         }
@@ -312,12 +324,34 @@ mod tests {
                 dropped_messages,
                 kept_turns,
                 reason,
+                token_budget,
+                tokens_before,
+                tokens_after,
+                tokens_before_source,
+                tokens_after_source,
             } => {
                 assert!(dropped_messages > 0, "must report dropped messages");
                 assert!(kept_turns >= 1, "must keep at least the current turn");
                 assert_eq!(
                     reason,
                     crate::i18n::get_required_cli_string("history-trim-reason-budget")
+                );
+                assert_eq!(
+                    token_budget,
+                    Some(32_000),
+                    "recovery must report the configured budget"
+                );
+                assert!(
+                    tokens_before.is_some_and(|before| before > tokens_after.unwrap_or(0)),
+                    "pre-trim count must exceed post-trim count"
+                );
+                assert_eq!(
+                    (tokens_before_source, tokens_after_source),
+                    (
+                        Some(zeroclaw_api::agent::TokenCountSource::Estimated),
+                        Some(zeroclaw_api::agent::TokenCountSource::Estimated),
+                    ),
+                    "estimate-based recovery counts are marked estimated"
                 );
             }
             other => panic!("expected HistoryTrimmed, got {other:?}"),
