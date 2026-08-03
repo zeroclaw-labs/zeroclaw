@@ -2988,11 +2988,15 @@ impl App {
 
     fn prepare_edit_at(&mut self, idx: usize) {
         let kind = self.fields[idx].kind;
-        let value = self.fields[idx]
-            .value
-            .as_ref()
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
+        let value = if self.fields[idx].populated {
+            self.fields[idx]
+                .value
+                .as_ref()
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        } else {
+            None
+        };
         let variants = self.fields[idx].enum_variants.clone();
 
         match kind {
@@ -4918,6 +4922,54 @@ mod tests {
         assert!(
             matches!(mgr.screen, Screen::TypeList { section_idx: 0 }),
             "Left on the leftmost alias tab walks out to the type list like Back"
+        );
+    }
+
+    fn field_with_value(kind: PropKind, value: &str, populated: bool) -> ConfigFieldEntry {
+        ConfigFieldEntry {
+            path: "test.field".into(),
+            category: String::new(),
+            kind,
+            type_hint: String::new(),
+            value: Some(serde_json::Value::String(value.into())),
+            populated,
+            is_secret: false,
+            is_env_overridden: false,
+            enum_variants: Vec::new(),
+            description: String::new(),
+            section: None,
+            tab: ConfigTab::None,
+            alias_source: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn prepare_edit_respects_populated_field() {
+        let mut mgr = test_manager();
+
+        mgr.fields = vec![field_with_value(PropKind::String, "<unset>", false)];
+        mgr.prepare_edit_at(0);
+        assert_eq!(
+            mgr.edit_buf, "",
+            "scalar unset field must start with an empty edit buffer"
+        );
+
+        mgr.fields = vec![field_with_value(
+            PropKind::StringArray,
+            r#"["ignored"]"#,
+            false,
+        )];
+        mgr.prepare_edit_at(0);
+        assert_eq!(
+            mgr.edit_buf, "",
+            "StringArray unset field must start with an empty edit buffer"
+        );
+
+        mgr.fields = vec![field_with_value(PropKind::String, "<unset>", true)];
+        mgr.prepare_edit_at(0);
+        assert_eq!(
+            mgr.edit_buf, "<unset>",
+            "populated scalar values must be preserved verbatim"
         );
     }
 }

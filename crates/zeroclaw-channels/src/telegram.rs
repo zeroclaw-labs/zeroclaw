@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 use zeroclaw_config::schema::{Config, StreamMode, TELEGRAM_OFFICIAL_API_BASE_URL};
+use zeroclaw_runtime::i18n;
 use zeroclaw_runtime::security::pairing::PairingGuard;
 
 /// Telegram's maximum message length for text messages
@@ -3927,10 +3928,30 @@ Ensure only one `zeroclaw` process is using this bot token."
 
                             // Answer the callback query to dismiss the spinner.
                             let answer_text = match action {
-                                "approve" => "✅ Approved",
-                                "always" => "✅✅ Always approved",
-                                "deny" => "❌ Denied",
-                                _ => "⚠️ Unknown action",
+                                "approve" => format!(
+                                    "✅ {}",
+                                    i18n::get_required_cli_string(
+                                        "channel-telegram-approval-ack-approved"
+                                    )
+                                ),
+                                "always" => format!(
+                                    "✅✅ {}",
+                                    i18n::get_required_cli_string(
+                                        "channel-telegram-approval-ack-always-approved"
+                                    )
+                                ),
+                                "deny" => format!(
+                                    "❌ {}",
+                                    i18n::get_required_cli_string(
+                                        "channel-telegram-approval-ack-denied"
+                                    )
+                                ),
+                                _ => format!(
+                                    "⚠️ {}",
+                                    i18n::get_required_cli_string(
+                                        "channel-telegram-approval-ack-unknown"
+                                    )
+                                ),
                             };
                             let answer_body = serde_json::json!({
                                 "callback_query_id": cb_id,
@@ -4078,20 +4099,27 @@ Ensure only one `zeroclaw` process is using this bot token."
         // Unique key embedded in callback_data so listen() can route the tap.
         let approval_id = uuid::Uuid::new_v4().to_string();
 
+        let heading = i18n::get_required_cli_string("channel-approval-heading");
+        let tool_label = i18n::get_required_cli_string("channel-approval-tool-label");
+        let tap_instruction = i18n::get_required_cli_string("channel-approval-tap-instruction");
+        let btn_approve = i18n::get_required_cli_string("channel-approval-btn-approve");
+        let btn_deny = i18n::get_required_cli_string("channel-approval-btn-deny");
+        let btn_always = i18n::get_required_cli_string("channel-approval-btn-always");
+
         let tool = Self::escape_html(&request.tool_name);
         let args = Self::escape_html(&request.arguments_summary);
         let text = format!(
-            "\u{1f527} <b>Tool approval required</b>\n\n\
-             Tool: <code>{tool}</code>\n\
+            "\u{1f527} <b>{heading}</b>\n\n\
+             {tool_label}: <code>{tool}</code>\n\
              {args}\n\n\
-             Tap a button below:",
+             {tap_instruction}",
         );
 
         let reply_markup = serde_json::json!({
             "inline_keyboard": [[
-                { "text": "✅ Approve",  "callback_data": format!("approval:{}:approve", approval_id) },
-                { "text": "❌ Deny",     "callback_data": format!("approval:{}:deny", approval_id) },
-                { "text": "✅✅ Always", "callback_data": format!("approval:{}:always", approval_id) },
+                { "text": format!("✅ {btn_approve}"),  "callback_data": format!("approval:{}:approve", approval_id) },
+                { "text": format!("❌ {btn_deny}"),     "callback_data": format!("approval:{}:deny", approval_id) },
+                { "text": format!("✅✅ {btn_always}"), "callback_data": format!("approval:{}:always", approval_id) },
             ]]
         });
 
@@ -4137,7 +4165,7 @@ Ensure only one `zeroclaw` process is using this bot token."
 
                 // Fallback: plain text, no parse_mode, keep the buttons
                 let plain_text = format!(
-                    "🔧 Tool approval required\n\nTool: {}\n{}\n\nTap a button below:",
+                    "🔧 {heading}\n\n{tool_label}: {}\n{}\n\n{tap_instruction}",
                     request.tool_name, request.arguments_summary
                 );
                 let mut plain_body = serde_json::json!({
@@ -7905,6 +7933,79 @@ mod tests {
 
         let result = rx.await.unwrap();
         assert_eq!(result, ChannelApprovalResponse::Approve);
+    }
+
+    #[tokio::test]
+    async fn request_approval_localizes_heading_and_keeps_callback_data_exact() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 1 }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let mention_only = false;
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        )
+        .with_api_base(mock_server.uri())
+        .with_approval_timeout_secs(1);
+
+        let request = zeroclaw_api::channel::ChannelApprovalRequest {
+            tool_name: "shell".to_string(),
+            arguments_summary: "ls -la".to_string(),
+            raw_arguments: None,
+        };
+
+        // No one resolves the pending oneshot — the short timeout above lets
+        // this return (as a timeout Deny) instead of hanging the test.
+        let _ = ch.request_approval("12345", &request).await;
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+
+        // Rebuild the expected text via the SAME Fluent keys the
+        // implementation uses (locale-agnostic: this holds whatever locale
+        // the test process resolves to) — a wiring regression that stops
+        // calling i18n, or a typo'd key, changes this and fails the test.
+        let heading = i18n::get_required_cli_string("channel-approval-heading");
+        let tool_label = i18n::get_required_cli_string("channel-approval-tool-label");
+        let tap_instruction = i18n::get_required_cli_string("channel-approval-tap-instruction");
+        let expected_text = format!(
+            "\u{1f527} <b>{heading}</b>\n\n{tool_label}: <code>shell</code>\nls -la\n\n{tap_instruction}",
+        );
+        assert_eq!(body["text"], expected_text);
+
+        // Protocol-exact: callback_data must stay `approval:<id>:approve|deny|always`
+        // regardless of locale, and all three buttons must share one id.
+        let buttons = body["reply_markup"]["inline_keyboard"][0]
+            .as_array()
+            .unwrap();
+        assert_eq!(buttons.len(), 3);
+        let mut ids = std::collections::HashSet::new();
+        let mut actions = Vec::new();
+        for btn in buttons {
+            let cb = btn["callback_data"].as_str().unwrap();
+            let rest = cb.strip_prefix("approval:").expect("callback_data prefix");
+            let (id, action) = rest
+                .rsplit_once(':')
+                .expect("callback_data has an action suffix");
+            ids.insert(id.to_string());
+            actions.push(action.to_string());
+        }
+        assert_eq!(ids.len(), 1, "all three buttons share one approval id");
+        assert_eq!(actions, vec!["approve", "deny", "always"]);
     }
 
     #[test]

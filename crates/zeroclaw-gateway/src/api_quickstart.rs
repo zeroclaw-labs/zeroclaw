@@ -115,6 +115,12 @@ pub async fn handle_apply(
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
+    // Held through the swap below (and across `apply_with_surface`'s own
+    // save, which runs while this guard is held) so a concurrent config
+    // writer can't land between this read and the swap.
+    let _cfg_guard = std::sync::Arc::clone(&state.config_write_lock)
+        .lock_owned()
+        .await;
     let mut working = state.config.read().clone();
     let result = apply_with_surface(submission, &mut working, Surface::Web).await;
     let body = match result {

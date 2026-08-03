@@ -18,12 +18,7 @@ use reqwest::{
 };
 use serde::{Deserialize, Serialize};
 
-/// Max wait for the next streaming body read before the connection is treated
-/// as stalled. Streaming clients omit reqwest's overall `.timeout()` (it kills
-/// long-running responses mid-stream), so without a per-read bound a connection
-/// that goes silent after the headers park the body stream forever and the turn
-/// hangs on "working". `read_timeout` caps the gap between reads and converts a
-/// silent stall into a retryable stream error.
+/// Maximum silence between body reads for OpenAI-compatible SSE streams.
 const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// A model_provider that speaks the OpenAI-compatible chat completions API.
@@ -1695,7 +1690,7 @@ fn sse_bytes_to_chunks(
         // HTTP/1.1 chunked transfer boundaries (e.g. 3-byte CJK chars).
         let mut utf8_buf: Vec<u8> = Vec::new();
 
-        while let Some(item) = bytes_stream.next().await {
+        'stream: while let Some(item) = bytes_stream.next().await {
             match item {
                 Ok(bytes) => {
                     utf8_buf.extend_from_slice(&bytes);
@@ -1726,6 +1721,10 @@ fn sse_bytes_to_chunks(
                     while let Some(pos) = buffer.find('\n') {
                         let line = buffer[..pos].to_string();
                         buffer.drain(..=pos);
+
+                        if line.trim().strip_prefix("data:").map(str::trim) == Some("[DONE]") {
+                            break 'stream;
+                        }
 
                         match parse_sse_line(&line) {
                             Ok(Some(chunk)) => {
@@ -1800,7 +1799,7 @@ fn sse_bytes_to_events_for_contract(
         let mut bytes_stream = response.bytes_stream();
         // Accumulate partial UTF-8 sequences split across chunk boundaries.
         let mut utf8_buf: Vec<u8> = Vec::new();
-        while let Some(item) = bytes_stream.next().await {
+        'stream: while let Some(item) = bytes_stream.next().await {
             match item {
                 Ok(bytes) => {
                     utf8_buf.extend_from_slice(&bytes);
@@ -1847,6 +1846,7 @@ fn sse_bytes_to_events_for_contract(
                                     == Some("[DONE]")
                                 {
                                     saw_completion = true;
+                                    break 'stream;
                                 }
                                 continue;
                             }
@@ -3755,6 +3755,87 @@ mod tests {
             events.push(ev);
         }
         events
+    }
+
+    async fn open_sse_response(
+        body: &'static str,
+    ) -> (reqwest::Response, tokio::task::JoinHandle<()>) {
+        use axum::{Router, response::IntoResponse, routing::get};
+
+        let app = Router::new().route(
+            "/stream",
+            get(move || async move {
+                let first = futures_util::stream::once(async move {
+                    Ok::<_, std::convert::Infallible>(axum::body::Bytes::from_static(
+                        body.as_bytes(),
+                    ))
+                });
+                let open = futures_util::stream::pending::<
+                    Result<axum::body::Bytes, std::convert::Infallible>,
+                >();
+                axum::body::Body::from_stream(first.chain(open)).into_response()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind SSE test server");
+        let addr = listener.local_addr().expect("SSE test server address");
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.expect("serve SSE test");
+        });
+        let response = reqwest::Client::new()
+            .get(format!("http://{addr}/stream"))
+            .send()
+            .await
+            .expect("request SSE test stream");
+        (response, server)
+    }
+
+    #[tokio::test]
+    async fn done_sentinel_finishes_chunk_stream_without_eof() {
+        let (response, server) = open_sse_response(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n",
+        )
+        .await;
+        let mut stream = sse_bytes_to_chunks(response, false);
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+            .await
+            .expect("text delta must arrive before the connection closes")
+            .expect("chunk stream must yield text")
+            .expect("text chunk must be valid");
+        assert_eq!(first.delta, "hi");
+        let final_chunk = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+            .await
+            .expect("[DONE] must finish the stream without EOF")
+            .expect("chunk stream must yield Final")
+            .expect("Final chunk must be valid");
+        assert!(final_chunk.is_final);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn done_sentinel_finishes_event_stream_without_eof() {
+        let (response, server) = open_sse_response(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n",
+        )
+        .await;
+        let mut stream = sse_bytes_to_events(response, false);
+        let mut saw_final = false;
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(event) = stream.next().await {
+                if matches!(event, Ok(StreamEvent::Final)) {
+                    saw_final = true;
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("[DONE] must finish the event stream without EOF");
+
+        server.abort();
+        assert!(saw_final, "terminal sentinel must emit Final");
     }
 
     #[tokio::test]

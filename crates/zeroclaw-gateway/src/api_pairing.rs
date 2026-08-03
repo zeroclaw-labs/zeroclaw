@@ -424,8 +424,12 @@ pub async fn submit_pairing_enhanced(
                         .into_response();
                 }
             }
-            if let Err(e) =
-                super::persist_pairing_tokens(state.config.clone(), &state.pairing).await
+            if let Err(e) = super::persist_pairing_tokens(
+                state.config.clone(),
+                &state.pairing,
+                state.config_write_lock.clone(),
+            )
+            .await
             {
                 ::zeroclaw_log::record!(
                     ERROR,
@@ -530,7 +534,13 @@ pub async fn revoke_device(
 
     state.pairing.revoke_token_hash(&token_hash);
 
-    if let Err(e) = super::persist_pairing_tokens(state.config.clone(), &state.pairing).await {
+    if let Err(e) = super::persist_pairing_tokens(
+        state.config.clone(),
+        &state.pairing,
+        state.config_write_lock.clone(),
+    )
+    .await
+    {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Token revoked in memory but config persist failed: {e}"),
@@ -633,7 +643,13 @@ pub async fn rotate_token(
     // Same persist-fail caveat as `revoke_device`: device row + in-memory
     // token are already gone; surfacing the persist error tells the caller
     // a restart could resurrect the token.
-    if let Err(e) = super::persist_pairing_tokens(state.config.clone(), &state.pairing).await {
+    if let Err(e) = super::persist_pairing_tokens(
+        state.config.clone(),
+        &state.pairing,
+        state.config_write_lock.clone(),
+    )
+    .await
+    {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Token revoked in memory but config persist failed: {e}"),

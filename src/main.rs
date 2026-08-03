@@ -7072,7 +7072,10 @@ fn paircode_no_code_message(
 
     lines.push(String::new());
     lines.push("To inspect the running gateway:".into());
-    lines.push(format!("    open http://{host}:{port}"));
+    lines.push(format!(
+        "    open http://{}:{port}",
+        gateway_browser_host(host)
+    ));
     indent_paircode_lines(lines)
 }
 
@@ -8012,6 +8015,14 @@ fn is_default_gateway_addr(host: &str, port: u16, default_host: &str, default_po
     host == default_host && port == default_port
 }
 
+fn gateway_browser_host(host: &str) -> &str {
+    match host {
+        "0.0.0.0" => "127.0.0.1",
+        "::" | "[::]" => "[::1]",
+        _ => host,
+    }
+}
+
 fn gateway_addr_in_use_message(
     host: &str,
     port: u16,
@@ -8028,7 +8039,10 @@ fn gateway_addr_in_use_message(
     ];
 
     if is_default_gateway_addr(host, port, default_host, default_port) {
-        lines.push(format!("    open http://{host}:{port}"));
+        lines.push(format!(
+            "    open http://{}:{port}",
+            gateway_browser_host(host)
+        ));
     }
 
     lines.push(gateway_paircode_recovery_command(
@@ -8728,6 +8742,31 @@ mod tests {
 
     #[test]
     #[cfg(feature = "agent-runtime")]
+    fn paircode_no_code_message_uses_loopback_browser_hint_for_wildcard_hosts() {
+        let default = config::GatewayConfig::default();
+
+        for (host, browser_host) in [("0.0.0.0", "127.0.0.1"), ("::", "[::1]"), ("[::]", "[::1]")] {
+            let msg = paircode_no_code_message(
+                host,
+                9001,
+                &default.host,
+                default.port,
+                &PaircodeAction::Show,
+                true,
+                None,
+            );
+
+            assert!(
+                msg.contains(&format!("open http://{browser_host}:9001")),
+                "{msg}"
+            );
+            assert!(msg.contains(&format!("--port 9001 --host {host}")), "{msg}");
+            assert!(!msg.contains(&format!("open http://{host}:9001")), "{msg}");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
     fn paircode_no_code_message_omits_configured_default_host_port() {
         let msg = paircode_no_code_message(
             "192.168.1.20",
@@ -8791,6 +8830,19 @@ mod tests {
         assert!(msg.contains("zeroclaw gateway get-paircode --port 9001 --host 0.0.0.0"));
         assert!(msg.contains("zeroclaw gateway start --port 9002 --host 0.0.0.0"));
         assert!(msg.contains("lsof -nP -iTCP:9001 -sTCP:LISTEN"));
+    }
+
+    #[test]
+    fn gateway_addr_in_use_message_uses_loopback_browser_hint_for_wildcard_default() {
+        for (host, browser_host) in [("0.0.0.0", "127.0.0.1"), ("::", "[::1]"), ("[::]", "[::1]")] {
+            let msg = gateway_addr_in_use_message(host, 9001, host, 9001, None);
+
+            assert!(
+                msg.contains(&format!("open http://{browser_host}:9001")),
+                "{msg}"
+            );
+            assert!(!msg.contains(&format!("open http://{host}:9001")), "{msg}");
+        }
     }
 
     #[test]

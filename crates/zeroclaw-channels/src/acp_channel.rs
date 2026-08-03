@@ -11,6 +11,7 @@ use zeroclaw_api::elicitation::{
     ElicitationCapabilities, ElicitationMode, ElicitationRequest, ElicitationResponse,
     multi_select_schema, single_select_schema,
 };
+use zeroclaw_runtime::i18n;
 
 use crate::orchestrator::acp_server::RpcOutbound;
 
@@ -415,30 +416,33 @@ impl Channel for AcpChannel {
         let mut options = vec![
             json!({
                 "optionId": "allow-once",
-                "name": "Allow once",
+                "name": i18n::get_required_cli_string("channel-approval-opt-allow-once"),
                 "kind": "allow_once",
             }),
             json!({
                 "optionId": "allow-always",
-                "name": "Always allow",
+                "name": i18n::get_required_cli_string("channel-approval-opt-allow-always"),
                 "kind": "allow_always",
             }),
         ];
         if is_edit_tool {
             options.push(json!({
                 "optionId": "reject-with-edit",
-                "name": "Reject with edit",
+                "name": i18n::get_required_cli_string("channel-approval-opt-reject-with-edit"),
                 "kind": "reject_with_edit",
             }));
         }
         options.push(json!({
             "optionId": "reject-once",
-            "name": "Reject",
+            "name": i18n::get_required_cli_string("channel-approval-opt-reject"),
             "kind": "reject_once",
         }));
 
         let tool_call_id = format!("approval-{}", uuid::Uuid::new_v4());
-        let title = format!("Approve {}?", request.tool_name);
+        let title = i18n::get_required_cli_string_with_args(
+            "channel-approval-title",
+            &[("tool", &request.tool_name)],
+        );
         let kind = map_approval_kind(&request.tool_name);
         let raw_input = build_approval_raw_input(&request.tool_name, &request.raw_arguments);
         let content = build_approval_content(
@@ -981,7 +985,14 @@ mod tests {
         assert_eq!(req["params"]["options"].as_array().unwrap().len(), 3);
         assert_eq!(req["params"]["options"][0]["optionId"], "allow-once");
         assert_eq!(req["params"]["options"][1]["kind"], "allow_always");
-        assert_eq!(req["params"]["toolCall"]["title"], "Approve git?");
+        // Locale-aware: resolve the expected title through the same Fluent
+        // key the implementation uses, rather than hardcoding the `en` text,
+        // so this test doesn't desync from a future wording change.
+        let expected_title = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+            "channel-approval-title",
+            &[("tool", "git")],
+        );
+        assert_eq!(req["params"]["toolCall"]["title"], expected_title);
         assert_eq!(req["params"]["toolCall"]["status"], "pending");
         assert_eq!(
             req["params"]["toolCall"]["content"][0]["content"]["text"],

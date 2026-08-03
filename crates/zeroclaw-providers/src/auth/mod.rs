@@ -6,6 +6,7 @@ pub mod openai_oauth;
 pub mod profiles;
 pub mod xai_oauth;
 
+use crate::auth::oauth_common::{RefreshRetryPolicy, refresh_with_retries};
 use crate::auth::openai_oauth::refresh_access_token;
 use crate::auth::profiles::{
     AuthProfile, AuthProfileKind, AuthProfilesData, AuthProfilesStore, TokenSet, profile_id,
@@ -24,7 +25,8 @@ const XAI_PROVIDER: &str = "xai";
 const DEFAULT_PROFILE_NAME: &str = "default";
 const OPENAI_REFRESH_SKEW_SECS: u64 = 90;
 const OPENAI_REFRESH_FAILURE_BACKOFF_SECS: u64 = 10;
-const OAUTH_REFRESH_MAX_ATTEMPTS: usize = 3;
+const OAUTH_REFRESH_MAX_ATTEMPTS: std::num::NonZeroUsize =
+    std::num::NonZeroUsize::new(3).expect("OAuth refresh attempt count must be nonzero");
 const OAUTH_REFRESH_RETRY_BASE_DELAY_MS: u64 = 350;
 static REFRESH_BACKOFFS: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
 
@@ -703,35 +705,18 @@ async fn refresh_openai_access_token_with_retries(
     client: &reqwest::Client,
     refresh_token: &str,
 ) -> Result<TokenSet> {
-    let mut last_error: Option<anyhow::Error> = None;
-
-    for attempt in 1..=OAUTH_REFRESH_MAX_ATTEMPTS {
-        match refresh_access_token(client, refresh_token).await {
-            Ok(tokens) => return Ok(tokens),
-            Err(err) => {
-                let should_retry = attempt < OAUTH_REFRESH_MAX_ATTEMPTS;
-                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"attempt": attempt, "max_attempts": OAUTH_REFRESH_MAX_ATTEMPTS, "retry": should_retry, "error": format!("{}", err)})), "OpenAI token refresh failed");
-                last_error = Some(err);
-                if should_retry {
-                    tokio::time::sleep(Duration::from_millis(
-                        OAUTH_REFRESH_RETRY_BASE_DELAY_MS * attempt as u64,
-                    ))
-                    .await;
-                }
-            }
-        }
-    }
-
-    Err(last_error.unwrap_or_else(|| {
-        ::zeroclaw_log::record!(
-            ERROR,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(::serde_json::json!({"oauth_provider": "openai"})),
-            "auth: OpenAI token refresh exhausted retries"
-        );
-        anyhow::Error::msg("OpenAI token refresh failed")
-    }))
+    refresh_with_retries(
+        RefreshRetryPolicy {
+            max_attempts: OAUTH_REFRESH_MAX_ATTEMPTS,
+            base_delay_ms: OAUTH_REFRESH_RETRY_BASE_DELAY_MS,
+        },
+        || refresh_access_token(client, refresh_token),
+        |_| false,
+        |failure| {
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"attempt": failure.attempt, "max_attempts": failure.max_attempts, "retry": failure.should_retry, "error": format!("{}", failure.error)})), "OpenAI token refresh failed");
+        },
+    )
+    .await
 }
 
 async fn refresh_gemini_access_token_with_retries(
@@ -740,37 +725,20 @@ async fn refresh_gemini_access_token_with_retries(
     client_secret: &str,
     refresh_token: &str,
 ) -> Result<TokenSet> {
-    let mut last_error: Option<anyhow::Error> = None;
-
-    for attempt in 1..=OAUTH_REFRESH_MAX_ATTEMPTS {
-        match gemini_oauth::refresh_access_token(client, client_id, client_secret, refresh_token)
-            .await
-        {
-            Ok(tokens) => return Ok(tokens),
-            Err(err) => {
-                let should_retry = attempt < OAUTH_REFRESH_MAX_ATTEMPTS;
-                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"attempt": attempt, "max_attempts": OAUTH_REFRESH_MAX_ATTEMPTS, "retry": should_retry, "error": format!("{}", err)})), "Gemini token refresh failed");
-                last_error = Some(err);
-                if should_retry {
-                    tokio::time::sleep(Duration::from_millis(
-                        OAUTH_REFRESH_RETRY_BASE_DELAY_MS * attempt as u64,
-                    ))
-                    .await;
-                }
-            }
-        }
-    }
-
-    Err(last_error.unwrap_or_else(|| {
-        ::zeroclaw_log::record!(
-            ERROR,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(::serde_json::json!({"oauth_provider": "gemini"})),
-            "auth: Gemini token refresh exhausted retries"
-        );
-        anyhow::Error::msg("Gemini token refresh failed")
-    }))
+    refresh_with_retries(
+        RefreshRetryPolicy {
+            max_attempts: OAUTH_REFRESH_MAX_ATTEMPTS,
+            base_delay_ms: OAUTH_REFRESH_RETRY_BASE_DELAY_MS,
+        },
+        || {
+            gemini_oauth::refresh_access_token(client, client_id, client_secret, refresh_token)
+        },
+        |_| false,
+        |failure| {
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"attempt": failure.attempt, "max_attempts": failure.max_attempts, "retry": failure.should_retry, "error": format!("{}", failure.error)})), "Gemini token refresh failed");
+        },
+    )
+    .await
 }
 
 async fn refresh_email_access_token_with_retries(
@@ -780,46 +748,26 @@ async fn refresh_email_access_token_with_retries(
     refresh_token: &str,
     scopes: &[String],
 ) -> Result<TokenSet> {
-    let mut last_error: Option<anyhow::Error> = None;
-    let retry_base_delay_ms = oauth_refresh_retry_base_delay_ms();
-
-    for attempt in 1..=OAUTH_REFRESH_MAX_ATTEMPTS {
-        match email_oauth2::refresh_access_token(
-            client,
-            token_url,
-            client_id,
-            refresh_token,
-            scopes,
-        )
-        .await
-        {
-            Ok(tokens) => return Ok(tokens),
-            Err(err) => {
-                let non_retryable = is_non_retryable_oauth_refresh_error(&err);
-                let should_retry = !non_retryable && attempt < OAUTH_REFRESH_MAX_ATTEMPTS;
-                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"attempt": attempt, "max_attempts": OAUTH_REFRESH_MAX_ATTEMPTS, "retry": should_retry, "non_retryable": non_retryable, "error": format!("{}", err)})), "Email OAuth2 token refresh failed");
-                last_error = Some(err);
-                if should_retry && retry_base_delay_ms > 0 {
-                    tokio::time::sleep(Duration::from_millis(retry_base_delay_ms * attempt as u64))
-                        .await;
-                }
-                if !should_retry {
-                    break;
-                }
-            }
-        }
-    }
-
-    Err(last_error.unwrap_or_else(|| {
-        ::zeroclaw_log::record!(
-            ERROR,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(::serde_json::json!({"oauth_provider": "email"})),
-            "auth: Email OAuth2 token refresh exhausted retries"
-        );
-        anyhow::Error::msg("Email OAuth2 token refresh failed")
-    }))
+    refresh_with_retries(
+        RefreshRetryPolicy {
+            max_attempts: OAUTH_REFRESH_MAX_ATTEMPTS,
+            base_delay_ms: oauth_refresh_retry_base_delay_ms(),
+        },
+        || {
+            email_oauth2::refresh_access_token(
+                client,
+                token_url,
+                client_id,
+                refresh_token,
+                scopes,
+            )
+        },
+        is_non_retryable_oauth_refresh_error,
+        |failure| {
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"attempt": failure.attempt, "max_attempts": failure.max_attempts, "retry": failure.should_retry, "non_retryable": failure.non_retryable, "error": format!("{}", failure.error)})), "Email OAuth2 token refresh failed");
+        },
+    )
+    .await
 }
 
 fn oauth_refresh_retry_base_delay_ms() -> u64 {
@@ -834,22 +782,16 @@ async fn refresh_xai_access_token_with_retries(
     client: &reqwest::Client,
     refresh_token: &str,
 ) -> Result<TokenSet> {
-    let mut last_err = None;
-    for attempt in 0..OAUTH_REFRESH_MAX_ATTEMPTS {
-        match crate::auth::xai_oauth::refresh_access_token(client, refresh_token).await {
-            Ok(tokens) => return Ok(tokens),
-            Err(err) => {
-                last_err = Some(err);
-                if attempt + 1 < OAUTH_REFRESH_MAX_ATTEMPTS {
-                    tokio::time::sleep(Duration::from_millis(
-                        OAUTH_REFRESH_RETRY_BASE_DELAY_MS * (attempt as u64 + 1),
-                    ))
-                    .await;
-                }
-            }
-        }
-    }
-    Err(last_err.unwrap_or_else(|| anyhow::Error::msg("xAI OAuth refresh failed")))
+    refresh_with_retries(
+        RefreshRetryPolicy {
+            max_attempts: OAUTH_REFRESH_MAX_ATTEMPTS,
+            base_delay_ms: OAUTH_REFRESH_RETRY_BASE_DELAY_MS,
+        },
+        || crate::auth::xai_oauth::refresh_access_token(client, refresh_token),
+        |_| false,
+        |_| {},
+    )
+    .await
 }
 
 fn is_non_retryable_oauth_refresh_error(err: &anyhow::Error) -> bool {
