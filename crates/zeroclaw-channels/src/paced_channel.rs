@@ -194,7 +194,7 @@ impl PacedChannel {
                 && !state.in_flight
                 && now >= state.next_allowed_at
             {
-                state.next_allowed_at = now + self.min_interval;
+                state.next_allowed_at = now + jittered_interval(self.min_interval);
                 state.in_flight = true;
                 (Some(op), None, false)
             } else if state.queue.len() >= self.queue_depth {
@@ -295,7 +295,7 @@ impl PacedChannel {
                         state.worker_running = false;
                         return;
                     }
-                    state.next_allowed_at = Instant::now() + min_interval;
+                    state.next_allowed_at = Instant::now() + jittered_interval(min_interval);
                     state.queue.pop_front()
                 };
                 if let Some(PendingSend { op, reply }) = pending {
@@ -305,6 +305,31 @@ impl PacedChannel {
             }
         });
     }
+}
+
+/// Fraction of the configured floor added, at most, as jitter.
+///
+/// Kept small on purpose. The floor is the operator's stated cadence; jitter
+/// exists to break the machine-perfect regularity of it, not to redefine it.
+const PACING_JITTER_FRACTION: f64 = 0.2;
+
+/// The floor for one dispatch, with jitter applied.
+///
+/// Jitter is **additive only** — the result is always in `[base, base * 1.2]`.
+/// `reply_min_interval_secs` is documented as a *minimum* gap, and 30+ channels
+/// rely on that guarantee; a jitter that could subtract would quietly turn a
+/// floor into an average and break the contract for every one of them.
+///
+/// The reason it exists: replies spaced at exactly N seconds, forever, are a
+/// signature no human produces. On a platform that judges an account on whether
+/// it behaves like a person, perfectly regular spacing is the tell — and this
+/// WhatsApp number has already been restricted twice for looking automated.
+fn jittered_interval(base: Duration) -> Duration {
+    if base.is_zero() {
+        return base;
+    }
+    let extra = base.mul_f64(PACING_JITTER_FRACTION * rand::random::<f64>());
+    base.saturating_add(extra)
 }
 
 /// Redact a recipient identifier for log surfaces. The privacy contract
@@ -912,5 +937,56 @@ mod tests {
             2,
             "both sends eventually dispatch exactly once each",
         );
+    }
+
+    /// The invariant every other channel depends on: `reply_min_interval_secs`
+    /// is a documented *minimum*. Jitter may only ever push a dispatch later,
+    /// never earlier. Sampled rather than asserted once, because a subtractive
+    /// jitter bug would show up as a rare early dispatch, not a consistent one.
+    #[test]
+    fn jitter_never_dispatches_before_the_configured_floor() {
+        let base = Duration::from_secs(10);
+        for _ in 0..10_000 {
+            let got = jittered_interval(base);
+            assert!(
+                got >= base,
+                "jitter must be additive: {got:?} fell below the {base:?} floor"
+            );
+            assert!(
+                got <= base.mul_f64(1.0 + PACING_JITTER_FRACTION),
+                "jitter must stay within the documented band: {got:?}"
+            );
+        }
+    }
+
+    /// A disabled floor stays disabled. `wrap()` returns the inner channel
+    /// untouched at zero, so a jitter that invented a delay here would
+    /// reintroduce latency on every channel that opted out of pacing.
+    #[test]
+    fn jitter_leaves_a_zero_floor_alone() {
+        assert_eq!(jittered_interval(Duration::ZERO), Duration::ZERO);
+    }
+
+    /// Jitter has to actually vary, or it is just a constant offset wearing a
+    /// costume and the machine-perfect spacing it exists to break survives.
+    #[test]
+    fn jitter_actually_varies_across_dispatches() {
+        let base = Duration::from_secs(10);
+        let samples: std::collections::HashSet<u128> = (0..200)
+            .map(|_| jittered_interval(base).as_nanos())
+            .collect();
+        assert!(
+            samples.len() > 100,
+            "expected a spread of intervals, got {} distinct values",
+            samples.len()
+        );
+    }
+
+    /// An enormous floor must not panic through the multiply-and-add. Uses
+    /// `saturating_add`, so the ceiling clamps instead of overflowing.
+    #[test]
+    fn jitter_saturates_instead_of_overflowing() {
+        let _ = jittered_interval(Duration::from_secs(u64::MAX / 2));
+        let _ = jittered_interval(Duration::MAX);
     }
 }
