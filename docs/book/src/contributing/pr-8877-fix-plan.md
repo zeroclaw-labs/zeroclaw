@@ -303,6 +303,7 @@ playwright test sidebar-compact-viewport  # capture evidence
 ```
 
 ### Diff stat
+
 ```
 web/src/components/layout/Sidebar.tsx   +XX / -YY  (merged with master)
 web/src/components/layout/SidebarNavLink.tsx  (unchanged, from master)
