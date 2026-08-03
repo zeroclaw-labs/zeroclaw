@@ -1284,6 +1284,35 @@ vision_model_provider = "openai"
     }
 
     #[test]
+    fn v2_bare_family_with_only_default_alias_variant_left_alone() {
+        // `qwen-intl` canonicalizes to `qwen.default` (with the intl endpoint)
+        // — a DEFAULT-named alias. A bare `qwen` reference must NOT be
+        // redirected to it, since that would silently inherit the qwen-intl
+        // endpoint/credentials. The bare family has no own source entry, so it
+        // stays bare (fail-closed).
+        let raw = r#"
+schema_version = 2
+
+[providers.models.qwen-intl]
+api_key = "sk-qwen-intl-test"
+model = "m"
+
+[multimodal]
+vision_model_provider = "qwen"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("qwen"),
+            "bare family with only a default-named variant must stay bare"
+        );
+        assert!(
+            cfg.providers.models.find("qwen", "default").is_some(),
+            "the qwen-intl entry must still migrate to qwen.default"
+        );
+    }
+
+    #[test]
     fn v1_legacy_vision_reference_migrates_through_chain() {
         // No `schema_version` implies V1. The `model_providers` shape feeds
         // V2 `[providers.models]`, and the V2->V3 step canonicalizes the
