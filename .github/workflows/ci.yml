@@ -155,6 +155,11 @@ jobs:
         run: |
           bash scripts/ci/comment_hygiene_gate.test.sh
           bash scripts/ci/comment_hygiene_gate.sh
+      - name: Channel feature coverage guard (no channel left unbuilt)
+        # A channel gated behind a feature that no aggregate set includes is a
+        # channel CI never compiles. Building without it yields a binary that
+        # starts clean, passes `doctor`, and silently serves nothing.
+        run: cargo test --test architecture channel_feature_coverage
 
   windows-clippy-tools-changes:
     name: Detect Windows Clippy changes

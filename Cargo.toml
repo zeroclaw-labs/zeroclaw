@@ -320,6 +320,10 @@ channels-full = [
     "channel-linq", "channel-wati", "channel-nextcloud",
     "channel-mochat", "channel-wecom", "channel-wecom-ws", "channel-clawdtalk",
     "channel-whatsapp-cloud", "channel-voice-call",
+    # Previously in no aggregate at all, so CI never compiled them: a build
+    # omitting one looks completely healthy while that channel is dead.
+    # Caught by tests/architecture/channel_feature_coverage.rs.
+    "channel-line", "channel-wechat", "channel-feishu",
 ]
 
 # Major subsystems — each forwards to exactly ONE crate
