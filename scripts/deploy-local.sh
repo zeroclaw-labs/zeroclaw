@@ -344,11 +344,57 @@ while IFS= read -r db; do
 done < <(find "$SESSION_DIR" -name 'session.db' -maxdepth 3 2>/dev/null)
 
 # ---------------------------------------------------------------------------
-# 7. Install and restart
+# 7. Install — and decide whether restarting is safe
+#
+# The health check in step 8 proves the deploy by waiting for the channel to
+# connect, and rolls back when it doesn't. That is the right behaviour when a
+# connection is *possible*. It is actively harmful when it is not.
+#
+# A WhatsApp session whose device row has no phone number has been revoked
+# server-side: the credentials are gone and no amount of restarting will bring
+# the channel up until a human re-pairs the device. Run the normal path against
+# that state and every deploy costs four device reconnections — start the new
+# binary, fail the health check, reinstall the old one, start it again — each
+# one more evidence to Meta that this account behaves like a bot. That is not
+# hypothetical: 23 restarts inside ten hours preceded the revocation this check
+# now detects, and the automatic rollback supplied a share of them.
+#
+# So when the session is already revoked, install the binary and stop. The
+# deploy still happens; the code is in place for whenever pairing is restored.
+# What is skipped is the part that cannot succeed and is not free to attempt.
 # ---------------------------------------------------------------------------
-say "7/8  Installing and restarting"
+say "7/8  Installing"
+
+# Returns 0 when a paired session exists, 1 when every session is revoked.
+# Absence of any session file is NOT revocation — a first-ever deploy has no
+# session yet and must be allowed to start and present a QR code.
+session_is_paired() {
+  local found_any=0 db pn
+  while IFS= read -r db; do
+    [[ -f "$db" ]] || continue
+    found_any=1
+    # `pn` is the device's own phone number, written at pairing and cleared
+    # when the server revokes. Query read-only so a live daemon is undisturbed.
+    pn=$(sqlite3 "file:${db}?mode=ro" \
+           "SELECT COALESCE(pn, '') FROM device LIMIT 1;" 2>/dev/null || true)
+    [[ -n "$pn" ]] && return 0
+  done < <(find "$HOME/.zeroclaw/state" -name 'session.db' -maxdepth 3 2>/dev/null)
+  (( found_any )) && return 1 || return 0
+}
+
 sudo install -m 755 "$BUILT" "$ZC_TARGET"
 ok "installed to $ZC_TARGET"
+
+if ! session_is_paired; then
+  bad "session is revoked — installed, NOT restarting"
+  info "every session on this host has an empty device.pn, which means the"
+  info "server dropped the pairing. Restarting cannot reconnect and each"
+  info "attempt makes the account look more automated."
+  info ""
+  info "re-pair first, then:  systemctl --user start $ZC_SERVICE"
+  exit 0
+fi
+
 systemctl --user restart "$ZC_SERVICE"
 ok "restarted $ZC_SERVICE"
 
