@@ -618,7 +618,97 @@ impl HindsightMemory {
             }
         }
     }
+
+    /// Dedicated write-time lookup of the COMPLETE set of ACTIVE (valid)
+    /// PRIVATE Daily rows, used ONLY by the per-turn Daily dedup gate
+    /// ([`Memory::list_own_daily_history`]).
+    ///
+    /// Deliberately does NOT reuse [`Self::list_bank`], because the dedup
+    /// decision must see every active private-Daily record - not the rows
+    /// recall chooses to PRESENT. Three differences from `list_bank`:
+    ///
+    ///   - `state=valid`: the Hindsight list route INCLUDES invalidated rows by
+    ///     default. Without this filter an explicitly invalidated Daily match
+    ///     could suppress its own replacement, so an invalidation would leave no
+    ///     active record. Restricting to `valid` means dedup only ever compares
+    ///     against rows that still exist.
+    ///   - COMPLETE pagination: the route returns only the first page
+    ///     (`PRIVATE_DAILY_PAGE_SIZE` rows) by default, so a valid duplicate
+    ///     beyond page 1 would be invisible and the same summary appended again.
+    ///     This pages until the server's reported `total` is covered (a short
+    ///     page also terminates, so a server that omits `total` still stops).
+    ///   - NO `recall_types` filter: S3 applies the `recall_types`
+    ///     recall-PRESENTATION predicate per row inside `list_bank`
+    ///     ([`Self::fact_type_allowed`]). Write-time dedup must be independent of
+    ///     how recall filters what it shows, so this path never calls
+    ///     `fact_type_allowed`. The recall path is untouched: recent-recall
+    ///     still routes through `list`/`list_bank`, which keeps S3's filter.
+    ///
+    /// Daily narrowing is expressed to the server as a `tags=daily` filter AND
+    /// re-enforced locally on the decoded category, so a server that ignores the
+    /// tag param still yields only Daily rows.
+    async fn list_private_daily_active(&self) -> Result<Vec<MemoryEntry>> {
+        let mut entries: Vec<MemoryEntry> = Vec::new();
+        let mut offset: usize = 0;
+        loop {
+            let resp = self
+                .client
+                .get(self.list_url_for(&self.bank))
+                .bearer_auth(&self.token)
+                // Validity + Daily narrowing. `state=valid` excludes invalidated
+                // rows; `tags=daily` asks the server to return only Daily rows.
+                // The literal "daily" is the retain-time category tag (see
+                // `tags_for`), so it round-trips through `category_from_tags`.
+                .query(&[("state", "valid"), ("tags", DAILY_CATEGORY_TAG)])
+                // Complete pagination over the active private Daily set.
+                .query(&[("limit", PRIVATE_DAILY_PAGE_SIZE), ("offset", offset)])
+                .send()
+                .await
+                .context("hindsight private-daily list request failed")?;
+            let status = resp.status();
+            if !status.is_success() {
+                let body = bounded_error_body(resp).await;
+                anyhow::bail!("hindsight private-daily list returned HTTP {status}: {body}");
+            }
+            let parsed: ListResponse = read_json_capped(
+                resp,
+                "hindsight private-daily list returned unparseable JSON",
+            )
+            .await?;
+            let page_len = parsed.items.len();
+            let total = parsed.total;
+            // Re-enforce the Daily category locally (defense in depth if the
+            // server ignores `tags=daily`). NOTE: intentionally no
+            // `fact_type_allowed` call - the write-time set must not inherit
+            // S3's recall_types presentation filter.
+            entries.extend(
+                parsed
+                    .items
+                    .into_iter()
+                    .map(|i| Self::to_entry(i.id, i.text, i.context, i.mentioned_at, &i.tags, None))
+                    .filter(|e| e.category == MemoryCategory::Daily),
+            );
+            offset += page_len;
+            // Terminate on a short/empty page (no more rows) or once the
+            // server's reported total is covered.
+            let covered_total = total.is_some_and(|t| offset as u64 >= t);
+            if page_len < PRIVATE_DAILY_PAGE_SIZE || page_len == 0 || covered_total {
+                break;
+            }
+        }
+        Ok(entries)
+    }
 }
+
+/// Rows requested per page when exhaustively paging the active private Daily
+/// dedup candidate set. The Hindsight list route caps a single page at 100
+/// rows, so the dedicated write-time query pages until the server's reported
+/// `total` is covered.
+const PRIVATE_DAILY_PAGE_SIZE: usize = 100;
+
+/// Retain-time category tag for Daily rows (`tags_for(Daily)` pushes this), sent
+/// as the server-side `tags=` narrowing filter on the write-time dedup query.
+const DAILY_CATEGORY_TAG: &str = "daily";
 
 // ── Wire types (validated against the live tokengate hindsight API) ──
 
@@ -1194,18 +1284,23 @@ impl Memory for HindsightMemory {
     }
 
     async fn list_own_daily_history(&self) -> Result<Vec<MemoryEntry>> {
-        // Private-bank + Daily-scoped candidate lookup for the per-turn Daily
-        // dedup gate. Unlike `list` (which merges the shared/system read tiers),
-        // this reads ONLY the agent's PRIVATE bank and keeps only Daily rows, so
-        // a shared/system Daily row can never suppress a private Daily write and
-        // an unrelated category can never crowd the private duplicate out. The
-        // list endpoint has no server-side category filter, so the Daily filter
-        // is applied locally on the decoded category.
-        let entries = self.list_bank(&self.bank).await?;
-        Ok(entries
-            .into_iter()
-            .filter(|e| e.category == MemoryCategory::Daily)
-            .collect())
+        // Write-time candidate lookup for the per-turn Daily dedup gate. Unlike
+        // `list` (which merges the shared/system read tiers) AND unlike
+        // `list_bank` (which is the recall-PRESENTATION path: first page only,
+        // includes invalidated rows, and applies S3's `recall_types` filter),
+        // this uses a DEDICATED query over the agent's PRIVATE bank that returns
+        // the COMPLETE set of ACTIVE (valid) Daily rows with NO recall_types
+        // filter (see `list_private_daily_active`). This guarantees:
+        //   - a shared/system Daily row can never suppress a private Daily write
+        //     (private bank only);
+        //   - an invalidated match can never suppress its replacement
+        //     (`state=valid`);
+        //   - a valid duplicate beyond the first page is never missed
+        //     (complete pagination);
+        //   - a Daily row excluded from recall by `recall_types` is still
+        //     compared at write time (no presentation filter here), while the
+        //     recall path keeps S3's filter untouched.
+        self.list_private_daily_active().await
     }
 
     async fn forget(&self, key: &str) -> Result<bool> {
@@ -2035,6 +2130,165 @@ mod tests {
             .expect("list should succeed");
         let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(ids, vec!["daily1", "daily2"], "only Daily rows: {ids:?}");
+    }
+
+    #[tokio::test]
+    async fn list_own_daily_history_requests_only_valid_state_so_invalidated_rows_cannot_suppress()
+    {
+        // B2 regression (a): the Hindsight list route INCLUDES invalidated rows
+        // by default, so an explicitly invalidated Daily match could suppress
+        // its own replacement at write time. The dedicated write-time query
+        // must send `state=valid`; the mock ONLY matches when that param is
+        // present, and returns the single active row. If the query regressed to
+        // the default (no state filter), wiremock would 404 and the call would
+        // fail loudly instead of silently including invalidated rows.
+        use wiremock::matchers::query_param;
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/list"))
+            .and(query_param("state", "valid"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "items": [
+                    { "id": "active-daily", "text": "the surviving replacement", "tags": ["daily"] }
+                ],
+                "total": 1
+            })))
+            .mount(&server)
+            .await;
+
+        let mem = memory_for(&server.uri(), "zeroclaw-test");
+        let rows = mem
+            .list_own_daily_history()
+            .await
+            .expect("write-time daily lookup must send state=valid and succeed");
+        let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["active-daily"],
+            "only the active (valid) Daily row is a dedup candidate: {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_own_daily_history_pages_beyond_the_first_hundred_candidates() {
+        // B2 regression (b): the list route returns only the first page (100
+        // rows) by default, so a valid duplicate beyond page 1 would be
+        // invisible and the same summary appended again. The dedicated query
+        // must page COMPLETELY. Page 1 (offset=0) returns 100 rows with
+        // total=101; page 2 (offset=100) returns the 101st row. Both must be in
+        // the returned candidate set.
+        use wiremock::matchers::query_param;
+        let server = MockServer::start().await;
+
+        let page1: Vec<_> = (0..100)
+            .map(|i| json!({ "id": format!("d{i}"), "text": format!("daily {i}"), "tags": ["daily"] }))
+            .collect();
+        Mock::given(method("GET"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/list"))
+            .and(query_param("offset", "0"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "items": page1, "total": 101 })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/list"))
+            .and(query_param("offset", "100"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "items": [
+                    { "id": "d100", "text": "daily 100 (page 2)", "tags": ["daily"] }
+                ],
+                "total": 101
+            })))
+            .mount(&server)
+            .await;
+
+        let mem = memory_for(&server.uri(), "zeroclaw-test");
+        let rows = mem
+            .list_own_daily_history()
+            .await
+            .expect("complete pagination must succeed");
+        assert_eq!(
+            rows.len(),
+            101,
+            "every active Daily candidate across all pages must be returned, got {}",
+            rows.len()
+        );
+        assert!(
+            rows.iter().any(|r| r.id == "d100"),
+            "the 101st row on page 2 must be included so a beyond-page-1 duplicate is not missed"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_own_daily_history_bypasses_recall_types_on_the_write_path() {
+        // B2 regression (c) + the S3 interaction: S3 applies `recall_types` as a
+        // per-row presentation predicate inside `list_bank`. Write-time dedup
+        // must compare against the COMPLETE active Daily set regardless of
+        // recall visibility, so the dedicated query must NOT inherit that
+        // filter. Here the agent is configured observations-only, yet a Daily
+        // row typed `experience` (which recall would hide) must still surface as
+        // a dedup candidate. The mock has no `type`-based behavior; the point is
+        // that the returned experience-typed Daily row is kept, proving
+        // `fact_type_allowed` is never applied on this path.
+        use wiremock::matchers::query_param;
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/list"))
+            .and(query_param("state", "valid"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "items": [
+                    { "id": "obs-daily", "text": "observation daily", "type": "observation", "tags": ["daily"] },
+                    { "id": "exp-daily", "text": "experience daily", "type": "experience", "tags": ["daily"] }
+                ],
+                "total": 2
+            })))
+            .mount(&server)
+            .await;
+
+        let mut mem = memory_for(&server.uri(), "zeroclaw-test");
+        // Recall presentation is restricted to observations only...
+        mem.recall_types = vec!["observation".to_string()];
+
+        // ...but the write-time dedup candidate set must include BOTH Daily rows.
+        let rows = mem
+            .list_own_daily_history()
+            .await
+            .expect("write-time daily lookup must succeed");
+        let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            ids.contains(&"obs-daily") && ids.contains(&"exp-daily"),
+            "write-time dedup must see the complete active Daily set, ignoring recall_types: {ids:?}"
+        );
+
+        // And prove the recall PATH is unaffected: the same mixed-type rows via
+        // the recall/list presentation path still drop the experience row.
+        // Served from a SECOND server because `list_bank` sends a plain GET
+        // (no `state=valid`), which the write-time mock above intentionally
+        // does not match.
+        let recall_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "items": [
+                    { "id": "obs-daily", "text": "observation daily", "type": "observation", "tags": ["daily"] },
+                    { "id": "exp-daily", "text": "experience daily", "type": "experience", "tags": ["daily"] }
+                ],
+                "total": 2
+            })))
+            .mount(&recall_server)
+            .await;
+        let mut recall_mem = memory_for(&recall_server.uri(), "zeroclaw-test");
+        recall_mem.recall_types = vec!["observation".to_string()];
+        let presented = recall_mem
+            .list_bank(&recall_mem.bank)
+            .await
+            .expect("recall-presentation list must succeed");
+        let presented_ids: Vec<&str> = presented.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            presented_ids.contains(&"obs-daily") && !presented_ids.contains(&"exp-daily"),
+            "S3's recall_types filter must still apply on the recall path: {presented_ids:?}"
+        );
     }
 
     /// A memory pointed at `base_url` whose client carries a very short
