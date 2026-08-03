@@ -258,10 +258,7 @@ const HUMAN_TYPING_MAX_HOLD_SECS: u64 = 9;
 /// Returns `None` when the answer is short enough, or generation slow enough,
 /// that the time already spent is a believable typing time on its own — the
 /// common case, where this costs nothing.
-fn remaining_human_typing_time(
-    chars: usize,
-    already_elapsed: Duration,
-) -> Option<Duration> {
+fn remaining_human_typing_time(chars: usize, already_elapsed: Duration) -> Option<Duration> {
     #[allow(clippy::cast_precision_loss)]
     let plausible_secs = chars as f64 / HUMAN_TYPING_CHARS_PER_SEC;
     let plausible = Duration::from_secs_f64(plausible_secs.min(
@@ -270,7 +267,9 @@ fn remaining_human_typing_time(
             HUMAN_TYPING_MAX_HOLD_SECS as f64
         },
     ));
-    plausible.checked_sub(already_elapsed).filter(|d| !d.is_zero())
+    plausible
+        .checked_sub(already_elapsed)
+        .filter(|d| !d.is_zero())
 }
 
 const CHANNEL_HEALTH_HEARTBEAT_SECS: u64 = 30;
@@ -7048,19 +7047,29 @@ async fn run_message_dispatch_loop(
         let msg = if msg.channel != "cli" {
             let debounce_key = conversation_history_key(&msg);
 
-            // Resolve effective debounce window: per-channel override wins,
-            // otherwise falls back to the global default from ChannelsConfig.
-            // A per-channel value of 0 is treated as unset (falls back to global).
-            let debounce_window = resolve_effective_debounce_window(
-                ctx.prompt_config.channels.debounce_ms,
-                &msg.channel,
-                msg.channel_alias.as_deref(),
-                &ctx.prompt_config.channels.telegram,
-            );
+                // Resolve effective debounce window: per-channel override wins,
+                // otherwise falls back to the global default from ChannelsConfig.
+                // A per-channel value of 0 is treated as unset (falls back to global).
+                let debounce_window = resolve_effective_debounce_window(
+                    ctx.prompt_config.channels.debounce_ms,
+                    &msg.channel,
+                    msg.channel_alias.as_deref(),
+                    &ctx.prompt_config.channels.telegram,
+                );
 
-            match ctx
-                .debouncer
-                .debounce_with_window(&debounce_key, &msg.content, debounce_window)
+                let mut msg = msg;
+                // Moved, not copied: the inbound message this burst supersedes is
+                // dropped, so the merged payload becomes the only owner of these
+                // attachments rather than a second copy of live state.
+                let pending_attachments = std::mem::take(&mut msg.attachments);
+                match ctx
+                    .debouncer
+                    .debounce_with_window(
+                        &debounce_key,
+                        &msg.content,
+                        pending_attachments,
+                        debounce_window,
+                    )
                 .await
             {
                 zeroclaw_infra::debounce::DebounceResult::Pending(rx) => {
@@ -7073,15 +7082,20 @@ async fn run_message_dispatch_loop(
                     let debounce_task_seq = Arc::clone(&task_sequence);
                     let mut debounce_msg = msg;
                     workers.spawn(async move {
-                        let combined = match rx.await {
-                            Ok(combined) => combined,
+                        let merged = match rx.await {
+                            Ok(merged) => merged,
                             Err(_) => {
                                 // Receiver dropped — a newer message superseded this one.
                                 return;
                             }
                         };
-                        debounce_msg.content = combined;
-                        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"channel": debounce_msg.channel, "sender": debounce_msg.sender})), "Debounced message ready — dispatching combined message");
+                        debounce_msg.content = merged.content;
+                        // Reattach the burst's media. Without this the agent
+                        // would receive the caption of a photo it was never
+                        // handed, because the message carrying the image is
+                        // exactly the one the merge supersedes.
+                        debounce_msg.attachments = merged.attachments;
+                        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"channel": debounce_msg.channel, "sender": debounce_msg.sender, "attachments_count": debounce_msg.attachments.len()})), "Debounced message ready — dispatching combined message");
 
                         let permit = match debounce_semaphore.acquire_owned().await {
                             Ok(permit) => permit,
@@ -7099,9 +7113,10 @@ async fn run_message_dispatch_loop(
                     });
                     continue;
                 }
-                zeroclaw_infra::debounce::DebounceResult::Passthrough(content) => {
+                zeroclaw_infra::debounce::DebounceResult::Passthrough(merged) => {
                     let mut m = msg;
-                    m.content = content;
+                    m.content = merged.content;
+                    m.attachments = merged.attachments;
                     m
                 }
             }

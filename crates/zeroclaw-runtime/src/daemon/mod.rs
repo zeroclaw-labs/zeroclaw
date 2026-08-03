@@ -1938,9 +1938,7 @@ fn heartbeat_session_key(
         } else {
             (b_head, a_head)
         };
-        !shorter.is_empty()
-            && longer.len() == shorter.len() + 1
-            && longer.starts_with(shorter)
+        !shorter.is_empty() && longer.len() == shorter.len() + 1 && longer.starts_with(shorter)
     }
 
     let target_digits = digits_of(to);
@@ -2146,36 +2144,6 @@ fn load_heartbeat_session_context(config: &Config) -> Option<String> {
     Some(ctx)
 }
 
-/// Read the last `HEARTBEAT_SESSION_CONTEXT_MESSAGES` `ChatMessage` lines from
-/// a JSONL session file using a bounded rolling window so we never hold the
-/// entire file in memory.
-fn load_jsonl_messages(path: &std::path::Path) -> Vec<zeroclaw_providers::traits::ChatMessage> {
-    use std::collections::VecDeque;
-    use std::io::BufRead;
-
-    let file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return Vec::new(),
-    };
-    let reader = std::io::BufReader::new(file);
-    let mut window: VecDeque<zeroclaw_providers::traits::ChatMessage> =
-        VecDeque::with_capacity(HEARTBEAT_SESSION_CONTEXT_MESSAGES + 1);
-    for line in reader.lines() {
-        let Ok(line) = line else { continue };
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if let Ok(msg) = serde_json::from_str::<zeroclaw_providers::traits::ChatMessage>(trimmed) {
-            window.push_back(msg);
-            if window.len() > HEARTBEAT_SESSION_CONTEXT_MESSAGES {
-                window.pop_front();
-            }
-        }
-    }
-    window.into_iter().collect()
-}
-
 /// Auto-detect the best channel for heartbeat delivery by checking which
 /// channels are configured. Returns the first match in priority order.
 fn auto_detect_heartbeat_channel(config: &Config) -> Option<(String, String)> {
@@ -2268,8 +2236,16 @@ mod tests {
         let backend = session_backend_with(
             tmp.path(),
             &[
-                ("whatsapp_default_76188559093817_lid__525551234567", "user", "hola"),
-                ("whatsapp_default_99999999999999_lid__525559999999", "user", "otro chat"),
+                (
+                    "whatsapp_default_76188559093817_lid__525551234567",
+                    "user",
+                    "hola",
+                ),
+                (
+                    "whatsapp_default_99999999999999_lid__525559999999",
+                    "user",
+                    "otro chat",
+                ),
             ],
         );
 
@@ -2294,9 +2270,17 @@ mod tests {
             tmp.path(),
             &[
                 // pre-fix key: number carries the Mexican `1`
-                ("whatsapp_default_76188559093817_lid__5215551234567", "user", "viejo"),
+                (
+                    "whatsapp_default_76188559093817_lid__5215551234567",
+                    "user",
+                    "viejo",
+                ),
                 // post-fix key: same human, folded number, newer
-                ("whatsapp_default_76188559093817_lid__525551234567", "user", "nuevo"),
+                (
+                    "whatsapp_default_76188559093817_lid__525551234567",
+                    "user",
+                    "nuevo",
+                ),
             ],
         );
 
@@ -2319,7 +2303,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let backend = session_backend_with(
             tmp.path(),
-            &[("whatsapp_default_11111111111111_lid__525557654321", "user", "ajeno")],
+            &[(
+                "whatsapp_default_11111111111111_lid__525557654321",
+                "user",
+                "ajeno",
+            )],
         );
 
         assert_eq!(
@@ -2339,8 +2327,16 @@ mod tests {
         let backend = session_backend_with(
             tmp.path(),
             &[
-                ("whatsapp_default_22222222222222_lid__15551234567", "user", "US +1"),
-                ("whatsapp_default_33333333333333_lid__445551234567", "user", "UK +44"),
+                (
+                    "whatsapp_default_22222222222222_lid__15551234567",
+                    "user",
+                    "US +1",
+                ),
+                (
+                    "whatsapp_default_33333333333333_lid__445551234567",
+                    "user",
+                    "UK +44",
+                ),
             ],
         );
 
@@ -2359,7 +2355,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let backend = session_backend_with(
             tmp.path(),
-            &[("whatsapp_default_44444444444444_lid__545551234567", "user", "hola")],
+            &[(
+                "whatsapp_default_44444444444444_lid__545551234567",
+                "user",
+                "hola",
+            )],
         );
 
         assert_eq!(
@@ -2374,7 +2374,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let backend = session_backend_with(
             tmp.path(),
-            &[("telegram_default_76188559093817_lid__525551234567", "user", "otro canal")],
+            &[(
+                "telegram_default_76188559093817_lid__525551234567",
+                "user",
+                "otro canal",
+            )],
         );
 
         assert_eq!(
