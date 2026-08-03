@@ -274,13 +274,26 @@ impl PromptSection for DateTimeSection {
         // Force Gregorian year to avoid confusion with local calendars (e.g. Buddhist calendar).
         let (year, month, day) = (now.year(), now.month(), now.day());
 
+        // Date only, deliberately — see #6931. Wall-clock time changes every
+        // second, and this section is part of the cached system prompt: putting
+        // the clock here invalidates the cache on every single turn. Time of day
+        // reaches the model through the per-message timestamp instead
+        // (`timestamp_channel_user_content` in the channels orchestrator), which
+        // is content that was already going to differ turn to turn.
+        //
+        // That timestamp renders in the process's local timezone, so a daemon
+        // running as UTC shows a user in Guadalajara a clock six hours ahead —
+        // one agent asked "¿a estas horas no duermes?" at seven in the evening.
+        // The fix for that is the deployment's `TZ`, not moving the clock back
+        // into this cached section.
         Ok(format!(
             "## CRITICAL CONTEXT: CURRENT DATE\n\n\
              The following is the ABSOLUTE TRUTH regarding the current date. \
              Use this for all relative time calculations (e.g. \"last 7 days\").\n\n\
-             Date: {year:04}-{month:02}-{day:02}\n\
-             UTC offset: {}",
-            now.format("%:z")
+             Date: {year:04}-{month:02}-{day:02} ({weekday})\n\
+             UTC offset: {offset}",
+            weekday = now.format("%A"),
+            offset = now.format("%:z"),
         ))
     }
 }
@@ -588,6 +601,21 @@ mod tests {
         assert!(payload.contains("UTC offset:"));
         assert!(!payload.contains("Time:"));
         assert!(!payload.contains("ISO 8601:"));
+
+        // The weekday is safe to include and the clock is not: this section is
+        // part of the cached system prompt, so anything that changes more often
+        // than once a day invalidates the cache every turn (#6931). A weekday
+        // name changes at most once per day; `HH:MM` changes every minute.
+        assert!(
+            payload.contains(chrono::Local::now().format("%A").to_string().as_str()),
+            "weekday belongs here — it is stable for a whole day: {payload}"
+        );
+        let clock = chrono::Local::now().format("%H:%M").to_string();
+        assert!(
+            !payload.contains(&clock),
+            "wall-clock time must NOT be in the cached prompt; it reaches the \
+             model via the per-message timestamp instead: {payload}"
+        );
     }
 
     #[test]
