@@ -1256,6 +1256,32 @@ vision_model_provider = "llama.cpp"
     }
 
     #[test]
+    fn v1_legacy_vision_reference_migrates_through_chain() {
+        // No `schema_version` implies V1. The `model_providers` shape feeds
+        // V2 `[providers.models]`, and the V2->V3 step canonicalizes the
+        // legacy vision reference through the same mapping, so a V1 legacy
+        // spelling must resolve too.
+        let raw = r#"
+[model_providers.grok]
+api_key = "sk-grok-test"
+model = "m"
+
+[multimodal]
+vision_model_provider = "grok"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("xai.default"),
+            "V1 legacy grok reference must rewrite through the full chain"
+        );
+        assert!(
+            cfg.providers.models.find("xai", "default").is_some(),
+            "migrated V1 grok entry must live at xai.default"
+        );
+    }
+
+    #[test]
     fn provider_pruner_never_panics_on_non_table_shapes() {
         // Array-of-tables where a family map is expected, scalar [providers],
         // array alias value. The salvage path is the daemon's never-fail
