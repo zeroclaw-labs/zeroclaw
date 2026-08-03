@@ -1,6 +1,7 @@
 //! Multi-provider Text-to-Speech (TTS) subsystem.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 
@@ -407,6 +408,20 @@ pub struct EdgeTtsProvider {
     binary_path: String,
 }
 
+/// RAII cleanup for the temporary Edge TTS output file. Removed on every path
+/// out of [`EdgeTtsProvider::synthesize`] — success, subprocess failure,
+/// timeout, and output-read failure — so a partial artifact is never leaked.
+/// Cleanup failure is swallowed so it never masks the primary synthesis error.
+struct EdgeTtsTempArtifact {
+    path: PathBuf,
+}
+
+impl Drop for EdgeTtsTempArtifact {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 impl EdgeTtsProvider {
     /// Allowed basenames for the Edge TTS binary.
     const ALLOWED_BINARIES: &[&str] = &["edge-tts", "edge-playback"];
@@ -433,6 +448,17 @@ impl EdgeTtsProvider {
             binary_path: raw_path,
         })
     }
+
+    /// Test-only constructor that accepts a script path so tests can drive the
+    /// `edge-tts` subprocess. The production [`new`](Self::new) allowlist stays
+    /// a security boundary; this exists only under `cfg(test)`.
+    #[cfg(test)]
+    fn new_with_binary(alias: &str, binary_path: &str) -> Self {
+        Self {
+            alias: alias.to_string(),
+            binary_path: binary_path.to_string(),
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -449,6 +475,11 @@ impl TtsProvider for EdgeTtsProvider {
     async fn synthesize(&self, text: &str, voice: &str) -> Result<Vec<u8>> {
         let temp_dir = std::env::temp_dir();
         let output_file = temp_dir.join(format!("zeroclaw_tts_{}.mp3", uuid::Uuid::new_v4()));
+        // Guard removes the artifact on every path out of `synthesize`,
+        // including the timeout, spawn-failure, and read-failure early returns.
+        let _artifact = EdgeTtsTempArtifact {
+            path: output_file.clone(),
+        };
         let output_path = output_file
             .to_str()
             .context("Failed to build temp file path for Edge TTS")?;
@@ -470,17 +501,12 @@ impl TtsProvider for EdgeTtsProvider {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            // Clean up temp file on failure.
-            let _ = tokio::fs::remove_file(&output_file).await;
             bail!("edge-tts failed (exit {}): {}", output.status, stderr);
         }
 
         let bytes = tokio::fs::read(&output_file)
             .await
             .context("Failed to read edge-tts output file")?;
-
-        // Clean up temp file.
-        let _ = tokio::fs::remove_file(&output_file).await;
 
         Ok(bytes)
     }
@@ -1325,5 +1351,58 @@ mod tests {
         let provider = OpenAiTtsProvider::new("test", &cfg).unwrap();
         assert_eq!(provider.base_url, "https://api.openai.com/v1/audio/speech");
         assert_eq!(provider.response_format, "opus");
+    }
+
+    fn temp_tts_leftovers(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with("zeroclaw_tts_"))
+            .count()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edge_tts_removes_temp_output_when_read_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Fake `edge-tts`: writes an unreadable artifact at `--write-media`
+        // and exits successfully, forcing the output-read failure path.
+        let temp_dir = std::env::temp_dir();
+        let script_path =
+            temp_dir.join(format!("zeroclaw_edgetts_test_{}.sh", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &script_path,
+            "#!/bin/sh\n\
+             out=\n\
+             prev=\n\
+             for a in \"$@\"; do\n\
+               if [ \"$prev\" = \"--write-media\" ]; then out=\"$a\"; fi\n\
+               prev=\"$a\"\n\
+             done\n\
+             : > \"$out\"\n\
+             chmod 000 \"$out\"\n\
+             exit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let before = temp_tts_leftovers(&temp_dir);
+        let provider = EdgeTtsProvider::new_with_binary("test", script_path.to_str().unwrap());
+        let err = provider
+            .synthesize("hello", "en-US-AriaNeural")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Failed to read edge-tts output file"),
+            "expected output-read failure, got: {err}"
+        );
+        assert_eq!(
+            temp_tts_leftovers(&temp_dir),
+            before,
+            "Edge TTS temp output must be cleaned up after an output-read failure"
+        );
+
+        let _ = std::fs::remove_file(&script_path);
     }
 }
