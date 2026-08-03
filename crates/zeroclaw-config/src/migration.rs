@@ -1178,6 +1178,84 @@ vision_model_provider = "nonexistent"
     }
 
     #[test]
+    fn v2_legacy_grok_vision_reference_migrates_to_xai_default() {
+        // `grok` canonicalizes to the xai family; the bare reference must be
+        // resolved through the same mapping and rewrite to xai.default.
+        let raw = r#"
+schema_version = 2
+
+[providers.models.grok]
+api_key = "sk-grok-test"
+model = "m"
+
+[multimodal]
+vision_model_provider = "grok"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("xai.default"),
+            "legacy grok reference must rewrite to the canonical xai.default alias"
+        );
+        assert!(
+            cfg.providers.models.find("xai", "default").is_some(),
+            "migrated grok entry must live at xai.default"
+        );
+    }
+
+    #[test]
+    fn v2_legacy_non_default_alias_vision_reference_migrates() {
+        // `openai-codex` folds into openai as the codex alias; the reference
+        // must rewrite to the non-default alias.
+        let raw = r#"
+schema_version = 2
+
+[providers.models.openai-codex]
+api_key = "sk-codex-test"
+model = "m"
+
+[multimodal]
+vision_model_provider = "openai-codex"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("openai.codex"),
+            "legacy openai-codex reference must rewrite to openai.codex"
+        );
+        assert!(
+            cfg.providers.models.find("openai", "codex").is_some(),
+            "migrated openai-codex entry must live at openai.codex"
+        );
+    }
+
+    #[test]
+    fn v2_dot_bearing_legacy_vision_reference_migrates() {
+        // `llama.cpp` carries a dot but is a legacy synonym for the llamacpp
+        // family; the rewrite must not early-return on the dot.
+        let raw = r#"
+schema_version = 2
+
+[providers.models."llama.cpp"]
+uri = "http://127.0.0.1:8080/v1"
+model = "m"
+
+[multimodal]
+vision_model_provider = "llama.cpp"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("llamacpp.default"),
+            "dot-bearing llama.cpp reference must rewrite to llamacpp.default"
+        );
+        assert!(
+            cfg.providers.models.find("llamacpp", "default").is_some(),
+            "migrated llama.cpp entry must live at llamacpp.default"
+        );
+    }
+
+    #[test]
     fn provider_pruner_never_panics_on_non_table_shapes() {
         // Array-of-tables where a family map is expected, scalar [providers],
         // array alias value. The salvage path is the daemon's never-fail
