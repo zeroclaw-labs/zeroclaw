@@ -233,6 +233,46 @@ const CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP: u64 = 4;
 const CHANNEL_MIN_IN_FLIGHT_MESSAGES: usize = 8;
 const CHANNEL_MAX_IN_FLIGHT_MESSAGES: usize = 64;
 const CHANNEL_TYPING_REFRESH_INTERVAL_SECS: u64 = 4;
+
+/// Typing speed used to decide how long a reply should still show the typing
+/// indicator after the model has already produced it.
+///
+/// Without this the indicator stops the instant generation finishes, so a
+/// three-line answer that took the model two seconds appears as two seconds of
+/// "typing…" followed by a whole paragraph. Nobody types that fast. It is one
+/// of the clearest tells that the other end is automated — and for accounts
+/// that get judged on behaving like a person, that tell has real consequences.
+///
+/// 45 WPM at an average five characters per word is an unhurried phone-typing
+/// pace: fast enough not to feel sluggish, slow enough to be plausible.
+const HUMAN_TYPING_CHARS_PER_SEC: f64 = 45.0 * 5.0 / 60.0;
+
+/// Upper bound on that wait. A long reply should not leave someone watching
+/// the indicator for a minute; past a few seconds the realism gain is gone and
+/// only the latency remains.
+const HUMAN_TYPING_MAX_HOLD_SECS: u64 = 9;
+
+/// How long a person would still be typing a reply of `chars` characters,
+/// given that `already_elapsed` has already passed while the model worked.
+///
+/// Returns `None` when the answer is short enough, or generation slow enough,
+/// that the time already spent is a believable typing time on its own — the
+/// common case, where this costs nothing.
+fn remaining_human_typing_time(
+    chars: usize,
+    already_elapsed: Duration,
+) -> Option<Duration> {
+    #[allow(clippy::cast_precision_loss)]
+    let plausible_secs = chars as f64 / HUMAN_TYPING_CHARS_PER_SEC;
+    let plausible = Duration::from_secs_f64(plausible_secs.min(
+        #[allow(clippy::cast_precision_loss)]
+        {
+            HUMAN_TYPING_MAX_HOLD_SECS as f64
+        },
+    ));
+    plausible.checked_sub(already_elapsed).filter(|d| !d.is_zero())
+}
+
 const CHANNEL_HEALTH_HEARTBEAT_SECS: u64 = 30;
 const MODEL_CACHE_FILE: &str = "models_cache.json";
 const MODEL_CACHE_PREVIEW_LIMIT: usize = 10;
@@ -5950,6 +5990,29 @@ async fn process_channel_message_body(
             };
 
             if let Some(channel) = delivery_channel.as_ref() {
+                // Hold the typing indicator for as long as writing this reply
+                // would plausibly have taken, on channels that ask for it.
+                // Generation finishing is not the same event as a person
+                // finishing typing: without this, a paragraph the model
+                // produced in two seconds arrives after two seconds of
+                // "typing…", which is not a speed a human hand reaches.
+                //
+                // Opt-in per channel rather than applied here for everyone:
+                // most surfaces want the reply as soon as it exists, and
+                // delaying them would buy nothing but latency.
+                if channel.paces_replies_to_human_typing_speed()
+                    && let Some(hold) = remaining_human_typing_time(
+                        delivered_response.chars().count(),
+                        llm_call_start.elapsed(),
+                    )
+                {
+                    // Refreshed first: the platform expires the indicator
+                    // after a few seconds of silence.
+                    let _ = channel.start_typing(&delivery_recipient).await;
+                    tokio::time::sleep(hold).await;
+                    let _ = channel.stop_typing(&delivery_recipient).await;
+                }
+
                 let is_redirect = turn_route
                     .as_ref()
                     .and_then(|r| r.channel.as_deref())
@@ -19401,6 +19464,67 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(sent_messages.len(), 2);
         assert!(sent_messages.iter().any(|msg| msg.starts_with("chat-1:")));
         assert!(sent_messages.iter().any(|msg| msg.starts_with("chat-2:")));
+    }
+
+    #[test]
+    fn pacing_is_opt_in_so_ordinary_channels_stay_instant() {
+        // The hold belongs to platforms that judge an account on looking
+        // human. Applying it to every channel would have slowed every reply
+        // across the whole system — including surfaces where a fast answer is
+        // simply a good answer — for no gain at all. That is not theoretical:
+        // the first version of this change did exactly that, and the suite's
+        // own runtime went from 30s to 220s because every delivery test now
+        // slept through a typing pause it never asked for.
+        assert!(
+            !RecordingChannel::default().paces_replies_to_human_typing_speed(),
+            "channels must not pace replies unless they opt in"
+        );
+    }
+
+    #[test]
+    fn a_long_reply_keeps_typing_for_a_plausible_human_duration() {
+        // 300 characters at ~3.75 char/s is roughly 80s of typing, capped to
+        // the ceiling. The model produced it in half a second, so nearly the
+        // whole hold remains — without it, a full paragraph would land after
+        // half a second of "typing…".
+        let hold = remaining_human_typing_time(300, Duration::from_millis(500))
+            .expect("a long reply generated fast still needs typing time");
+        assert!(
+            hold >= Duration::from_secs(HUMAN_TYPING_MAX_HOLD_SECS - 1),
+            "expected close to the ceiling, got {hold:?}"
+        );
+        assert!(
+            hold <= Duration::from_secs(HUMAN_TYPING_MAX_HOLD_SECS),
+            "the hold must never exceed the ceiling, got {hold:?}"
+        );
+    }
+
+    #[test]
+    fn a_short_reply_is_not_delayed() {
+        // "ok" is plausible to type in well under the time the model already
+        // spent. Adding latency here would make quick replies feel worse for
+        // no realism gain.
+        assert_eq!(
+            remaining_human_typing_time(2, Duration::from_millis(900)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_slow_model_is_never_penalised_twice() {
+        // The person has already been watching the indicator for a minute
+        // while the model worked. Sleeping again on top of that is the failure
+        // mode this guards against: the wait is what typing *would have* cost,
+        // not an extra delay stacked onto generation.
+        assert_eq!(
+            remaining_human_typing_time(300, Duration::from_secs(60)),
+            None
+        );
+    }
+
+    #[test]
+    fn an_empty_reply_asks_for_no_wait() {
+        assert_eq!(remaining_human_typing_time(0, Duration::ZERO), None);
     }
 
     #[tokio::test]

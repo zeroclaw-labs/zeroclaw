@@ -3053,6 +3053,14 @@ impl Channel for WhatsAppWebChannel {
         bot_handle_guard.is_some()
     }
 
+    /// WhatsApp accounts are judged on whether they behave like a person, and
+    /// a reply that lands while the typing indicator has barely appeared is one
+    /// of the plainer signals that they don't. This account has already been
+    /// restricted for looking automated, so the cost here is concrete.
+    fn paces_replies_to_human_typing_speed(&self) -> bool {
+        true
+    }
+
     async fn start_typing(&self, recipient: &str) -> Result<()> {
         let client = self.client.lock().clone();
         let Some(client) = client else {

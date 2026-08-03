@@ -644,6 +644,18 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         false
     }
 
+    /// Whether replies on this channel should stay "typing" for as long as
+    /// writing them would plausibly have taken.
+    ///
+    /// Off by default: on most surfaces an instant reply is a feature, and a
+    /// bot that answers fast is simply a fast bot. It matters on personal
+    /// messaging platforms, where the account is judged on whether it behaves
+    /// like a person and an inhuman typing speed is a spam signal — so the
+    /// channel that knows it lives on such a platform opts in.
+    fn paces_replies_to_human_typing_speed(&self) -> bool {
+        false
+    }
+
     /// Whether this channel supports multi-message streaming delivery.
     fn supports_multi_message_streaming(&self) -> bool {
         false
