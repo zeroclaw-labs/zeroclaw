@@ -804,11 +804,14 @@ fn rewrite_bare_vision_provider_reference(
         return;
     };
     let target_alias = if reference.as_str() == canonical_family {
-        // A bare canonical family name: only unambiguous when exactly one
-        // migrated alias exists for it.
+        // A bare canonical family name: rewrite only when its own default
+        // alias is the sole migrated alias. A single alias created from a
+        // DIFFERENT legacy spelling (e.g. openai-codex -> openai.codex) must
+        // not redirect a bare "openai" reference to it — that would silently
+        // change provider and credential selection.
         let mut aliases: Vec<&str> = family_table.keys().map(String::as_str).collect();
         aliases.sort_unstable();
-        if aliases.len() != 1 {
+        if aliases.len() != 1 || aliases[0] != canonical_alias {
             return;
         }
         aliases[0].to_string()
