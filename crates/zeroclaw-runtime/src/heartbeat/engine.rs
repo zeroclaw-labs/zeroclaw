@@ -49,6 +49,14 @@ impl fmt::Display for TaskStatus {
     }
 }
 
+/// Opt-in directive a HEARTBEAT.md can place anywhere in its body to declare
+/// that only explicitly marked bullets (`- [normal] ...`) are tasks, leaving
+/// every other bullet as prose.
+///
+/// Written as an HTML comment so it renders as nothing in any markdown viewer
+/// while staying visible to this parser and to whoever edits the file.
+const ONLY_MARKED_TASKS_DIRECTIVE: &str = "<!-- heartbeat: only-marked-tasks -->";
+
 /// A structured heartbeat task with priority and status metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeartbeatTask {
@@ -299,18 +307,74 @@ impl HeartbeatEngine {
         Ok(tasks)
     }
 
+    /// Parse tasks from HEARTBEAT.md with structured metadata support.
+    ///
+    /// Supports both legacy flat format and new structured format:
+    ///
+    /// Legacy:
+    ///   `- Check email`  →  medium priority, active status
+    ///
+    /// Structured:
+    ///   `- [high] Check email`           →  high priority, active
+    ///   `- [low|paused] Review old PRs`  →  low priority, paused
+    ///   `- [completed] Old task`         →  medium priority, completed
+    ///
+    /// Mixing the two in one file is supported and common for operator
+    /// checklists, so an unmarked bullet is a task by default.
+    ///
+    /// That default is wrong for one class of file, which is why the opt-in
+    /// below exists. A persona agent's HEARTBEAT.md explains *when not to act*
+    /// in bulleted prose ("- Si acaban de hablar. No insistas."), and every one
+    /// of those bullets became its own agent run: ten guidance lines, ten
+    /// tasks, each "completed" with status chatter that was delivered verbatim
+    /// to the person the agent talks to — someone not meant to know it has
+    /// tasks or a scheduler at all. Such a file can declare
+    ///
+    ///   `<!-- heartbeat: only-marked-tasks -->`
+    ///
+    /// anywhere in its body, and then ONLY explicitly marked bullets run.
+    /// Opt-in rather than inferred: inferring "this file has markers, so
+    /// unmarked lines must be prose" would silently stop running the unmarked
+    /// half of every existing mixed checklist.
     fn parse_tasks(content: &str) -> Vec<HeartbeatTask> {
+        let only_marked = content.contains(ONLY_MARKED_TASKS_DIRECTIVE);
+
         content
             .lines()
             .filter_map(|line| {
-                let trimmed = line.trim();
-                let text = trimmed.strip_prefix("- ")?;
-                if text.is_empty() {
+                let text = line.trim().strip_prefix("- ")?;
+                if text.is_empty() || (only_marked && !Self::has_explicit_marker(text)) {
                     return None;
                 }
                 Some(Self::parse_task_line(text))
             })
             .collect()
+    }
+
+    /// Whether a bullet opens with a `[...]` marker whose contents are known
+    /// priority/status keywords. A bare `[` — a markdown link, say — is not a
+    /// marker, so a link bullet is never mistaken for a declared task.
+    fn has_explicit_marker(text: &str) -> bool {
+        let Some(rest) = text.strip_prefix('[') else {
+            return false;
+        };
+        let Some((marker, _)) = rest.split_once(']') else {
+            return false;
+        };
+        let marker = marker.trim();
+        !marker.is_empty()
+            && marker
+                .split('|')
+                .all(|part| Self::is_known_marker_keyword(part.trim()))
+    }
+
+    /// Keywords accepted inside a `[...]` marker, mirroring what
+    /// `parse_task_line` understands for priority and status.
+    fn is_known_marker_keyword(part: &str) -> bool {
+        matches!(
+            part.to_ascii_lowercase().as_str(),
+            "high" | "medium" | "normal" | "low" | "active" | "paused" | "completed" | "done"
+        )
     }
 
     /// Parse a single task line into a structured `HeartbeatTask`.
@@ -445,6 +509,54 @@ impl HeartbeatEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn directive_makes_unmarked_bullets_prose() {
+        // The exact shape that leaked to a real user: a persona HEARTBEAT.md
+        // whose guidance is written as bullets, with one genuinely marked task
+        // at the end. Without the directive every bullet ran as a task, so the
+        // agent executed "Si acaban de hablar. No insistas." as an instruction
+        // and shipped its completion chatter straight to her chat.
+        let content = "\
+# HEARTBEAT.md
+
+<!-- heartbeat: only-marked-tasks -->
+
+## Cuándo NO — y esto manda
+
+- Si acaban de hablar. No insistas.
+- Si es de madrugada para ella.
+- Si lo único que se te ocurre es \"¿cómo estás?\".
+
+## La tarea
+
+- [normal] Decide si le escribes ahora. Si no, responde NO_REPLY
+";
+        let tasks = HeartbeatEngine::parse_tasks(content);
+        assert_eq!(tasks.len(), 1, "only the marked bullet is a task");
+        assert!(tasks[0].text.starts_with("Decide si le escribes"));
+        assert_eq!(tasks[0].priority, TaskPriority::Medium);
+    }
+
+    #[test]
+    fn without_the_directive_mixed_files_are_unchanged() {
+        // The directive is opt-in precisely so existing mixed checklists keep
+        // running every bullet. Same content as above, minus the directive.
+        let content = "- Si acaban de hablar. No insistas.\n- [normal] Decide si le escribes";
+        assert_eq!(HeartbeatEngine::parse_tasks(content).len(), 2);
+    }
+
+    #[test]
+    fn a_markdown_link_bullet_is_not_a_marker() {
+        // `[` alone must not count as a marker, or a directive-bearing file
+        // whose bullets are links would run them as declared tasks.
+        let content = "<!-- heartbeat: only-marked-tasks -->\n\
+                       - [docs](https://example.com) read this\n\
+                       - [high] Real task";
+        let tasks = HeartbeatEngine::parse_tasks(content);
+        assert_eq!(tasks.len(), 1, "the link bullet is prose, not a task");
+        assert_eq!(tasks[0].text, "Real task");
+    }
 
     #[test]
     fn parse_tasks_basic() {
