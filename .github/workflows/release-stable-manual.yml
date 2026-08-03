@@ -811,7 +811,7 @@ jobs:
       - id: attest_payloads
         name: Attest release payloads
         continue-on-error: true
-        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-path: release-assets/*
 
@@ -915,7 +915,7 @@ jobs:
       - id: attest_checksums
         name: Attest final checksums
         continue-on-error: true
-        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-path: release-assets/SHA256SUMS
 
@@ -925,7 +925,7 @@ jobs:
         name: Attest verification archive
         if: ${{ !cancelled() && steps.verification_archive.outcome == 'success' }}
         continue-on-error: true
-        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-path: release-assets/zeroclaw-${{ needs.validate.outputs.tag }}-verification.tar.gz
 
