@@ -1355,7 +1355,7 @@ impl SlackChannel {
     async fn get_bot_user_id(&self) -> Option<String> {
         let resp: serde_json::Value = self
             .http_client()
-            .get("https://slack.com/api/auth.test")
+            .get(self.slack_api_url("auth.test"))
             .bearer_auth(&self.bot_token)
             .send()
             .await
@@ -4575,7 +4575,7 @@ impl SlackChannel {
         for attempt in 0..=SLACK_HISTORY_MAX_RETRIES {
             let resp = match self
                 .http_client()
-                .get("https://slack.com/api/conversations.history")
+                .get(self.slack_api_url("conversations.history"))
                 .bearer_auth(&self.bot_token)
                 .query(params)
                 .send()
@@ -8874,6 +8874,104 @@ mod tests {
             crate::util::PendingApprovalResolution::Resolved,
         );
         assert_eq!(approve_rx.await.unwrap(), ChannelApprovalResponse::Approve);
+    }
+
+    #[tokio::test]
+    async fn polling_ingress_suppresses_rejected_approval_replies_and_delivers_authorized_one() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/auth.test"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "user_id": "U_BOT" })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/conversations.history"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "messages": [
+                    { "ts": "9999999999.000003", "user": "U_OTHER", "text": "other1 deny" },
+                    { "ts": "9999999999.000002", "user": "U_OPERATOR", "text": "wrong1 deny" },
+                    { "ts": "9999999999.000001", "user": "U_OPERATOR", "text": "auth01 approve" }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let channel = SlackChannel::new(
+            "xoxb-token".into(),
+            None,
+            vec!["C_ORIGIN".into()],
+            "slack_test_alias",
+            Arc::new(|| vec!["U_OPERATOR".into()]),
+        )
+        .with_api_base_url(server.uri());
+        let pending = Arc::clone(&channel.pending_approvals);
+        let (approved_tx, approved_rx) = oneshot::channel();
+        let (wrong_tx, _wrong_rx) = oneshot::channel();
+        let (unauthorized_tx, _unauthorized_rx) = oneshot::channel();
+        {
+            let mut approvals = pending.lock().await;
+            approvals.insert(
+                "auth01".into(),
+                crate::util::PendingApproval {
+                    sender: approved_tx,
+                    destination: "C_ORIGIN".into(),
+                },
+            );
+            approvals.insert(
+                "wrong1".into(),
+                crate::util::PendingApproval {
+                    sender: wrong_tx,
+                    destination: "C_OTHER".into(),
+                },
+            );
+            approvals.insert(
+                "other1".into(),
+                crate::util::PendingApproval {
+                    sender: unauthorized_tx,
+                    destination: "C_ORIGIN".into(),
+                },
+            );
+        }
+
+        let (tx, mut inbound_rx) = tokio::sync::mpsc::channel(4);
+        let listener = zeroclaw_spawn::spawn!(async move { channel.listen(tx).await });
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(6), approved_rx)
+                .await
+                .expect("polling ingress should resolve the authorized approval")
+                .expect("approval manager sender should stay open"),
+            ChannelApprovalResponse::Approve
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), inbound_rx.recv())
+                .await
+                .is_err(),
+            "approval-shaped messages must not reach agent dispatch"
+        );
+        let approvals = pending.lock().await;
+        assert!(approvals.contains_key("wrong1"));
+        assert!(approvals.contains_key("other1"));
+        drop(approvals);
+
+        listener.abort();
+        let _ = listener.await;
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .any(|request| request.url.path() == "/conversations.history"),
+            "test must drive the production polling ingress"
+        );
     }
 
     #[test]

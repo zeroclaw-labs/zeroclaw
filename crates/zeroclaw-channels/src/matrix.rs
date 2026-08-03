@@ -4206,9 +4206,10 @@ mod tests {
         use matrix_sdk::ruma::{RoomId, room_id, user_id};
         use matrix_sdk::test_utils::mocks::MatrixMockServer;
         use matrix_sdk_test::JoinedRoomBuilder;
-        use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock, mpsc};
+        use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock, mpsc, oneshot};
         use wiremock::matchers::{method, path, path_regex};
         use wiremock::{Mock, ResponseTemplate};
+        use zeroclaw_api::channel::ChannelApprovalResponse;
         use zeroclaw_config::schema::{MatrixConfig, TranscriptionConfig};
 
         use super::super::inbound::{HandlerCtx, register_event_handlers};
@@ -4567,6 +4568,108 @@ mod tests {
             );
 
             assert_stt_received_the_wav(&stt.received_requests().await.unwrap(), &wav);
+        }
+
+        #[tokio::test]
+        async fn sync_ingress_suppresses_rejected_approval_replies_and_delivers_authorized_one() {
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.sync_joined_room(&client, test_room()).await;
+
+            let (tx, mut inbound_rx) = mpsc::channel(4);
+            let ctx = HandlerCtx {
+                config: Arc::new(MatrixConfig {
+                    allowed_rooms: vec![test_room().to_string()],
+                    ..MatrixConfig::default()
+                }),
+                alias: "test".to_string(),
+                peer_resolver: Arc::new(|| vec!["@operator:localhost".to_string()]),
+                transcription: None,
+                workspace_dir: None,
+                tx,
+                pending_approvals: Arc::new(TokioMutex::new(HashMap::new())),
+                threads_seen: Arc::new(TokioRwLock::new(HashSet::new())),
+                bot_user_id: user_id!("@bot:localhost").to_owned(),
+                bot_display_name: Arc::new(TokioRwLock::new(None)),
+                initial_sync_done: Arc::new(AtomicBool::new(true)),
+                undecryptable_seen: Arc::new(TokioMutex::new(HashSet::new())),
+            };
+            let (approved_tx, approved_rx) = oneshot::channel();
+            let (wrong_tx, _wrong_rx) = oneshot::channel();
+            let (unauthorized_tx, _unauthorized_rx) = oneshot::channel();
+            {
+                let mut approvals = ctx.pending_approvals.lock().await;
+                approvals.insert(
+                    "AUTH0001".into(),
+                    crate::util::PendingApproval {
+                        sender: approved_tx,
+                        destination: test_room().to_string(),
+                    },
+                );
+                approvals.insert(
+                    "WRONG001".into(),
+                    crate::util::PendingApproval {
+                        sender: wrong_tx,
+                        destination: "!other:localhost".into(),
+                    },
+                );
+                approvals.insert(
+                    "OTHER001".into(),
+                    crate::util::PendingApproval {
+                        sender: unauthorized_tx,
+                        destination: test_room().to_string(),
+                    },
+                );
+            }
+
+            let _guards = register_event_handlers(&client, &ctx);
+            let approved = serde_json::json!({
+                "type": "m.room.message",
+                "event_id": "$approved:localhost",
+                "sender": "@operator:localhost",
+                "origin_server_ts": 1_000_000u64,
+                "content": { "msgtype": "m.text", "body": "AUTH0001 approve" }
+            });
+            let wrong_destination = serde_json::json!({
+                "type": "m.room.message",
+                "event_id": "$wrong-destination:localhost",
+                "sender": "@operator:localhost",
+                "origin_server_ts": 1_000_001u64,
+                "content": { "msgtype": "m.text", "body": "WRONG001 deny" }
+            });
+            let unauthorized = serde_json::json!({
+                "type": "m.room.message",
+                "event_id": "$unauthorized:localhost",
+                "sender": "@other:localhost",
+                "origin_server_ts": 1_000_002u64,
+                "content": { "msgtype": "m.text", "body": "OTHER001 deny" }
+            });
+            matrix
+                .sync_room(
+                    &client,
+                    JoinedRoomBuilder::new(test_room())
+                        .add_timeline_event(timeline_raw(&approved))
+                        .add_timeline_event(timeline_raw(&wrong_destination))
+                        .add_timeline_event(timeline_raw(&unauthorized)),
+                )
+                .await;
+
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(5), approved_rx)
+                    .await
+                    .expect("sync ingress should resolve the authorized approval")
+                    .expect("sync ingress should resolve the authorized approval"),
+                ChannelApprovalResponse::Approve
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), inbound_rx.recv())
+                    .await
+                    .is_err(),
+                "approval-shaped events must not reach agent dispatch"
+            );
+            let approvals = ctx.pending_approvals.lock().await;
+            assert!(approvals.contains_key("WRONG001"));
+            assert!(approvals.contains_key("OTHER001"));
         }
     }
 
