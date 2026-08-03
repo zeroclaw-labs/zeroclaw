@@ -1669,10 +1669,12 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                         } else {
                             &output
                         };
+                        // Store what the agent said, not the fact that a
+                        // heartbeat said it. See `heartbeat_memory_body`.
                         let _ = mem
                             .store(
                                 &key,
-                                &format!("Heartbeat task '{}': {}", task.text, summary),
+                                heartbeat_memory_body(summary),
                                 zeroclaw_memory::MemoryCategory::Daily,
                                 None,
                             )
@@ -1978,6 +1980,26 @@ fn heartbeat_session_key(
     candidates.pop().map(|(key, _)| key)
 }
 
+/// The body to persist for one heartbeat run: the agent's own words, with no
+/// operator scaffolding wrapped around them.
+///
+/// Recalled memories are rendered into the prompt as `- {key}: {content}` (see
+/// `agent::memory_inject`), so whatever is stored here comes back later as
+/// something the agent apparently said. This used to prefix the content with
+/// `Heartbeat task '<task text>': `, which quietly taught the model that
+/// narrating its own scheduling was part of how it speaks. On a persona channel
+/// that surfaced as a reply to a real person ending "✅ Guardado en memoria
+/// diaria como nota de actividad (heartbeat)". The workspace prompt forbids
+/// exactly that phrasing — and lost, because an instruction cannot outvote a
+/// demonstration the runtime keeps feeding back in.
+///
+/// The run itself (task text, timing, status, raw output) is already durably
+/// recorded by `heartbeat::store::record_run`, which is where operators look.
+/// Memory is for the agent, and the agent needs the substance, not the frame.
+fn heartbeat_memory_body(summary: &str) -> &str {
+    summary
+}
+
 fn load_heartbeat_session_context(config: &Config) -> Option<String> {
     use zeroclaw_providers::traits::ChatMessage;
 
@@ -2222,6 +2244,55 @@ mod tests {
             backend.append(key, &message).unwrap();
         }
         std::sync::Arc::new(backend)
+    }
+
+    /// A heartbeat memory must read as something the agent said, because that
+    /// is exactly how it comes back — `agent::memory_inject` renders recalled
+    /// entries as `- {key}: {content}` and the model treats them as its own
+    /// prior words. Any operator framing stored alongside the content becomes a
+    /// worked example of narrating internal machinery, which is how "✅ Guardado
+    /// en memoria diaria como nota de actividad (heartbeat)" reached a real
+    /// person on a persona channel.
+    #[test]
+    fn heartbeat_memory_keeps_the_agent_voice_and_drops_the_scaffolding() {
+        let agent_said = "le escribí que apenas vi el teléfono, sin dar más explicación";
+        let stored = heartbeat_memory_body(agent_said);
+
+        assert_eq!(
+            stored, agent_said,
+            "the stored body must be the agent's words verbatim — any wrapper \
+             is re-read as something the agent chose to say"
+        );
+
+        // Named individually rather than as a blanket substring check so a
+        // failure says which kind of scaffolding crept back in.
+        for marker in ["Heartbeat", "heartbeat", "task '", "Task:"] {
+            assert!(
+                !stored.contains(marker),
+                "operator scaffolding {marker:?} must not reach agent memory; \
+                 the run is already recorded by heartbeat::store::record_run"
+            );
+        }
+    }
+
+    /// The body is stored verbatim, so it must survive content the agent may
+    /// legitimately produce — including the very phrases the old format
+    /// introduced. Sanitising the agent's own words here would be the wrong
+    /// fix: the bug was the frame, not the speech.
+    #[test]
+    fn heartbeat_memory_does_not_mangle_unusual_agent_output() {
+        for text in [
+            "",
+            "una sola línea",
+            "acentos, emoji 🚬 y comillas 'simples'",
+            "Heartbeat is also an album title she mentioned",
+        ] {
+            assert_eq!(
+                heartbeat_memory_body(text),
+                text,
+                "the agent's own text must pass through untouched"
+            );
+        }
     }
 
     #[test]
