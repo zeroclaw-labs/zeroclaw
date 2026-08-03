@@ -9470,9 +9470,10 @@ mod tests {
     #[test]
     fn ensure_map_key_for_prop_path_leaves_existing_hyphenated_alias_alone() {
         let mut config = Config::default();
-        config
-            .cron
-            .insert("morning-brief".to_string(), zeroclaw_config::schema::CronJobDecl::default());
+        config.cron.insert(
+            "morning-brief".to_string(),
+            zeroclaw_config::schema::CronJobDecl::default(),
+        );
 
         let created = ensure_map_key_for_prop_path(&mut config, "cron.morning-brief.name")
             .expect("an existing loaded alias must never be rejected by the create grammar");
@@ -9481,7 +9482,9 @@ mod tests {
             "the existing `morning-brief` alias must not be reported as newly created"
         );
         assert!(
-            config.set_prop("cron.morning-brief.name", "Morning brief").is_ok(),
+            config
+                .set_prop("cron.morning-brief.name", "Morning brief")
+                .is_ok(),
             "setting a field on an existing hyphenated cron alias must succeed"
         );
         assert_eq!(
