@@ -1095,6 +1095,89 @@ temperature = "hot"
     }
 
     #[test]
+    fn v2_bare_vision_provider_reference_migrates_to_dotted_alias() {
+        // Repro for #9651: a bare `[multimodal] vision_model_provider` cannot
+        // select the migrated V3 alias, so the keyed provider's credentials
+        // never reach the vision route. Migration must rewrite the reference
+        // to the family's unambiguous migrated alias.
+        let raw = r#"
+schema_version = 2
+
+[providers.models.openrouter]
+api_key = "sk-openrouter-test"
+model = "a-vision-capable-openrouter-model"
+
+[multimodal]
+vision_model_provider = "openrouter"
+vision_model = "a-vision-capable-openrouter-model"
+
+[media_pipeline]
+enabled = true
+describe_images = true
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("openrouter.default"),
+            "bare reference must become a dotted alias ref"
+        );
+        let alias = cfg
+            .providers
+            .models
+            .find("openrouter", "default")
+            .expect("migrated alias must exist");
+        assert_eq!(
+            alias.api_key.as_deref(),
+            Some("sk-openrouter-test"),
+            "dotted reference must select the migrated alias credential"
+        );
+    }
+
+    #[test]
+    fn v2_dotted_vision_provider_reference_preserved() {
+        // An explicit dotted reference already selects the migrated alias;
+        // migration must leave it unchanged.
+        let raw = r#"
+schema_version = 2
+
+[providers.models.openrouter]
+api_key = "sk-openrouter-test"
+model = "m"
+
+[multimodal]
+vision_model_provider = "openrouter.default"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("openrouter.default"),
+            "explicit dotted reference must be preserved unchanged"
+        );
+    }
+
+    #[test]
+    fn v2_bare_vision_provider_reference_without_alias_left_alone() {
+        // A bare family with no migrated alias stays bare so the runtime
+        // keeps failing closed on an unknown provider.
+        let raw = r#"
+schema_version = 2
+
+[providers.models.openrouter]
+api_key = "sk-openrouter-test"
+model = "m"
+
+[multimodal]
+vision_model_provider = "nonexistent"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("nonexistent"),
+            "bare reference to an unknown family must not be rewritten"
+        );
+    }
+
+    #[test]
     fn provider_pruner_never_panics_on_non_table_shapes() {
         // Array-of-tables where a family map is expected, scalar [providers],
         // array alias value. The salvage path is the daemon's never-fail

@@ -247,6 +247,13 @@ impl V2Config {
         // (api_key, default_model, etc.) inline; fold them down.
         fold_providers_globals_into_models(&mut new_providers, &mut aliased_models);
 
+        // A bare `[multimodal] vision_model_provider = "<family>"` cannot select
+        // the migrated V3 alias: runtime resolves only dotted `<family>.<alias>`
+        // refs to typed alias config, so a bare ref reaches the legacy
+        // configless construction path and loses the alias's api_key. Rewrite
+        // it to the family's unambiguous migrated alias when exactly one exists.
+        rewrite_bare_vision_provider_reference(&mut passthrough, &aliased_models);
+
         // V3 dropped cost.prices: the V2 keys ("<provider>/<model>")
         // don't carry the V3 alias path, so remapping is fragile.
         // Log each entry's last-known rates for manual reinstatement.
@@ -762,6 +769,38 @@ fn alias_provider_models(models: Option<toml::Value>) -> toml::Table {
         }
     }
     aliased
+}
+
+/// Rewrite a bare `[multimodal] vision_model_provider = "<family>"` to the
+/// dotted `<family>.<alias>` form when the family migrated to exactly one
+/// alias. Dotted refs and `custom:` colon refs are left untouched, and a
+/// bare family with no migrated alias stays bare so the runtime keeps
+/// failing closed on an unknown provider.
+fn rewrite_bare_vision_provider_reference(
+    passthrough: &mut toml::Table,
+    aliased_models: &toml::Table,
+) {
+    let Some(toml::Value::Table(multimodal)) = passthrough.get_mut("multimodal") else {
+        return;
+    };
+    let Some(toml::Value::String(reference)) = multimodal.get("vision_model_provider") else {
+        return;
+    };
+    if reference.contains('.') || reference.contains(':') {
+        return;
+    }
+    let Some(toml::Value::Table(family_table)) = aliased_models.get(reference) else {
+        return;
+    };
+    let mut aliases: Vec<&str> = family_table.keys().map(String::as_str).collect();
+    aliases.sort_unstable();
+    if aliases.len() != 1 {
+        return;
+    }
+    multimodal.insert(
+        "vision_model_provider".to_string(),
+        toml::Value::String(format!("{reference}.{}", aliases[0])),
+    );
 }
 
 fn fold_providers_globals_into_models(
