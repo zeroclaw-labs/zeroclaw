@@ -1256,6 +1256,34 @@ vision_model_provider = "llama.cpp"
     }
 
     #[test]
+    fn v2_bare_family_with_only_legacy_alias_left_alone() {
+        // A bare `openai` reference must NOT be redirected to the `openai.codex`
+        // alias created from a different legacy spelling (`openai-codex`); that
+        // would silently change provider and credential selection. The bare
+        // family has no `default` entry, so it stays bare (fail-closed).
+        let raw = r#"
+schema_version = 2
+
+[providers.models.openai-codex]
+api_key = "sk-codex-test"
+model = "m"
+
+[multimodal]
+vision_model_provider = "openai"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("openai"),
+            "bare family with only a legacy-spelling alias must stay bare"
+        );
+        assert!(
+            cfg.providers.models.find("openai", "codex").is_some(),
+            "the openai-codex entry must still migrate to openai.codex"
+        );
+    }
+
+    #[test]
     fn v1_legacy_vision_reference_migrates_through_chain() {
         // No `schema_version` implies V1. The `model_providers` shape feeds
         // V2 `[providers.models]`, and the V2->V3 step canonicalizes the
