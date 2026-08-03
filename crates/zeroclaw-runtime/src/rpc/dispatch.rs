@@ -4880,11 +4880,21 @@ fn notification_for_turn_event(
             dropped_messages,
             kept_turns,
             reason,
+            token_budget,
+            tokens_before,
+            tokens_after,
+            tokens_before_source,
+            tokens_after_source,
         } => SessionUpdateEvent::HistoryTrimmed {
             session_id: session_id.to_string(),
             dropped_messages: *dropped_messages,
             kept_turns: *kept_turns,
             reason: reason.clone(),
+            token_budget: *token_budget,
+            tokens_before: *tokens_before,
+            tokens_after: *tokens_after,
+            tokens_before_source: *tokens_before_source,
+            tokens_after_source: *tokens_after_source,
         },
         TurnEvent::Usage { input_tokens, .. } => SessionUpdateEvent::ContextUsage {
             session_id: session_id.to_string(),
@@ -6731,6 +6741,11 @@ mod tests {
             dropped_messages: 12,
             kept_turns: 1,
             reason: "context token budget exceeded".into(),
+            token_budget: Some(500_000),
+            tokens_before: Some(612_000),
+            tokens_after: Some(117_000),
+            tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Provider),
+            tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
         };
         let json = notification_for_turn_event("s1", &event, None).unwrap();
         let v = parse(&json);
@@ -6740,6 +6755,11 @@ mod tests {
         assert_eq!(v["params"]["dropped_messages"], 12);
         assert_eq!(v["params"]["kept_turns"], 1);
         assert_eq!(v["params"]["reason"], "context token budget exceeded");
+        assert_eq!(v["params"]["token_budget"], 500_000);
+        assert_eq!(v["params"]["tokens_before"], 612_000);
+        assert_eq!(v["params"]["tokens_after"], 117_000);
+        assert_eq!(v["params"]["tokens_before_source"], "provider");
+        assert_eq!(v["params"]["tokens_after_source"], "calibrated");
     }
 
     #[test]
@@ -7761,6 +7781,11 @@ mod tests {
             dropped_messages: 4,
             kept_turns: 1,
             reason: "message cap".into(),
+            token_budget: None,
+            tokens_before: None,
+            tokens_after: None,
+            tokens_before_source: None,
+            tokens_after_source: None,
         };
 
         dispatcher

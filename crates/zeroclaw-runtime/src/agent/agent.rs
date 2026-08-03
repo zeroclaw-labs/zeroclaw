@@ -306,6 +306,12 @@ impl HistoryTrimNotice {
             dropped_messages: self.dropped_messages,
             kept_turns: self.kept_turns,
             reason: self.reason,
+            // Message-limit trims carry no token accounting.
+            token_budget: None,
+            tokens_before: None,
+            tokens_after: None,
+            tokens_before_source: None,
+            tokens_after_source: None,
         }
     }
 }
@@ -1915,6 +1921,12 @@ impl Agent {
             channel: Some(channel),
             agent_alias,
             turn_id,
+            // Message-limit trims carry no token accounting.
+            token_budget: None,
+            tokens_before: None,
+            tokens_after: None,
+            tokens_before_source: None,
+            tokens_after_source: None,
         });
 
         Some(HistoryTrimNotice {
@@ -7573,6 +7585,7 @@ mod tests {
                 dropped_messages,
                 kept_turns,
                 reason,
+                ..
             } = event
             {
                 trim_events.push((dropped_messages, kept_turns, reason));

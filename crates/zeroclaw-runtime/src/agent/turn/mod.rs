@@ -262,6 +262,13 @@ async fn enforce_reported_budget(
                     dropped_messages: result.dropped_messages,
                     kept_turns: result.kept_turns,
                     reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
+                    token_budget: Some(context_token_budget as u64),
+                    tokens_before: Some(result.tokens_before as u64),
+                    tokens_after: Some(result.tokens_after as u64),
+                    // The pre-trim count is provider-reported; the post-trim
+                    // count is an estimate scaled to the provider figure.
+                    tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Provider),
+                    tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
                 })
                 .await;
         }
@@ -273,6 +280,11 @@ async fn enforce_reported_budget(
                 channel: None,
                 agent_alias: None,
                 turn_id: None,
+                token_budget: Some(context_token_budget as u64),
+                tokens_before: Some(result.tokens_before as u64),
+                tokens_after: Some(result.tokens_after as u64),
+                tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Provider),
+                tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
             },
         );
     } else {
@@ -684,6 +696,15 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                             reason: crate::i18n::get_required_cli_string(
                                 "history-trim-reason-budget",
                             ),
+                            token_budget: Some(context_token_budget as u64),
+                            tokens_before: Some(result.tokens_before as u64),
+                            tokens_after: Some(result.tokens_after as u64),
+                            tokens_before_source: Some(
+                                zeroclaw_api::agent::TokenCountSource::Estimated,
+                            ),
+                            tokens_after_source: Some(
+                                zeroclaw_api::agent::TokenCountSource::Estimated,
+                            ),
                         })
                         .await;
                 }
@@ -695,6 +716,13 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                         channel: None,
                         agent_alias: None,
                         turn_id: None,
+                        token_budget: Some(context_token_budget as u64),
+                        tokens_before: Some(result.tokens_before as u64),
+                        tokens_after: Some(result.tokens_after as u64),
+                        tokens_before_source: Some(
+                            zeroclaw_api::agent::TokenCountSource::Estimated,
+                        ),
+                        tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
                     },
                 );
             }
