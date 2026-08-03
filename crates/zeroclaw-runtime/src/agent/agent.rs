@@ -7642,11 +7642,18 @@ mod tests {
                 .await
         });
 
-        assert!(
-            matches!(
-                event_rx.recv().await,
-                Some(TurnEvent::Chunk { delta }) if delta == "draft"
-            ),
+        // The pre-dispatch budget check emits a non-visible `UsageEstimate` (and may emit other
+        // metadata events) before the first streamed chunk. Consume those while waiting for the
+        // first visible chunk, preserving the contract: the client sees `draft` before the error.
+        let first_chunk = loop {
+            match event_rx.recv().await {
+                Some(TurnEvent::Chunk { delta }) => break delta,
+                Some(_) => continue,
+                None => panic!("the client should see the streamed text before the provider error"),
+            }
+        };
+        assert_eq!(
+            first_chunk, "draft",
             "the client should see the streamed text before the provider error"
         );
 
