@@ -6630,6 +6630,27 @@ mod tests {
     }
 
     #[test]
+    fn history_trimmed_estimated_source_serializes_as_canonical_estimate() {
+        // The wire spelling must match the WS/SSE/ACP adapters (`as_str()` ->
+        // "estimate"), not serde's snake_case default ("estimated"), so clients
+        // keep resolving the provenance label.
+        let event = TurnEvent::HistoryTrimmed {
+            dropped_messages: 4,
+            kept_turns: 2,
+            reason: "context token budget exceeded".into(),
+            token_budget: Some(10_000),
+            tokens_before: Some(12_000),
+            tokens_after: Some(6_000),
+            tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
+            tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
+        };
+        let json = notification_for_turn_event("s1", &event, None).unwrap();
+        let v = parse(&json);
+        assert_eq!(v["params"]["tokens_before_source"], "estimate");
+        assert_eq!(v["params"]["tokens_after_source"], "estimate");
+    }
+
+    #[test]
     fn usage_event_emits_context_usage_notification() {
         let event = TurnEvent::Usage {
             input_tokens: Some(100),

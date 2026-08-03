@@ -9196,6 +9196,30 @@ mod tests {
     }
 
     #[test]
+    fn history_trimmed_estimated_sources_render_estimate_label() {
+        let mut s = state();
+        s.apply_update(SessionUpdate::HistoryTrimmed {
+            session_id: "sess-1".to_string(),
+            dropped_messages: 2,
+            kept_turns: 1,
+            reason: "context token budget exceeded".to_string(),
+            token_budget: Some(10_000),
+            tokens_before: Some(12_000),
+            tokens_after: Some(6_000),
+            tokens_before_source: Some("estimate".to_string()),
+            tokens_after_source: Some("estimate".to_string()),
+        });
+
+        assert!(matches!(
+            s.entries().last(),
+            Some(ChatEntry::SystemMessage(text))
+                if text.contains("estimated")
+                    && text.contains("estimated before")
+                    && text.contains("estimated after")
+        ));
+    }
+
+    #[test]
     fn tool_call_followed_by_result_is_one_entry() {
         let mut s = state();
         s.apply_update(SessionUpdate::ToolCall {

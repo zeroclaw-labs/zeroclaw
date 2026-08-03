@@ -64,6 +64,7 @@ pub enum TokenCountSource {
     /// Count comes from provider-reported usage.
     Provider,
     /// Count is locally estimated.
+    #[serde(rename = "estimate")]
     Estimated,
     /// Count is calibrated from provider-reported usage and a local estimate.
     Calibrated,
