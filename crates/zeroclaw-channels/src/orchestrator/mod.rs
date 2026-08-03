@@ -482,6 +482,11 @@ struct ChannelRuntimeContext {
     query_classification: zeroclaw_config::schema::QueryClassificationConfig,
     ack_reactions: bool,
     show_tool_calls: bool,
+    /// Durable record of inbound messages already acted on, so a crash
+    /// mid-turn can never cause the same message to be answered twice when
+    /// the platform redelivers it on reconnect. `None` disables the guard
+    /// (used by tests and by contexts with no writable state dir).
+    processed_messages: Option<Arc<crate::processed_messages::ProcessedMessageStore>>,
     session_store: Option<Arc<dyn zeroclaw_infra::session_backend::SessionBackend>>,
     /// Non-interactive approval manager for channel-driven runs.
     /// Enforces `auto_approve` / `always_ask` / supervised policy from
@@ -4357,6 +4362,54 @@ async fn process_channel_message(
     let agent_alias = Arc::clone(&ctx.agent_alias);
     let sender = msg.sender.clone();
     let message_id = msg.id.clone();
+
+    // Idempotency gate — MUST stay here, before the agent is invoked.
+    //
+    // WhatsApp redelivers any message the client never acknowledged. If the
+    // daemon died between receiving this message and sending the reply, the
+    // platform hands us the identical message again on reconnect. Claiming it
+    // here makes a second delivery a silent no-op, so the person on the other
+    // end never sees the agent answer the same thing twice.
+    //
+    // Claiming BEFORE generation (rather than after a successful send) is
+    // deliberate: the claim and its durable record are one atomic SQLite
+    // statement, so there is no window to crash inside. The cost is that a
+    // crash mid-generation drops that one reply instead of retrying it. For a
+    // companion agent that is the right trade — a missed message reads as
+    // someone who got distracted, a doubled message reads as a broken bot.
+    if let Some(ref store) = ctx.processed_messages {
+        let key = crate::processed_messages::ProcessedMessageStore::key_for(
+            &channel_composite,
+            &sender,
+            &message_id,
+        );
+        match store.claim_with_status(&key) {
+            crate::processed_messages::ClaimOutcome::Claimed => {}
+            crate::processed_messages::ClaimOutcome::Duplicate => {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "channel": channel_composite,
+                            "message_id": message_id,
+                        })),
+                    "skipping redelivered message (already processed)"
+                );
+                return;
+            }
+            crate::processed_messages::ClaimOutcome::StoreError(err) => {
+                // Fail open: a broken guard must never render the agent mute.
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({ "error": err })),
+                    "processed-message store unavailable; duplicate protection degraded"
+                );
+            }
+        }
+    }
+
     let composite_for_body = channel_composite.clone();
     zeroclaw_log::scope!(
         category: "channel",
@@ -11023,6 +11076,29 @@ pub async fn start_channels(
             query_classification: config.query_classification.clone(),
             ack_reactions: config.channels.ack_reactions,
             show_tool_calls: config.channels.show_tool_calls,
+            // Durable duplicate guard. Opened once per runtime context and
+            // shared by every inbound message. On failure we log and continue
+            // with `None`: losing duplicate protection is bad, but refusing to
+            // start the channel over it would be worse.
+            processed_messages:
+                match crate::processed_messages::ProcessedMessageStore::open_in_state_dir(
+                    &config.data_dir.join("state"),
+                ) {
+                    Ok(store) => Some(Arc::new(store)),
+                    Err(e) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({ "error": format!("{e}") })),
+                            "could not open processed-message store; duplicate protection disabled"
+                        );
+                        None
+                    }
+                },
             session_store: shared_session_store.clone(),
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(&risk_profile)),
             activated_tools: ch_activated_handle,
@@ -11585,6 +11661,7 @@ fn concurrent_persist_lock_serialization() {
         query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
         ack_reactions: true,
         show_tool_calls: true,
+        processed_messages: None,
         session_store: Some(Arc::new(backend) as Arc<dyn SessionBackend>),
         approval_manager: Arc::new(ApprovalManager::for_non_interactive(
             &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -12180,6 +12257,7 @@ temperature = 0.3
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            processed_messages: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -12807,6 +12885,7 @@ temperature = 0.3
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            processed_messages: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -13279,6 +13358,7 @@ api_key = "anthropic-key"
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            processed_messages: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -13376,6 +13456,7 @@ api_key = "anthropic-key"
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            processed_messages: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -13491,6 +13572,7 @@ api_key = "anthropic-key"
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            processed_messages: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -13610,6 +13692,7 @@ api_key = "anthropic-key"
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            processed_messages: None,
             session_store: Some(Arc::clone(&store)),
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -14185,6 +14268,7 @@ api_key = "anthropic-key"
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            processed_messages: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -16076,6 +16160,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            processed_messages: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -16161,6 +16246,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            processed_messages: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -16279,6 +16365,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            processed_messages: None,
             session_store: Some(Arc::clone(&session_store)),
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(&{
                 let mut profile = zeroclaw_config::schema::RiskProfileConfig::default();
@@ -16393,6 +16480,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            processed_messages: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig {
@@ -16548,6 +16636,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            processed_messages: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig {
@@ -16667,6 +16756,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            processed_messages: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig {
@@ -16813,6 +16903,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            processed_messages: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -16941,6 +17032,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            processed_messages: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -17054,6 +17146,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            processed_messages: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -17187,6 +17280,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            processed_messages: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -17344,6 +17438,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            processed_messages: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -17520,6 +17615,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            processed_messages: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig {
@@ -17741,6 +17837,19 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
+    // FLAKY UNDER PARALLEL EXECUTION — not a bug in the code under test.
+    //
+    // This test installs a global capture subscriber and asserts on the events
+    // it receives. The writer/hook locks below serialize it against other
+    // log-asserting tests, but `subscribe_or_install` reads a process-wide
+    // broadcast channel: any test running concurrently that emits log events
+    // can land in this receiver, and a slow machine can drop events from the
+    // bounded channel before this test drains them.
+    //
+    // Measured 2026-08-02 on this repo: the full suite reports 1-2 failures
+    // here under the default parallel runner, and `1414 passed; 0 failed` with
+    // `-- --test-threads=1`. The same tests pass in isolation. If you see this
+    // fail, re-run serially before suspecting your change.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn process_channel_message_precheck_log_uses_span_attribution_not_attrs() {
@@ -18006,6 +18115,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            processed_messages: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -18114,6 +18224,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            processed_messages: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -18232,6 +18343,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            processed_messages: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -18600,6 +18712,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            processed_messages: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -18744,6 +18857,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            processed_messages: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -18893,6 +19007,7 @@ BTC is currently around $65,000 based on latest tool output."#
             },
             ack_reactions: true,
             show_tool_calls: true,
+            processed_messages: None,
             session_store: None,
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -19065,6 +19180,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            processed_messages: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -19217,6 +19333,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            processed_messages: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -19351,6 +19468,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            processed_messages: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -19464,6 +19582,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            processed_messages: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -19591,6 +19710,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            processed_messages: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -19766,6 +19886,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            processed_messages: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -21986,6 +22107,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            processed_messages: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -22161,6 +22283,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            processed_messages: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -22550,6 +22673,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            processed_messages: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -23036,6 +23160,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            processed_messages: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -23186,6 +23311,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            processed_messages: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -25035,6 +25161,7 @@ This is an example JSON object for profile settings."#;
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            processed_messages: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -25155,6 +25282,7 @@ This is an example JSON object for profile settings."#;
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            processed_messages: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -25314,6 +25442,7 @@ This is an example JSON object for profile settings."#;
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            processed_messages: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -25552,6 +25681,7 @@ This is an example JSON object for profile settings."#;
             query_classification: classification_config,
             ack_reactions: true,
             show_tool_calls: true,
+            processed_messages: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -25705,6 +25835,7 @@ This is an example JSON object for profile settings."#;
             query_classification: classification_config,
             ack_reactions: true,
             show_tool_calls: true,
+            processed_messages: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -25850,6 +25981,7 @@ This is an example JSON object for profile settings."#;
             query_classification: classification_config,
             ack_reactions: true,
             show_tool_calls: true,
+            processed_messages: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -26015,6 +26147,7 @@ This is an example JSON object for profile settings."#;
             query_classification: classification_config,
             ack_reactions: true,
             show_tool_calls: true,
+            processed_messages: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -26580,6 +26713,7 @@ This is an example JSON object for profile settings."#;
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            processed_messages: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
