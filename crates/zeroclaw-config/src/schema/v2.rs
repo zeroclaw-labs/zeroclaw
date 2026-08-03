@@ -770,11 +770,18 @@ fn alias_provider_models(models: Option<toml::Value>) -> toml::Table {
     aliased
 }
 
-/// Rewrite a bare `[multimodal] vision_model_provider = "<family>"` to the
-/// dotted `<family>.<alias>` form when the family migrated to exactly one
-/// alias. Dotted refs and `custom:` colon refs are left untouched, and a
-/// bare family with no migrated alias stays bare so the runtime keeps
-/// failing closed on an unknown provider.
+/// Rewrite a `[multimodal] vision_model_provider` reference to the dotted
+/// `<family>.<alias>` form the runtime resolves. The reference is resolved
+/// through the same [`normalize_provider_type`] mapping used by
+/// [`alias_provider_models`], so legacy spellings select their migrated alias:
+/// `grok` -> `xai.default`, `openai-codex` -> `openai.codex`,
+/// `opencode-go` -> `opencode.go`, and dot-bearing `llama.cpp` ->
+/// `llamacpp.default`. A bare family is only rewritten when it migrated to
+/// exactly one alias; a reference that names a specific alias (dotted, or
+/// legacy with a fixed alias) is rewritten when that alias exists. Colon-URL
+/// refs and already-valid dotted refs that do not canonicalize to a configured
+/// alias are left untouched, and an unknown family stays as-is so the runtime
+/// keeps failing closed on an unknown provider.
 fn rewrite_bare_vision_provider_reference(
     passthrough: &mut toml::Table,
     aliased_models: &toml::Table,
@@ -785,20 +792,36 @@ fn rewrite_bare_vision_provider_reference(
     let Some(toml::Value::String(reference)) = multimodal.get("vision_model_provider") else {
         return;
     };
-    if reference.contains('.') || reference.contains(':') {
+    if reference.contains(':') {
         return;
     }
-    let Some(toml::Value::Table(family_table)) = aliased_models.get(reference) else {
+    let (canonical_family, canonical_alias, _extras) =
+        normalize_provider_type(reference, "default");
+    let Some(toml::Value::Table(family_table)) = aliased_models.get(&canonical_family) else {
+        // Unknown family, or a dotted ref that does not canonicalize to a
+        // migrated family ("openrouter.default", "custom.rag_bot") — preserve.
         return;
     };
-    let mut aliases: Vec<&str> = family_table.keys().map(String::as_str).collect();
-    aliases.sort_unstable();
-    if aliases.len() != 1 {
-        return;
-    }
+    let target_alias = if reference.as_str() == canonical_family {
+        // A bare canonical family name: only unambiguous when exactly one
+        // migrated alias exists for it.
+        let mut aliases: Vec<&str> = family_table.keys().map(String::as_str).collect();
+        aliases.sort_unstable();
+        if aliases.len() != 1 {
+            return;
+        }
+        aliases[0].to_string()
+    } else {
+        // A legacy spelling that maps to a specific alias: rewrite only when
+        // that alias was actually migrated.
+        if !family_table.contains_key(&canonical_alias) {
+            return;
+        }
+        canonical_alias
+    };
     multimodal.insert(
         "vision_model_provider".to_string(),
-        toml::Value::String(format!("{reference}.{}", aliases[0])),
+        toml::Value::String(format!("{canonical_family}.{target_alias}")),
     );
 }
 
