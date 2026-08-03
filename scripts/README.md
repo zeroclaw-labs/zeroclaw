@@ -1,11 +1,61 @@
-# scripts/ — Raspberry Pi Deployment Guide
+# scripts/ — Deployment Guides
 
-This directory contains everything needed to cross-compile ZeroClaw and deploy it to a Raspberry Pi over SSH.
+This directory contains deployment tooling: cross-compiling to a Raspberry Pi
+over SSH, and deploying in place on the machine ZeroClaw already runs on.
+
+## Deploying on the host itself — `deploy-local.sh`
+
+For a box that both builds and runs ZeroClaw (an always-on agent serving a real
+person), use `deploy-local.sh` rather than `cargo build && install` by hand.
+
+```bash
+./scripts/deploy-local.sh              # build, verify, install, restart, health-check
+./scripts/deploy-local.sh --dry-run    # build + verify only
+./scripts/deploy-local.sh --skip-build # verify/install an existing artifact
+```
+
+### Why not just `cargo build --release`?
+
+Because **channel features are opt-in and their absence is invisible.**
+`whatsapp-web` is not in `default`. A build that omits it produces a binary that
+starts perfectly — service `active`, `zeroclaw doctor` clean, config still
+saying the channel is enabled — while the daemon quietly logs:
+
+```text
+No active channels to supervise (none configured or all disabled).
+```
+
+That message blames the config; the real cause is the missing compile-time
+feature. Every health surface reports green while the agent answers nobody.
+
+`deploy-local.sh` closes that gap:
+
+1. **Derives features from your config**, so enabling a channel in TOML can
+   never outrun the build command.
+2. **Inspects the built artifact** for each channel's own runtime strings before
+   installing. Note that counting `strings | grep -c <name>` hits is *not* a
+   valid test — the linker packs literals into blobs, and two functionally
+   identical binaries measured 4 vs 12 hits for the same working channel. The
+   script probes for a literal only the compiled module can emit.
+3. **Backs up the running binary and paired sessions** first.
+4. **Verifies the channel actually came up** after restart, and rolls back
+   automatically if it did not. `systemctl is-active` is not proof — the broken
+   build reported active while serving nothing.
+
+The complementary source-level guard is
+`tests/architecture/channel_feature_coverage.rs`, wired into CI: it fails when a
+channel feature belongs to no aggregate feature set, i.e. when CI would never
+compile that channel at all.
+
+## Raspberry Pi deployment
+
+This directory also contains everything needed to cross-compile ZeroClaw and deploy it to a Raspberry Pi over SSH.
 
 ## Contents
 
 | File | Purpose |
 |------|---------|
+| `deploy-local.sh` | Build, verify, install and health-check on the local host |
 | `deploy-rpi.sh` | One-shot cross-compile and deploy script |
 | `rpi-config.toml` | Production config template deployed to `~/.zeroclaw/config.toml` |
 | `zeroclaw.service` | systemd unit file installed on the Pi |
