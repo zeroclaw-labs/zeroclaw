@@ -43,6 +43,7 @@
 use super::traits::{Memory, MemoryCategory, MemoryEntry};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use chrono::{DateTime, FixedOffset};
 use serde::Deserialize;
 use zeroclaw_config::schema::{
     DEFAULT_HINDSIGHT_TIMEOUT_SECS, DEFAULT_HINDSIGHT_TOP_K, HindsightMemoryConfig,
@@ -409,9 +410,184 @@ struct ListResponse {
     total: Option<u64>,
 }
 
+/// A caller-supplied `[since, until]` recall window, parsed once into typed
+/// RFC 3339 instants at the read boundary.
+///
+/// Hindsight has no server-side time predicate, so the driver enforces the
+/// window client-side. Parsing the CALLER'S bounds up front (rather than
+/// per-row, lexically) means an invalid `since`/`until` is a clear, typed
+/// error instead of a silent byte comparison, and every kept/dropped decision
+/// is made against real instants. Empty/whitespace bounds are treated as
+/// absent, matching the established backends. Mirrors the typed RFC 3339
+/// validation the SQLite/Lucid/Markdown backends already apply.
+#[derive(Clone, Copy, Default)]
+struct TimeWindow {
+    since: Option<DateTime<FixedOffset>>,
+    until: Option<DateTime<FixedOffset>>,
+}
+
+impl TimeWindow {
+    /// Parse and validate the caller-supplied bounds. An empty/whitespace bound
+    /// is absent; a non-empty bound that is not RFC 3339 is a hard error; and
+    /// `since` must not be after `until`.
+    fn parse(since: Option<&str>, until: Option<&str>) -> Result<Self> {
+        let since = Self::parse_bound("since", since)?;
+        let until = Self::parse_bound("until", until)?;
+        if let (Some(s), Some(u)) = (since, until)
+            && s > u
+        {
+            anyhow::bail!("'since' must not be after 'until'");
+        }
+        Ok(Self { since, until })
+    }
+
+    fn parse_bound(field: &str, raw: Option<&str>) -> Result<Option<DateTime<FixedOffset>>> {
+        raw.map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                DateTime::parse_from_rfc3339(s)
+                    .with_context(|| format!("invalid '{field}' date (expected RFC 3339): {s:?}"))
+            })
+            .transpose()
+    }
+
+    /// Whether either bound is present. When neither is, the window imposes no
+    /// constraint and undatable rows are kept.
+    fn is_bounded(&self) -> bool {
+        self.since.is_some() || self.until.is_some()
+    }
+}
+
 impl HindsightMemory {
+    /// Categories whose rows are durable global knowledge when they carry no
+    /// session binding: a `core`/`daily` fact with no session is long-term
+    /// knowledge meant to be recallable from any session, not a per-session
+    /// artifact. Mirrors the SQLite backend's single source of truth so the
+    /// remote read boundary enforces the same session semantics.
+    const DURABLE_GLOBAL_CATEGORIES: [MemoryCategory; 2] =
+        [MemoryCategory::Core, MemoryCategory::Daily];
+
+    /// When a recall carries a session/time discriminator the remote cannot
+    /// evaluate itself, over-fetch this multiple of the caller's limit as the
+    /// FIRST page before filtering client-side. Subsequent pages double the
+    /// fetch until the window is filled or the ceiling is hit. Mirrors the
+    /// scoped-memory wrapper's over-fetch pattern.
+    const RECALL_SCOPED_OVERFETCH: usize = 4;
+
+    /// Hard ceiling on the per-bank fetch limit while paging a scoped recall to
+    /// fill its window. Bounds the escalation so a window that can never be
+    /// filled (e.g. the bank holds far more foreign-session/out-of-window rows
+    /// than the limit) still terminates after a bounded number of doublings
+    /// instead of walking the entire bank. The response byte cap
+    /// ([`MAX_REMOTE_BODY_BYTES`]) is the second backstop.
+    const RECALL_SCOPED_FETCH_CEILING: usize = 512;
+
     fn tags_for(category: &MemoryCategory) -> Vec<String> {
         vec!["zeroclaw".to_string(), category.to_string()]
+    }
+
+    /// Retain-time tags for a write: the `["zeroclaw", <category>]` markers
+    /// plus a `session:<id>` discriminator when the write is session-scoped.
+    /// Round-tripping the session through a tag (the same channel the category
+    /// already uses) lets the remote read boundary re-derive and ENFORCE the
+    /// originating session, so conversation memory written under one session
+    /// cannot be recalled into another. `category_from_tags` ignores the
+    /// `key:value` session tag, so category decode is unaffected.
+    fn tags_for_write(category: &MemoryCategory, session_id: Option<&str>) -> Vec<String> {
+        let mut tags = Self::tags_for(category);
+        if let Some(sid) = session_id.map(str::trim).filter(|s| !s.is_empty()) {
+            tags.push(format!("session:{sid}"));
+        }
+        tags
+    }
+
+    /// Decode the originating session id a write stamped via
+    /// [`Self::tags_for_write`] (`session:<id>`), so recalled/listed entries
+    /// carry the real session instead of `None`. Returns `None` when the row
+    /// has no session tag (a durable-global or legacy row).
+    fn session_from_tags(tags: &[String]) -> Option<String> {
+        tags.iter().find_map(|t| {
+            t.trim()
+                .strip_prefix("session:")
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+    }
+
+    /// Whether a row is durable global knowledge (a `core`/`daily` row with no
+    /// session binding), and therefore recallable from any session.
+    fn is_durable_global(category: &MemoryCategory) -> bool {
+        Self::DURABLE_GLOBAL_CATEGORIES.contains(category)
+    }
+
+    /// Whether `entry` passes the session gate for a recall/list scoped to
+    /// `filter_session`. Mirrors the SQLite backend's rule: with a session
+    /// filter, keep rows bound to that exact session PLUS durable-global
+    /// `core`/`daily` rows that carry no session; without a filter, keep
+    /// everything. This is the privacy boundary: a session-scoped
+    /// conversation row from another session is dropped.
+    fn passes_session_gate(entry: &MemoryEntry, filter_session: Option<&str>) -> bool {
+        match filter_session {
+            None => true,
+            Some(sid) => {
+                entry.session_id.as_deref() == Some(sid)
+                    || (entry.session_id.is_none() && Self::is_durable_global(&entry.category))
+            }
+        }
+    }
+
+    /// Whether `entry.timestamp` falls within the inclusive `[since, until]`
+    /// window carried by `bounds`.
+    ///
+    /// Fails CLOSED: whenever a bound is present, a row whose timestamp is
+    /// empty or not parseable as RFC 3339 is EXCLUDED, because it cannot be
+    /// shown to satisfy a window the remote could not enforce server-side.
+    /// Only when NO bound is supplied is an undatable row kept - there is no
+    /// window to fall outside of, so the caller asked for everything. Parseable
+    /// timestamps compare as instants against the (already validated) typed
+    /// bounds; there is no lexical fallback, so a malformed date can never
+    /// slip through a byte comparison.
+    fn passes_time_range(entry: &MemoryEntry, bounds: &TimeWindow) -> bool {
+        if !bounds.is_bounded() {
+            return true;
+        }
+        let Ok(ts) = DateTime::parse_from_rfc3339(entry.timestamp.trim()) else {
+            // A bound is present but this row carries no parseable instant:
+            // it cannot be placed inside the window, so exclude it.
+            return false;
+        };
+        if let Some(since) = bounds.since
+            && ts < since
+        {
+            return false;
+        }
+        if let Some(until) = bounds.until
+            && ts > until
+        {
+            return false;
+        }
+        true
+    }
+
+    /// Apply the session and time discriminators to a fetched result set at
+    /// the read boundary, then truncate to `limit`. The remote returned rows
+    /// ranked by relevance (recall) or recency (list); this preserves that
+    /// order while dropping rows that fall outside the requested session or
+    /// `[since, until]` window, enforcing the same scoping the local backends
+    /// apply server-side in SQL.
+    fn filter_scoped(
+        entries: Vec<MemoryEntry>,
+        session_id: Option<&str>,
+        window: &TimeWindow,
+        limit: usize,
+    ) -> Vec<MemoryEntry> {
+        entries
+            .into_iter()
+            .filter(|e| Self::passes_session_gate(e, session_id))
+            .filter(|e| Self::passes_time_range(e, window))
+            .take(limit)
+            .collect()
     }
 
     /// Decode a row's real [`MemoryCategory`] from the tags the driver itself
@@ -450,7 +626,11 @@ impl HindsightMemory {
             content: text.unwrap_or_default(),
             category: Self::category_from_tags(tags),
             timestamp: mentioned_at.unwrap_or_default(),
-            session_id: None,
+            // Recover the originating session the write stamped into the tags
+            // (`session:<id>`), so a materialized entry carries the real
+            // session instead of `None`. Durable-global/legacy rows have no
+            // session tag and stay `None`.
+            session_id: Self::session_from_tags(tags),
             score,
             namespace: context.unwrap_or_else(|| "default".to_string()),
             importance: None,
@@ -475,7 +655,7 @@ impl Memory for HindsightMemory {
         key: &str,
         content: &str,
         category: MemoryCategory,
-        _session_id: Option<&str>,
+        session_id: Option<&str>,
     ) -> Result<()> {
         // Skip empty and auto-save bookkeeping keys' empty content.
         if content.trim().is_empty() {
@@ -486,11 +666,14 @@ impl Memory for HindsightMemory {
         } else {
             key.to_string()
         };
+        // Round-trip the originating session through the tags so the remote
+        // read boundary can re-derive and enforce it: conversation memory
+        // written under one session must not be recallable from another.
         let body = RetainBody {
             items: vec![RetainItem {
                 content,
                 context: Some(context_owned.as_str()),
-                tags: Self::tags_for(&category),
+                tags: Self::tags_for_write(&category, session_id),
             }],
             is_async: false,
         };
@@ -514,29 +697,71 @@ impl Memory for HindsightMemory {
         &self,
         query: &str,
         limit: usize,
-        _session_id: Option<&str>,
-        _since: Option<&str>,
-        _until: Option<&str>,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
     ) -> Result<Vec<MemoryEntry>> {
         let effective_limit = if limit == 0 {
             self.default_top_k
         } else {
             limit
         };
+        // Validate the caller-supplied window ONCE, up front: an invalid
+        // `since`/`until` is a clear typed error here, not a silent per-row
+        // lexical comparison deeper in the filter.
+        let window = TimeWindow::parse(since, until)?;
         let normalized = super::traits::normalize_recent_recall_query(query);
-        // Hindsight recall needs a query; for recent/empty queries fall back to list.
+        // Hindsight recall needs a query; for recent/empty queries fall back to
+        // list, which applies the same session gate.
         if normalized.trim().is_empty() {
-            return self.list(None, None).await.map(|mut v| {
-                v.truncate(effective_limit);
-                v
-            });
+            return self
+                .list(None, session_id)
+                .await
+                .map(|entries| Self::filter_scoped(entries, session_id, &window, effective_limit));
         }
         // Private-only foundation: recall exactly this agent's own bank. The
         // shared/system read tiers live in the memory-tiers slice on top.
-        let entries = self
-            .recall_bank(&self.bank, normalized, effective_limit)
-            .await?;
-        Ok(entries)
+        //
+        // Hindsight has no server-side session/time predicate, so ENFORCE the
+        // discriminators client-side at the read boundary. Without this, a
+        // conversation row from session A could surface in session B's prompt -
+        // a live privacy boundary crossing.
+        let scoped = session_id.is_some() || window.is_bounded();
+        if !scoped {
+            let entries = self
+                .recall_bank(&self.bank, normalized, effective_limit)
+                .await?;
+            return Ok(Self::filter_scoped(
+                entries,
+                session_id,
+                &window,
+                effective_limit,
+            ));
+        }
+        // Scoped recall PAGES to fill the window. Hindsight ranks by relevance,
+        // so a window dominated by foreign-session or out-of-window rows could
+        // otherwise fill a single over-fetch and hide valid rows ranked lower.
+        // The recall API is limit-only (no cursor/offset), so the only paging
+        // it admits is to request a larger limit and re-filter: escalate the
+        // fetch until the window is filled, the remote is exhausted (it
+        // returned fewer rows than asked, so there are no more), or a hard
+        // ceiling is reached. The response byte cap ([`MAX_REMOTE_BODY_BYTES`])
+        // is the second backstop on worst-case fetch size.
+        let ceiling = Self::RECALL_SCOPED_FETCH_CEILING.max(effective_limit);
+        let mut fetch_limit = effective_limit
+            .saturating_mul(Self::RECALL_SCOPED_OVERFETCH)
+            .min(ceiling);
+        loop {
+            let raw = self
+                .recall_bank(&self.bank, normalized, fetch_limit)
+                .await?;
+            let exhausted = raw.len() < fetch_limit;
+            let filtered = Self::filter_scoped(raw, session_id, &window, effective_limit);
+            if filtered.len() >= effective_limit || exhausted || fetch_limit >= ceiling {
+                return Ok(filtered);
+            }
+            fetch_limit = fetch_limit.saturating_mul(2).min(ceiling);
+        }
     }
 
     async fn get(&self, _key: &str) -> Result<Option<MemoryEntry>> {
@@ -546,12 +771,21 @@ impl Memory for HindsightMemory {
 
     async fn list(
         &self,
-        _category: Option<&MemoryCategory>,
-        _session_id: Option<&str>,
+        category: Option<&MemoryCategory>,
+        session_id: Option<&str>,
     ) -> Result<Vec<MemoryEntry>> {
         // Private-only foundation: list exactly this agent's own bank.
+        //
+        // Hindsight's list endpoint has no server-side category/session
+        // predicate, so enforce both discriminators client-side at the read
+        // boundary: keep only the requested category (when given) and apply the
+        // session gate (exact session match plus durable-global core/daily).
         let entries = self.list_bank(&self.bank).await?;
-        Ok(entries)
+        Ok(entries
+            .into_iter()
+            .filter(|e| category.is_none_or(|c| &e.category == c))
+            .filter(|e| Self::passes_session_gate(e, session_id))
+            .collect())
     }
 
     async fn forget(&self, key: &str) -> Result<bool> {
@@ -647,7 +881,7 @@ impl ::zeroclaw_api::attribution::Attributable for HindsightMemory {
 mod tests {
     use super::*;
     use serde_json::json;
-    use wiremock::matchers::{body_partial_json, header, method, path};
+    use wiremock::matchers::{body_partial_json, body_string_contains, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     /// A HindsightMemory pointed at a mock server with a fixed token/bank and
@@ -1222,6 +1456,416 @@ mod tests {
             msg.len() < 700,
             "error message must be bounded: {}",
             msg.len()
+        );
+    }
+
+    // ── B1: session / category / time scoping at the read boundary ──
+
+    #[test]
+    fn write_tags_round_trip_the_originating_session() {
+        // A session-scoped write stamps `session:<id>` alongside the category
+        // marker; a session-less write does not. The session tag must not
+        // disturb category decode.
+        let scoped = HindsightMemory::tags_for_write(&MemoryCategory::Conversation, Some("sess-A"));
+        assert!(
+            scoped.iter().any(|t| t == "session:sess-A"),
+            "session-scoped write must stamp the session tag: {scoped:?}"
+        );
+        assert_eq!(
+            HindsightMemory::session_from_tags(&scoped).as_deref(),
+            Some("sess-A")
+        );
+        assert_eq!(
+            HindsightMemory::category_from_tags(&scoped),
+            MemoryCategory::Conversation,
+            "session tag must not disturb category decode"
+        );
+        // Blank/absent session -> no tag, decodes back to None.
+        let unscoped = HindsightMemory::tags_for_write(&MemoryCategory::Core, None);
+        assert!(unscoped.iter().all(|t| !t.starts_with("session:")));
+        assert_eq!(HindsightMemory::session_from_tags(&unscoped), None);
+        let blank = HindsightMemory::tags_for_write(&MemoryCategory::Core, Some("  "));
+        assert!(blank.iter().all(|t| !t.starts_with("session:")));
+    }
+
+    #[tokio::test]
+    async fn store_persists_session_discriminator_in_tags() {
+        // Production autosave writes Conversation memory with the active
+        // session; that session must be persisted through the retain payload
+        // tags so the read boundary can later enforce it.
+        let server = MockServer::start().await;
+        // Match on the serialized payload: the session must ride the tags as
+        // `session:conv-A` (array elements aren't partial-matched element-wise
+        // by body_partial_json, so assert on the raw JSON string instead).
+        Mock::given(method("POST"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories"))
+            .and(body_string_contains("session:conv-A"))
+            .and(body_string_contains("SECRET-IN-A"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ok": true })))
+            .mount(&server)
+            .await;
+
+        let mem = memory_for(&server.uri(), "zeroclaw-test");
+        mem.store(
+            "k",
+            "SECRET-IN-A",
+            MemoryCategory::Conversation,
+            Some("conv-A"),
+        )
+        .await
+        .expect("session-scoped store must post the session tag");
+    }
+
+    #[tokio::test]
+    async fn materialized_entries_carry_real_session_not_none() {
+        // A recalled row whose tags carry the originating session must
+        // materialize with that session_id, not None.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/recall"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [
+                    { "id": "m1", "text": "hi", "tags": ["zeroclaw", "conversation", "session:conv-A"],
+                      "scores": { "final": 0.9 } }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let mem = memory_for(&server.uri(), "zeroclaw-test");
+        let hits = mem
+            .recall("hi", 5, Some("conv-A"), None, None)
+            .await
+            .expect("recall should succeed");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].session_id.as_deref(),
+            Some("conv-A"),
+            "materialized entry must carry the real session, not None"
+        );
+    }
+
+    /// PRODUCTION-BOUNDARY regression: conversation memory written under one
+    /// session must NEVER be recalled into another session's prompt. Memory
+    /// injection passes the current session to `recall` specifically to keep
+    /// conversation entries scoped; Hindsight must honor that at the remote
+    /// read boundary. The mock bank returns BOTH sessions' rows (Hindsight has
+    /// no server-side session predicate), so the driver itself must drop the
+    /// foreign-session conversation row.
+    #[tokio::test]
+    async fn conversation_memory_cannot_cross_sessions() {
+        let server = MockServer::start().await;
+        // The remote bank holds a conversation row from session A, a
+        // conversation row from session B, and a durable-global core fact with
+        // no session. A recall scoped to session B returns everything (no
+        // server-side filter), so the driver must enforce the session gate.
+        Mock::given(method("POST"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/recall"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [
+                    { "id": "a", "text": "SECRET-FROM-SESSION-A",
+                      "tags": ["zeroclaw", "conversation", "session:conv-A"],
+                      "scores": { "final": 0.99 } },
+                    { "id": "b", "text": "hello-from-session-B",
+                      "tags": ["zeroclaw", "conversation", "session:conv-B"],
+                      "scores": { "final": 0.98 } },
+                    { "id": "g", "text": "durable-global-fact",
+                      "tags": ["zeroclaw", "core"],
+                      "scores": { "final": 0.50 } }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let mem = memory_for(&server.uri(), "zeroclaw-test");
+        let hits = mem
+            .recall("anything", 10, Some("conv-B"), None, None)
+            .await
+            .expect("recall should succeed");
+
+        let contents: Vec<&str> = hits.iter().map(|h| h.content.as_str()).collect();
+        assert!(
+            !contents.contains(&"SECRET-FROM-SESSION-A"),
+            "session A's conversation row must NOT cross into session B: {contents:?}"
+        );
+        assert!(
+            contents.contains(&"hello-from-session-B"),
+            "session B's own conversation row must be recallable: {contents:?}"
+        );
+        assert!(
+            contents.contains(&"durable-global-fact"),
+            "durable-global core facts stay recallable across sessions: {contents:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_enforces_session_and_category_filters() {
+        // Hindsight's list endpoint has no server-side predicate; the driver
+        // must apply both the category and session filters client-side.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "items": [
+                    { "id": "a", "text": "conv A", "tags": ["zeroclaw", "conversation", "session:s-A"] },
+                    { "id": "b", "text": "conv B", "tags": ["zeroclaw", "conversation", "session:s-B"] },
+                    { "id": "g", "text": "core fact", "tags": ["zeroclaw", "core"] }
+                ],
+                "total": 3
+            })))
+            .mount(&server)
+            .await;
+
+        let mem = memory_for(&server.uri(), "zeroclaw-test");
+        // Session filter: only session B's row plus the durable-global core row.
+        let scoped = mem
+            .list(None, Some("s-B"))
+            .await
+            .expect("list should succeed");
+        let scoped_ids: Vec<&str> = scoped.iter().map(|e| e.id.as_str()).collect();
+        assert!(
+            scoped_ids.contains(&"b"),
+            "own session row kept: {scoped_ids:?}"
+        );
+        assert!(
+            scoped_ids.contains(&"g"),
+            "durable-global row kept: {scoped_ids:?}"
+        );
+        assert!(
+            !scoped_ids.contains(&"a"),
+            "foreign session row dropped: {scoped_ids:?}"
+        );
+        // Category filter narrows to conversation rows only.
+        let convo = mem
+            .list(Some(&MemoryCategory::Conversation), None)
+            .await
+            .expect("list should succeed");
+        assert!(
+            convo
+                .iter()
+                .all(|e| e.category == MemoryCategory::Conversation)
+        );
+        assert_eq!(convo.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn recall_enforces_time_window() {
+        // A recall bounded by [since, until] must drop rows whose timestamp
+        // falls outside the window, even though Hindsight returns them all.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/recall"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [
+                    { "id": "old", "text": "too old", "mentioned_at": "2026-01-01T00:00:00Z",
+                      "tags": ["zeroclaw", "core"], "scores": { "final": 0.9 } },
+                    { "id": "mid", "text": "in window", "mentioned_at": "2026-06-15T00:00:00Z",
+                      "tags": ["zeroclaw", "core"], "scores": { "final": 0.8 } },
+                    { "id": "new", "text": "too new", "mentioned_at": "2026-12-31T00:00:00Z",
+                      "tags": ["zeroclaw", "core"], "scores": { "final": 0.7 } }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let mem = memory_for(&server.uri(), "zeroclaw-test");
+        let hits = mem
+            .recall(
+                "anything",
+                10,
+                None,
+                Some("2026-06-01T00:00:00Z"),
+                Some("2026-07-01T00:00:00Z"),
+            )
+            .await
+            .expect("recall should succeed");
+        let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(ids, vec!["mid"], "only the in-window row survives: {ids:?}");
+    }
+
+    /// Fail-closed regression: a row with a MISSING (empty) remote timestamp
+    /// must be EXCLUDED when a bound is present - it cannot be shown to satisfy
+    /// a window the remote could not enforce. (With no bound it would be kept;
+    /// that is `recall_keeps_undated_rows_when_unbounded` below.)
+    #[tokio::test]
+    async fn recall_excludes_undated_row_when_bound_present() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/recall"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [
+                    { "id": "dated", "text": "in window", "mentioned_at": "2026-06-15T00:00:00Z",
+                      "tags": ["zeroclaw", "core"], "scores": { "final": 0.9 } },
+                    { "id": "undated", "text": "no timestamp",
+                      "tags": ["zeroclaw", "core"], "scores": { "final": 0.8 } }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let mem = memory_for(&server.uri(), "zeroclaw-test");
+        let hits = mem
+            .recall(
+                "anything",
+                10,
+                None,
+                Some("2026-06-01T00:00:00Z"),
+                Some("2026-07-01T00:00:00Z"),
+            )
+            .await
+            .expect("recall should succeed");
+        let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["dated"],
+            "an undated row must fail closed under a bound: {ids:?}"
+        );
+    }
+
+    /// Fail-closed regression: a row with a MALFORMED (non-RFC-3339) remote
+    /// timestamp must be EXCLUDED when a bound is present - a byte comparison
+    /// must never let `"not-a-real-date"` survive a window it cannot be placed
+    /// in.
+    #[tokio::test]
+    async fn recall_excludes_malformed_timestamp_row_when_bound_present() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/recall"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [
+                    { "id": "dated", "text": "in window", "mentioned_at": "2026-06-15T00:00:00Z",
+                      "tags": ["zeroclaw", "core"], "scores": { "final": 0.9 } },
+                    { "id": "garbage", "text": "bad date", "mentioned_at": "not-a-real-date",
+                      "tags": ["zeroclaw", "core"], "scores": { "final": 0.8 } }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let mem = memory_for(&server.uri(), "zeroclaw-test");
+        let hits = mem
+            .recall(
+                "anything",
+                10,
+                None,
+                Some("2026-06-01T00:00:00Z"),
+                Some("2026-07-01T00:00:00Z"),
+            )
+            .await
+            .expect("recall should succeed");
+        let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["dated"],
+            "a malformed-timestamp row must fail closed under a bound: {ids:?}"
+        );
+    }
+
+    /// A malformed CALLER bound is a clear error, not a silent lexical
+    /// comparison: the caller asked for a window the driver cannot honor, so
+    /// recall must refuse rather than quietly return unfiltered rows.
+    #[tokio::test]
+    async fn recall_rejects_invalid_caller_bound() {
+        let server = MockServer::start().await;
+        // No recall route is mounted: a correct implementation rejects the bad
+        // bound BEFORE any HTTP call, so the mock is never hit.
+        let mem = memory_for(&server.uri(), "zeroclaw-test");
+        let err = mem
+            .recall("anything", 10, None, Some("yesterday"), None)
+            .await
+            .expect_err("an unparseable caller bound must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("since") && msg.contains("RFC 3339"),
+            "error should name the invalid bound and expected format: {msg}"
+        );
+    }
+
+    /// Unbounded recall keeps an undated row: with no window there is nothing
+    /// for it to fall outside of, so fail-closed exclusion must NOT apply.
+    #[tokio::test]
+    async fn recall_keeps_undated_rows_when_unbounded() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/recall"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [
+                    { "id": "undated", "text": "no timestamp",
+                      "tags": ["zeroclaw", "core"], "scores": { "final": 0.8 } }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let mem = memory_for(&server.uri(), "zeroclaw-test");
+        let hits = mem
+            .recall("anything", 10, None, None, None)
+            .await
+            .expect("recall should succeed");
+        let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["undated"],
+            "an undated row is kept when no bound is supplied: {ids:?}"
+        );
+    }
+
+    /// WARNING regression: scoped recall PAGES to fill the window. A valid
+    /// own-session row ranked BELOW a full first over-fetch page of
+    /// foreign-session rows must still surface: the driver escalates the fetch
+    /// (limit-only API, so a larger limit is the only paging shape) until the
+    /// requested limit is satisfied. The mock answers the first page
+    /// (`limit == 4`, the over-fetch of `limit 1`) with four foreign-session
+    /// rows, and the escalated page (`limit == 8`) with the valid row appended,
+    /// proving the second fetch happened and filled the window.
+    #[tokio::test]
+    async fn scoped_recall_pages_to_fill_window() {
+        let server = MockServer::start().await;
+        let foreign: Vec<serde_json::Value> = (0..4)
+            .map(|i| {
+                json!({
+                    "id": format!("f{i}"), "text": "foreign",
+                    "tags": ["zeroclaw", "conversation", "session:other"],
+                    "scores": { "final": 0.9 - f64::from(i) * 0.01 }
+                })
+            })
+            .collect();
+        // First page (over-fetch of limit 1 -> 4): only foreign-session rows.
+        Mock::given(method("POST"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/recall"))
+            .and(body_partial_json(json!({ "limit": 4 })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "results": foreign.clone() })),
+            )
+            .mount(&server)
+            .await;
+        // Escalated page (doubled to 8): the valid own-session row appears,
+        // ranked below the four foreign rows.
+        let mut with_valid = foreign;
+        with_valid.push(json!({
+            "id": "mine", "text": "valid own-session row",
+            "tags": ["zeroclaw", "conversation", "session:mine"],
+            "scores": { "final": 0.5 }
+        }));
+        Mock::given(method("POST"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/recall"))
+            .and(body_partial_json(json!({ "limit": 8 })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "results": with_valid })),
+            )
+            .mount(&server)
+            .await;
+
+        let mem = memory_for(&server.uri(), "zeroclaw-test");
+        let hits = mem
+            .recall("anything", 1, Some("mine"), None, None)
+            .await
+            .expect("recall should succeed");
+        let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["mine"],
+            "paging must surface the valid row ranked below the first page: {ids:?}"
         );
     }
 }
