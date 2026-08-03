@@ -587,9 +587,23 @@ async fn handle_socket(
         dropped_messages,
         kept_turns,
         reason,
+        token_budget,
+        tokens_before,
+        tokens_after,
+        tokens_before_source,
+        tokens_after_source,
     }) = restore_trim_event
     {
-        let frame = history_trimmed_ws_frame(dropped_messages, kept_turns, &reason);
+        let frame = history_trimmed_ws_frame(
+            dropped_messages,
+            kept_turns,
+            &reason,
+            token_budget,
+            tokens_before,
+            tokens_after,
+            tokens_before_source.map(|s| s.as_str()),
+            tokens_after_source.map(|s| s.as_str()),
+        );
         let _ = sender.send(Message::Text(frame.to_string().into())).await;
     }
 
@@ -934,13 +948,34 @@ fn history_trimmed_ws_frame(
     dropped_messages: usize,
     kept_turns: usize,
     reason: &str,
+    token_budget: Option<u64>,
+    tokens_before: Option<u64>,
+    tokens_after: Option<u64>,
+    tokens_before_source: Option<&str>,
+    tokens_after_source: Option<&str>,
 ) -> serde_json::Value {
-    serde_json::json!({
+    let mut frame = serde_json::json!({
         "type": "history_trimmed",
         "dropped_messages": dropped_messages,
         "kept_turns": kept_turns,
         "reason": reason,
-    })
+    });
+    if let Some(token_budget) = token_budget {
+        frame["token_budget"] = token_budget.into();
+    }
+    if let Some(tokens_before) = tokens_before {
+        frame["tokens_before"] = tokens_before.into();
+    }
+    if let Some(tokens_after) = tokens_after {
+        frame["tokens_after"] = tokens_after.into();
+    }
+    if let Some(tokens_before_source) = tokens_before_source {
+        frame["tokens_before_source"] = tokens_before_source.into();
+    }
+    if let Some(tokens_after_source) = tokens_after_source {
+        frame["tokens_after_source"] = tokens_after_source.into();
+    }
+    frame
 }
 
 fn needs_onboarding_ws_error(
@@ -1289,7 +1324,21 @@ async fn process_chat_message(
                             dropped_messages,
                             kept_turns,
                             reason,
-                        } => history_trimmed_ws_frame(dropped_messages, kept_turns, &reason),
+                            token_budget,
+                            tokens_before,
+                            tokens_after,
+                            tokens_before_source,
+                            tokens_after_source,
+                        } => history_trimmed_ws_frame(
+                            dropped_messages,
+                            kept_turns,
+                            &reason,
+                            token_budget,
+                            tokens_before,
+                            tokens_after,
+                            tokens_before_source.map(|s| s.as_str()),
+                            tokens_after_source.map(|s| s.as_str()),
+                        ),
                         TurnEvent::Plan { entries } => serde_json::json!({
                             "type": "plan",
                             "entries": entries,
@@ -1992,7 +2041,7 @@ data: {\"type\":\"message_stop\"}\n\n",
 
     #[test]
     fn restore_trim_uses_live_history_trimmed_frame_shape() {
-        let frame = history_trimmed_ws_frame(12, 3, "message limit");
+        let frame = history_trimmed_ws_frame(12, 3, "message limit", None, None, None, None, None);
 
         assert_eq!(
             frame,
@@ -2003,6 +2052,27 @@ data: {\"type\":\"message_stop\"}\n\n",
                 "reason": "message limit",
             })
         );
+    }
+
+    #[test]
+    fn history_trimmed_frame_carries_token_accounting_when_present() {
+        let frame = history_trimmed_ws_frame(
+            12,
+            3,
+            "context token budget exceeded",
+            Some(500_000),
+            Some(612_000),
+            Some(117_000),
+            Some("provider"),
+            Some("calibrated"),
+        );
+
+        assert_eq!(frame["type"], "history_trimmed");
+        assert_eq!(frame["token_budget"], 500_000);
+        assert_eq!(frame["tokens_before"], 612_000);
+        assert_eq!(frame["tokens_after"], 117_000);
+        assert_eq!(frame["tokens_before_source"], "provider");
+        assert_eq!(frame["tokens_after_source"], "calibrated");
     }
 
     #[test]

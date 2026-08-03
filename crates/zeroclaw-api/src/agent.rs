@@ -54,6 +54,32 @@ impl ToolArtifact {
     }
 }
 
+/// Provenance of a token count carried on a history-trim event. Lets clients
+/// distinguish provider-reported usage from a local estimate and from a mix of
+/// the two (the reported-budget trim path scales an estimate to a
+/// provider-reported figure).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenCountSource {
+    /// Count comes from provider-reported usage.
+    Provider,
+    /// Count is locally estimated.
+    Estimated,
+    /// Count is calibrated from provider-reported usage and a local estimate.
+    Calibrated,
+}
+
+impl TokenCountSource {
+    /// Wire value used by the WS, SSE, RPC, and ACP surfaces.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TokenCountSource::Provider => "provider",
+            TokenCountSource::Estimated => "estimate",
+            TokenCountSource::Calibrated => "calibrated",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum TurnEvent {
     /// A text chunk from the LLM response (may arrive many times).
@@ -103,6 +129,17 @@ pub enum TurnEvent {
         dropped_messages: usize,
         kept_turns: usize,
         reason: String,
+        /// Configured context token budget in effect at trim time. `None` for
+        /// message-limit trims, which carry no token accounting.
+        token_budget: Option<u64>,
+        /// Token count before trimming.
+        tokens_before: Option<u64>,
+        /// Token count after trimming.
+        tokens_after: Option<u64>,
+        /// Provenance of `tokens_before`.
+        tokens_before_source: Option<TokenCountSource>,
+        /// Provenance of `tokens_after`.
+        tokens_after_source: Option<TokenCountSource>,
     },
     /// Per-LLM-call token usage and cost; a turn may emit several, one per
     /// model call. `None` means "unavailable for this call", not zero.
