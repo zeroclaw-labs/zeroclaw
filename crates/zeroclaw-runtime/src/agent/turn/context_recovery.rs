@@ -85,7 +85,7 @@ pub(crate) async fn try_recover_context_overflow(
         let dropped_turns = result.dropped_turns;
         let dropped_messages = result.dropped_messages;
         let kept_turns = result.kept_turns;
-        let tokens_after = result.tokens_after;
+        let mut tokens_after = result.tokens_after;
         let mut recovered_history = result.history;
         if trimmed {
             // Announce compaction only once the trim has actually succeeded.
@@ -102,6 +102,9 @@ pub(crate) async fn try_recover_context_overflow(
                 .take_while(|m| m.role == "system")
                 .count();
             recovered_history.insert(system_count, crate::agent::history_trim::breadcrumb());
+            // Recompute from the final recovered history (breadcrumb included)
+            // so the reported count matches what the retried call sends.
+            tokens_after = crate::agent::history::estimate_history_tokens(&recovered_history);
         }
         *history = recovered_history;
         if trimmed {
@@ -353,6 +356,11 @@ mod tests {
                         Some(zeroclaw_api::agent::TokenCountSource::Estimated),
                     ),
                     "estimate-based recovery counts are marked estimated"
+                );
+                assert_eq!(
+                    tokens_after,
+                    Some(crate::agent::history::estimate_history_tokens(&history) as u64),
+                    "tokens_after must describe the final recovered history (breadcrumb included)"
                 );
             }
             other => panic!("expected HistoryTrimmed, got {other:?}"),
