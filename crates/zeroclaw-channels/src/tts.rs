@@ -488,28 +488,48 @@ impl TtsProvider for EdgeTtsProvider {
             .to_str()
             .context("Failed to build temp file path for Edge TTS")?;
 
-        let output = tokio::time::timeout(
-            self.timeout,
-            tokio::process::Command::new(&self.binary_path)
-                .arg("--text")
-                .arg(text)
-                .arg("--voice")
-                .arg(voice)
-                .arg("--write-media")
-                .arg(output_path)
-                // Own the child lifecycle: when the timeout fires and the
-                // `output()` future is dropped, the child is killed rather than
-                // left running to recreate the artifact after our cleanup runs.
-                .kill_on_drop(true)
-                .output(),
-        )
-        .await
-        .context("Edge TTS subprocess timed out")?
-        .context("Failed to spawn edge-tts subprocess")?;
+        // Spawn explicitly so synthesize owns the child through timeout
+        // handling. On timeout the child is killed AND reaped before the
+        // artifact guard removes the output, so the deletion cannot race a
+        // still-terminating process (kill_on_drop alone only sends the kill).
+        let mut child = tokio::process::Command::new(&self.binary_path)
+            .arg("--text")
+            .arg(text)
+            .arg("--voice")
+            .arg(voice)
+            .arg("--write-media")
+            .arg(output_path)
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .context("Failed to spawn edge-tts subprocess")?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("edge-tts failed (exit {}): {}", output.status, stderr);
+        let status = match tokio::time::timeout(self.timeout, child.wait()).await {
+            Ok(Ok(status)) => status,
+            Ok(Err(err)) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                return Err(err).context("Failed to wait for edge-tts subprocess");
+            }
+            Err(_elapsed) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                bail!("Edge TTS subprocess timed out");
+            }
+        };
+
+        let stderr = {
+            use tokio::io::AsyncReadExt;
+            let mut stderr = String::new();
+            if let Some(mut stderr_pipe) = child.stderr.take() {
+                let _ = tokio::time::timeout(self.timeout, stderr_pipe.read_to_string(&mut stderr))
+                    .await;
+            }
+            stderr
+        };
+
+        if !status.success() {
+            bail!("edge-tts failed (exit {}): {}", status, stderr);
         }
 
         let bytes = tokio::fs::read(&output_file)
