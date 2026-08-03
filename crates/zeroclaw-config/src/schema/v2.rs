@@ -241,6 +241,18 @@ impl V2Config {
                 "providers.fallback eradicated"
             );
         }
+        // Capture the raw provider keys and global default_provider BEFORE
+        // canonicalization: the vision-reference rewrite needs them to know
+        // whether a bare family name has its own source entry, rather than
+        // inferring that from the post-canonicalization alias count alone.
+        let raw_provider_keys: Vec<String> = match new_providers.get("models") {
+            Some(toml::Value::Table(models)) => models.keys().cloned().collect(),
+            _ => Vec::new(),
+        };
+        let g_default_provider = new_providers
+            .get("default_provider")
+            .and_then(toml::Value::as_str)
+            .map(str::to_string);
         let mut aliased_models = alias_provider_models(new_providers.remove("models"));
 
         // V3 ModelProviderConfig absorbed the V2 [providers] globals
@@ -251,8 +263,14 @@ impl V2Config {
         // the migrated V3 alias: runtime resolves only dotted `<family>.<alias>`
         // refs to typed alias config, so a bare ref reaches the legacy
         // configless construction path and loses the alias's api_key. Rewrite
-        // it to the family's unambiguous migrated alias when exactly one exists.
-        rewrite_bare_vision_provider_reference(&mut passthrough, &aliased_models);
+        // it to the family's unambiguous migrated alias when the family itself
+        // has a source entry.
+        rewrite_bare_vision_provider_reference(
+            &mut passthrough,
+            &aliased_models,
+            &raw_provider_keys,
+            g_default_provider.as_deref(),
+        );
 
         // V3 dropped cost.prices: the V2 keys ("<provider>/<model>")
         // don't carry the V3 alias path, so remapping is fragile.
@@ -777,15 +795,19 @@ fn alias_provider_models(models: Option<toml::Value>) -> toml::Table {
 /// [`alias_provider_models`], so legacy spellings select their migrated alias:
 /// `grok` -> `xai.default`, `openai-codex` -> `openai.codex`,
 /// `opencode-go` -> `opencode.go`, and dot-bearing `llama.cpp` ->
-/// `llamacpp.default`. A bare family is only rewritten when it migrated to
-/// exactly one alias; a reference that names a specific alias (dotted, or
-/// legacy with a fixed alias) is rewritten when that alias exists. Colon-URL
-/// refs and already-valid dotted refs that do not canonicalize to a configured
-/// alias are left untouched, and an unknown family stays as-is so the runtime
-/// keeps failing closed on an unknown provider.
+/// `llamacpp.default`. A bare family is only rewritten when the family name
+/// itself has a source entry (a raw provider key or the global
+/// `default_provider`) and migrated to exactly one alias; a reference that
+/// names a specific alias (dotted, or legacy with a fixed alias) is rewritten
+/// when that alias exists. Colon-URL refs and already-valid dotted refs that
+/// do not canonicalize to a configured alias are left untouched, and an
+/// unknown family stays as-is so the runtime keeps failing closed on an
+/// unknown provider.
 fn rewrite_bare_vision_provider_reference(
     passthrough: &mut toml::Table,
     aliased_models: &toml::Table,
+    raw_provider_keys: &[String],
+    global_default_provider: Option<&str>,
 ) {
     let Some(toml::Value::Table(multimodal)) = passthrough.get_mut("multimodal") else {
         return;
@@ -804,11 +826,18 @@ fn rewrite_bare_vision_provider_reference(
         return;
     };
     let target_alias = if reference.as_str() == canonical_family {
-        // A bare canonical family name: rewrite only when its own default
-        // alias is the sole migrated alias. A single alias created from a
-        // DIFFERENT legacy spelling (e.g. openai-codex -> openai.codex) must
-        // not redirect a bare "openai" reference to it — that would silently
-        // change provider and credential selection.
+        // A bare canonical family name: rewrite only when the family name has
+        // its own source entry (a raw provider key of that exact name, or the
+        // global default_provider) AND its default alias is the sole migrated
+        // alias. A default alias synthesized from a DIFFERENT legacy variant
+        // (openai-codex -> openai.codex, qwen-code -> qwen.default with the
+        // code endpoint) must not redirect a bare family reference to it —
+        // that would silently change provider and credential selection.
+        let has_own_source = raw_provider_keys.iter().any(|k| k == reference)
+            || global_default_provider == Some(reference.as_str());
+        if !has_own_source {
+            return;
+        }
         let mut aliases: Vec<&str> = family_table.keys().map(String::as_str).collect();
         aliases.sort_unstable();
         if aliases.len() != 1 || aliases[0] != canonical_alias {
