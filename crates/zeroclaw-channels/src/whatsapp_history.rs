@@ -93,17 +93,36 @@ pub fn role_for(from_me: bool) -> &'static str {
 /// — a malformed entry should cost its own turns, not the entire recovered
 /// history.
 ///
+/// `resolve_sender` turns a chat JID into the sender string the live path
+/// records. This is a parameter rather than something derived here because
+/// getting it wrong is silent: the live path stores `+E.164` (resolved through
+/// `sender_phone_candidates`, which needs the client's LID→phone mapping), so a
+/// JID built locally would key every claim differently and the ledger would
+/// treat messages the agent had already answered as brand new. The channel owns
+/// that resolution; this module must not guess at it. Returning `None` skips
+/// the conversation — better to miss old turns than to import them under a key
+/// that defeats the duplicate check.
+///
 /// Turns come back in the payload's own order. Ordering by timestamp is left
 /// to the caller, which has to merge these with whatever the session already
 /// holds anyway.
 #[cfg(feature = "whatsapp-web")]
-pub fn extract_turns(
+pub fn extract_turns<F>(
     sync: &wacore::types::events::LazyHistorySync,
     channel_scope: &str,
-) -> Vec<RecoveredTurn> {
+    mut resolve_sender: F,
+) -> Vec<RecoveredTurn>
+where
+    F: FnMut(&str) -> Option<String>,
+{
     let mut stream = sync.stream();
     let mut turns = Vec::new();
     while let Ok(Some(conversation)) = stream.next_conversation() {
+        // Resolved once per conversation: the mapping is per-peer, and a sync
+        // can carry hundreds of messages per chat.
+        let Some(sender) = resolve_sender(&conversation.id) else {
+            continue;
+        };
         for entry in &conversation.messages {
             let Some(info) = entry.message.as_option() else {
                 continue;
@@ -121,18 +140,10 @@ pub fn extract_turns(
             else {
                 continue;
             };
-            // `conversation.id` is the chat's JID, which is what the live path
-            // uses as reply_target. The peer's own JID is the sender: in a DM
-            // they are the same conversation, but the session key keeps both
-            // positions, so they are passed separately rather than assumed.
-            let sender = key
-                .participant
-                .as_deref()
-                .unwrap_or(conversation.id.as_str());
             turns.push(RecoveredTurn {
                 message_id: message_id.to_string(),
-                sender: sender.to_string(),
-                session_key: session_key_for_chat(channel_scope, &conversation.id, sender),
+                sender: sender.clone(),
+                session_key: session_key_for_chat(channel_scope, &conversation.id, &sender),
                 role: role_for(key.from_me.unwrap_or(false)),
                 content: text,
                 timestamp_secs,
@@ -336,6 +347,13 @@ mod tests {
     /// history: the live path claims under the same key, so the import sees it
     /// as known. This is why idempotency is delegated to the existing store
     /// instead of a fingerprint derived here.
+    ///
+    /// The two sides deliberately use the shapes production uses: the live path
+    /// claims under the `+E.164` that `sender_phone_candidates` resolves, while
+    /// the chat is identified by a LID. An earlier version of this test wrote
+    /// the LID on both sides and passed while the real code keyed the two paths
+    /// differently — a test that builds both halves from the same assumption
+    /// cannot catch a mismatch between them.
     #[cfg(feature = "whatsapp-web")]
     #[test]
     fn a_turn_already_claimed_by_the_live_path_is_not_re_imported() {
@@ -346,17 +364,25 @@ mod tests {
         let claims = ProcessedMessageStore::open_in_state_dir(dir.path()).unwrap();
         let sessions = SessionStore::new(dir.path()).unwrap();
 
-        // The live path claims the message when it answers it.
-        let live_key = ProcessedMessageStore::key_for("whatsapp", "76188559093817@lid", "MSG_LIVE");
+        // What the live path actually writes: the resolved phone number, not
+        // the chat's LID.
+        let live_sender = "+5215557654321";
+        let live_key = ProcessedMessageStore::key_for("whatsapp", live_sender, "MSG_LIVE");
         assert!(
             claims.claim(&live_key),
             "live path claims the message first"
         );
 
+        let session_key = session_key_for_chat(
+            "whatsapp.default",
+            "76188559093817@lid", // chat JID
+            live_sender,          // resolved sender
+        );
+
         let turns = vec![RecoveredTurn {
             message_id: "MSG_LIVE".into(),
-            sender: "76188559093817@lid".into(),
-            session_key: "whatsapp_default_chat_peer".into(),
+            sender: live_sender.into(),
+            session_key: session_key.clone(),
             role: "user",
             content: "hola".into(),
             timestamp_secs: 1_754_170_320,
@@ -368,8 +394,36 @@ mod tests {
             "a turn the agent already handled must not be imported again"
         );
         assert!(
-            sessions.load("whatsapp_default_chat_peer").is_empty(),
+            sessions.load(&session_key).is_empty(),
             "nothing should have been written"
+        );
+    }
+
+    /// The failure this module exists to prevent, stated as a test: if the
+    /// import keys its claims on the chat JID while the live path keys them on
+    /// the resolved phone number, the ledger sees two different messages and
+    /// re-imports a conversation the agent already answered.
+    #[cfg(feature = "whatsapp-web")]
+    #[test]
+    fn keying_the_import_on_the_jid_would_defeat_the_duplicate_check() {
+        use crate::processed_messages::ProcessedMessageStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let claims = ProcessedMessageStore::open_in_state_dir(dir.path()).unwrap();
+
+        let live = ProcessedMessageStore::key_for("whatsapp", "+5215557654321", "MSG_X");
+        let by_jid = ProcessedMessageStore::key_for("whatsapp", "76188559093817@lid", "MSG_X");
+
+        assert_ne!(
+            live, by_jid,
+            "the two shapes must differ — this is the trap being guarded against"
+        );
+        assert!(claims.claim(&live), "live path claims first");
+        assert!(
+            claims.claim(&by_jid),
+            "a JID-keyed claim for the SAME message is accepted as new, which is \
+             exactly why extract_turns takes a resolver instead of deriving the \
+             sender from the chat JID"
         );
     }
 }

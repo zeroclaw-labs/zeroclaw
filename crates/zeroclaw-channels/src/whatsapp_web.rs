@@ -2932,9 +2932,57 @@ impl Channel for WhatsAppWebChannel {
                                 // message content: this is someone's private
                                 // thread, and a log line is the easiest place
                                 // for it to leak.
+                                // Resolve each chat's sender the way the live
+                                // path does, BEFORE extracting: the claim
+                                // ledger is keyed on `+E.164` resolved through
+                                // the client's LID→phone mapping, so a JID used
+                                // here would key every claim differently and
+                                // the ledger would treat already-answered
+                                // messages as new. The lookup is async and
+                                // extract_turns is not, so the mapping is built
+                                // first and handed in.
+                                let mut sender_by_chat: std::collections::HashMap<String, String> =
+                                    std::collections::HashMap::new();
+                                {
+                                    let mut probe = sync.stream();
+                                    while let Ok(Some(conv)) = probe.next_conversation() {
+                                        if sender_by_chat.contains_key(&conv.id) {
+                                            continue;
+                                        }
+                                        let Ok(jid) = conv.id.parse::<wacore_binary::jid::Jid>()
+                                        else {
+                                            continue;
+                                        };
+                                        // Groups have no single peer number, so
+                                        // there is no live-path sender to match.
+                                        if jid.is_group() {
+                                            continue;
+                                        }
+                                        let mapped = if jid.is_lid() {
+                                            match client.get_lid_pn_entry(&jid).await {
+                                                Ok(Some(entry)) => Some(entry.phone_number),
+                                                _ => None,
+                                            }
+                                        } else {
+                                            None
+                                        };
+                                        if let Some(sender) = Self::sender_phone_candidates(
+                                            &jid,
+                                            None,
+                                            mapped.as_deref(),
+                                        )
+                                        .into_iter()
+                                        .next()
+                                        {
+                                            sender_by_chat.insert(conv.id.clone(), sender);
+                                        }
+                                    }
+                                }
+
                                 let turns = crate::whatsapp_history::extract_turns(
                                     sync,
                                     &history_scope_inner,
+                                    |chat| sender_by_chat.get(chat).cloned(),
                                 );
                                 let stored = match (
                                     history_sessions_inner.as_ref(),
