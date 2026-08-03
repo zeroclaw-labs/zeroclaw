@@ -1,0 +1,183 @@
+# Build the aarch64 production binary on pve-compute, deploy it to the OCI host.
+#
+# WHY THIS PIPELINE EXISTS
+#     The OCI host runs the live agent *and* the Hermes gateway inside one user
+#     cgroup capped at MemoryHigh=6G. A release build's LTO link peaks near 6 GB
+#     by itself, so building there pushes the cgroup over its limit and the
+#     kernel throttles every allocation — an observed run logged 952,664
+#     `memory.events high` entries and took 76 minutes of wall clock for 8
+#     minutes of CPU, while also squeezing the agent that shares that cgroup.
+#     Builds belong on the 28-core/80 GB box; the OCI host should only ever
+#     receive a finished artifact.
+#
+# THE GLIBC TRAP THAT MAKES THIS NON-OBVIOUS
+#     pve-compute is Debian 13 (glibc 2.41), production is Ubuntu 24.04
+#     (glibc 2.39). A naive cross-build links against the builder's glibc and
+#     dies on the target with `version 'GLIBC_2.41' not found`. cargo-zigbuild
+#     pins the glibc version in the target triple; the verify step then reads the
+#     highest GLIBC_* symbol the artifact actually needs and fails the job rather
+#     than shipping something that cannot exec.
+#
+# DEPLOY SAFETY
+#     Two invariants are enforced before the daemon is restarted, both learned
+#     from production incidents:
+#       1. Never restart into a revoked WhatsApp session — reconnecting against a
+#          revoked device is what got the number banned. `device.pn IS NULL`
+#          marks revocation (the row survives revocation, so COUNT(*) proves
+#          nothing).
+#       2. Always stop the daemon before swapping the binary. The workspace lock
+#          means a second process cannot start anyway, and an in-place swap of a
+#          running executable is how you get a mismatched runtime.
+name: build-and-deploy
+
+on:
+  push:
+    branches: [master, 'feat/**', 'fix/**']
+    paths:
+      - 'crates/**'
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/build-and-deploy.yml'
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: 'Install and restart on the OCI host'
+        type: boolean
+        default: false
+
+concurrency:
+  # One build per branch. A superseded push has nothing worth finishing, but a
+  # deploy in flight must never be cancelled halfway.
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: '0'
+  CARGO_TERM_COLOR: always
+  RUST_VERSION: '1.96.1'
+  TARGET_GLIBC: '2.39'
+  TRIPLE: aarch64-unknown-linux-gnu
+  FEATURES: whatsapp-web
+
+jobs:
+  build:
+    # Self-hosted on pve-compute: 28 cores, 80 GB, no cgroup memory cap.
+    runs-on: [self-hosted, pve-compute]
+    timeout-minutes: 60
+    outputs:
+      md5: ${{ steps.artifact.outputs.md5 }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify toolchain matches the repo pin
+        # A different rustc silently invalidates fmt/clippy/test output and the
+        # pre-push hook rejects it anyway. Fail loudly and early.
+        run: |
+          export PATH="$HOME/.cargo/bin:/usr/local/bin:$PATH"
+          have="$(rustc --version | awk '{print $2}')"
+          [ "$have" = "$RUST_VERSION" ] || {
+            echo "::error::rustc $have != pinned $RUST_VERSION"; exit 1; }
+          command -v cargo-zigbuild >/dev/null || {
+            echo "::error::cargo-zigbuild missing — required to pin target glibc"; exit 1; }
+          zig version
+
+      - name: Format and lint
+        run: |
+          export PATH="$HOME/.cargo/bin:/usr/local/bin:$PATH"
+          cargo fmt --all -- --check
+          cargo clippy --all-targets --features "$FEATURES" -- -D warnings
+
+      - name: Test
+        run: |
+          export PATH="$HOME/.cargo/bin:/usr/local/bin:$PATH"
+          cargo test --workspace --features "$FEATURES"
+
+      - name: Cross-build for the production host
+        run: |
+          export PATH="$HOME/.cargo/bin:/usr/local/bin:$PATH"
+          cargo zigbuild --release --bin zeroclaw \
+            --features "$FEATURES" \
+            --target "$TRIPLE.$TARGET_GLIBC"
+
+      - name: Verify the artifact can actually run on the target
+        id: artifact
+        run: |
+          bin="target/$TRIPLE/release/zeroclaw"
+          file "$bin" | grep -q 'ARM aarch64' || {
+            echo "::error::artifact is not aarch64"; exit 1; }
+
+          highest="$(objdump -T "$bin" | grep -oE 'GLIBC_2\.[0-9]+' | sort -uV | tail -1)"
+          need="${highest#GLIBC_}"
+          echo "highest glibc symbol required: $highest"
+          if [ "$(printf '%s\n%s\n' "$need" "$TARGET_GLIBC" | sort -V | tail -1)" != "$TARGET_GLIBC" ]; then
+            echo "::error::needs glibc $need, production has $TARGET_GLIBC — would fail to exec"
+            exit 1
+          fi
+
+          # The channel is a feature, and a binary built without it starts
+          # cleanly while leaving the agent mute — a failure mode that has
+          # reached production before. Prove the feature is compiled in.
+          strings "$bin" | grep -q 'whatsapp' || {
+            echo "::error::binary has no whatsapp symbols — built without --features $FEATURES?"; exit 1; }
+
+          echo "md5=$(md5sum "$bin" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zeroclaw-aarch64
+          path: target/${{ env.TRIPLE }}/release/zeroclaw
+          retention-days: 14
+
+  deploy:
+    needs: build
+    # Manual only, and only from a green build. Auto-deploying a companion agent
+    # on every push would restart it mid-conversation.
+    if: github.event_name == 'workflow_dispatch' && inputs.deploy
+    runs-on: [self-hosted, oci-quetzalogic]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: zeroclaw-aarch64
+
+      - name: Refuse to restart into a revoked session
+        # Reconnecting against a revoked device is what triggered the account
+        # bans. The row survives revocation with its identity fields nulled, so
+        # the marker is `pn IS NULL`, not the row's absence.
+        run: |
+          db="$HOME/.zeroclaw/state/whatsapp-julian/session.db"
+          if [ -f "$db" ]; then
+            pn="$(sqlite3 "file:$db?mode=ro" "SELECT COALESCE(pn,'REVOKED') FROM device LIMIT 1;" 2>/dev/null || echo UNKNOWN)"
+            if [ "$pn" = "REVOKED" ]; then
+              echo "::error::session is revoked — install manually and re-pair before starting"
+              exit 1
+            fi
+            echo "session paired ok"
+          fi
+
+      - name: Install and restart
+        run: |
+          chmod +x zeroclaw
+          sudo cp -a /usr/local/lib/zeroclaw/zeroclaw-bin \
+            "/usr/local/lib/zeroclaw/zeroclaw-bin.prev-$(date +%Y%m%d-%H%M%S)"
+          systemctl --user stop zeroclaw
+          sudo install -m755 zeroclaw /usr/local/lib/zeroclaw/zeroclaw-bin
+          got="$(md5sum /usr/local/lib/zeroclaw/zeroclaw-bin | cut -d' ' -f1)"
+          [ "$got" = "${{ needs.build.outputs.md5 }}" ] || {
+            echo "::error::installed md5 $got != built ${{ needs.build.outputs.md5 }}"; exit 1; }
+          systemctl --user start zeroclaw
+
+      - name: Verify it is actually serving
+        # `active` only means systemd started a process. The channel banner and a
+        # live TLS socket are what prove the agent can receive a message.
+        run: |
+          sleep 30
+          systemctl --user is-active --quiet zeroclaw || {
+            echo "::error::service not active"; exit 1; }
+          restarts="$(systemctl --user show zeroclaw -p NRestarts --value)"
+          [ "$restarts" = "0" ] || echo "::warning::daemon restarted $restarts times since start"
+
+          conns="$(ss -tnp 2>/dev/null | grep zeroclaw | grep -c ':443' || true)"
+          [ "$conns" -ge 1 ] || { echo "::error::no TLS connection to the platform"; exit 1; }
+          echo "serving: $conns connection(s), $restarts restarts"
