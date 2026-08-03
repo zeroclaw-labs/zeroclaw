@@ -8123,8 +8123,8 @@ mod tests {
     /// `registered`) correctly live in `attributes`; the "who/where" identity
     /// (`channel = telegram.<alias>`) must ride in from the span, never from the
     /// call site. This pins the attribution/attrs split the logging contract
-    /// requires and answers the L1082 review question with executable evidence:
-    /// operators see the WARN attributed to the emitting Telegram channel.
+    /// requires: operators see the WARN attributed to the emitting Telegram
+    /// channel, while the numeric counts remain in `attributes`.
     #[tokio::test]
     async fn register_bot_commands_truncation_warn_carries_channel_attribution() {
         use wiremock::matchers::{method, path_regex};
