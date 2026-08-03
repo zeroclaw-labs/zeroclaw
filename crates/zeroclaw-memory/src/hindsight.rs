@@ -49,13 +49,17 @@
 //! default (`[memory.hindsight] retain_async = false`), so a successful
 //! `Memory::store` return means the item is durably queryable before the call
 //! returns - an immediate recall, next-turn injection, or another agent's
-//! shared-bank read cannot miss it. Setting `retain_async = true` (or the
-//! `ZC_HINDSIGHT_RETAIN_ASYNC` env override, read through this same
-//! [`HindsightMemory::from_config`] constructor so it reaches every runtime
-//! path) sends the server-side `async` flag instead, trading that
-//! read-after-write guarantee for lower in-turn latency; the env value is
-//! parsed strictly (`true`/`false`/`1`/`0`/`yes`/`no`, case-insensitive) and
-//! any other value is a startup error rather than a silent fallback.
+//! shared-bank read cannot miss it. Setting `retain_async = true` sends the
+//! server-side `async` flag instead, trading that read-after-write guarantee
+//! for lower in-turn latency. The effective value comes solely from the typed
+//! `[memory.hindsight] retain_async` field: the generic
+//! `ZEROCLAW_memory__hindsight__retain_async` override and the legacy short
+//! form `ZC_HINDSIGHT_RETAIN_ASYNC` are both resolved into that typed field
+//! during config loading (the legacy name is bridged in
+//! `zeroclaw_config::env_overrides`, parsed strictly -
+//! `true`/`false`/`1`/`0`/`yes`/`no`, case-insensitive, any other value a
+//! startup error), so this constructor never re-reads the environment and there
+//! is a single observable source of truth visible to config inspection.
 //!
 //! Recall type filter: `recall_types` restricts recall to selected Hindsight
 //! fact types (`experience`, `observation`, `world`); it is sent as the recall
@@ -112,23 +116,6 @@ use serde::Deserialize;
 use zeroclaw_config::schema::{
     DEFAULT_HINDSIGHT_TIMEOUT_SECS, DEFAULT_HINDSIGHT_TOP_K, HindsightMemoryConfig,
 };
-
-/// Env var overriding `[memory.hindsight] retain_async`. Read inside
-/// [`HindsightMemory::from_config`] (the single canonical constructor) so the
-/// override reaches every runtime path, not just an env-only entry point.
-const RETAIN_ASYNC_ENV: &str = "ZC_HINDSIGHT_RETAIN_ASYNC";
-
-/// Strictly parse a boolean-shaped env value. Unlike a falsey-only check, an
-/// unrecognized value (e.g. a typo) is REJECTED as an error instead of
-/// silently defaulting to `true` - a typo in a durability-affecting override
-/// must fail loudly, not flip retain semantics unnoticed.
-fn parse_strict_bool(raw: &str) -> std::result::Result<bool, String> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" => Ok(true),
-        "0" | "false" | "no" => Ok(false),
-        other => Err(other.to_string()),
-    }
-}
 
 /// Percent-encode a single URL path segment (bank id or server-provided memory
 /// id). Encodes everything that is not an unreserved URL character so a bank
@@ -412,23 +399,17 @@ impl HindsightMemory {
         // disagree with reported config.
         let recall_types = cfg.recall_types.clone();
 
-        // Retain durability: the typed default is synchronous (`false`), so a
-        // successful `store`/`store_to_bank` is durably queryable before the
-        // call returns. `ZC_HINDSIGHT_RETAIN_ASYNC` overrides it, but is read
-        // HERE (the single canonical constructor every runtime path uses) so
-        // the documented rollback actually reaches per-agent construction,
-        // not just the removed env-only path. Parsed strictly: an
-        // unrecognized value is a startup error rather than being silently
-        // treated as `true`.
-        let retain_async = match std::env::var(RETAIN_ASYNC_ENV) {
-            Ok(raw) => parse_strict_bool(&raw).map_err(|bad| {
-                anyhow::Error::msg(format!(
-                    "environment variable {RETAIN_ASYNC_ENV} has an invalid value {bad:?}; \
-                     must be one of true, false, 1, 0, yes, no (case-insensitive)"
-                ))
-            })?,
-            Err(_) => cfg.retain_async,
-        };
+        // Retain durability: the effective value comes ONLY from the typed
+        // config field. The default is synchronous (`false`), so a successful
+        // `store`/`store_to_bank` is durably queryable before the call returns.
+        // The legacy `ZC_HINDSIGHT_RETAIN_ASYNC` override is NOT re-read here:
+        // it is bridged into `cfg.retain_async` during config loading
+        // (`env_overrides::apply_env_overrides`) alongside the generic
+        // `ZEROCLAW_memory__hindsight__retain_async` form, so there is exactly
+        // ONE observable source of truth (typed `Config`, visible to config
+        // inspection and drift) instead of a second env read that could
+        // silently disagree with reported config.
+        let retain_async = cfg.retain_async;
 
         Ok(Self {
             alias: agent_alias.to_string(),
@@ -1973,10 +1954,11 @@ mod tests {
 
     #[tokio::test]
     async fn from_config_defaults_retain_async_false() {
+        // Only the token env var is read by `from_config` now; `retain_async`
+        // comes solely from the typed field. Serialize + guard the token var.
+        let _lock = env_test_lock();
         let env_name = "ZC_HINDSIGHT_TEST_TOKEN_RETAIN";
-        // SAFETY: single-threaded test; set + remove within this test only.
-        unsafe { std::env::set_var(env_name, "tok") };
-        unsafe { std::env::remove_var(RETAIN_ASYNC_ENV) };
+        let _tok = EnvVarGuard::set(env_name, "tok");
         let cfg = HindsightMemoryConfig {
             base_url: "https://memory.example.com/hs".to_string(),
             token_env: env_name.to_string(),
@@ -1996,23 +1978,24 @@ mod tests {
         };
         let mem_on = HindsightMemory::from_config(&cfg_on, "scout", "").expect("construct");
         assert!(mem_on.retain_async, "retain_async on must propagate");
-        unsafe { std::env::remove_var(env_name) };
     }
 
-    /// Blocker fix (env override reaches the real runtime path): the
-    /// documented `ZC_HINDSIGHT_RETAIN_ASYNC` rollback must reach
-    /// `from_config` (the canonical constructor `create_memory_for_agent`
-    /// uses for every per-agent runtime), not merely a removed env-only
-    /// constructor. This is the "production-construction regression" the
-    /// review asked for: it drives the exact `from_config` call the runtime
-    /// factory makes and proves the env value wins over a conflicting typed
-    /// default.
+    /// Blocker fix B1 (single observable source of truth): the effective
+    /// `retain_async` must come ONLY from the typed config field. The
+    /// `from_config` constructor must NOT re-read any environment variable -
+    /// even the legacy `ZC_HINDSIGHT_RETAIN_ASYNC` name, which is now bridged
+    /// into the typed field during config loading. Here the typed field says
+    /// sync (false) while the legacy env is set to `true`; the constructor must
+    /// honor the typed field and ignore the stray env, proving the backend no
+    /// longer has a second, config-invisible source.
     #[tokio::test]
-    async fn retain_async_env_override_reaches_from_config_runtime_path() {
-        let env_name = "ZC_HINDSIGHT_TEST_TOKEN_ENV_OVERRIDE";
-        unsafe { std::env::set_var(env_name, "tok") };
-        // Typed config says sync (false); the env override flips it to async.
-        unsafe { std::env::set_var(RETAIN_ASYNC_ENV, "true") };
+    async fn from_config_retain_async_ignores_legacy_env_uses_typed_field_only() {
+        let _lock = env_test_lock();
+        let env_name = "ZC_HINDSIGHT_TEST_TOKEN_ENV_TYPED_ONLY";
+        let _tok = EnvVarGuard::set(env_name, "tok");
+        // A stray legacy env value must NOT reach the backend; only config
+        // loading bridges it, and that is exercised in the config crate.
+        let _stray = EnvVarGuard::set("ZC_HINDSIGHT_RETAIN_ASYNC", "true");
         let cfg = HindsightMemoryConfig {
             base_url: "https://memory.example.com/hs".to_string(),
             token_env: env_name.to_string(),
@@ -2021,35 +2004,10 @@ mod tests {
         };
         let mem = HindsightMemory::from_config(&cfg, "scout", "").expect("construct");
         assert!(
-            mem.retain_async,
-            "ZC_HINDSIGHT_RETAIN_ASYNC=true must override a typed-config false \
-             through the canonical from_config runtime path"
+            !mem.retain_async,
+            "from_config must use the typed field only and ignore the legacy \
+             ZC_HINDSIGHT_RETAIN_ASYNC env (bridged during config load instead)"
         );
-        unsafe { std::env::remove_var(RETAIN_ASYNC_ENV) };
-        unsafe { std::env::remove_var(env_name) };
-    }
-
-    /// Blocker fix (strict boolean parser rejects typos): an unrecognized env
-    /// value must be a construction ERROR, not silently coerced to `true`
-    /// (which would otherwise be a way for a typo to unknowingly disable the
-    /// durability guarantee).
-    #[tokio::test]
-    async fn retain_async_env_override_rejects_invalid_value() {
-        let env_name = "ZC_HINDSIGHT_TEST_TOKEN_ENV_TYPO";
-        unsafe { std::env::set_var(env_name, "tok") };
-        unsafe { std::env::set_var(RETAIN_ASYNC_ENV, "asyncc") };
-        let cfg = HindsightMemoryConfig {
-            base_url: "https://memory.example.com/hs".to_string(),
-            token_env: env_name.to_string(),
-            ..HindsightMemoryConfig::default()
-        };
-        let err = HindsightMemory::from_config(&cfg, "scout", "").unwrap_err();
-        assert!(
-            err.to_string().contains(RETAIN_ASYNC_ENV) && err.to_string().contains("asyncc"),
-            "an invalid env value must fail construction naming the bad value: {err}"
-        );
-        unsafe { std::env::remove_var(RETAIN_ASYNC_ENV) };
-        unsafe { std::env::remove_var(env_name) };
     }
 
     #[tokio::test]
