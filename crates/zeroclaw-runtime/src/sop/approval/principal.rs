@@ -125,7 +125,7 @@ impl ApprovalPrincipal {
     }
 
     /// Quorum-distinctness key. Qualified by the *voter source* (see
-    /// [`Self::voter_source`]) so a different identity on a different source stays
+    /// `Self::voter_source`) so a different identity on a different source stays
     /// distinct, while the same paired credential over HTTP+WS counts once. Channel
     /// voters are additionally namespaced by channel key so same-looking sender ids
     /// from different channels/aliases cannot satisfy each other's quorum. An

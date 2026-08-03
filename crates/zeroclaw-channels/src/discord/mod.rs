@@ -807,9 +807,10 @@ impl DiscordChannel {
         token: &str,
         request: &ChannelApprovalRequest,
     ) -> anyhow::Result<()> {
-        let text = format!(
-            "APPROVAL REQUIRED [{}]\nTool: {}\nArgs: {}\n\nReply: \"{} yes\", \"{} no\", or \"{} always\"",
-            token, request.tool_name, request.arguments_summary, token, token, token,
+        let text = crate::util::build_yesno_approval_prompt(
+            token,
+            &request.tool_name,
+            &request.arguments_summary,
         );
         self.send(&SendMessage::new(text, channel_id)).await
     }
@@ -839,8 +840,11 @@ impl DiscordChannel {
             }
         }
 
+        let heading = i18n::get_required_cli_string("channel-approval-heading-shout");
+        let tool_label = i18n::get_required_cli_string("channel-approval-tool-label");
+        let args_label = i18n::get_required_cli_string("channel-approval-args-label");
         let text = format!(
-            "APPROVAL REQUIRED\nTool: {}\nArgs: {}",
+            "{heading}\n{tool_label}: {}\n{args_label}: {}",
             request.tool_name, request.arguments_summary,
         );
         let outgoing = DiscordOutgoing::with_components(text, vec![row]);

@@ -74,6 +74,8 @@ rpc_type! {
     pub struct InitializeResult {
         pub protocol_version: u64,
         pub server_version: String,
+        /// OS process ID of the daemon serving this connection.
+        pub server_pid: u32,
         /// Assigned TUI session UID.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub tui_id: Option<String>,

@@ -57,10 +57,13 @@ The most common hardware target. A minimal setup:
 
 #### sh
 
+<!-- >>> generated:unix-fast-command by `cargo generate installers` - do not edit <<< -->
 ```sh
-# install
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | sh
+```
+<!-- >>> end generated:unix-fast-command <<< -->
 
+```sh
 # add yourself to hardware groups (re-login after)
 sudo usermod -aG gpio,spi,i2c $USER
 
