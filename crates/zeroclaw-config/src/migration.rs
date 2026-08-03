@@ -1096,7 +1096,7 @@ temperature = "hot"
 
     #[test]
     fn v2_bare_vision_provider_reference_migrates_to_dotted_alias() {
-        // Repro for #9651: a bare `[multimodal] vision_model_provider` cannot
+        // Repro: a bare `[multimodal] vision_model_provider` cannot
         // select the migrated V3 alias, so the keyed provider's credentials
         // never reach the vision route. Migration must rewrite the reference
         // to the family's unambiguous migrated alias.
