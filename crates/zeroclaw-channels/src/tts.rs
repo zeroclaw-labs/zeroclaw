@@ -406,6 +406,7 @@ impl TtsProvider for GoogleTtsProvider {
 pub struct EdgeTtsProvider {
     alias: String,
     binary_path: String,
+    timeout: std::time::Duration,
 }
 
 /// RAII cleanup for the temporary Edge TTS output file. Removed on every path
@@ -446,6 +447,7 @@ impl EdgeTtsProvider {
         Ok(Self {
             alias: alias.to_string(),
             binary_path: raw_path,
+            timeout: TTS_HTTP_TIMEOUT,
         })
     }
 
@@ -457,6 +459,8 @@ impl EdgeTtsProvider {
         Self {
             alias: alias.to_string(),
             binary_path: binary_path.to_string(),
+            // Short so a hanging fake binary exercises the timeout path fast.
+            timeout: std::time::Duration::from_millis(250),
         }
     }
 }
@@ -485,7 +489,7 @@ impl TtsProvider for EdgeTtsProvider {
             .context("Failed to build temp file path for Edge TTS")?;
 
         let output = tokio::time::timeout(
-            TTS_HTTP_TIMEOUT,
+            self.timeout,
             tokio::process::Command::new(&self.binary_path)
                 .arg("--text")
                 .arg(text)
@@ -493,6 +497,10 @@ impl TtsProvider for EdgeTtsProvider {
                 .arg(voice)
                 .arg("--write-media")
                 .arg(output_path)
+                // Own the child lifecycle: when the timeout fires and the
+                // `output()` future is dropped, the child is killed rather than
+                // left running to recreate the artifact after our cleanup runs.
+                .kill_on_drop(true)
                 .output(),
         )
         .await
@@ -1353,42 +1361,43 @@ mod tests {
         assert_eq!(provider.response_format, "opus");
     }
 
-    fn temp_tts_leftovers(dir: &std::path::Path) -> usize {
-        std::fs::read_dir(dir)
-            .unwrap()
-            .filter_map(Result::ok)
-            .filter(|e| e.file_name().to_string_lossy().starts_with("zeroclaw_tts_"))
-            .count()
-    }
-
     #[cfg(unix)]
     #[tokio::test]
     async fn edge_tts_removes_temp_output_when_read_fails() {
         use std::os::unix::fs::PermissionsExt;
 
-        // Fake `edge-tts`: writes an unreadable artifact at `--write-media`
-        // and exits successfully, forcing the output-read failure path.
+        // Fake `edge-tts`: records the `--write-media` output path, writes an
+        // unreadable artifact there, and exits successfully, forcing the
+        // output-read failure path.
         let temp_dir = std::env::temp_dir();
         let script_path =
             temp_dir.join(format!("zeroclaw_edgetts_test_{}.sh", uuid::Uuid::new_v4()));
+        let out_path_file = temp_dir.join(format!(
+            "zeroclaw_edgetts_path_{}.txt",
+            uuid::Uuid::new_v4()
+        ));
+        let script = script_path.to_str().unwrap();
+        let sidecar = out_path_file.to_str().unwrap();
         std::fs::write(
             &script_path,
-            "#!/bin/sh\n\
-             out=\n\
-             prev=\n\
-             for a in \"$@\"; do\n\
-               if [ \"$prev\" = \"--write-media\" ]; then out=\"$a\"; fi\n\
-               prev=\"$a\"\n\
-             done\n\
-             : > \"$out\"\n\
-             chmod 000 \"$out\"\n\
-             exit 0\n",
+            format!(
+                "#!/bin/sh\n\
+                 out=\n\
+                 prev=\n\
+                 for a in \"$@\"; do\n\
+                   if [ \"$prev\" = \"--write-media\" ]; then out=\"$a\"; fi\n\
+                   prev=\"$a\"\n\
+                 done\n\
+                 printf '%s' \"$out\" > \"{sidecar}\"\n\
+                 : > \"$out\"\n\
+                 chmod 000 \"$out\"\n\
+                 exit 0\n"
+            ),
         )
         .unwrap();
         std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let before = temp_tts_leftovers(&temp_dir);
-        let provider = EdgeTtsProvider::new_with_binary("test", script_path.to_str().unwrap());
+        let provider = EdgeTtsProvider::new_with_binary("test", script);
         let err = provider
             .synthesize("hello", "en-US-AriaNeural")
             .await
@@ -1398,12 +1407,76 @@ mod tests {
                 .contains("Failed to read edge-tts output file"),
             "expected output-read failure, got: {err}"
         );
-        assert_eq!(
-            temp_tts_leftovers(&temp_dir),
-            before,
-            "Edge TTS temp output must be cleaned up after an output-read failure"
+
+        let artifact =
+            std::fs::read_to_string(&out_path_file).expect("script must record output path");
+        assert!(
+            !std::path::Path::new(&artifact).exists(),
+            "Edge TTS temp output must be cleaned up after an output-read failure: {artifact}"
         );
 
         let _ = std::fs::remove_file(&script_path);
+        let _ = std::fs::remove_file(&out_path_file);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edge_tts_timeout_kills_child_and_removes_temp_output() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Fake `edge-tts`: records the `--write-media` output path, writes an
+        // artifact there, then keeps rewriting it while hanging, so the short
+        // test timeout fires while a partial artifact exists. A live child
+        // would recreate the artifact after our cleanup; kill_on_drop must
+        // stop it so the path stays gone.
+        let temp_dir = std::env::temp_dir();
+        let script_path =
+            temp_dir.join(format!("zeroclaw_edgetts_test_{}.sh", uuid::Uuid::new_v4()));
+        let out_path_file = temp_dir.join(format!(
+            "zeroclaw_edgetts_path_{}.txt",
+            uuid::Uuid::new_v4()
+        ));
+        let script = script_path.to_str().unwrap();
+        let sidecar = out_path_file.to_str().unwrap();
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\n\
+                 out=\n\
+                 prev=\n\
+                 for a in \"$@\"; do\n\
+                   if [ \"$prev\" = \"--write-media\" ]; then out=\"$a\"; fi\n\
+                   prev=\"$a\"\n\
+                 done\n\
+                 printf '%s' \"$out\" > \"{sidecar}\"\n\
+                 : > \"$out\"\n\
+                 while :; do : > \"$out\"; sleep 0.05; done\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let provider = EdgeTtsProvider::new_with_binary("test", script);
+        let err = provider
+            .synthesize("hello", "en-US-AriaNeural")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("timed out"),
+            "expected a timeout error, got: {err}"
+        );
+
+        let artifact =
+            std::fs::read_to_string(&out_path_file).expect("script must record output path");
+        // Give a (wrongly) still-alive child time to recreate the artifact so
+        // the absence assertion below actually distinguishes killed from leaked.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !std::path::Path::new(&artifact).exists(),
+            "Edge TTS temp output must be removed after a timeout and the child killed: {artifact}"
+        );
+
+        let _ = std::fs::remove_file(&script_path);
+        let _ = std::fs::remove_file(&out_path_file);
     }
 }
