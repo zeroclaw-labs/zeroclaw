@@ -1204,6 +1204,44 @@ vision_model_provider = "grok"
     }
 
     #[test]
+    fn v2_legacy_source_with_folded_globals_still_migrates() {
+        // A sole legacy source (`[providers.models.grok]`) plus global
+        // `[providers]` values with no explicit `default_provider`: the fold
+        // reuses the already-materialized `xai` alias table (the only
+        // family present) rather than introducing a second distinct source.
+        // Registering the canonical family name as a second provenance
+        // producer here would falsely make the slot look ambiguous and
+        // leave the bare reference unrewritten even though `grok` is the
+        // sole real source.
+        let raw = r#"
+schema_version = 2
+
+[providers]
+api_key = "sk-global-test"
+default_model = "vision-model"
+
+[providers.models.grok]
+
+[multimodal]
+vision_model_provider = "grok"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("xai.default"),
+            "the sole legacy source must still resolve the bare reference \
+             even after global values are folded into the same slot"
+        );
+        let alias = cfg
+            .providers
+            .models
+            .find("xai", "default")
+            .expect("global values must fold into the migrated xai.default alias");
+        assert_eq!(alias.api_key.as_deref(), Some("sk-global-test"));
+        assert_eq!(alias.model.as_deref(), Some("vision-model"));
+    }
+
+    #[test]
     fn v2_legacy_non_default_alias_vision_reference_migrates() {
         // `openai-codex` folds into openai as the codex alias; the reference
         // must rewrite to the non-default alias.
