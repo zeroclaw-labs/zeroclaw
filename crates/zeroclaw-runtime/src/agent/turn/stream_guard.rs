@@ -49,8 +49,7 @@ impl StreamTextGuard {
                 self.pending_candidate_start = Some(start);
                 self.pending.push_str(&chunk[start..]);
                 return if self.should_suppress_protocol_candidate(&self.pending) {
-                    self.suppress_protocol();
-                    None
+                    self.suppress_protocol(&chunk[..start])
                 } else {
                     self.pending.insert_str(0, &chunk[..start]);
                     self.evaluate_pending(false)
@@ -82,8 +81,7 @@ impl StreamTextGuard {
             &self.pending,
             &self.known_tool_names,
         ) {
-            self.suppress_protocol();
-            return None;
+            return self.suppress_protocol(&self.narration_before_candidate());
         }
         Some(std::mem::take(&mut self.pending))
     }
@@ -95,20 +93,26 @@ impl StreamTextGuard {
             .unwrap_or(&self.pending);
 
         if !finalizing && starts_suspicious_tag_or_fence_prefix(candidate) {
+            if !self.has_active_tools {
+                return None;
+            }
+            if !looks_like_tool_protocol_example(candidate)
+                && self.should_suppress_protocol_candidate(candidate)
+            {
+                return self.suppress_protocol(&self.narration_before_candidate());
+            }
             return None;
         }
 
         if self.should_suppress_protocol_candidate(candidate) {
-            self.suppress_protocol();
-            return None;
+            return self.suppress_protocol(&self.narration_before_candidate());
         }
 
         if let Some(is_protocol) =
             complete_json_fence_protocol_state(candidate, &self.known_tool_names)
         {
             if is_protocol && self.has_active_tools {
-                self.suppress_protocol();
-                return None;
+                return self.suppress_protocol(&self.narration_before_candidate());
             }
             self.pending_candidate_start = None;
             return Some(std::mem::take(&mut self.pending));
@@ -122,11 +126,24 @@ impl StreamTextGuard {
         None
     }
 
-    fn suppress_protocol(&mut self) {
+    fn suppress_protocol(&mut self, narration: &str) -> Option<String> {
+        let narration = narration.trim();
+        let narration = (!narration.is_empty()).then(|| narration.to_string());
         self.pending.clear();
         self.pending_candidate_start = None;
         self.suppress_forwarding = true;
         self.suppressed_protocol = true;
+        narration
+    }
+
+    fn narration_before_candidate(&self) -> String {
+        self.pending_candidate_start
+            .map(|start| {
+                self.pending[..start.min(self.pending.len())]
+                    .trim()
+                    .to_string()
+            })
+            .unwrap_or_default()
     }
 
     fn looks_like_active_tool_json(&self, text: &str) -> bool {
@@ -339,5 +356,174 @@ mod tests {
         assert_eq!(guard.push("<｜dsml"), None);
         assert_eq!(guard.push("data"), None);
         assert_eq!(guard.finish(), Some("<｜dsmldata".to_string()));
+    }
+
+    #[test]
+    fn forwards_narration_before_embedded_dsml_marker() {
+        let mut guard = shell_guard();
+
+        assert_eq!(
+            guard.push(
+                "I will run it. <｜DSML｜tool_calls><｜DSML｜invoke name=\"shell\"><｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>"
+            ),
+            Some("I will run it.".to_string())
+        );
+        assert_eq!(guard.finish(), None);
+        assert!(
+            guard.suppressed_protocol,
+            "narration forwarded but DSML envelope suppressed"
+        );
+        assert!(guard.suppress_forwarding);
+    }
+
+    #[test]
+    fn forwards_narration_split_across_chunks() {
+        let mut guard = shell_guard();
+
+        assert_eq!(guard.push("I will run it. <｜DSML｜tool_calls>"), None);
+        assert_eq!(guard.push("<｜DSML｜invoke name=\"shell\">\n"), None);
+        assert_eq!(
+            guard.push(
+                "<｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter>\n"
+            ),
+            None
+        );
+        assert_eq!(
+            guard.push("</｜DSML｜invoke>\n</｜DSML｜tool_calls>"),
+            Some("I will run it.".to_string())
+        );
+        assert_eq!(guard.finish(), None);
+        assert!(guard.suppressed_protocol);
+    }
+
+    #[test]
+    fn narration_before_marker_split_at_chunk_boundary() {
+        let mut guard = shell_guard();
+
+        assert_eq!(guard.push("I will run it. <｜DSM"), None);
+        assert_eq!(guard.push("L｜tool_calls>"), None);
+        assert_eq!(guard.push("<｜DSML｜invoke name=\"shell\">\n"), None);
+        assert_eq!(
+            guard.push(
+                "<｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter>\n"
+            ),
+            None
+        );
+        assert_eq!(
+            guard.push("</｜DSML｜invoke>\n</｜DSML｜tool_calls>"),
+            Some("I will run it.".to_string())
+        );
+        assert_eq!(guard.finish(), None);
+        assert!(guard.suppressed_protocol);
+    }
+
+    #[test]
+    fn narration_before_marker_split_at_boundary_suppresses_full_envelope() {
+        let mut guard = shell_guard();
+
+        assert_eq!(guard.push("Narration. <|D"), None);
+        assert_eq!(guard.push("SML|>\n"), None);
+        assert_eq!(guard.push("{\"name\":\"shell\""), None);
+        assert_eq!(
+            guard.push(",\"arguments\":{\"cmd\":\"ls\"}}"),
+            Some("Narration.".to_string()),
+            "narration is released when the guard becomes certain the DSML envelope is protocol"
+        );
+        assert_eq!(guard.push("\n</|DSML|>"), None);
+        assert_eq!(guard.finish(), None);
+        assert!(
+            guard.suppressed_protocol,
+            "DSML envelope must be suppressed after forwarding narration"
+        );
+    }
+
+    #[test]
+    fn finish_suppresses_standalone_envelope_and_returns_narration() {
+        let mut guard = shell_guard();
+
+        assert_eq!(
+            guard.push(
+                "<|DSML|>invoke name=\"shell\"><|DSML|>parameter name=\"command\" string=\"true\">ls</|DSML|>parameter></|DSML|>invoke></|DSML|>tool_calls>"
+            ),
+            None,
+            "standalone envelope must be buffered"
+        );
+        assert_eq!(
+            guard.finish(),
+            None,
+            "standalone envelope must not be released as visible text"
+        );
+        assert!(guard.suppressed_protocol);
+    }
+
+    #[test]
+    fn finish_returns_narration_before_envelope_suppressed_at_finish() {
+        let mut guard = shell_guard();
+
+        assert_eq!(guard.push("Before: "), Some("Before: ".to_string()));
+        assert_eq!(
+            guard.push(
+                "<|DSML|>invoke name=\"shell\"><|DSML|>parameter name=\"command\" string=\"true\">ls</|DSML|>parameter></|DSML|>invoke></|DSML|>tool_calls>"
+            ),
+            None,
+            "narration already forwarded; envelope buffered"
+        );
+        assert_eq!(guard.finish(), None);
+        assert!(guard.suppressed_protocol);
+    }
+
+    #[test]
+    fn plain_text_with_marker_prefix_still_forwards() {
+        let mut guard = shell_guard();
+
+        assert_eq!(guard.push("plain <｜dsml"), None);
+        assert_eq!(guard.push("data"), None);
+        assert_eq!(guard.finish(), Some("plain <｜dsmldata".to_string()));
+    }
+
+    #[test]
+    fn split_fenced_example_without_tools_waits_for_trailer() {
+        let mut guard = StreamTextGuard::new(None);
+
+        assert_eq!(
+            guard.push(
+                "```tool_call\n{\"name\":\"shell\",\"arguments\":{\"command\":\"pwd\"}}\n```"
+            ),
+            None,
+            "a complete fence must be buffered until the example trailer resolves it"
+        );
+        assert_eq!(
+            guard.push("\nThis is an example, not an invocation."),
+            None,
+            "the trailer must not be forwarded until the candidate is classified"
+        );
+        assert_eq!(
+            guard.finish(),
+            Some(
+                "```tool_call\n{\"name\":\"shell\",\"arguments\":{\"command\":\"pwd\"}}\n```\nThis is an example, not an invocation.".to_string()
+            )
+        );
+        assert!(
+            !guard.suppressed_protocol,
+            "fenced examples must not be suppressed when no tools are enabled"
+        );
+    }
+
+    #[test]
+    fn standalone_fence_without_tools_is_suppressed_at_finish() {
+        let mut guard = StreamTextGuard::new(None);
+
+        assert_eq!(
+            guard.push(
+                "```tool_call\n{\"name\":\"shell\",\"arguments\":{\"command\":\"pwd\"}}\n```"
+            ),
+            None,
+            "fence must be buffered rather than suppressed mid-stream"
+        );
+        assert_eq!(guard.finish(), None);
+        assert!(
+            guard.suppressed_protocol,
+            "a standalone fence without an example trailer is a protocol leak"
+        );
     }
 }

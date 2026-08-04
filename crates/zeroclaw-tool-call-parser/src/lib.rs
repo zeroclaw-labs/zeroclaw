@@ -994,14 +994,15 @@ fn parse_fullwidth_dsml_tool_calls(response: &str) -> Option<(String, Vec<Parsed
             let is_string = param_cap
                 .get(2)
                 .is_some_and(|m| m.as_str().eq_ignore_ascii_case("true"));
-            let value = param_cap.get(3).map(|m| m.as_str().trim()).unwrap_or("");
+            let raw_value = param_cap.get(3).map(|m| m.as_str()).unwrap_or("");
             let Some(key) = key else {
                 continue;
             };
 
             let parsed = if is_string {
-                serde_json::Value::String(value.to_string())
+                serde_json::Value::String(raw_value.to_string())
             } else {
+                let value = raw_value.trim();
                 serde_json::from_str::<serde_json::Value>(value)
                     .unwrap_or_else(|_| serde_json::Value::String(value.to_string()))
             };
@@ -2802,6 +2803,39 @@ After text."#;
     }
 
     #[test]
+    fn parse_tool_calls_fullwidth_dsml_preserves_string_parameter_whitespace() {
+        let response = "<｜DSML｜tool_calls>\n\
+            <｜DSML｜invoke name=\"shell\">\n\
+            <｜DSML｜parameter name=\"script\" string=\"true\">  echo hi  \n\tls -la  </｜DSML｜parameter>\n\
+            </｜DSML｜invoke>\n\
+            </｜DSML｜tool_calls>";
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.trim().is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        let script = calls[0].arguments.get("script").unwrap().as_str().unwrap();
+        assert_eq!(script, "  echo hi  \n\tls -la  ");
+    }
+
+    #[test]
+    fn parse_tool_calls_fullwidth_dsml_trims_non_string_parameter_before_json() {
+        let response = "<｜DSML｜tool_calls>\n\
+            <｜DSML｜invoke name=\"shell\">\n\
+            <｜DSML｜parameter name=\"count\" string=\"false\">  3  </｜DSML｜parameter>\n\
+            </｜DSML｜invoke>\n\
+            </｜DSML｜tool_calls>";
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.trim().is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].arguments.get("count").unwrap(),
+            &serde_json::json!(3)
+        );
+    }
+
+    #[test]
     fn parse_tool_calls_fullwidth_dsml_json_parameter_types() {
         let response = "<｜DSML｜tool_calls>\n\
             <｜DSML｜invoke name=\"shell\">\n\
@@ -4507,7 +4541,7 @@ Let me check the result."#;
     #[test]
     fn extract_json_values_handles_whitespace_only() {
         let result = extract_json_values(
-            "   
+            "
 	  ",
         );
         assert!(result.is_empty());

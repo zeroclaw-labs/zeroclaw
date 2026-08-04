@@ -15,6 +15,18 @@ pub(crate) fn longest_suffix_matching_prefix(text: &str, pattern: &str) -> usize
         .unwrap_or(0)
 }
 
+fn ends_with_partial_marker(text: &str) -> Option<usize> {
+    let lower = text.to_ascii_lowercase();
+    let mut best: Option<usize> = None;
+    for marker in ["<|dsml|", "<|tool_call|", "<｜dsml｜", "<｜tool_call｜"] {
+        let matched = longest_suffix_matching_prefix(&lower, marker);
+        if matched >= 2 {
+            best = Some(best.map_or(matched, |current| current.max(matched)));
+        }
+    }
+    best.map(|matched| text.len() - matched)
+}
+
 pub(crate) fn find_embedded_protocol_candidate_start(text: &str) -> Option<usize> {
     let lower = text.to_ascii_lowercase();
     let mut earliest: Option<usize> = None;
@@ -66,6 +78,10 @@ pub(crate) fn find_incomplete_protocol_candidate_start(text: &str) -> Option<usi
         if let Some(idx) = lower.rfind(pattern) {
             earliest = Some(earliest.map_or(idx, |current| current.min(idx)));
         }
+    }
+
+    if let Some(partial_start) = ends_with_partial_marker(text) {
+        earliest = Some(earliest.map_or(partial_start, |current| current.min(partial_start)));
     }
 
     for delimiter in ['{', '['] {
@@ -235,5 +251,25 @@ mod tests {
             "<｜dsml｜tool_calls>"
         ));
         assert!(find_incomplete_protocol_candidate_start("x<｜dsml").is_some());
+    }
+
+    #[test]
+    fn detects_marker_split_across_chunk_boundary() {
+        assert!(find_incomplete_protocol_candidate_start("I will <|").is_some());
+        assert!(find_incomplete_protocol_candidate_start("I will <|D").is_some());
+        assert!(find_incomplete_protocol_candidate_start("I will <|DSM").is_some());
+        assert!(find_incomplete_protocol_candidate_start("I will <｜").is_some());
+        assert!(find_incomplete_protocol_candidate_start("I will <｜D").is_some());
+        assert!(find_incomplete_protocol_candidate_start("I will <｜DSM").is_some());
+        assert!(find_incomplete_protocol_candidate_start("x<|tool_").is_some());
+        assert!(find_incomplete_protocol_candidate_start("x<｜tool_").is_some());
+        assert!(
+            find_incomplete_protocol_candidate_start("just text <").is_none(),
+            "a bare trailing '<' is not a protocol candidate"
+        );
+        assert!(
+            find_incomplete_protocol_candidate_start("wrote 5 < 10").is_none(),
+            "'<' inside plain text is not a protocol candidate"
+        );
     }
 }
