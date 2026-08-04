@@ -278,6 +278,10 @@ channel-matrix = ["dep:matrix-sdk", "dep:mime_guess"]
 voice-wake = ["dep:cpal"]
 
 [dev-dependencies]
+# Enables the runtime crate's test-only `ScopedToolRegistry::from_raw_for_test`
+# so channel test fixtures can mint the now-sealed `ChannelRuntimeContext`
+# tools registry. dev-dependency only: never enabled in the shipped channels lib.
+zeroclaw-runtime = { workspace = true, features = ["test-util"] }
 axum = { version = "0.8", default-features = false, features = [
   "http1",
   "json",

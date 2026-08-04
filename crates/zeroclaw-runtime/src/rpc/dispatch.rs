@@ -6483,7 +6483,9 @@ mod tests {
         let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
         let agent = crate::agent::agent::Agent::builder()
             .model_provider(Box::new(DummyModelProvider))
-            .tools(vec![])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
             .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
             .observer(Arc::new(crate::observability::noop::NoopObserver))
             .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
@@ -8290,7 +8292,9 @@ mod tests {
 
         let agent = crate::agent::agent::Agent::builder()
             .model_provider(Box::new(DummyModelProvider))
-            .tools(vec![])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
             .memory(scoped)
             .observer(Arc::new(crate::observability::noop::NoopObserver))
             .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
@@ -9354,7 +9358,9 @@ mod tests {
         // dispatcher sees a live session.
         let agent = crate::agent::agent::Agent::builder()
             .model_provider(Box::new(DummyModelProvider))
-            .tools(vec![])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
             .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
             .observer(Arc::new(crate::observability::noop::NoopObserver))
             .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))

@@ -472,6 +472,11 @@ strip = true
 panic = "abort"
 
 [dev-dependencies]
+# Enables the runtime crate's test-only `ScopedToolRegistry::from_raw_for_test`
+# so this package's integration-test helpers can mint the now-sealed engine tool
+# registry. dev-dependency only: resolver v2 keeps `test-util` out of the shipped
+# binary build, so the assemble()-only seal holds in production.
+zeroclaw-runtime = { workspace = true, features = ["test-util"] }
 tempfile = "3.26"
 criterion = { version = "0.8", features = ["async_tokio"] }
 wiremock = "0.6"
