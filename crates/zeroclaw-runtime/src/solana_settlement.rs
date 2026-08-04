@@ -19,10 +19,6 @@ use solana_sdk::signature::{Keypair, Signer};
 use solana_sdk::system_instruction;
 use solana_sdk::transaction::Transaction;
 
-/// The SPL System Program's `NonceInitialize`/`AdvanceNonceAccount` program.
-/// `system_instruction::advance_nonce_account` builds the instruction.
-const SYSTEM_PROGRAM_ID: &str = "11111111111111111111111111111111";
-
 /// A settlement that passed chain verification and is ready to broadcast.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settlement {
@@ -40,38 +36,44 @@ pub struct Settlement {
 /// checked signatures and constraints; this layer only checks that the payee
 /// address in the verified fulfillment parses as a Solana account and that
 /// the amount is sane, then builds the durable-nonce transaction.
+///
+/// The mandate holder is the single signer: they are simultaneously the nonce
+/// authority, the fee payer, and the transfer sender. The agent holds no key
+/// material (T1 custody), so exactly one keypair ever signs a settlement.
 pub fn build_durable_nonce_transfer(
     settlement: &Settlement,
-    payer: &Keypair,
-    nonce_authority: &Keypair,
+    authority: &Keypair,
     nonce: &str,
 ) -> Result<Transaction> {
     let payee_pubkey = Pubkey::from_str(&settlement.payee)
         .map_err(|e| anyhow!("payee is not a valid Solana address: {e}"))?;
     let nonce_account = Pubkey::from_str(&settlement.nonce_account)
         .map_err(|e| anyhow!("nonce account is not a valid Solana address: {e}"))?;
-    let authority = Pubkey::from_str(&settlement.authority)
+    let authority_pubkey = Pubkey::from_str(&settlement.authority)
         .map_err(|e| anyhow!("authority is not a valid Solana address: {e}"))?;
+    if authority_pubkey != authority.pubkey() {
+        return Err(anyhow!(
+            "settlement authority {} does not match signing keypair {}",
+            authority_pubkey,
+            authority.pubkey()
+        ));
+    }
     if settlement.lamports == 0 {
         return Err(anyhow!("refusing zero-lamport settlement"));
     }
+    let _ = nonce;
 
     // Instruction 1: advance the nonce. This consumes the current nonce value
     // and derives the next; the transaction is then bound to the *durable*
     // nonce, not to a recent blockhash.
-    let advance = system_instruction::advance_nonce_account(&nonce_account, &authority);
-    let _ = nonce;
+    let advance = system_instruction::advance_nonce_account(&nonce_account, &authority_pubkey);
 
     // Instruction 2: the transfer itself, from the mandate holder to the payee.
-    let transfer = system_instruction::transfer(&authority, &payee_pubkey, settlement.lamports);
+    let transfer = system_instruction::transfer(&authority_pubkey, &payee_pubkey, settlement.lamports);
 
-    let message = Message::new(&[advance, transfer], Some(&authority));
+    let message = Message::new(&[advance, transfer], Some(&authority_pubkey));
 
-    let tx = Transaction::new(
-        &[payer, nonce_authority],
-        message,
-        solana_sdk::hash::Hash::default(), // durable nonce replaces the blockhash; patched below
-    );
+    let tx = Transaction::new(&[authority], message, solana_sdk::hash::Hash::default());
     Ok(tx)
 }
 
@@ -97,18 +99,18 @@ mod tests {
 
     const SYSVAR_RECENT_BLOCKHASHES_ID: &str = "SysvarRecentB1ockHashes11111111111111111111";
     const SYSVAR_RENT_ID: &str = "SysvarRent111111111111111111111111111111111";
+    const SYSTEM_PROGRAM_ID: &str = "11111111111111111111111111111111";
 
     fn keypair() -> Keypair {
         Keypair::new()
     }
 
-    fn sample_settlement() -> Settlement {
-        let payer = keypair();
+    fn sample_settlement_for(authority: &Keypair) -> Settlement {
         Settlement {
             payee: keypair().pubkey().to_string(),
             lamports: 10_000_000, // 0.01 SOL
             nonce_account: keypair().pubkey().to_string(),
-            authority: payer.pubkey().to_string(),
+            authority: authority.pubkey().to_string(),
         }
     }
 
@@ -126,18 +128,12 @@ mod tests {
 
     #[test]
     fn builds_durable_nonce_transaction() {
-        let payer = keypair();
-        let nonce_authority = keypair();
-        let settlement = sample_settlement();
+        let authority = keypair();
+        let settlement = sample_settlement_for(&authority);
         let nonce = "9zP1oXqBkLmNvW3yZ7aC4eF6gH8jK0nQ2rT5uV7xW9yZ1b";
 
-        let tx = build_durable_nonce_transfer(
-            &settlement,
-            &payer,
-            &nonce_authority,
-            nonce,
-        )
-        .expect("valid settlement builds");
+        let tx = build_durable_nonce_transfer(&settlement, &authority, nonce)
+            .expect("valid settlement builds");
 
         // The message must contain both instructions.
         assert_eq!(tx.message.instructions.len(), 2);
@@ -149,40 +145,38 @@ mod tests {
 
     #[test]
     fn rejects_zero_lamports() {
-        let payer = keypair();
-        let nonce_authority = keypair();
-        let mut settlement = sample_settlement();
+        let authority = keypair();
+        let mut settlement = sample_settlement_for(&authority);
         settlement.lamports = 0;
-        let err = build_durable_nonce_transfer(&settlement, &payer, &nonce_authority, "nonce")
-            .unwrap_err();
+        let err = build_durable_nonce_transfer(&settlement, &authority, "nonce").unwrap_err();
         assert!(err.to_string().contains("zero-lamport"));
     }
 
     #[test]
     fn rejects_invalid_payee() {
-        let payer = keypair();
-        let nonce_authority = keypair();
-        let mut settlement = sample_settlement();
+        let authority = keypair();
+        let mut settlement = sample_settlement_for(&authority);
         settlement.payee = "not-an-address".into();
-        let err = build_durable_nonce_transfer(&settlement, &payer, &nonce_authority, "nonce")
-            .unwrap_err();
+        let err = build_durable_nonce_transfer(&settlement, &authority, "nonce").unwrap_err();
         assert!(err.to_string().contains("valid Solana address"));
+    }
+
+    #[test]
+    fn rejects_authority_keypair_mismatch() {
+        let authority = keypair();
+        let stranger = keypair();
+        let settlement = sample_settlement_for(&authority);
+        let err = build_durable_nonce_transfer(&settlement, &stranger, "nonce").unwrap_err();
+        assert!(err.to_string().contains("does not match signing keypair"));
     }
 
     #[test]
     fn two_instructions_one_nonce_account() {
         // One nonce per in-flight transaction: the tx has exactly one
         // AdvanceNonceAccount instruction and one transfer.
-        let payer = keypair();
-        let nonce_authority = keypair();
-        let settlement = sample_settlement();
-        let tx = build_durable_nonce_transfer(
-            &settlement,
-            &payer,
-            &nonce_authority,
-            "nonce-value",
-        )
-        .unwrap();
+        let authority = keypair();
+        let settlement = sample_settlement_for(&authority);
+        let tx = build_durable_nonce_transfer(&settlement, &authority, "nonce-value").unwrap();
 
         let sysvar_recent = Pubkey::from_str(SYSVAR_RECENT_BLOCKHASHES_ID).unwrap();
         let rent = Pubkey::from_str(SYSVAR_RENT_ID).unwrap();
@@ -194,31 +188,27 @@ mod tests {
 
     #[test]
     fn signature_verifies_after_sign() {
-        let payer = keypair();
-        let nonce_authority = keypair();
-        let settlement = sample_settlement();
-        let mut tx = build_durable_nonce_transfer(
-            &settlement,
-            &payer,
-            &nonce_authority,
-            "nonce",
-        )
-        .unwrap();
-        sign_for_submission(&mut tx, &[&payer, &nonce_authority]);
-        assert_eq!(tx.signatures.len(), 2);
-        // The payer's signature must be present and verifiable.
+        let authority = keypair();
+        let settlement = sample_settlement_for(&authority);
+        let mut tx = build_durable_nonce_transfer(&settlement, &authority, "nonce").unwrap();
+        sign_for_submission(&mut tx, &[&authority]);
+        assert_eq!(tx.signatures.len(), 1);
+        // The authority's signature must be present and verifiable.
         let sig = &tx.signatures[0];
-        let pubkey_bytes = payer.pubkey().to_bytes();
+        let pubkey_bytes = authority.pubkey().to_bytes();
         assert!(sig.verify(&pubkey_bytes, &tx.message.hash().to_bytes()));
     }
 
     #[test]
     fn devnet_only_no_mainnet() {
-        // No mainnet RPC constant exists in this module by construction.
+        // No mainnet RPC constant exists in the production module. The test
+        // must strip its own module (whose assertions mention the banned
+        // strings) before scanning, otherwise the check is self-referential.
         // Use a path relative to this file: `file!()` expands against the
         // workspace root when the module is compiled behind a feature flag,
         // which doubles the crate path and breaks include_str!.
-        let src = include_str!("solana_settlement.rs");
+        let full = include_str!("solana_settlement.rs");
+        let src = full.split("#[cfg(test)]").next().unwrap_or(full);
         assert!(
             !src.contains("api.mainnet-beta.solana.com"),
             "settlement module must not reference mainnet"
