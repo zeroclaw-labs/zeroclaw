@@ -150,7 +150,7 @@ fn collapse_model_probes(probes: Vec<(String, ModelProbe)>) -> Vec<DiagResult> {
     out
 }
 
-async fn probe_models(config: &Config) -> Vec<DiagResult> {
+pub(crate) async fn probe_models(config: &Config) -> Vec<DiagResult> {
     let targets = doctor_model_targets(config, None);
     let mut probes = Vec::with_capacity(targets.len());
 
@@ -250,22 +250,33 @@ pub async fn run_structured_with_timeout(
     config: &Config,
     probe_timeout: std::time::Duration,
 ) -> (Vec<DiagResult>, Option<String>) {
+    run_structured_with_probe(config, probe_timeout, Box::pin(probe_models(config))).await
+}
+
+/// Same contract as [`run_structured_with_timeout`], with the probe phase
+/// injectable. Production callers pass `Box::pin(probe_models(config))`; tests
+/// pass a controlled future so both sides of the deadline are exercised
+/// deterministically instead of depending on a real network boundary.
+pub(crate) async fn run_structured_with_probe(
+    config: &Config,
+    probe_timeout: std::time::Duration,
+    probe: std::pin::Pin<Box<dyn std::future::Future<Output = Vec<DiagResult>> + Send + '_>>,
+) -> (Vec<DiagResult>, Option<String>) {
     let mut results = diagnose(config);
     results.extend(check_codex_auth_wiring(config).await);
 
-    let (probe_results, timed_out) =
-        match tokio::time::timeout(probe_timeout, probe_models(config)).await {
-            Ok(probes) => (probes, None),
-            Err(_) => {
-                let msg = crate::i18n::get_required_cli_string("cli-doctor-probe-timeout-message");
-                results.push(DiagResult {
-                    severity: Severity::Warn,
-                    category: "doctor".into(),
-                    message: msg,
-                });
-                (vec![], Some("probe_models".into()))
-            }
-        };
+    let (probe_results, timed_out) = match tokio::time::timeout(probe_timeout, probe).await {
+        Ok(probes) => (probes, None),
+        Err(_) => {
+            let msg = crate::i18n::get_required_cli_string("cli-doctor-probe-timeout-message");
+            results.push(DiagResult {
+                severity: Severity::Warn,
+                category: "doctor".into(),
+                message: msg,
+            });
+            (vec![], Some("probe_models".into()))
+        }
+    };
     results.extend(probe_results);
     (results, timed_out)
 }
@@ -2347,27 +2358,24 @@ mod tests {
         );
     }
 
-    /// Regression test: production-path timeout via `run_structured_with_timeout`
-    /// must preserve pre-timeout diagnostics and set `timed_out_phase` when
-    /// `probe_models` exceeds the deadline. This pins the actual RPC boundary
-    /// behavior, not just synthetic response-state construction.
+    /// Regression test: the probe-phase timeout path must preserve the
+    /// pre-probe diagnostics and set `timed_out_phase` when the probe exceeds
+    /// the deadline. The probe future is injected (`std::future::pending`), so
+    /// the timeout branch is forced deterministically — no dependency on a real
+    /// network endpoint that may or may not hang.
     #[tokio::test]
     async fn run_structured_with_timeout_preserves_prior_diagnostics() {
         use std::time::Duration;
 
-        let mut config = Config::default();
-        // Configure a custom provider with a non-routable URI so probe_models
-        // hangs until the timeout fires.
-        let profile = config
-            .providers
-            .models
-            .ensure("custom", "local")
-            .expect("known model_provider type");
-        profile.api_key = Some("redacted-test-key".to_string());
-        profile.uri = Some("http://192.0.2.1:9/v1".to_string()); // TEST-NET-1, unroutable
+        let config = Config::default();
 
-        let (results, timed_out_phase) =
-            run_structured_with_timeout(&config, Duration::from_millis(100)).await;
+        // A never-completing probe forces the timeout branch on every run.
+        let (results, timed_out_phase) = run_structured_with_probe(
+            &config,
+            Duration::from_millis(100),
+            Box::pin(std::future::pending::<Vec<DiagResult>>()),
+        )
+        .await;
 
         // Pre-probe diagnostics (config, workspace, daemon, environment, CLI tools)
         // must survive the timeout.
@@ -2401,6 +2409,17 @@ mod tests {
         assert_eq!(timeout_warning.category, "doctor");
         assert_eq!(timeout_warning.severity, Severity::Warn);
 
+        // The warning must be appended exactly once, not duplicated by
+        // re-running the probe.
+        assert_eq!(
+            results
+                .iter()
+                .filter(|r| r.message == expected_warning)
+                .count(),
+            1,
+            "probe timeout must append exactly one timeout warning"
+        );
+
         // timed_out_phase must identify the probe phase.
         assert_eq!(
             timed_out_phase,
@@ -2409,16 +2428,35 @@ mod tests {
         );
     }
 
-    /// Regression test: when probe_models completes under the deadline,
-    /// `timed_out_phase` must be `None` and all probe results must be present.
+    /// Regression test: when the probe completes under the deadline,
+    /// `timed_out_phase` must be `None` and an actual probe result must be
+    /// retained in the output — not dropped or replaced by a timeout warning.
     #[tokio::test]
     async fn run_structured_with_timeout_under_deadline() {
         use std::time::Duration;
 
         let config = Config::default();
-        // No providers configured → probe_models returns immediately with no rows.
-        let (results, timed_out_phase) =
-            run_structured_with_timeout(&config, Duration::from_secs(5)).await;
+
+        // A probe that completes immediately with a real result — this proves
+        // completed probe rows survive to the output, which the old
+        // no-providers-under-deadline case could not exercise.
+        let probe_result = DiagResult {
+            severity: Severity::Ok,
+            category: "probe.mock".into(),
+            message: "mock probe ok".into(),
+        };
+        let (results, timed_out_phase) = run_structured_with_probe(
+            &config,
+            Duration::from_secs(5),
+            Box::pin(async move { vec![probe_result] }),
+        )
+        .await;
+
+        // The probe result must survive to the output.
+        assert!(
+            results.iter().any(|r| r.message == "mock probe ok"),
+            "under-deadline probe results must be retained"
+        );
 
         // No timeout warning should be present (compared via the same Fluent
         // lookup the production path uses, so the check is locale-independent).

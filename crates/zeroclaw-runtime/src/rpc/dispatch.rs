@@ -978,8 +978,22 @@ impl RpcDispatcher {
 
     async fn handle_doctor_run(&self) -> RpcResult {
         let config = self.ctx.config.read().clone();
+        self.run_doctor(Box::pin(crate::doctor::probe_models(&config)))
+            .await
+    }
+
+    /// Serialize a Doctor run into the `doctor/run` response. The probe future
+    /// is injectable so tests can force both sides of the timeout deadline
+    /// deterministically; the production path passes `Box::pin(probe_models)`.
+    async fn run_doctor(
+        &self,
+        probe: std::pin::Pin<
+            Box<dyn std::future::Future<Output = Vec<crate::doctor::DiagResult>> + Send + '_>,
+        >,
+    ) -> RpcResult {
+        let config = self.ctx.config.read().clone();
         let (results, timed_out_phase) =
-            crate::doctor::run_structured_with_timeout(&config, PROBE_MODEL_TIMEOUT).await;
+            crate::doctor::run_structured_with_probe(&config, PROBE_MODEL_TIMEOUT, probe).await;
         let summary = doctor_summary(&results);
         let log_path = if config.observability.log_persistence
             != zeroclaw_config::schema::LogPersistence::None
@@ -7147,6 +7161,112 @@ mod tests {
             obj.get("log_path").map(|v| v.is_null()).unwrap_or(true),
             "log_path must be null when persistence is disabled; got: {:?}",
             obj.get("log_path")
+        );
+    }
+
+    /// RPC-boundary coverage for the probe-timeout branch: a controlled
+    /// never-completing probe must yield a `doctor/run` response whose
+    /// serialized JSON carries `timed_out_phase`, preserves the earlier
+    /// diagnostics, and appends the localized timeout warning exactly once.
+    #[tokio::test]
+    async fn doctor_run_timeout_serializes_partial_result() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (dispatcher, _sessions) = make_acp_test_dispatcher(config);
+
+        // Force the timeout branch deterministically — no reliance on a real
+        // network endpoint hanging or not.
+        let result = dispatcher
+            .run_doctor(Box::pin(std::future::pending::<
+                Vec<crate::doctor::DiagResult>,
+            >()))
+            .await
+            .expect("doctor/run must succeed");
+        let obj = result.as_object().expect("result must be an object");
+
+        assert_eq!(
+            obj.get("timed_out_phase").and_then(|v| v.as_str()),
+            Some("probe_models"),
+            "serialized response must carry timed_out_phase='probe_models'"
+        );
+
+        // Earlier diagnostics survive in the serialized results.
+        let results = obj
+            .get("results")
+            .and_then(|v| v.as_array())
+            .expect("results must be an array");
+        assert!(
+            results
+                .iter()
+                .any(|r| r.get("category").and_then(|c| c.as_str()) == Some("config")),
+            "serialized results must retain config diagnostics after timeout"
+        );
+        assert!(
+            results
+                .iter()
+                .any(|r| r.get("category").and_then(|c| c.as_str()) == Some("workspace")),
+            "serialized results must retain workspace diagnostics after timeout"
+        );
+
+        // The timeout warning is appended exactly once in the serialized output.
+        let warning = crate::i18n::get_required_cli_string("cli-doctor-probe-timeout-message");
+        let warns = results
+            .iter()
+            .filter(|r| r.get("message").and_then(|m| m.as_str()) == Some(warning.as_str()))
+            .count();
+        assert_eq!(
+            warns, 1,
+            "serialized results must append the timeout warning exactly once"
+        );
+    }
+
+    /// RPC-boundary coverage for the under-deadline branch: a probe that
+    /// completes immediately with a real result must have that result retained
+    /// in the serialized `doctor/run` response, with `timed_out_phase` absent.
+    #[tokio::test]
+    async fn doctor_run_under_deadline_retains_probe_results() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (dispatcher, _sessions) = make_acp_test_dispatcher(config);
+
+        let probe_result = crate::doctor::DiagResult {
+            severity: crate::doctor::Severity::Ok,
+            category: "probe.mock".into(),
+            message: "mock probe ok".into(),
+        };
+        let result = dispatcher
+            .run_doctor(Box::pin(async move { vec![probe_result] }))
+            .await
+            .expect("doctor/run must succeed");
+        let obj = result.as_object().expect("result must be an object");
+
+        // timed_out_phase is None → skipped on the wire.
+        assert!(
+            obj.get("timed_out_phase")
+                .map(|v| v.is_null())
+                .unwrap_or(true),
+            "under-deadline response must not carry timed_out_phase"
+        );
+
+        // The completed probe result survives in the serialized output.
+        let results = obj
+            .get("results")
+            .and_then(|v| v.as_array())
+            .expect("results must be an array");
+        assert!(
+            results
+                .iter()
+                .any(|r| r.get("message").and_then(|m| m.as_str()) == Some("mock probe ok")),
+            "serialized results must retain the completed probe result"
+        );
+
+        // No timeout warning leaks into the under-deadline response.
+        let warning = crate::i18n::get_required_cli_string("cli-doctor-probe-timeout-message");
+        assert!(
+            !results
+                .iter()
+                .any(|r| r.get("message").and_then(|m| m.as_str()) == Some(warning.as_str())),
+            "under-deadline response must not contain the timeout warning"
         );
     }
 
