@@ -125,7 +125,7 @@ pub(crate) async fn try_recover_context_overflow(
             // `context_token_budget` is 0). Use a distinct reason so clients
             // do not render this as "trimmed against a Z-token budget" when
             // no configured budget governed the trim. The configured limit is
-            // still reported (contract: issue #9619) but only when one is
+            // still reported (the configured-budget exposure contract) but only when one is
             // actually set, so a disabled-enforcement recovery does not claim
             // a nonsensical zero-token budget.
             let reason = crate::i18n::get_required_cli_string("history-trim-reason-recovery");
