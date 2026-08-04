@@ -818,13 +818,26 @@ fn rewrite_bare_vision_provider_reference(
     if reference.contains(':') {
         return;
     }
-    let (canonical_family, canonical_alias, _extras) =
+    let (canonical_family, canonical_alias, reference_extras) =
         normalize_provider_type(reference, "default");
     let Some(toml::Value::Table(family_table)) = aliased_models.get(&canonical_family) else {
         // Unknown family, or a dotted ref that does not canonicalize to a
         // migrated family ("openrouter.default", "custom.rag_bot") — preserve.
         return;
     };
+    // A raw provider key (or the global default_provider) is a source for the
+    // reference's variant when it canonicalizes to the same family, alias, and
+    // variant extras (endpoint/auth_mode/uri). This preserves raw-provider
+    // provenance: a reference to a variant must not select a differently-named
+    // source's credentials (e.g. `qwen-intl` must not pick canonical `qwen`).
+    let source_is_equivalent = |key: &str| {
+        let (family, alias, extras) = normalize_provider_type(key, "default");
+        family == canonical_family && alias == canonical_alias && extras == reference_extras
+    };
+    let has_equivalent_source = raw_provider_keys.iter().any(|k| source_is_equivalent(k))
+        || global_default_provider
+            .map(source_is_equivalent)
+            .unwrap_or(false);
     let target_alias = if reference.as_str() == canonical_family {
         // A bare canonical family name: rewrite only when the family name has
         // its own source entry (a raw provider key of that exact name, or the
@@ -845,9 +858,10 @@ fn rewrite_bare_vision_provider_reference(
         }
         aliases[0].to_string()
     } else {
-        // A legacy spelling that maps to a specific alias: rewrite only when
-        // that alias was actually migrated.
-        if !family_table.contains_key(&canonical_alias) {
+        // A legacy spelling that maps to a specific variant: rewrite only when
+        // that alias was migrated AND the reference's variant has an
+        // equivalent raw source (same family/alias/extras).
+        if !family_table.contains_key(&canonical_alias) || !has_equivalent_source {
             return;
         }
         canonical_alias
