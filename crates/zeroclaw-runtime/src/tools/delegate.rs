@@ -1063,13 +1063,38 @@ impl DelegateTool {
             file.write_all(&bytes).await?;
             file.sync_all().await?;
             drop(file);
-            tokio::fs::rename(&tmp_path, result_path).await
+            tokio::fs::rename(&tmp_path, result_path).await?;
+            Self::sync_parent_directory(result_path).await
         }
         .await;
         if let Err(error) = write_result {
             let _ = tokio::fs::remove_file(&tmp_path).await;
-            return Err(error.into());
+            return Err(error);
         }
+        Ok(())
+    }
+
+    #[allow(clippy::unused_async)]
+    async fn sync_parent_directory(path: &Path) -> anyhow::Result<()> {
+        let parent = path.parent().ok_or_else(|| {
+            anyhow::Error::msg(format!(
+                "delegate output path has no parent directory: {}",
+                path.display()
+            ))
+        })?;
+
+        #[cfg(unix)]
+        {
+            let directory = tokio::fs::File::open(parent).await?;
+            directory.sync_all().await?;
+        }
+
+        #[cfg(not(unix))]
+        {
+            // std does not expose a portable directory-sync primitive here.
+            let _ = parent;
+        }
+
         Ok(())
     }
 
