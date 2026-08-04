@@ -7,7 +7,7 @@ use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::authority::is_authoritative;
-use super::task_registry::{TaskKind, TaskRecord, TaskRegistry, TaskStatus};
+use super::task_registry::{TaskKind, TaskRecord, TaskRegistry, TaskSnapshot, TaskStatus};
 
 mod goal;
 
@@ -197,6 +197,14 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRecord> {
     })
 }
 
+fn row_to_snapshot(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskSnapshot> {
+    Ok(TaskSnapshot {
+        task: row_to_record(row)?,
+        output: row.get("output")?,
+        error: row.get("error")?,
+    })
+}
+
 /// Collect query rows, SKIPPING (and logging) any single row that fails to convert —
 /// one unrecognised/corrupt record (e.g. a forward-incompat `kind`/`status` written by a
 /// newer binary) must not fail the whole enumeration and starve the reaper (finding #3).
@@ -280,6 +288,31 @@ fn update_task_status_record(
     .context("update task status")
 }
 
+fn transition_task_terminal_record(
+    conn: &Connection,
+    id: &str,
+    status: TaskStatus,
+    output: Option<String>,
+    error: Option<String>,
+) -> Result<usize> {
+    anyhow::ensure!(
+        status.is_terminal(),
+        "terminal transition requires a terminal status"
+    );
+    let finished_at = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "UPDATE tasks
+            SET status = ?1,
+                output = ?2,
+                error = ?3,
+                finished_at = ?4
+          WHERE id = ?5
+            AND status NOT IN ('completed','failed','cancelled','lost','timed_out')",
+        params![status_to_db(status), output, error, finished_at, id],
+    )
+    .context("transition task terminal")
+}
+
 fn claim_task_owner_record(
     conn: &Connection,
     id: &str,
@@ -332,6 +365,17 @@ impl TaskRegistry for SqliteTaskStore {
         Ok(())
     }
 
+    async fn transition_terminal(
+        &self,
+        id: &str,
+        status: TaskStatus,
+        output: Option<String>,
+        error: Option<String>,
+    ) -> Result<bool> {
+        let conn = self.conn.lock();
+        Ok(transition_task_terminal_record(&conn, id, status, output, error)? == 1)
+    }
+
     async fn claim_owner(&self, id: &str, owner_pid: u32, owner_boot_id: &str) -> Result<()> {
         let conn = self.conn.lock();
         claim_task_owner_record(&conn, id, owner_pid, owner_boot_id)?;
@@ -349,6 +393,17 @@ impl TaskRegistry for SqliteTaskStore {
             .optional()
             .context("get task")?;
         Ok(rec)
+    }
+
+    async fn get_snapshot(&self, id: &str) -> Result<Option<TaskSnapshot>> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT * FROM tasks WHERE id = ?1",
+            params![id],
+            row_to_snapshot,
+        )
+        .optional()
+        .context("get task snapshot")
     }
 
     async fn list_running(&self) -> Result<Vec<TaskRecord>> {
@@ -389,13 +444,46 @@ impl TaskRegistry for SqliteTaskStore {
             return Ok(false);
         }
         let now = chrono::Utc::now().to_rfc3339();
-        conn.execute(
-            "UPDATE tasks SET status = 'lost', finished_at = ?1
-              WHERE id = ?2 AND status = 'running'",
-            params![now, id],
-        )
-        .context("reconcile: mark lost")?;
-        Ok(true)
+        let changed = conn
+            .execute(
+                "UPDATE tasks
+                    SET status = 'lost',
+                        error = COALESCE(error, 'task owner is no longer available'),
+                        finished_at = ?1
+                  WHERE id = ?2
+                    AND status = 'running'
+                    AND owner_pid = ?3
+                    AND owner_boot_id = ?4",
+                params![now, id, rec.owner_pid as i64, rec.owner_boot_id],
+            )
+            .context("reconcile: mark lost")?;
+        Ok(changed == 1)
+    }
+
+    async fn reconcile_timed_out(
+        &self,
+        id: &str,
+        owner_pid: u32,
+        owner_boot_id: &str,
+        heartbeat_at: &str,
+    ) -> Result<bool> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let conn = self.conn.lock();
+        let changed = conn
+            .execute(
+                "UPDATE tasks
+                    SET status = 'timed_out',
+                        error = COALESCE(error, 'heartbeat timeout'),
+                        finished_at = ?1
+                  WHERE id = ?2
+                    AND status = 'running'
+                    AND owner_pid = ?3
+                    AND owner_boot_id = ?4
+                    AND heartbeat_at = ?5",
+                params![now, id, owner_pid as i64, owner_boot_id, heartbeat_at],
+            )
+            .context("reconcile: mark timed out")?;
+        Ok(changed == 1)
     }
 }
 
@@ -444,6 +532,91 @@ mod tests {
         let got = s.get("a").await.unwrap().unwrap();
         assert_eq!(got.status, TaskStatus::Completed);
         assert!(got.finished_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn terminal_transition_atomically_records_the_winning_outcome() {
+        let s = SqliteTaskStore::new_in_memory().unwrap();
+        s.create(rec("atomic", "main", 1, "boot-1")).await.unwrap();
+
+        assert!(
+            s.transition_terminal(
+                "atomic",
+                TaskStatus::Completed,
+                Some("delegate_results/atomic.json".into()),
+                None,
+            )
+            .await
+            .unwrap()
+        );
+
+        let snapshot = s.get_snapshot("atomic").await.unwrap().unwrap();
+        assert_eq!(snapshot.task.status, TaskStatus::Completed);
+        assert_eq!(
+            snapshot.output.as_deref(),
+            Some("delegate_results/atomic.json")
+        );
+        assert!(snapshot.error.is_none());
+        assert!(snapshot.task.finished_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn competing_terminal_transition_cannot_overwrite_the_winner() {
+        let s = SqliteTaskStore::new_in_memory().unwrap();
+        s.create(rec("race", "main", 1, "boot-1")).await.unwrap();
+
+        assert!(
+            s.transition_terminal(
+                "race",
+                TaskStatus::Cancelled,
+                None,
+                Some("cancelled by user request".into()),
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !s.transition_terminal(
+                "race",
+                TaskStatus::Completed,
+                Some("delegate_results/race.json".into()),
+                None,
+            )
+            .await
+            .unwrap()
+        );
+
+        let snapshot = s.get_snapshot("race").await.unwrap().unwrap();
+        assert_eq!(snapshot.task.status, TaskStatus::Cancelled);
+        assert!(snapshot.output.is_none());
+        assert_eq!(snapshot.error.as_deref(), Some("cancelled by user request"));
+    }
+
+    #[tokio::test]
+    async fn timeout_reconciliation_requires_the_observed_owner_and_heartbeat() {
+        let s = SqliteTaskStore::new_in_memory().unwrap();
+        let mut task = rec("timeout-race", "main", 7, "boot-1");
+        task.heartbeat_at = Some("2026-06-18T00:00:00Z".into());
+        s.create(task).await.unwrap();
+
+        assert!(
+            !s.reconcile_timed_out("timeout-race", 7, "boot-1", "2026-06-18T00:00:01Z",)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            s.get("timeout-race").await.unwrap().unwrap().status,
+            TaskStatus::Running
+        );
+        assert!(
+            s.reconcile_timed_out("timeout-race", 7, "boot-1", "2026-06-18T00:00:00Z",)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            s.get("timeout-race").await.unwrap().unwrap().status,
+            TaskStatus::TimedOut
+        );
     }
 
     #[tokio::test]

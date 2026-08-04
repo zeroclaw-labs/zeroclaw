@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
-use super::task_registry::{TaskRegistry, TaskStatus};
+use super::task_registry::TaskRegistry;
 
 /// How often the periodic sweep runs.
 pub const REAP_INTERVAL: Duration = Duration::from_secs(60);
@@ -88,13 +88,8 @@ pub async fn sweep(
             if let Some(beat) = rec.heartbeat_at.as_deref()
                 && age_secs(beat, now).is_some_and(|age| age > max_runtime_secs)
             {
-                store
-                    .update_status(
-                        &rec.id,
-                        TaskStatus::TimedOut,
-                        None,
-                        Some("heartbeat timeout".into()),
-                    )
+                let _ = store
+                    .reconcile_timed_out(&rec.id, rec.owner_pid, &rec.owner_boot_id, beat)
                     .await?;
             }
         }
@@ -105,7 +100,7 @@ pub async fn sweep(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control_plane::task_registry::{TaskKind, TaskRecord};
+    use crate::control_plane::task_registry::{TaskKind, TaskRecord, TaskStatus};
     use crate::control_plane::task_store_sqlite::SqliteTaskStore;
 
     fn rec(id: &str, boot: &str, pid: u32, beat_secs_ago: Option<i64>) -> TaskRecord {

@@ -184,7 +184,7 @@ Exact, sourced from `crates/zeroclaw-runtime/src/tools/delegate.rs`.
    task_id: <uuid>
    Use action='check_result' with task_id='<uuid>' to retrieve the result.
    ```
-   The result file lives at `<workspace>/delegate_results/<uuid>.json`. While running, the file's `status` field is `running`; terminal states are `completed`, `failed`, or `cancelled`.
+   Lifecycle state is stored in `data/control_plane.db`. The workspace artifact at `<workspace>/delegate_results/<uuid>.json` contains task identity and output only; it is not a second status record.
 5. `action="check_result"` with an unknown task id: error is `No result found for task_id '<uuid>'`.
 6. `action="await_sessions"` with `task_ids: [<uuid>, ...]` waits for multiple background result files at once. The output is a JSON object with `status` (`complete` or `timeout`), `completed`, `pending`, `missing`, `failed`, and `results`. `timeout_ms` defaults to 30000 and is capped at 120000; on timeout the tool returns partial results and an error saying one or more tasks are still pending or missing. Duplicate task IDs are rejected.
 7. Parallel fan-out output: begins with `[Parallel delegation: <N> agents]\n\n`, followed by per-agent blocks separated by `\n\n`, each block beginning with `--- <target> (success=<bool>) ---\n`. On per-agent failure the inner block is `--- <target> (success=false) ---\nError: <wrapped error>`.
@@ -197,7 +197,7 @@ Exact, sourced from `crates/zeroclaw-runtime/src/tools/delegate.rs`.
 
 ### `delegate`: how to verify it actually fired
 
-`delegate` does not emit a dedicated tracing span today. The signal is the **target** agent's loop appearing in the log, which inherits whatever scope the parent's tool-call dispatch was inside. Background-mode spawns are easier to verify out-of-band: the result file `<workspace>/delegate_results/<uuid>.json` exists on disk and carries the target agent's `status` + `output` fields; `cat` or `jq` works without touching the log at all.
+`delegate` does not emit a dedicated tracing span today. The signal is the **target** agent's loop appearing in the log, which inherits whatever scope the parent's tool-call dispatch was inside. For background mode, use `check_result` or `await_sessions` to read the authoritative lifecycle state and output together. The workspace artifact can confirm that output was persisted, but it does not carry status.
 
 (Cron-launched agent jobs are a separate spawn site and use the explicit `subagent` span described above; `delegate` and cron are not the same path.)
 

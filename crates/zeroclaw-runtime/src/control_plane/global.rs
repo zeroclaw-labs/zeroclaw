@@ -13,8 +13,9 @@ pub fn init_control_plane(handle: ControlPlaneHandle) -> bool {
     CONTROL_PLANE.set(handle).is_ok()
 }
 
-/// The live control-plane, or `None` when not running under a booted daemon. Producers
-/// MUST treat `None` as "supervision disabled" and proceed exactly as today.
+/// The daemon-owned control plane, or `None` when this process has not booted a
+/// daemon. Producers that require durable lifecycle state must either attach to
+/// the configured store explicitly or reject the operation.
 pub fn control_plane() -> Option<&'static ControlPlaneHandle> {
     CONTROL_PLANE.get()
 }
@@ -26,7 +27,7 @@ mod tests {
     #[test]
     fn uninitialized_is_none() {
         // In the unit-test process the daemon never boots, so the plane is absent and
-        // producers no-op. (We do not call init here — that would leak into other tests
+        // producers choose their explicit fallback. (We do not call init here — that would leak into other tests
         // via the process-global; init is exercised by the daemon integration path.)
         assert!(control_plane().is_none());
     }

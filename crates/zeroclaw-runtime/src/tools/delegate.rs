@@ -13,6 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::{
@@ -51,6 +52,26 @@ pub struct BackgroundDelegateResult {
     pub finished_at: Option<String>,
 }
 
+/// Output artifact written by current background delegates.
+///
+/// Lifecycle status intentionally lives only in the control-plane task row.
+/// `BackgroundDelegateResult` remains the compatibility shape for legacy files
+/// that embedded their own status.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct BackgroundDelegateOutput {
+    task_id: String,
+    output: Option<String>,
+}
+
+struct StoredBackgroundOutput {
+    output: BackgroundDelegateOutput,
+    legacy_agent: Option<String>,
+    legacy_status: Option<BackgroundTaskStatus>,
+    legacy_error: Option<String>,
+    legacy_started_at: Option<String>,
+    legacy_finished_at: Option<String>,
+}
+
 /// Status of a background delegate task.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -78,6 +99,18 @@ impl BackgroundResultState {
             BackgroundTaskStatus::Completed => Self::Completed,
             BackgroundTaskStatus::Failed => Self::Failed,
             BackgroundTaskStatus::Cancelled => Self::Cancelled,
+        }
+    }
+
+    fn from_task_status(status: crate::control_plane::TaskStatus) -> Self {
+        match status {
+            crate::control_plane::TaskStatus::Running
+            | crate::control_plane::TaskStatus::Paused => Self::Running,
+            crate::control_plane::TaskStatus::Completed => Self::Completed,
+            crate::control_plane::TaskStatus::Failed => Self::Failed,
+            crate::control_plane::TaskStatus::Cancelled => Self::Cancelled,
+            crate::control_plane::TaskStatus::Lost => Self::Lost,
+            crate::control_plane::TaskStatus::TimedOut => Self::TimedOut,
         }
     }
 
@@ -146,6 +179,10 @@ pub struct DelegateTool {
     /// advertised roster so an agent is never offered itself as a
     /// delegation target. Empty when unset (legacy unit-test constructors).
     caller_alias: String,
+    /// Optional per-tree override for background task lifecycle storage. A
+    /// daemon-provided control plane wins; non-daemon surfaces share a
+    /// process-local handle keyed by `root_config.data_dir`.
+    task_control_plane: Arc<tokio::sync::OnceCell<crate::control_plane::ControlPlaneHandle>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -217,6 +254,7 @@ impl DelegateTool {
     pub const NAME: &'static str = "delegate";
     const MAX_AWAIT_SESSIONS_TIMEOUT: Duration = Duration::from_secs(120);
     const MAX_AWAIT_SESSION_TASK_IDS: usize = 128;
+    const OUTPUT_ARTIFACT_PREFIX: &'static str = "artifact:";
     const INDEPENDENT_ALWAYS_ASK_DOC_REF: &'static str =
         "ZeroClaw docs, \"Delegation & SubAgents\" > \"What's not supported\"";
 
@@ -258,6 +296,7 @@ impl DelegateTool {
             skill_bundles: Arc::new(HashMap::new()),
             root_config: None,
             caller_alias: String::new(),
+            task_control_plane: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
 
@@ -305,6 +344,7 @@ impl DelegateTool {
             skill_bundles: Arc::new(HashMap::new()),
             root_config: None,
             caller_alias: String::new(),
+            task_control_plane: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
 
@@ -404,6 +444,15 @@ impl DelegateTool {
     /// canonical agent config at delegate time.
     pub fn with_root_config(mut self, config: Arc<Config>) -> Self {
         self.root_config = Some(config);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_task_control_plane(self, handle: crate::control_plane::ControlPlaneHandle) -> Self {
+        assert!(
+            self.task_control_plane.set(handle).is_ok(),
+            "task control plane is set only once in tests"
+        );
         self
     }
 
@@ -959,15 +1008,103 @@ impl DelegateTool {
         self.workspace_dir.join("delegate_results")
     }
 
-    async fn write_result_atomic(
+    async fn background_control_plane(
+        &self,
+    ) -> anyhow::Result<crate::control_plane::ControlPlaneHandle> {
+        if let Some(handle) = crate::control_plane::control_plane() {
+            return Ok(handle.clone());
+        }
+        if let Some(handle) = self.task_control_plane.get() {
+            return Ok(handle.clone());
+        }
+
+        let Some(data_dir) = self
+            .root_config
+            .as_ref()
+            .map(|config| config.data_dir.clone())
+        else {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "background delegation rejected because the durable task store is unavailable"
+            );
+            return Err(anyhow::Error::msg(
+                "background delegation requires a durable task store; root config is unavailable",
+            ));
+        };
+        type ControlPlaneCell = tokio::sync::OnceCell<crate::control_plane::ControlPlaneHandle>;
+        static CONTROL_PLANES: std::sync::OnceLock<
+            parking_lot::Mutex<HashMap<PathBuf, Arc<ControlPlaneCell>>>,
+        > = std::sync::OnceLock::new();
+        let cell = CONTROL_PLANES
+            .get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
+            .lock()
+            .entry(data_dir.clone())
+            .or_insert_with(|| Arc::new(ControlPlaneCell::new()))
+            .clone();
+        cell.get_or_try_init(|| crate::control_plane::ControlPlaneHandle::start(&data_dir))
+            .await
+            .cloned()
+    }
+
+    async fn write_result_atomic<T: serde::Serialize>(
         result_path: &Path,
-        result: &BackgroundDelegateResult,
+        result: &T,
     ) -> anyhow::Result<()> {
         let bytes = serde_json::to_vec_pretty(result)?;
         let tmp_path = result_path.with_extension(format!("json.{}.tmp", uuid::Uuid::new_v4()));
-        tokio::fs::write(&tmp_path, &bytes).await?;
-        tokio::fs::rename(&tmp_path, result_path).await?;
+        let write_result = async {
+            let mut file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)
+                .await?;
+            file.write_all(&bytes).await?;
+            file.sync_all().await?;
+            drop(file);
+            tokio::fs::rename(&tmp_path, result_path).await
+        }
+        .await;
+        if let Err(error) = write_result {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(error.into());
+        }
         Ok(())
+    }
+
+    async fn settle_background_task(
+        store: &dyn crate::control_plane::TaskRegistry,
+        result_path: &Path,
+        result: &BackgroundDelegateOutput,
+        terminal_status: crate::control_plane::TaskStatus,
+        terminal_error: Option<String>,
+    ) -> anyhow::Result<bool> {
+        let (settled_status, output_ref, settled_error) =
+            match Self::write_result_atomic(result_path, result).await {
+                Ok(()) => (
+                    terminal_status,
+                    (terminal_status == crate::control_plane::TaskStatus::Completed).then(|| {
+                        format!(
+                            "{}{}",
+                            Self::OUTPUT_ARTIFACT_PREFIX,
+                            result_path
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                        )
+                    }),
+                    terminal_error,
+                ),
+                Err(error) => (
+                    crate::control_plane::TaskStatus::Failed,
+                    None,
+                    Some(format!("failed to persist delegate output: {error:#}")),
+                ),
+            };
+        store
+            .transition_terminal(&result.task_id, settled_status, output_ref, settled_error)
+            .await
     }
 
     /// Validate that a user-provided task_id is a valid UUID to prevent
@@ -1455,6 +1592,17 @@ impl DelegateTool {
             });
         }
 
+        let task_control_plane = match self.background_control_plane().await {
+            Ok(handle) => handle,
+            Err(error) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(format!("Cannot start background delegation: {error:#}")),
+                });
+            }
+        };
+
         let task_id = uuid::Uuid::new_v4().to_string();
         let results_dir = self.results_dir();
         tokio::fs::create_dir_all(&results_dir).await?;
@@ -1473,43 +1621,44 @@ impl DelegateTool {
         let started_at = chrono::Utc::now().to_rfc3339();
         let agent_name_owned = agent_name.to_string();
 
-        // Write initial "running" status
-        let initial_result = BackgroundDelegateResult {
+        // The workspace artifact scopes listing and stores output, but never owns
+        // lifecycle status. Status is created atomically in the task store below.
+        let initial_result = BackgroundDelegateOutput {
             task_id: task_id.clone(),
-            agent: agent_name_owned.clone(),
-            status: BackgroundTaskStatus::Running,
             output: None,
-            error: None,
-            started_at: started_at.clone(),
-            finished_at: None,
         };
         let result_path = results_dir.join(format!("{task_id}.json"));
         Self::write_result_atomic(&result_path, &initial_result).await?;
 
-        // EPIC-A supervision: register the task in the durable control-plane BEFORE the
-        // spawn, so a crash between here and the spawn is recoverable by the reaper. A
-        // no-op when not running under a booted daemon (the plane is absent).
-        if let Some(cp) = crate::control_plane::control_plane() {
-            let _ = cp
-                .store
-                .create(crate::control_plane::TaskRecord {
-                    id: task_id.clone(),
-                    kind: crate::control_plane::TaskKind::Delegate,
-                    agent: agent_name_owned.clone(),
-                    status: crate::control_plane::TaskStatus::Running,
-                    owner_pid: std::process::id(),
-                    owner_boot_id: cp.boot_id.clone(),
-                    heartbeat_at: None,
-                    depth: self.depth,
-                    parent_id: None,
-                    originator_route: None,
-                    delivered: false,
-                    idem_key: None,
-                    principal_id: None,
-                    started_at: started_at.clone(),
-                    finished_at: None,
-                })
-                .await;
+        if let Err(error) = task_control_plane
+            .store
+            .create(crate::control_plane::TaskRecord {
+                id: task_id.clone(),
+                kind: crate::control_plane::TaskKind::Delegate,
+                agent: agent_name_owned.clone(),
+                status: crate::control_plane::TaskStatus::Running,
+                owner_pid: std::process::id(),
+                owner_boot_id: task_control_plane.boot_id.clone(),
+                heartbeat_at: None,
+                depth: self.depth,
+                parent_id: None,
+                originator_route: None,
+                delivered: false,
+                idem_key: None,
+                principal_id: None,
+                started_at: started_at.clone(),
+                finished_at: None,
+            })
+            .await
+        {
+            let _ = tokio::fs::remove_file(&result_path).await;
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!(
+                    "Cannot start background delegation: task registration failed: {error:#}"
+                )),
+            });
         }
 
         let agents = Arc::clone(&self.agents);
@@ -1539,6 +1688,8 @@ impl DelegateTool {
         let skill_bundles = Arc::clone(&self.skill_bundles);
         let root_config = self.root_config.clone();
         let caller_alias = self.caller_alias.clone();
+        let nested_task_control_plane = Arc::clone(&self.task_control_plane);
+        let terminal_store = Arc::clone(&task_control_plane.store);
         let memory = self.memory.clone();
         let parent_session_key = current_tool_loop_session_key();
         let __zc_delegate_alias = agent_name_owned.clone();
@@ -1564,6 +1715,7 @@ impl DelegateTool {
                     skill_bundles,
                     root_config,
                     caller_alias,
+                    task_control_plane: nested_task_control_plane,
                 };
 
                 let args_inner = json!({
@@ -1595,58 +1747,52 @@ impl DelegateTool {
                     }
                 };
 
-                let finished_at = chrono::Utc::now().to_rfc3339();
-                let final_result = match outcome {
-                    Ok(output) => BackgroundDelegateResult {
-                        task_id: task_id_clone.clone(),
-                        agent: agent_name_owned,
-                        status: BackgroundTaskStatus::Completed,
-                        output: Some(output),
-                        error: None,
-                        started_at,
-                        finished_at: Some(finished_at),
-                    },
+                let (terminal_status, terminal_error, final_result) = match outcome {
+                    Ok(output) => (
+                        crate::control_plane::TaskStatus::Completed,
+                        None,
+                        BackgroundDelegateOutput {
+                            task_id: task_id_clone.clone(),
+                            output: Some(output),
+                        },
+                    ),
                     Err(err) => {
                         let status = if err.contains("Cancelled") {
-                            BackgroundTaskStatus::Cancelled
+                            crate::control_plane::TaskStatus::Cancelled
                         } else {
-                            BackgroundTaskStatus::Failed
+                            crate::control_plane::TaskStatus::Failed
                         };
-                        BackgroundDelegateResult {
-                            task_id: task_id_clone.clone(),
-                            agent: agent_name_owned,
+                        (
                             status,
-                            output: None,
-                            error: Some(err),
-                            started_at,
-                            finished_at: Some(finished_at),
-                        }
+                            Some(err),
+                            BackgroundDelegateOutput {
+                                task_id: task_id_clone.clone(),
+                                output: None,
+                            },
+                        )
                     }
                 };
 
                 let result_path = results_dir.join(format!("{}.json", task_id_clone));
-                let _ = DelegateTool::write_result_atomic(&result_path, &final_result).await;
-
-                if let Some(cp) = crate::control_plane::control_plane() {
-                    let cp_status = match final_result.status {
-                        BackgroundTaskStatus::Completed => {
-                            crate::control_plane::TaskStatus::Completed
-                        }
-                        BackgroundTaskStatus::Failed => crate::control_plane::TaskStatus::Failed,
-                        BackgroundTaskStatus::Cancelled => {
-                            crate::control_plane::TaskStatus::Cancelled
-                        }
-                        BackgroundTaskStatus::Running => crate::control_plane::TaskStatus::Running,
-                    };
-                    let _ = cp
-                        .store
-                        .update_status(
-                            &task_id_clone,
-                            cp_status,
-                            final_result.output.clone(),
-                            final_result.error.clone(),
-                        )
-                        .await;
+                if let Err(error) = DelegateTool::settle_background_task(
+                    terminal_store.as_ref(),
+                    &result_path,
+                    &final_result,
+                    terminal_status,
+                    terminal_error,
+                )
+                .await
+                {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Write)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "task_id": task_id_clone,
+                                "error": format!("{error:#}"),
+                            })),
+                        "background delegate terminal transition failed"
+                    );
                 }
 
                 // Drop the live cancel token now the task has settled.
@@ -1789,6 +1935,7 @@ impl DelegateTool {
             let caller_alias = self.caller_alias.clone();
             let session_key = parent_session_key.clone();
             let memory = self.memory.clone();
+            let task_control_plane = Arc::clone(&self.task_control_plane);
             let __zc_delegate_alias = agent_name.clone();
 
             handles.push(zeroclaw_spawn::spawn!(
@@ -1812,6 +1959,7 @@ impl DelegateTool {
                         skill_bundles,
                         root_config,
                         caller_alias,
+                        task_control_plane,
                     };
                     let agent_name_for_return = agent_name.clone();
                     let result = scope_delegate_session_key(session_key, async move {
@@ -1880,69 +2028,143 @@ impl DelegateTool {
 
     // ── Result Retrieval ────────────────────────────────────────────
 
-    async fn reconciled_loss_label(
-        task_id: &str,
-        file_status: &BackgroundTaskStatus,
-    ) -> Option<&'static str> {
-        let cp = crate::control_plane::control_plane()?;
-        Self::reconciled_loss_label_with(task_id, file_status, cp.store.as_ref()).await
-    }
-
-    /// Store-injected core of [`Self::reconciled_loss_label`] — kept separate from the
-    /// process-global accessor so it is unit-testable against an in-memory store.
-    async fn reconciled_loss_label_with(
-        task_id: &str,
-        file_status: &BackgroundTaskStatus,
-        store: &dyn crate::control_plane::TaskRegistry,
-    ) -> Option<&'static str> {
-        if *file_status != BackgroundTaskStatus::Running {
-            return None;
-        }
-        match store.get(task_id).await.ok().flatten()?.status {
-            crate::control_plane::TaskStatus::Lost => Some("lost"),
-            crate::control_plane::TaskStatus::TimedOut => Some("timed_out"),
-            _ => None,
-        }
-    }
-
-    async fn read_background_result(
+    async fn read_stored_background_output(
         &self,
         task_id: &str,
-    ) -> anyhow::Result<Option<BackgroundDelegateResult>> {
+    ) -> anyhow::Result<Option<StoredBackgroundOutput>> {
         let result_path = self.results_dir().join(format!("{task_id}.json"));
         let content = match tokio::fs::read_to_string(&result_path).await {
             Ok(content) => content,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-        let result = serde_json::from_str(&content)?;
-        Ok(Some(result))
+        let value: serde_json::Value = serde_json::from_str(&content)?;
+        if value.get("status").is_some() {
+            let legacy: BackgroundDelegateResult = serde_json::from_value(value)?;
+            anyhow::ensure!(
+                legacy.task_id == task_id,
+                "delegate output task id does not match its filename"
+            );
+            return Ok(Some(StoredBackgroundOutput {
+                output: BackgroundDelegateOutput {
+                    task_id: legacy.task_id,
+                    output: legacy.output,
+                },
+                legacy_agent: Some(legacy.agent),
+                legacy_status: Some(legacy.status),
+                legacy_error: legacy.error,
+                legacy_started_at: Some(legacy.started_at),
+                legacy_finished_at: legacy.finished_at,
+            }));
+        }
+        let output: BackgroundDelegateOutput = serde_json::from_value(value)?;
+        anyhow::ensure!(
+            output.task_id == task_id,
+            "delegate output task id does not match its filename"
+        );
+        Ok(Some(StoredBackgroundOutput {
+            output,
+            legacy_agent: None,
+            legacy_status: None,
+            legacy_error: None,
+            legacy_started_at: None,
+            legacy_finished_at: None,
+        }))
     }
 
-    async fn background_result_view(
+    async fn read_background_view(
+        &self,
         task_id: &str,
-        result: BackgroundDelegateResult,
-    ) -> anyhow::Result<(BackgroundResultState, serde_json::Value)> {
-        if let Some(label) = Self::reconciled_loss_label(task_id, &result.status).await {
-            let state = match label {
-                "lost" => BackgroundResultState::Lost,
-                "timed_out" => BackgroundResultState::TimedOut,
-                _ => BackgroundResultState::from_file_status(&result.status),
+    ) -> anyhow::Result<Option<(BackgroundResultState, serde_json::Value, Option<String>)>> {
+        let control_plane = self.background_control_plane().await?;
+        if let Some(snapshot) = control_plane.store.get_snapshot(task_id).await? {
+            let state = BackgroundResultState::from_task_status(snapshot.task.status);
+            let mut task_error = snapshot.error;
+            let output = if state == BackgroundResultState::Completed {
+                match snapshot.output {
+                    Some(output_ref) => {
+                        if let Some(filename) =
+                            output_ref.strip_prefix(Self::OUTPUT_ARTIFACT_PREFIX)
+                        {
+                            let expected = format!("{task_id}.json");
+                            if filename != expected {
+                                task_error.get_or_insert_with(|| {
+                                    format!(
+                                        "delegate output reference '{filename}' does not match task '{task_id}'"
+                                    )
+                                });
+                                None
+                            } else {
+                                match self.read_stored_background_output(task_id).await {
+                                    Ok(Some(stored)) => stored.output.output,
+                                    Ok(None) => {
+                                        task_error.get_or_insert_with(|| {
+                                            format!(
+                                                "delegate output artifact '{filename}' is missing"
+                                            )
+                                        });
+                                        None
+                                    }
+                                    Err(error) => {
+                                        task_error.get_or_insert_with(|| {
+                                            format!(
+                                                "delegate output artifact '{filename}' is unreadable: {error:#}"
+                                            )
+                                        });
+                                        None
+                                    }
+                                }
+                            }
+                        } else {
+                            Some(output_ref)
+                        }
+                    }
+                    None => None,
+                }
+            } else {
+                None
             };
-            return Ok((
+            let note = matches!(state, BackgroundResultState::Lost | BackgroundResultState::TimedOut)
+                .then_some(
+                    "the owning daemon exited or the task exceeded its max runtime; reconciled by the supervision reaper",
+                );
+            return Ok(Some((
                 state,
                 json!({
                     "task_id": task_id,
-                    "agent": result.agent,
-                    "status": label,
-                    "started_at": result.started_at,
-                    "note": "the owning daemon exited or the task exceeded its max runtime; \
-                             reconciled by the supervision reaper",
+                    "agent": snapshot.task.agent,
+                    "status": state.as_str(),
+                    "output": output,
+                    "error": task_error.clone(),
+                    "started_at": snapshot.task.started_at,
+                    "finished_at": snapshot.task.finished_at,
+                    "note": note,
                 }),
-            ));
+                task_error,
+            )));
         }
-        let state = BackgroundResultState::from_file_status(&result.status);
-        Ok((state, serde_json::to_value(result)?))
+
+        let stored = self.read_stored_background_output(task_id).await?;
+        let Some(stored) = stored else {
+            return Ok(None);
+        };
+        let Some(status) = stored.legacy_status else {
+            return Ok(None);
+        };
+        let state = BackgroundResultState::from_file_status(&status);
+        Ok(Some((
+            state,
+            json!({
+                "task_id": stored.output.task_id,
+                "agent": stored.legacy_agent,
+                "status": state.as_str(),
+                "output": stored.output.output,
+                "error": stored.legacy_error,
+                "started_at": stored.legacy_started_at,
+                "finished_at": stored.legacy_finished_at,
+            }),
+            stored.legacy_error,
+        )))
     }
 
     fn task_ids_from_args(args: &serde_json::Value) -> anyhow::Result<Vec<String>> {
@@ -2020,24 +2242,22 @@ impl DelegateTool {
             });
         }
 
-        let Some(result) = self.read_background_result(task_id).await? else {
+        let Some((state, value, task_error)) = self.read_background_view(task_id).await? else {
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!("No result found for task_id '{task_id}'")),
             });
         };
-        let error = result.error.clone();
-        let (state, value) = Self::background_result_view(task_id, result).await?;
-        let success = state.is_success();
+        let success = state.is_success() && task_error.is_none();
 
         Ok(ToolResult {
             success,
             output: serde_json::to_string_pretty(&value)?.into(),
-            error: if success {
-                None
-            } else if let Some(error) = error {
+            error: if let Some(error) = task_error {
                 Some(error)
+            } else if success {
+                None
             } else if state.is_failure() {
                 Some(format!(
                     "background task is {} and will not complete",
@@ -2079,14 +2299,14 @@ impl DelegateTool {
             let mut failed = Vec::new();
 
             for task_id in &task_ids {
-                let Some(result) = self.read_background_result(task_id).await? else {
+                let Some((state, value, task_error)) = self.read_background_view(task_id).await?
+                else {
                     missing.push(task_id.clone());
                     continue;
                 };
-                let (state, value) = Self::background_result_view(task_id, result).await?;
                 if state.is_pending() {
                     pending.push(task_id.clone());
-                } else if state.is_failure() {
+                } else if state.is_failure() || task_error.is_some() {
                     failed.push(task_id.clone());
                 }
                 results.push(value);
@@ -2105,7 +2325,10 @@ impl DelegateTool {
                 } else if timed_out {
                     Some("one or more background tasks are still pending or missing".into())
                 } else {
-                    Some("one or more background tasks failed or were cancelled".into())
+                    Some(
+                        "one or more background tasks failed, were cancelled, or have unreadable output"
+                            .into(),
+                    )
                 };
                 return Ok(ToolResult {
                     success,
@@ -2143,22 +2366,17 @@ impl DelegateTool {
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) == Some("json")
-                && let Ok(content) = tokio::fs::read_to_string(&path).await
-                && let Ok(result) = serde_json::from_str::<BackgroundDelegateResult>(&content)
+                && let Some(task_id) = path.file_stem().and_then(|value| value.to_str())
+                && Self::validate_task_id(task_id).is_ok()
+                && let Some((_, result, _)) = self.read_background_view(task_id).await?
             {
-                // Surface the reconciled loss state (lost/timed_out) for a task whose flat
-                // file still says `Running` but whose owning daemon died / timed out.
-                let status =
-                    match Self::reconciled_loss_label(&result.task_id, &result.status).await {
-                        Some(label) => json!(label),
-                        None => json!(result.status),
-                    };
                 results.push(json!({
-                    "task_id": result.task_id,
-                    "agent": result.agent,
-                    "status": status,
-                    "started_at": result.started_at,
-                    "finished_at": result.finished_at,
+                    "task_id": result.get("task_id"),
+                    "agent": result.get("agent"),
+                    "status": result.get("status"),
+                    "error": result.get("error"),
+                    "started_at": result.get("started_at"),
+                    "finished_at": result.get("finished_at"),
                 }));
             }
         }
@@ -2222,19 +2440,82 @@ impl DelegateTool {
             });
         }
 
-        let result_path = self.results_dir().join(format!("{task_id}.json"));
-        if !result_path.exists() {
+        let control_plane = self.background_control_plane().await?;
+        if let Some(snapshot) = control_plane.store.get_snapshot(task_id).await? {
+            if snapshot.task.status != crate::control_plane::TaskStatus::Running {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(format!(
+                        "Task '{task_id}' is not running (status: {:?})",
+                        snapshot.task.status
+                    )),
+                });
+            }
+
+            let aborted = Self::background_task_cancels()
+                .lock()
+                .remove(task_id)
+                .inspect(CancellationToken::cancel)
+                .is_some();
+            let won = control_plane
+                .store
+                .transition_terminal(
+                    task_id,
+                    crate::control_plane::TaskStatus::Cancelled,
+                    None,
+                    Some("cancelled by user request".into()),
+                )
+                .await?;
+            if !won {
+                let status = control_plane
+                    .store
+                    .get(task_id)
+                    .await?
+                    .map(|task| format!("{:?}", task.status))
+                    .unwrap_or_else(|| "missing".into());
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(format!(
+                        "Task '{task_id}' is not running (status: {status})"
+                    )),
+                });
+            }
             return Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(format!("No task found for task_id '{task_id}'")),
+                success: true,
+                output: if aborted {
+                    format!("Task '{task_id}' cancelled: the running task was aborted.").into()
+                } else {
+                    format!("Task '{task_id}' marked cancelled (it had already settled).").into()
+                },
+                error: None,
             });
         }
 
-        // Read current status
-        let content = tokio::fs::read_to_string(&result_path).await?;
-        let mut result: BackgroundDelegateResult = serde_json::from_str(&content)?;
-
+        // Compatibility path for legacy result files without a task row.
+        let result_path = self.results_dir().join(format!("{task_id}.json"));
+        let content = match tokio::fs::read_to_string(&result_path).await {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(format!("No task found for task_id '{task_id}'")),
+                });
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let mut result: BackgroundDelegateResult = match serde_json::from_str(&content) {
+            Ok(result) => result,
+            Err(_) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(format!("No task found for task_id '{task_id}'")),
+                });
+            }
+        };
         if result.status != BackgroundTaskStatus::Running {
             return Ok(ToolResult {
                 success: false,
@@ -2245,10 +2526,6 @@ impl DelegateTool {
                 )),
             });
         }
-
-        // Actually abort the running task by signalling its registered cancel token —
-        // this cascades into the task's `tokio::select!`, which settles it as Cancelled.
-        // Falls back to file-marking when the task already settled (token absent).
         let aborted = Self::background_task_cancels()
             .lock()
             .remove(task_id)
@@ -2259,19 +2536,6 @@ impl DelegateTool {
         result.error = Some("Cancelled by user request".into());
         result.finished_at = Some(chrono::Utc::now().to_rfc3339());
         Self::write_result_atomic(&result_path, &result).await?;
-
-        // Reconcile the durable supervision registry so the supervised view agrees.
-        if let Some(cp) = crate::control_plane::control_plane() {
-            let _ = cp
-                .store
-                .update_status(
-                    task_id,
-                    crate::control_plane::TaskStatus::Cancelled,
-                    None,
-                    Some("cancelled by user request".into()),
-                )
-                .await;
-        }
 
         Ok(ToolResult {
             success: true,
@@ -2793,6 +3057,9 @@ impl Observer for NoopObserver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control_plane::{
+        ControlPlaneHandle, SqliteTaskStore, TaskKind, TaskRecord, TaskRegistry, TaskStatus,
+    };
     use crate::platform::RuntimeAdapter;
     use crate::security::{AutonomyLevel, SecurityPolicy};
     use crate::tools::{MemoryRecallTool, MemoryStoreTool};
@@ -2809,19 +3076,14 @@ mod tests {
 
     zeroclaw_api::mock_tool_attribution!(EchoTool, FakeMcpTool);
 
-    #[tokio::test]
-    async fn reconciled_loss_label_surfaces_registry_truth() {
-        use crate::control_plane::{
-            SqliteTaskStore, TaskKind, TaskRecord, TaskRegistry, TaskStatus,
-        };
-        let store = SqliteTaskStore::new_in_memory().unwrap();
-        let rec = |id: &str, status: TaskStatus| TaskRecord {
+    fn task_record(id: &str, status: TaskStatus) -> TaskRecord {
+        TaskRecord {
             id: id.into(),
             kind: TaskKind::Delegate,
             agent: "main".into(),
             status,
             owner_pid: 0,
-            owner_boot_id: "b".into(),
+            owner_boot_id: "test-boot".into(),
             heartbeat_at: None,
             depth: 0,
             parent_id: None,
@@ -2831,66 +3093,294 @@ mod tests {
             principal_id: None,
             started_at: "2026-06-21T00:00:00Z".into(),
             finished_at: None,
-        };
-        store.create(rec("lost", TaskStatus::Lost)).await.unwrap();
-        store
-            .create(rec("timed", TaskStatus::TimedOut))
-            .await
-            .unwrap();
-        store
-            .create(rec("alive", TaskStatus::Running))
-            .await
-            .unwrap();
+        }
+    }
 
-        // Flat file says Running + registry reconciled to a loss state → surface the loss.
-        assert_eq!(
-            DelegateTool::reconciled_loss_label_with(
-                "lost",
-                &BackgroundTaskStatus::Running,
-                &store
-            )
-            .await,
-            Some("lost")
+    fn task_control_plane(store: Arc<dyn TaskRegistry>) -> ControlPlaneHandle {
+        ControlPlaneHandle {
+            store,
+            boot_id: "test-boot".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn task_store_status_overrides_legacy_result_status() {
+        let temp = TempDir::new().unwrap();
+        let task_id = "11111111-1111-1111-1111-111111111111";
+        let store: Arc<dyn TaskRegistry> = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let mut task = task_record(task_id, TaskStatus::Lost);
+        task.finished_at = Some("2026-06-21T00:01:00Z".into());
+        store.create(task).await.unwrap();
+
+        let tool = DelegateTool::new(HashMap::new(), None, Arc::new(SecurityPolicy::default()))
+            .with_workspace_dir(temp.path().into())
+            .with_task_control_plane(task_control_plane(store));
+        tokio::fs::create_dir_all(tool.results_dir()).await.unwrap();
+        DelegateTool::write_result_atomic(
+            &tool.results_dir().join(format!("{task_id}.json")),
+            &BackgroundDelegateResult {
+                task_id: task_id.into(),
+                agent: "main".into(),
+                status: BackgroundTaskStatus::Completed,
+                output: Some("stale output".into()),
+                error: None,
+                started_at: "2026-06-21T00:00:00Z".into(),
+                finished_at: Some("2026-06-21T00:00:30Z".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+        let (state, view, _) = tool.read_background_view(task_id).await.unwrap().unwrap();
+        assert_eq!(state, BackgroundResultState::Lost);
+        assert_eq!(view["status"], "lost");
+        assert!(view["output"].is_null());
+    }
+
+    #[tokio::test]
+    async fn legacy_result_status_remains_readable_without_task_row() {
+        let temp = TempDir::new().unwrap();
+        let task_id = "22222222-2222-2222-2222-222222222222";
+        let tool = with_in_memory_task_store(
+            DelegateTool::new(HashMap::new(), None, Arc::new(SecurityPolicy::default()))
+                .with_workspace_dir(temp.path().into()),
         );
-        assert_eq!(
-            DelegateTool::reconciled_loss_label_with(
-                "timed",
-                &BackgroundTaskStatus::Running,
-                &store
+        tokio::fs::create_dir_all(tool.results_dir()).await.unwrap();
+        DelegateTool::write_result_atomic(
+            &tool.results_dir().join(format!("{task_id}.json")),
+            &BackgroundDelegateResult {
+                task_id: task_id.into(),
+                agent: "main".into(),
+                status: BackgroundTaskStatus::Completed,
+                output: Some("legacy output".into()),
+                error: None,
+                started_at: "2026-06-21T00:00:00Z".into(),
+                finished_at: Some("2026-06-21T00:00:30Z".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+        let (state, view, _) = tool.read_background_view(task_id).await.unwrap().unwrap();
+        assert_eq!(state, BackgroundResultState::Completed);
+        assert_eq!(view["status"], "completed");
+        assert_eq!(view["output"], "legacy output");
+    }
+
+    #[tokio::test]
+    async fn legacy_inline_task_output_remains_readable_without_an_artifact() {
+        let temp = TempDir::new().unwrap();
+        let task_id = "66666666-6666-6666-6666-666666666666";
+        let store: Arc<dyn TaskRegistry> = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        store
+            .create(task_record(task_id, TaskStatus::Running))
+            .await
+            .unwrap();
+        store
+            .update_status(
+                task_id,
+                TaskStatus::Completed,
+                Some("legacy inline output".into()),
+                None,
             )
-            .await,
-            Some("timed_out")
-        );
-        // Registry still Running → nothing to overlay.
-        assert_eq!(
-            DelegateTool::reconciled_loss_label_with(
-                "alive",
-                &BackgroundTaskStatus::Running,
-                &store
+            .await
+            .unwrap();
+        let tool = DelegateTool::new(HashMap::new(), None, Arc::new(SecurityPolicy::default()))
+            .with_workspace_dir(temp.path().into())
+            .with_task_control_plane(task_control_plane(store));
+
+        let (state, view, _) = tool.read_background_view(task_id).await.unwrap().unwrap();
+        assert_eq!(state, BackgroundResultState::Completed);
+        assert_eq!(view["output"], "legacy inline output");
+    }
+
+    #[tokio::test]
+    async fn background_lifecycle_reports_artifact_errors_without_changing_terminal_status() {
+        let temp = TempDir::new().unwrap();
+        let store: Arc<dyn TaskRegistry> = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let missing = "77777777-7777-7777-7777-777777777777";
+        let corrupt = "88888888-8888-8888-8888-888888888888";
+        let mismatched = "99999999-9999-9999-9999-999999999999";
+        for task_id in [missing, corrupt, mismatched] {
+            store
+                .create(task_record(task_id, TaskStatus::Running))
+                .await
+                .unwrap();
+        }
+        store
+            .transition_terminal(
+                missing,
+                TaskStatus::Completed,
+                Some(format!(
+                    "{}{missing}.json",
+                    DelegateTool::OUTPUT_ARTIFACT_PREFIX
+                )),
+                None,
             )
-            .await,
-            None
-        );
-        // The flat file already wrote a terminal state → it is authoritative, no overlay.
-        assert_eq!(
-            DelegateTool::reconciled_loss_label_with(
-                "lost",
-                &BackgroundTaskStatus::Completed,
-                &store
+            .await
+            .unwrap();
+        store
+            .transition_terminal(
+                corrupt,
+                TaskStatus::Completed,
+                Some(format!(
+                    "{}{corrupt}.json",
+                    DelegateTool::OUTPUT_ARTIFACT_PREFIX
+                )),
+                None,
             )
-            .await,
-            None
-        );
-        // Unknown task → None.
-        assert_eq!(
-            DelegateTool::reconciled_loss_label_with(
-                "missing",
-                &BackgroundTaskStatus::Running,
-                &store
+            .await
+            .unwrap();
+        store
+            .transition_terminal(
+                mismatched,
+                TaskStatus::Completed,
+                Some(format!(
+                    "{}wrong-task.json",
+                    DelegateTool::OUTPUT_ARTIFACT_PREFIX
+                )),
+                None,
             )
-            .await,
-            None
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(temp.path().join("delegate_results"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            temp.path()
+                .join("delegate_results")
+                .join(format!("{corrupt}.json")),
+            b"{not-json",
+        )
+        .await
+        .unwrap();
+        let tool = DelegateTool::new(HashMap::new(), None, Arc::new(SecurityPolicy::default()))
+            .with_workspace_dir(temp.path().into())
+            .with_task_control_plane(task_control_plane(store));
+
+        for (task_id, expected_error) in [
+            (missing, "is missing"),
+            (corrupt, "is unreadable"),
+            (mismatched, "does not match task"),
+        ] {
+            let (state, view, error) = tool.read_background_view(task_id).await.unwrap().unwrap();
+            assert_eq!(state, BackgroundResultState::Completed);
+            assert_eq!(view["status"], "completed");
+            assert!(view["output"].is_null());
+            assert!(
+                error
+                    .as_deref()
+                    .is_some_and(|error| error.contains(expected_error))
+            );
+        }
+
+        let check = tool
+            .handle_check_result(&json!({"task_id": missing}))
+            .await
+            .unwrap();
+        assert!(!check.success);
+        assert!(check.output.contains("\"status\": \"completed\""));
+
+        let awaited = tool
+            .handle_await_sessions(&json!({"task_ids": [missing], "timeout_ms": 0}))
+            .await
+            .unwrap();
+        assert!(!awaited.success);
+        assert!(awaited.output.contains(missing));
+        assert!(awaited.output.contains("\"failed\""));
+    }
+
+    #[test]
+    fn current_background_output_artifact_has_no_lifecycle_status() {
+        let value = serde_json::to_value(BackgroundDelegateOutput {
+            task_id: "33333333-3333-3333-3333-333333333333".into(),
+            output: Some("done".into()),
+        })
+        .unwrap();
+        assert!(value.get("status").is_none());
+        assert!(value.get("error").is_none());
+        assert!(value.get("started_at").is_none());
+        assert!(value.get("finished_at").is_none());
+    }
+
+    #[tokio::test]
+    async fn output_failure_is_recorded_as_the_terminal_task_failure() {
+        let store = SqliteTaskStore::new_in_memory().unwrap();
+        let task_id = "44444444-4444-4444-4444-444444444444";
+        store
+            .create(task_record(task_id, TaskStatus::Running))
+            .await
+            .unwrap();
+        let temp = TempDir::new().unwrap();
+        let missing_parent = temp.path().join("missing").join(format!("{task_id}.json"));
+        let result = BackgroundDelegateOutput {
+            task_id: task_id.into(),
+            output: Some("done".into()),
+        };
+
+        assert!(
+            DelegateTool::settle_background_task(
+                &store,
+                &missing_parent,
+                &result,
+                TaskStatus::Completed,
+                None,
+            )
+            .await
+            .unwrap()
         );
+        let snapshot = store.get_snapshot(task_id).await.unwrap().unwrap();
+        assert_eq!(snapshot.task.status, TaskStatus::Failed);
+        assert!(snapshot.output.is_none());
+        assert!(
+            snapshot
+                .error
+                .as_deref()
+                .is_some_and(|error| error.starts_with("failed to persist delegate output:"))
+        );
+    }
+
+    #[tokio::test]
+    async fn earlier_terminal_status_wins_even_when_output_writes_later() {
+        let store = SqliteTaskStore::new_in_memory().unwrap();
+        let task_id = "55555555-5555-5555-5555-555555555555";
+        store
+            .create(task_record(task_id, TaskStatus::Running))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .transition_terminal(
+                    task_id,
+                    TaskStatus::Cancelled,
+                    None,
+                    Some("cancelled first".into()),
+                )
+                .await
+                .unwrap()
+        );
+        let temp = TempDir::new().unwrap();
+        let result_path = temp.path().join(format!("{task_id}.json"));
+        let result = BackgroundDelegateOutput {
+            task_id: task_id.into(),
+            output: Some("late output".into()),
+        };
+
+        assert!(
+            !DelegateTool::settle_background_task(
+                &store,
+                &result_path,
+                &result,
+                TaskStatus::Completed,
+                None,
+            )
+            .await
+            .unwrap()
+        );
+        let snapshot = store.get_snapshot(task_id).await.unwrap().unwrap();
+        assert_eq!(snapshot.task.status, TaskStatus::Cancelled);
+        assert!(snapshot.output.is_none());
+        assert_eq!(snapshot.error.as_deref(), Some("cancelled first"));
     }
 
     #[tokio::test]
@@ -3005,33 +3495,49 @@ mod tests {
     }
 
     async fn wait_for_terminal_background_result(
-        workspace: &Path,
+        tool: &DelegateTool,
         task_id: &str,
     ) -> BackgroundDelegateResult {
-        let result_path = workspace
-            .join("delegate_results")
-            .join(format!("{task_id}.json"));
         let deadline = Instant::now() + Duration::from_secs(5);
-        let mut last_result = None;
+        let mut last_status = None;
 
         loop {
-            if let Ok(content) = std::fs::read_to_string(&result_path)
-                && let Ok(result) = serde_json::from_str::<BackgroundDelegateResult>(&content)
-            {
-                if result.status != BackgroundTaskStatus::Running {
-                    return result;
+            if let Ok(Some((state, view, error))) = tool.read_background_view(task_id).await {
+                if !state.is_pending() {
+                    let status = match state {
+                        BackgroundResultState::Completed => BackgroundTaskStatus::Completed,
+                        BackgroundResultState::Cancelled => BackgroundTaskStatus::Cancelled,
+                        BackgroundResultState::Failed
+                        | BackgroundResultState::Lost
+                        | BackgroundResultState::TimedOut => BackgroundTaskStatus::Failed,
+                        BackgroundResultState::Running => unreachable!(),
+                    };
+                    return BackgroundDelegateResult {
+                        task_id: task_id.to_string(),
+                        agent: view["agent"].as_str().unwrap_or_default().to_string(),
+                        status,
+                        output: view["output"].as_str().map(str::to_string),
+                        error,
+                        started_at: view["started_at"].as_str().unwrap_or_default().to_string(),
+                        finished_at: view["finished_at"].as_str().map(str::to_string),
+                    };
                 }
-                last_result = Some(result);
+                last_status = Some(state);
             }
 
             if Instant::now() >= deadline {
                 panic!(
-                    "Background task {task_id} did not finish before timeout; last result: {last_result:?}"
+                    "Background task {task_id} did not finish before timeout; last status: {last_status:?}"
                 );
             }
 
             sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    fn with_in_memory_task_store(tool: DelegateTool) -> DelegateTool {
+        let store: Arc<dyn TaskRegistry> = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        tool.with_task_control_plane(task_control_plane(store))
     }
 
     fn background_result(
@@ -3402,7 +3908,6 @@ mod tests {
         inner_memory: Arc<SqliteMemory>,
         caller_uuid: String,
         target_uuid: String,
-        workspace_dir: PathBuf,
         tool: DelegateTool,
         target_config: AliasedAgentConfig,
     }
@@ -3516,7 +4021,6 @@ mod tests {
             inner_memory,
             caller_uuid,
             target_uuid,
-            workspace_dir,
             tool,
             target_config,
         }
@@ -4491,7 +4995,7 @@ mod tests {
             .unwrap()
             .trim_start_matches("task_id: ")
             .trim();
-        let bg_result = wait_for_terminal_background_result(&fixture.workspace_dir, task_id).await;
+        let bg_result = wait_for_terminal_background_result(&fixture.tool, task_id).await;
         assert_eq!(bg_result.status, BackgroundTaskStatus::Completed);
         assert!(
             bg_result
@@ -4740,7 +5244,7 @@ mod tests {
             .unwrap()
             .trim_start_matches("task_id: ")
             .trim();
-        let bg_result = wait_for_terminal_background_result(&workspace_dir, task_id).await;
+        let bg_result = wait_for_terminal_background_result(&tool, task_id).await;
 
         assert_eq!(
             bg_result.status,
@@ -5753,8 +6257,10 @@ mod tests {
         ));
         std::fs::create_dir_all(&workspace).unwrap();
 
-        let tool = DelegateTool::new(sample_agents(), None, test_security())
-            .with_workspace_dir(workspace.clone());
+        let tool = with_in_memory_task_store(
+            DelegateTool::new(sample_agents(), None, test_security())
+                .with_workspace_dir(workspace.clone()),
+        );
         let result = tool
             .execute(json!({
                 "agent": "researcher",
@@ -5787,8 +6293,10 @@ mod tests {
         ));
         std::fs::create_dir_all(&workspace).unwrap();
 
-        let tool = DelegateTool::new(sample_agents(), None, test_security())
-            .with_workspace_dir(workspace.clone());
+        let tool = with_in_memory_task_store(
+            DelegateTool::new(sample_agents(), None, test_security())
+                .with_workspace_dir(workspace.clone()),
+        );
         let result = tool
             .execute(json!({
                 "agent": "nonexistent",
@@ -5812,8 +6320,10 @@ mod tests {
         ));
         std::fs::create_dir_all(&workspace).unwrap();
 
-        let tool = DelegateTool::new(sample_agents(), None, test_security())
-            .with_workspace_dir(workspace.clone());
+        let tool = with_in_memory_task_store(
+            DelegateTool::new(sample_agents(), None, test_security())
+                .with_workspace_dir(workspace.clone()),
+        );
         let result = tool.execute(json!({"action": "check_result"})).await;
 
         assert!(result.is_err());
@@ -5829,8 +6339,10 @@ mod tests {
         ));
         std::fs::create_dir_all(&workspace).unwrap();
 
-        let tool = DelegateTool::new(sample_agents(), None, test_security())
-            .with_workspace_dir(workspace.clone());
+        let tool = with_in_memory_task_store(
+            DelegateTool::new(sample_agents(), None, test_security())
+                .with_workspace_dir(workspace.clone()),
+        );
         // Use a valid UUID format that doesn't correspond to any real task
         let fake_uuid = uuid::Uuid::new_v4().to_string();
         let result = tool
@@ -5894,8 +6406,10 @@ mod tests {
             ),
         );
 
-        let tool = DelegateTool::new(sample_agents(), None, test_security())
-            .with_workspace_dir(workspace.clone());
+        let tool = with_in_memory_task_store(
+            DelegateTool::new(sample_agents(), None, test_security())
+                .with_workspace_dir(workspace.clone()),
+        );
         let result = tool
             .execute(json!({
                 "action": "await_sessions",
@@ -5933,8 +6447,10 @@ mod tests {
             ),
         );
 
-        let tool = DelegateTool::new(sample_agents(), None, test_security())
-            .with_workspace_dir(workspace.clone());
+        let tool = with_in_memory_task_store(
+            DelegateTool::new(sample_agents(), None, test_security())
+                .with_workspace_dir(workspace.clone()),
+        );
         let result = tool
             .execute(json!({
                 "action": "await_sessions",
@@ -6013,8 +6529,10 @@ mod tests {
         std::fs::create_dir_all(&workspace).unwrap();
         let missing = uuid::Uuid::new_v4().to_string();
 
-        let tool = DelegateTool::new(sample_agents(), None, test_security())
-            .with_workspace_dir(workspace.clone());
+        let tool = with_in_memory_task_store(
+            DelegateTool::new(sample_agents(), None, test_security())
+                .with_workspace_dir(workspace.clone()),
+        );
         let result = tool
             .execute(json!({
                 "action": "await_sessions",
@@ -6305,8 +6823,10 @@ mod tests {
         ));
         std::fs::create_dir_all(&workspace).unwrap();
 
-        let tool = DelegateTool::new(sample_agents(), None, test_security())
-            .with_workspace_dir(workspace.clone());
+        let tool = with_in_memory_task_store(
+            DelegateTool::new(sample_agents(), None, test_security())
+                .with_workspace_dir(workspace.clone()),
+        );
 
         let result = tool
             .execute(json!({
@@ -6338,7 +6858,7 @@ mod tests {
         );
 
         // Read and parse the result
-        let bg_result = wait_for_terminal_background_result(&workspace, task_id).await;
+        let bg_result = wait_for_terminal_background_result(&tool, task_id).await;
         assert_eq!(bg_result.task_id, task_id);
         assert_eq!(bg_result.agent, "researcher");
         // The task will have failed because ollama isn't running, but it should be persisted
@@ -6359,8 +6879,10 @@ mod tests {
         ));
         std::fs::create_dir_all(&workspace).unwrap();
 
-        let tool = DelegateTool::new(sample_agents(), None, test_security())
-            .with_workspace_dir(workspace.clone());
+        let tool = with_in_memory_task_store(
+            DelegateTool::new(sample_agents(), None, test_security())
+                .with_workspace_dir(workspace.clone()),
+        );
 
         // Start background task
         let result = tool
@@ -6382,7 +6904,7 @@ mod tests {
             .to_string();
 
         // Wait for background task
-        let _ = wait_for_terminal_background_result(&workspace, &task_id).await;
+        let _ = wait_for_terminal_background_result(&tool, &task_id).await;
 
         // Check result
         let check = tool
@@ -6408,8 +6930,10 @@ mod tests {
         ));
         std::fs::create_dir_all(&workspace).unwrap();
 
-        let tool = DelegateTool::new(sample_agents(), None, test_security())
-            .with_workspace_dir(workspace.clone());
+        let tool = with_in_memory_task_store(
+            DelegateTool::new(sample_agents(), None, test_security())
+                .with_workspace_dir(workspace.clone()),
+        );
 
         // Start a background task
         let result = tool
@@ -6430,7 +6954,7 @@ mod tests {
             .trim();
 
         // Wait for task to complete
-        let _ = wait_for_terminal_background_result(&workspace, task_id).await;
+        let _ = wait_for_terminal_background_result(&tool, task_id).await;
 
         // List results
         let list = tool
