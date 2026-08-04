@@ -1011,9 +1011,14 @@ impl DelegateTool {
     async fn background_control_plane(
         &self,
     ) -> anyhow::Result<crate::control_plane::ControlPlaneHandle> {
+        #[cfg(test)]
+        if let Some(handle) = self.task_control_plane.get() {
+            return Ok(handle.clone());
+        }
         if let Some(handle) = crate::control_plane::control_plane() {
             return Ok(handle.clone());
         }
+        #[cfg(not(test))]
         if let Some(handle) = self.task_control_plane.get() {
             return Ok(handle.clone());
         }
