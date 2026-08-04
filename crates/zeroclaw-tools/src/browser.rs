@@ -3505,6 +3505,50 @@ mod tests {
         tool.validate_screenshot_path(&mut action).await.unwrap();
     }
 
+    #[tokio::test]
+    async fn execute_action_rejects_malicious_screenshot_before_local_backend_dispatch() {
+        // Production-boundary regression for the `execute_action` wiring
+        // (line ~1302): a screenshot action carrying a traversal path must be
+        // rejected by `validate_screenshot_path` before either local backend
+        // (AgentBrowser or RustNative) receives it. If that call is removed,
+        // the validation error never fires and this assertion fails — the
+        // backend-specific error does not mention the path or the allowlist.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        tokio::fs::create_dir_all(&ws).await.unwrap();
+
+        let tool = screenshot_tool_with_workspace(&ws);
+        let action = BrowserAction::Screenshot {
+            path: Some("../etc/passwd".into()),
+            full_page: false,
+        };
+
+        let err = tool
+            .execute_action(action, ResolvedBackend::AgentBrowser)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("not in the workspace allowlist") || err.contains("../etc/passwd"),
+            "traversal path must be rejected at execute_action before backend dispatch, got: {err}"
+        );
+
+        // The mut-borrow contract still holds for the second local backend.
+        let action2 = BrowserAction::Screenshot {
+            path: Some("../etc/passwd".into()),
+            full_page: false,
+        };
+        let err = tool
+            .execute_action(action2, ResolvedBackend::RustNative)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("not in the workspace allowlist") || err.contains("../etc/passwd"),
+            "traversal path must be rejected at execute_action for rust_native too, got: {err}"
+        );
+    }
+
     // ============ ComputerUse dispatch tests ============
 
     fn test_computer_use_config() -> ComputerUseConfig {
