@@ -5887,6 +5887,7 @@ mod tests {
             approval_id.clone(),
             PendingApproval {
                 sender: tx,
+                destination: String::new(),
                 message_id: String::new(),
                 tool_name: String::new(),
                 arguments_summary: String::new(),
