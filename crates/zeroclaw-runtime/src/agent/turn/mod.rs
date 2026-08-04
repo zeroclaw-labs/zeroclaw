@@ -280,13 +280,9 @@ impl<'a> TurnState<'a> {
     }
 }
 
-/// Add a provider-only warning when the tool-loop budget is nearly exhausted.
-///
-/// Callers pass the per-iteration prepared-message clone so the warning guides
-/// the active response without becoming part of canonical session history.
-fn inject_iteration_budget_warning(messages: &mut Vec<ChatMessage>, remaining: usize) {
+fn iteration_budget_warning(remaining: usize) -> Option<String> {
     if remaining == 0 || remaining > ITERATION_BUDGET_WARNING_THRESHOLD {
-        return;
+        return None;
     }
 
     let guidance = if remaining == 1 {
@@ -302,11 +298,43 @@ fn inject_iteration_budget_warning(messages: &mut Vec<ChatMessage>, remaining: u
              blocked actions or spend the remaining rounds on optional discovery."
         )
     };
-    let warning = format!(
+    Some(format!(
         "{ITERATION_BUDGET_WARNING_MARKER}\n\
          {guidance}\n\
          </tool-iteration-budget>"
-    );
+    ))
+}
+
+fn iteration_budget_warning_token_cost(messages: &[ChatMessage], warning: &str) -> usize {
+    if let Some(system_message) = messages.iter().find(|message| message.role == "system") {
+        let before =
+            crate::agent::history::estimate_history_tokens(std::slice::from_ref(system_message));
+        let mut augmented = system_message.clone();
+        augmented.content.push_str("\n\n");
+        augmented.content.push_str(warning);
+        crate::agent::history::estimate_history_tokens(std::slice::from_ref(&augmented))
+            .saturating_sub(before)
+    } else {
+        crate::agent::history::estimate_history_tokens(&[ChatMessage::system(warning.to_owned())])
+    }
+}
+
+/// Add a provider-only warning when the tool-loop budget is nearly exhausted.
+///
+/// Callers pass the per-iteration prepared-message clone so the warning guides
+/// the active response without becoming part of canonical session history.
+fn inject_iteration_budget_warning(
+    messages: &mut Vec<ChatMessage>,
+    warning: &str,
+    context_token_budget: usize,
+) -> bool {
+    let estimated_tokens = crate::agent::history::estimate_history_tokens(messages);
+    let warning_tokens = iteration_budget_warning_token_cost(messages, warning);
+    if context_token_budget > 0
+        && estimated_tokens.saturating_add(warning_tokens) > context_token_budget
+    {
+        return false;
+    }
 
     if let Some(system_message) = messages.iter_mut().find(|message| message.role == "system") {
         if !system_message
@@ -314,11 +342,12 @@ fn inject_iteration_budget_warning(messages: &mut Vec<ChatMessage>, remaining: u
             .contains(ITERATION_BUDGET_WARNING_MARKER)
         {
             system_message.content.push_str("\n\n");
-            system_message.content.push_str(&warning);
+            system_message.content.push_str(warning);
         }
     } else {
-        messages.insert(0, ChatMessage::system(warning));
+        messages.insert(0, ChatMessage::system(warning.to_owned()));
     }
+    true
 }
 
 pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
@@ -561,9 +590,30 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
 
         preflight_history_maintenance(turn_state.history);
 
-        if iteration == 0 && context_token_budget > 0 {
+        let warning_candidate = iteration_budget_warning(remaining_iterations);
+        let candidate_token_reserve = warning_candidate.as_deref().map_or(0, |warning| {
+            iteration_budget_warning_token_cost(turn_state.history, warning)
+        });
+        let iteration_budget_warning = warning_candidate.filter(|_| {
+            context_token_budget == 0 || candidate_token_reserve < context_token_budget
+        });
+        let warning_token_reserve = if iteration_budget_warning.is_some() {
+            candidate_token_reserve
+        } else {
+            0
+        };
+        let prepared_history_budget = if context_token_budget > 0 {
+            context_token_budget
+                .saturating_sub(warning_token_reserve)
+                .max(1)
+        } else {
+            0
+        };
+
+        if context_token_budget > 0 && (iteration == 0 || iteration_budget_warning.is_some()) {
             let system_floor =
-                crate::agent::history::estimate_system_floor_tokens(turn_state.history);
+                crate::agent::history::estimate_system_floor_tokens(turn_state.history)
+                    .saturating_add(warning_token_reserve);
             if system_floor >= context_token_budget {
                 let __zc_floor_span = ::zeroclaw_log::info_span!(
                     target: "zeroclaw_log_internal_scope",
@@ -588,7 +638,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     )
                 );
             }
-            let result = turn_state.trim_to_budget(context_token_budget);
+            let result = turn_state.trim_to_budget(prepared_history_budget);
             if result.trimmed {
                 {
                     let __zc_trim_span = ::zeroclaw_log::info_span!(
@@ -607,6 +657,8 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                                 "dropped_turns": result.dropped_turns,
                                 "kept_turns": result.kept_turns,
                                 "budget_tokens": context_token_budget,
+                                "prepared_history_budget": prepared_history_budget,
+                                "iteration_warning_tokens": warning_token_reserve,
                                 "tokens_before": result.tokens_before,
                                 "tokens_after": result.tokens_after,
                                 "tokens_reclaimed": result.tokens_before.saturating_sub(result.tokens_after),
@@ -714,7 +766,27 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             image_cache.as_deref_mut(),
         )
         .await?;
-        inject_iteration_budget_warning(&mut prepared_messages.messages, remaining_iterations);
+        if let Some(warning) = iteration_budget_warning.as_deref()
+            && !inject_iteration_budget_warning(
+                &mut prepared_messages.messages,
+                warning,
+                context_token_budget,
+            )
+        {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_attrs(::serde_json::json!({
+                        "remaining_iterations": remaining_iterations,
+                        "budget_tokens": context_token_budget,
+                        "estimated_tokens": crate::agent::history::estimate_history_tokens(
+                            &prepared_messages.messages,
+                        ),
+                    })),
+                "iteration budget warning omitted to keep provider request within context budget"
+            );
+        }
 
         let llm_started_at = announce_llm_request(
             &ctx,
@@ -2291,10 +2363,12 @@ mod surface3_tests {
         let original = make_system_prompt(NATIVE_TOOLS_TASK_FRAMING);
         let mut messages = vec![original.clone(), ChatMessage::user("task")];
 
-        inject_iteration_budget_warning(&mut messages, 4);
+        let warning = iteration_budget_warning(4);
+        assert!(warning.is_none());
         assert_eq!(messages[0].content, original.content);
 
-        inject_iteration_budget_warning(&mut messages, 3);
+        let warning = iteration_budget_warning(3).expect("warning at threshold");
+        assert!(inject_iteration_budget_warning(&mut messages, &warning, 0));
         assert!(
             messages[0]
                 .content
@@ -2314,7 +2388,8 @@ mod surface3_tests {
             ChatMessage::user("task"),
         ];
 
-        inject_iteration_budget_warning(&mut messages, 1);
+        let warning = iteration_budget_warning(1).expect("final-round warning");
+        assert!(inject_iteration_budget_warning(&mut messages, &warning, 0));
 
         assert!(
             messages[0]
@@ -2328,7 +2403,8 @@ mod surface3_tests {
     fn iteration_budget_warning_can_prepare_user_only_history() {
         let mut messages = vec![ChatMessage::user("task")];
 
-        inject_iteration_budget_warning(&mut messages, 1);
+        let warning = iteration_budget_warning(1).expect("final-round warning");
+        assert!(inject_iteration_budget_warning(&mut messages, &warning, 0));
 
         assert_eq!(messages[0].role, "system");
         assert!(
@@ -2337,6 +2413,22 @@ mod surface3_tests {
                 .contains(ITERATION_BUDGET_WARNING_MARKER)
         );
         assert_eq!(messages[1].role, "user");
+    }
+
+    #[test]
+    fn iteration_budget_warning_is_omitted_without_context_headroom() {
+        let mut messages = vec![ChatMessage::user("task")];
+        let context_token_budget = crate::agent::history::estimate_history_tokens(&messages);
+        let warning = iteration_budget_warning(1).expect("final-round warning");
+
+        assert!(!inject_iteration_budget_warning(
+            &mut messages,
+            &warning,
+            context_token_budget,
+        ));
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].content, "task");
     }
 }
 
