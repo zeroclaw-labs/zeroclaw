@@ -215,14 +215,17 @@ pub(crate) async fn consume_provider_streaming_response(
                     continue;
                 }
 
-                outcome.response_text.push_str(&sanitized_delta);
+                // First pass through the marker stripper to strip terminal markers
+                let stripped = marker_stripper.push(&sanitized_delta);
+
+                // Append the stripped text to response_text (single accumulation path)
+                outcome.response_text.push_str(&stripped);
 
                 if strict_tool_parsing {
-                    forward_visible!(sanitized_delta, true);
+                    forward_visible!(stripped, true);
                     continue;
                 }
 
-                let stripped = marker_stripper.push(&sanitized_delta);
                 let Some(forward_text) = text_guard.push(&stripped) else {
                     continue;
                 };
@@ -232,22 +235,25 @@ pub(crate) async fn consume_provider_streaming_response(
         }
     }
 
+    // Process trailing delta from think stripper through marker stripper
     let trailing_delta = think_stripper.finish();
     if !trailing_delta.is_empty() {
-        let stripped = marker_stripper.push(&trailing_delta);
-        outcome.response_text.push_str(&stripped);
+        let trailing_stripped = marker_stripper.push(&trailing_delta);
+        outcome.response_text.push_str(&trailing_stripped);
         if strict_tool_parsing {
-            forward_visible!(stripped, false);
-        } else if let Some(forward_text) = text_guard.push(&stripped) {
+            forward_visible!(trailing_stripped, false);
+        } else if let Some(forward_text) = text_guard.push(&trailing_stripped) {
             forward_visible!(forward_text, false);
         }
     }
 
-    // Flush any remaining terminal markers
+    // Flush any remaining terminal markers held by the marker stripper
     let remaining = marker_stripper.finish();
     if !remaining.is_empty() {
         outcome.response_text.push_str(&remaining);
-        if let Some(forward_text) = text_guard.push(&remaining) {
+        if strict_tool_parsing {
+            forward_visible!(remaining, false);
+        } else if let Some(forward_text) = text_guard.push(&remaining) {
             forward_visible!(forward_text, false);
         }
     }
@@ -381,6 +387,209 @@ mod tests {
         assert!(
             forwarded.contains("check the count."),
             "narration emitted after the native tool call must be forwarded live; forwarded={forwarded:?}"
+        );
+    }
+
+    struct MarkerTestProvider {
+        text_sequence: Vec<&'static str>,
+    }
+
+    impl MarkerTestProvider {
+        fn with_text_sequence(texts: Vec<&'static str>) -> Self {
+            Self {
+                text_sequence: texts,
+            }
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for MarkerTestProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "MarkerTestProvider"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for MarkerTestProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                native_tool_calling: true,
+                vision: false,
+                prompt_caching: false,
+                extended_thinking: false,
+            }
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            anyhow::bail!("unused")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn supports_streaming_tool_events(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            let events: Vec<StreamResult<StreamEvent>> = self
+                .text_sequence
+                .iter()
+                .map(|text| Ok(StreamEvent::TextDelta(StreamChunk::delta(*text))))
+                .chain(std::iter::once(Ok(StreamEvent::Final)))
+                .collect();
+            Box::pin(futures_util::stream::iter(events))
+        }
+    }
+
+    #[tokio::test]
+    async fn strips_terminal_marker_same_chunk() {
+        let provider = MarkerTestProvider::with_text_sequence(vec!["Summary<eom>"]);
+
+        let outcome = consume_provider_streaming_response(
+            &provider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .expect("stream consume should succeed");
+
+        // Critical: response_text should NOT contain the marker
+        assert_eq!(
+            outcome.response_text, "Summary",
+            "terminal marker <eom> should be stripped from response_text"
+        );
+    }
+
+    #[tokio::test]
+    async fn strips_terminal_marker_in_strict_mode() {
+        let provider = MarkerTestProvider::with_text_sequence(vec!["Summary<eom>"]);
+
+        let outcome = consume_provider_streaming_response(
+            &provider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            None,
+            None,
+            true, // strict_tool_parsing = true
+        )
+        .await
+        .expect("stream consume should succeed");
+
+        // Critical: strict mode should also strip terminal markers
+        assert_eq!(
+            outcome.response_text, "Summary",
+            "terminal marker <eom> should be stripped even in strict_tool_parsing mode"
+        );
+    }
+
+    #[tokio::test]
+    async fn strips_fragmented_terminal_marker() {
+        let provider = MarkerTestProvider::with_text_sequence(vec!["Summary<", "eom>"]);
+
+        let outcome = consume_provider_streaming_response(
+            &provider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .expect("stream consume should succeed");
+
+        assert_eq!(
+            outcome.response_text, "Summary",
+            "fragmented terminal marker across chunks should be stripped"
+        );
+    }
+
+    #[tokio::test]
+    async fn strips_stacked_terminal_markers() {
+        let provider = MarkerTestProvider::with_text_sequence(vec!["Summary<eom><|eom|>"]);
+
+        let outcome = consume_provider_streaming_response(
+            &provider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .expect("stream consume should succeed");
+
+        assert_eq!(
+            outcome.response_text, "Summary",
+            "stacked terminal markers should be stripped"
+        );
+    }
+
+    #[tokio::test]
+    async fn preserves_inline_marker_but_strips_terminal() {
+        let provider = MarkerTestProvider::with_text_sequence(vec!["Text <eom> inline<eom>"]);
+
+        let outcome = consume_provider_streaming_response(
+            &provider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .expect("stream consume should succeed");
+
+        // The inline <eom> should be preserved, terminal <eom> stripped
+        assert_eq!(
+            outcome.response_text, "Text <eom> inline",
+            "inline marker should be preserved but terminal marker stripped"
         );
     }
 }
