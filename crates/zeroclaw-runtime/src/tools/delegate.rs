@@ -3529,6 +3529,27 @@ mod tests {
         loop {
             if let Ok(Some((state, view, error))) = tool.read_background_view(task_id).await {
                 if !state.is_pending() {
+                    if state == BackgroundResultState::Completed {
+                        let artifact_path = tool.results_dir().join(format!("{task_id}.json"));
+                        let artifact = std::fs::read_to_string(&artifact_path)
+                            .unwrap_or_else(|read_error| {
+                                panic!(
+                                    "completed background task {task_id} has no readable output artifact at {artifact_path:?}: {read_error}"
+                                )
+                            });
+                        let artifact: BackgroundDelegateOutput = serde_json::from_str(&artifact)
+                            .unwrap_or_else(|parse_error| {
+                                panic!(
+                                    "completed background task {task_id} has an invalid output artifact: {parse_error}"
+                                )
+                            });
+                        assert_eq!(artifact.task_id, task_id);
+                        assert_eq!(artifact.output.as_deref(), view["output"].as_str());
+                        assert!(
+                            error.is_none(),
+                            "completed task has retrieval error: {error:?}"
+                        );
+                    }
                     let status = match state {
                         BackgroundResultState::Completed => BackgroundTaskStatus::Completed,
                         BackgroundResultState::Cancelled => BackgroundTaskStatus::Cancelled,
