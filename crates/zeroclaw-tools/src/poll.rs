@@ -29,6 +29,33 @@ const MIN_OPTIONS: usize = 2;
 const MAX_OPTIONS: usize = 10;
 const DEFAULT_DURATION_MINUTES: u64 = 60;
 
+/// Honest failure for a channel whose structured UI declined/cancelled (or is
+/// unavailable) AND whose `send` does not actually deliver.
+///
+/// Both conditions matter. `request_choice` returning `Ok(None)` is overloaded:
+/// it means "no native UI, use your fallback" for ordinary channels, but on
+/// `RpcApprovalChannel` / `WsApprovalChannel` it also covers decline/cancel and
+/// missing form capability. Those channels' `send` returns `Ok(())` without
+/// rendering anything, so the formatted-text fallback would report
+/// "Poll created" for a poll the user never saw.
+fn structured_only_poll_result(channel_name: &str, multi_select: bool) -> ToolResult {
+    let kind = if multi_select {
+        "multi-select"
+    } else {
+        "single-select"
+    };
+    ToolResult {
+        success: false,
+        output: ToolOutput::default(),
+        error: Some(format!(
+            "Channel '{channel_name}' did not complete the {kind} poll (user cancelled/declined, \
+             or the structured UI is unavailable), and it cannot deliver the formatted-text \
+             fallback. No poll was shown to the user. Retry, or run the poll on a channel that \
+             supports text delivery."
+        )),
+    }
+}
+
 pub struct PollTool {
     security: Arc<SecurityPolicy>,
     channels: ChannelMapHandle,
@@ -279,7 +306,12 @@ On ACP channels that advertise elicitation.form, the tool blocks until the user 
                         error: None,
                     });
                 }
-                Ok(None) => { /* fall through to text-poll fallback */ }
+                Ok(None) if channel.supports_outbound_send() => {
+                    /* fall through to text-poll fallback */
+                }
+                Ok(None) => {
+                    return Ok(structured_only_poll_result(&channel_name, true));
+                }
                 Err(e) => {
                     return Ok(ToolResult {
                         success: false,
@@ -306,7 +338,12 @@ On ACP channels that advertise elicitation.form, the tool blocks until the user 
                         error: None,
                     });
                 }
-                Ok(None) => { /* fall through to text-poll fallback */ }
+                Ok(None) if channel.supports_outbound_send() => {
+                    /* fall through to text-poll fallback */
+                }
+                Ok(None) => {
+                    return Ok(structured_only_poll_result(&channel_name, false));
+                }
                 Err(e) => {
                     return Ok(ToolResult {
                         success: false,
@@ -880,5 +917,164 @@ mod tests {
         assert!(result.success);
         // Took the fallback path (no overflow during interactive_timeout calc).
         assert_eq!(stub_for_assert.send_call_count(), 1);
+    }
+
+    /// Mirrors `RpcApprovalChannel` / `WsApprovalChannel`: structured choice
+    /// yields `Ok(None)` (declined/cancelled, or no `elicitation.form`
+    /// capability) and `send` returns `Ok(())` while rendering NOTHING.
+    struct StructuredOnlyNoDeliveryChannel {
+        channel_name: String,
+        send_calls: Arc<AtomicUsize>,
+    }
+
+    impl StructuredOnlyNoDeliveryChannel {
+        fn new(name: &str) -> Self {
+            Self {
+                channel_name: name.to_string(),
+                send_calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn send_call_count(&self) -> usize {
+            self.send_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for StructuredOnlyNoDeliveryChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+        fn alias(&self) -> &str {
+            "test"
+        }
+    }
+
+    #[async_trait]
+    impl Channel for StructuredOnlyNoDeliveryChannel {
+        fn name(&self) -> &str {
+            &self.channel_name
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            self.send_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("listen not supported")
+        }
+
+        fn supports_outbound_send(&self) -> bool {
+            false
+        }
+
+        fn supports_free_form_ask(&self) -> bool {
+            false
+        }
+        // request_choice / request_multi_choice inherit the default Ok(None).
+    }
+
+    #[tokio::test]
+    async fn single_select_poll_cannot_report_false_success_on_structured_only_channel() {
+        // Regression: Ok(None) from request_choice fell through to the
+        // formatted-text fallback. On RPC/WS back-channels `send` is a silent
+        // no-op, so poll reported "Poll created" while the user saw nothing.
+        let stub = Arc::new(StructuredOnlyNoDeliveryChannel::new("rpc"));
+        let stub_for_assert = Arc::clone(&stub);
+        let channels = make_channel_map(vec![stub as Arc<dyn Channel>]);
+        let tool = PollTool::new(Arc::new(SecurityPolicy::default()), channels);
+
+        let result = tool
+            .execute(json!({
+                "question": "Ship it?",
+                "options": ["Yes", "No"],
+                "channel": "rpc",
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "must not report success for an undelivered poll; output: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("Poll created"),
+            "must not claim the poll was created: {}",
+            result.output
+        );
+        let err = result.error.unwrap_or_default();
+        assert!(err.contains("rpc"), "error should name the channel: {err}");
+        assert_eq!(
+            stub_for_assert.send_call_count(),
+            0,
+            "must not attempt a text fallback that cannot be delivered"
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_select_poll_cannot_report_false_success_on_structured_only_channel() {
+        // Same false-success path via request_multi_choice.
+        let stub = Arc::new(StructuredOnlyNoDeliveryChannel::new("ws"));
+        let stub_for_assert = Arc::clone(&stub);
+        let channels = make_channel_map(vec![stub as Arc<dyn Channel>]);
+        let tool = PollTool::new(Arc::new(SecurityPolicy::default()), channels);
+
+        let result = tool
+            .execute(json!({
+                "question": "Pick releases",
+                "options": ["A", "B", "C"],
+                "multi_select": true,
+                "channel": "ws",
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "must not report success for an undelivered multi-select poll; output: {}",
+            result.output
+        );
+        assert!(!result.output.contains("Poll created"));
+        let err = result.error.unwrap_or_default();
+        assert!(
+            err.contains("multi-select"),
+            "error should identify the poll kind: {err}"
+        );
+        assert_eq!(stub_for_assert.send_call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn deliverable_channel_still_takes_text_fallback_on_none() {
+        // Guard against over-correction: ordinary channels that return
+        // Ok(None) (no native structured UI) MUST still get the text poll.
+        let stub = Arc::new(FallbackOnlyChannel::new("telegram"));
+        let stub_for_assert = Arc::clone(&stub);
+        let channels = make_channel_map(vec![stub as Arc<dyn Channel>]);
+        let tool = PollTool::new(Arc::new(SecurityPolicy::default()), channels);
+
+        for multi in [false, true] {
+            let result = tool
+                .execute(json!({
+                    "question": "Lunch?",
+                    "options": ["Pizza", "Sushi"],
+                    "multi_select": multi,
+                    "channel": "telegram",
+                }))
+                .await
+                .unwrap();
+            assert!(
+                result.success,
+                "deliverable channel must keep the fallback (multi={multi}): {:?}",
+                result.error
+            );
+            assert!(result.output.contains("Poll created"));
+        }
+        assert_eq!(stub_for_assert.send_call_count(), 2);
     }
 }

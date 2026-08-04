@@ -1271,6 +1271,16 @@ impl Chat {
             return false;
         }
 
+        // The attachment manager is modal within the input surface. Higher
+        // overlays above have already had first refusal; handle it before queue,
+        // browse, and other pane-level shortcuts.
+        if state.pending_approval().is_none() && state.input_bar.has_attachment_manager() {
+            state.clear_mouse_highlight();
+            let _ = state.input_bar.handle_key(key);
+            state.mark_dirty_full();
+            return false;
+        }
+
         {
             use crate::keymap::ChatTabAction as QAction;
             let qaction = QAction::from_chord(&key);
@@ -2186,8 +2196,11 @@ impl Chat {
             && let MouseEventKind::Down(MouseButton::Left) = mouse.kind
             && !state.turn_in_flight
             && !state.input_bar.has_file_explorer()
+            && !state.input_bar.has_attachment_manager()
             && matches!(state.session_overlay, SessionOverlay::None)
             && !state.model_picker.is_open()
+            && state.pending_approval().is_none()
+            && state.pending_elicitation().is_none()
             && state.title_hit_target_at(mouse.column, mouse.row) == Some(TitleHitTarget::Agent)
         {
             let current_alias = state.agent_alias.clone();
@@ -2196,8 +2209,8 @@ impl Chat {
         }
 
         if let ChatPhase::Active(ref mut state) = self.phase {
-            // Let the file explorer handle mouse events first when open.
-            if state.input_bar.handle_mouse(mouse) {
+            // The file explorer renders above every parent overlay.
+            if state.input_bar.has_file_explorer() && state.input_bar.handle_mouse(mouse) {
                 state.clear_mouse_highlight();
                 return;
             }
@@ -2252,6 +2265,17 @@ impl Chat {
                 if let Some(entry) = confirm_session {
                     Self::switch_to_session_entry(&self.rpc, self.pane_kind, state, entry).await;
                 }
+                return;
+            }
+
+            // Approval and elicitation overlays are keyboard-driven but still
+            // block clicks from reaching controls rendered beneath them.
+            if state.pending_approval().is_some() || state.pending_elicitation().is_some() {
+                return;
+            }
+
+            if state.input_bar.handle_mouse(mouse) {
+                state.clear_mouse_highlight();
                 return;
             }
 
@@ -2588,6 +2612,9 @@ impl Chat {
                     return true;
                 }
                 if !matches!(s.session_overlay, SessionOverlay::None) {
+                    return false;
+                }
+                if s.pending_approval().is_some() {
                     return false;
                 }
                 // Browse mode: single-char bindings active.
@@ -3083,6 +3110,7 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect, pane_kind: PaneKind)
 
     render_conversation(f, state, actual_conv);
     state.input_bar.render_autocomplete_popup(f);
+    state.input_bar.render_attachment_manager(f, area);
 
     if state.pending_approval().is_some() {
         render_approval_overlay(f, state, area);
@@ -3092,7 +3120,7 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect, pane_kind: PaneKind)
         render_elicitation_overlay(f, state, area);
     }
 
-    match &state.session_overlay {
+    match &mut state.session_overlay {
         SessionOverlay::List {
             sessions,
             list_state,
@@ -3873,14 +3901,14 @@ fn render_transcript_selection(f: &mut Frame, state: &ChatState) {
     else {
         return;
     };
-    if !selection.dragged {
+    let Some((start, end)) = snapshot.selection_bounds(selection) else {
         return;
-    }
+    };
 
     let buffer = f.buffer_mut();
     for row in 0..snapshot.area.height {
         for column in 0..snapshot.area.width {
-            if snapshot.selection_contains(selection, CellPoint { column, row }) {
+            if TranscriptSnapshot::bounds_contain(start, end, CellPoint { column, row }) {
                 buffer[(snapshot.area.x + column, snapshot.area.y + row)]
                     .set_style(theme::selected_bg_style());
             }
@@ -4191,7 +4219,7 @@ fn render_session_list_overlay(
     f: &mut Frame,
     area: Rect,
     sessions: &[SessionEntry],
-    list_state: &ListState,
+    list_state: &mut ListState,
     title: String,
 ) {
     let overlay_area = session_list_overlay_area(area);
@@ -4218,9 +4246,11 @@ fn render_session_list_overlay(
         .collect();
 
     let list = List::new(items).highlight_style(theme::list_highlight_style());
-    // Copy state to pass as mutable.
-    let mut ls = *list_state;
-    f.render_stateful_widget(list, inner, &mut ls);
+    // Render through the caller's state so the scroll offset ratatui computes
+    // to keep the selection visible is retained. Mouse hit-testing later reads
+    // `list_state.offset()`, so a discarded offset would make clicks after a
+    // scroll resolve to the wrong row.
+    f.render_stateful_widget(list, inner, list_state);
 }
 
 fn emit_code_block_body(lines: &mut Vec<Line<'static>>, text: &str, lang: Option<&str>) {
@@ -4984,11 +5014,29 @@ impl TranscriptSnapshot {
         .is_some_and(|origin| !origin.symbol.chars().all(char::is_whitespace))
     }
 
+    fn row_text_bounds(&self, row: u16) -> Option<(u16, u16)> {
+        let first =
+            (0..self.area.width).find(|&column| self.has_text_at(CellPoint { column, row }))?;
+        let last = (0..self.area.width)
+            .rev()
+            .find(|&column| self.has_text_at(CellPoint { column, row }))?;
+        Some((first, last))
+    }
+
+    fn clamp_outer_whitespace(&self, mut point: CellPoint) -> CellPoint {
+        if let Some((first, last)) = self.row_text_bounds(point.row) {
+            point.column = point.column.clamp(first, last);
+        }
+        point
+    }
+
     fn selection_bounds(&self, selection: TranscriptSelection) -> Option<(CellPoint, CellPoint)> {
         if !selection.dragged {
             return None;
         }
         let (mut start, mut end) = selection.normalized();
+        start = self.clamp_outer_whitespace(start);
+        end = self.clamp_outer_whitespace(end);
         start.column = self.cell(start)?.span_start;
         let end_cell = self.cell(end)?;
         let origin = self.cell(CellPoint {
@@ -5006,10 +5054,7 @@ impl TranscriptSnapshot {
         Some((start, end))
     }
 
-    fn selection_contains(&self, selection: TranscriptSelection, point: CellPoint) -> bool {
-        let Some((start, end)) = self.selection_bounds(selection) else {
-            return false;
-        };
+    fn bounds_contain(start: CellPoint, end: CellPoint, point: CellPoint) -> bool {
         (point.row, point.column) >= (start.row, start.column)
             && (point.row, point.column) <= (end.row, end.column)
     }
@@ -5325,7 +5370,7 @@ impl ChatState {
             self.clear_transcript_selection();
             return false;
         };
-        if !snapshot.has_text_at(point) {
+        if snapshot.row_text_bounds(point.row).is_none() {
             self.clear_transcript_selection();
             return false;
         }
@@ -6839,7 +6884,13 @@ mod tests {
         };
 
         assert!(snapshot.has_text_at(CellPoint { column: 2, row: 0 }));
-        assert!(snapshot.selection_contains(selection, CellPoint { column: 1, row: 0 }));
+        assert_eq!(
+            snapshot.selection_bounds(selection),
+            Some((
+                CellPoint { column: 1, row: 0 },
+                CellPoint { column: 3, row: 0 }
+            ))
+        );
         assert_eq!(snapshot.selected_text(selection).as_deref(), Some("界B"));
     }
 
@@ -6860,6 +6911,51 @@ mod tests {
         assert_eq!(state.transcript_selected_text().as_deref(), Some("be\nta"));
         assert_eq!(state.copy_feedback, None);
         assert!(state.info_message.is_none());
+    }
+
+    #[test]
+    fn transcript_selection_drag_can_start_in_side_whitespace() {
+        let mut state = state();
+        state.transcript_snapshot = Some(transcript_snapshot(Rect::new(10, 5, 8, 1), &["alpha"]));
+
+        assert!(state.begin_transcript_drag(17, 5));
+        assert!(state.update_transcript_drag(16, 5));
+        let snapshot = state.transcript_snapshot.as_ref().unwrap();
+        let selection = state.transcript_selection.unwrap();
+        assert_eq!(snapshot.selected_text(selection).as_deref(), Some("a"));
+        assert_eq!(
+            snapshot.selection_bounds(selection),
+            Some((
+                CellPoint { column: 4, row: 0 },
+                CellPoint { column: 4, row: 0 }
+            ))
+        );
+
+        assert!(state.update_transcript_drag(10, 5));
+        state.finish_transcript_drag();
+
+        assert_eq!(state.transcript_selected_text().as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn transcript_selection_side_whitespace_click_still_dismisses() {
+        let mut state = state();
+        state.transcript_snapshot = Some(transcript_snapshot(Rect::new(10, 5, 8, 1), &["alpha"]));
+
+        assert!(state.begin_transcript_drag(17, 5));
+        state.finish_transcript_drag();
+
+        assert_eq!(state.transcript_selection, None);
+    }
+
+    #[test]
+    fn transcript_selection_empty_row_cannot_start_drag() {
+        let mut state = state();
+        state.transcript_snapshot =
+            Some(transcript_snapshot(Rect::new(10, 5, 8, 2), &["alpha", ""]));
+
+        assert!(!state.begin_transcript_drag(17, 6));
+        assert_eq!(state.transcript_selection, None);
     }
 
     #[test]
@@ -7417,6 +7513,34 @@ mod tests {
                 None,
             ));
         }
+        assert!(chat.wants_text_input());
+    }
+
+    #[tokio::test]
+    async fn attachment_manager_makes_chat_claim_text_input() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut active = state();
+        active.input_bar.add_attachment(PendingAttachment {
+            path: std::path::PathBuf::from("one.png"),
+            mime_type: "image/png".into(),
+            filename: "one.png".into(),
+            size_bytes: 1,
+            source: crate::attachment::AttachmentSource::File,
+        });
+        active.input_bar.insert_text("/attachments");
+        assert!(matches!(
+            active
+                .input_bar
+                .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            crate::input_bar::InputBarAction::Consumed
+        ));
+        chat.phase = ChatPhase::Active(Box::new(active));
+
         assert!(chat.wants_text_input());
     }
 
@@ -8296,6 +8420,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn model_picker_blocks_attachment_remove_click() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let (mut chat, _rx) = test_chat();
+        let mut active = state();
+        active.input_bar.add_attachment(PendingAttachment {
+            path: std::path::PathBuf::from("one.png"),
+            mime_type: "image/png".into(),
+            filename: "one.png".into(),
+            size_bytes: 1,
+            source: crate::attachment::AttachmentSource::File,
+        });
+        active.model_picker =
+            ModelPickerOverlay::Model(crate::widgets::PickerState::new(vec!["a".into()], None));
+
+        let area = Rect::new(0, 0, 80, 20);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| render(frame, &mut active, area, PaneKind::Chat))
+            .expect("draw chat");
+        let attachment_area = active
+            .input_bar
+            .attachment_area()
+            .expect("attachment row rendered");
+        chat.phase = ChatPhase::Active(Box::new(active));
+
+        chat.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: attachment_area.x + attachment_area.width - 2,
+                row: attachment_area.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        )
+        .await;
+
+        let ChatPhase::Active(active) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert_eq!(active.input_bar.pending_attachments().len(), 1);
+    }
+
+    #[tokio::test]
     async fn blank_side_click_clears_transcript_mouse_highlight() {
         use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
         use ratatui::{Terminal, backend::TestBackend};
@@ -8347,13 +8517,20 @@ mod tests {
         state.dirty = LinesDirty::Clean;
         chat.phase = ChatPhase::Active(Box::new(state));
 
-        let click = MouseEvent {
+        let mouse_down = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: blank_col,
             row: blank_row,
             modifiers: KeyModifiers::NONE,
         };
-        chat.handle_mouse(click, area).await;
+        chat.handle_mouse(mouse_down, area).await;
+        let mouse_up = MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: blank_col,
+            row: blank_row,
+            modifiers: KeyModifiers::NONE,
+        };
+        chat.handle_mouse(mouse_up, area).await;
 
         let ChatPhase::Active(state) = &chat.phase else {
             panic!("expected active chat");
@@ -9015,7 +9192,7 @@ mod tests {
                     frame,
                     area,
                     &sessions,
-                    &list_state,
+                    &mut list_state,
                     crate::i18n::t("zc-chat-session-list-switch-title"),
                 );
             })
@@ -9039,6 +9216,66 @@ mod tests {
             selected_text_cell.style().bg,
             Some(expected_bg),
             "selected session row must keep the themed fill background"
+        );
+    }
+
+    #[test]
+    fn session_overlay_retains_scroll_offset_for_mouse_hit_test() {
+        use ratatui::{Terminal, backend::TestBackend};
+        // Regression for the picker selecting the wrong row after scrolling:
+        // the renderer must persist the offset it computes so mouse hit-testing
+        // reads the same geometry that was drawn.
+        let sessions: Vec<SessionEntry> = (0..30)
+            .map(|i| SessionEntry {
+                session_id: format!("session-{i}"),
+                session_key: format!("session-{i}"),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                last_activity: "2026-01-01T00:00:00Z".to_string(),
+                agent_alias: Some("agent".to_string()),
+                channel_id: None,
+                name: Some(format!("prompt {i}")),
+                message_count: 1,
+            })
+            .collect();
+
+        let mut list_state = ListState::default();
+        // Select a row far enough down that the list must scroll to show it.
+        list_state.select(Some(25));
+
+        let area = Rect::new(0, 0, 100, 30);
+        let overlay_area = session_list_overlay_area(area);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render_session_list_overlay(
+                    frame,
+                    area,
+                    &sessions,
+                    &mut list_state,
+                    crate::i18n::t("zc-chat-session-list-switch-title"),
+                );
+            })
+            .expect("draw session list overlay");
+
+        // The renderer scrolled the list to reveal the selection; that offset
+        // must survive the draw. Before the fix it was computed on a discarded
+        // copy and stayed 0.
+        let offset = list_state.offset();
+        assert!(
+            offset > 0,
+            "rendering a scrolled selection must retain a nonzero offset, got {offset}"
+        );
+
+        // A click on the third visible row must resolve through the retained
+        // offset, not the pre-scroll top of the list.
+        let clicked_row = overlay_area.y + 1 + 2;
+        let idx = crate::mouse::list_click_index(clicked_row, overlay_area, offset, sessions.len())
+            .expect("click inside the visible list resolves to a row");
+        assert_eq!(
+            idx,
+            offset + 2,
+            "clicked row must map to offset + visible row, not the unscrolled index"
         );
     }
 

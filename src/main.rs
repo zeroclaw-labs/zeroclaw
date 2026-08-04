@@ -7072,7 +7072,10 @@ fn paircode_no_code_message(
 
     lines.push(String::new());
     lines.push("To inspect the running gateway:".into());
-    lines.push(format!("    open http://{host}:{port}"));
+    lines.push(format!(
+        "    open http://{}:{port}",
+        gateway_browser_host(host)
+    ));
     indent_paircode_lines(lines)
 }
 
@@ -8012,6 +8015,14 @@ fn is_default_gateway_addr(host: &str, port: u16, default_host: &str, default_po
     host == default_host && port == default_port
 }
 
+fn gateway_browser_host(host: &str) -> &str {
+    match host {
+        "0.0.0.0" => "127.0.0.1",
+        "::" | "[::]" => "[::1]",
+        _ => host,
+    }
+}
+
 fn gateway_addr_in_use_message(
     host: &str,
     port: u16,
@@ -8028,7 +8039,10 @@ fn gateway_addr_in_use_message(
     ];
 
     if is_default_gateway_addr(host, port, default_host, default_port) {
-        lines.push(format!("    open http://{host}:{port}"));
+        lines.push(format!(
+            "    open http://{}:{port}",
+            gateway_browser_host(host)
+        ));
     }
 
     lines.push(gateway_paircode_recovery_command(
@@ -8728,6 +8742,31 @@ mod tests {
 
     #[test]
     #[cfg(feature = "agent-runtime")]
+    fn paircode_no_code_message_uses_loopback_browser_hint_for_wildcard_hosts() {
+        let default = config::GatewayConfig::default();
+
+        for (host, browser_host) in [("0.0.0.0", "127.0.0.1"), ("::", "[::1]"), ("[::]", "[::1]")] {
+            let msg = paircode_no_code_message(
+                host,
+                9001,
+                &default.host,
+                default.port,
+                &PaircodeAction::Show,
+                true,
+                None,
+            );
+
+            assert!(
+                msg.contains(&format!("open http://{browser_host}:9001")),
+                "{msg}"
+            );
+            assert!(msg.contains(&format!("--port 9001 --host {host}")), "{msg}");
+            assert!(!msg.contains(&format!("open http://{host}:9001")), "{msg}");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
     fn paircode_no_code_message_omits_configured_default_host_port() {
         let msg = paircode_no_code_message(
             "192.168.1.20",
@@ -8791,6 +8830,19 @@ mod tests {
         assert!(msg.contains("zeroclaw gateway get-paircode --port 9001 --host 0.0.0.0"));
         assert!(msg.contains("zeroclaw gateway start --port 9002 --host 0.0.0.0"));
         assert!(msg.contains("lsof -nP -iTCP:9001 -sTCP:LISTEN"));
+    }
+
+    #[test]
+    fn gateway_addr_in_use_message_uses_loopback_browser_hint_for_wildcard_default() {
+        for (host, browser_host) in [("0.0.0.0", "127.0.0.1"), ("::", "[::1]"), ("[::]", "[::1]")] {
+            let msg = gateway_addr_in_use_message(host, 9001, host, 9001, None);
+
+            assert!(
+                msg.contains(&format!("open http://{browser_host}:9001")),
+                "{msg}"
+            );
+            assert!(!msg.contains(&format!("open http://{host}:9001")), "{msg}");
+        }
     }
 
     #[test]
@@ -9352,6 +9404,33 @@ mod tests {
         assert!(
             config.agents.contains_key("researcher"),
             "researcher alias should have been created"
+        );
+    }
+
+    #[test]
+    fn config_set_materializes_agent_workspace_path() {
+        let mut config = Config::default();
+        let raw = "agents.assistant.workspace.path";
+
+        let known: Vec<String> = config.prop_fields().into_iter().map(|f| f.name).collect();
+        let mut path = zeroclaw_config::helpers::resolve_field_path(&known, raw);
+        let created = ensure_map_key_for_prop_path(&mut config, &path)
+            .expect("agent alias and workspace path should materialize");
+        assert!(created, "missing agent alias should be created");
+
+        let known: Vec<String> = config.prop_fields().into_iter().map(|f| f.name).collect();
+        path = zeroclaw_config::helpers::resolve_field_path(&known, &path);
+        config
+            .set_prop_persistent(&path, "/srv/zeroclaw/assistant")
+            .expect("agent workspace path should be writable");
+
+        assert_eq!(path, raw);
+        assert_eq!(
+            config
+                .agents
+                .get("assistant")
+                .and_then(|agent| agent.workspace.path.as_deref()),
+            Some(std::path::Path::new("/srv/zeroclaw/assistant"))
         );
     }
 

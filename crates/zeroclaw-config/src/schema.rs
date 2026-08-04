@@ -9679,6 +9679,37 @@ fn validate_required_bot_token(field_path: &str, enabled: bool, token: &str) -> 
     Ok(())
 }
 
+/// Shared "required once enabled" rule for channel-credential fields whose
+/// name doesn't end in `bot_token` (Signal's `http_url`/`account`, Voice
+/// Call's `account_id`/`auth_token`/`from_number`), so the sibling
+/// `.enabled` path can't be derived by suffix-stripping like
+/// `validate_required_bot_token` does. An enabled channel built with an
+/// empty required credential never connects, so its per-channel supervisor
+/// restarts it forever; rejecting at config-load time turns that crashloop
+/// into a fail-fast startup error instead.
+pub(crate) fn validate_required_field(
+    field_path: &str,
+    enabled_path: &str,
+    enabled: bool,
+    value: &str,
+) -> Result<()> {
+    if value.trim() == crate::traits::UNSET_DISPLAY {
+        validation_bail!(
+            RequiredFieldEmpty,
+            field_path.to_string(),
+            "{field_path} must not contain the unset display placeholder",
+        );
+    }
+    if enabled && crate::traits::is_unset_display_value(value) {
+        validation_bail!(
+            RequiredFieldEmpty,
+            field_path.to_string(),
+            "{field_path} is required when {enabled_path} = true",
+        );
+    }
+    Ok(())
+}
+
 fn set_proxy_env_pair(key: &str, value: Option<&str>) {
     let lowercase_key = key.to_ascii_lowercase();
     if let Some(value) = value.and_then(|candidate| normalize_proxy_url_option(Some(candidate))) {
@@ -10937,6 +10968,99 @@ pub fn validate_memory_semantics(
             )
         })
         .collect()
+}
+
+/// Surface WhatsApp chat-policy keys that are accepted but never consulted.
+///
+/// `dm_policy`, `group_policy` and `self_chat_mode` are read only by the Web
+/// transport inside its `mode == Personal` block, so under `mode = "business"`
+/// they validate cleanly and have no effect. That is easy to miss because
+/// `dm_policy` DEFAULTS to `Allowlist`: a business-mode Web channel reads as
+/// restrictive while answering every DM it receives.
+///
+/// `allowed_groups` is separate. `is_group_chat_allowed` returns true when the
+/// list is empty, and that gate does run in both modes, which makes an empty
+/// list the only group protection under `mode = "business"` and an open one.
+///
+/// Warnings only, no behaviour change: an operator who is relying on the
+/// current defaults keeps working, and learns about it at `config validate`.
+///
+/// Called from `Config::collect_warnings`, so this reaches the CLI and the
+/// gateway dashboard on the same path as the other warnings.
+pub fn validate_whatsapp_semantics(
+    alias: &str,
+    wa: &WhatsAppConfig,
+) -> Vec<crate::validation_warnings::ValidationWarning> {
+    let mut out = Vec::new();
+    if !wa.enabled || !wa.is_web_config() {
+        return out;
+    }
+
+    if wa.mode != WhatsAppWebMode::Personal {
+        let mut inert: Vec<(&'static str, String)> = Vec::new();
+        if wa.dm_policy != WhatsAppChatPolicy::All {
+            inert.push((
+                "dm_policy",
+                "every direct message is answered regardless of this setting".to_string(),
+            ));
+        }
+        if wa.group_policy != WhatsAppChatPolicy::All {
+            inert.push((
+                "group_policy",
+                "group messages are not filtered by this setting".to_string(),
+            ));
+        }
+        if wa.self_chat_mode {
+            inert.push((
+                "self_chat_mode",
+                "self-chat handling is unchanged by this setting".to_string(),
+            ));
+        }
+        for (key, effect) in inert {
+            out.push(crate::validation_warnings::ValidationWarning::new(
+                "whatsapp_chat_policy_inert",
+                format!(
+                    "channels.whatsapp.{alias}.{key} is set but the Web transport only \
+                     consults it under mode = \"personal\"; as configured, {effect}"
+                ),
+                format!("channels.whatsapp.{alias}.{key}"),
+            ));
+        }
+    }
+
+    // An empty allowed_groups only creates UNINTENDED open access where the
+    // effective policy would otherwise have consulted the list. Two personal-mode
+    // configurations must stay quiet:
+    //
+    //   group_policy = "ignore"    the channel gate drops every group message
+    //                              downstream, so nothing is permitted. Warning here
+    //                              also told the operator to set exactly this, and
+    //                              then kept firing after they did.
+    //   group_policy = "all"       an explicit opt-in to open group access. Warning
+    //                              here reports a deliberate choice as unsafe.
+    //
+    // So the warning applies to business mode (where the list is consulted no matter
+    // what group_policy says) and to personal mode with group_policy = "allowlist"
+    // (where an empty list is an allowlist that admits everything).
+    let empty_list_permits_all = if wa.mode == WhatsAppWebMode::Personal {
+        wa.group_policy == WhatsAppChatPolicy::Allowlist
+    } else {
+        true
+    };
+
+    if wa.allowed_groups.is_empty() && empty_list_permits_all {
+        out.push(crate::validation_warnings::ValidationWarning::new(
+            "whatsapp_empty_group_allowlist_permits_all",
+            format!(
+                "channels.whatsapp.{alias}.allowed_groups is empty, which permits EVERY \
+                 group the linked account belongs to. List the group JIDs you intend to \
+                 serve, or set group_policy = \"ignore\" under mode = \"personal\"."
+            ),
+            format!("channels.whatsapp.{alias}.allowed_groups"),
+        ));
+    }
+
+    out
 }
 
 /// Write-time duplicate handling policy for memory entries.
@@ -12258,6 +12382,22 @@ pub struct ModelRouteConfig {
     pub api_key: Option<String>,
 }
 
+// ── Model cache (shared between CLI refresh and channel reader) ──
+
+/// Canonical on-disk model cache schema. Written by `zeroclaw models refresh`
+/// and read by the channel `/model` command. Both sides MUST use this type
+/// to prevent schema drift (single-source-of-truth rule).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ModelCacheState {
+    pub entries: Vec<ModelCacheEntry>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ModelCacheEntry {
+    pub model_provider: String,
+    pub models: Vec<String>,
+}
+
 // ── Embedding routing ───────────────────────────────────────────
 
 /// Route an embedding hint to a specific model_provider + model.
@@ -12581,6 +12721,17 @@ pub struct CronJobDecl {
     #[serde(default)]
     #[nested]
     pub delivery: Option<DeliveryConfigDecl>,
+    /// Output format for shell jobs: `"wrapped"` (default) or `"raw"`.
+    ///
+    /// - `"wrapped"` (default): returns stdout and stderr wrapped in a
+    ///   `status=... / stdout: / stderr:` envelope.
+    /// - `"raw"`: returns trimmed stdout when the process exits zero. A
+    ///   non-zero process exit still gets the wrapped status/stdout/stderr
+    ///   envelope for diagnosis. Failures that never reach a process exit —
+    ///   a security-policy denial, a shell setup/spawn failure, or a
+    ///   timeout — return a plain error string in either format.
+    #[serde(default)]
+    pub shell_output_format: CronShellOutputFormat,
 }
 
 impl Default for CronJobDecl {
@@ -12597,8 +12748,23 @@ impl Default for CronJobDecl {
             uses_memory: true,
             session_target: None,
             delivery: None,
+            shell_output_format: CronShellOutputFormat::default(),
         }
     }
+}
+
+/// Output format for shell cron job stdout.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, zeroclaw_macros::ConfigEnum)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum CronShellOutputFormat {
+    /// Wrapped format: `status=...\nstdout:\n...\nstderr:\n...` (default).
+    #[default]
+    Wrapped,
+    /// Raw stdout on a zero process exit; wrapped status/stdout/stderr on a
+    /// non-zero exit; a plain error string for failures that never reach a
+    /// process exit (security denial, spawn/setup failure, timeout).
+    Raw,
 }
 
 /// Schedule variant for declarative cron jobs.
@@ -13883,6 +14049,11 @@ impl ChannelConfig for DiscordConfig {
     }
 }
 
+/// Default number of prior Slack thread messages included on first encounter.
+pub const DEFAULT_SLACK_THREAD_CONTEXT_MAX_MESSAGES: usize = 0;
+/// Slack's `conversations.replies` request limit used by thread hydration.
+pub const MAX_SLACK_THREAD_CONTEXT_MAX_MESSAGES: usize = 50;
+
 /// Slack bot channel configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -13947,6 +14118,13 @@ pub struct SlackConfig {
     #[tab(Advanced)]
     #[serde(default)]
     pub strict_mention_in_thread: bool,
+    /// Maximum number of prior messages prepended when ZeroClaw first
+    /// encounters a Slack thread. `0` disables automatic thread-context
+    /// hydration. When omitted, defaults to 0, so hydration is opt-in.
+    /// Maximum: 50.
+    #[tab(Advanced)]
+    #[serde(default)]
+    pub thread_context_max_messages: Option<usize>,
     /// Use the newer Slack `markdown` block type (12 000 char limit, richer formatting).
     /// Defaults to false (uses universally supported `section` blocks with `mrkdwn`).
     /// Enable this only if your Slack workspace supports the `markdown` block type.
@@ -14009,6 +14187,13 @@ impl ChannelConfig for SlackConfig {
 }
 
 impl SlackConfig {
+    /// Resolve the configured thread-context depth without copying config
+    /// state into the channel runtime.
+    pub fn effective_thread_context_max_messages(&self) -> usize {
+        self.thread_context_max_messages
+            .unwrap_or(DEFAULT_SLACK_THREAD_CONTEXT_MAX_MESSAGES)
+    }
+
     /// Resolve the effective Slack bot token: the configured `bot_token` when
     /// set and non-empty, else the `ZEROCLAW_SLACK_BOT_TOKEN` env var, else
     /// `SLACK_BOT_TOKEN`. Returns `None` when none is available. Resolving here
@@ -14498,6 +14683,40 @@ pub struct SignalConfig {
     pub reply_queue_depth_max: u16,
 }
 
+impl SignalConfig {
+    /// Whether both required credentials (`http_url`, `account`) are
+    /// present. Mirrors `WhatsAppConfig::is_cloud_config`'s role: the
+    /// channel orchestrator uses this bool to decide whether to build the
+    /// channel at all, skipping (with a warning) an enabled-but-uncredentialed
+    /// alias instead of building a listener that can never connect and
+    /// crashloops its per-channel supervisor.
+    pub fn has_required_credentials(&self) -> bool {
+        !crate::traits::is_unset_display_value(&self.http_url)
+            && !crate::traits::is_unset_display_value(&self.account)
+    }
+
+    /// Validate this alias's required credentials once enabled. Mirrors
+    /// `TelegramConfig::validate_bot_token` / `DiscordConfig::validate_bot_token`:
+    /// an enabled Signal channel built with an empty `http_url` or `account`
+    /// never connects and crashloops its per-channel supervisor, so reject
+    /// it at config-load time instead.
+    pub fn validate_required(&self, alias: &str) -> Result<()> {
+        let enabled_path = format!("channels.signal.{alias}.enabled");
+        validate_required_field(
+            &format!("channels.signal.{alias}.http_url"),
+            &enabled_path,
+            self.enabled,
+            &self.http_url,
+        )?;
+        validate_required_field(
+            &format!("channels.signal.{alias}.account"),
+            &enabled_path,
+            self.enabled,
+            &self.account,
+        )
+    }
+}
+
 impl ChannelConfig for SignalConfig {
     fn name() -> &'static str {
         "Signal"
@@ -14571,8 +14790,13 @@ pub struct WhatsAppConfig {
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub verify_token: Option<String>,
     /// App secret from Meta Business Suite (for webhook signature verification)
-    /// Can also be set via `ZEROCLAW_WHATSAPP_APP_SECRET` environment variable
-    /// Only used in Cloud API mode
+    /// Can also be set with the alias-qualified generic environment override:
+    /// `ZEROCLAW_channels__whatsapp__<alias>__app_secret`.
+    /// Only used in Cloud API mode.
+    ///
+    /// Required to receive webhooks. Inbound requests are signature-verified,
+    /// and with no secret configured the gateway cannot verify them, so it
+    /// refuses them with `401` rather than accepting them unverified.
     #[serde(default)]
     #[secret]
     #[tab(Connection)]
@@ -14731,7 +14955,11 @@ pub struct LinqConfig {
     /// Phone number to send from (E.164 format)
     #[tab(Advanced)]
     pub from_phone: String,
-    /// Webhook signing secret for signature verification
+    /// Webhook signing secret for signature verification.
+    ///
+    /// Required to receive webhooks. Inbound requests are signature-verified,
+    /// and with no secret configured the gateway cannot verify them, so it
+    /// refuses them with `401` rather than accepting them unverified.
     #[serde(default)]
     #[secret]
     #[tab(Connection)]
@@ -18179,6 +18407,40 @@ struct ExtraNestedModelProviderTable {
     nested: String,
 }
 
+/// Classification of a `peer_groups.<name>.channel` reference against the
+/// configured `[channels.*]` blocks. This is the single source of truth for
+/// resolving a raw `channel` string — `Config::validate()` consumes it for
+/// its hard-error checks, and `Config::collect_peer_groups_warnings`
+/// consumes it for the non-fatal dangling-alias warning. Do not duplicate
+/// this resolution logic elsewhere; classify the ref once and match on the
+/// result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PeerGroupChannelRef {
+    /// Empty or whitespace-only `channel` value.
+    Empty,
+    /// A bare channel type with no dotted alias (e.g. `"discord"`), which
+    /// authorizes every alias of that type.
+    BareType {
+        channel_type: String,
+        /// Whether `[channels.<channel_type>.*]` has at least one entry.
+        configured: bool,
+    },
+    /// A dotted `type.alias` reference (e.g. `"discord.work"`).
+    Dotted {
+        channel_type: String,
+        alias: String,
+        /// Whether `[channels.<channel_type>.*]` is configured at all.
+        type_configured: bool,
+        /// Whether `alias` is among the configured aliases for
+        /// `channel_type`. Always `false` when `type_configured` is `false`.
+        exists: bool,
+        /// The configured aliases for `channel_type` (empty when the type
+        /// itself is unconfigured), sorted lexicographically so consumers
+        /// that pick between candidates are deterministic.
+        known_aliases: Vec<String>,
+    },
+}
+
 impl Config {
     /// External-peer usernames authorized on `<channel_type>.<alias>`.
     ///
@@ -18859,12 +19121,16 @@ impl Config {
         self.collect_cross_provider_summary_model_warnings(&mut warnings);
         self.collect_a2a_exposed_skills_warnings(&mut warnings);
         self.collect_memory_semantic_search_warnings(&mut warnings);
+        self.collect_peer_groups_warnings(&mut warnings);
         // Must run after `collect_cross_provider_summary_model_warnings`: it
         // scans `warnings` to suppress its generic inert `summary_model`
         // warning when the more specific cross-provider diagnostic already
         // covers the same path.
         self.collect_context_compression_ignored_warnings(&mut warnings);
         warnings.extend(validate_memory_semantics(&self.memory));
+        for (alias, wa) in &self.channels.whatsapp {
+            warnings.extend(validate_whatsapp_semantics(alias, wa));
+        }
         // `wire_api` is only honored by bring-your-own-endpoint families; on a
         // branded family with a fixed wire protocol it is silently ignored.
         // Surface that so an operator who sets it on, e.g., `mistral` learns it
@@ -19379,6 +19645,112 @@ impl Config {
             .collect()
     }
 
+    /// Classify a raw `peer_groups.<name>.channel` value against the
+    /// configured `[channels.*]` blocks. See [`PeerGroupChannelRef`] for the
+    /// meaning of each variant; this is the only place that resolves the
+    /// channel-type/alias lookup for peer groups, via the same canonical
+    /// `get_map_keys` enumeration every other typed-ref check uses (`None` =
+    /// the channel type has no configured block at all; `Some(keys)` = the
+    /// list of configured aliases for that type).
+    fn classify_peer_group_channel_ref(&self, raw: &str) -> PeerGroupChannelRef {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return PeerGroupChannelRef::Empty;
+        }
+        // `get_map_keys` stores section names using the raw field ident
+        // (snake); look up the channel type verbatim.
+        let (channel_type, alias) = match trimmed.split_once('.') {
+            Some((ty, al)) => (ty, Some(al)),
+            None => (trimmed, None),
+        };
+        let channel_aliases = self.get_map_keys(&format!("channels.{channel_type}"));
+        match alias {
+            None => PeerGroupChannelRef::BareType {
+                channel_type: channel_type.to_string(),
+                configured: channel_aliases.is_some(),
+            },
+            Some(alias) => {
+                let type_configured = channel_aliases.is_some();
+                let exists = channel_aliases
+                    .as_ref()
+                    .is_some_and(|keys| keys.iter().any(|k| k == alias));
+                // `get_map_keys` iterates a HashMap-backed section, so its
+                // order is randomized per process; sort here (the canonical
+                // resolution point) so downstream consumers — notably the
+                // did-you-mean tie-break in `collect_peer_groups_warnings`
+                // — are deterministic across runs.
+                let mut known_aliases = channel_aliases.unwrap_or_default();
+                known_aliases.sort();
+                PeerGroupChannelRef::Dotted {
+                    channel_type: channel_type.to_string(),
+                    alias: alias.to_string(),
+                    type_configured,
+                    exists,
+                    known_aliases,
+                }
+            }
+        }
+    }
+
+    /// Surface a `peer_groups.<name>.channel` dotted reference that does not
+    /// resolve to any configured `[channels.<type>.<alias>]` block —
+    /// typically a typo (`telegram.alert` vs. configured `telegram.alerts`)
+    /// that silently authorizes nobody instead of failing loudly. This is a
+    /// non-fatal companion to the `DanglingReference` hard error
+    /// `Config::validate()` already raises for the exact same condition (see
+    /// `classify_peer_group_channel_ref`): it exists so config-load tracing,
+    /// `channel doctor`, and the gateway config surface can flag the
+    /// misconfiguration even when a caller chooses to log-and-continue past
+    /// a failed `validate()` instead of refusing to boot.
+    ///
+    /// Bare type-wide refs (`channel = "discord"`) are an explicit non-goal:
+    /// they intentionally authorize every alias of that type, so there is no
+    /// "did you mean" ambiguity, and an unconfigured bare type is already a
+    /// hard error at `validate()`.
+    fn collect_peer_groups_warnings(
+        &self,
+        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
+    ) {
+        let mut group_names: Vec<&String> = self.peer_groups.keys().collect();
+        group_names.sort();
+        for group_name in group_names {
+            let group_channel = self.peer_groups[group_name].channel.trim();
+            let PeerGroupChannelRef::Dotted {
+                channel_type,
+                alias,
+                type_configured,
+                exists,
+                known_aliases,
+            } = self.classify_peer_group_channel_ref(group_channel)
+            else {
+                continue;
+            };
+            if type_configured && exists {
+                continue;
+            }
+
+            let suggestion = if type_configured {
+                crate::validation_warnings::closest_match(&alias, &known_aliases)
+                    .map(|closest| format!("; did you mean \"{channel_type}.{closest}\"?"))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            let reason = if type_configured {
+                format!("[channels.{channel_type}.{alias}] is not configured")
+            } else {
+                format!("no [channels.{channel_type}.*] block is configured")
+            };
+            warnings.push(crate::validation_warnings::ValidationWarning::new(
+                "peer_group_channel_dangling",
+                format!(
+                    "peer_groups.{group_name}.channel = {group_channel:?} but {reason}{suggestion}"
+                ),
+                format!("peer_groups.{group_name}.channel"),
+            ));
+        }
+    }
+
     /// Validate configuration values that would cause runtime failures.
     ///
     /// Called after TOML deserialization and env-override application to catch
@@ -19477,8 +19849,51 @@ impl Config {
             )?;
         }
 
+        for (alias, slack) in &self.channels.slack {
+            let max_messages = slack.effective_thread_context_max_messages();
+            if max_messages > MAX_SLACK_THREAD_CONTEXT_MAX_MESSAGES {
+                let path = format!("channels.slack.{alias}.thread_context_max_messages");
+                validation_bail!(
+                    InvalidNumericRange,
+                    path,
+                    "{path} = {max_messages} is out of range; must be 0..={MAX_SLACK_THREAD_CONTEXT_MAX_MESSAGES}"
+                );
+            }
+        }
+
         for (alias, dc) in &self.channels.discord {
             dc.validate_bot_token(alias)?;
+        }
+
+        // Signal and Voice Call: like Telegram/Discord's bot_token, these
+        // channels have unambiguous required plain-String credentials. An
+        // enabled channel built with an empty credential never connects and
+        // its per-channel supervisor restarts it forever (crashloop), so
+        // reject at config-load time instead.
+        for (alias, sig) in &self.channels.signal {
+            sig.validate_required(alias)?;
+        }
+
+        for (alias, vc) in &self.channels.voice_call {
+            let enabled_path = format!("channels.voice_call.{alias}.enabled");
+            validate_required_field(
+                &format!("channels.voice_call.{alias}.account_id"),
+                &enabled_path,
+                vc.enabled,
+                &vc.account_id,
+            )?;
+            validate_required_field(
+                &format!("channels.voice_call.{alias}.auth_token"),
+                &enabled_path,
+                vc.enabled,
+                &vc.auth_token,
+            )?;
+            validate_required_field(
+                &format!("channels.voice_call.{alias}.from_number"),
+                &enabled_path,
+                vc.enabled,
+                &vc.from_number,
+            )?;
         }
 
         // Git forge channel: a PAT-backed provider must name its API origin
@@ -20879,37 +21294,55 @@ impl Config {
         for group_name in peer_group_names {
             let group = &self.peer_groups[group_name];
             let group_channel = group.channel.trim();
-            if group_channel.is_empty() {
-                validation_bail!(
-                    RequiredFieldEmpty,
-                    format!("peer_groups.{group_name}.channel"),
-                    "peer_groups.{group_name}.channel must name a channel type (e.g. \"discord\") or dotted alias (e.g. \"discord.work\")",
-                );
-            }
-            // `get_map_keys` stores section names using the raw field ident
-            // (snake); look up the channel type verbatim.
+            // The channel ref is resolved once by the shared classifier; its
+            // bound fields feed the error messages below. The split_once
+            // locals exist only for the member-ref loop further down, which
+            // is out of scope for the classifier.
             let (group_channel_type, group_channel_alias) = match group_channel.split_once('.') {
                 Some((ty, al)) => (ty, Some(al)),
                 None => (group_channel, None),
             };
-            let channel_aliases = self.get_map_keys(&format!("channels.{group_channel_type}"));
-            if channel_aliases.is_none() {
-                validation_bail!(
-                    DanglingReference,
-                    format!("peer_groups.{group_name}.channel"),
-                    "peer_groups.{group_name}.channel = {group_channel:?} but no [channels.{group_channel_type}.*] block is configured",
-                );
-            }
-            if let Some(alias) = group_channel_alias {
-                let exists = channel_aliases
-                    .as_ref()
-                    .is_some_and(|keys| keys.iter().any(|k| k == alias));
-                if !exists {
+            match self.classify_peer_group_channel_ref(group_channel) {
+                PeerGroupChannelRef::Empty => {
                     validation_bail!(
-                        DanglingReference,
+                        RequiredFieldEmpty,
                         format!("peer_groups.{group_name}.channel"),
-                        "peer_groups.{group_name}.channel = {group_channel:?} but [channels.{group_channel_type}.{alias}] is not configured",
+                        "peer_groups.{group_name}.channel must name a channel type (e.g. \"discord\") or dotted alias (e.g. \"discord.work\")",
                     );
+                }
+                PeerGroupChannelRef::BareType {
+                    channel_type,
+                    configured,
+                } => {
+                    if !configured {
+                        validation_bail!(
+                            DanglingReference,
+                            format!("peer_groups.{group_name}.channel"),
+                            "peer_groups.{group_name}.channel = {group_channel:?} but no [channels.{channel_type}.*] block is configured",
+                        );
+                    }
+                }
+                PeerGroupChannelRef::Dotted {
+                    channel_type,
+                    alias,
+                    type_configured,
+                    exists,
+                    ..
+                } => {
+                    if !type_configured {
+                        validation_bail!(
+                            DanglingReference,
+                            format!("peer_groups.{group_name}.channel"),
+                            "peer_groups.{group_name}.channel = {group_channel:?} but no [channels.{channel_type}.*] block is configured",
+                        );
+                    }
+                    if !exists {
+                        validation_bail!(
+                            DanglingReference,
+                            format!("peer_groups.{group_name}.channel"),
+                            "peer_groups.{group_name}.channel = {group_channel:?} but [channels.{channel_type}.{alias}] is not configured",
+                        );
+                    }
                 }
             }
             for (i, member) in group.agents.iter().enumerate() {
@@ -24406,6 +24839,203 @@ api_base_url = "http://127.0.0.1:8081"
             .expect_err("the unset display sentinel must never become persisted config");
     }
 
+    // Regression: an enabled Signal or Voice Call channel with empty
+    // required credentials was built anyway, then its listener failed to
+    // connect and the per-channel supervisor restarted it forever
+    // (crashloop). Reject at config-load time instead, mirroring how
+    // Telegram/Discord require `bot_token`.
+    #[test]
+    async fn validate_rejects_enabled_signal_without_http_url() {
+        let mut config = Config::default();
+        config.channels.signal.insert(
+            "signal".to_string(),
+            SignalConfig {
+                enabled: true,
+                http_url: "   ".into(),
+                account: "+15551234567".into(),
+                ..Default::default()
+            },
+        );
+
+        let err = config
+            .validate()
+            .expect_err("enabled Signal channel must require an http_url");
+        assert!(err.to_string().contains("channels.signal.signal.http_url"));
+    }
+
+    #[test]
+    async fn validate_rejects_enabled_signal_without_account() {
+        let mut config = Config::default();
+        config.channels.signal.insert(
+            "signal".to_string(),
+            SignalConfig {
+                enabled: true,
+                http_url: "http://127.0.0.1:8686".into(),
+                account: "   ".into(),
+                ..Default::default()
+            },
+        );
+
+        let err = config
+            .validate()
+            .expect_err("enabled Signal channel must require an account");
+        assert!(err.to_string().contains("channels.signal.signal.account"));
+    }
+
+    #[test]
+    async fn validate_allows_disabled_signal_without_creds() {
+        let mut config = Config::default();
+        config.channels.signal.insert(
+            "signal".to_string(),
+            SignalConfig {
+                enabled: false,
+                http_url: "   ".into(),
+                account: "   ".into(),
+                ..Default::default()
+            },
+        );
+
+        config
+            .validate()
+            .expect("disabled Signal channel may be staged without credentials");
+    }
+
+    #[test]
+    async fn validate_rejects_disabled_signal_with_unset_sentinel() {
+        let mut config = Config::default();
+        config.channels.signal.insert(
+            "signal".to_string(),
+            SignalConfig {
+                enabled: false,
+                http_url: crate::traits::UNSET_DISPLAY.to_string(),
+                account: "+15551234567".into(),
+                ..Default::default()
+            },
+        );
+
+        let err = config
+            .validate()
+            .expect_err("the unset display sentinel must never become persisted config, even for a disabled channel");
+        assert!(err.to_string().contains("channels.signal.signal.http_url"));
+    }
+
+    #[test]
+    async fn signal_has_required_credentials_true_when_both_set() {
+        let sig = SignalConfig {
+            http_url: "http://127.0.0.1:8686".into(),
+            account: "+15551234567".into(),
+            ..Default::default()
+        };
+        assert!(sig.has_required_credentials());
+    }
+
+    #[test]
+    async fn signal_has_required_credentials_false_when_either_blank() {
+        let missing_http_url = SignalConfig {
+            http_url: "   ".into(),
+            account: "+15551234567".into(),
+            ..Default::default()
+        };
+        assert!(!missing_http_url.has_required_credentials());
+
+        let missing_account = SignalConfig {
+            http_url: "http://127.0.0.1:8686".into(),
+            account: "   ".into(),
+            ..Default::default()
+        };
+        assert!(!missing_account.has_required_credentials());
+
+        assert!(!SignalConfig::default().has_required_credentials());
+    }
+
+    #[test]
+    async fn validate_rejects_enabled_voice_call_without_account_id() {
+        let mut config = Config::default();
+        config.channels.voice_call.insert(
+            "voice".to_string(),
+            crate::scattered_types::VoiceCallConfig {
+                enabled: true,
+                account_id: "   ".into(),
+                auth_token: "tok".into(),
+                from_number: "+15551234567".into(),
+                ..Default::default()
+            },
+        );
+
+        let err = config
+            .validate()
+            .expect_err("enabled Voice Call channel must require an account_id");
+        assert!(
+            err.to_string()
+                .contains("channels.voice_call.voice.account_id")
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_enabled_voice_call_without_auth_token() {
+        let mut config = Config::default();
+        config.channels.voice_call.insert(
+            "voice".to_string(),
+            crate::scattered_types::VoiceCallConfig {
+                enabled: true,
+                account_id: "AC123".into(),
+                auth_token: "   ".into(),
+                from_number: "+15551234567".into(),
+                ..Default::default()
+            },
+        );
+
+        let err = config
+            .validate()
+            .expect_err("enabled Voice Call channel must require an auth_token");
+        assert!(
+            err.to_string()
+                .contains("channels.voice_call.voice.auth_token")
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_enabled_voice_call_without_from_number() {
+        let mut config = Config::default();
+        config.channels.voice_call.insert(
+            "voice".to_string(),
+            crate::scattered_types::VoiceCallConfig {
+                enabled: true,
+                account_id: "AC123".into(),
+                auth_token: "tok".into(),
+                from_number: "   ".into(),
+                ..Default::default()
+            },
+        );
+
+        let err = config
+            .validate()
+            .expect_err("enabled Voice Call channel must require a from_number");
+        assert!(
+            err.to_string()
+                .contains("channels.voice_call.voice.from_number")
+        );
+    }
+
+    #[test]
+    async fn validate_allows_disabled_voice_call_without_creds() {
+        let mut config = Config::default();
+        config.channels.voice_call.insert(
+            "voice".to_string(),
+            crate::scattered_types::VoiceCallConfig {
+                enabled: false,
+                account_id: "   ".into(),
+                auth_token: "   ".into(),
+                from_number: "   ".into(),
+                ..Default::default()
+            },
+        );
+
+        config
+            .validate()
+            .expect("disabled Voice Call channel may be staged without credentials");
+    }
+
     // Regression (fail closed, both PAT-backed forge providers): a Gitea or
     // Forgejo alias with an access token but no api_base_url must be rejected
     // at config-validation time. The old behavior silently defaulted to
@@ -27001,6 +27631,50 @@ allowed_users = ["U111"]
         assert_eq!(parsed.thread_replies, Some(false));
         assert!(!parsed.interrupt_on_new_message);
         assert!(!parsed.mention_only);
+    }
+
+    #[test]
+    async fn slack_thread_context_max_messages_defaults_to_zero() {
+        let parsed: SlackConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed.thread_context_max_messages, None);
+        assert_eq!(parsed.effective_thread_context_max_messages(), 0);
+    }
+
+    #[test]
+    async fn slack_thread_context_max_messages_deserializes_explicit_value() {
+        let parsed: SlackConfig =
+            serde_json::from_str(r#"{"thread_context_max_messages":7}"#).unwrap();
+        assert_eq!(parsed.thread_context_max_messages, Some(7));
+        assert_eq!(parsed.effective_thread_context_max_messages(), 7);
+    }
+
+    #[test]
+    async fn slack_thread_context_max_messages_allows_zero_to_disable_backfill() {
+        let parsed: SlackConfig =
+            serde_json::from_str(r#"{"thread_context_max_messages":0}"#).unwrap();
+        assert_eq!(parsed.thread_context_max_messages, Some(0));
+        assert_eq!(parsed.effective_thread_context_max_messages(), 0);
+    }
+
+    #[test]
+    async fn slack_thread_context_max_messages_rejects_values_above_slack_fetch_limit() {
+        let mut config = Config::default();
+        config.channels.slack.insert(
+            "default".to_string(),
+            SlackConfig {
+                thread_context_max_messages: Some(51),
+                ..Default::default()
+            },
+        );
+
+        let err = config
+            .validate()
+            .expect_err("values above the Slack fetch limit must be rejected")
+            .to_string();
+        assert!(
+            err.contains("channels.slack.default.thread_context_max_messages"),
+            "unexpected validation error: {err}",
+        );
     }
 
     #[test]
@@ -32694,6 +33368,34 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         assert_description(&email, ".observer_mode", "never modifies any IMAP flag");
     }
 
+    #[test]
+    async fn agent_workspace_path_is_a_settable_property() {
+        let mut workspace = crate::multi_agent::AgentWorkspaceConfig::default();
+
+        let path = workspace
+            .prop_fields()
+            .into_iter()
+            .find(|field| field.name == "agent_workspace.path")
+            .expect("workspace path property");
+        assert_eq!(path.kind, crate::config::PropKind::String);
+        assert_eq!(path.display_value, crate::config::UNSET_DISPLAY);
+
+        workspace
+            .set_prop("agent_workspace.path", "/srv/zeroclaw/assistant")
+            .unwrap();
+        assert_eq!(
+            workspace.path,
+            Some(std::path::PathBuf::from("/srv/zeroclaw/assistant"))
+        );
+        assert_eq!(
+            workspace.get_prop("agent_workspace.path").unwrap(),
+            "/srv/zeroclaw/assistant"
+        );
+
+        workspace.set_prop("agent_workspace.path", "").unwrap();
+        assert_eq!(workspace.path, None);
+    }
+
     #[cfg(feature = "schema-export")]
     #[test]
     async fn generated_config_types_keep_schema_descriptions() {
@@ -35608,6 +36310,247 @@ allowed_users = []
             .expect("two-member same-channel peer group must validate cleanly");
     }
 
+    const PEER_GROUP_CHANNEL_DANGLING_WARNING: &str = "peer_group_channel_dangling";
+
+    #[test]
+    async fn collect_warnings_flags_peer_group_dangling_alias_with_suggestion() {
+        let mut config = multi_agent_test_config();
+        // A second configured telegram alias close enough to the typo below
+        // to be a plausible "did you mean" suggestion.
+        config
+            .channels
+            .telegram
+            .insert("alerts".to_string(), TelegramConfig::default());
+        let group = crate::multi_agent::PeerGroupConfig {
+            channel: "telegram.alert".into(),
+            agents: vec![crate::multi_agent::AgentAlias::new("alpha")],
+            ..crate::multi_agent::PeerGroupConfig::default()
+        };
+        config.peer_groups.insert("team_chat".to_string(), group);
+
+        let warnings = warnings_with_code(&config, PEER_GROUP_CHANNEL_DANGLING_WARNING);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "expected exactly one warning: {warnings:?}"
+        );
+        let warning = &warnings[0];
+        assert_eq!(warning.path, "peer_groups.team_chat.channel");
+        assert!(
+            warning.message.contains("team_chat"),
+            "message should name the offending group: {}",
+            warning.message
+        );
+        assert!(
+            warning.message.contains("telegram.alert"),
+            "message should name the bad ref: {}",
+            warning.message
+        );
+        assert!(
+            warning
+                .message
+                .contains("did you mean \"telegram.alerts\"?"),
+            "message should suggest the near-match configured alias: {}",
+            warning.message
+        );
+    }
+
+    #[test]
+    async fn collect_warnings_flags_peer_group_dangling_alias_without_suggestion() {
+        let mut config = multi_agent_test_config();
+        // Only "draft" is configured; "zz" is not a plausible typo of it.
+        let group = crate::multi_agent::PeerGroupConfig {
+            channel: "telegram.zz".into(),
+            agents: vec![crate::multi_agent::AgentAlias::new("alpha")],
+            ..crate::multi_agent::PeerGroupConfig::default()
+        };
+        config.peer_groups.insert("team_chat".to_string(), group);
+
+        let warnings = warnings_with_code(&config, PEER_GROUP_CHANNEL_DANGLING_WARNING);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "expected exactly one warning: {warnings:?}"
+        );
+        assert!(
+            !warnings[0].message.contains("did you mean"),
+            "no near-match should mean no suggestion: {}",
+            warnings[0].message
+        );
+    }
+
+    #[test]
+    async fn collect_warnings_peer_group_suggestion_is_deterministic_on_ties() {
+        let mut config = multi_agent_test_config();
+        // "alerta" and "alerts" are both distance 1 from the typo "alert";
+        // the classifier sorts known_aliases, so the lexicographically first
+        // candidate must win regardless of HashMap iteration order.
+        config
+            .channels
+            .telegram
+            .insert("alerts".to_string(), TelegramConfig::default());
+        config
+            .channels
+            .telegram
+            .insert("alerta".to_string(), TelegramConfig::default());
+        let group = crate::multi_agent::PeerGroupConfig {
+            channel: "telegram.alert".into(),
+            agents: vec![crate::multi_agent::AgentAlias::new("alpha")],
+            ..crate::multi_agent::PeerGroupConfig::default()
+        };
+        config.peer_groups.insert("team_chat".to_string(), group);
+
+        let warnings = warnings_with_code(&config, PEER_GROUP_CHANNEL_DANGLING_WARNING);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "expected exactly one warning: {warnings:?}"
+        );
+        assert!(
+            warnings[0]
+                .message
+                .contains("did you mean \"telegram.alerta\"?"),
+            "equidistant candidates must resolve to the lexicographically first alias: {}",
+            warnings[0].message
+        );
+    }
+
+    #[test]
+    async fn collect_warnings_peer_group_trailing_dot_ref_warns_without_suggestion() {
+        let mut config = multi_agent_test_config();
+        // A trailing dot leaves an empty alias; that is dangling (warn) but
+        // is not a typo of anything, so no "did you mean" — the distance
+        // floor would otherwise propose an unrelated short alias.
+        config
+            .channels
+            .telegram
+            .insert("ab".to_string(), TelegramConfig::default());
+        let group = crate::multi_agent::PeerGroupConfig {
+            channel: "telegram.".into(),
+            agents: vec![crate::multi_agent::AgentAlias::new("alpha")],
+            ..crate::multi_agent::PeerGroupConfig::default()
+        };
+        config.peer_groups.insert("team_chat".to_string(), group);
+
+        let warnings = warnings_with_code(&config, PEER_GROUP_CHANNEL_DANGLING_WARNING);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "expected exactly one warning: {warnings:?}"
+        );
+        assert!(
+            !warnings[0].message.contains("did you mean"),
+            "an empty alias must never produce a suggestion: {}",
+            warnings[0].message
+        );
+    }
+
+    #[test]
+    async fn collect_warnings_flags_peer_group_channel_type_unconfigured() {
+        let mut config = multi_agent_test_config();
+        // "foobar" is not a channel type the schema knows at all, so
+        // `get_map_keys("channels.foobar")` is `None` and the classifier
+        // reports the type itself as unconfigured. (A recognized type with
+        // zero aliases — e.g. bare `discord` here — returns `Some(vec![])`
+        // and takes the alias-not-found branch instead; see the next test.)
+        let group = crate::multi_agent::PeerGroupConfig {
+            channel: "foobar.ops".into(),
+            agents: vec![crate::multi_agent::AgentAlias::new("alpha")],
+            ..crate::multi_agent::PeerGroupConfig::default()
+        };
+        config.peer_groups.insert("team_chat".to_string(), group);
+
+        let warnings = warnings_with_code(&config, PEER_GROUP_CHANNEL_DANGLING_WARNING);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "expected exactly one warning: {warnings:?}"
+        );
+        assert!(
+            warnings[0].message.contains("foobar.ops"),
+            "message should name the bad ref: {}",
+            warnings[0].message
+        );
+        assert!(
+            warnings[0]
+                .message
+                .contains("no [channels.foobar.*] block is configured"),
+            "message should use the type-unconfigured reason: {}",
+            warnings[0].message
+        );
+        assert!(
+            !warnings[0].message.contains("did you mean"),
+            "an unconfigured type has no aliases to suggest: {}",
+            warnings[0].message
+        );
+    }
+
+    #[test]
+    async fn collect_warnings_flags_peer_group_known_type_with_no_aliases() {
+        let mut config = multi_agent_test_config();
+        // "discord" IS a recognized schema channel type, so even with zero
+        // configured aliases `get_map_keys("channels.discord")` returns
+        // `Some(vec![])` — the classifier reports the type as configured
+        // and the warning takes the alias-not-found reason.
+        let group = crate::multi_agent::PeerGroupConfig {
+            channel: "discord.ops".into(),
+            agents: vec![crate::multi_agent::AgentAlias::new("alpha")],
+            ..crate::multi_agent::PeerGroupConfig::default()
+        };
+        config.peer_groups.insert("team_chat".to_string(), group);
+
+        let warnings = warnings_with_code(&config, PEER_GROUP_CHANNEL_DANGLING_WARNING);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "expected exactly one warning: {warnings:?}"
+        );
+        assert!(
+            warnings[0]
+                .message
+                .contains("[channels.discord.ops] is not configured"),
+            "message should use the alias-not-found reason: {}",
+            warnings[0].message
+        );
+        assert!(
+            !warnings[0].message.contains("did you mean"),
+            "zero configured aliases means nothing to suggest: {}",
+            warnings[0].message
+        );
+    }
+
+    #[test]
+    async fn collect_warnings_silent_for_valid_peer_group_dotted_channel() {
+        let mut config = multi_agent_test_config();
+        let group = crate::multi_agent::PeerGroupConfig {
+            channel: "telegram.draft".into(),
+            agents: vec![crate::multi_agent::AgentAlias::new("alpha")],
+            ..crate::multi_agent::PeerGroupConfig::default()
+        };
+        config.peer_groups.insert("team_chat".to_string(), group);
+
+        assert!(
+            warnings_with_code(&config, PEER_GROUP_CHANNEL_DANGLING_WARNING).is_empty(),
+            "a valid dotted alias must not warn"
+        );
+    }
+
+    #[test]
+    async fn collect_warnings_silent_for_bare_type_peer_group_channel() {
+        let mut config = multi_agent_test_config();
+        let group = crate::multi_agent::PeerGroupConfig {
+            channel: "telegram".into(),
+            agents: vec![crate::multi_agent::AgentAlias::new("alpha")],
+            ..crate::multi_agent::PeerGroupConfig::default()
+        };
+        config.peer_groups.insert("team_chat".to_string(), group);
+
+        assert!(
+            warnings_with_code(&config, PEER_GROUP_CHANNEL_DANGLING_WARNING).is_empty(),
+            "a bare type-wide ref must never warn, even though it authorizes every alias"
+        );
+    }
+
     #[test]
     async fn config_validate_rejects_classifier_provider_pointing_at_missing_alias() {
         // Use the SHARED `typed_provider_refs` validation loop — same error
@@ -36318,6 +37261,194 @@ allowed_users = []
                 .iter()
                 .any(|w| w.code == "cross_provider_summary_model"),
             "agent-level summary_provider override must suppress the warning"
+        );
+    }
+
+    const WA_INERT_WARNING: &str = "whatsapp_chat_policy_inert";
+    const WA_OPEN_GROUPS_WARNING: &str = "whatsapp_empty_group_allowlist_permits_all";
+
+    /// A Web channel in business mode: the chat policies are accepted and never
+    /// consulted, and dm_policy DEFAULTS to allowlist, so the operator believes
+    /// the channel is gated when every DM is answered.
+    #[test]
+    async fn whatsapp_business_mode_flags_inert_chat_policies() {
+        let toml = r#"
+[channels.whatsapp.shop]
+enabled = true
+mode = "business"
+session_path = "/tmp/wa-session"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let warnings = warnings_with_code(&cfg, WA_INERT_WARNING);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.path == "channels.whatsapp.shop.dm_policy"),
+            "default dm_policy under business mode must be flagged: {warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.message.contains("personal")),
+            "the warning should name the mode that would honour it: {warnings:?}"
+        );
+    }
+
+    /// Personal mode consults the policies, so there is nothing to warn about.
+    #[test]
+    async fn whatsapp_personal_mode_does_not_flag_chat_policies() {
+        let toml = r#"
+[channels.whatsapp.shop]
+enabled = true
+mode = "personal"
+session_path = "/tmp/wa-session"
+allowed_groups = ["123@g.us"]
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(
+            warnings_with_code(&cfg, WA_INERT_WARNING).is_empty(),
+            "personal mode honours the policies and must not warn"
+        );
+    }
+
+    /// A Cloud-API channel has no Web transport, so neither warning applies.
+    /// Without this guard the check would fire for every Cloud user.
+    #[test]
+    async fn whatsapp_cloud_channel_is_not_flagged() {
+        let toml = r#"
+[channels.whatsapp.cloud]
+enabled = true
+phone_number_id = "1234567890"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(warnings_with_code(&cfg, WA_INERT_WARNING).is_empty());
+        assert!(warnings_with_code(&cfg, WA_OPEN_GROUPS_WARNING).is_empty());
+    }
+
+    /// A disabled channel cannot answer anything, so it must stay quiet.
+    #[test]
+    async fn whatsapp_disabled_channel_is_not_flagged() {
+        let toml = r#"
+[channels.whatsapp.shop]
+enabled = false
+mode = "business"
+session_path = "/tmp/wa-session"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(warnings_with_code(&cfg, WA_INERT_WARNING).is_empty());
+        assert!(warnings_with_code(&cfg, WA_OPEN_GROUPS_WARNING).is_empty());
+    }
+
+    /// The group gate runs in BOTH modes and returns true when the list is
+    /// empty, which makes the default the open case.
+    #[test]
+    async fn whatsapp_empty_allowed_groups_is_flagged() {
+        let toml = r#"
+[channels.whatsapp.shop]
+enabled = true
+mode = "personal"
+session_path = "/tmp/wa-session"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let warnings = warnings_with_code(&cfg, WA_OPEN_GROUPS_WARNING);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(warnings[0].path, "channels.whatsapp.shop.allowed_groups");
+    }
+
+    /// An explicit list is the closed case and must not warn.
+    #[test]
+    async fn whatsapp_populated_allowed_groups_is_not_flagged() {
+        let toml = r#"
+[channels.whatsapp.shop]
+enabled = true
+mode = "personal"
+session_path = "/tmp/wa-session"
+allowed_groups = ["123@g.us"]
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(warnings_with_code(&cfg, WA_OPEN_GROUPS_WARNING).is_empty());
+    }
+
+    /// The remediation the warning itself recommends must SILENCE the warning.
+    /// Under personal mode the channel gate drops every group message when
+    /// group_policy = "ignore", so an empty list permits nothing. Warning here
+    /// told the operator to set exactly this and then kept firing after they
+    /// did, which is the defect this test pins.
+    #[test]
+    async fn whatsapp_personal_ignore_groups_is_not_flagged() {
+        let toml = r#"
+[channels.whatsapp.shop]
+enabled = true
+mode = "personal"
+session_path = "/tmp/wa-session"
+group_policy = "ignore"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(
+            warnings_with_code(&cfg, WA_OPEN_GROUPS_WARNING).is_empty(),
+            "group_policy = \"ignore\" drops every group message, so an empty \
+             allowed_groups permits nothing and the warning must not fire"
+        );
+    }
+
+    /// group_policy = "all" is the explicit opt-in to open group access. An
+    /// empty list is then consistent with a deliberate choice, not an accident,
+    /// and reporting it as unsafe would flag intent as error.
+    #[test]
+    async fn whatsapp_personal_all_groups_is_not_flagged() {
+        let toml = r#"
+[channels.whatsapp.shop]
+enabled = true
+mode = "personal"
+session_path = "/tmp/wa-session"
+group_policy = "all"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(
+            warnings_with_code(&cfg, WA_OPEN_GROUPS_WARNING).is_empty(),
+            "group_policy = \"all\" is an explicit opt-in to open groups and must \
+             not be reported as an unintended configuration"
+        );
+    }
+
+    /// Business mode never consults group_policy, so the list is the only gate
+    /// and an empty one really does admit every group. This is the positive
+    /// case that must survive narrowing the warning.
+    #[test]
+    async fn whatsapp_business_empty_allowed_groups_is_flagged() {
+        let toml = r#"
+[channels.whatsapp.shop]
+enabled = true
+mode = "business"
+session_path = "/tmp/wa-session"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let warnings = warnings_with_code(&cfg, WA_OPEN_GROUPS_WARNING);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "business mode with an empty allowed_groups must still warn: {warnings:?}"
+        );
+        assert_eq!(warnings[0].path, "channels.whatsapp.shop.allowed_groups");
+    }
+
+    /// Business mode ignores group_policy entirely, so even the value that
+    /// silences the warning under personal mode must NOT silence it here.
+    /// Without this, narrowing the check could be over-applied and reopen the
+    /// original bug from the other side.
+    #[test]
+    async fn whatsapp_business_ignore_group_policy_still_flagged() {
+        let toml = r#"
+[channels.whatsapp.shop]
+enabled = true
+mode = "business"
+session_path = "/tmp/wa-session"
+group_policy = "ignore"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            warnings_with_code(&cfg, WA_OPEN_GROUPS_WARNING).len(),
+            1,
+            "group_policy is inert under business mode, so it must not silence \
+             the open-groups warning"
         );
     }
 

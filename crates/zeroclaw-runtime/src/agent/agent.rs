@@ -94,12 +94,20 @@ pub fn tool_dispatcher_for_provider(
     }
 }
 
+// Debug so a failing routing assertion can print which variant and which
+// source it actually got; without it the test just says "assertion failed".
+#[derive(Debug)]
 pub(crate) enum RoutedApproval {
     /// Use this response. `decider` names the channel that answered, for audit
     /// attribution; `None` for a bridge-synthesized fail-closed deny.
+    ///
+    /// `source` says whether a human actually decided. `decider` cannot answer
+    /// that on its own: it is also `None` when a single non-fan-out channel
+    /// relays a real operator answer.
     Decided {
         response: zeroclaw_api::channel::ChannelApprovalResponse,
         decider: Option<String>,
+        source: zeroclaw_api::channel::ApprovalSource,
     },
     /// Explicit `InheritOriginator` — defer to the originating-channel fan-out.
     Fallthrough,
@@ -117,22 +125,45 @@ pub(crate) async fn resolve_routed_approval(
         .find(|(name, _)| name.as_str() == route.approver_channel)
         .map(|(name, channel)| (name.clone(), Arc::clone(channel)));
 
-    let reason: &str = if let Some((channel_name, channel)) = approver {
-        let dur = std::time::Duration::from_secs(route.timeout_secs.max(1));
-        match tokio::time::timeout(dur, channel.request_approval(recipient, request)).await {
-            Ok(Ok(Some(response))) => {
-                return RoutedApproval::Decided {
-                    response,
-                    decider: Some(channel_name),
-                };
+    // `source` is tracked alongside `reason` so the fail-closed deny below can
+    // say WHY no operator decided, rather than leaving the caller to guess from
+    // a missing decider.
+    let (reason, source): (&str, zeroclaw_api::channel::ApprovalSource) =
+        if let Some((channel_name, channel)) = approver {
+            let dur = std::time::Duration::from_secs(route.timeout_secs.max(1));
+            // Attributed, not legacy: if the approver channel synthesizes its own
+            // `Some(Deny)` (its inner timeout firing before this outer one), that
+            // is a runtime denial and must not be relabelled as the approver's
+            // decision just because a response came back.
+            match tokio::time::timeout(dur, channel.request_approval_attributed(recipient, request))
+                .await
+            {
+                Ok(Ok(Some(attributed))) => {
+                    return RoutedApproval::Decided {
+                        response: attributed.response,
+                        decider: Some(channel_name),
+                        source: attributed.source,
+                    };
+                }
+                Ok(Ok(None)) => (
+                    "approver returned no decision",
+                    zeroclaw_api::channel::ApprovalSource::Unreachable,
+                ),
+                Ok(Err(_)) => (
+                    "approver channel unreachable",
+                    zeroclaw_api::channel::ApprovalSource::Unreachable,
+                ),
+                Err(_) => (
+                    "approver timed out",
+                    zeroclaw_api::channel::ApprovalSource::TimedOut,
+                ),
             }
-            Ok(Ok(None)) => "approver returned no decision",
-            Ok(Err(_)) => "approver channel unreachable",
-            Err(_) => "approver timed out",
-        }
-    } else {
-        "approver channel not registered"
-    };
+        } else {
+            (
+                "approver channel not registered",
+                zeroclaw_api::channel::ApprovalSource::Unavailable,
+            )
+        };
 
     match route.on_no_approver {
         zeroclaw_config::autonomy::OnNoApprover::Deny => {
@@ -151,6 +182,10 @@ pub(crate) async fn resolve_routed_approval(
             RoutedApproval::Decided {
                 response: zeroclaw_api::channel::ChannelApprovalResponse::Deny,
                 decider: None,
+                // The runtime denied this, not a person. Carrying the specific
+                // reason lets the tool result say so instead of reporting a
+                // user denial that never happened.
+                source,
             }
         }
         zeroclaw_config::autonomy::OnNoApprover::InheritOriginator => {
@@ -233,12 +268,18 @@ impl zeroclaw_api::channel::Channel for RoutedApprovalChannel {
         match resolve_routed_approval(&self.handles, &self.route, recipient, request).await {
             // The deciding approver's name travels on the response itself;
             // `None` for a bridge-synthesized fail-closed deny.
-            RoutedApproval::Decided { response, decider } => {
-                Ok(Some(zeroclaw_api::channel::AttributedApprovalResponse {
-                    response,
-                    decided_by: decider,
-                }))
-            }
+            //
+            // Cross-crate construction: `AttributedApprovalResponse` is
+            // `#[non_exhaustive]`, so struct-literal syntax is forbidden from
+            // here. Build via the dedicated constructors.
+            RoutedApproval::Decided {
+                response,
+                decider,
+                source,
+            } => Ok(Some(
+                zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(response, source)
+                    .with_decider_opt(decider),
+            )),
             // No originating channel to inherit on this path; let the gate apply
             // the non-interactive default (auto-deny).
             RoutedApproval::Fallthrough => Ok(None),
@@ -2285,8 +2326,16 @@ impl Agent {
             });
         }
 
-        let mut loop_history = provider_messages;
-        let mut loop_new_messages: Vec<ChatMessage> = Vec::new();
+        // Split provider_messages: loop_history gets past turns only,
+        // loop_new_messages gets this turn's user message so the hook
+        // can observe/modify it. Seed loop_history with the user message so
+        // the provider sees it without clone-and-append.
+        let split_idx = provider_messages
+            .iter()
+            .rposition(|m| m.role == "user")
+            .unwrap_or(provider_messages.len());
+        let mut loop_history = provider_messages[..split_idx].to_vec();
+        let mut loop_new_messages: Vec<ChatMessage> = provider_messages[split_idx..].to_vec();
 
         let knobs = crate::agent::loop_::LoopKnobs {
             dedup_enabled: false,
@@ -2411,6 +2460,10 @@ impl Agent {
                 None,
             );
         }
+        // Pop the original user message (pushed before the loop) so the
+        // replayed version — which includes the user message, possibly
+        // modified by the hook.
+        self.history.pop();
         for replayed in Self::replay_loop_messages(&loop_new_messages) {
             self.history.push(replayed);
         }
@@ -2428,8 +2481,10 @@ impl Agent {
         // tool-free exchange (exactly one assistant message), mirroring the
         // old "no tool calls" put condition.
         if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key)
-            && loop_new_messages.len() == 1
-            && loop_new_messages[0].role == "assistant"
+            && loop_new_messages.len() == 2
+            && loop_new_messages
+                .last()
+                .is_some_and(|m| m.role == "assistant")
         {
             #[allow(clippy::cast_possible_truncation)]
             let _ = cache.put(key, &effective_model, &response, usage.output_tokens as u32);
@@ -2608,7 +2663,14 @@ impl Agent {
             });
         }
 
-        let mut loop_history = provider_messages;
+        // Split provider_messages: loop_history gets past turns, user_msg_for_loop
+        // seeds round 0's round_added so the hook can observe/modify the user message.
+        let split_idx = provider_messages
+            .iter()
+            .rposition(|m| m.role == "user")
+            .unwrap_or(provider_messages.len());
+        let mut loop_history = provider_messages[..split_idx].to_vec();
+        let user_msg_for_loop: Vec<ChatMessage> = provider_messages[split_idx..].to_vec();
 
         let approval_bridge: Option<Box<dyn zeroclaw_api::channel::Channel>> =
             self.channel_handles.ask_user.as_ref().map(|handles| {
@@ -2663,25 +2725,42 @@ impl Agent {
                 });
             }
 
+            let mut round_added: Vec<ChatMessage> = if round == 0 {
+                user_msg_for_loop.clone()
+            } else {
+                Vec::new()
+            };
+
             // Steering drain: each accepted mid-turn message becomes its own
             // enriched user turn in both transcripts before the next round.
             for steering_message in crate::agent::loop_::drain_steering_messages(&mut steering_rx) {
-                self.append_streamed_user_message_to_history(
-                    &steering_message,
-                    &mut new_msgs,
-                    &turn_id,
-                )
-                .await;
-                if let Some(ConversationMessage::Chat(user_msg)) = new_msgs.last() {
-                    loop_history.push(user_msg.clone());
+                // Mirror the enrichment logic from append_streamed_user_message_to_history
+                // but route through round_added instead of self.history/new_msgs.
+                if self.auto_save {
+                    let store_start = std::time::Instant::now();
+                    let store_result = self
+                        .memory
+                        .store(
+                            "user_msg",
+                            &steering_message,
+                            MemoryCategory::Conversation,
+                            self.memory_session_id.as_deref(),
+                        )
+                        .await;
+                    self.observer.record_event(&ObserverEvent::MemoryStore {
+                        category: MemoryCategory::Conversation.to_string(),
+                        backend: self.memory.name().to_string(),
+                        duration: store_start.elapsed(),
+                        success: store_result.is_ok(),
+                        channel: Some(self.channel_name.clone()),
+                        agent_alias: self.observer_agent_alias(),
+                        turn_id: Some(turn_id.clone()),
+                    });
                 }
+                let now = self.current_turn_datetime().format("%Y-%m-%d %H:%M:%S %Z");
+                let enriched = format!("[{now}] {steering_message}");
+                round_added.push(ChatMessage::user(enriched));
             }
-
-            // Per-round append-log: the loop mirrors every message it adds to
-            // `loop_history` into this capture at push time, on success AND
-            // error exits — never derived from history indices, which the
-            // loop's own preflight pruning can invalidate.
-            let mut round_added: Vec<ChatMessage> = Vec::new();
             let round_loop = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                 Some(cost_context.clone()),
                 crate::agent::tool_receipts::scope_receipts(
@@ -2809,10 +2888,17 @@ impl Agent {
                 );
             }
 
-            // Replay everything the loop appended this round into the
-            // conversation history and the persistence capture.
-            let single_text_exchange =
-                round == 0 && round_added.len() == 1 && round_added[0].role == "assistant";
+            // round_added now contains the user message for round 0;
+            // a single tool-free exchange is [user, assistant].
+            let single_text_exchange = round == 0
+                && round_added.len() == 2
+                && round_added.first().is_some_and(|m| m.role == "user")
+                && round_added.last().is_some_and(|m| m.role == "assistant");
+
+            if round == 0 {
+                self.history.pop();
+                new_msgs.pop();
+            }
             for replayed in Self::replay_loop_messages(&round_added) {
                 new_msgs.push(replayed.clone());
                 self.history.push(replayed);
@@ -9499,12 +9585,21 @@ mod approval_route_tests {
             behavior: StubBehavior::Answer(ChannelApprovalResponse::Approve),
         }]);
         match resolve_routed_approval(&h, &route("ops", OnNoApprover::Deny), "r", &req()).await {
-            RoutedApproval::Decided { response, decider } => {
+            RoutedApproval::Decided {
+                response,
+                decider,
+                source,
+            } => {
                 assert_eq!(response, ChannelApprovalResponse::Approve);
                 assert_eq!(
                     decider.as_deref(),
                     Some("ops"),
                     "decider names the approver"
+                );
+                assert_eq!(
+                    source,
+                    zeroclaw_api::channel::ApprovalSource::Operator,
+                    "an approver's answer is an operator decision"
                 );
             }
             RoutedApproval::Fallthrough => panic!("expected a routed decision"),
@@ -9515,9 +9610,22 @@ mod approval_route_tests {
     async fn unregistered_approver_fails_closed_by_default() {
         let h = registry(vec![]);
         match resolve_routed_approval(&h, &route("ops", OnNoApprover::Deny), "r", &req()).await {
-            RoutedApproval::Decided { response, decider } => {
+            RoutedApproval::Decided {
+                response,
+                decider,
+                source,
+            } => {
                 assert_eq!(response, ChannelApprovalResponse::Deny, "fail-closed deny");
                 assert!(decider.is_none(), "synthetic deny has no decider");
+                // The regression this guards: a fail-closed deny is Some(Deny)
+                // with no decider, so anything inferring "a user decided" from
+                // the presence of a response reports a denial nobody made.
+                assert_eq!(
+                    source,
+                    zeroclaw_api::channel::ApprovalSource::Unavailable,
+                    "an unregistered approver is a runtime denial, not a user's"
+                );
+                assert!(source.is_runtime_fail_closed());
             }
             RoutedApproval::Fallthrough => panic!("default policy must NOT fall through"),
         }
@@ -9546,13 +9654,17 @@ mod approval_route_tests {
             behavior: StubBehavior::NoDecision,
         }]);
         let out = resolve_routed_approval(&h, &route("ops", OnNoApprover::Deny), "r", &req()).await;
-        assert!(matches!(
-            out,
-            RoutedApproval::Decided {
-                response: ChannelApprovalResponse::Deny,
-                ..
-            }
-        ));
+        assert!(
+            matches!(
+                out,
+                RoutedApproval::Decided {
+                    response: ChannelApprovalResponse::Deny,
+                    source: zeroclaw_api::channel::ApprovalSource::Unreachable,
+                    ..
+                }
+            ),
+            "an approver that returns no decision is a runtime denial: {out:?}"
+        );
     }
 
     // The route timeout (1s) fires and cancels the stub's long sleep, so this
@@ -9564,13 +9676,19 @@ mod approval_route_tests {
             behavior: StubBehavior::Slow,
         }]);
         let out = resolve_routed_approval(&h, &route("ops", OnNoApprover::Deny), "r", &req()).await;
-        assert!(matches!(
-            out,
-            RoutedApproval::Decided {
-                response: ChannelApprovalResponse::Deny,
-                ..
-            }
-        ));
+        // A timeout is the case most easily mistaken for a user's "no": the
+        // route returns Some(Deny) exactly as an operator denial would.
+        assert!(
+            matches!(
+                out,
+                RoutedApproval::Decided {
+                    response: ChannelApprovalResponse::Deny,
+                    source: zeroclaw_api::channel::ApprovalSource::TimedOut,
+                    ..
+                }
+            ),
+            "a timed-out approver is a runtime denial, not a user's: {out:?}"
+        );
     }
 
     use zeroclaw_api::channel::Channel as _;
