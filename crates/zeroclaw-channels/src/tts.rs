@@ -529,8 +529,9 @@ impl TtsProvider for EdgeTtsProvider {
         };
 
         // Drain stderr concurrently so a verbose child cannot deadlock on a
-        // full pipe while we wait for it to exit.
-        let stderr_reader = {
+        // full pipe while we wait for it to exit. The join is bounded below so
+        // a descendant holding the pipe open cannot hang synthesis forever.
+        let mut stderr_reader = {
             use tokio::io::AsyncReadExt;
             let pipe = _artifact.child_mut().stderr.take().expect("stderr piped");
             zeroclaw_spawn::spawn!(async move {
@@ -541,23 +542,40 @@ impl TtsProvider for EdgeTtsProvider {
             })
         };
 
-        let status = match tokio::time::timeout(self.timeout, _artifact.child_mut().wait()).await {
-            Ok(Ok(status)) => status,
-            Ok(Err(err)) => {
-                let child = _artifact.child_mut();
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                return Err(err).context("Failed to wait for edge-tts subprocess");
-            }
-            Err(_elapsed) => {
-                let child = _artifact.child_mut();
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                bail!("Edge TTS subprocess timed out");
-            }
-        };
-
-        let stderr = stderr_reader.await.unwrap_or_default();
+        // Cancel the reader and reap the task once its pipe can no longer
+        // reach EOF (e.g. a descendant kept stderr open).
+        let (status, stderr) =
+            match tokio::time::timeout(self.timeout, _artifact.child_mut().wait()).await {
+                Ok(Ok(status)) => {
+                    let stderr = match tokio::time::timeout(self.timeout, &mut stderr_reader).await
+                    {
+                        Ok(Ok(buf)) => buf,
+                        Ok(Err(_)) => String::new(),
+                        Err(_elapsed) => {
+                            stderr_reader.abort();
+                            let _ = stderr_reader.await;
+                            String::new()
+                        }
+                    };
+                    (status, stderr)
+                }
+                Ok(Err(err)) => {
+                    stderr_reader.abort();
+                    let _ = stderr_reader.await;
+                    let child = _artifact.child_mut();
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    return Err(err).context("Failed to wait for edge-tts subprocess");
+                }
+                Err(_elapsed) => {
+                    stderr_reader.abort();
+                    let _ = stderr_reader.await;
+                    let child = _artifact.child_mut();
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    bail!("Edge TTS subprocess timed out");
+                }
+            };
 
         if !status.success() {
             bail!("edge-tts failed (exit {}): {}", status, stderr);
@@ -1588,5 +1606,76 @@ mod tests {
 
         let _ = std::fs::remove_file(&script_path);
         let _ = std::fs::remove_file(&out_path_file);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edge_tts_descendant_holding_stderr_is_bounded_and_cleaned() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // The direct `edge-tts` child exits successfully, but a background
+        // descendant keeps the stderr pipe open, so EOF never arrives. The
+        // reader join must be bounded (not hang synthesis) and the artifact
+        // must still be removed.
+        let temp_dir = std::env::temp_dir();
+        let script_path =
+            temp_dir.join(format!("zeroclaw_edgetts_test_{}.sh", uuid::Uuid::new_v4()));
+        let out_path_file = temp_dir.join(format!(
+            "zeroclaw_edgetts_path_{}.txt",
+            uuid::Uuid::new_v4()
+        ));
+        let pid_file = temp_dir.join(format!("zeroclaw_edgetts_pid_{}.txt", uuid::Uuid::new_v4()));
+        let script = script_path.to_str().unwrap();
+        let sidecar = out_path_file.to_str().unwrap();
+        let pidfile = pid_file.to_str().unwrap();
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\n\
+                 out=\n\
+                 prev=\n\
+                 for a in \"$@\"; do\n\
+                   if [ \"$prev\" = \"--write-media\" ]; then out=\"$a\"; fi\n\
+                   prev=\"$a\"\n\
+                 done\n\
+                 printf '%s' \"$out\" > \"{sidecar}\"\n\
+                 : > \"$out\"\n\
+                 sleep 100 &\n\
+                 echo $! > \"{pidfile}\"\n\
+                 exit 0\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let provider = EdgeTtsProvider::new_with_binary("test", script);
+        let bounded = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            provider.synthesize("hello", "en-US-AriaNeural"),
+        )
+        .await;
+        let _ = bounded
+            .unwrap_or_else(|_| panic!("synthesis must not hang on a stderr pipe that never EOFs"));
+
+        // Clean up the descendant that held the pipe open.
+        if let Some(pid) = std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|pid| pid.trim().parse::<i32>().ok())
+        {
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &pid.to_string()])
+                .status();
+        }
+
+        let artifact =
+            std::fs::read_to_string(&out_path_file).expect("script must record output path");
+        assert!(
+            !std::path::Path::new(&artifact).exists(),
+            "artifact must be removed even when stderr never reaches EOF: {artifact}"
+        );
+
+        let _ = std::fs::remove_file(&script_path);
+        let _ = std::fs::remove_file(&out_path_file);
+        let _ = std::fs::remove_file(&pid_file);
     }
 }
