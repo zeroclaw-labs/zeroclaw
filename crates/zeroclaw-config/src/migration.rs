@@ -1363,6 +1363,74 @@ vision_model_provider = "qwen-intl"
     }
 
     #[test]
+    fn v2_bare_family_with_canonical_and_legacy_alias_rewrites_to_default() {
+        // A bare `openai` reference alongside BOTH a canonical `openai` entry
+        // and a legacy `openai-codex` entry: the exact raw `openai` key
+        // establishes the source, so the unrelated codex alias must not strand
+        // the canonical reference on the configless path.
+        let raw = r#"
+schema_version = 2
+
+[providers.models.openai]
+api_key = "sk-openai-test"
+model = "m"
+
+[providers.models.openai-codex]
+api_key = "sk-codex-test"
+model = "m2"
+
+[multimodal]
+vision_model_provider = "openai"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("openai.default"),
+            "bare canonical family with its own entry must rewrite to its default alias"
+        );
+        assert!(
+            cfg.providers.models.find("openai", "default").is_some(),
+            "canonical openai entry must live at openai.default"
+        );
+        assert!(
+            cfg.providers.models.find("openai", "codex").is_some(),
+            "openai-codex entry must live at openai.codex"
+        );
+    }
+
+    #[test]
+    fn v2_collided_default_alias_left_bare() {
+        // `qwen` and `qwen-intl` both normalize to qwen.default with different
+        // endpoint variants; the retained slot is ambiguous. A bare `qwen`
+        // reference must NOT be rewritten to it (it could silently pick the
+        // wrong endpoint/credential), so it stays bare (fail-closed).
+        let raw = r#"
+schema_version = 2
+
+[providers.models.qwen]
+api_key = "sk-qwen-test"
+model = "m"
+
+[providers.models.qwen-intl]
+api_key = "sk-qwen-intl-test"
+model = "m2"
+
+[multimodal]
+vision_model_provider = "qwen"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("qwen"),
+            "a collided default alias slot must not capture a bare family reference"
+        );
+        assert!(
+            cfg.providers.models.find("qwen", "default").is_some(),
+            "the collided qwen.default slot still migrates"
+        );
+    }
+
+    #[test]
     fn v1_legacy_vision_reference_migrates_through_chain() {
         // No `schema_version` implies V1. The `model_providers` shape feeds
         // V2 `[providers.models]`, and the V2->V3 step canonicalizes the

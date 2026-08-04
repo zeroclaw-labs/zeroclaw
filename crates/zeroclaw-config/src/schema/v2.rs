@@ -241,36 +241,35 @@ impl V2Config {
                 "providers.fallback eradicated"
             );
         }
-        // Capture the raw provider keys and global default_provider BEFORE
-        // canonicalization: the vision-reference rewrite needs them to know
-        // whether a bare family name has its own source entry, rather than
-        // inferring that from the post-canonicalization alias count alone.
-        let raw_provider_keys: Vec<String> = match new_providers.get("models") {
-            Some(toml::Value::Table(models)) => models.keys().cloned().collect(),
-            _ => Vec::new(),
-        };
+        // Capture the global default_provider BEFORE canonicalization: it is a
+        // source for the (family, default) slot it folds into, and the
+        // vision-reference rewrite needs full source provenance.
         let g_default_provider = new_providers
             .get("default_provider")
             .and_then(toml::Value::as_str)
             .map(str::to_string);
-        let mut aliased_models = alias_provider_models(new_providers.remove("models"));
+        let (mut aliased_models, mut provenance) =
+            alias_provider_models(new_providers.remove("models"));
 
         // V3 ModelProviderConfig absorbed the V2 [providers] globals
         // (api_key, default_model, etc.) inline; fold them down.
         fold_providers_globals_into_models(&mut new_providers, &mut aliased_models);
+        // Record the global default_provider as a producer of its folded slot.
+        if let Some(dp) = g_default_provider.as_deref() {
+            let (family, alias, _) = normalize_provider_type(dp, "default");
+            provenance
+                .entry((family, alias))
+                .or_default()
+                .insert(dp.to_string());
+        }
 
         // A bare `[multimodal] vision_model_provider = "<family>"` cannot select
         // the migrated V3 alias: runtime resolves only dotted `<family>.<alias>`
         // refs to typed alias config, so a bare ref reaches the legacy
         // configless construction path and loses the alias's api_key. Rewrite
-        // it to the family's unambiguous migrated alias when the family itself
-        // has a source entry.
-        rewrite_bare_vision_provider_reference(
-            &mut passthrough,
-            &aliased_models,
-            &raw_provider_keys,
-            g_default_provider.as_deref(),
-        );
+        // it to the migrated alias only when every producer of that alias slot
+        // is equivalent to the reference's canonical variant.
+        rewrite_bare_vision_provider_reference(&mut passthrough, &provenance);
 
         // V3 dropped cost.prices: the V2 keys ("<provider>/<model>")
         // don't carry the V3 alias path, so remapping is fragile.
@@ -747,12 +746,27 @@ fn normalize_provider_type(
     (raw.to_string(), incoming_alias.to_string(), extras)
 }
 
-fn alias_provider_models(models: Option<toml::Value>) -> toml::Table {
+/// Alias-wrap V2 flat provider models into the V3 `<family>.<alias>` shape.
+/// Returns the migrated table together with a provenance map recording, for
+/// each `(family, alias)` slot, every raw provider key that wrote to it. The
+/// rewrite of a vision reference needs that provenance so it cannot infer
+/// source selection from the post-canonicalization alias count (variants such
+/// as `qwen-code` collapse onto the same `qwen.default` slot).
+fn alias_provider_models(
+    models: Option<toml::Value>,
+) -> (
+    toml::Table,
+    std::collections::HashMap<(String, String), std::collections::BTreeSet<String>>,
+) {
     let flat = match models {
         Some(toml::Value::Table(t)) => t,
-        _ => return toml::Table::new(),
+        _ => return (toml::Table::new(), std::collections::HashMap::new()),
     };
     let mut aliased = toml::Table::new();
+    let mut provenance: std::collections::HashMap<
+        (String, String),
+        std::collections::BTreeSet<String>,
+    > = std::collections::HashMap::new();
     for (provider_id, mut config) in flat {
         // Colon-URL form like `"anthropic-custom:https://..."`: split the URL
         // out into `uri` and use only the prefix as the seed for normalization.
@@ -780,13 +794,17 @@ fn alias_provider_models(models: Option<toml::Value>) -> toml::Table {
         }
 
         let entry = aliased
-            .entry(provider_type)
+            .entry(provider_type.clone())
             .or_insert_with(|| toml::Value::Table(toml::Table::new()));
         if let toml::Value::Table(entry_table) = entry {
-            entry_table.insert(alias, config);
+            entry_table.insert(alias.clone(), config);
         }
+        provenance
+            .entry((provider_type, alias))
+            .or_default()
+            .insert(provider_id);
     }
-    aliased
+    (aliased, provenance)
 }
 
 /// Rewrite a `[multimodal] vision_model_provider` reference to the dotted
@@ -795,19 +813,18 @@ fn alias_provider_models(models: Option<toml::Value>) -> toml::Table {
 /// [`alias_provider_models`], so legacy spellings select their migrated alias:
 /// `grok` -> `xai.default`, `openai-codex` -> `openai.codex`,
 /// `opencode-go` -> `opencode.go`, and dot-bearing `llama.cpp` ->
-/// `llamacpp.default`. A bare family is only rewritten when the family name
-/// itself has a source entry (a raw provider key or the global
-/// `default_provider`) and migrated to exactly one alias; a reference that
-/// names a specific alias (dotted, or legacy with a fixed alias) is rewritten
-/// when that alias exists. Colon-URL refs and already-valid dotted refs that
-/// do not canonicalize to a configured alias are left untouched, and an
-/// unknown family stays as-is so the runtime keeps failing closed on an
-/// unknown provider.
+/// `llamacpp.default`. The rewrite only happens when EVERY raw producer of the
+/// target `(family, alias)` slot canonicalizes to the same variant as the
+/// reference (same family, alias, and extras). That preserves raw-provider
+/// provenance: a bare or variant reference is never redirected to an alias
+/// supplied by a differently-named source, and a collided slot (e.g. `qwen`
+/// plus `qwen-intl` both writing `qwen.default`) is left unchanged. Colon-URL
+/// refs and already-valid dotted refs that do not canonicalize to a configured
+/// alias are left untouched, and an unknown family stays as-is so the runtime
+/// keeps failing closed on an unknown provider.
 fn rewrite_bare_vision_provider_reference(
     passthrough: &mut toml::Table,
-    aliased_models: &toml::Table,
-    raw_provider_keys: &[String],
-    global_default_provider: Option<&str>,
+    provenance: &std::collections::HashMap<(String, String), std::collections::BTreeSet<String>>,
 ) {
     let Some(toml::Value::Table(multimodal)) = passthrough.get_mut("multimodal") else {
         return;
@@ -820,55 +837,30 @@ fn rewrite_bare_vision_provider_reference(
     }
     let (canonical_family, canonical_alias, reference_extras) =
         normalize_provider_type(reference, "default");
-    let Some(toml::Value::Table(family_table)) = aliased_models.get(&canonical_family) else {
-        // Unknown family, or a dotted ref that does not canonicalize to a
-        // migrated family ("openrouter.default", "custom.rag_bot") — preserve.
+    let Some(producers) = provenance.get(&(canonical_family.clone(), canonical_alias.clone()))
+    else {
+        // No source produced the alias the reference names (unknown family,
+        // an already-valid dotted ref, or the reference's variant is absent) —
+        // preserve.
         return;
     };
-    // A raw provider key (or the global default_provider) is a source for the
-    // reference's variant when it canonicalizes to the same family, alias, and
-    // variant extras (endpoint/auth_mode/uri). This preserves raw-provider
-    // provenance: a reference to a variant must not select a differently-named
-    // source's credentials (e.g. `qwen-intl` must not pick canonical `qwen`).
-    let source_is_equivalent = |key: &str| {
+    if producers.is_empty() {
+        return;
+    }
+    // Only rewrite when every producer is the same variant as the reference.
+    // A producer from a differently-named source (bare `qwen` vs `qwen-intl`
+    // both collapsing onto `qwen.default`) makes the selection ambiguous, so
+    // the reference stays as-is rather than silently picking a credential.
+    let all_equivalent = producers.iter().all(|key| {
         let (family, alias, extras) = normalize_provider_type(key, "default");
         family == canonical_family && alias == canonical_alias && extras == reference_extras
-    };
-    let has_equivalent_source = raw_provider_keys.iter().any(|k| source_is_equivalent(k))
-        || global_default_provider
-            .map(source_is_equivalent)
-            .unwrap_or(false);
-    let target_alias = if reference.as_str() == canonical_family {
-        // A bare canonical family name: rewrite only when the family name has
-        // its own source entry (a raw provider key of that exact name, or the
-        // global default_provider) AND its default alias is the sole migrated
-        // alias. A default alias synthesized from a DIFFERENT legacy variant
-        // (openai-codex -> openai.codex, qwen-code -> qwen.default with the
-        // code endpoint) must not redirect a bare family reference to it —
-        // that would silently change provider and credential selection.
-        let has_own_source = raw_provider_keys.iter().any(|k| k == reference)
-            || global_default_provider == Some(reference.as_str());
-        if !has_own_source {
-            return;
-        }
-        let mut aliases: Vec<&str> = family_table.keys().map(String::as_str).collect();
-        aliases.sort_unstable();
-        if aliases.len() != 1 || aliases[0] != canonical_alias {
-            return;
-        }
-        aliases[0].to_string()
-    } else {
-        // A legacy spelling that maps to a specific variant: rewrite only when
-        // that alias was migrated AND the reference's variant has an
-        // equivalent raw source (same family/alias/extras).
-        if !family_table.contains_key(&canonical_alias) || !has_equivalent_source {
-            return;
-        }
-        canonical_alias
-    };
+    });
+    if !all_equivalent {
+        return;
+    }
     multimodal.insert(
         "vision_model_provider".to_string(),
-        toml::Value::String(format!("{canonical_family}.{target_alias}")),
+        toml::Value::String(format!("{canonical_family}.{canonical_alias}")),
     );
 }
 
