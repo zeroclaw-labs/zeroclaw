@@ -22,8 +22,6 @@ use solana_sdk::transaction::Transaction;
 /// The SPL System Program's `NonceInitialize`/`AdvanceNonceAccount` program.
 /// `system_instruction::advance_nonce_account` builds the instruction.
 const SYSTEM_PROGRAM_ID: &str = "11111111111111111111111111111111";
-const SYSVAR_RECENT_BLOCKHASHES_ID: &str = "SysvarRecentB1ockHashes11111111111111111111";
-const SYSVAR_RENT_ID: &str = "SysvarRent111111111111111111111111111111111";
 
 /// A settlement that passed chain verification and is ready to broadcast.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,6 +94,9 @@ pub fn validate_payee(payee: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SYSVAR_RECENT_BLOCKHASHES_ID: &str = "SysvarRecentB1ockHashes11111111111111111111";
+    const SYSVAR_RENT_ID: &str = "SysvarRent111111111111111111111111111111111";
 
     fn keypair() -> Keypair {
         Keypair::new()
@@ -214,7 +215,10 @@ mod tests {
     #[test]
     fn devnet_only_no_mainnet() {
         // No mainnet RPC constant exists in this module by construction.
-        let src = include_str!(file!());
+        // Use a path relative to this file: `file!()` expands against the
+        // workspace root when the module is compiled behind a feature flag,
+        // which doubles the crate path and breaks include_str!.
+        let src = include_str!("solana_settlement.rs");
         assert!(
             !src.contains("api.mainnet-beta.solana.com"),
             "settlement module must not reference mainnet"
