@@ -8231,4 +8231,260 @@ mod tests {
         let cb_data = "some_other_action:data";
         assert!(cb_data.strip_prefix("approval:").is_none());
     }
+
+    // ── listen() integration tests (with mock server) ──────────────────────
+
+    /// listen() dispatch boundary test: ambient group message in mention_only
+    /// mode is silently skipped — no ChannelMessage delivered, no pairing
+    /// prompt (sendMessage) sent.
+    #[tokio::test]
+    async fn listen_mention_only_skips_ambient_group_without_pairing_prompt() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getMe$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "id": 100, "username": "zeroclaw_bot", "is_bot": true }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/setMyCommands$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": true })),
+            )
+            .mount(&mock_server)
+            .await;
+
+        // getUpdates always returns the ambient group message.
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/getUpdates$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": [{
+                    "update_id": 1,
+                    "message": {
+                        "message_id": 1,
+                        "chat": { "id": -100123456, "type": "group" },
+                        "from": { "id": 999, "username": "stranger" },
+                        "text": "ambient conversation about lunch"
+                    }
+                }]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // No sendMessage should be called (no pairing prompt).
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": {} })),
+            )
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ChannelMessage>(8);
+
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(Vec::new), // empty peers → pairing mode
+            true,               // mention_only
+        )
+        .with_api_base(mock_server.uri());
+
+        let listen_fut = async {
+            let _ = ch.listen(tx).await;
+        };
+
+        tokio::time::timeout(std::time::Duration::from_millis(500), listen_fut)
+            .await
+            .ok();
+
+        // No ChannelMessage should have been delivered.
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// listen() boundary: when getMe fails (bot_username unavailable), an
+    /// ambient group message in mention_only mode is skipped without sending
+    /// a pairing prompt.
+    #[tokio::test]
+    async fn listen_mention_only_fails_closed_getme_when_bot_username_unknown() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getMe$"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "ok": false,
+                "description": "Unauthorized"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/setMyCommands$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": true })),
+            )
+            .mount(&mock_server)
+            .await;
+
+        // getUpdates always returns an ambient group message.
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/getUpdates$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": [{
+                    "update_id": 1,
+                    "message": {
+                        "message_id": 1,
+                        "chat": { "id": -100123456, "type": "group" },
+                        "from": { "id": 999, "username": "stranger" },
+                        "text": "ambient conversation"
+                    }
+                }]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // No sendMessage (pairing prompt) should be sent.
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": {} })),
+            )
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ChannelMessage>(8);
+
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(Vec::new),
+            true, // mention_only
+        )
+        .with_api_base(mock_server.uri());
+
+        let listen_fut = async {
+            let _ = ch.listen(tx).await;
+        };
+
+        tokio::time::timeout(std::time::Duration::from_millis(500), listen_fut)
+            .await
+            .ok();
+
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// listen() boundary: a group message that mentions the bot is dispatched
+    /// as a ChannelMessage — no pairing prompt (sendMessage) is sent.
+    #[tokio::test]
+    async fn listen_mention_only_dispatches_mentioned_group_message() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getMe$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "id": 100, "username": "zeroclaw_bot", "is_bot": true }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/setMyCommands$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": true })),
+            )
+            .mount(&mock_server)
+            .await;
+
+        // Allow sendChatAction (typing indicator) — errors are ignored by listen().
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendChatAction$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": true })),
+            )
+            .mount(&mock_server)
+            .await;
+
+        // No sendMessage should be sent — the channel message is dispatched, not answered.
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": {} })),
+            )
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        // getUpdates always returns a message that mentions the bot from an authorized peer.
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/getUpdates$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": [{
+                    "update_id": 1,
+                    "message": {
+                        "message_id": 1,
+                        "chat": { "id": -100123456, "type": "group" },
+                        "from": { "id": 42, "username": "alice" },
+                        "text": "hey @zeroclaw_bot can you help?"
+                    }
+                }]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ChannelMessage>(8);
+
+        // Alice is authorized via wildcard peer resolver.
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            true, // mention_only
+        )
+        .with_api_base(mock_server.uri());
+
+        let listen_fut = async {
+            let _ = ch.listen(tx).await;
+        };
+
+        tokio::time::timeout(std::time::Duration::from_millis(500), listen_fut)
+            .await
+            .ok();
+
+        // A ChannelMessage should have been delivered.
+        let delivered = rx.try_recv();
+        assert!(
+            delivered.is_ok(),
+            "expected a ChannelMessage to be dispatched"
+        );
+        let msg = delivered.unwrap();
+        assert_eq!(msg.channel_alias.as_deref(), Some("telegram_test_alias"));
+        // Mention text is preserved in content (normalize_incoming_content trims only).
+        assert!(msg.content.contains("zeroclaw_bot"));
+    }
 }
