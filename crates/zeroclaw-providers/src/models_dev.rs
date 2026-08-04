@@ -69,7 +69,6 @@ impl Modalities {
     /// an explicit `"image"` token in `input` flips it on. Malformed
     /// catalog entries (missing `modalities` or empty `input`) yield
     /// `false`; callers fall back to the family default in that case.
-    #[allow(dead_code)] // TODO: wire into provider.capabilities() and orchestrator supports_vision() call site (follow-up work)
     fn supports_image_input(&self) -> bool {
         self.input.iter().any(|m| m == "image")
     }
@@ -77,7 +76,9 @@ impl Modalities {
 
 pub(crate) type Catalog = HashMap<String, ProviderEntry>;
 
-static CACHED_CATALOG: OnceCell<Arc<Catalog>> = OnceCell::const_new();
+/// Process-wide cached catalog. Public so `OpenAiCompatibleModelProvider::capabilities_for_model()`
+/// can do a non-blocking lookup for per-model vision support.
+pub(crate) static CACHED_CATALOG: OnceCell<Arc<Catalog>> = OnceCell::const_new();
 
 /// Fetch and parse the models.dev catalog fresh (no process cache). Used by the
 /// live-pricing refresher so its fallback tracks upstream changes per cycle;
@@ -242,10 +243,8 @@ pub(crate) fn context_windows_from_catalog(
 /// catalog entry has no `modalities` block at all — callers should fall
 /// back to the family default in that case.
 ///
-/// Pure / sync / no network. This is the parser half of the modalities work;
-/// wiring the result into `provider.capabilities()` and the orchestrator
-/// `supports_vision()` call site is a separate follow-up change.
-#[allow(dead_code)] // TODO: wire into provider.capabilities() and orchestrator supports_vision() call site (follow-up work)
+/// Pure / sync / no network. Used by `OpenAiCompatibleModelProvider::capabilities_for_model()`
+/// to resolve per-model vision capability from the models.dev catalog.
 pub(crate) fn model_supports_vision(
     catalog: &Catalog,
     provider_key: &str,
