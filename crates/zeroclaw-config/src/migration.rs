@@ -1313,6 +1313,56 @@ vision_model_provider = "qwen"
     }
 
     #[test]
+    fn v2_variant_vision_reference_with_only_canonical_source_left_alone() {
+        // `qwen-intl` names the international variant, but only the canonical
+        // `qwen` entry exists (which migrates to qwen.default with no intl
+        // endpoint). The reference must NOT be rewritten to qwen.default, since
+        // that would silently drop the variant's endpoint/credentials intent.
+        let raw = r#"
+schema_version = 2
+
+[providers.models.qwen]
+api_key = "sk-qwen-test"
+model = "m"
+
+[multimodal]
+vision_model_provider = "qwen-intl"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("qwen-intl"),
+            "variant reference with only a canonical source must stay as-is"
+        );
+        assert!(
+            cfg.providers.models.find("qwen", "default").is_some(),
+            "the canonical qwen entry must still migrate to qwen.default"
+        );
+    }
+
+    #[test]
+    fn v2_variant_vision_reference_with_equivalent_source_migrates() {
+        // With the matching variant source present, `qwen-intl` rewrites to
+        // its own migrated alias (endpoint carried on the alias entry).
+        let raw = r#"
+schema_version = 2
+
+[providers.models.qwen-intl]
+api_key = "sk-qwen-intl-test"
+model = "m"
+
+[multimodal]
+vision_model_provider = "qwen-intl"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("qwen.default"),
+            "variant reference with an equivalent source must rewrite"
+        );
+    }
+
+    #[test]
     fn v1_legacy_vision_reference_migrates_through_chain() {
         // No `schema_version` implies V1. The `model_providers` shape feeds
         // V2 `[providers.models]`, and the V2->V3 step canonicalizes the
