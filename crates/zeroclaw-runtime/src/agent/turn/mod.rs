@@ -144,6 +144,13 @@ pub struct ToolLoop<'a> {
 async fn enforce_reported_budget(
     history: &mut Vec<ChatMessage>,
     reported_input_tokens: usize,
+    // Estimated token count of the exact message population that produced
+    // `reported_input_tokens` (the request built from `prepared_messages`,
+    // before any assistant/tool-result output for this iteration was
+    // appended to `history`). Using a fresher estimate of `history` here
+    // would mix a later, larger transcript into the calibration ratio's
+    // denominator and understate the calibrated post-trim count.
+    reported_population_estimated: usize,
     context_token_budget: usize,
     event_tx: Option<&tokio::sync::mpsc::Sender<TurnEvent>>,
     observer: &dyn crate::observability::Observer,
@@ -151,7 +158,7 @@ async fn enforce_reported_budget(
     if context_token_budget == 0 || reported_input_tokens <= context_token_budget {
         return;
     }
-    let pre_trim_estimated = crate::agent::history::estimate_history_tokens(history);
+    let pre_trim_estimated = reported_population_estimated;
     let taken = std::mem::take(history);
     let mut result = crate::agent::history_trim::trim_to_reported_budget(
         taken,
@@ -710,6 +717,12 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             image_cache.as_deref_mut(),
         )
         .await?;
+        // Snapshot the estimate for the exact message population sent to the
+        // provider this iteration, before any assistant/tool-result output is
+        // appended to `history`. `enforce_reported_budget` below needs this as
+        // the calibration denominator, not a later, larger `history` estimate.
+        let reported_population_estimated =
+            crate::agent::history::estimate_history_tokens(&prepared_messages.messages);
 
         // Fail closed on the local budget BEFORE announcing the request.
         // `announce_llm_request` emits the user-visible `WaitingOnModel`
@@ -979,6 +992,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 enforce_reported_budget(
                     turn_state.history,
                     reported as usize,
+                    reported_population_estimated,
                     context_token_budget,
                     event_tx.as_ref(),
                     observer,
@@ -1249,6 +1263,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             enforce_reported_budget(
                 turn_state.history,
                 reported as usize,
+                reported_population_estimated,
                 context_token_budget,
                 event_tx.as_ref(),
                 observer,
@@ -2313,7 +2328,15 @@ mod reported_budget_tests {
         let estimated = crate::agent::history::estimate_history_tokens(&history);
         let reported = estimated * 4;
         let budget = reported / 2;
-        enforce_reported_budget(&mut history, reported, budget, None, &NoopObserver).await;
+        enforce_reported_budget(
+            &mut history,
+            reported,
+            estimated,
+            budget,
+            None,
+            &NoopObserver,
+        )
+        .await;
         assert!(
             history.len() < before,
             "over-budget no-tool history must be trimmed before it is persisted"
@@ -2334,7 +2357,15 @@ mod reported_budget_tests {
         ];
         let before: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
         let estimated = crate::agent::history::estimate_history_tokens(&history);
-        enforce_reported_budget(&mut history, estimated, estimated * 4, None, &NoopObserver).await;
+        enforce_reported_budget(
+            &mut history,
+            estimated,
+            estimated,
+            estimated * 4,
+            None,
+            &NoopObserver,
+        )
+        .await;
         let after: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
         assert_eq!(after, before, "within-budget history is untouched");
     }
@@ -2343,7 +2374,7 @@ mod reported_budget_tests {
     async fn enforce_noop_when_budget_disabled() {
         let mut history = big_history();
         let before: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
-        enforce_reported_budget(&mut history, usize::MAX, 0, None, &NoopObserver).await;
+        enforce_reported_budget(&mut history, usize::MAX, usize::MAX, 0, None, &NoopObserver).await;
         let after: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
         assert_eq!(after, before, "zero budget disables enforcement");
     }
@@ -2355,7 +2386,15 @@ mod reported_budget_tests {
         let reported = estimated * 4;
         let budget = reported / 2;
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        enforce_reported_budget(&mut history, reported, budget, Some(&tx), &NoopObserver).await;
+        enforce_reported_budget(
+            &mut history,
+            reported,
+            estimated,
+            budget,
+            Some(&tx),
+            &NoopObserver,
+        )
+        .await;
 
         let event = rx
             .recv()
@@ -2383,6 +2422,57 @@ mod reported_budget_tests {
         assert_eq!(
             tokens_after, expected,
             "tokens_after must reflect the final provider history (breadcrumb included)"
+        );
+    }
+
+    #[tokio::test]
+    async fn calibration_ignores_output_appended_after_the_measured_request() {
+        // `estimated` mirrors the population that actually produced `reported`
+        // (i.e. `prepared_messages`, before this iteration's assistant/tool
+        // output was appended). A large tool result appended to `history`
+        // after that point must not leak into the calibration denominator.
+        let mut history = big_history();
+        let estimated = crate::agent::history::estimate_history_tokens(&history);
+        let reported = estimated * 4;
+        let budget = reported / 2;
+
+        // Simulate a large tool result appended to `history` after the
+        // provider request was measured but before enforcement runs.
+        let late_tool_output = "y".repeat(5000);
+        history.push(ChatMessage::assistant(late_tool_output));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        enforce_reported_budget(
+            &mut history,
+            reported,
+            estimated,
+            budget,
+            Some(&tx),
+            &NoopObserver,
+        )
+        .await;
+
+        let event = rx
+            .recv()
+            .await
+            .expect("a trim must emit a HistoryTrimmed event");
+        let tokens_after = match event {
+            TurnEvent::HistoryTrimmed { tokens_after, .. } => {
+                tokens_after.expect("reported-budget trim must carry token accounting")
+            }
+            other => panic!("expected HistoryTrimmed, got {other:?}"),
+        };
+
+        // The calibration ratio must be computed against `estimated` (the
+        // pre-append population), not a fresh estimate of the post-append
+        // `history`, which would understate the ratio because the late tool
+        // output was never part of the provider-reported input.
+        let ratio = reported as f64 / estimated.max(1) as f64;
+        let expected = (crate::agent::history::estimate_history_tokens(&history) as f64 * ratio)
+            .round() as u64;
+        assert_eq!(
+            tokens_after, expected,
+            "calibration must use the measured-request population, not post-append history"
         );
     }
 }
