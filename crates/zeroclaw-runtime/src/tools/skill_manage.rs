@@ -1,25 +1,10 @@
 //! Skill management tools for the background review fork.
-//!
-//! Three Tool impls exposed to the forked review agent:
-//! - `skills_list`: enumerate installed skills (name, description, version).
-//! - `skill_view`: read a single skill's SKILL.md (YAML front-matter + body
-//!   preview) plus the names of files in `references/`, `templates/`,
-//!   `scripts/`.
-//! - `skill_manage`: mutating actions — `patch` (atomically rewrite the
-//!   SKILL.md YAML front-matter via SkillImprover), `write_file` (add a file
-//!   under `references/|templates/|scripts/`), `archive` (move to `.archive/`).
-//!
-//! Format follows the agentskills.io / Anthropic Agent Skills standard:
-//! single `SKILL.md` per skill, YAML front-matter at top, Markdown body below.
-//! These tools are NOT registered in the default tool registry — the review
-//! fork builds them on demand so the main agent can't accidentally invoke
-//! them.
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 
 const ARCHIVE_DIRNAME: &str = ".archive";
 const ALLOWED_FILE_PREFIXES: &[&str] = &["references/", "templates/", "scripts/"];
@@ -42,15 +27,6 @@ fn resolve_skill_dir(workspace_dir: &Path, slug: &str) -> Result<PathBuf> {
     Ok(skills_root(workspace_dir).join(slug))
 }
 
-/// Resolve `workspace/skills/<slug>` and verify the canonical resolved path is
-/// a non-symlinked directory inside the canonical skills root.
-///
-/// This is the OS-level boundary check that prevents a symlinked
-/// `workspace/skills/<slug>` from redirecting mutating operations outside the
-/// intended skills tree. The audit module already rejects symlinks *within* a
-/// skill at load time; this helper rejects them at the *root* before mutation.
-///
-/// Returns `(canonical_skills_root, canonical_skill_dir)`.
 fn safe_skill_dir(workspace_dir: &Path, slug: &str) -> Result<(PathBuf, PathBuf)> {
     let skill_dir = resolve_skill_dir(workspace_dir, slug)?;
     if !skill_dir.exists() {
@@ -112,7 +88,7 @@ impl Tool for SkillsListTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Failed to read skills directory: {e}")),
                 });
             }
@@ -121,7 +97,7 @@ impl Tool for SkillsListTool {
         if entries.is_empty() {
             return Ok(ToolResult {
                 success: true,
-                output: "0 installed skills.".to_string(),
+                output: "0 installed skills.".to_string().into(),
                 error: None,
             });
         }
@@ -136,7 +112,7 @@ impl Tool for SkillsListTool {
         }
         Ok(ToolResult {
             success: true,
-            output: out,
+            output: out.into(),
             error: None,
         })
     }
@@ -227,7 +203,7 @@ impl Tool for SkillViewTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(e.to_string()),
                 });
             }
@@ -239,7 +215,7 @@ impl Tool for SkillViewTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Skill '{slug}' not found: {e}")),
                 });
             }
@@ -271,7 +247,7 @@ impl Tool for SkillViewTool {
 
         Ok(ToolResult {
             success: true,
-            output,
+            output: output.into(),
             error: None,
         })
     }
@@ -379,7 +355,7 @@ impl Tool for SkillManageTool {
             "archive" => self.archive(slug).await,
             other => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Unknown action '{other}'. Valid: patch, write_file, archive"
                 )),
@@ -389,13 +365,6 @@ impl Tool for SkillManageTool {
 }
 
 impl SkillManageTool {
-    /// Run the install/load audit on a skill directory and roll back on
-    /// failure. Returns `Ok(())` on clean audit and an error message string
-    /// on failure (the caller decides how to surface it).
-    ///
-    /// `pre_snapshot` is the original SKILL.md content captured before the
-    /// mutation; if `Some`, audit failure restores it. For non-`patch` callers,
-    /// the `_unused` parameter exists so this helper has one signature.
     async fn post_mutation_audit(
         &self,
         slug: &str,
@@ -451,7 +420,7 @@ impl SkillManageTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(e.to_string()),
                 });
             }
@@ -460,7 +429,7 @@ impl SkillManageTool {
         if !md_path.exists() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Skill '{slug}' not found (no SKILL.md)")),
             });
         }
@@ -468,7 +437,7 @@ impl SkillManageTool {
         if md_path.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "SKILL.md for '{slug}' is a symlink — refusing patch"
                 )),
@@ -481,7 +450,7 @@ impl SkillManageTool {
         if content.len() > MAX_FILE_BYTES {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "patch content exceeds {MAX_FILE_BYTES} bytes ({} given)",
                     content.len()
@@ -493,15 +462,10 @@ impl SkillManageTool {
             .and_then(|v| v.as_str())
             .unwrap_or("Skill review");
 
-        // Check the kill switch before the cooldown so the agent gets a
-        // distinct, actionable error when improvement is disabled — otherwise
-        // both reasons collapse onto the cooldown message via
-        // `should_improve_skill`, and the agent wastes turns waiting for a
-        // cooldown that the disabled flag will never clear.
         if !self.config.enabled {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Skill improvement is disabled (enabled: false)".to_string()),
             });
         }
@@ -513,7 +477,7 @@ impl SkillManageTool {
         if !improver.should_improve_skill(slug) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Skill '{slug}' is on cooldown — try again later")),
             });
         }
@@ -533,19 +497,19 @@ impl SkillManageTool {
                 {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(err),
                     });
                 }
                 Ok(ToolResult {
                     success: true,
-                    output: format!("Patched skill '{slug}'."),
+                    output: format!("Patched skill '{slug}'.").into(),
                     error: None,
                 })
             }
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Patch failed: {e}")),
             }),
         }
@@ -557,7 +521,7 @@ impl SkillManageTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(e.to_string()),
                 });
             }
@@ -577,7 +541,7 @@ impl SkillManageTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "file_path must start with one of: {}",
                     ALLOWED_FILE_PREFIXES.join(", ")
@@ -587,14 +551,14 @@ impl SkillManageTool {
         if file_path.contains("..") || file_path.contains('\0') {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("file_path contains forbidden segment".to_string()),
             });
         }
         if content.len() > MAX_FILE_BYTES {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "content exceeds {MAX_FILE_BYTES} bytes ({} given)",
                     content.len()
@@ -615,7 +579,7 @@ impl SkillManageTool {
         if !canonical_target_parent.starts_with(&canonical_skill_dir) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("file_path escapes skill directory".to_string()),
             });
         }
@@ -625,7 +589,7 @@ impl SkillManageTool {
         if target.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("target path is a symlink — refusing write".to_string()),
             });
         }
@@ -653,7 +617,7 @@ impl SkillManageTool {
                 rollback_write(&target, pre_snapshot.as_deref(), target_existed).await;
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Post-write audit errored: {e}")),
                 });
             }
@@ -662,7 +626,7 @@ impl SkillManageTool {
             rollback_write(&target, pre_snapshot.as_deref(), target_existed).await;
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Wrote {file_path} but skill failed audit (rolled back): {}",
                     report.summary()
@@ -671,7 +635,7 @@ impl SkillManageTool {
         }
         Ok(ToolResult {
             success: true,
-            output: format!("Wrote {file_path} for skill '{slug}'."),
+            output: format!("Wrote {file_path} for skill '{slug}'.").into(),
             error: None,
         })
     }
@@ -683,7 +647,7 @@ impl SkillManageTool {
                 Err(e) => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(e.to_string()),
                     });
                 }
@@ -699,7 +663,7 @@ impl SkillManageTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Archive directory {ARCHIVE_DIRNAME} is a symlink — refusing archive"
                 )),
@@ -711,7 +675,7 @@ impl SkillManageTool {
         if !canonical_archive_dir.starts_with(&canonical_skills_root) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("archive directory escapes canonical skills root".to_string()),
             });
         }
@@ -727,14 +691,14 @@ impl SkillManageTool {
         if final_target.parent() != Some(canonical_archive_dir.as_path()) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("archive target escapes archive directory".to_string()),
             });
         }
         tokio::fs::rename(&canonical_skill_dir, &final_target).await?;
         Ok(ToolResult {
             success: true,
-            output: format!("Archived skill '{slug}' to {}", final_target.display()),
+            output: format!("Archived skill '{slug}' to {}", final_target.display()).into(),
             error: None,
         })
     }
@@ -993,7 +957,7 @@ mod tests {
 
     #[tokio::test]
     async fn skill_manage_patch_blocks_when_skill_is_on_cooldown() {
-        // Regression for #6683: with a non-zero cooldown configured, a skill
+        // with a non-zero cooldown configured, a skill
         // whose front-matter carries a fresh `updated_at` is on cooldown and
         // a patch must be refused with a structured error rather than writing.
         let dir = tempdir();
@@ -1032,7 +996,7 @@ mod tests {
 
     #[tokio::test]
     async fn skill_manage_patch_proceeds_when_skill_is_stale() {
-        // Regression for #6683: an `updated_at` older than cooldown_secs is
+        // an `updated_at` older than cooldown_secs is
         // stale and a patch must proceed.
         let dir = tempdir();
         let stale = (chrono::Utc::now() - chrono::Duration::seconds(7200)).to_rfc3339();
@@ -1062,7 +1026,7 @@ mod tests {
 
     #[tokio::test]
     async fn skill_manage_patch_proceeds_when_no_updated_at() {
-        // Regression for #6683: a skill with no `updated_at` is not on
+        // a skill with no `updated_at` is not on
         // cooldown — first patch must proceed even with a cooldown configured.
         let dir = tempdir();
         write_skill(dir.path(), "deploy", VALID_SKILL).await;
@@ -1300,7 +1264,6 @@ mod tests {
     }
 
     // ─── Symlink rejection (safe_skill_dir boundary) ────────
-    //
     // These tests verify that a symlinked `workspace/skills/<slug>` cannot be
     // used to redirect mutating operations outside the canonical skills root.
 

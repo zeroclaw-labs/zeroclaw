@@ -1,12 +1,12 @@
-//! `cargo generate installers` - render install surfaces (setup.bat,
-//! Containerfile, Dockerfiles, packaging, ...) from the canonical spec.
-//! install.sh@HEAD is the behavioral reference. The spec is the single source
-//! of truth; surfaces are derived and drift-checked. Surfaces are registered in
-//! one table so adding one is data, not control flow.
+//! `cargo generate installers` - render install surfaces from canonical route
+//! semantics and deterministic renderer bodies. The spec owns route policy;
+//! renderers own generated surface content; content outside generated zones is
+//! hand-authored. Every tracked surface is registered below and drift-checked.
 
 pub mod container;
 pub mod container_base;
 pub mod docker_tags;
+pub mod docs;
 pub mod flake;
 pub mod install_sh;
 pub mod packaging;
@@ -18,7 +18,7 @@ use spec::Selection as Sel;
 use std::path::{Path, PathBuf};
 
 /// A render: given the workspace root and the file's current content, produce
-/// the regenerated content (splicing only sentinel zones).
+/// either a whole-file rendering or a rendering with sentinel zones spliced.
 type Render = fn(&Path, &str) -> anyhow::Result<String>;
 
 /// One registered surface: a canonical name and the file it owns + how to
@@ -41,6 +41,36 @@ fn registry() -> Vec<Surface> {
             name: "setup-bat",
             file: "setup.bat",
             render: |root, cur| setup_bat::render_file(root, cur),
+        },
+        Surface {
+            name: "install-docs",
+            file: "docs/book/src/_snippets/install.md",
+            render: docs::render_file,
+        },
+        Surface {
+            name: "readme-unix-fast",
+            file: "README.md",
+            render: docs::render_readme_unix_fast_zone,
+        },
+        Surface {
+            name: "linux-unix-fast",
+            file: "docs/book/src/setup/linux.md",
+            render: docs::render_unix_fast_command_zone,
+        },
+        Surface {
+            name: "macos-unix-fast",
+            file: "docs/book/src/setup/macos.md",
+            render: docs::render_unix_fast_command_zone,
+        },
+        Surface {
+            name: "hardware-unix-fast",
+            file: "docs/book/src/hardware/subsystem.md",
+            render: docs::render_unix_fast_command_zone,
+        },
+        Surface {
+            name: "windows-prebuilt-guide",
+            file: "docs/book/src/setup/windows.md",
+            render: docs::render_windows_guide,
         },
         Surface {
             name: "containerfile",
@@ -80,16 +110,16 @@ fn registry() -> Vec<Surface> {
     ]
 }
 
-/// Dockerfile-family ARG default: ships Dist by default (all channels, no
-/// heavyweight), build-time overridable via --build-arg.
+/// Dockerfile-family ARG default: ships the lean standard Dist selection,
+/// build-time overridable via --build-arg.
 fn render_docker_arg(root: &Path, current: &str) -> anyhow::Result<String> {
     let body = container::render_features_arg(root, &Sel::Dist)?;
     let spliced = container::splice(current, "docker-features-arg", &body)?;
     container_base::splice_zones(root, &spliced)
 }
 
-/// Containerfile surface: standard image ships Dist (all channels, no
-/// heavyweight); fat image ships All (kitchen sink). Selections, not literals.
+/// Containerfile surface: standard image ships lean Dist; fat image ships All
+/// (kitchen sink). Selections, not literals.
 fn containerfile_surface() -> ContainerSurface {
     ContainerSurface {
         file: "Containerfile",
@@ -107,18 +137,25 @@ fn workspace_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-pub fn features(selection_id: &str) -> anyhow::Result<()> {
-    let menu = Sel::menu();
-    let selection = menu
-        .iter()
-        .find(|s| s.id() == selection_id)
-        .ok_or_else(|| {
-            anyhow::Error::msg(format!(
-                "unknown selection `{selection_id}` (known: {})",
-                menu.iter().map(|s| s.id()).collect::<Vec<_>>().join(", ")
-            ))
-        })?;
-    let list = spec::resolve_feature_list(&workspace_root(), selection)?;
+pub fn features(
+    selection_id: &str,
+    target: Option<&str>,
+    excluded: &[String],
+) -> anyhow::Result<()> {
+    let selection = Sel::from_id(selection_id).ok_or_else(|| {
+        anyhow::Error::msg(format!(
+            "unknown selection `{selection_id}` (known: {})",
+            Sel::named()
+                .iter()
+                .map(Sel::id)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    })?;
+    let list = spec::exclude_features(
+        spec::resolve_feature_list_for_target(&workspace_root(), &selection, target)?,
+        excluded,
+    )?;
     println!("{}", list.join(","));
     Ok(())
 }

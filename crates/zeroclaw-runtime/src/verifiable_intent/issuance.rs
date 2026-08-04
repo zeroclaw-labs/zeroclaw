@@ -1,8 +1,4 @@
 //! L2 and L3 credential issuance.
-//!
-//! Provides builders for constructing VI credentials with proper SD-JWT
-//! serialization and key binding. L1 issuance is out of scope (performed by
-//! external credential model_providers / issuers).
 
 use ring::signature::EcdsaKeyPair;
 use serde_json::json;
@@ -26,7 +22,6 @@ pub struct ImmediateL2Result {
 }
 
 /// Create an L2 Immediate-mode credential binding final checkout and payment values.
-///
 /// The caller must provide the serialized L1 SD-JWT and the user's signing key
 /// (the private key corresponding to L1 `cnf.jwk`).
 pub fn create_layer2_immediate(

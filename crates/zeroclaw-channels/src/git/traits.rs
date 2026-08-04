@@ -1,14 +1,4 @@
 //! `GitProvider` — the git-forge provider seam.
-//!
-//! The generic channel core (poll loop, dedup, routing, dispatch, draft
-//! throttle, comment chunking, mention gating, allowlist) lives in this `git`
-//! module and is provider-agnostic. Each forge — GitHub first, GitLab/Gitea
-//! next — implements `GitProvider`, owning ONLY what is forge-specific: auth,
-//! REST shapes, and payload→[`GitEvent`] normalization. Adding a provider must
-//! not require touching the core.
-//!
-//! Layer: contract. Implementations live under `git::providers::<forge>`;
-//! `git::channel` is the sole consumer.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -27,13 +17,6 @@ pub struct SelfIdentity {
     pub bot_login: String,
 }
 
-/// One provider fetch for a single (repo, stream): the normalized events,
-/// the cursor to advance the stream to, and feed-ETag bookkeeping.
-///
-/// The provider owns each stream's endpoint quirks (no-`since` endpoints
-/// filtered provider-side, pending-run-aware cursors, feed paging/304) and
-/// reports the resulting cursor via `advance_to`; the generic core only
-/// dedups, sorts, and dispatches.
 pub struct FetchPage {
     /// Normalized events surfaced this fetch (pre-dedup; the core dedups).
     pub events: Vec<GitEvent>,
@@ -61,7 +44,6 @@ pub enum ReactionTarget {
 }
 
 /// A git forge the channel can converse through. One implementation per forge.
-///
 /// Providers MUST be cheap to hold and internally cache their own auth/tokens;
 /// the core calls these per poll tick and per outbound message.
 #[async_trait]
@@ -112,4 +94,16 @@ pub trait GitProvider: Send + Sync {
         target: &ReactionTarget,
         emoji: &str,
     ) -> Result<(), GitChannelError>;
+
+    /// Low-level, provider-relative forge API call. The transport seam every
+    /// higher-level forge operation is built on: the provider prepends its API
+    /// base, attaches auth, sends `req`, and returns the status plus decoded
+    /// JSON body without raising on non-2xx (the caller inspects the forge's
+    /// own error envelope). This is what lets the `git_forge` tool carry a
+    /// resource/action vocabulary and a `raw` catch-all over one seam, without
+    /// a new trait method per operation.
+    async fn forge_request(
+        &self,
+        req: super::types::ForgeRequest,
+    ) -> Result<super::types::ForgeResponse, GitChannelError>;
 }

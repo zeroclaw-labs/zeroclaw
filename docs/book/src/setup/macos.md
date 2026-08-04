@@ -14,13 +14,15 @@ That is the whole install. Run it from a clone, or pipe it from `curl`:
 
 #### sh
 
+<!-- >>> generated:unix-fast-command by `cargo generate installers` - do not edit <<< -->
 ```sh
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | sh
 ```
+<!-- >>> end generated:unix-fast-command <<< -->
 
 </div>
 
-The installer picks a prebuilt binary or builds from source (interactive by default), installs to `~/.cargo/bin/zeroclaw`, and offers to run [`zeroclaw quickstart`](../getting-started/quickstart.md) for first-time setup. Pass `--help` for the full flag reference, or `--skip-quickstart` to install only.
+The [canonical installation paths](../getting-started/quickstart.md#install) explain the fast and guided routes, source fallback, app selection, PATH handoff, and the next Quickstart step.
 
 ### Homebrew
 
@@ -113,7 +115,7 @@ Re-run the installer, it detects the existing install and upgrades in place:
 #### sh
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash -s -- --skip-quickstart
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | sh -s -- --skip-quickstart
 zeroclaw service restart
 ```
 
@@ -187,7 +189,7 @@ rm -rf ~/.zeroclaw ~/.config/zeroclaw
 
 - **Homebrew config path mismatch.** The `brew services` daemon reads config from `$HOMEBREW_PREFIX/var/zeroclaw/`, not `~/.zeroclaw/`. If your service is reading stale config, check which one the daemon sees and set `ZEROCLAW_WORKSPACE` accordingly.
 - **First launch of the browser tool** downloads Chromium (~150 MB) via Playwright.
-- **Apple Silicon** and **Intel** builds are both released. The bootstrap script auto-detects. Homebrew auto-selects.
+- **Apple Silicon and Intel:** the bootstrap script detects the architecture and uses a matching prebuilt release artifact when one is available. If the release has no matching artifact, it falls back to a source build. Homebrew selects the appropriate package for the host.
 
 ## Next
 

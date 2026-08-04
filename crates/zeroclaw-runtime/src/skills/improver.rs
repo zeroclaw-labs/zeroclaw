@@ -1,19 +1,3 @@
-// Skill self-improvement: atomic writer + history-scanning helpers for the
-// background review fork (see `agent::loop_` post-turn hook + `tools::skill_manage`).
-//
-// Operates on `SKILL.md` with YAML front-matter — the agentskills.io
-// (Anthropic) standard format. The front-matter block lives between two
-// `---` delimiters at the top of the file; the Markdown body below carries
-// the actual skill instructions and is preserved verbatim on every patch.
-//
-// This module owns:
-// - `SkillImprover` — atomic temp+validate+rename for SKILL.md plus cooldown
-//   tracking (in-memory and durable on-disk via the YAML `updated_at` field).
-// - `extract_skill_executions_from_history` / `looks_like_failure` — surface a
-//   list of failed skill slugs from history that the review prompt can pass
-//   along as a hint ("these skills failed this run"), without those failures
-//   *gating* whether the fork runs.
-
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -39,11 +23,6 @@ impl SkillImprover {
         }
     }
 
-    /// Check whether a skill is eligible for improvement (enabled + cooldown expired).
-    ///
-    /// Combines an in-memory cooldown (fast path, per-process) with a durable
-    /// on-disk cooldown (`updated_at` field in `SKILL.md` front-matter) so
-    /// cooldowns survive process restarts.
     pub fn should_improve_skill(&self, slug: &str) -> bool {
         if !self.config.enabled {
             return false;
@@ -80,14 +59,6 @@ impl SkillImprover {
         elapsed.num_seconds() < self.config.cooldown_secs as i64
     }
 
-    /// Improve an existing skill file atomically.
-    ///
-    /// Writes to a temp file first, validates, then renames over the original.
-    /// Returns `Ok(Some(slug))` if the skill was improved.
-    ///
-    /// **Caller-gated:** this does NOT check `should_improve_skill` — callers
-    /// must check that themselves before invoking, so they can also skip the
-    /// (expensive) LLM call that produces `improved_content`.
     pub async fn improve_skill(
         &mut self,
         slug: &str,
@@ -178,7 +149,6 @@ pub fn validate_skill_content(content: &str) -> Result<()> {
 }
 
 /// Split a SKILL.md into (front_matter_text, body_text).
-///
 /// Returns `None` if the file doesn't start with `---\n` or has no closing
 /// `---` delimiter.
 fn split_front_matter(content: &str) -> Option<(String, String)> {
@@ -293,14 +263,6 @@ fn looks_like_failure(content: &str) -> bool {
         || lower.starts_with("exit code")
 }
 
-/// Extract skill tool executions from conversation history.
-///
-/// Returns `(skill_slug, succeeded)` pairs, one per dotted tool-result found.
-/// Handles two formats:
-/// - XML: `<tool_result name="slug.tool">…content…</tool_result>` (prompt-guided
-///   tool-calling)
-/// - Native: a `tool`-role message preceded by an `assistant` message whose
-///   content embeds a JSON tool-call with a dotted `"name": "slug.tool"`
 pub fn extract_skill_executions_from_history(history: &[ChatMessage]) -> Vec<(String, bool)> {
     let mut results: Vec<(String, bool)> = Vec::new();
     let mut seen = std::collections::HashSet::new();

@@ -213,6 +213,7 @@ export default function Cron() {
   const [formDeliveryChannel, setFormDeliveryChannel] = useState('');
   const [formDeliveryTo, setFormDeliveryTo] = useState('');
   const [formDeliveryBestEffort, setFormDeliveryBestEffort] = useState(true);
+  const [formUsesMemory, setFormUsesMemory] = useState(true);
   const [agentOptions, setAgentOptions] = useState<string[]>([]);
   const [boundChannels, setBoundChannels] = useState<AgentBoundChannel[]>([]);
   const [formError, setFormError] = useState<string | null>(null);
@@ -235,6 +236,7 @@ export default function Cron() {
     setFormDeliveryChannel('');
     setFormDeliveryTo('');
     setFormDeliveryBestEffort(true);
+    setFormUsesMemory(true);
     setFormError(null);
     setModalJob('add');
   };
@@ -275,6 +277,7 @@ export default function Cron() {
       setFormSessionTarget('isolated');
       setFormAllowedTools('');
     }
+    setFormUsesMemory(job.uses_memory ?? true);
     setFormError(null);
     setModalJob(job);
   };
@@ -386,7 +389,7 @@ export default function Cron() {
       if (isEditing) {
         const existingTimezone = scheduleTimezone(modalJob as CronJob);
         const timezone = formTimezone.trim();
-        const patch: { agent: string; name?: string; schedule?: string; tz?: string; clear_tz?: boolean; command?: string; prompt?: string } = {
+        const patch: { agent: string; name?: string; schedule?: string; tz?: string; clear_tz?: boolean; command?: string; prompt?: string; uses_memory?: boolean } = {
           // The gateway requires `agent` on every patch (it risk-gates a
           // command change); send the job's existing alias so a pure
           // name/schedule/prompt edit doesn't 422 with "missing field agent".
@@ -404,6 +407,7 @@ export default function Cron() {
         } else {
           patch.command = formCommand.trim();
         }
+        patch.uses_memory = formUsesMemory;
         const updated = await patchCronJob(
           (modalJob as CronJob).id,
           patch,
@@ -438,6 +442,7 @@ export default function Cron() {
             best_effort: formDeliveryBestEffort,
           };
         }
+        body.uses_memory = formUsesMemory;
         const job = await addCronJob(body);
         setJobs((prev) => [...prev, job]);
       }
@@ -834,6 +839,22 @@ export default function Cron() {
                   )}
                 </>
               )}
+
+              {/* Uses memory toggle */}
+              <div>
+                <label className="flex items-center gap-2 text-sm cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={formUsesMemory}
+                    onChange={(e) => setFormUsesMemory(e.target.checked)}
+                    className="accent-pc-accent"
+                  />
+                  <div>
+                    <span className="text-pc-text-secondary">{t('cron.uses_memory')}</span>
+                    <p className="text-xs text-pc-text-faint">{t('cron.uses_memory_help')}</p>
+                  </div>
+                </label>
+              </div>
 
               {/* Delivery section — scoped to the picked agent's channel
                   bindings. The channel composite + identity field

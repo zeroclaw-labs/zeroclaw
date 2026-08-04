@@ -1,8 +1,4 @@
 //! Arduino upload tool — agent generates code, uploads via arduino-cli.
-//!
-//! When user says "make a heart on the LED grid", the agent generates Arduino
-//! sketch code and calls this tool. ZeroClaw compiles and uploads it — no
-//! manual IDE or file editing.
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -63,7 +59,7 @@ impl Tool for ArduinoUploadTool {
         if code.trim().is_empty() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: String::new().into(),
                 error: Some("Code cannot be empty".into()),
             });
         }
@@ -72,7 +68,7 @@ impl Tool for ArduinoUploadTool {
         if Command::new("arduino-cli").arg("version").output().is_err() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: String::new().into(),
                 error: Some(
                     "arduino-cli not found. Install it: https://arduino.github.io/arduino-cli/"
                         .into(),
@@ -88,7 +84,7 @@ impl Tool for ArduinoUploadTool {
         if let Err(e) = tokio::fs::create_dir_all(&sketch_dir).await {
             return Ok(ToolResult {
                 success: false,
-                output: format!("Failed to create sketch dir: {}", e),
+                output: format!("Failed to create sketch dir: {}", e).into(),
                 error: Some(e.to_string()),
             });
         }
@@ -97,7 +93,7 @@ impl Tool for ArduinoUploadTool {
             let _ = tokio::fs::remove_dir_all(&temp_dir).await;
             return Ok(ToolResult {
                 success: false,
-                output: format!("Failed to write sketch: {}", e),
+                output: format!("Failed to write sketch: {}", e).into(),
                 error: Some(e.to_string()),
             });
         }
@@ -116,7 +112,7 @@ impl Tool for ArduinoUploadTool {
                 let _ = tokio::fs::remove_dir_all(&temp_dir).await;
                 return Ok(ToolResult {
                     success: false,
-                    output: format!("arduino-cli compile failed: {}", e),
+                    output: format!("arduino-cli compile failed: {}", e).into(),
                     error: Some(e.to_string()),
                 });
             }
@@ -127,7 +123,7 @@ impl Tool for ArduinoUploadTool {
             let _ = tokio::fs::remove_dir_all(&temp_dir).await;
             return Ok(ToolResult {
                 success: false,
-                output: format!("Compile failed:\n{}", stderr),
+                output: format!("Compile failed:\n{}", stderr).into(),
                 error: Some("Arduino compile error".into()),
             });
         }
@@ -143,7 +139,7 @@ impl Tool for ArduinoUploadTool {
                 let _ = tokio::fs::remove_dir_all(&temp_dir).await;
                 return Ok(ToolResult {
                     success: false,
-                    output: format!("arduino-cli upload failed: {}", e),
+                    output: format!("arduino-cli upload failed: {}", e).into(),
                     error: Some(e.to_string()),
                 });
             }
@@ -155,7 +151,7 @@ impl Tool for ArduinoUploadTool {
             let stderr = String::from_utf8_lossy(&upload_output.stderr);
             return Ok(ToolResult {
                 success: false,
-                output: format!("Upload failed:\n{}", stderr),
+                output: format!("Upload failed:\n{}", stderr).into(),
                 error: Some("Arduino upload error".into()),
             });
         }

@@ -3,7 +3,7 @@ use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::Config;
 
 pub struct CronRunTool {
@@ -46,7 +46,7 @@ impl Tool for CronRunTool {
         if !self.config.scheduler.enabled {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("cron is disabled by config (scheduler.enabled=false)".to_string()),
             });
         }
@@ -56,7 +56,7 @@ impl Tool for CronRunTool {
             _ => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some("Missing 'job_id' parameter".to_string()),
                 });
             }
@@ -69,7 +69,7 @@ impl Tool for CronRunTool {
         if !self.security.can_act() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Security policy: read-only mode, cannot perform 'cron_run'".into()),
             });
         }
@@ -77,7 +77,7 @@ impl Tool for CronRunTool {
         if self.security.is_rate_limited() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Rate limit exceeded: too many actions in the last hour".into()),
             });
         }
@@ -87,7 +87,7 @@ impl Tool for CronRunTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(e.to_string()),
                 });
             }
@@ -100,7 +100,7 @@ impl Tool for CronRunTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(reason),
             });
         }
@@ -108,7 +108,7 @@ impl Tool for CronRunTool {
         if !self.security.record_action() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Rate limit exceeded: action budget exhausted".into()),
             });
         }
@@ -128,7 +128,8 @@ impl Tool for CronRunTool {
                 "status": result.status,
                 "duration_ms": result.duration_ms,
                 "output": result.output
-            }))?,
+            }))?
+            .into(),
             error: if result.success {
                 None
             } else {

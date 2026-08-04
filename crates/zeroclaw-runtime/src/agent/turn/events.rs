@@ -1,5 +1,5 @@
 //! Stream/draft event types and pacing constants for the turn loop, plus the
-//! loop's `TurnEvent` emission helpers (#7415 consolidation).
+//! loop's `TurnEvent` emission helpersconsolidation).
 
 use super::outcome::ToolLoopCancelled;
 use super::redact::scrub_credentials;
@@ -7,7 +7,8 @@ use crate::agent::tool_execution::ToolExecutionOutcome;
 use anyhow::Result;
 use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
-use zeroclaw_api::agent::TurnEvent;
+use zeroclaw_api::agent::{ToolArtifact, TurnEvent};
+pub use zeroclaw_api::channel::ProgressEvent;
 use zeroclaw_tool_call_parser::ParsedToolCall;
 
 /// Minimum characters per chunk when relaying LLM text to a streaming draft.
@@ -24,16 +25,21 @@ pub enum StreamDelta {
     Text(String),
     /// Ephemeral tool progress (not part of the response body).
     Status(String),
+    /// Typed, non-sensitive agent lifecycle progress.
+    Lifecycle(ProgressEvent),
+}
+
+/// Send a typed lifecycle state through the draft stream without exposing tool
+/// names, arguments, prompts, provider output, or error details.
+pub(crate) async fn send_progress(on_delta: Option<&Sender<DraftEvent>>, event: ProgressEvent) {
+    if let Some(tx) = on_delta {
+        let _ = tx.send(StreamDelta::Lifecycle(event)).await;
+    }
 }
 
 /// Backwards-compatible alias while callers are migrated.
 pub type DraftEvent = StreamDelta;
 
-/// Send `text` to the draft channel in word-aligned chunks of at least
-/// [`STREAM_CHUNK_MIN_CHARS`] (upstream loop body, no-tool-calls final exit).
-/// Used when the final response wasn't already streamed live. Honors the
-/// cancellation token between chunks; a closed receiver stops chunking
-/// silently.
 pub(crate) async fn stream_text_posthoc_chunks(
     on_delta: &Sender<DraftEvent>,
     text: &str,
@@ -60,24 +66,12 @@ pub(crate) async fn stream_text_posthoc_chunks(
     Ok(())
 }
 
-/// Resolve the stable correlation id for a parsed call. Native calls carry
-/// their own `tool_call_id`; text-protocol calls are id-less, so a fresh UUID
-/// is synthesized. Callers that emit the pending `ToolCall` and the later
-/// `ToolResult` separately must resolve the id once and reuse it so both
-/// halves correlate (ACP/WS clients key on it).
 pub(crate) fn resolve_tool_call_id(call: &ParsedToolCall) -> String {
     call.tool_call_id
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
 }
 
-/// Emit the pending `TurnEvent::ToolCall` for a call that is about to execute.
-///
-/// This is the event ACP/WS clients render as the live "tool running" card.
-/// It must be sent BEFORE the tool blocks so a long-running tool surfaces in
-/// the window immediately instead of leaving the turn visibly idle until the
-/// result lands. `id` must equal the value passed to the matching
-/// [`emit_tool_result`] so the result updates the same card.
 pub(crate) async fn emit_tool_call_pending(
     event_tx: &Sender<TurnEvent>,
     id: &str,
@@ -105,6 +99,12 @@ pub(crate) async fn emit_tool_result(
             id: id.to_string(),
             name: name.to_string(),
             output: scrub_credentials(&outcome.output),
+            // Project the tool's structured output into typed artifact metadata
+            // when it declared a delivered file, so channels never parse `output`.
+            artifact: outcome
+                .output_data
+                .as_ref()
+                .and_then(ToolArtifact::from_delivered_data),
         })
         .await;
 }
@@ -140,6 +140,18 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    #[tokio::test]
+    async fn progress_events_remain_typed_in_the_draft_stream() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+
+        send_progress(Some(&tx), ProgressEvent::RunningTool).await;
+
+        assert!(matches!(
+            rx.recv().await,
+            Some(StreamDelta::Lifecycle(ProgressEvent::RunningTool))
+        ));
+    }
+
     fn parsed_call(id: Option<&str>) -> ParsedToolCall {
         ParsedToolCall {
             name: "echo".into(),
@@ -155,11 +167,10 @@ mod tests {
             error_reason: None,
             duration: Duration::ZERO,
             receipt: None,
+            output_data: None,
         }
     }
 
-    /// Text-protocol calls have no id; the pair must still correlate via a
-    /// fresh non-empty id, and two id-less calls must never share one.
     #[tokio::test]
     async fn idless_calls_get_distinct_synthesized_pair_ids() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
@@ -187,7 +198,6 @@ mod tests {
         assert_ne!(ids[0], ids[2], "distinct calls must get distinct ids");
     }
 
-    /// Parser-assigned ids pass through untouched.
     #[tokio::test]
     async fn existing_ids_pass_through() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
@@ -203,9 +213,6 @@ mod tests {
         }
     }
 
-    /// Split emit: a pending ToolCall sent before execution and a ToolResult
-    /// sent after must correlate via the resolved id so the client updates the
-    /// same card. This is the load-bearing contract for the live tool card.
     #[tokio::test]
     async fn split_pending_then_result_share_resolved_id() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
@@ -232,8 +239,6 @@ mod tests {
         );
     }
 
-    /// The UI-facing `ToolResult` event is scrubbed at the rendering boundary,
-    /// even though the source outcome carries raw bytes on the data path.
     #[tokio::test]
     async fn tool_result_event_is_scrubbed_for_rendering() {
         let outcome = ToolExecutionOutcome {
@@ -242,6 +247,7 @@ mod tests {
             error_reason: None,
             duration: Duration::ZERO,
             receipt: None,
+            output_data: None,
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         emit_tool_call_pair(&tx, &parsed_call(Some("c1")), &outcome).await;

@@ -132,12 +132,6 @@ impl BubblewrapSandbox {
             "--die-with-parent",
         ]);
         Self::append_capability_drops(&mut bwrap_cmd, support);
-        // Conditionally bind dynamic-loader library directories that may exist
-        // on the host.  On Fedora / RHEL systems the ELF interpreter and shared
-        // libraries live in /lib64; on some older or non-merged-usr distros they
-        // live in /lib.  Without these paths inside the sandbox, any dynamically
-        // linked executable (including `cargo`) will fail to start even when its
-        // binary is reachable.
         for lib_dir in &["/lib64", "/lib"] {
             if std::path::Path::new(lib_dir).exists() {
                 bwrap_cmd.args(["--ro-bind", lib_dir, lib_dir]);

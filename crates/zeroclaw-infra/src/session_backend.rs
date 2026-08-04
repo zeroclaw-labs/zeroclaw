@@ -1,8 +1,4 @@
 //! Trait abstraction for session persistence backends.
-//!
-//! Backends store per-sender conversation histories. The trait is intentionally
-//! minimal — load, append, remove_last, clear_messages, list — so that JSONL
-//! and SQLite (and future backends) share a common interface.
 
 use chrono::{DateTime, Utc};
 use zeroclaw_api::model_provider::ChatMessage;
@@ -70,7 +66,6 @@ pub struct TimestampedMessage {
 }
 
 /// Trait for session persistence backends.
-///
 /// Implementations must be `Send + Sync` for sharing across async tasks.
 pub trait SessionBackend: Send + Sync {
     /// Load all messages for a session. Returns empty vec if session doesn't exist.
@@ -95,11 +90,6 @@ pub trait SessionBackend: Send + Sync {
     /// Remove the last message from a session. Returns `true` if a message was removed.
     fn remove_last(&self, session_key: &str) -> std::io::Result<bool>;
 
-    /// Update the content of the last message in a session. Used for incremental
-    /// persistence of streaming responses — append a placeholder first, then
-    /// update_last periodically as more content arrives. Returns `false` if
-    /// the session is empty. Default implementation is remove_last + append
-    /// (backends can override for efficiency).
     fn update_last(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<bool> {
         if self.remove_last(session_key)? {
             self.append(session_key, message)?;
@@ -149,12 +139,6 @@ pub trait SessionBackend: Send + Sync {
         Vec::new()
     }
 
-    /// Clear all messages from a session, keeping the session itself alive.
-    /// Returns the number of messages removed.
-    ///
-    /// Override for production use. The default is O(n²) via iterative
-    /// `remove_last` — acceptable for tests but may cause latency on
-    /// sessions with >100 messages.
     fn clear_messages(&self, session_key: &str) -> std::io::Result<usize> {
         let mut count = 0;
         while self.remove_last(session_key)? {
@@ -168,40 +152,18 @@ pub trait SessionBackend: Send + Sync {
         Ok(false)
     }
 
-    /// Clear the agent attribution (`agent_alias` → NULL) on every session
-    /// owned by `agent_alias`, returning the number of rows updated. Used by the
-    /// agent-deletion cascade (#7175): the conversation history (a possibly
-    /// channel-shared session) is kept, only the stale agent attribution is
-    /// dropped. No-op for backends without per-agent metadata.
     fn clear_agent_attribution(&self, _agent_alias: &str) -> std::io::Result<usize> {
         Ok(0)
     }
 
-    /// Re-point session attribution (`agent_alias` `from` → `to`) on every
-    /// session owned by `from`, returning the number of rows updated. Used by
-    /// the agent-rename cascade (#7468): the conversation history is kept and
-    /// its attribution follows the renamed agent (contrast
-    /// [`Self::clear_agent_attribution`], which drops it on delete). No-op for
-    /// backends without per-agent metadata.
     fn rename_agent_attribution(&self, _from: &str, _to: &str) -> std::io::Result<usize> {
         Ok(0)
     }
 
-    /// Read-only residue probe for the agent-rename cascade (#7940): the count of
-    /// session-metadata rows [`Self::rename_agent_attribution`] WOULD re-point for
-    /// `agent_alias`, without mutating anything. The gateway uses this to tell a
-    /// genuine post-persist partial failure (attribution still lagging at the old
-    /// alias) apart from an unrelated request, so a resume only fires on real
-    /// residue. No-op default (0) for backends without per-agent metadata.
     fn count_agent_attribution(&self, _agent_alias: &str) -> std::io::Result<usize> {
         Ok(0)
     }
 
-    /// Quick existence check used by the gateway to avoid resurrecting a
-    /// session that the user just deleted (#7126). The default impl falls
-    /// back to `get_session_metadata`; production backends should override
-    /// with the cheapest query consistent with how `delete_session` decides
-    /// what to wipe (SQLite: a `SELECT 1` against `session_metadata`).
     fn session_exists(&self, session_key: &str) -> bool {
         self.get_session_metadata(session_key).is_some()
     }
@@ -232,11 +194,6 @@ pub trait SessionBackend: Send + Sync {
         Ok(None)
     }
 
-    /// Record the channel / room / sender routing context for a session.
-    /// Called by channel orchestrators right before the LLM dispatch so
-    /// the session row can be filtered by platform attribute in the
-    /// dashboard. No-op default; SQLite override fills the columns added
-    /// in the structured-routing migration.
     fn set_session_context(
         &self,
         _session_key: &str,
@@ -245,12 +202,6 @@ pub trait SessionBackend: Send + Sync {
         Ok(())
     }
 
-    /// Look up metadata for a single session by key.
-    ///
-    /// The default impl loads all messages to derive the count and calls
-    /// `get_session_name` for the name. `created_at` and `last_activity` are
-    /// set to `Utc::now()` at call time — backends with stored timestamps
-    /// (e.g. SQLite) should override this method.
     fn get_session_metadata(&self, session_key: &str) -> Option<SessionMetadata> {
         let messages = self.load(session_key);
         if messages.is_empty() {

@@ -1,22 +1,24 @@
 //! Regression coverage for `zeroclaw config patch --json` output.
 
 use axum::{Router, routing::patch};
-use parking_lot::Mutex;
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 use tower::ServiceExt;
 use zeroclaw::gateway::{self, AppState};
-use zeroclaw::providers::Provider;
+use zeroclaw_api::attribution::Attributable;
 use zeroclaw_config::schema::Config;
 use zeroclaw_memory::NoneMemory;
+use zeroclaw_providers::ModelProvider;
 use zeroclaw_runtime::security::PairingGuard;
 
-struct MockProvider;
+#[derive(Default)]
+struct MockModelProvider;
 
 #[async_trait::async_trait]
-impl Provider for MockProvider {
+impl ModelProvider for MockModelProvider {
     async fn chat_with_system(
         &self,
         _system_prompt: Option<&str>,
@@ -28,13 +30,35 @@ impl Provider for MockProvider {
     }
 }
 
+impl Attributable for MockModelProvider {
+    fn role(&self) -> zeroclaw_api::attribution::Role {
+        zeroclaw_api::attribution::Role::Provider(zeroclaw_api::attribution::ProviderKind::Model(
+            zeroclaw_api::attribution::ModelProviderKind::Custom,
+        ))
+    }
+
+    fn alias(&self) -> &str {
+        "MockModelProvider"
+    }
+}
+
 fn test_state(config: Config) -> AppState {
+    let memory: Arc<dyn zeroclaw_memory::Memory> =
+        Arc::new(NoneMemory::new("config-patch-cli-test"));
     AppState {
-        config: Arc::new(Mutex::new(config)),
-        provider: Arc::new(MockProvider),
+        config: Arc::new(RwLock::new(config)),
+        config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+        model_provider: Arc::new(MockModelProvider),
         model: "test-model".into(),
-        temperature: 0.0,
-        mem: Arc::new(NoneMemory::new()),
+        temperature: None,
+        mem: memory.clone(),
+        memory_strategy: Arc::new(
+            zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                memory,
+                zeroclaw_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            ),
+        ),
         auto_save: false,
         webhook_secret_hash: None,
         pairing: Arc::new(PairingGuard::new(false, &[])),
@@ -45,22 +69,32 @@ fn test_state(config: Config) -> AppState {
             Duration::from_secs(300),
             1000,
         )),
-        whatsapp: None,
-        whatsapp_app_secret: None,
+        #[cfg(feature = "channel-whatsapp-cloud")]
+        whatsapp: HashMap::new(),
+        #[cfg(feature = "channel-whatsapp-cloud")]
+        whatsapp_app_secret: HashMap::new(),
+        #[cfg(feature = "channel-linq")]
         linq: HashMap::new(),
+        #[cfg(feature = "channel-linq")]
         linq_signing_secrets: HashMap::new(),
-        nextcloud_talk: None,
-        nextcloud_talk_webhook_secret: None,
-        wati: None,
+        #[cfg(feature = "channel-nextcloud")]
+        nextcloud_talk: HashMap::new(),
+        #[cfg(feature = "channel-nextcloud")]
+        nextcloud_talk_webhook_secret: HashMap::new(),
+        #[cfg(feature = "channel-wati")]
+        wati: HashMap::new(),
+        #[cfg(feature = "channel-email")]
         gmail_push: None,
         observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
         tools_registry: Arc::new(Vec::new()),
+        tools_registry_by_agent: Arc::new(HashMap::new()),
         cost_tracker: None,
         event_tx: tokio::sync::broadcast::channel(16).0,
         event_buffer: Arc::new(gateway::sse::EventBuffer::new(16)),
         shutdown_tx: tokio::sync::watch::channel(false).0,
         reload_tx: None,
         node_registry: Arc::new(gateway::nodes::NodeRegistry::new(16)),
+        mdns_peer_registry: gateway::nodes::mdns::MdnsPeerRegistry::default(),
         path_prefix: String::new(),
         web_dist_dir: None,
         session_backend: None,
@@ -71,6 +105,10 @@ fn test_state(config: Config) -> AppState {
         #[cfg(feature = "webauthn")]
         webauthn: None,
         cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        tui_registry: None,
+        sop_engine: None,
+        sop_audit: None,
     }
 }
 
@@ -96,6 +134,52 @@ fn run_cli_patch_output(config_dir: &std::path::Path, patch_doc: &[u8]) -> Outpu
             child.wait_with_output()
         })
         .expect("run zeroclaw config patch")
+}
+
+/// Run `zeroclaw config patch - ` **without** `--json`, exercising the
+/// human-readable failure branch of `config_patch_fail_json_or_human`.
+fn run_cli_patch_output_human(config_dir: &std::path::Path, patch_doc: &[u8]) -> Output {
+    let bin = env!("CARGO_BIN_EXE_zeroclaw");
+    Command::new(bin)
+        .env("ZEROCLAW_CONFIG_DIR", config_dir)
+        .env("RUST_LOG", "off")
+        .args(["config", "patch", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            {
+                use std::io::Write;
+                child
+                    .stdin
+                    .as_mut()
+                    .expect("child stdin")
+                    .write_all(patch_doc)?;
+            }
+            child.wait_with_output()
+        })
+        .expect("run zeroclaw config patch (human mode)")
+}
+
+/// Drive a failing patch in human mode and return stderr. Asserts the
+/// no-`--json` contract: nonzero exit, empty stdout, and stderr that is
+/// human-readable text rather than a JSON error envelope.
+fn run_cli_patch_human(config_dir: &std::path::Path, patch_doc: &[u8]) -> String {
+    let output = run_cli_patch_output_human(config_dir, patch_doc);
+    assert!(!output.status.success(), "patch should fail");
+    assert!(
+        output.stdout.is_empty(),
+        "failed human-mode patch should not emit success stdout: {}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+
+    let stderr = String::from_utf8(output.stderr).expect("stderr utf8");
+    assert!(
+        serde_json::from_str::<serde_json::Value>(stderr.trim()).is_err(),
+        "human-mode stderr must NOT be a JSON envelope: {stderr}"
+    );
+    stderr
 }
 
 fn run_cli_patch(config_dir: &std::path::Path, patch_doc: &[u8]) -> serde_json::Value {
@@ -237,5 +321,459 @@ fn config_patch_json_post_apply_validation_emits_structured_error_envelope() {
             .expect("message")
             .contains("gateway.host must not be empty"),
         "message should describe validation failure: {envelope}"
+    );
+}
+
+#[test]
+fn config_patch_json_missing_value_field_emits_structured_error_envelope() {
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    let envelope = run_cli_patch(
+        config_dir.path(),
+        br#"[{"op":"add","path":"/gateway/host"}]"#,
+    );
+
+    assert_eq!(envelope["code"], "value_type_mismatch");
+    assert_eq!(envelope["path"], "gateway.host");
+    assert_eq!(envelope["op_index"], 0);
+    assert!(
+        envelope["message"]
+            .as_str()
+            .expect("message")
+            .contains("missing `value` field"),
+        "message should describe the missing `value` field: {envelope}"
+    );
+}
+
+#[test]
+fn config_patch_json_value_coercion_failure_emits_structured_error_envelope() {
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    // `enabled` is a bool field; a JSON array is the wrong shape and must be
+    // rejected by `coerce_for_set_prop` before ever reaching `set_prop`.
+    let envelope = run_cli_patch(
+        config_dir.path(),
+        br#"[{"op":"add","path":"/channels/telegram/coercebot/enabled","value":["not","a","bool"]}]"#,
+    );
+
+    assert_eq!(envelope["code"], "value_type_mismatch");
+    assert_eq!(envelope["path"], "channels.telegram.coercebot.enabled");
+    assert_eq!(envelope["op_index"], 0);
+    assert!(
+        envelope["message"]
+            .as_str()
+            .expect("message")
+            .contains("bool field requires"),
+        "message should describe the bool coercion failure: {envelope}"
+    );
+
+    let saved =
+        std::fs::read_to_string(config_dir.path().join("config.toml")).expect("read saved config");
+    let cfg: Config = toml::from_str(&saved).expect("saved config should parse");
+    assert!(
+        !cfg.channels.telegram.contains_key("coercebot"),
+        "a coercion failure must not leave a phantom alias on disk: {saved}"
+    );
+}
+
+#[test]
+fn config_patch_human_missing_value_field_emits_readable_error_without_json_envelope() {
+    // Mirrors `config_patch_json_missing_value_field_emits_structured_error_envelope`
+    // but on the no-`--json` branch: the compatibility half of the
+    // machine-readable/human-readable output contract.
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    let stderr = run_cli_patch_human(
+        config_dir.path(),
+        br#"[{"op":"add","path":"/gateway/host"}]"#,
+    );
+
+    assert!(
+        stderr.contains("op[0]")
+            && stderr.contains("gateway.host")
+            && stderr.contains("missing `value` field"),
+        "human stderr should describe the missing `value` field: {stderr}"
+    );
+    // The structured field names must NOT leak into human output.
+    assert!(
+        !stderr.contains("\"code\"") && !stderr.contains("value_type_mismatch"),
+        "human stderr must not contain JSON envelope fields: {stderr}"
+    );
+}
+
+#[test]
+fn config_patch_human_value_coercion_failure_emits_readable_error_without_json_envelope() {
+    // Mirrors `config_patch_json_value_coercion_failure_emits_structured_error_envelope`
+    // on the no-`--json` branch, and re-asserts the no-phantom-alias guarantee.
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    let stderr = run_cli_patch_human(
+        config_dir.path(),
+        br#"[{"op":"add","path":"/channels/telegram/coercebot/enabled","value":["not","a","bool"]}]"#,
+    );
+
+    assert!(
+        stderr.contains("bool field requires"),
+        "human stderr should describe the bool coercion failure: {stderr}"
+    );
+    assert!(
+        !stderr.contains("\"code\"") && !stderr.contains("\"op_index\""),
+        "human stderr must not contain JSON envelope fields: {stderr}"
+    );
+
+    let saved =
+        std::fs::read_to_string(config_dir.path().join("config.toml")).expect("read saved config");
+    let cfg: Config = toml::from_str(&saved).expect("saved config should parse");
+    assert!(
+        !cfg.channels.telegram.contains_key("coercebot"),
+        "a coercion failure must not leave a phantom alias on disk: {saved}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Alias auto-materialization (mirrors `PATCH /api/config`'s
+// `ensure_map_key_for_path` guard in `handle_patch`, api_config.rs:2040-2051)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn config_patch_add_materializes_new_map_alias_and_persists() {
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    let envelope = run_cli_patch_success(
+        config_dir.path(),
+        br#"[
+            {"op":"add","path":"/channels/telegram/newbot/enabled","value":true},
+            {"op":"add","path":"/channels/telegram/newbot/bot_token","value":"dummy-token"}
+        ]"#,
+    );
+
+    assert_eq!(envelope["saved"], true);
+    assert_eq!(envelope["results"][0]["op"], "add");
+    assert_eq!(
+        envelope["results"][0]["path"],
+        "channels.telegram.newbot.enabled"
+    );
+    assert_eq!(envelope["results"][0]["value"], "true");
+
+    let saved =
+        std::fs::read_to_string(config_dir.path().join("config.toml")).expect("read saved config");
+    let parsed: Config = toml::from_str(&saved).expect("saved config should parse");
+    let newbot = parsed
+        .channels
+        .telegram
+        .get("newbot")
+        .expect("new alias should be persisted to disk");
+    assert!(
+        newbot.enabled,
+        "materialized alias should carry the patched value"
+    );
+}
+
+#[test]
+fn config_patch_replace_materializes_new_map_alias_and_persists() {
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    let envelope = run_cli_patch_success(
+        config_dir.path(),
+        br#"[
+            {"op":"replace","path":"/channels/telegram/anotherbot/enabled","value":true},
+            {"op":"replace","path":"/channels/telegram/anotherbot/bot_token","value":"dummy-token"}
+        ]"#,
+    );
+
+    assert_eq!(envelope["saved"], true);
+    assert_eq!(envelope["results"][0]["op"], "replace");
+    assert_eq!(
+        envelope["results"][0]["path"],
+        "channels.telegram.anotherbot.enabled"
+    );
+
+    let saved =
+        std::fs::read_to_string(config_dir.path().join("config.toml")).expect("read saved config");
+    let parsed: Config = toml::from_str(&saved).expect("saved config should parse");
+    let bot = parsed
+        .channels
+        .telegram
+        .get("anotherbot")
+        .expect("new alias should be persisted to disk via `replace` too");
+    assert!(bot.enabled);
+}
+
+#[test]
+fn config_patch_replace_on_existing_alias_does_not_recreate_it() {
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+
+    // Establish the alias first.
+    run_cli_patch_success(
+        config_dir.path(),
+        br#"[
+            {"op":"add","path":"/channels/telegram/existingbot/enabled","value":true},
+            {"op":"add","path":"/channels/telegram/existingbot/bot_token","value":"dummy-token"}
+        ]"#,
+    );
+    let saved_before = std::fs::read_to_string(config_dir.path().join("config.toml"))
+        .expect("read config after setup");
+    let before: Config = toml::from_str(&saved_before).expect("config should parse");
+    let mut keys_before = before
+        .get_map_keys("channels.telegram")
+        .expect("channels.telegram should be a map-keyed section");
+    keys_before.sort();
+
+    let envelope = run_cli_patch_success(
+        config_dir.path(),
+        br#"[{"op":"replace","path":"/channels/telegram/existingbot/enabled","value":false}]"#,
+    );
+    assert_eq!(envelope["results"][0]["value"], "false");
+
+    let saved_after = std::fs::read_to_string(config_dir.path().join("config.toml"))
+        .expect("read config after replace");
+    let after: Config = toml::from_str(&saved_after).expect("config should parse");
+    let mut keys_after = after
+        .get_map_keys("channels.telegram")
+        .expect("channels.telegram should be a map-keyed section");
+    keys_after.sort();
+
+    assert_eq!(
+        keys_before, keys_after,
+        "replace on an existing alias must not add or remove aliases"
+    );
+    assert!(!after.channels.telegram["existingbot"].enabled);
+}
+
+#[test]
+fn config_patch_remove_and_test_do_not_materialize_unknown_alias() {
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    // Establish a config.toml on disk first via a benign, unrelated op.
+    run_cli_patch_success(
+        config_dir.path(),
+        br#"[{"op":"replace","path":"/gateway/host","value":"127.0.0.4"}]"#,
+    );
+
+    let remove_envelope = run_cli_patch(
+        config_dir.path(),
+        br#"[{"op":"remove","path":"/channels/telegram/ghostbot/enabled"}]"#,
+    );
+    assert_eq!(remove_envelope["code"], "path_not_found");
+    assert_eq!(
+        remove_envelope["path"],
+        "channels.telegram.ghostbot.enabled"
+    );
+
+    let test_envelope = run_cli_patch(
+        config_dir.path(),
+        br#"[{"op":"test","path":"/channels/telegram/ghostbot/enabled","value":true}]"#,
+    );
+    assert_eq!(test_envelope["code"], "path_not_found");
+    assert_eq!(test_envelope["path"], "channels.telegram.ghostbot.enabled");
+
+    let saved =
+        std::fs::read_to_string(config_dir.path().join("config.toml")).expect("read saved config");
+    let cfg: Config = toml::from_str(&saved).expect("saved config should parse");
+    assert!(
+        !cfg.channels.telegram.contains_key("ghostbot"),
+        "remove/test must not materialize an unknown alias: {saved}"
+    );
+}
+
+#[test]
+fn config_patch_add_on_reserved_default_agent_is_refused() {
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    // Establish a config.toml on disk first via a benign, unrelated op.
+    run_cli_patch_success(
+        config_dir.path(),
+        br#"[{"op":"replace","path":"/gateway/host","value":"127.0.0.5"}]"#,
+    );
+
+    let envelope = run_cli_patch(
+        config_dir.path(),
+        br#"[{"op":"add","path":"/agents/default/enabled","value":true}]"#,
+    );
+
+    assert_eq!(envelope["code"], "validation_failed");
+    assert_eq!(envelope["path"], "agents.default.enabled");
+    assert_eq!(envelope["op_index"], 0);
+    assert!(
+        envelope["message"]
+            .as_str()
+            .expect("message")
+            .contains("alias `default` is reserved"),
+        "message should name the reserved alias: {envelope}"
+    );
+
+    let saved =
+        std::fs::read_to_string(config_dir.path().join("config.toml")).expect("read saved config");
+    let cfg: Config = toml::from_str(&saved).expect("saved config should parse");
+    assert!(
+        !cfg.agents.contains_key("default"),
+        "reserved alias must not be materialized"
+    );
+}
+
+#[test]
+fn config_patch_add_failure_after_materialization_does_not_persist_phantom_alias() {
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+
+    let envelope = run_cli_patch(
+        config_dir.path(),
+        br#"[{"op":"add","path":"/channels/telegram/phantombot/reply_min_interval_secs","value":99999}]"#,
+    );
+    assert_eq!(envelope["code"], "invalid_numeric_range");
+    assert_eq!(
+        envelope["path"],
+        "channels.telegram.phantombot.reply_min_interval_secs"
+    );
+
+    let saved =
+        std::fs::read_to_string(config_dir.path().join("config.toml")).expect("read saved config");
+    let cfg: Config = toml::from_str(&saved).expect("saved config should parse");
+    assert!(
+        !cfg.channels.telegram.contains_key("phantombot"),
+        "a failed op must not leave a phantom alias on disk: {saved}"
+    );
+}
+
+#[test]
+fn config_patch_add_does_not_materialize_resource_keyed_rate_alias() {
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    // Establish a config.toml on disk first via a benign, unrelated op.
+    run_cli_patch_success(
+        config_dir.path(),
+        br#"[{"op":"replace","path":"/gateway/host","value":"127.0.0.6"}]"#,
+    );
+
+    let envelope = run_cli_patch(
+        config_dir.path(),
+        br#"[{"op":"add","path":"/cost/rates/providers/models/openai/gpt-5/input_per_mtok","value":1.5}]"#,
+    );
+    assert_eq!(envelope["code"], "path_not_found");
+    assert_eq!(
+        envelope["path"],
+        "cost.rates.providers.models.openai.gpt-5.input_per_mtok"
+    );
+
+    let saved =
+        std::fs::read_to_string(config_dir.path().join("config.toml")).expect("read saved config");
+    let cfg: Config = toml::from_str(&saved).expect("saved config should parse");
+    assert!(
+        cfg.cost.rates.providers.models.openai.is_empty(),
+        "a leaf write must not auto-create a resource-keyed rate row: {saved}"
+    );
+}
+
+/// Guard against future divergence, not regression coverage: this passes
+/// identically before the `resource_key` exclusion, because `apply_dirty_path`
+/// splits the dirty path on every dot and so a phantom `gpt-4` never reaches
+/// disk. The dot-free `gpt-5` case above is the CLI's real signal.
+#[test]
+fn config_patch_replace_on_dotted_resource_id_does_not_plant_phantom_sibling() {
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    let version = zeroclaw_config::migration::CURRENT_SCHEMA_VERSION;
+    std::fs::write(
+        config_dir.path().join("config.toml"),
+        format!(
+            "schema_version = {version}\n\n\
+             [cost.rates.providers.models.openai.\"gpt-4.1\"]\n\
+             input_per_mtok = 1.0\n"
+        ),
+    )
+    .expect("seed config.toml");
+
+    let envelope = run_cli_patch_success(
+        config_dir.path(),
+        br#"[{"op":"replace","path":"/cost/rates/providers/models/openai/gpt-4.1/input_per_mtok","value":2.5}]"#,
+    );
+    assert_eq!(envelope["saved"], true);
+
+    let saved =
+        std::fs::read_to_string(config_dir.path().join("config.toml")).expect("read saved config");
+    let cfg: Config = toml::from_str(&saved).expect("saved config should parse");
+    let keys: Vec<&String> = cfg.cost.rates.providers.models.openai.keys().collect();
+    assert_eq!(
+        keys,
+        vec!["gpt-4.1"],
+        "no phantom `gpt-4` sibling may appear: {saved}"
+    );
+}
+
+fn run_cli_init(config_dir: &std::path::Path, section: &str) -> serde_json::Value {
+    let bin = env!("CARGO_BIN_EXE_zeroclaw");
+    let output = Command::new(bin)
+        .env("ZEROCLAW_CONFIG_DIR", config_dir)
+        .env("RUST_LOG", "off")
+        .args(["config", "init", section, "--json"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run zeroclaw config init");
+    assert!(
+        output.status.success(),
+        "config init should succeed: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf8");
+    serde_json::from_str(&stdout).expect("stdout should be JSON envelope")
+}
+
+fn run_cli_get(config_dir: &std::path::Path, path: &str) -> serde_json::Value {
+    let bin = env!("CARGO_BIN_EXE_zeroclaw");
+    let output = Command::new(bin)
+        .env("ZEROCLAW_CONFIG_DIR", config_dir)
+        .env("RUST_LOG", "off")
+        .args(["config", "get", path, "--json"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run zeroclaw config get");
+    assert!(
+        output.status.success(),
+        "config get should succeed after reloading the saved file: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf8");
+    serde_json::from_str(&stdout).expect("stdout should be JSON envelope")
+}
+
+#[test]
+fn config_init_materializes_new_map_alias_and_persists() {
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    // Seed a config.toml first: `save_dirty()` short-circuits to a full `save()`
+    // when the file is missing, which would exercise the fallback instead of the
+    // incremental dirty-path write this test exists to prove.
+    run_cli_patch_success(
+        config_dir.path(),
+        br#"[{"op":"replace","path":"/gateway/host","value":"127.0.0.7"}]"#,
+    );
+
+    let envelope = run_cli_init(config_dir.path(), "risk_profiles.strict");
+    assert_eq!(
+        envelope["initialized"],
+        serde_json::json!(["risk_profiles.strict"])
+    );
+
+    let saved =
+        std::fs::read_to_string(config_dir.path().join("config.toml")).expect("read saved config");
+    let cfg: Config = toml::from_str(&saved).expect("saved config should parse");
+    assert!(
+        cfg.risk_profiles.contains_key("strict"),
+        "the new alias must survive save_dirty + reload: {saved}"
+    );
+}
+
+#[test]
+fn config_init_channel_alias_survives_config_reload() {
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    run_cli_patch_success(
+        config_dir.path(),
+        br#"[{"op":"replace","path":"/gateway/host","value":"127.0.0.7"}]"#,
+    );
+
+    let envelope = run_cli_init(config_dir.path(), "channels.telegram.main");
+    assert_eq!(
+        envelope["initialized"],
+        serde_json::json!(["channels.telegram.main"])
+    );
+
+    let reloaded = run_cli_get(config_dir.path(), "channels.telegram.main.enabled");
+    assert_eq!(
+        reloaded,
+        serde_json::json!({
+            "path": "channels.telegram.main.enabled",
+            "value": "false",
+        }),
+        "the initialized channel alias must remain addressable after Config reload",
     );
 }

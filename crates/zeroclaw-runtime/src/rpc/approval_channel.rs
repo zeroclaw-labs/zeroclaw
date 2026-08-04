@@ -2,15 +2,6 @@
 //! Channel::request_choice(), and Channel::request_multi_choice() to the
 //! daemon Unix socket RPC stream so Zerocode's Code tab can both gate
 //! tool calls (the original purpose) and surface ACP-style elicitation
-//! prompts.
-//!
-//! Zerocode's Code tab is intentionally a superset of the standalone
-//! ACP channel: the multiple-choice elicitation RFD path is wired
-//! through the same `elicitation/create` outbound JSON-RPC method as
-//! `AcpChannel`, gated on the TUI advertising
-//! `clientCapabilities.elicitation.form` during `initialize`. See the ACP
-//! elicitation RFD: <https://agentclientprotocol.com/rfds/elicitation>
-//! for the wire protocol.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,17 +31,6 @@ pub struct RpcApprovalChannel {
     rpc: Arc<RpcOutbound>,
     pending: Arc<ApprovalPendingMap>,
     approval_timeout: Duration,
-    /// Parsed elicitation capabilities the TUI advertised during
-    /// `initialize`. Connection-scoped immutable snapshot; the canonical
-    /// owner is `RpcDispatcher.client_elicitation_caps` and this field
-    /// is a `Copy` taken at session-creation time. When `form` is true,
-    /// `request_choice` and `request_multi_choice` route over
-    /// `elicitation/create`; otherwise they return `Ok(None)` so the
-    /// caller can fall back to its non-channel path (mirroring how
-    /// `AcpChannel` handles legacy clients minus the
-    /// `session/request_permission` overload — Zerocode never spoke
-    /// that overload, so there's no legacy single-select fallback to
-    /// preserve here).
     client_caps: ElicitationCapabilities,
 }
 
@@ -93,6 +73,15 @@ impl Channel for RpcApprovalChannel {
         Ok(())
     }
 
+    /// `send` above is a deliberate no-op: the Code tab renders agent output
+    /// from the RPC turn stream, not from generic channel sends. Declaring it
+    /// here lets surfaces that must genuinely deliver (`poll`'s text fallback,
+    /// `escalate_to_human`) refuse this channel instead of reporting success
+    /// for a message the user never saw.
+    fn supports_outbound_send(&self) -> bool {
+        false
+    }
+
     async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         anyhow::bail!("RpcApprovalChannel.listen is not supported")
     }
@@ -114,6 +103,15 @@ impl Channel for RpcApprovalChannel {
             .await
     }
 
+    async fn request_approval_attributed(
+        &self,
+        recipient: &str,
+        request: &ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
+        self.request_approval_attributed_with_timeout(recipient, request, self.approval_timeout)
+            .await
+    }
+
     async fn request_choice(
         &self,
         question: &str,
@@ -127,11 +125,6 @@ impl Channel for RpcApprovalChannel {
             anyhow::bail!("RpcApprovalChannel.request_choice requires at least one choice")
         }
         if !self.client_caps.form {
-            // No native single-select path without elicitation support.
-            // Tools fall back to their generic `send` + `listen` flow,
-            // which for this channel itself bails — matching how an older
-            // TUI behaves today (no behaviour change for clients that
-            // don't advertise the capability).
             return Ok(None);
         }
         self.request_choice_via_elicitation(question, choices, timeout)
@@ -158,12 +151,26 @@ impl Channel for RpcApprovalChannel {
 }
 
 impl RpcApprovalChannel {
+    /// Kept as-is for callers that do not need provenance; delegates to
+    /// [`Self::request_approval_attributed_with_timeout`].
     pub async fn request_approval_with_timeout(
+        &self,
+        recipient: &str,
+        request: &ChannelApprovalRequest,
+        timeout: Duration,
+    ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
+        Ok(self
+            .request_approval_attributed_with_timeout(recipient, request, timeout)
+            .await?
+            .map(|attributed| attributed.response))
+    }
+
+    pub async fn request_approval_attributed_with_timeout(
         &self,
         _recipient: &str,
         request: &ChannelApprovalRequest,
         timeout: Duration,
-    ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
+    ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
         let request_id = Uuid::new_v4().to_string();
         let (tx, rx) = tokio::sync::oneshot::channel::<ChannelApprovalResponse>();
         let mut pending_request = self.pending.register(request_id.clone(), tx);
@@ -182,20 +189,30 @@ impl RpcApprovalChannel {
             )
             .await;
 
+        // Only the answered arm is an operator decision. The other two deny
+        // because the client went away or never answered, and say so.
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(response)) => {
                 pending_request.disarm();
-                Ok(Some(response))
+                Ok(Some(
+                    zeroclaw_api::channel::AttributedApprovalResponse::operator(response),
+                ))
             }
-            Ok(Err(_)) | Err(_) => Ok(Some(ChannelApprovalResponse::Deny)),
+            Ok(Err(_)) => Ok(Some(
+                zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                    ChannelApprovalResponse::Deny,
+                    zeroclaw_api::channel::ApprovalSource::Unreachable,
+                ),
+            )),
+            Err(_) => Ok(Some(
+                zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                    ChannelApprovalResponse::Deny,
+                    zeroclaw_api::channel::ApprovalSource::TimedOut,
+                ),
+            )),
         }
     }
 
-    /// Form-mode elicitation single-select path — issues `elicitation/create`
-    /// over the daemon's outbound JSON-RPC channel and decodes the
-    /// three-action response. Wire format mirrors `AcpChannel`
-    /// byte-for-byte so a TUI client only needs one elicitation
-    /// implementation.
     async fn request_choice_via_elicitation(
         &self,
         question: &str,
@@ -413,9 +430,6 @@ mod tests {
 
     // ── Elicitation (request_choice / request_multi_choice) ────────
 
-    /// Capability gate: without `elicitation.form` advertised, the channel
-    /// returns `Ok(None)` so the calling tool can take its non-channel
-    /// fallback. No `elicitation/create` is emitted on the wire.
     #[tokio::test]
     async fn request_choice_without_capability_returns_none() {
         let (rpc, mut write_rx) = make_rpc();
@@ -434,9 +448,6 @@ mod tests {
         assert!(write_rx.try_recv().is_err());
     }
 
-    /// With the form capability advertised, the channel emits an
-    /// `elicitation/create` JSON-RPC *request* (id present, method present)
-    /// and waits for a matching response on the same id.
     #[tokio::test]
     async fn request_choice_with_capability_sends_elicitation_request() {
         let (rpc, mut write_rx) = make_rpc();
@@ -484,8 +495,6 @@ mod tests {
         assert_eq!(answer.as_deref(), Some("Banana"));
     }
 
-    /// `decline` and `cancel` both collapse to `Ok(None)` so callers
-    /// can fall back to a default or re-prompt.
     #[tokio::test]
     async fn request_choice_decline_returns_none() {
         let (rpc, mut write_rx) = make_rpc();
@@ -522,8 +531,6 @@ mod tests {
         assert_eq!(answer, None);
     }
 
-    /// Accept payload with an out-of-range `choice-N` is a hard error
-    /// (defense in depth per the RFD).
     #[tokio::test]
     async fn request_choice_accept_with_unknown_const_errors() {
         let (rpc, mut write_rx) = make_rpc();
@@ -546,8 +553,6 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// Multi-select: the channel emits the array schema and decodes the
-    /// `choices` array back to the original texts.
     #[tokio::test]
     async fn request_multi_choice_with_capability_sends_array_schema() {
         let (rpc, mut write_rx) = make_rpc();

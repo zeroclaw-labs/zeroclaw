@@ -1,5 +1,4 @@
 //! WebSocket Secure (WSS) transport for the RPC layer.
-//!
 //! Mirrors the Unix socket transport (`unix.rs`) but uses TLS-encrypted
 //! WebSocket connections, enabling remote TUI-to-daemon connectivity.
 
@@ -41,11 +40,6 @@ const EMFILE: i32 = 24; // too many open files (this process)
 #[cfg(unix)]
 const ENFILE: i32 = 23; // too many open files (system-wide)
 
-/// Returns `true` when an error from a stream listener's `accept()` is
-/// transient and the listener itself remains usable, so the serve loop
-/// should log and keep running rather than terminating the daemon. Covers
-/// file-descriptor exhaustion (`EMFILE`/`ENFILE`, see #7042) and the usual
-/// per-connection hiccups.
 fn is_recoverable_accept_error(e: &std::io::Error) -> bool {
     if matches!(
         e.kind(),
@@ -189,7 +183,6 @@ pub fn build_tls_acceptor(cert_path: &str, key_path: &str) -> Result<TlsAcceptor
 // ── Listener ─────────────────────────────────────────────────────
 
 /// Run the WSS RPC listener as a daemon subsystem.
-///
 /// `client_count` is incremented on connect, decremented on disconnect —
 /// shared with the Unix socket listener for `--ephemeral` shutdown logic.
 pub async fn run_wss_listener(
@@ -228,7 +221,7 @@ pub async fn run_wss_listener(
                             // Transient (e.g. EMFILE under fd pressure):
                             // the listener is still valid. Back off briefly
                             // to avoid hot-spinning, then keep serving
-                            // rather than killing the daemon (#7042).
+                            // rather than killing the daemon
                             ::zeroclaw_log::record!(
                                 WARN,
                                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -323,7 +316,7 @@ mod accept_error_tests {
     #[cfg(unix)]
     #[test]
     fn fd_exhaustion_accept_errors_are_recoverable() {
-        // #7042: EMFILE/ENFILE must not terminate the daemon.
+        // EMFILE/ENFILE must not terminate the daemon.
         assert!(is_recoverable_accept_error(&Error::from_raw_os_error(24))); // EMFILE
         assert!(is_recoverable_accept_error(&Error::from_raw_os_error(23))); // ENFILE
     }

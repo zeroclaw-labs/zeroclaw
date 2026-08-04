@@ -1,5 +1,6 @@
 #[allow(clippy::module_inception)]
 pub mod agent;
+pub(crate) mod approval_bridge;
 pub mod classifier;
 pub mod context_analyzer;
 pub mod cost;
@@ -21,6 +22,8 @@ pub mod thinking;
 pub mod tool_execution;
 pub mod tool_receipts;
 pub(crate) mod turn;
+
+pub use turn::context::TurnMeta;
 
 pub(crate) fn is_runtime_approved_arg_tool(tool_name: &str) -> bool {
     matches!(

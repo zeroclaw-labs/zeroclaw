@@ -1,8 +1,4 @@
 //! WeChat personal iLink Bot channel.
-//!
-//! Note: the iLink consent screen ("Connect X to Weixin") shows the bot name
-//! from the iLink developer portal, not from ZeroClaw config. Users who
-//! register their own iLink bot will see their own name there.
 
 use aes::cipher::{BlockDecryptMut, BlockEncryptMut, KeyInit, block_padding::Pkcs7};
 use anyhow::Context;
@@ -14,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, RwLock};
 use std::time::Duration;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+use zeroclaw_config::paths::{normalize_lexical, resolve_under};
 use zeroclaw_config::schema::Config;
 use zeroclaw_runtime::i18n;
 use zeroclaw_runtime::security::pairing::PairingGuard;
@@ -44,6 +41,12 @@ const MAX_QR_REFRESH: u32 = 3;
 const QR_SCAN_TIMEOUT: Duration = Duration::from_secs(480);
 
 const WECHAT_BIND_COMMAND: &str = "/bind";
+
+/// State-dir file holding the persisted bot token / account identity.
+/// Single source of truth for every reader, writer, and the relink purge.
+const ACCOUNT_FILE: &str = "account.json";
+/// State-dir file holding the persisted sync cursor and context tokens.
+const SYNC_FILE: &str = "sync.json";
 
 /// iLink Bot message types.
 const MESSAGE_TYPE_BOT: u32 = 2;
@@ -453,9 +456,6 @@ pub struct WeChatChannel {
     /// Resolves inbound external peers from canonical state at message-time.
     /// No cache (see AGENTS.md "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH").
     peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
-    /// Optional pairing-persist handle. `None` in tests; `Some` in the
-    /// long-running daemon, wired via `.with_persistence(config)`. RwLock so
-    /// concurrent peer reads from sibling channels don't serialize.
     persist: Option<Arc<parking_lot::RwLock<Config>>>,
     /// Pairing guard for /bind flow.
     pairing: Option<PairingGuard>,
@@ -677,12 +677,28 @@ impl WeChatChannel {
         let api_base_url = https_base_url("api_base_url", api_base_url, DEFAULT_API_BASE_URL)?;
         let cdn_base_url = https_base_url("cdn_base_url", cdn_base_url, CDN_BASE_URL)?;
 
+        let alias = alias.into();
         let has_peers = !peer_resolver().is_empty();
         let pairing = if has_peers {
             None
         } else {
             let guard = PairingGuard::new(true, &[]);
             if let Some(code) = guard.pairing_code() {
+                // Mirror Telegram: a backgrounded daemon discards stdout, so
+                // also record the one-time bind code through the structured
+                // log where `zeroclaw service logs` / the gateway can find it.
+                // Tag it `Channel` so the web Logs page shows it by default
+                // (an untagged event defaults to `Internal` and is hidden).
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Channel)
+                        .with_attrs(::serde_json::json!({
+                            "alias": alias.as_str(),
+                            "pairing_code": code.as_str(),
+                        })),
+                    "WeChat pairing required; one-time bind code issued"
+                );
                 println!(
                     "  {}",
                     wechat_cli_string_with_args("cli-wechat-pairing-required", &[("code", &code)],)
@@ -698,18 +714,14 @@ impl WeChatChannel {
             Some(guard)
         };
 
-        let state_dir = state_dir.unwrap_or_else(|| {
-            directories::UserDirs::new()
-                .map(|u| u.home_dir().join(".zeroclaw").join("wechat"))
-                .unwrap_or_else(|| PathBuf::from(".zeroclaw/wechat"))
-        });
+        let state_dir = state_dir.unwrap_or_else(Self::default_state_dir);
 
         let mut channel = Self {
             bot_token: RwLock::new(None),
             account_id: RwLock::new(None),
             api_base_url,
             cdn_base_url,
-            alias: alias.into(),
+            alias,
             peer_resolver,
             persist: None,
             pairing,
@@ -741,12 +753,71 @@ impl WeChatChannel {
         self
     }
 
+    /// Default state directory when `[channels.wechat.<alias>] state_dir`
+    /// is unset: `~/.zeroclaw/wechat`.
+    fn default_state_dir() -> PathBuf {
+        directories::UserDirs::new()
+            .map(|u| u.home_dir().join(".zeroclaw").join("wechat"))
+            .unwrap_or_else(|| PathBuf::from(".zeroclaw/wechat"))
+    }
+
+    /// Resolve the effective state directory from the raw
+    /// `[channels.wechat.<alias>] state_dir` config value: tilde-expanded
+    /// when set, [`Self::default_state_dir`] otherwise. Single source of
+    /// truth for every consumer of the config value — channel construction
+    /// and the readiness probe must agree on the directory.
+    pub fn resolve_state_dir(configured: Option<&str>) -> PathBuf {
+        match configured {
+            Some(path) => PathBuf::from(shellexpand::tilde(path).as_ref()),
+            None => Self::default_state_dir(),
+        }
+    }
+
+    /// Read `account.json` from a state directory, if present and parseable.
+    fn read_account_data(state_dir: &Path) -> Option<AccountData> {
+        let data = std::fs::read_to_string(state_dir.join(ACCOUNT_FILE)).ok()?;
+        serde_json::from_str::<AccountData>(&data).ok()
+    }
+
+    /// Channel-owned persisted-login probe: reports whether this state
+    /// directory holds the same signal [`Self::load_persisted_state`] uses
+    /// to resume a session without a fresh QR scan — an `account.json`
+    /// carrying a non-empty bot token. Read-only; never creates files.
+    pub fn has_persisted_login(state_dir: &Path) -> bool {
+        Self::read_account_data(state_dir)
+            .and_then(|account| account.token)
+            .is_some_and(|token| !token.is_empty())
+    }
+
+    /// Channel-owned relink hook: delete the persisted login state so the
+    /// next channel start finds no session and begins a fresh QR pairing.
+    ///
+    /// Removes exactly the files this module persists — [`ACCOUNT_FILE`]
+    /// (the bot token, i.e. the credential) and [`SYNC_FILE`] (the sync
+    /// cursor, which belongs to the replaced session) — and never the
+    /// directory itself. Returns the paths actually removed; an already
+    /// absent file is not an error, so relinking an unpaired channel is a
+    /// safe no-op that returns an empty list.
+    ///
+    /// This only clears disk state. A currently running channel keeps its
+    /// in-memory token until it is restarted; callers own scheduling that
+    /// restart (e.g. a daemon reload).
+    pub fn clear_persisted_login(state_dir: &Path) -> std::io::Result<Vec<String>> {
+        let mut removed = Vec::new();
+        for file in [ACCOUNT_FILE, SYNC_FILE] {
+            let path = state_dir.join(file);
+            match std::fs::remove_file(&path) {
+                Ok(()) => removed.push(path.display().to_string()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(removed)
+    }
+
     /// Load persisted token and cursor from state_dir.
     fn load_persisted_state(&mut self) {
-        let account_path = self.state_dir.join("account.json");
-        if let Ok(data) = std::fs::read_to_string(&account_path)
-            && let Ok(account) = serde_json::from_str::<AccountData>(&data)
-        {
+        if let Some(account) = Self::read_account_data(&self.state_dir) {
             if let Some(ref token) = account.token
                 && !token.is_empty()
             {
@@ -762,7 +833,7 @@ impl WeChatChannel {
             }
         }
 
-        let sync_path = self.state_dir.join("sync.json");
+        let sync_path = self.state_dir.join(SYNC_FILE);
         if let Ok(data) = std::fs::read_to_string(&sync_path)
             && let Ok(sync) = serde_json::from_str::<SyncData>(&data)
         {
@@ -804,7 +875,7 @@ impl WeChatChannel {
             user_id: user_id.map(String::from),
             saved_at: Some(chrono::Utc::now().to_rfc3339()),
         };
-        let path = self.state_dir.join("account.json");
+        let path = self.state_dir.join(ACCOUNT_FILE);
         match serde_json::to_string_pretty(&data) {
             Ok(json) => {
                 if let Err(e) = write_private(&path, json.as_bytes()) {
@@ -843,7 +914,7 @@ impl WeChatChannel {
             get_updates_buf: self.cursor.lock().clone(),
             context_tokens: self.context_tokens.lock().clone(),
         };
-        let path = self.state_dir.join("sync.json");
+        let path = self.state_dir.join(SYNC_FILE);
         match serde_json::to_string(&data) {
             Ok(json) => {
                 if let Err(e) = write_private(&path, json.as_bytes()) {
@@ -891,55 +962,13 @@ impl WeChatChannel {
     }
 
     async fn persist_allowed_identity(&self, identity: &str) -> anyhow::Result<()> {
-        use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
-        use zeroclaw_config::providers::ChannelRef;
-
-        let Some(config) = &self.persist else {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"identity": identity})),
-                "paired identity not persisted (no persistence handle wired)"
-            );
-            return Ok(());
-        };
-        let normalized = identity.trim().to_string();
-        if normalized.is_empty() {
-            anyhow::bail!("Cannot persist empty WeChat identity");
-        }
-        let group_name = format!("wechat_{}", self.alias);
-        let channel_ref = ChannelRef::new(format!("wechat.{}", self.alias));
-        let snapshot = {
-            let mut cfg = config.write();
-            if !cfg.channels.wechat.contains_key(&self.alias) {
-                anyhow::bail!(
-                    "Missing [channels.wechat.{}] section. Run `zeroclaw config set channels.wechat.<alias>.app-id=<id>` to configure.",
-                    self.alias
-                );
-            }
-            let group = cfg
-                .peer_groups
-                .entry(group_name)
-                .or_insert_with(|| PeerGroupConfig {
-                    channel: channel_ref,
-                    ..PeerGroupConfig::default()
-                });
-            if group
-                .external_peers
-                .iter()
-                .any(|p| p.as_str() == normalized)
-            {
-                return Ok(());
-            }
-            group.external_peers.push(PeerUsername::new(normalized));
-            cfg.clone()
-        };
-        snapshot
-            .save()
-            .await
-            .context("Failed to persist WeChat peer to config.toml")?;
-        Ok(())
+        crate::identity_persist::persist_external_peer(
+            self.persist.as_ref(),
+            "wechat",
+            &self.alias,
+            identity,
+        )
+        .await
     }
 
     fn extract_bind_code(text: &str) -> Option<&str> {
@@ -973,50 +1002,105 @@ impl WeChatChannel {
         )
     }
 
-    fn resolve_local_attachment_path(&self, target: &str) -> PathBuf {
-        let target = target.trim();
-        let target = target.strip_prefix("file://").unwrap_or(target);
-
-        let resolved = if let Some(rel) = target.strip_prefix("/workspace/") {
-            if let Some(workspace_dir) = &self.workspace_dir {
-                workspace_dir.join(rel)
-            } else {
-                PathBuf::from(target)
-            }
-        } else {
-            let path = PathBuf::from(target);
-            if path.is_absolute() {
-                path
-            } else {
-                std::env::current_dir()
-                    .unwrap_or_else(|_| PathBuf::from("."))
-                    .join(path)
-            }
+    fn canonicalize_within_workspace(
+        candidate: &Path,
+        workspace_dir: &Path,
+        raw_target: &str,
+    ) -> anyhow::Result<PathBuf> {
+        let Ok(candidate_canon) = std::fs::canonicalize(candidate) else {
+            return Ok(candidate.to_path_buf());
         };
-
-        // Prevent path traversal outside workspace when workspace_dir is set
-        if let Some(workspace_dir) = &self.workspace_dir
-            && let (Ok(canonical), Ok(allowed)) =
-                (resolved.canonicalize(), workspace_dir.canonicalize())
-            && !canonical.starts_with(&allowed)
-        {
+        let workspace_canon = std::fs::canonicalize(workspace_dir).with_context(|| {
+            format!(
+                "workspace_dir {} could not be canonicalized",
+                workspace_dir.display()
+            )
+        })?;
+        if !candidate_canon.starts_with(&workspace_canon) {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
                 &format!(
-                    "attachment path {} escapes workspace {}, rejected",
-                    canonical.display(),
-                    allowed.display()
+                    "attachment path {} canonicalizes to {} which escapes workspace {}",
+                    raw_target,
+                    candidate_canon.display(),
+                    workspace_canon.display(),
                 )
             );
-            return PathBuf::from(format!(
-                "/nonexistent/blocked_path_traversal_{}",
-                uuid::Uuid::new_v4()
-            ));
+            anyhow::bail!(
+                "attachment path {} canonicalizes to {} which escapes workspace {}",
+                raw_target,
+                candidate_canon.display(),
+                workspace_canon.display(),
+            );
+        }
+        Ok(candidate_canon)
+    }
+
+    fn resolve_local_attachment_path(&self, target: &str) -> anyhow::Result<PathBuf> {
+        let workspace_dir = self.workspace_dir.as_deref().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "workspace directory is not configured; cannot resolve local attachment path"
+            );
+            anyhow::Error::msg(
+                "workspace directory is not configured; cannot resolve local attachment path",
+            )
+        })?;
+
+        let target = target.trim();
+        let target = target.strip_prefix("file://").unwrap_or(target);
+
+        let workspace_normalized = normalize_lexical(workspace_dir);
+
+        // `/workspace/...` is interpreted as relative to the workspace root.
+        if let Some(rel) = target.strip_prefix("/workspace/") {
+            let resolved = resolve_under(workspace_dir, rel).with_context(|| {
+                format!(
+                    "attachment path {} escapes workspace {}",
+                    target,
+                    workspace_dir.display()
+                )
+            })?;
+            return Self::canonicalize_within_workspace(&resolved, workspace_dir, target);
         }
 
-        resolved
+        // Absolute paths are allowed only if they are already inside the workspace.
+        let candidate = Path::new(target);
+        if candidate.is_absolute() {
+            let normalized = normalize_lexical(candidate);
+            if !normalized.starts_with(&workspace_normalized) {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    &format!(
+                        "attachment path {} escapes workspace {}, rejected",
+                        target,
+                        workspace_dir.display()
+                    )
+                );
+                anyhow::bail!(
+                    "attachment path {} escapes workspace {}",
+                    target,
+                    workspace_dir.display()
+                );
+            }
+            return Self::canonicalize_within_workspace(&normalized, workspace_dir, target);
+        }
+
+        // Relative paths are resolved under the workspace root.
+        let resolved = resolve_under(workspace_dir, target).with_context(|| {
+            format!(
+                "attachment path {} escapes workspace {}",
+                target,
+                workspace_dir.display()
+            )
+        })?;
+        Self::canonicalize_within_workspace(&resolved, workspace_dir, target)
     }
 
     fn remote_file_name(
@@ -1115,7 +1199,7 @@ impl WeChatChannel {
                 .await;
         }
 
-        let path = self.resolve_local_attachment_path(target);
+        let path = self.resolve_local_attachment_path(target)?;
         if !path.exists() {
             anyhow::bail!("attachment path not found: {}", path.display());
         }
@@ -1522,13 +1606,16 @@ impl WeChatChannel {
             qr_refresh_count += 1;
             if qr_refresh_count > MAX_QR_REFRESH {
                 let max = MAX_QR_REFRESH.to_string();
-                anyhow::bail!(
-                    "{}",
-                    wechat_cli_string_with_args(
-                        "cli-wechat-qr-expired-giving-up",
-                        &[("max", &max)],
-                    )
+                let reason = wechat_cli_string_with_args(
+                    "cli-wechat-qr-expired-giving-up",
+                    &[("max", &max)],
                 );
+                crate::login_events::LoginEvent::Failed { reason: &reason }.emit(
+                    self.name(),
+                    &self.alias,
+                    "WeChat QR login gave up after repeated expiry",
+                );
+                anyhow::bail!("{reason}");
             }
 
             // Fetch QR code
@@ -1585,6 +1672,17 @@ impl WeChatChannel {
             } else {
                 qrcode_img_url
             };
+            crate::login_events::LoginEvent::Qr {
+                payload: qr_payload,
+                image_url: (!qrcode_img_url.is_empty()).then_some(qrcode_img_url),
+                attempt: Some(qr_refresh_count),
+                max_attempts: Some(MAX_QR_REFRESH),
+            }
+            .emit(
+                self.name(),
+                &self.alias,
+                "WeChat login QR code ready (scan with the WeChat app)",
+            );
             match render_login_qr(qr_payload) {
                 Ok(qr) => println!("{qr}"),
                 Err(err) => {
@@ -1675,6 +1773,11 @@ impl WeChatChannel {
                     "scaned" => {
                         if !scanned_printed {
                             println!("  {}", wechat_cli_string("cli-wechat-scanned-confirm"));
+                            crate::login_events::LoginEvent::Scanned.emit(
+                                self.name(),
+                                &self.alias,
+                                "WeChat QR code scanned — waiting for in-app confirmation",
+                            );
                             scanned_printed = true;
                         }
                     }
@@ -1682,6 +1785,15 @@ impl WeChatChannel {
                         println!(
                             "  {}",
                             wechat_cli_string("cli-wechat-qr-expired-refreshing")
+                        );
+                        crate::login_events::LoginEvent::Expired {
+                            attempt: qr_refresh_count,
+                            max_attempts: MAX_QR_REFRESH,
+                        }
+                        .emit(
+                            self.name(),
+                            &self.alias,
+                            "WeChat login QR code expired",
                         );
                         break; // Will loop back and get a new QR code
                     }
@@ -1712,6 +1824,11 @@ impl WeChatChannel {
                             .map(String::from);
 
                         println!("  {}", wechat_cli_string("cli-wechat-connected"));
+                        crate::login_events::LoginEvent::Connected.emit(
+                            self.name(),
+                            &self.alias,
+                            "WeChat login confirmed — channel connected",
+                        );
                         return Ok((bot_token, account_id, user_id));
                     }
                     other => {
@@ -2384,7 +2501,6 @@ impl Channel for WeChatChannel {
 
     async fn send_draft(&self, _msg: &SendMessage) -> anyhow::Result<Option<String>> {
         // TODO: Re-enable placeholder if WeChat adds message edit/revoke support.
-        //
         // Current behavior: Return draft_id without sending placeholder.
         // The final response will be sent in finalize_draft().
         let draft_id = format!("draft_{}", uuid::Uuid::new_v4());
@@ -2453,6 +2569,44 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ch.name(), "wechat");
+    }
+
+    #[test]
+    fn has_persisted_login_requires_non_empty_account_token() {
+        let temp = tempdir().unwrap();
+        let dir = temp.path();
+
+        assert!(!WeChatChannel::has_persisted_login(dir));
+
+        // A token cleared on logout is not a persisted login.
+        std::fs::write(dir.join("account.json"), r#"{"token": ""}"#).unwrap();
+        assert!(!WeChatChannel::has_persisted_login(dir));
+
+        std::fs::write(
+            dir.join("account.json"),
+            r#"{"token": "tok_persisted", "account_id": "acct_1"}"#,
+        )
+        .unwrap();
+        assert!(WeChatChannel::has_persisted_login(dir));
+    }
+
+    #[test]
+    fn clear_persisted_login_removes_state_files_and_is_idempotent() {
+        let temp = tempdir().unwrap();
+        let dir = temp.path();
+        std::fs::write(dir.join("account.json"), r#"{"token": "tok_persisted"}"#).unwrap();
+        std::fs::write(dir.join("sync.json"), r#"{"get_updates_buf": "cursor"}"#).unwrap();
+
+        let removed = WeChatChannel::clear_persisted_login(dir).unwrap();
+        assert_eq!(removed.len(), 2);
+        assert!(!dir.join("account.json").exists());
+        assert!(!dir.join("sync.json").exists());
+        assert!(!WeChatChannel::has_persisted_login(dir));
+        assert!(dir.exists(), "the state directory itself must survive");
+
+        // Relinking an already unpaired channel is a safe no-op.
+        let removed = WeChatChannel::clear_persisted_login(dir).unwrap();
+        assert!(removed.is_empty());
     }
 
     #[test]
@@ -2649,6 +2803,215 @@ mod tests {
         );
     }
 
+    fn test_wechat_channel_with_workspace(workspace_dir: &Path) -> WeChatChannel {
+        WeChatChannel::new(
+            "wechat_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            None,
+            None,
+            Some(workspace_dir.join("state")),
+        )
+        .unwrap()
+        .with_workspace_dir(workspace_dir.to_path_buf())
+    }
+
+    #[test]
+    fn resolve_local_attachment_path_requires_workspace_dir() {
+        let temp = tempdir().unwrap();
+        let ch = WeChatChannel::new(
+            "wechat_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            None,
+            None,
+            Some(temp.path().join("state")),
+        )
+        .unwrap();
+        let err = ch.resolve_local_attachment_path("photo.png").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("workspace directory is not configured"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_local_attachment_path_accepts_relative_workspace_path() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let ch = test_wechat_channel_with_workspace(&workspace);
+        assert_eq!(
+            ch.resolve_local_attachment_path("photo.png").unwrap(),
+            workspace.join("photo.png")
+        );
+    }
+
+    #[test]
+    fn resolve_local_attachment_path_accepts_workspace_prefix() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let ch = test_wechat_channel_with_workspace(&workspace);
+        assert_eq!(
+            ch.resolve_local_attachment_path("/workspace/photo.png")
+                .unwrap(),
+            workspace.join("photo.png")
+        );
+    }
+
+    #[test]
+    fn resolve_local_attachment_path_accepts_file_uri_with_workspace_prefix() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let ch = test_wechat_channel_with_workspace(&workspace);
+        assert_eq!(
+            ch.resolve_local_attachment_path("file:///workspace/photo.png")
+                .unwrap(),
+            workspace.join("photo.png")
+        );
+    }
+
+    #[test]
+    fn resolve_local_attachment_path_accepts_absolute_path_inside_workspace() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let ch = test_wechat_channel_with_workspace(&workspace);
+        let file = workspace.join("photo.png");
+        assert_eq!(
+            ch.resolve_local_attachment_path(file.to_str().unwrap())
+                .unwrap(),
+            file
+        );
+    }
+
+    #[test]
+    fn resolve_local_attachment_path_normalizes_within_workspace() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let ch = test_wechat_channel_with_workspace(&workspace);
+        assert_eq!(
+            ch.resolve_local_attachment_path("/workspace/sub/../photo.png")
+                .unwrap(),
+            workspace.join("photo.png")
+        );
+    }
+
+    #[test]
+    fn resolve_local_attachment_path_rejects_dotdot_escape() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let ch = test_wechat_channel_with_workspace(&workspace);
+        assert!(
+            ch.resolve_local_attachment_path("/workspace/../etc/passwd")
+                .is_err(),
+            "dotdot escape with /workspace/ prefix should be rejected"
+        );
+        assert!(
+            ch.resolve_local_attachment_path("sub/../../etc/passwd")
+                .is_err(),
+            "relative dotdot escape should be rejected"
+        );
+    }
+
+    #[test]
+    fn resolve_local_attachment_path_rejects_absolute_outside_workspace() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let ch = test_wechat_channel_with_workspace(&workspace);
+        assert!(
+            ch.resolve_local_attachment_path("/etc/passwd").is_err(),
+            "absolute path outside workspace should be rejected"
+        );
+        assert!(
+            ch.resolve_local_attachment_path("file:///etc/passwd")
+                .is_err(),
+            "file URI outside workspace should be rejected"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)] // `std::os::unix::fs::symlink` is Unix-only; on Windows the
+    // lexical-only containment path is still exercised by the
+    // other tests in this module.
+    fn resolve_local_attachment_path_rejects_symlink_escaping_workspace() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let outside_dir = temp.path().join("outside-target");
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        let outside_file = outside_dir.join("secret.txt");
+        std::fs::write(&outside_file, "top secret").unwrap();
+        std::os::unix::fs::symlink(&outside_dir, workspace.join("outside")).unwrap();
+
+        let ch = test_wechat_channel_with_workspace(&workspace);
+        let err = ch
+            .resolve_local_attachment_path("/workspace/outside/secret.txt")
+            .expect_err("symlink that escapes workspace must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("canonicalizes to") && msg.contains("escapes workspace"),
+            "expected canonical-escape error, got: {msg}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)] // Symlink creation is Unix-only; the test still proves the
+    // canonical-containment path on the platforms where it runs.
+    fn resolve_local_attachment_path_accepts_symlink_within_workspace() {
+        // Workspace-internal symlinks are legitimate aliases (e.g. a
+        // `latest -> 2026-07-03` link inside an attachments directory).
+        // They must still resolve cleanly so the upload sees the real file.
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let real_dir = workspace.join("attachments").join("2026-07-03");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let real_file = real_dir.join("report.pdf");
+        std::fs::write(&real_file, b"%PDF-1.4\n").unwrap();
+        std::os::unix::fs::symlink(&real_dir, workspace.join("latest")).unwrap();
+
+        let ch = test_wechat_channel_with_workspace(&workspace);
+        let resolved = ch
+            .resolve_local_attachment_path("/workspace/latest/report.pdf")
+            .expect("workspace-internal symlink alias must be accepted");
+        let real_canon = std::fs::canonicalize(&real_file).unwrap();
+        assert_eq!(resolved, real_canon);
+    }
+
+    #[test]
+    fn resolve_local_attachment_path_allows_nonexistent_lexical_target() {
+        // Non-existent paths must still pass (a future-write path, or a
+        // target the agent has not created yet). The canonical-containment
+        // check is skipped because canonicalize() would fail.
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let ch = test_wechat_channel_with_workspace(&workspace);
+        let resolved = ch
+            .resolve_local_attachment_path("/workspace/not-yet-created.png")
+            .expect("non-existent path under workspace is allowed (lexical only)");
+        assert_eq!(resolved, workspace.join("not-yet-created.png"));
+    }
+
+    #[tokio::test]
+    async fn load_attachment_payload_rejects_path_traversal() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let ch = test_wechat_channel_with_workspace(&workspace);
+        let attachment = WeChatAttachment {
+            kind: WeChatAttachmentKind::Image,
+            target: "/workspace/../etc/passwd".to_string(),
+        };
+        let err = ch.load_attachment_payload(&attachment).await.unwrap_err();
+        assert!(err.to_string().contains("escapes workspace"), "got: {err}");
+    }
+
     #[test]
     fn parse_aes_key_accepts_hex_and_base64() {
         let raw: [u8; 16] = *b"0123456789abcdef";
@@ -2659,11 +3022,6 @@ mod tests {
         assert_eq!(parse_aes_key(&hex_key).unwrap(), raw);
         assert_eq!(parse_aes_key(&base64_key).unwrap(), raw);
 
-        // Outbound CDNMedia `aes_key` must be base64(hex(key)), matching the
-        // official @tencent-weixin/openclaw-weixin client (base64-decode then
-        // hex-decode back to 16 bytes). Encoding raw bytes directly is
-        // undecryptable by the client ("image expired"), so it must NOT equal
-        // base64(raw) and must round-trip through the same parser.
         let outbound = base64::engine::general_purpose::STANDARD.encode(hex::encode(raw));
         assert_ne!(outbound, base64_key);
         assert_eq!(parse_aes_key(&outbound).unwrap(), raw);
