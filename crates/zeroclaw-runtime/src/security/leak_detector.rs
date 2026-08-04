@@ -43,6 +43,8 @@ pub struct LeakDetector {
     sensitivity: f64,
     /// Enable heuristic redaction of standalone high-entropy token candidates.
     high_entropy_tokens: bool,
+    /// Allow Solana base58 public identifiers through high-entropy redaction.
+    solana_identifiers: bool,
 }
 
 impl Default for LeakDetector {
@@ -71,6 +73,7 @@ impl LeakDetector {
             enabled: config.enabled,
             sensitivity: config.sensitivity.clamp(0.0, 1.0),
             high_entropy_tokens: config.high_entropy_tokens,
+            solana_identifiers: config.solana_identifiers,
         }
     }
 
@@ -523,6 +526,13 @@ impl LeakDetector {
                 continue;
             }
 
+            // Solana public identifiers are exempt when enabled (issue #9486):
+            // wallet addresses, tx signatures and program IDs are public by
+            // design, and every one of them trips the entropy heuristics.
+            if self.solana_identifiers && is_solana_identifier(token.value) {
+                continue;
+            }
+
             if is_path_like_token(token.value) {
                 if collect_path_segment_entropy_redactions(&token, entropy_threshold, redactions) {
                     patterns.push("High-entropy token".to_string());
@@ -596,6 +606,28 @@ fn is_high_entropy_candidate(s: &str, entropy_threshold: f64) -> bool {
     s.len() >= ENTROPY_TOKEN_MIN_LEN
         && shannon_entropy(s) >= entropy_threshold
         && has_mixed_alpha_digit(s)
+}
+
+/// Base58 alphabet (Bitcoin/Solana): excludes `0OIl` to avoid ambiguity.
+const BASE58_ALPHABET: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+/// Whether `s` consists entirely of base58 characters.
+fn is_base58(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes().all(|b| {
+            BASE58_ALPHABET
+                .iter()
+                .any(|&a| a == b)
+        })
+}
+
+/// Whether `s` is a Solana public identifier:
+/// - wallet address / program ID: 32 bytes → 43-44 base58 chars
+/// - transaction signature: 64 bytes → 87-88 base58 chars
+/// - token mint / associated token account: 32 bytes → 43-44 chars
+fn is_solana_identifier(s: &str) -> bool {
+    let len = s.len();
+    (len == 43 || len == 44 || len == 87 || len == 88) && is_base58(s)
 }
 
 fn collect_path_segment_entropy_redactions(
@@ -1393,5 +1425,114 @@ MIIEowIBAAKCAQEA0ZPr5JeyVDonXsKhfq...
             detector.scan("connection reset by peer"),
             LeakResult::Clean
         ));
+    }
+
+    // ── Solana identifier allowlist (issue #9486) ────────────────────
+
+    // Real Solana testnet address (base58, 44 chars).
+    const SOLANA_ADDRESS: &str =
+        "7RJWhvQBQPEjJmki5fhBboGBWRJhmcFkMvrr4Fu3tMSJ";
+    // Real Solana transaction signature shape (88 base58 chars).
+    const SOLANA_TX_SIG: &str =
+        "h82pJGF9p7kpzb6eU326EFZf2cDnimbTFVeJtx1qtBmUNJAEqN76R7PwPfHt3oWb8R6cKvhgyxQdDn53jFrK6wFx";
+
+    #[test]
+    fn solana_address_is_not_redacted_by_default() {
+        let detector = LeakDetector::new();
+        // Sanity: the address alone would trip the entropy heuristic.
+        assert!(
+            is_high_entropy_candidate(SOLANA_ADDRESS, 3.5 + 0.7 * 1.25),
+            "test address must be high-entropy to be a meaningful regression"
+        );
+        let content = format!(
+            "Send the payment to {} on Solana",
+            SOLANA_ADDRESS
+        );
+        match detector.scan(&content) {
+            LeakResult::Clean => {}
+            LeakResult::Detected { redacted, .. } => {
+                assert!(
+                    redacted.contains(SOLANA_ADDRESS),
+                    "Solana address was redacted: {redacted}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn solana_tx_signature_is_not_redacted_by_default() {
+        let detector = LeakDetector::new();
+        let content = format!(
+            "Settled: https://solscan.io/tx/{}",
+            SOLANA_TX_SIG
+        );
+        match detector.scan(&content) {
+            LeakResult::Clean => {}
+            LeakResult::Detected { redacted, .. } => {
+                assert!(
+                    redacted.contains(SOLANA_TX_SIG),
+                    "Solana tx signature was redacted: {redacted}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn high_entropy_secret_still_redacted_when_solana_allowed() {
+        let detector = LeakDetector::new();
+        // A 44-char token that is NOT base58 (contains `0`) must still be
+        // redacted: the allowlist is character-set strict. The string is a
+        // neutral high-entropy value with no known-secret prefix, so the
+        // repo's secret scanner never flags the test itself.
+        let secret = "cX9kQz7Z0qXvFb3NpR8tW2yH6jL0mQ4sV8bN1cD5fG7hJ2kL";
+        let content = format!("my api key is {secret}");
+        let result = detector.scan(&content);
+        match result {
+            LeakResult::Detected { redacted, .. } => {
+                assert!(
+                    !redacted.contains(secret),
+                    "non-base58 secret survived redaction"
+                );
+            }
+            LeakResult::Clean => panic!("secret should have been detected"),
+        }
+    }
+
+    #[test]
+    fn solana_exemption_can_be_disabled() {
+        let mut config = LeakDetectionConfig::default();
+        config.solana_identifiers = false;
+        let detector = LeakDetector::with_config(&config);
+        let content = format!(
+            "Send the payment to {} on Solana",
+            SOLANA_ADDRESS
+        );
+        match detector.scan(&content) {
+            LeakResult::Detected { redacted, .. } => {
+                assert!(
+                    !redacted.contains(SOLANA_ADDRESS),
+                    "address must be redacted when allowlist disabled"
+                );
+            }
+            LeakResult::Clean => panic!("address must be flagged when allowlist disabled"),
+        }
+    }
+
+    #[test]
+    fn base58_validation_rejects_non_base58() {
+        assert!(is_solana_identifier(SOLANA_ADDRESS));
+        assert!(is_solana_identifier(SOLANA_TX_SIG));
+        // Contains `0` (not in base58).
+        assert!(!is_solana_identifier(
+            "7RJWhvQBQPEjJmki5fhBboGBWRJhmcFkMvrr4Fu3tMS0"
+        ));
+        // Wrong length (too short).
+        assert!(!is_solana_identifier("7RJWhvQBQPEjJmki5fh"));
+        // Wrong length (too long for an address, too short for a signature).
+        assert!(!is_solana_identifier(
+            "7RJWhvQBQPEjJmki5fhBboGBWRJhmcFkMvrr4Fu3tMSJx"
+        ));
+        // Empty.
+        assert!(!is_solana_identifier(""));
     }
 }
