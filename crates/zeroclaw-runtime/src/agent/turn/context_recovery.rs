@@ -120,14 +120,25 @@ pub(crate) async fn try_recover_context_overflow(
                     })),
                 "Context recovery: dropped oldest whole turns, retrying"
             );
-            let reason = crate::i18n::get_required_cli_string("history-trim-reason-budget");
+            // This path trims toward `tokens_now * 2 / 3`, not toward
+            // `context_token_budget` — a provider can overflow below the
+            // configured limit (or with enforcement disabled entirely, where
+            // `context_token_budget` is 0). Use a distinct reason so clients
+            // do not render this as "trimmed against a Z-token budget" when
+            // no configured budget governed the trim. The configured limit is
+            // still reported (contract: issue #9619) but only when one is
+            // actually set, so a disabled-enforcement recovery does not claim
+            // a nonsensical zero-token budget.
+            let reason = crate::i18n::get_required_cli_string("history-trim-reason-recovery");
+            let reported_token_budget =
+                (context_token_budget > 0).then(|| context_token_budget as u64);
             if let Some(tx) = event_tx {
                 let _ = tx
                     .send(zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
                         dropped_messages,
                         kept_turns,
                         reason: reason.clone(),
-                        token_budget: Some(context_token_budget as u64),
+                        token_budget: reported_token_budget,
                         tokens_before: Some(tokens_now as u64),
                         tokens_after: Some(tokens_after as u64),
                         tokens_before_source: Some(
@@ -144,7 +155,7 @@ pub(crate) async fn try_recover_context_overflow(
                 channel: None,
                 agent_alias: None,
                 turn_id: None,
-                token_budget: Some(context_token_budget as u64),
+                token_budget: reported_token_budget,
                 tokens_before: Some(tokens_now as u64),
                 tokens_after: Some(tokens_after as u64),
                 tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
@@ -338,12 +349,14 @@ mod tests {
                 assert!(kept_turns >= 1, "must keep at least the current turn");
                 assert_eq!(
                     reason,
-                    crate::i18n::get_required_cli_string("history-trim-reason-budget")
+                    crate::i18n::get_required_cli_string("history-trim-reason-recovery"),
+                    "recovery must use a reason distinct from configured-budget trims: \
+                     the trim target is tokens_now * 2/3, not the configured budget"
                 );
                 assert_eq!(
                     token_budget,
                     Some(32_000),
-                    "recovery must report the configured budget"
+                    "recovery must report the configured budget when one is set"
                 );
                 assert!(
                     tokens_before.is_some_and(|before| before > tokens_after.unwrap_or(0)),
@@ -361,6 +374,82 @@ mod tests {
                     tokens_after,
                     Some(crate::agent::history::estimate_history_tokens(&history) as u64),
                     "tokens_after must describe the final recovered history (breadcrumb included)"
+                );
+            }
+            other => panic!("expected HistoryTrimmed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_below_configured_budget_does_not_claim_it_governed_the_trim() {
+        // A provider can overflow at a token count below the configured
+        // limit (e.g. the provider's own window is smaller than our
+        // configured budget). The recovery trim target here is
+        // tokens_now * 2/3, unrelated to the configured budget, so the
+        // emitted reason must not read as a configured-budget trim even
+        // though the configured budget is still reported for the contract.
+        let mut history = overflowing_history();
+        let tokens_now = estimate_history_tokens(&history);
+        let configured_budget = tokens_now * 4; // configured limit far above the overflow point
+        let err = anyhow::Error::msg("maximum context length exceeded");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let observer = NoopObserver;
+
+        let recovered = try_recover_context_overflow(
+            &mut history,
+            &err,
+            1,
+            Some(&tx),
+            &observer,
+            configured_budget,
+        )
+        .await;
+
+        assert!(recovered, "an overflowing history must trim and recover");
+        let event = rx.try_recv().expect("recovery must emit a TurnEvent");
+        match event {
+            zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
+                reason,
+                token_budget,
+                ..
+            } => {
+                assert_eq!(
+                    reason,
+                    crate::i18n::get_required_cli_string("history-trim-reason-recovery"),
+                    "a below-configured-limit overflow must not be reported as a \
+                     configured-budget trim"
+                );
+                assert_eq!(
+                    token_budget,
+                    Some(configured_budget as u64),
+                    "the configured limit is still reported for the #9619 contract"
+                );
+            }
+            other => panic!("expected HistoryTrimmed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_with_enforcement_disabled_reports_no_budget() {
+        // `context_token_budget == 0` means configured enforcement is
+        // disabled. A provider overflow can still trigger recovery in this
+        // state; the emitted event must not claim a nonsensical "0-token
+        // budget" governed the trim.
+        let mut history = overflowing_history();
+        let err = anyhow::Error::msg("maximum context length exceeded");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let observer = NoopObserver;
+
+        let recovered =
+            try_recover_context_overflow(&mut history, &err, 1, Some(&tx), &observer, 0).await;
+
+        assert!(recovered, "an overflowing history must trim and recover");
+        let event = rx.try_recv().expect("recovery must emit a TurnEvent");
+        match event {
+            zeroclaw_api::agent::TurnEvent::HistoryTrimmed { token_budget, .. } => {
+                assert_eq!(
+                    token_budget, None,
+                    "disabled enforcement must not report a 0-token budget as governing"
                 );
             }
             other => panic!("expected HistoryTrimmed, got {other:?}"),
