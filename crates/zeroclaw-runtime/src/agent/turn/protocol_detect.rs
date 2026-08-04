@@ -25,6 +25,8 @@ pub(crate) fn find_embedded_protocol_candidate_start(text: &str) -> Option<usize
         "<tool-call",
         "<invoke",
         "<function",
+        "<|dsml",
+        "<|tool_call",
         "```tool",
         "```invoke",
         "```json",
@@ -53,6 +55,8 @@ pub(crate) fn find_incomplete_protocol_candidate_start(text: &str) -> Option<usi
         "<tool",
         "<invoke",
         "<function",
+        "<|dsml",
+        "<|tool_call",
         "```tool",
         "```invoke",
         "```json",
@@ -89,6 +93,8 @@ pub(crate) fn starts_suspicious_protocol_prefix(text: &str) -> bool {
         || lower.starts_with("<tool")
         || lower.starts_with("<invoke")
         || lower.starts_with("<function")
+        || lower.starts_with("<|dsml")
+        || lower.starts_with("<|tool_call")
         || lower.starts_with("```tool")
         || lower.starts_with("```invoke")
         || lower.starts_with("```json")
@@ -99,6 +105,8 @@ pub(crate) fn starts_suspicious_tag_or_fence_prefix(text: &str) -> bool {
     lower.starts_with("<tool")
         || lower.starts_with("<invoke")
         || lower.starts_with("<function")
+        || lower.starts_with("<|dsml")
+        || lower.starts_with("<|tool_call")
         || lower.starts_with("```tool")
         || lower.starts_with("```invoke")
         || lower.starts_with("```json")

@@ -270,3 +270,43 @@ impl StreamThinkTagStripper {
         std::mem::take(&mut self.pending)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::ToolSpec;
+
+    fn shell_guard() -> StreamTextGuard {
+        StreamTextGuard::new(Some(&[ToolSpec::new(
+            "shell",
+            "run a command",
+            serde_json::json!({}),
+        )]))
+    }
+
+    #[test]
+    fn suppresses_dsml_envelope_split_across_stream_chunks() {
+        let mut guard = shell_guard();
+
+        assert_eq!(guard.push("<|DSML|>"), None);
+        assert_eq!(guard.push("\n{\"name\":\"shell\""), None);
+        assert_eq!(guard.push(",\"arguments\":{\"cmd\":\"ls\"}}"), None);
+        assert_eq!(guard.push("\n</|DSML|>"), None);
+
+        assert_eq!(guard.finish(), None);
+        assert!(
+            guard.suppressed_protocol,
+            "DSML envelope must be suppressed"
+        );
+        assert!(guard.suppress_forwarding);
+    }
+
+    #[test]
+    fn forwards_plain_text_with_dsml_prefixes() {
+        let mut guard = shell_guard();
+
+        assert_eq!(guard.push("<|dsml"), None);
+        assert_eq!(guard.push("data"), None);
+        assert_eq!(guard.finish(), Some("<|dsmldata".to_string()));
+    }
+}
