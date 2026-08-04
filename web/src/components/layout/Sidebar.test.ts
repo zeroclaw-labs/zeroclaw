@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { createElement } from 'react';
+import { createElement, type Ref } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { MemoryRouter } from 'react-router-dom';
+import { railAsideStyle, railNavClassName } from './sidebarRail.ts';
 import { SidebarNavLink } from './SidebarNavLink.ts';
 
 function renderSidebarLinks(pathname: string, activePath: string): string {
@@ -49,4 +50,36 @@ test('other config routes select only Config in both sidebar variants', () => {
 
   assert.equal(links.length, 2);
   assert.ok(links.every((link) => link.includes('href="/config"')));
+});
+
+test('SidebarNavLink forwards a ref prop to the underlying NavLink', () => {
+  // The rail tooltip positions itself from
+  // `linkRef.current.getBoundingClientRect()`, so the ref passed to
+  // `SidebarNavLink` must reach the rendered `<a>`. React 19 passes ref as a
+  // regular prop; the component must spread it through.
+  const ref: Ref<HTMLAnchorElement> = { current: null };
+  const el = SidebarNavLink({
+    activePath: '/config',
+    to: '/config/agents',
+    ref,
+    children: 'Agent',
+  });
+  assert.equal(el.props.ref, ref);
+});
+
+test('desktop rail relies on the portal, not an overflow-x mask, for horizontal overflow', () => {
+  // The rail tooltip is portaled out of the nav subtree, so `overflow-y:
+  // auto` alone must keep the rail at `scrollWidth === clientWidth`. An
+  // `overflow-x` hidden/clip added here masks the symptom at the container
+  // instead of removing the overflowing content, and it reintroduces the
+  // band-aid that #8791 reviewers rejected.
+  assert.ok(railNavClassName.includes('overflow-y-auto'));
+  assert.ok(
+    !railNavClassName.includes('overflow-x'),
+    'rail nav must not carry an overflow-x class',
+  );
+  assert.ok(
+    !('overflowX' in railAsideStyle),
+    'rail aside must not carry an overflowX inline style',
+  );
 });

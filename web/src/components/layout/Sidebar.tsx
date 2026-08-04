@@ -1,6 +1,7 @@
 import { useLocation } from 'react-router-dom';
 import { basePath } from '../../lib/basePath';
 import { findActiveNavPath } from './sidebarNav';
+import { railAsideStyle, railNavClassName } from './sidebarRail';
 import { SidebarNavLink } from './SidebarNavLink';
 import {
   Activity,
@@ -101,10 +102,11 @@ const navPaths = navGroups.flatMap((group) => group.items.map((item) => item.to)
 // which we don't want). With the portal, the popover is rendered into
 // the top-level body and `position: fixed` pins it to viewport coords
 // computed from the NavLink's bounding rect, with `scroll` / `resize`
-// listeners re-anchoring it while it is visible. The `<nav>`'s
-// `overflow-x: hidden` (round-1 band-aid for #8791) is removed in round-4
-// of this PR: the portal alone keeps the rail at `scrollWidth ===
-// clientWidth`, so the band-aid is no longer required.
+// listeners re-anchoring it while it is visible. Because the popover was
+// the only content that ever extended past the rail's right border, the
+// nav needs no horizontal overflow handling at all: `overflow-y: auto`
+// alone leaves `scrollWidth === clientWidth`, so no `overflow-x` value
+// (hidden or clip) is applied to either the `<nav>` or the `<aside>`.
 function RailNavItem({
   item,
   activePath,
@@ -120,7 +122,7 @@ function RailNavItem({
   // Tooltip anchor in viewport coords, derived from the DOM: `tooltipTop`
   // is the vertical center of the NavLink (so the popover visually aligns
   // with the icon) and `tooltipLeft` is the rail's right edge (the closest
-  // `<aside>`) plus the 8 px gap that round-1 established with `ml-2` —
+  // `<aside>`) plus the 8 px visual gap —
   // i.e. the popover sits flush against the rail. Both are `null` together
   // when the popover should not render. Deriving both from the rect means
   // the rail's `w-14` width is no longer hard-coded into the popover's
@@ -131,16 +133,16 @@ function RailNavItem({
   const showTooltip = () => {
     const linkRect = linkRef.current?.getBoundingClientRect();
     // Anchor the popover to the rail's right edge (the closest `<aside>`),
-    // not the link's right edge. Round-1 hard-coded `left: 64` because the
-    // rail is `w-14` (56 px) and the desired gap is 8 px; deriving from the
-    // rail's actual rect keeps the visual gap stable regardless of how the
-    // link is positioned within the rail (centered icon, full-width item,
-    // future layout changes, etc.) — i.e. the rail's `w-14` is no longer
-    // duplicated into the popover's horizontal position.
+    // not the link's right edge. The rail is `w-14` (56 px) and the desired
+    // gap is 8 px; deriving from the rail's actual rect keeps the visual gap
+    // stable regardless of how the link is positioned within the rail
+    // (centered icon, full-width item, future layout changes, etc.) — i.e.
+    // the rail's `w-14` is no longer duplicated into the popover's
+    // horizontal position.
     const railRect = linkRef.current?.closest('aside')?.getBoundingClientRect();
     if (linkRect && railRect) {
       setTooltipTop(linkRect.top + linkRect.height / 2);
-      setTooltipLeft(railRect.right + 8); // 8 px gap, matches the round-1 ml-2
+      setTooltipLeft(railRect.right + 8); // 8 px gap from the rail's right edge
     }
   };
   const hideTooltip = () => {
@@ -154,7 +156,9 @@ function RailNavItem({
     if (tooltipTop === null) return;
     const update = () => {
       const linkRect = linkRef.current?.getBoundingClientRect();
-      const railRect = linkRef.current?.closest('aside')?.getBoundingClientRect();
+      const railRect = linkRef.current
+        ?.closest('aside')
+        ?.getBoundingClientRect();
       if (linkRect && railRect) {
         setTooltipTop(linkRect.top + linkRect.height / 2);
         setTooltipLeft(railRect.right + 8);
@@ -169,62 +173,67 @@ function RailNavItem({
   }, [tooltipTop !== null]);
 
   return (
-    <SidebarNavLink
-      to={to}
-      activePath={activePath}
-      onClick={onClick}
-      onMouseEnter={showTooltip}
-      onMouseLeave={hideTooltip}
-      onFocus={showTooltip}
-      onBlur={hideTooltip}
-      title={text}
-      aria-label={text}
-      className={({ isActive }) =>
-        [
-          'group relative flex h-10 w-10 mx-auto items-center justify-center',
-          'rounded-[var(--radius-md)] transition-colors duration-150',
-          'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]',
-          isActive
-            ? 'bg-pc-accent/10 text-pc-accent'
-            : 'text-pc-text-muted hover:text-pc-text-secondary hover:bg-[var(--pc-hover)]',
-        ].join(' ')
-      }
-    >
-      {({ isActive }) => (
-        <>
-          {/* 2px left accent bar marking the active item against the rail edge. */}
-          {isActive && (
-            <span
-              aria-hidden="true"
-              className="absolute left-0 top-1.5 bottom-1.5 w-0.5 rounded-full bg-pc-accent"
+    <>
+      <SidebarNavLink
+        to={to}
+        activePath={activePath}
+        ref={linkRef}
+        onClick={onClick}
+        onMouseEnter={showTooltip}
+        onMouseLeave={hideTooltip}
+        onFocus={showTooltip}
+        onBlur={hideTooltip}
+        title={text}
+        aria-label={text}
+        className={({ isActive }) =>
+          [
+            'group relative flex h-10 w-10 mx-auto items-center justify-center',
+            'rounded-[var(--radius-md)] transition-colors duration-150',
+            'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]',
+            isActive
+              ? 'bg-pc-accent/10 text-pc-accent'
+              : 'text-pc-text-muted hover:text-pc-text-secondary hover:bg-[var(--pc-hover)]',
+          ].join(' ')
+        }
+      >
+        {({ isActive }) => (
+          <>
+            {/* 2px left accent bar marking the active item against the rail edge. */}
+            {isActive && (
+              <span
+                aria-hidden="true"
+                className="absolute left-0 top-1.5 bottom-1.5 w-0.5 rounded-full bg-pc-accent"
+              />
+            )}
+            <Icon
+              className={`h-[22px] w-[22px] shrink-0 transition-colors ${
+                isActive
+                  ? 'text-pc-accent'
+                  : 'group-hover:text-pc-text-secondary'
+              }`}
             />
-          )}
-          <Icon
-            className={`h-[22px] w-[22px] shrink-0 transition-colors ${
-              isActive ? 'text-pc-accent' : 'group-hover:text-pc-text-secondary'
-            }`}
-          />
-        </>
-      )}
-    </SidebarNavLink>
-    {tooltipTop !== null &&
-      createPortal(
-        <span
-          role="tooltip"
-          className="pointer-events-none fixed z-9999 whitespace-nowrap rounded-[var(--radius-sm)] px-2 py-1 text-xs"
-          style={{
-            top: tooltipTop,
-            left: tooltipLeft ?? 0, // set iff tooltipTop is set; see showTooltip
-            transform: 'translateY(-50%)',
-            background: 'var(--pc-bg-elevated)',
-            color: 'var(--pc-text-primary)',
-            border: '1px solid var(--pc-border)',
-          }}
-        >
-          {text}
-        </span>,
-        document.body,
-      )}
+          </>
+        )}
+      </SidebarNavLink>
+      {tooltipTop !== null &&
+        createPortal(
+          <span
+            role="tooltip"
+            className="pointer-events-none fixed z-9999 whitespace-nowrap rounded-[var(--radius-sm)] px-2 py-1 text-xs"
+            style={{
+              top: tooltipTop,
+              left: tooltipLeft ?? 0, // set iff tooltipTop is set; see showTooltip
+              transform: 'translateY(-50%)',
+              background: 'var(--pc-bg-elevated)',
+              color: 'var(--pc-text-primary)',
+              border: '1px solid var(--pc-border)',
+            }}
+          >
+            {text}
+          </span>,
+          document.body,
+        )}
+    </>
   );
 }
 
@@ -351,15 +360,11 @@ export default function Sidebar({ open, onClose }: SidebarProps) {
           divider rules between the icon clusters. */}
       <aside
         className="hidden md:flex fixed top-0 left-0 h-screen w-14 flex-col border-r z-50"
-        style={{
-          background: 'var(--pc-bg-sidebar)',
-          borderColor: 'var(--pc-border)',
-          overflowX: 'clip', // Fix compact viewport overflow (#8791)
-        }}
+        style={railAsideStyle}
         aria-label={t('nav.aria.primary')}
       >
         <RailLogo />
-        <nav className="flex-1 overflow-y-auto py-3 px-1.5" aria-label={t('nav.aria.primary')}>
+        <nav className={railNavClassName} aria-label={t('nav.aria.primary')}>
           {navGroups.map((group, index) => (
             <div key={group.headingKey} className="space-y-1" role="group" aria-label={t(group.headingKey)}>
               {/* Thin divider between clusters (skipped before the first). */}
