@@ -5055,8 +5055,9 @@ pub struct VerifiableIntentConfig {
     /// Opt in to the VI section (default: false).
     ///
     /// While the tool is withheld this does not enable credential verification
-    /// on commerce tool calls. It currently causes a startup warning naming that
-    /// gap, emitted once per agent registry assembly.
+    /// on commerce tool calls. It currently causes a warning naming that gap,
+    /// emitted once per config application: at process startup, and again when
+    /// a daemon reload re-reads config from disk.
     #[serde(default)]
     pub enabled: bool,
 
