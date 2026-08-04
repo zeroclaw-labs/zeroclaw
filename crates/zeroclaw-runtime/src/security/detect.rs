@@ -204,12 +204,7 @@ fn sandbox_backend_available(
 
 #[cfg(target_os = "macos")]
 fn seatbelt_available() -> bool {
-    Path::new("/usr/bin/sandbox-exec").exists()
-        || std::process::Command::new("sandbox-exec")
-            .args(["-n", "no-network", "true"])
-            .output()
-            .map(|output| output.status.success())
-            .unwrap_or(false)
+    Path::new(super::seatbelt::SANDBOX_EXEC_PATH).is_file()
 }
 
 #[cfg(not(target_os = "macos"))]

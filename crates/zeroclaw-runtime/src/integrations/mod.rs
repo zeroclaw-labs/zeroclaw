@@ -160,7 +160,7 @@ pub fn show_integration_info(config: &Config, name: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(test, zeroclaw_root_crate))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -179,32 +179,20 @@ mod tests {
     #[test]
     fn handle_command_info_is_case_insensitive_for_known_integrations() {
         let config = Config::default();
-        let first_name = registry::all_integrations(&config)
-            .first()
-            .expect("registry should define at least one integration")
-            .name
-            .to_lowercase();
-
-        let result = handle_command(
-            crate::IntegrationCommands::Info { name: first_name },
-            &config,
+        let entries = registry::all_integrations(&config);
+        assert!(
+            !entries.is_empty(),
+            "registry should define at least one integration"
         );
 
-        assert!(result.is_ok());
+        let upper_name = entries[0].name.to_uppercase();
+        assert!(show_integration_info(&config, &upper_name).is_ok());
     }
 
     #[test]
     fn handle_command_info_returns_error_for_unknown_integration() {
         let config = Config::default();
-        let result = handle_command(
-            crate::IntegrationCommands::Info {
-                name: "definitely-not-a-real-integration".into(),
-            },
-            &config,
-        );
-
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("Unknown integration"));
+        let err = show_integration_info(&config, "definitely-not-a-real-integration").unwrap_err();
+        assert!(err.to_string().contains("Unknown integration"));
     }
 }

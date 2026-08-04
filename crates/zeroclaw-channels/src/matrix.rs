@@ -230,9 +230,13 @@ mod approval {
             return None;
         }
         let response = match verb.as_str() {
-            "approve" | "yes" | "y" => ChannelApprovalResponse::Approve,
-            "deny" | "no" | "n" => ChannelApprovalResponse::Deny,
-            "always" => ChannelApprovalResponse::AlwaysApprove,
+            crate::util::APPROVAL_REPLY_APPROVE
+            | crate::util::APPROVAL_REPLY_YES
+            | crate::util::APPROVAL_REPLY_YES_SHORT => ChannelApprovalResponse::Approve,
+            crate::util::APPROVAL_REPLY_DENY
+            | crate::util::APPROVAL_REPLY_NO
+            | crate::util::APPROVAL_REPLY_NO_SHORT => ChannelApprovalResponse::Deny,
+            crate::util::APPROVAL_REPLY_ALWAYS => ChannelApprovalResponse::AlwaysApprove,
             _ => return None,
         };
         Some((token.to_uppercase(), response))
@@ -1994,12 +1998,11 @@ mod inbound {
             let encrypted: matrix_sdk::ruma::events::room::EncryptedFile =
                 serde_json::from_value(file.clone()).ok()?;
             matrix_sdk::ruma::events::room::MediaSource::Encrypted(Box::new(encrypted))
-        } else if let Some(url) = content.get("url").and_then(|u| u.as_str()) {
+        } else {
+            let url = content.get("url").and_then(|u| u.as_str())?;
             matrix_sdk::ruma::events::room::MediaSource::Plain(matrix_sdk::ruma::OwnedMxcUri::from(
                 url,
             ))
-        } else {
-            return None;
         };
         Some(MediaInfo::new(source, file_name, mime, kind))
     }
@@ -3789,15 +3792,29 @@ impl Channel for MatrixChannel {
         Ok(())
     }
 
+    /// Delegates to [`Self::request_approval_attributed`] and drops the
+    /// provenance, so the prompt/timeout logic lives in exactly one place.
     async fn request_approval(
         &self,
         recipient: &str,
         request: &ChannelApprovalRequest,
     ) -> Result<Option<ChannelApprovalResponse>> {
+        Ok(self
+            .request_approval_attributed(recipient, request)
+            .await?
+            .map(|attributed| attributed.response))
+    }
+
+    async fn request_approval_attributed(
+        &self,
+        recipient: &str,
+        request: &ChannelApprovalRequest,
+    ) -> Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
         let token = approval::generate_token_default();
-        let prompt = format!(
-            "APPROVAL REQUIRED [{token}]\nTool: {}\nArgs: {}\n\nReply `{token} approve` / `{token} deny` / `{token} always`.",
-            request.tool_name, request.arguments_summary
+        let prompt = crate::util::build_approve_deny_approval_prompt(
+            &token,
+            &request.tool_name,
+            &request.arguments_summary,
         );
 
         let (tx, rx) = oneshot::channel();
@@ -3817,10 +3834,24 @@ impl Channel for MatrixChannel {
         if result.is_err() {
             self.pending_approvals.lock().await.remove(&token);
         }
+        // Only the first arm is an operator decision; the other two are the
+        // runtime denying because nobody replied, and must say so.
         match result {
-            Ok(Ok(resp)) => Ok(Some(resp)),
-            Ok(Err(_)) => Ok(Some(ChannelApprovalResponse::Deny)),
-            Err(_) => Ok(Some(ChannelApprovalResponse::Deny)),
+            Ok(Ok(resp)) => Ok(Some(
+                zeroclaw_api::channel::AttributedApprovalResponse::operator(resp),
+            )),
+            Ok(Err(_)) => Ok(Some(
+                zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                    ChannelApprovalResponse::Deny,
+                    zeroclaw_api::channel::ApprovalSource::Unreachable,
+                ),
+            )),
+            Err(_) => Ok(Some(
+                zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                    ChannelApprovalResponse::Deny,
+                    zeroclaw_api::channel::ApprovalSource::TimedOut,
+                ),
+            )),
         }
     }
 }
@@ -4684,6 +4715,36 @@ mod tests {
         #[test]
         fn rejects_trailing_garbage() {
             assert!(parse_reply("ABCDEFGH approve please").is_none());
+        }
+
+        #[test]
+        fn localized_request_approval_prompt_still_parses_via_matrix_own_parser() {
+            // Localization must not desync the (possibly translated) prompt
+            // prose from Matrix's own approve/deny/always parser: the
+            // keywords the prompt shows must remain the literal ASCII words
+            // `parse_reply` expects, whatever locale is active.
+            let token = generate_token_default();
+            let prompt = crate::util::build_approve_deny_approval_prompt(&token, "shell", "ls -la");
+            assert!(
+                prompt.contains(&token),
+                "prompt should echo the token verbatim; got {prompt:?}"
+            );
+
+            for (word, expected) in [
+                ("approve", ChannelApprovalResponse::Approve),
+                ("deny", ChannelApprovalResponse::Deny),
+                ("always", ChannelApprovalResponse::AlwaysApprove),
+            ] {
+                let reply = format!("{token} {word}");
+                assert!(
+                    prompt.contains(&reply),
+                    "prompt should show the exact reply {reply:?}; got {prompt:?}"
+                );
+                let (parsed_token, response) =
+                    parse_reply(&reply).unwrap_or_else(|| panic!("{reply:?} should parse"));
+                assert_eq!(parsed_token, token);
+                assert_eq!(response, expected);
+            }
         }
     }
 
