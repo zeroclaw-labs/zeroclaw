@@ -42,9 +42,10 @@ pub struct WhatsAppWebChannel {
     bot_lid: Arc<Mutex<Option<String>>>,
     /// Usage mode (business vs personal policy filtering)
     mode: zeroclaw_config::schema::WhatsAppWebMode,
-    /// DM policy when mode = personal
+    /// DM policy. Consulted under BOTH modes; these comments said "when mode =
+    /// personal", which was the behaviour this change removes.
     dm_policy: zeroclaw_config::schema::WhatsAppChatPolicy,
-    /// Group policy when mode = personal
+    /// Group policy. Consulted under BOTH modes, same as `dm_policy`.
     group_policy: zeroclaw_config::schema::WhatsAppChatPolicy,
     /// Whether to always respond in self-chat when mode = personal
     self_chat_mode: bool,
@@ -309,13 +310,21 @@ impl WhatsAppWebChannel {
             return String::new();
         }
         if mapped_phone.is_none() {
-            format!(
-                " (LID→phone resolution returned None for sender {sender}; \
-                 allowlist phone-number entries cannot match. Workaround: \
-                 add the LID-form (+{}) to allowed_numbers, or wait for the \
-                 in-memory LID cache to populate for this contact.)",
-                sender.user
-            )
+            // Deliberately identifier-free. This string reaches `record!(WARN, ..)`, which the
+            // repository fans out to the dashboard and the optional persisted JSONL, and
+            // `identity_persist.rs` already sets the contract for exactly this class: a raw
+            // linked-account identity is durable personal data and must not reach the log sink.
+            // The failure REASON and the candidate count at the call site are what the operator
+            // needs to act; the sender JID and the raw LID user value are not.
+            //
+            // The remedy also had to change. `allowed_numbers` is a V2 field that migrates into
+            // `peer_groups` on load, so steering an operator to it pointed at a knob the current
+            // config model no longer has.
+            " (sender is a LID and LID→phone resolution returned None, so phone-number entries \
+             cannot match it. Add this contact to the applicable \
+             [peer_groups.<name>].external_peers, or wait for the in-memory LID cache to \
+             populate for it.)"
+                .to_string()
         } else {
             " (sender is LID; resolved phone did not match any allowlist entry)".to_string()
         }
@@ -3385,14 +3394,56 @@ mod tests {
             diag.contains("LID→phone resolution returned None"),
             "diagnostic must name the resolution failure mode #6350 describes; got {diag:?}"
         );
+        // These two previously asserted the OPPOSITE, which is what pinned the defect in place:
+        // the diagnostic reaches a WARN that fans out to the dashboard and the persisted log, so
+        // the raw identity must never appear, and the remedy must name a field that still exists.
         assert!(
-            diag.contains("76188559093817"),
-            "diagnostic must surface the LID identifier so the operator can add the LID-form workaround; got {diag:?}"
+            !diag.contains("76188559093817"),
+            "the raw LID is durable personal data and must not reach the log sink; got {diag:?}"
         );
         assert!(
-            diag.contains("allowed_numbers"),
-            "diagnostic must point at the config knob to fix this; got {diag:?}"
+            !diag.contains("allowed_numbers"),
+            "allowed_numbers is a V2 field that migrates into peer_groups, so it is not a remedy an \
+             operator can apply today; got {diag:?}"
         );
+        assert!(
+            diag.contains("external_peers"),
+            "diagnostic must point at the admission source the current config model actually uses; \
+             got {diag:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn lid_rejection_diagnostic_never_leaks_sender_identity_on_either_branch() {
+        // The control for the two negative assertions above. Those alone would pass against a
+        // diagnostic that returned the empty string on every input, so this drives BOTH LID
+        // branches and requires each to stay informative while carrying no identifier.
+        let sender = Jid::lid("76188559093817");
+        for (label, mapped) in [
+            ("unresolved", None),
+            ("resolved-mismatch", Some("15551234567")),
+        ] {
+            let diag = WhatsAppWebChannel::lid_rejection_diagnostic(&sender, mapped);
+            assert!(
+                !diag.is_empty(),
+                "{label}: a LID sender must still produce a reason; got {diag:?}"
+            );
+            assert!(
+                !diag.contains("76188559093817"),
+                "{label}: the LID user value must not appear; got {diag:?}"
+            );
+            assert!(
+                !diag.contains(&sender.to_string()),
+                "{label}: the full sender JID must not appear; got {diag:?}"
+            );
+            if let Some(phone) = mapped {
+                assert!(
+                    !diag.contains(phone),
+                    "{label}: the resolved phone number must not appear either; got {diag:?}"
+                );
+            }
+        }
     }
 
     #[test]
