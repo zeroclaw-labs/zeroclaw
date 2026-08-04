@@ -9408,6 +9408,33 @@ mod tests {
     }
 
     #[test]
+    fn config_set_materializes_agent_workspace_path() {
+        let mut config = Config::default();
+        let raw = "agents.assistant.workspace.path";
+
+        let known: Vec<String> = config.prop_fields().into_iter().map(|f| f.name).collect();
+        let mut path = zeroclaw_config::helpers::resolve_field_path(&known, raw);
+        let created = ensure_map_key_for_prop_path(&mut config, &path)
+            .expect("agent alias and workspace path should materialize");
+        assert!(created, "missing agent alias should be created");
+
+        let known: Vec<String> = config.prop_fields().into_iter().map(|f| f.name).collect();
+        path = zeroclaw_config::helpers::resolve_field_path(&known, &path);
+        config
+            .set_prop_persistent(&path, "/srv/zeroclaw/assistant")
+            .expect("agent workspace path should be writable");
+
+        assert_eq!(path, raw);
+        assert_eq!(
+            config
+                .agents
+                .get("assistant")
+                .and_then(|agent| agent.workspace.path.as_deref()),
+            Some(std::path::Path::new("/srv/zeroclaw/assistant"))
+        );
+    }
+
+    #[test]
     fn ensure_map_key_rolls_back_alias_on_unknown_tail_field() {
         let mut config = Config::default();
         let path = "risk_profiles.newprofile.not_a_real_field";
