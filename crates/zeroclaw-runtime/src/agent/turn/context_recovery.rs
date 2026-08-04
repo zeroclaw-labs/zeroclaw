@@ -131,7 +131,7 @@ pub(crate) async fn try_recover_context_overflow(
             // a nonsensical zero-token budget.
             let reason = crate::i18n::get_required_cli_string("history-trim-reason-recovery");
             let reported_token_budget =
-                (context_token_budget > 0).then(|| context_token_budget as u64);
+                (context_token_budget > 0).then_some(context_token_budget as u64);
             if let Some(tx) = event_tx {
                 let _ = tx
                     .send(zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
