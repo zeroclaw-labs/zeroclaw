@@ -101,6 +101,7 @@ encoding_rs = "0.8"
 default = ["observability-prometheus", "schema-export"]
 observability-prometheus = ["dep:prometheus"]
 observability-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
+observability-langfuse = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
 sandbox-landlock = ["dep:landlock"]
 schema-export = ["dep:schemars", "zeroclaw-config/schema-export", "zeroclaw-sop-graph/schema-export"]
 

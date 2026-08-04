@@ -285,6 +285,7 @@ default = [
     "acp-bridge",
     "gateway",
     "observability-prometheus",
+    "observability-langfuse",
     "schema-export",
 ]
 
@@ -377,6 +378,7 @@ voice-wake = ["zeroclaw-channels/voice-wake"]
 memory-postgres = ["zeroclaw-memory/memory-postgres"]
 
 # Backends and platform flags — each forwards to ONE crate
+observability-langfuse = ["zeroclaw-runtime/observability-langfuse"]
 observability-prometheus = [
     "zeroclaw-runtime/observability-prometheus",
     "zeroclaw-gateway/observability-prometheus",
@@ -433,7 +435,8 @@ ci-all = [
     "agent-runtime",
     "channels-full",
     "channel-nostr", "channel-matrix", "whatsapp-web",
-    "observability-prometheus", "observability-otel",
+    "observability-prometheus",
+    "observability-langfuse", "observability-otel",
     "hardware", "peripheral-rpi",
     "sandbox-landlock", "sandbox-bubblewrap",
     "browser-native", "probe",
