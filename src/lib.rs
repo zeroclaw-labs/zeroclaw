@@ -605,11 +605,16 @@ pub enum MigrateCommands {
 /// would take `--thread` as the recipient and then fail on the positional
 /// argument. Rejecting a `--` prefix keeps that mistake legible while leaving
 /// every real recipient shape (`-100…`, `-100…:42`) accepted.
+///
+/// The rejection is unconditional. A value parser runs on the parsed value
+/// whichever syntax supplied it, so `--to=--thread` is rejected identically and
+/// the message must not offer that as a workaround. No supported channel has a
+/// recipient beginning with `--`.
 fn parse_delivery_recipient(raw: &str) -> Result<String, String> {
     if raw.starts_with("--") {
         return Err(format!(
             "`{raw}` looks like a flag, not a recipient; \
-             if a recipient really starts with `--`, pass it as `--to={raw}`"
+             recipient values beginning with `--` are not supported"
         ));
     }
     Ok(raw.to_string())

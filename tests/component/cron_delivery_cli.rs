@@ -401,4 +401,36 @@ fn cron_delivery_accepts_negative_telegram_chat_id() {
         flag_shaped_stderr.contains("--thread"),
         "the error must quote the token that was mistaken for a value:\n{flag_shaped_stderr}"
     );
+
+    // The value parser runs on the parsed value whichever syntax supplied it, so
+    // the equals form is rejected identically. The message must not advertise it
+    // as a workaround, which an earlier revision did.
+    let equals_form = run(
+        config_dir,
+        &[
+            "cron",
+            "add",
+            "*/5 * * * *",
+            "--agent",
+            "default",
+            "--channel",
+            "telegram",
+            "--to=--thread",
+            "echo hi",
+        ],
+    );
+    assert!(
+        !equals_form.status.success(),
+        "the equals form must be rejected too\nstdout:\n{}",
+        stdout_of(&equals_form)
+    );
+    let equals_stderr = stderr_of(&equals_form);
+    assert!(
+        equals_stderr.contains("not supported"),
+        "the message must state the shape is unsupported:\n{equals_stderr}"
+    );
+    assert!(
+        !equals_stderr.contains("pass it as"),
+        "the message must not advertise an escape hatch that does not work:\n{equals_stderr}"
+    );
 }
