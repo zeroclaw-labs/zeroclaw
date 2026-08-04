@@ -2274,6 +2274,30 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// Like [`temp_sqlite`] but with the importance blend switched off.
+    ///
+    /// Tests that assert on normalized scores are measuring the vector/keyword
+    /// blend. Leaving importance at the production default dilutes the score and
+    /// the assertion stops describing what the test is for — so the knob is
+    /// turned off here rather than changed in `SqliteMemory::new`, which must
+    /// keep matching `default_importance_weight()` from the config schema.
+    fn temp_sqlite_no_importance() -> (TempDir, SqliteMemory) {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::with_embedder(
+            "test",
+            tmp.path(),
+            Arc::new(super::super::embeddings::NoopEmbedding),
+            0.7,
+            0.3,
+            0.0,
+            10_000,
+            None,
+            SearchMode::default(),
+        )
+        .unwrap();
+        (tmp, mem)
+    }
+
     fn temp_sqlite() -> (TempDir, SqliteMemory) {
         let tmp = TempDir::new().unwrap();
         let mem = SqliteMemory::new("test", tmp.path()).unwrap();
@@ -3209,6 +3233,7 @@ mod tests {
             Arc::new(KeyedEmbedding),
             0.7,
             0.3,
+            0.0, // importance disabled: this test isolates the vector/keyword blend
             1000,
             None,
             SearchMode::default(),
@@ -3253,6 +3278,7 @@ mod tests {
             Arc::new(MissingModalityEmbedding),
             0.7,
             0.3,
+            0.0, // importance disabled: these tests isolate the vector/keyword blend
             1000,
             None,
             SearchMode::default(),
@@ -3406,7 +3432,7 @@ mod tests {
     /// thresholding and the injection rerank stage see one calibrated scale.
     #[tokio::test]
     async fn noop_embedder_session_recall_keeps_strict_filter_and_normalizes_scores() {
-        let (_tmp, mem) = temp_sqlite();
+        let (_tmp, mem) = temp_sqlite_no_importance();
         mem.store(
             "vault_fact",
             "the orbital vault passphrase is quokka-vellum",

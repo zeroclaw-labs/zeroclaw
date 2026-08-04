@@ -87,6 +87,28 @@ pub trait SessionBackend: Send + Sync {
     /// Append a single message to a session.
     fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()>;
 
+    /// Append a message that was said at a known past time.
+    ///
+    /// `append` stamps "now", which is correct for live traffic — the moment a
+    /// message arrives *is* when it was said. Recovered history breaks that
+    /// assumption: turns pulled from a platform's history sync were said days
+    /// or months ago, and stamping them "now" both misorders the conversation
+    /// and lies to everything that reads `load_with_timestamps` to decide how
+    /// stale a session is.
+    ///
+    /// Default impl delegates to `append`, so backends with nowhere to put a
+    /// timestamp (JSONL serialises `ChatMessage`, which has only role and
+    /// content) keep their current behaviour rather than silently dropping
+    /// messages.
+    fn append_at(
+        &self,
+        session_key: &str,
+        message: &ChatMessage,
+        _said_at: DateTime<Utc>,
+    ) -> std::io::Result<()> {
+        self.append(session_key, message)
+    }
+
     /// Remove the last message from a session. Returns `true` if a message was removed.
     fn remove_last(&self, session_key: &str) -> std::io::Result<bool>;
 

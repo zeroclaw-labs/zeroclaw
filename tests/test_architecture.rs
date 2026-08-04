@@ -18,7 +18,7 @@ mod cli_fluent_coverage;
 #[path = "architecture/desktop_release.rs"]
 mod desktop_release;
 
-#[path = "architecture/container_release.rs"]
-mod container_release;
 #[path = "architecture/channel_feature_coverage.rs"]
 mod channel_feature_coverage;
+#[path = "architecture/container_release.rs"]
+mod container_release;

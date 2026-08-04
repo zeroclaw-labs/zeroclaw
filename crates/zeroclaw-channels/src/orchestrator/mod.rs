@@ -7047,31 +7047,31 @@ async fn run_message_dispatch_loop(
         let msg = if msg.channel != "cli" {
             let debounce_key = conversation_history_key(&msg);
 
-                // Resolve effective debounce window: per-channel override wins,
-                // otherwise falls back to the global default from ChannelsConfig.
-                // A per-channel value of 0 is treated as unset (falls back to global).
-                let debounce_window = resolve_effective_debounce_window(
-                    ctx.prompt_config.channels.debounce_ms,
-                    &msg.channel,
-                    msg.channel_alias.as_deref(),
-                    &ctx.prompt_config.channels.telegram,
-                );
+            // Resolve effective debounce window: per-channel override wins,
+            // otherwise falls back to the global default from ChannelsConfig.
+            // A per-channel value of 0 is treated as unset (falls back to global).
+            let debounce_window = resolve_effective_debounce_window(
+                ctx.prompt_config.channels.debounce_ms,
+                &msg.channel,
+                msg.channel_alias.as_deref(),
+                &ctx.prompt_config.channels.telegram,
+            );
 
-                let mut msg = msg;
-                // Moved, not copied: the inbound message this burst supersedes is
-                // dropped, so the merged payload becomes the only owner of these
-                // attachments rather than a second copy of live state.
-                let burst_part = zeroclaw_infra::debounce::BurstPart {
-                    content: msg.content.clone(),
-                    attachments: std::mem::take(&mut msg.attachments),
-                    passive_context: msg.passive_context,
-                    explicitly_addressed: msg.explicitly_addressed,
-                };
-                match ctx
-                    .debouncer
-                    .debounce_with_window(&debounce_key, burst_part, debounce_window)
-                    .await
-                {
+            let mut msg = msg;
+            // Moved, not copied: the inbound message this burst supersedes is
+            // dropped, so the merged payload becomes the only owner of these
+            // attachments rather than a second copy of live state.
+            let burst_part = zeroclaw_infra::debounce::BurstPart {
+                content: msg.content.clone(),
+                attachments: std::mem::take(&mut msg.attachments),
+                passive_context: msg.passive_context,
+                explicitly_addressed: msg.explicitly_addressed,
+            };
+            match ctx
+                .debouncer
+                .debounce_with_window(&debounce_key, burst_part, debounce_window)
+                .await
+            {
                 zeroclaw_infra::debounce::DebounceResult::Pending(rx) => {
                     // Spawn a lightweight task that waits for the debounce window
                     // to expire, then feeds the combined message through the normal
@@ -24261,7 +24261,8 @@ This is an example JSON object for profile settings."#;
         );
 
         let config_arc = Arc::new(RwLock::new(config.clone()));
-        let configured = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let configured =
+            collect_configured_channels(&config_arc, "test", &[], None, None, None, None);
         let channel_map = configured_channel_map(&configured);
         assert!(
             channel_map.contains_key("discord.ops"),
@@ -24328,7 +24329,8 @@ This is an example JSON object for profile settings."#;
         );
 
         let config_arc = Arc::new(RwLock::new(config));
-        let configured = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let configured =
+            collect_configured_channels(&config_arc, "test", &[], None, None, None, None);
         let channel_map = configured_channel_map(&configured);
         assert!(channel_map.contains_key("discord.ops"));
         assert!(
@@ -24540,7 +24542,8 @@ This is an example JSON object for profile settings."#;
         );
 
         let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let channels =
+            collect_configured_channels(&config_arc, "test", &[], None, None, None, None);
         assert!(
             !channels.iter().any(|entry| entry.display_name == "Signal"),
             "enabled Signal without credentials must not be collected (would crashloop)"
@@ -24562,7 +24565,8 @@ This is an example JSON object for profile settings."#;
         );
 
         let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let channels =
+            collect_configured_channels(&config_arc, "test", &[], None, None, None, None);
         assert!(
             channels.iter().any(|entry| entry.display_name == "Signal"),
             "enabled Signal with credentials must be collected"
@@ -24585,7 +24589,8 @@ This is an example JSON object for profile settings."#;
         );
 
         let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let channels =
+            collect_configured_channels(&config_arc, "test", &[], None, None, None, None);
         assert!(
             channels
                 .iter()
@@ -24610,7 +24615,8 @@ This is an example JSON object for profile settings."#;
         );
 
         let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let channels =
+            collect_configured_channels(&config_arc, "test", &[], None, None, None, None);
         assert!(
             !channels
                 .iter()

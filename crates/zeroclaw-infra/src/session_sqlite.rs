@@ -229,7 +229,7 @@ impl SessionBackend for SqliteSessionBackend {
     fn load(&self, session_key: &str) -> Vec<ChatMessage> {
         let conn = self.conn.lock();
         let mut stmt = match conn
-            .prepare("SELECT role, content FROM sessions WHERE session_key = ?1 ORDER BY id ASC")
+            .prepare("SELECT role, content FROM sessions WHERE session_key = ?1 ORDER BY created_at ASC, id ASC")
         {
             Ok(s) => s,
             Err(_) => return Vec::new(),
@@ -255,7 +255,7 @@ impl SessionBackend for SqliteSessionBackend {
         use crate::session_backend::TimestampedMessage;
         let conn = self.conn.lock();
         let mut stmt = match conn.prepare(
-            "SELECT role, content, created_at FROM sessions WHERE session_key = ?1 ORDER BY id ASC",
+            "SELECT role, content, created_at FROM sessions WHERE session_key = ?1 ORDER BY created_at ASC, id ASC",
         ) {
             Ok(s) => s,
             Err(_) => return Vec::new(),
@@ -282,13 +282,26 @@ impl SessionBackend for SqliteSessionBackend {
     }
 
     fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {
+        self.append_at(session_key, message, Utc::now())
+    }
+
+    fn append_at(
+        &self,
+        session_key: &str,
+        message: &ChatMessage,
+        said_at: DateTime<Utc>,
+    ) -> std::io::Result<()> {
         let conn = self.conn.lock();
+        let said = said_at.to_rfc3339();
+        // Session activity is when the row was written, not when the message
+        // was said: a history import touching a session today does not make a
+        // months-old conversation recently active.
         let now = Utc::now().to_rfc3339();
 
         conn.execute(
             "INSERT INTO sessions (session_key, role, content, created_at)
              VALUES (?1, ?2, ?3, ?4)",
-            params![session_key, message.role, message.content, now],
+            params![session_key, message.role, message.content, said],
         )
         .map_err(std::io::Error::other)?;
 
@@ -907,6 +920,99 @@ impl SessionBackend for SqliteSessionBackend {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// The property recovered history depends on: a turn said weeks ago but
+    /// written to the table today must read back in its chronological place,
+    /// not at the end.
+    ///
+    /// This is why `load` orders by `created_at` and not by `id`. Insertion
+    /// order equals conversation order only for live traffic, where the moment
+    /// a message arrives is the moment it was said. Importing history breaks
+    /// that: without this, recovering an old conversation would append it after
+    /// everything newer and the agent would read a scrambled thread as though
+    /// the oldest lines were the most recent thing said to it.
+    #[test]
+    fn a_turn_said_earlier_reads_earlier_even_when_written_later() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        // Live traffic arrives first and is stamped now.
+        backend
+            .append("peer", &ChatMessage::user("said today"))
+            .unwrap();
+
+        // Then history recovery brings back something from last week.
+        let last_week = Utc::now() - chrono::Duration::days(7);
+        backend
+            .append_at("peer", &ChatMessage::user("said last week"), last_week)
+            .unwrap();
+
+        let msgs = backend.load("peer");
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(
+            msgs[0].content, "said last week",
+            "the older message must come first — ordering by insertion id would \
+             put the recovered turn last and scramble the conversation"
+        );
+        assert_eq!(msgs[1].content, "said today");
+    }
+
+    /// `append_at` must persist the given instant, not the wall clock, or the
+    /// ordering above would only appear to work while everything that reads
+    /// timestamps (staleness checks, heartbeat context) still saw "now".
+    #[test]
+    fn append_at_persists_the_supplied_time() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        let last_week = Utc::now() - chrono::Duration::days(7);
+        backend
+            .append_at("peer", &ChatMessage::user("old"), last_week)
+            .unwrap();
+
+        let stamped = backend.load_with_timestamps("peer");
+        assert_eq!(stamped.len(), 1);
+        let got = stamped[0].created_at.expect("sqlite records created_at");
+        assert!(
+            (got - last_week).num_seconds().abs() < 2,
+            "stored {got}, expected ~{last_week}"
+        );
+    }
+
+    /// The reason `append_at` exists: recovered history is written *after*
+    /// newer messages but has to read back *before* them. Storing the true time
+    /// is only half of it — `load` has to order by that time rather than by
+    /// insertion, or an imported turn still lands at the end and the agent
+    /// reads weeks-old text as the latest thing said.
+    #[test]
+    fn an_older_turn_inserted_later_still_reads_in_chronological_order() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        // Live message arrives first...
+        backend
+            .append("peer", &ChatMessage::user("recent"))
+            .unwrap();
+        // ...then history recovery supplies something said a week earlier.
+        backend
+            .append_at(
+                "peer",
+                &ChatMessage::user("older"),
+                Utc::now() - chrono::Duration::days(7),
+            )
+            .unwrap();
+
+        let contents: Vec<String> = backend
+            .load("peer")
+            .into_iter()
+            .map(|m| m.content)
+            .collect();
+        assert_eq!(
+            contents,
+            vec!["older".to_string(), "recent".to_string()],
+            "history must read oldest-first regardless of insertion order"
+        );
+    }
 
     #[test]
     fn round_trip_sqlite() {

@@ -188,7 +188,22 @@ pub fn persist_turns(
             role: turn.role.to_string(),
             content: turn.content.clone(),
         };
-        if session_store.append(&turn.session_key, &message).is_ok() {
+        // Stored under the time the message was actually said, not now:
+        // `load` orders by created_at, so a turn from weeks ago has to carry
+        // its own timestamp or it lands after messages that came later.
+        //
+        // WhatsApp's timestamp is unsigned and chrono wants a signed epoch.
+        // `try_from` rather than `as`: no real message can overflow i64
+        // seconds, but a corrupt payload could, and wrapping it to a negative
+        // instant would silently file the turn in 1969 instead of falling back.
+        let said_at = i64::try_from(turn.timestamp_secs)
+            .ok()
+            .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0))
+            .unwrap_or_else(chrono::Utc::now);
+        if session_store
+            .append_at(&turn.session_key, &message, said_at)
+            .is_ok()
+        {
             stored += 1;
         }
     }

@@ -517,6 +517,7 @@ mod tests {
             Arc::new(SessionScopeEmbedding),
             0.7,
             0.3,
+            0.2,
             1000,
             None,
             SearchMode::default(),

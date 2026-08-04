@@ -825,6 +825,7 @@ mod tests {
             Arc::new(DetEmbedding),
             0.7,
             0.3,
+            0.2,
             1000,
             None,
             SearchMode::default(),
