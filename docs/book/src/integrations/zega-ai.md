@@ -1,3 +1,13 @@
+---
+type: integration
+status: prototype
+last-reviewed: 2026-08-04
+relates-to:
+  - FND-002
+  - FND-003
+  - crates/zeroclaw-gateway
+---
+
 # ZEGA AI (External Prototype)
 
 [ZEGA AI](https://github.com/siabang35/zega.ai) is an external fintech
@@ -13,6 +23,21 @@ ZeroClaw itself.
 > production compatibility.
 
 ## Pairing
+
+> **Gateway URL configuration note:** The bridge client defaults to
+> `http://127.0.0.1:4242`, whereas ZeroClaw's canonical `GatewayConfig`
+> default port is `42617`. When connecting to a stock local ZeroClaw daemon,
+> configure the client with the matching gateway address:
+>
+> ```ts
+> const client = new ZeroClawGatewayClient({
+>   gatewayUrl: "http://127.0.0.1:42617",
+> });
+> ```
+>
+> Connecting without setting the gateway port to match the active ZeroClaw
+> daemon will cause the bridge to report an offline/unreachable state before
+> pairing can occur.
 
 The bridge implements the two pairing contracts exposed by the ZeroClaw
 gateway and tries them in order:
@@ -57,15 +82,15 @@ Upstream handler: `handle_pair`
 |---|---|
 | `ZeroClawGatewayClient` | HTTP client with `AbortController` timeouts and automatic retry with exponential back-off. Falls back to an offline error state when the daemon is unreachable. |
 | `ZeroClawAuthManager` | Manages the pairing flow (enhanced → legacy fallback) and generates `Authorization: Bearer <token>` headers for authenticated endpoints. |
-| Version matrix | Client-side SemVer check enforcing `>=0.8.0 <0.9.0-alpha` (target `v0.8.3`). This range has **not** been verified against a live daemon; it reflects the bridge's design target. |
+| Version matrix | Client-side version check targeting numeric bounds `>=0.8.0 <0.9.0` (target `v0.8.3`). The current client helper strips prerelease suffixes prior to comparison and evaluates numeric components (`major.minor.patch`). This range reflects design intent and has **not** been verified against a live daemon. |
 
 ## What the smoke test covers
 
 The bridge ships a smoke test (`pnpm --filter @zega/zeroclaw-bridge test:smoke`)
 that validates the following **offline / unit-level** behavior:
 
-- SemVer parsing and comparison.
-- Version compatibility matrix (compatible, too-old, exceeds-max).
+- Numeric version parsing and comparison.
+- Version compatibility matrix for numeric bounds (compatible, too-old, exceeds-max).
 - Auth manager initialization and `Authorization` header formatting.
 - Gateway client offline resilience (graceful error state, no crash).
 - Error class hierarchy instantiation.
@@ -77,4 +102,3 @@ code, or call any gateway endpoint over HTTP.
 
 For source code and monorepo details, visit the
 [ZEGA AI repository](https://github.com/siabang35/zega.ai).
-
