@@ -4,7 +4,7 @@
 # Alpine, no core-llvm-libgcc, no external deps for the GCC runtime.
 
 # ── Stage: config-gen (generate default config template) ────
-FROM docker.io/stagex/pallet-rust@sha256:2d90b9552412ee2c4fa2a13b489c2f28c044be7fb5d6a942bfd5a480a5c288fd AS config-gen
+FROM docker.io/stagex/pallet-rust@sha256:abe9b95c93a5afa271f69fcd5eb18c8cd405fe5df6491a63c9418e3a170573dc AS config-gen
 
 # Default config template consumed by build/build-fat. Single source of truth
 # so operators get a working config on first run without migration overhead.
@@ -41,7 +41,7 @@ EOF
 FROM docker.io/stagex/pallet-nodejs@sha256:81bc04b9490a4f4401a8b6fd277736d75f1f0ad4bd98e8f6b4b3616e18b75f7b AS nodejs
 
 # ── Stage: web-build (web dashboard via xtask + npm build) ──
-FROM docker.io/stagex/pallet-rust@sha256:2d90b9552412ee2c4fa2a13b489c2f28c044be7fb5d6a942bfd5a480a5c288fd AS web-build
+FROM docker.io/stagex/pallet-rust@sha256:abe9b95c93a5afa271f69fcd5eb18c8cd405fe5df6491a63c9418e3a170573dc AS web-build
 
 WORKDIR /src
 COPY . .
@@ -97,7 +97,7 @@ EOF
 # Single source of truth for "what passes" in the deterministic StageX
 # musl environment. Used by CI and developers as a pre-push gate.
 # Does NOT depend on web-build (creates a stub for compilation).
-FROM docker.io/stagex/pallet-rust@sha256:2d90b9552412ee2c4fa2a13b489c2f28c044be7fb5d6a942bfd5a480a5c288fd AS check
+FROM docker.io/stagex/pallet-rust@sha256:abe9b95c93a5afa271f69fcd5eb18c8cd405fe5df6491a63c9418e3a170573dc AS check
 
 WORKDIR /src
 COPY . .
@@ -152,7 +152,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
 EOF
 
 # ── Stage: build (zeroclaw + zerocode, default channels) ────
-FROM docker.io/stagex/pallet-rust@sha256:2d90b9552412ee2c4fa2a13b489c2f28c044be7fb5d6a942bfd5a480a5c288fd AS build
+FROM docker.io/stagex/pallet-rust@sha256:abe9b95c93a5afa271f69fcd5eb18c8cd405fe5df6491a63c9418e3a170573dc AS build
 
 WORKDIR /src
 COPY . .
@@ -237,7 +237,7 @@ ENTRYPOINT ["/usr/bin/zeroclaw"]
 CMD ["daemon"]
 
 # ── Stage: build-fat (zeroclaw + zerocode, all channels) ────
-FROM docker.io/stagex/pallet-rust@sha256:2d90b9552412ee2c4fa2a13b489c2f28c044be7fb5d6a942bfd5a480a5c288fd AS build-fat
+FROM docker.io/stagex/pallet-rust@sha256:abe9b95c93a5afa271f69fcd5eb18c8cd405fe5df6491a63c9418e3a170573dc AS build-fat
 
 WORKDIR /src
 COPY . .

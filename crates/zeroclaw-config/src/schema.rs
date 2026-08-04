@@ -14049,6 +14049,11 @@ impl ChannelConfig for DiscordConfig {
     }
 }
 
+/// Default number of prior Slack thread messages included on first encounter.
+pub const DEFAULT_SLACK_THREAD_CONTEXT_MAX_MESSAGES: usize = 0;
+/// Slack's `conversations.replies` request limit used by thread hydration.
+pub const MAX_SLACK_THREAD_CONTEXT_MAX_MESSAGES: usize = 50;
+
 /// Slack bot channel configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -14113,6 +14118,13 @@ pub struct SlackConfig {
     #[tab(Advanced)]
     #[serde(default)]
     pub strict_mention_in_thread: bool,
+    /// Maximum number of prior messages prepended when ZeroClaw first
+    /// encounters a Slack thread. `0` disables automatic thread-context
+    /// hydration. When omitted, defaults to 0, so hydration is opt-in.
+    /// Maximum: 50.
+    #[tab(Advanced)]
+    #[serde(default)]
+    pub thread_context_max_messages: Option<usize>,
     /// Use the newer Slack `markdown` block type (12 000 char limit, richer formatting).
     /// Defaults to false (uses universally supported `section` blocks with `mrkdwn`).
     /// Enable this only if your Slack workspace supports the `markdown` block type.
@@ -14175,6 +14187,13 @@ impl ChannelConfig for SlackConfig {
 }
 
 impl SlackConfig {
+    /// Resolve the configured thread-context depth without copying config
+    /// state into the channel runtime.
+    pub fn effective_thread_context_max_messages(&self) -> usize {
+        self.thread_context_max_messages
+            .unwrap_or(DEFAULT_SLACK_THREAD_CONTEXT_MAX_MESSAGES)
+    }
+
     /// Resolve the effective Slack bot token: the configured `bot_token` when
     /// set and non-empty, else the `ZEROCLAW_SLACK_BOT_TOKEN` env var, else
     /// `SLACK_BOT_TOKEN`. Returns `None` when none is available. Resolving here
@@ -19819,6 +19838,18 @@ impl Config {
                 &format!("channels.telegram.{alias}.api_base_url"),
                 &tg.api_base_url,
             )?;
+        }
+
+        for (alias, slack) in &self.channels.slack {
+            let max_messages = slack.effective_thread_context_max_messages();
+            if max_messages > MAX_SLACK_THREAD_CONTEXT_MAX_MESSAGES {
+                let path = format!("channels.slack.{alias}.thread_context_max_messages");
+                validation_bail!(
+                    InvalidNumericRange,
+                    path,
+                    "{path} = {max_messages} is out of range; must be 0..={MAX_SLACK_THREAD_CONTEXT_MAX_MESSAGES}"
+                );
+            }
         }
 
         for (alias, dc) in &self.channels.discord {
@@ -27594,6 +27625,50 @@ allowed_users = ["U111"]
     }
 
     #[test]
+    async fn slack_thread_context_max_messages_defaults_to_zero() {
+        let parsed: SlackConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed.thread_context_max_messages, None);
+        assert_eq!(parsed.effective_thread_context_max_messages(), 0);
+    }
+
+    #[test]
+    async fn slack_thread_context_max_messages_deserializes_explicit_value() {
+        let parsed: SlackConfig =
+            serde_json::from_str(r#"{"thread_context_max_messages":7}"#).unwrap();
+        assert_eq!(parsed.thread_context_max_messages, Some(7));
+        assert_eq!(parsed.effective_thread_context_max_messages(), 7);
+    }
+
+    #[test]
+    async fn slack_thread_context_max_messages_allows_zero_to_disable_backfill() {
+        let parsed: SlackConfig =
+            serde_json::from_str(r#"{"thread_context_max_messages":0}"#).unwrap();
+        assert_eq!(parsed.thread_context_max_messages, Some(0));
+        assert_eq!(parsed.effective_thread_context_max_messages(), 0);
+    }
+
+    #[test]
+    async fn slack_thread_context_max_messages_rejects_values_above_slack_fetch_limit() {
+        let mut config = Config::default();
+        config.channels.slack.insert(
+            "default".to_string(),
+            SlackConfig {
+                thread_context_max_messages: Some(51),
+                ..Default::default()
+            },
+        );
+
+        let err = config
+            .validate()
+            .expect_err("values above the Slack fetch limit must be rejected")
+            .to_string();
+        assert!(
+            err.contains("channels.slack.default.thread_context_max_messages"),
+            "unexpected validation error: {err}",
+        );
+    }
+
+    #[test]
     async fn discord_config_default_interrupt_on_new_message_is_false() {
         let json = r#"{"bot_token":"tok"}"#;
         let parsed: DiscordConfig = serde_json::from_str(json).unwrap();
@@ -33282,6 +33357,34 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
 
         let email = crate::scattered_types::EmailConfig::default().prop_fields();
         assert_description(&email, ".observer_mode", "never modifies any IMAP flag");
+    }
+
+    #[test]
+    async fn agent_workspace_path_is_a_settable_property() {
+        let mut workspace = crate::multi_agent::AgentWorkspaceConfig::default();
+
+        let path = workspace
+            .prop_fields()
+            .into_iter()
+            .find(|field| field.name == "agent_workspace.path")
+            .expect("workspace path property");
+        assert_eq!(path.kind, crate::config::PropKind::String);
+        assert_eq!(path.display_value, crate::config::UNSET_DISPLAY);
+
+        workspace
+            .set_prop("agent_workspace.path", "/srv/zeroclaw/assistant")
+            .unwrap();
+        assert_eq!(
+            workspace.path,
+            Some(std::path::PathBuf::from("/srv/zeroclaw/assistant"))
+        );
+        assert_eq!(
+            workspace.get_prop("agent_workspace.path").unwrap(),
+            "/srv/zeroclaw/assistant"
+        );
+
+        workspace.set_prop("agent_workspace.path", "").unwrap();
+        assert_eq!(workspace.path, None);
     }
 
     #[cfg(feature = "schema-export")]
