@@ -240,26 +240,21 @@ impl V2Config {
                 "providers.fallback eradicated"
             );
         }
-        // Capture the global default_provider BEFORE canonicalization: it is a
-        // source for the (family, default) slot it folds into, and the
-        // vision-reference rewrite needs full source provenance.
-        let g_default_provider = new_providers
-            .get("default_provider")
-            .and_then(toml::Value::as_str)
-            .map(str::to_string);
         let (mut aliased_models, mut provenance) =
             alias_provider_models(new_providers.remove("models"));
 
         // V3 ModelProviderConfig absorbed the V2 [providers] globals
         // (api_key, default_model, etc.) inline; fold them down.
-        fold_providers_globals_into_models(&mut new_providers, &mut aliased_models);
-        // Record the global default_provider as a producer of its folded slot.
-        if let Some(dp) = g_default_provider.as_deref() {
-            let (family, alias, _) = normalize_provider_type(dp, "default");
+        let folded_source =
+            fold_providers_globals_into_models(&mut new_providers, &mut aliased_models);
+        // Record the global default_provider (explicit or synthesized fallback)
+        // as a producer of the slot it folded into.
+        if let Some(source) = folded_source {
+            let (family, alias, _) = normalize_provider_type(&source, "default");
             provenance
                 .entry((family, alias))
                 .or_default()
-                .insert(dp.to_string());
+                .insert(source);
         }
 
         // A bare `[multimodal] vision_model_provider = "<family>"` cannot select
@@ -843,15 +838,19 @@ fn rewrite_bare_vision_provider_reference(
         // preserve.
         return;
     };
-    if producers.is_empty() {
+    // A single producer is required: two sources collapsing onto the same slot
+    // (synonyms `gemini`/`google`, variants `qwen`/`qwen-intl`, or two colon-URL
+    // forms) are ambiguous regardless of whether they normalize equivalently,
+    // because the materialized table retains only one of their configs.
+    if producers.len() != 1 {
         return;
     }
-    // Only rewrite when every producer is the same variant as the reference.
-    // A producer from a differently-named source (bare `qwen` vs `qwen-intl`
-    // both collapsing onto `qwen.default`) makes the selection ambiguous, so
-    // the reference stays as-is rather than silently picking a credential.
+    // The producer must canonicalize to the same variant as the reference.
+    // Colon-URL producers (`custom:https://...`) are split back to their prefix
+    // before normalization so they match a bare `custom` reference.
     let all_equivalent = producers.iter().all(|key| {
-        let (family, alias, extras) = normalize_provider_type(key, "default");
+        let (raw_type, _url) = split_colon_url_provider(key);
+        let (family, alias, extras) = normalize_provider_type(&raw_type, "default");
         family == canonical_family && alias == canonical_alias && extras == reference_extras
     });
     if !all_equivalent {
@@ -866,7 +865,7 @@ fn rewrite_bare_vision_provider_reference(
 fn fold_providers_globals_into_models(
     new_providers: &mut toml::Table,
     aliased_models: &mut toml::Table,
-) {
+) -> Option<String> {
     let g_api_key = new_providers.remove("api_key");
     let g_api_url = new_providers.remove("api_url");
     let g_api_path = new_providers.remove("api_path");
@@ -887,23 +886,30 @@ fn fold_providers_globals_into_models(
         || g_extra_headers.is_some();
 
     if !any_value_globals && g_default_provider.is_none() {
-        return;
+        return None;
     }
 
-    let (target_type, target_alias, colon_url, normalized_extras) =
+    let (target_type, target_alias, colon_url, normalized_extras, source_key) =
         match g_default_provider.as_ref().and_then(toml::Value::as_str) {
             Some(s) => {
                 let (raw_type, url) = split_colon_url_provider(s);
                 let (canonical, alias, extras) = normalize_provider_type(&raw_type, "default");
-                (canonical, alias, url, extras)
+                (canonical, alias, url, extras, raw_type)
             }
             None => match aliased_models.keys().next() {
-                Some(k) => (k.clone(), "default".to_string(), None, Vec::new()),
+                Some(k) => (
+                    k.clone(),
+                    "default".to_string(),
+                    None,
+                    Vec::new(),
+                    k.clone(),
+                ),
                 None => (
                     "openrouter".to_string(),
                     "default".to_string(),
                     None,
                     Vec::new(),
+                    "openrouter".to_string(),
                 ),
             },
         };
@@ -911,17 +917,11 @@ fn fold_providers_globals_into_models(
     let provider_value = aliased_models
         .entry(target_type.clone())
         .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-    let provider_table = match provider_value.as_table_mut() {
-        Some(t) => t,
-        None => return,
-    };
+    let provider_table = provider_value.as_table_mut()?;
     let alias_value = provider_table
         .entry(target_alias.clone())
         .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-    let alias_table = match alias_value.as_table_mut() {
-        Some(t) => t,
-        None => return,
-    };
+    let alias_table = alias_value.as_table_mut()?;
 
     let base_url_source = colon_url.map(toml::Value::String).or(g_api_url);
     let uri_source = match (base_url_source, g_api_path) {
@@ -974,6 +974,7 @@ fn fold_providers_globals_into_models(
             "[providers] globals folded onto model_providers.."
         );
     }
+    Some(source_key)
 }
 
 /// Pull `prices` (a per-model HashMap) out of a V2 `[cost]` block.
