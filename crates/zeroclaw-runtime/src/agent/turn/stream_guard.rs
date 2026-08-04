@@ -309,4 +309,35 @@ mod tests {
         assert_eq!(guard.push("data"), None);
         assert_eq!(guard.finish(), Some("<|dsmldata".to_string()));
     }
+
+    #[test]
+    fn suppresses_fullwidth_dsml_envelope_split_across_stream_chunks() {
+        let mut guard = shell_guard();
+
+        assert_eq!(guard.push("<｜DSML｜tool_calls>\n"), None);
+        assert_eq!(guard.push("<｜DSML｜invoke name=\"shell\">\n"), None);
+        assert_eq!(
+            guard.push(
+                "<｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter>\n"
+            ),
+            None
+        );
+        assert_eq!(guard.push("</｜DSML｜invoke>\n</｜DSML｜tool_calls>"), None);
+
+        assert_eq!(guard.finish(), None);
+        assert!(
+            guard.suppressed_protocol,
+            "fullwidth DSML envelope must be suppressed"
+        );
+        assert!(guard.suppress_forwarding);
+    }
+
+    #[test]
+    fn forwards_plain_text_with_fullwidth_dsml_prefixes() {
+        let mut guard = shell_guard();
+
+        assert_eq!(guard.push("<｜dsml"), None);
+        assert_eq!(guard.push("data"), None);
+        assert_eq!(guard.finish(), Some("<｜dsmldata".to_string()));
+    }
 }

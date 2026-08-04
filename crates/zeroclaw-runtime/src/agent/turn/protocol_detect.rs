@@ -11,7 +11,7 @@ use zeroclaw_tool_call_parser::{
 pub(crate) fn longest_suffix_matching_prefix(text: &str, pattern: &str) -> usize {
     (1..pattern.len())
         .rev()
-        .find(|&len| text.ends_with(&pattern[..len]))
+        .find(|&len| pattern.is_char_boundary(len) && text.ends_with(&pattern[..len]))
         .unwrap_or(0)
 }
 
@@ -27,6 +27,7 @@ pub(crate) fn find_embedded_protocol_candidate_start(text: &str) -> Option<usize
         "<function",
         "<|dsml",
         "<|tool_call",
+        "<｜dsml",
         "```tool",
         "```invoke",
         "```json",
@@ -57,6 +58,7 @@ pub(crate) fn find_incomplete_protocol_candidate_start(text: &str) -> Option<usi
         "<function",
         "<|dsml",
         "<|tool_call",
+        "<｜dsml",
         "```tool",
         "```invoke",
         "```json",
@@ -95,6 +97,7 @@ pub(crate) fn starts_suspicious_protocol_prefix(text: &str) -> bool {
         || lower.starts_with("<function")
         || lower.starts_with("<|dsml")
         || lower.starts_with("<|tool_call")
+        || lower.starts_with("<｜dsml")
         || lower.starts_with("```tool")
         || lower.starts_with("```invoke")
         || lower.starts_with("```json")
@@ -107,6 +110,7 @@ pub(crate) fn starts_suspicious_tag_or_fence_prefix(text: &str) -> bool {
         || lower.starts_with("<function")
         || lower.starts_with("<|dsml")
         || lower.starts_with("<|tool_call")
+        || lower.starts_with("<｜dsml")
         || lower.starts_with("```tool")
         || lower.starts_with("```invoke")
         || lower.starts_with("```json")
@@ -200,4 +204,36 @@ pub(crate) fn json_fence_body(trimmed: &str) -> Option<&str> {
         return None;
     }
     Some(body_with_close[..close_start].trim())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn longest_suffix_matching_prefix_is_character_boundary_safe() {
+        // The fullwidth DSML token is multi-byte UTF-8; slicing must not panic.
+        assert_eq!(longest_suffix_matching_prefix("ab｜DS", "｜DSML｜"), 5);
+        assert_eq!(longest_suffix_matching_prefix("ab", "｜DSML｜"), 0);
+        assert_eq!(longest_suffix_matching_prefix("", "｜DSML｜"), 0);
+        assert_eq!(longest_suffix_matching_prefix("hello", "hello"), 0);
+        // The text ends in a full `｜` char, matching the 3-byte pattern prefix.
+        assert_eq!(longest_suffix_matching_prefix("ab｜", "｜DSML｜"), 3);
+    }
+
+    #[test]
+    fn detects_fullwidth_dsml_candidates() {
+        let embedded = r#"Here it is: <｜DSML｜tool_calls>"#;
+        assert_eq!(
+            find_embedded_protocol_candidate_start(embedded),
+            Some(embedded.find("<｜DSML｜tool_calls>").unwrap())
+        );
+        assert!(starts_suspicious_protocol_prefix(
+            "<｜dsml｜invoke name=\"shell\">"
+        ));
+        assert!(starts_suspicious_tag_or_fence_prefix(
+            "<｜dsml｜tool_calls>"
+        ));
+        assert!(find_incomplete_protocol_candidate_start("x<｜dsml").is_some());
+    }
 }
