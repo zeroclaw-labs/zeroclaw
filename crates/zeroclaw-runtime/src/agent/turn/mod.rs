@@ -625,6 +625,12 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             activated_tools,
         )?;
 
+        // Warm per-model capability metadata (e.g. the models.dev catalog)
+        // before the synchronous capability gate resolves vision support, so
+        // a credentialed compatible provider resolves per-model vision instead
+        // of silently using the family default. No-op once warmed.
+        model_provider.warm_capabilities_metadata().await;
+
         let (vision_model_provider_box, degrade_strip_images) = resolve_vision_provider(
             config,
             model_provider,

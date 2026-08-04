@@ -4634,6 +4634,21 @@ fn record_passive_context(ctx: &ChannelRuntimeContext, msg: &ChannelMessage, his
     );
 }
 
+/// Decide whether the channel media pipeline may preserve image bytes as an
+/// `IMAGE:data:...` marker. Model-aware: the agent's configured model decides,
+/// not the family-level flag — a cataloged image-input model (e.g. Pixtral
+/// under a pure-compatible Mistral family whose provider default has no
+/// vision) must keep the marker even when the family says no vision. A
+/// configured vision provider also enables image preservation regardless of
+/// the primary model.
+fn media_pipeline_vision_available(
+    provider: &dyn ModelProvider,
+    model: &str,
+    has_vision_provider: bool,
+) -> bool {
+    provider.capabilities_for_model(model).vision || has_vision_provider
+}
+
 async fn process_channel_message_body(
     ctx: Arc<ChannelRuntimeContext>,
     msg: zeroclaw_api::channel::ChannelMessage,
@@ -4792,8 +4807,11 @@ async fn process_channel_message_body(
 
     // ── Media pipeline: enrich inbound message with media annotations ──
     if ctx.media_pipeline.enabled && !msg.attachments.is_empty() {
-        let vision =
-            ctx.model_provider.supports_vision() || ctx.multimodal.vision_model_provider.is_some();
+        let vision = media_pipeline_vision_available(
+            ctx.model_provider.as_ref(),
+            ctx.model.as_str(),
+            ctx.multimodal.vision_model_provider.is_some(),
+        );
         // Build from legacy config; if that fails (e.g. no legacy api_key
         // but typed providers are configured), fall back to an empty shell
         // so with_typed_providers() can still populate the registry.
@@ -14046,6 +14064,73 @@ api_key = "anthropic-key"
         fn alias(&self) -> &str {
             "DummyModelProvider"
         }
+    }
+
+    /// Provider whose family default has no vision but whose catalog-backed
+    /// per-model capability marks one model as image-input — the exact
+    /// pure-compatible-Mistral/Pixtral shape the media pipeline gate exists for.
+    struct CatalogVisionModelProvider;
+
+    #[async_trait::async_trait]
+    impl ModelProvider for CatalogVisionModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        fn capabilities_for_model(
+            &self,
+            model: &str,
+        ) -> zeroclaw_api::model_provider::ProviderCapabilities {
+            zeroclaw_api::model_provider::ProviderCapabilities {
+                vision: model == "pixtral-x",
+                ..Default::default()
+            }
+        }
+
+        fn supports_vision(&self) -> bool {
+            false
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for CatalogVisionModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "CatalogVisionModelProvider"
+        }
+    }
+
+    #[test]
+    fn media_pipeline_vision_uses_model_aware_capability() {
+        // Regression for the channel media boundary: the family-level
+        // `supports_vision()` flag is false for this provider, yet the
+        // configured model is cataloged as image-input — the pipeline must
+        // keep the `IMAGE:data:...` marker for that model, and only for it.
+        let provider = CatalogVisionModelProvider;
+        assert!(
+            media_pipeline_vision_available(&provider, "pixtral-x", false),
+            "cataloged image-input model must preserve the image marker"
+        );
+        assert!(
+            !media_pipeline_vision_available(&provider, "mistral-text-model", false),
+            "text-only model must not preserve the image marker"
+        );
+        // A configured vision provider enables image preservation regardless
+        // of the primary model's per-model capability.
+        assert!(
+            media_pipeline_vision_available(&provider, "mistral-text-model", true),
+            "a configured vision provider keeps attachments"
+        );
     }
 
     struct FormatErrorModelProvider;

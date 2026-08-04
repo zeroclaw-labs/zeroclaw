@@ -2522,6 +2522,29 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         }
     }
 
+    async fn warm_capabilities_metadata(&self) {
+        // Credentialed compatible providers list models through their native
+        // `/models` endpoint and may never trigger a models.dev listing, so the
+        // process-wide catalog would stay empty and `capabilities_for_model`
+        // would silently return the family default. Preload the catalog from
+        // async turn context so the synchronous gate can resolve per-model
+        // vision support.
+        if self.models_dev_key.is_some()
+            && let Err(err) = crate::models_dev::ensure_catalog_loaded().await
+        {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "model_provider": &self.name,
+                        "err": err.to_string(),
+                    })),
+                "compatible: models.dev catalog preload failed; per-model vision falls back to family default"
+            );
+        }
+    }
+
     fn capabilities_for_model(
         &self,
         model: &str,
@@ -5253,6 +5276,65 @@ mod tests {
         let caps = <OpenAiCompatibleModelProvider as ModelProvider>::capabilities(&p);
         assert!(caps.native_tool_calling);
         assert!(caps.vision);
+    }
+
+    #[tokio::test]
+    async fn capabilities_for_model_resolves_catalog_vision_for_credentialed_provider() {
+        // Regression for the catalog-lifecycle gap: a credentialed compatible
+        // provider lists models through its native `/models` endpoint and never
+        // triggers a models.dev listing, so the process-wide catalog stays
+        // empty and the synchronous capability gate silently returns the family
+        // default. `warm_capabilities_metadata` must preload the catalog from
+        // async turn context so `capabilities_for_model` resolves per-model
+        // vision — an image-input model and a text-only model, both cataloged.
+        use crate::models_dev::{CACHED_CATALOG, parse_catalog};
+        use std::sync::Arc;
+
+        let catalog_json = br#"{
+            "mock-compatible": {
+                "models": {
+                    "vision-model": {
+                        "id": "vision-model",
+                        "modalities": {"input": ["image", "text"]}
+                    },
+                    "text-model": {
+                        "id": "text-model",
+                        "modalities": {"input": ["text"]}
+                    }
+                }
+            }
+        }"#;
+        let catalog = parse_catalog(catalog_json).unwrap();
+        // The catalog is a process-wide OnceCell; only this test injects it.
+        // A distinct provider key avoids colliding with any production key.
+        let _ = CACHED_CATALOG.set(Arc::new(catalog));
+
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("mock-compatible")
+            .base_url("https://example.com/v1")
+            .credential(Some("fake-key"))
+            .auth_style(AuthStyle::Bearer)
+            .models_dev_key("mock-compatible")
+            .build();
+
+        // Family default: no provider-wide vision flag, so any per-model vision
+        // below must come from the catalog, not the family.
+        assert!(!<OpenAiCompatibleModelProvider as ModelProvider>::capabilities(&provider).vision);
+
+        // `warm_capabilities_metadata` is the async seam that preloads the
+        // catalog into the same production lifecycle that runs the sync
+        // capability gate. With the catalog injected it must be a no-op and
+        // leave the catalog usable by the gate.
+        provider.warm_capabilities_metadata().await;
+
+        assert!(
+            provider.capabilities_for_model("vision-model").vision,
+            "cataloged image-input model must resolve vision after warming"
+        );
+        assert!(
+            !provider.capabilities_for_model("text-model").vision,
+            "cataloged text-only model must not resolve vision"
+        );
     }
 
     #[test]
