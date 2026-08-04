@@ -16103,6 +16103,17 @@ pub struct LeakDetectionConfig {
     /// Enable high-entropy token redaction; deterministic patterns still run when false.
     #[serde(default = "default_leak_detection_high_entropy_tokens")]
     pub high_entropy_tokens: bool,
+
+    /// Allow Solana public identifiers (wallet addresses, transaction
+    /// signatures, program IDs) through high-entropy redaction. These are
+    /// public by design and always appear as base58 strings; redacting them
+    /// makes every Solana-capable agent unusable. See issue #9486.
+    #[serde(default = "default_leak_detection_solana_identifiers")]
+    pub solana_identifiers: bool,
+}
+
+fn default_leak_detection_solana_identifiers() -> bool {
+    true
 }
 
 fn default_leak_detection_enabled() -> bool {
@@ -16123,6 +16134,7 @@ impl Default for LeakDetectionConfig {
             enabled: default_leak_detection_enabled(),
             sensitivity: default_leak_detection_sensitivity(),
             high_entropy_tokens: default_leak_detection_high_entropy_tokens(),
+            solana_identifiers: default_leak_detection_solana_identifiers(),
         }
     }
 }
