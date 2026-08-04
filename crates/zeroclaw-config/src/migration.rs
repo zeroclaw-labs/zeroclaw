@@ -1431,6 +1431,92 @@ vision_model_provider = "qwen"
     }
 
     #[test]
+    fn v2_synonym_collision_left_bare() {
+        // `gemini` and `google` are synonyms that both collapse onto
+        // gemini.default. The materialized slot retains only one of their
+        // configs, so a bare `gemini` reference must not be rewritten (it could
+        // silently pick the `google` config).
+        let raw = r#"
+schema_version = 2
+
+[providers.models.gemini]
+model = "canonical-model"
+api_key = "sk-gemini"
+
+[providers.models.google]
+model = "synonym-model"
+api_key = "sk-google"
+
+[multimodal]
+vision_model_provider = "gemini"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("gemini"),
+            "a synonym-collided slot must not capture a bare family reference"
+        );
+    }
+
+    #[test]
+    fn v2_colon_url_source_rewrites_bare_custom() {
+        // A colon-URL source materializes custom.default with the uri. The
+        // provenance records the unsplit key; the equivalence check must split
+        // it back to the `custom` prefix so the bare reference rewrites.
+        let raw = r#"
+schema_version = 2
+
+[providers.models."custom:https://vision.example.invalid/v1"]
+model = "vision-model"
+
+[multimodal]
+vision_model_provider = "custom"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("custom.default"),
+            "bare custom reference must rewrite to the colon-URL source's alias"
+        );
+        let alias = cfg
+            .providers
+            .models
+            .find("custom", "default")
+            .expect("migrated colon-URL entry must live at custom.default");
+        assert_eq!(
+            alias.uri.as_deref(),
+            Some("https://vision.example.invalid/v1"),
+            "the migrated custom.default must retain the source uri"
+        );
+    }
+
+    #[test]
+    fn v2_global_only_fallback_rewrites_bare_openrouter() {
+        // No model entries and no default_provider: the fold synthesizes
+        // openrouter.default from the global default_model. The synthesized
+        // slot must be registered as a source so the bare reference rewrites.
+        let raw = r#"
+schema_version = 2
+
+[providers]
+default_model = "vision-model"
+
+[multimodal]
+vision_model_provider = "openrouter"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("openrouter.default"),
+            "bare openrouter reference must rewrite to the synthesized global alias"
+        );
+        assert!(
+            cfg.providers.models.find("openrouter", "default").is_some(),
+            "the synthesized openrouter.default must exist"
+        );
+    }
+
+    #[test]
     fn v1_legacy_vision_reference_migrates_through_chain() {
         // No `schema_version` implies V1. The `model_providers` shape feeds
         // V2 `[providers.models]`, and the V2->V3 step canonicalizes the
