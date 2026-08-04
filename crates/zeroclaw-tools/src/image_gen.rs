@@ -153,8 +153,9 @@ impl ImageGenTool {
     }
 
     /// Construct with a resolver closure that reads the allowlist from the
-    /// canonical config at use time. The resolver is called on each request
-    /// to get the current normalized allowlist.
+    /// canonical config at use time. The resolver is called on each request,
+    /// and its result is normalized via `domain_guard::normalize_allowed_domains`
+    /// so a live config edit takes effect on the next call.
     ///
     /// This avoids storing a duplicate `Vec<String>` in the tool handle,
     /// per the repository's single-source-of-truth rule (AGENTS.md).
@@ -169,37 +170,44 @@ impl ImageGenTool {
     where
         F: Fn() -> Vec<String> + Send + Sync + 'static,
     {
-        Ok(Self {
-            security,
-            workspace_dir,
-            default_model,
-            api_key_env,
-            allowed_private_hosts_resolver: Arc::new(allowed_private_hosts_resolver),
-            persistent_writes,
-        })
-    }
-
-    /// Deprecated: use `new_with_config_resolver` instead to avoid
-    /// storing a duplicate policy copy in the tool handle.
-    #[deprecated(since = "0.8.3", note = "Use new_with_config_resolver instead")]
-    pub fn new_with_config(
-        security: Arc<SecurityPolicy>,
-        workspace_dir: PathBuf,
-        default_model: String,
-        api_key_env: String,
-        persistent_writes: bool,
-        allowed_private_hosts: Vec<String>,
-    ) -> anyhow::Result<Self> {
-        let normalized = domain_guard::normalize_allowed_domains(
-            allowed_private_hosts,
+        // Construction-time validation preserves the caller's
+        // disable-on-invalid behavior for a malformed initial config. The
+        // resolver then re-normalizes per call, so an operator editing
+        // `Config.image_gen.allowed_private_hosts` at runtime sees the new
+        // value (normalized) on the next request instead of a stale copy.
+        domain_guard::normalize_allowed_domains(
+            allowed_private_hosts_resolver(),
             "image_gen.allowed_private_hosts",
         )?;
+        let resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = Arc::new(move || {
+            match domain_guard::normalize_allowed_domains(
+                allowed_private_hosts_resolver(),
+                "image_gen.allowed_private_hosts",
+            ) {
+                Ok(normalized) => normalized,
+                Err(err) => {
+                    // Fail closed to an empty allowlist (reject every private
+                    // host) rather than matching raw, unnormalized strings.
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "tool": "image_gen",
+                                "err": err.to_string(),
+                            })),
+                        "image_gen: invalid allowed_private_hosts at use time; allowlist disabled"
+                    );
+                    Vec::new()
+                }
+            }
+        });
         Ok(Self {
             security,
             workspace_dir,
             default_model,
             api_key_env,
-            allowed_private_hosts_resolver: Arc::new(move || normalized.clone()),
+            allowed_private_hosts_resolver: resolver,
             persistent_writes,
         })
     }
@@ -394,7 +402,9 @@ impl ImageGenTool {
 
     /// Public entry point: same as `validate_image_url_resolved_with_resolver`
     /// but always resolves via `tokio::net::lookup_host` (the production path).
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Test-only: production goes through `*_with_resolver` with the injected
+    /// resolver seam, so this wrapper is compiled only under `cfg(test)`.
+    #[cfg(test)]
     async fn validate_image_url_resolved(
         &self,
         validated_url: &str,
@@ -427,7 +437,9 @@ impl ImageGenTool {
 
     /// Public entry point: same as `validate_image_target_with_resolver`
     /// but always resolves via `tokio::net::lookup_host` (the production path).
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Test-only: production goes through `*_with_resolver` with the injected
+    /// resolver seam, so this wrapper is compiled only under `cfg(test)`.
+    #[cfg(test)]
     async fn validate_image_target(&self, raw_url: &str) -> anyhow::Result<ValidatedImageTarget> {
         self.validate_image_target_with_resolver(raw_url, &resolve_host_for_download)
             .await
@@ -1209,6 +1221,33 @@ mod tests {
             .await
             .unwrap_err()
             .to_string();
+        assert!(err.contains("metadata"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn validate_image_target_rejects_ipv4_mapped_metadata_under_wildcard() {
+        // A public-looking hostname whose DNS answer contains the
+        // IPv4-mapped spelling of the EC2 metadata endpoint
+        // (`::ffff:169.254.169.254`) must be rejected even when
+        // `allowed_private_hosts = ["*"]` lifts the non-global gate, because
+        // `domain_guard::is_cloud_metadata_ip` normalizes IPv4-mapped IPv6
+        // to its mapped IPv4 before matching — the metadata block is
+        // unconditional. This is the image_gen-side regression for the
+        // shared-predicate fix.
+        use std::net::SocketAddr;
+
+        let tool = test_tool_with_private_hosts(vec!["*"]);
+        let mapped: SocketAddr = "[::ffff:169.254.169.254]:80".parse().unwrap();
+        let err = match tool
+            .validate_image_target_with_resolver(
+                "http://public-cdn.example/image.png",
+                &|_host: String, _port: u16| async move { Ok(vec![mapped]) },
+            )
+            .await
+        {
+            Ok(_) => panic!("IPv4-mapped metadata endpoint must be rejected"),
+            Err(e) => e.to_string(),
+        };
         assert!(err.contains("metadata"), "got: {err}");
     }
 

@@ -1139,16 +1139,25 @@ pub fn all_tools_with_runtime(
         )));
     }
 
-    // Standalone image generation tool (config-gated)
+    // Standalone image generation tool (config-gated). The allowlist is
+    // resolved from canonical config at use time (live handle when present,
+    // snapshot fallback otherwise) — the same seam `AgentPeerGroupResolver`
+    // uses below — so the tool never retains a second policy copy.
     if root_config.image_gen.enabled {
-        let allowed_hosts = root_config.image_gen.allowed_private_hosts.clone();
+        let allowlist_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
+            if let Some(live) = live_config.clone() {
+                Arc::new(move || live.read().image_gen.allowed_private_hosts.clone())
+            } else {
+                let snapshot = root_config.image_gen.allowed_private_hosts.clone();
+                Arc::new(move || snapshot.clone())
+            };
         match ImageGenTool::new_with_config_resolver(
             security.clone(),
             workspace_dir.to_path_buf(),
             root_config.image_gen.default_model.clone(),
             root_config.image_gen.api_key_env.clone(),
             persistent_writes,
-            move || allowed_hosts.clone(),
+            move || allowlist_resolver(),
         ) {
             Ok(tool) => tool_arcs.push(Arc::new(tool)),
             Err(err) => ::zeroclaw_log::record!(

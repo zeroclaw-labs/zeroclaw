@@ -8756,9 +8756,11 @@ pub struct ImageGenConfig {
     /// tools. Use for internal CDNs that proxy fal.ai artifacts in air-gapped
     /// deployments.
     ///
-    /// Entries are normalized at config-load time via
-    /// `domain_guard::normalize_allowed_domains`. A bare `"*"` blanket-tolerates
-    /// any private/local host (use only for dev).
+    /// Entries are normalized per use by the image tool via
+    /// `domain_guard::normalize_allowed_domains`: once at tool construction
+    /// and again from the live config on every request, so an operator edit
+    /// to this field takes effect without a restart. A bare `"*"`
+    /// blanket-tolerates any private/local host (use only for dev).
     #[serde(default)]
     pub allowed_private_hosts: Vec<String>,
 }
