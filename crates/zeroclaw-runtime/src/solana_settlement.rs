@@ -13,8 +13,6 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
-use solana_sdk::commitment_config::CommitmentConfig;
-use solana_sdk::instruction::Instruction;
 use solana_sdk::message::Message;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signer};
@@ -145,7 +143,7 @@ mod tests {
         // The advance instruction targets the System Program.
         let system_program = Pubkey::from_str(SYSTEM_PROGRAM_ID).unwrap();
         let advance_program = tx.message.instructions[0].program_id(&tx.message.account_keys);
-        assert_eq!(advance_program, system_program);
+        assert_eq!(*advance_program, system_program);
     }
 
     #[test]
@@ -208,8 +206,9 @@ mod tests {
         sign_for_submission(&mut tx, &[&payer, &nonce_authority]);
         assert_eq!(tx.signatures.len(), 2);
         // The payer's signature must be present and verifiable.
-        let sig = tx.signatures[0];
-        assert!(sig.verify(&payer.pubkey().to_bytes(), tx.message.hash()));
+        let sig = &tx.signatures[0];
+        let pubkey_bytes = payer.pubkey().to_bytes();
+        assert!(sig.verify(&pubkey_bytes, &tx.message.hash().to_bytes()));
     }
 
     #[test]
