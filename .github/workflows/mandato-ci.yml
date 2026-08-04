@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # One job at a time keeps peak memory ~2.5-3GB on the runner; the
+  # zeroclaw-runtime crate is heavy and parallel rustc jobs are wasteful here.
+  CARGO_BUILD_JOBS: 2
+
+jobs:
+  verifiable-intent:
+    name: Chain verifier + leak detector + settlement
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build + test the chain verifier (issue #9328)
+        run: cargo test -p zeroclaw-runtime verifiable_intent
+
+      - name: Test the leak detector, incl. Solana allowlist (issue #9486)
+        run: cargo test -p zeroclaw-runtime leak_detector
+
+      - name: Build the settlement module (solana-sdk feature)
+        run: cargo build -p zeroclaw-runtime --features solana-sdk
+
+      - name: Test the settlement module (devnet-only assertions)
+        run: cargo test -p zeroclaw-runtime --features solana-sdk solana_settlement
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy on changed surface
+        run: cargo clippy -p zeroclaw-runtime --features solana-sdk -- -D warnings
+        continue-on-error: true
