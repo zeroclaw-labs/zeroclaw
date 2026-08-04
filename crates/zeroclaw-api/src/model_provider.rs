@@ -460,6 +460,13 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
         capabilities
     }
 
+    /// Warm any process-wide metadata the synchronous [`Self::capabilities_for_model`]
+    /// may depend on (e.g. a cached model catalog). Called once per turn from
+    /// async context, before the capability gate runs, so the sync query can
+    /// resolve model-aware capabilities instead of silently falling back to the
+    /// family default. Default no-op.
+    async fn warm_capabilities_metadata(&self) {}
+
     /// Family-preferred temperature default. Override per family. Documented
     /// for introspection only; never use to convert `None` into a wire value.
     fn default_temperature(&self) -> f64 {

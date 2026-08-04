@@ -120,6 +120,19 @@ pub(crate) fn filter_models(catalog: &Catalog, provider_key: &str) -> Result<Vec
     Ok(ids)
 }
 
+/// Ensure the process-wide catalog is populated, so the synchronous
+/// per-model capability gate (`capabilities_for_model`) can resolve
+/// vision support from it even on paths that never run a models.dev
+/// listing (e.g. credentialed OpenAI-compatible providers that list
+/// through their native `/models` endpoint). No-op once loaded.
+/// Called from async agent-turn context before the capability query.
+pub(crate) async fn ensure_catalog_loaded() -> Result<()> {
+    CACHED_CATALOG
+        .get_or_try_init(fetch_catalog)
+        .await
+        .map(|_| ())
+}
+
 /// Look up model IDs for a model_provider, keyed by `models.dev`'s model_provider name.
 ///
 /// First call fetches the catalog; subsequent calls hit the cache. The
