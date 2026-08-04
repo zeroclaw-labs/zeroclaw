@@ -399,6 +399,7 @@ mod tests {
             &err,
             1,
             Some(&tx),
+            None,
             &observer,
             configured_budget,
         )
@@ -440,7 +441,8 @@ mod tests {
         let observer = NoopObserver;
 
         let recovered =
-            try_recover_context_overflow(&mut history, &err, 1, Some(&tx), &observer, 0).await;
+            try_recover_context_overflow(&mut history, &err, 1, Some(&tx), None, &observer, 0)
+                .await;
 
         assert!(recovered, "an overflowing history must trim and recover");
         let event = rx.try_recv().expect("recovery must emit a TurnEvent");
