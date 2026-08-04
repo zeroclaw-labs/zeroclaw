@@ -890,11 +890,24 @@ impl Channel for SignalChannel {
         Ok(())
     }
 
+    /// Delegates to [`Self::request_approval_attributed`] and drops the
+    /// provenance, so the prompt/timeout logic lives in exactly one place.
     async fn request_approval(
         &self,
         recipient: &str,
         request: &ChannelApprovalRequest,
     ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
+        Ok(self
+            .request_approval_attributed(recipient, request)
+            .await?
+            .map(|attributed| attributed.response))
+    }
+
+    async fn request_approval_attributed(
+        &self,
+        recipient: &str,
+        request: &ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
         let token = crate::util::new_approval_token();
         let text = crate::util::build_yesno_approval_prompt(
             &token,
@@ -913,15 +926,27 @@ impl Channel for SignalChannel {
             return Err(err);
         }
 
-        let response =
+        // Only a real token-echo reply is an operator decision; the
+        // dropped-sender and timeout arms are the runtime denying on its own.
+        let attributed =
             match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), rx).await {
-                Ok(Ok(resp)) => resp,
-                _ => {
+                Ok(Ok(resp)) => zeroclaw_api::channel::AttributedApprovalResponse::operator(resp),
+                Ok(Err(_)) => {
                     self.pending_approvals.lock().await.remove(&token);
-                    ChannelApprovalResponse::Deny
+                    zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                        ChannelApprovalResponse::Deny,
+                        zeroclaw_api::channel::ApprovalSource::Unreachable,
+                    )
+                }
+                Err(_) => {
+                    self.pending_approvals.lock().await.remove(&token);
+                    zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                        ChannelApprovalResponse::Deny,
+                        zeroclaw_api::channel::ApprovalSource::TimedOut,
+                    )
                 }
             };
-        Ok(Some(response))
+        Ok(Some(attributed))
     }
 }
 

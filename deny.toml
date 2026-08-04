@@ -40,13 +40,7 @@ ignore = [
     # audit.toml/deny.toml drift reconcile + wasmtime CVEs; tracking #8519.
     # RUSTSEC-2026-0149, -0182, -0188 cleared by wasmtime/wasmtime-wasi 43 -> 45.0.3
     # bump in crates/zeroclaw-plugins. Resolved by #8542.
-    # wasmtime -- Store type-index confusion between engines (CVSS 3.8 low);
-    # requires multiple Engines with Stores crossing engine boundaries. The
-    # plugin runtime uses a single process-wide Engine (component.rs engine()
-    # OnceLock singleton) and mints every Store from it, so the cross-Engine
-    # precondition cannot occur; no patched 45.x release exists, remediation
-    # is the wasmtime 46.0.2+/47.0.3+ series bump
-    { id = "RUSTSEC-2026-0222", reason = "wasmtime Store type-index confusion between engines; single-Engine plugin runtime is not exposed; no patched 45.x, remediation is the 46/47 bump; tracking #8519" },
+    # RUSTSEC-2026-0222 cleared by wasmtime stack 45.0.3 -> 47.0.3 bump.
     # GTK3 stack unmaintained via zeroclaw-desktop (tauri -> webkit2gtk); tracking #8519.
     { id = "RUSTSEC-2024-0411", reason = "gdkwayland-sys unmaintained gtk-rs GTK3 bindings; tracking #8519" },
     { id = "RUSTSEC-2024-0412", reason = "gdk unmaintained gtk-rs GTK3 bindings; tracking #8519" },

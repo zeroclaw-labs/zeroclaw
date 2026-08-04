@@ -68,11 +68,18 @@ impl Channel for AskUserApprovalBridge {
     ) -> anyhow::Result<Option<AttributedApprovalResponse>> {
         if let Some(route) = &self.route {
             match resolve_routed_approval(&self.handles, route, recipient, request).await {
-                RoutedApproval::Decided { response, decider } => {
-                    return Ok(Some(AttributedApprovalResponse {
-                        response,
-                        decided_by: decider,
-                    }));
+                // Cross-crate construction: `AttributedApprovalResponse` is
+                // `#[non_exhaustive]`, so struct-literal syntax is forbidden
+                // from here. Build via the dedicated constructors.
+                RoutedApproval::Decided {
+                    response,
+                    decider,
+                    source,
+                } => {
+                    return Ok(Some(
+                        AttributedApprovalResponse::from_runtime(response, source)
+                            .with_decider_opt(decider),
+                    ));
                 }
                 RoutedApproval::Fallthrough => {
                     // explicit InheritOriginator → originating fan-out below
@@ -87,15 +94,19 @@ impl Channel for AskUserApprovalBridge {
             .map(|(name, channel)| (name.clone(), Arc::clone(channel)))
             .collect();
         for (channel_name, channel) in &channels {
-            match channel.request_approval(recipient, request).await {
+            // Ask for the ATTRIBUTED response, not the legacy one: a back-channel
+            // that synthesizes `Some(Deny)` on timeout reports that provenance
+            // here, and calling `request_approval` would discard it and relabel
+            // the runtime's deny as the operator's.
+            match channel
+                .request_approval_attributed(recipient, request)
+                .await
+            {
                 // The deciding back-channel's name travels back on the response
                 // itself, so a concurrent fan-out on the same bridge instance
                 // cannot overwrite this call's attribution.
-                Ok(Some(response)) => {
-                    return Ok(Some(AttributedApprovalResponse {
-                        response,
-                        decided_by: Some(channel_name.clone()),
-                    }));
+                Ok(Some(attributed)) => {
+                    return Ok(Some(attributed.with_decider(channel_name.clone())));
                 }
                 Ok(None) => continue,
                 Err(e) => {
@@ -175,6 +186,110 @@ mod tests {
             name: name.to_string(),
             approves_recipient: approves_recipient.to_string(),
         })
+    }
+
+    /// A back-channel whose prompt timed out, so it synthesizes `Some(Deny)`
+    /// the way Discord / Matrix / Telegram / Slack / the gateway WS all do.
+    struct TimedOutApprover {
+        name: String,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for TimedOutApprover {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Cli,
+            )
+        }
+        fn alias(&self) -> &str {
+            &self.name
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for TimedOutApprover {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        async fn send(&self, _m: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn request_approval_attributed(
+            &self,
+            _recipient: &str,
+            _r: &ChannelApprovalRequest,
+        ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
+            Ok(Some(
+                zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                    ChannelApprovalResponse::Deny,
+                    zeroclaw_api::channel::ApprovalSource::TimedOut,
+                ),
+            ))
+        }
+    }
+
+    /// The fan-out must not launder a back-channel's synthesized timeout into an
+    /// operator decision.
+    ///
+    /// This is the regression: the bridge used to call the legacy
+    /// `request_approval`, which returns a bare `Some(Deny)` that is
+    /// indistinguishable from a real "no", and then stamped `Operator` on it.
+    /// The gate then told the model "Denied by user." for a prompt no human
+    /// ever saw. The bridge now asks for the attributed response and forwards
+    /// the provenance untouched, adding only the deciding channel's name.
+    #[tokio::test]
+    async fn fanout_preserves_a_backchannel_synthesized_timeout() {
+        let bridge = AskUserApprovalBridge::new(
+            handles_with(vec![Arc::new(TimedOutApprover {
+                name: "discord".to_string(),
+            })]),
+            None,
+        );
+
+        let decided = bridge
+            .request_approval_attributed("user-A", &req())
+            .await
+            .unwrap()
+            .expect("a synthesized deny is still a response");
+
+        assert_eq!(decided.response, ChannelApprovalResponse::Deny);
+        assert_eq!(
+            decided.source,
+            zeroclaw_api::channel::ApprovalSource::TimedOut,
+            "the back-channel's runtime provenance must survive the fan-out"
+        );
+        assert!(decided.source.is_runtime_fail_closed());
+        assert_eq!(
+            decided.decided_by.as_deref(),
+            Some("discord"),
+            "the fan-out still names which surface produced the outcome"
+        );
+    }
+
+    /// The complement: a back-channel that a person actually answered still
+    /// reports `Operator`, so the fix does not simply blanket-neutralize every
+    /// denial.
+    #[tokio::test]
+    async fn fanout_keeps_operator_provenance_for_a_real_answer() {
+        let bridge =
+            AskUserApprovalBridge::new(handles_with(vec![approver("acp", "user-A")]), None);
+
+        let decided = bridge
+            .request_approval_attributed("user-A", &req())
+            .await
+            .unwrap()
+            .expect("a back-channel approved");
+
+        assert_eq!(
+            decided.source,
+            zeroclaw_api::channel::ApprovalSource::Operator
+        );
+        assert!(!decided.source.is_runtime_fail_closed());
     }
 
     fn handles_with(channels: Vec<Arc<dyn Channel>>) -> PerToolChannelHandle {

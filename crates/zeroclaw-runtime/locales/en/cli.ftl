@@ -934,6 +934,12 @@ turn-tool-interrupted-before-result = [interrupted by user before this tool prod
 # Safe reply delivered when the model repeatedly emits malformed internal
 # tool-call protocol and the turn gives up retrying.
 channel-runtime-malformed-tool-output = I generated an internal tool-call format error and could not complete this request. Please try again.
+channel-runtime-progress-received = Received
+channel-runtime-progress-planning = Planning
+channel-runtime-progress-waiting-on-model = Waiting on model
+channel-runtime-progress-running-tool = Running tool
+channel-runtime-progress-compacting-context = Compacting context
+channel-runtime-progress-finalizing-response = Finalizing response
 channel-runtime-new-session = Conversation history cleared. Starting fresh.
 channel-runtime-stop-sent = Stop signal sent.
 channel-runtime-stop-no-task = No in-flight task for this sender scope.
