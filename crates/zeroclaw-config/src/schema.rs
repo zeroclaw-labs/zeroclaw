@@ -5061,10 +5061,10 @@ pub struct VerifiableIntentConfig {
     #[serde(default)]
     pub enabled: bool,
 
-    /// Intended strictness mode for constraint evaluation, `"strict"` or
-    /// `"permissive"`. Default: `"strict"`.
+    /// Intended strictness mode for constraint evaluation.
     ///
-    /// No production code reads this while the tool is withheld.
+    /// Accepts `"strict"` or `"permissive"`, and defaults to `"strict"`. No
+    /// production code reads it while the tool is withheld.
     #[serde(default = "default_vi_strictness")]
     pub strictness: String,
 }
