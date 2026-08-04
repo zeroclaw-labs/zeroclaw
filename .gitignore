@@ -128,3 +128,4 @@ target/openapi.json
 .worktrees/
 .zero-to-5/
 vendor-wa
+.githooks-local/
