@@ -1268,24 +1268,14 @@ impl LarkChannel {
                         Ok(e) => e,
                         Err(e) => { ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"error": format!("{}", e)})), "event JSON"); continue; }
                     };
-                    match event.header.event_type.as_str() {
-                        "im.message.receive_v1" => {}
-                        "card.action.trigger" => {
-                            if let Err(e) = self.handle_card_action_event(&event.event).await {
-                                ::zeroclaw_log::record!(
-                                    WARN,
-                                    ::zeroclaw_log::Event::new(
-                                        module_path!(),
-                                        ::zeroclaw_log::Action::Dispatch
-                                    )
-                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                    .with_attrs(::serde_json::json!({"error": e.to_string()})),
-                                    "Lark WS: card action dispatch error"
-                                );
-                            }
-                            continue;
-                        }
-                        _ => continue,
+                    if self
+                        .handle_card_action_ingress(&event.header.event_type, Some(&event.event))
+                        .await
+                    {
+                        continue;
+                    }
+                    if event.header.event_type != "im.message.receive_v1" {
+                        continue;
                     }
 
                     let event_payload = event.event;
@@ -3373,6 +3363,37 @@ impl LarkChannel {
         Ok((status, parsed))
     }
 
+    /// Route card-action envelopes before either ingress treats them as ordinary messages.
+    /// Returns `true` once the envelope is consumed, even when the callback is rejected.
+    async fn handle_card_action_ingress(
+        &self,
+        event_type: &str,
+        event_payload: Option<&serde_json::Value>,
+    ) -> bool {
+        if event_type != "card.action.trigger" {
+            return false;
+        }
+        let Some(event_payload) = event_payload else {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Dispatch)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "Lark card action ingress: missing event payload"
+            );
+            return true;
+        };
+        if let Err(e) = self.handle_card_action_event(event_payload).await {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Dispatch)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                "Lark card action ingress: callback rejected"
+            );
+        }
+        true
+    }
+
     async fn handle_card_action_event(
         &self,
         event_payload: &serde_json::Value,
@@ -3577,21 +3598,11 @@ impl LarkChannel {
                 .pointer("/header/event_type")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            if event_type == "card.action.trigger"
-                && let Some(inner) = payload.get("event")
+            if state
+                .channel
+                .handle_card_action_ingress(event_type, payload.get("event"))
+                .await
             {
-                if let Err(e) = state.channel.handle_card_action_event(inner).await {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(
-                            module_path!(),
-                            ::zeroclaw_log::Action::Dispatch
-                        )
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"error": e.to_string()})),
-                        "Lark webhook: card action dispatch error"
-                    );
-                }
                 return (StatusCode::OK, "ok").into_response();
             }
 
@@ -5868,6 +5879,103 @@ mod tests {
             .expect("handler ok");
         let result = rx.await.expect("oneshot delivered");
         assert_eq!(result, ChannelApprovalResponse::AlwaysApprove);
+    }
+
+    #[tokio::test]
+    async fn card_action_ingress_suppresses_rejected_approval_envelopes() {
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+
+        let ch = make_channel();
+        let (approved_tx, approved_rx) = tokio::sync::oneshot::channel();
+        let (wrong_chat_tx, _wrong_chat_rx) = tokio::sync::oneshot::channel();
+        let (unauthorized_tx, _unauthorized_rx) = tokio::sync::oneshot::channel();
+        {
+            let mut approvals = ch.pending_approvals.lock().await;
+            approvals.insert(
+                "AUTH0001".to_string(),
+                PendingApproval {
+                    sender: approved_tx,
+                    destination: "oc_origin".to_string(),
+                    message_id: String::new(),
+                    tool_name: String::new(),
+                    arguments_summary: String::new(),
+                },
+            );
+            approvals.insert(
+                "WRONG001".to_string(),
+                PendingApproval {
+                    sender: wrong_chat_tx,
+                    destination: "oc_origin".to_string(),
+                    message_id: String::new(),
+                    tool_name: String::new(),
+                    arguments_summary: String::new(),
+                },
+            );
+            approvals.insert(
+                "OTHER001".to_string(),
+                PendingApproval {
+                    sender: unauthorized_tx,
+                    destination: "oc_origin".to_string(),
+                    message_id: String::new(),
+                    tool_name: String::new(),
+                    arguments_summary: String::new(),
+                },
+            );
+        }
+
+        let envelopes = [
+            serde_json::json!({
+                "header": { "event_type": "card.action.trigger" },
+                "event": {
+                    "action": { "value": { "approval_id": "OTHER001", "decision": "deny" } },
+                    "context": { "open_chat_id": "oc_origin" },
+                    "operator": { "open_id": "ou_untrusted" }
+                }
+            }),
+            serde_json::json!({
+                "header": { "event_type": "card.action.trigger" },
+                "event": {
+                    "action": { "value": { "approval_id": "WRONG001", "decision": "deny" } },
+                    "context": { "open_chat_id": "oc_wrong" },
+                    "operator": { "open_id": "ou_testuser123" }
+                }
+            }),
+            serde_json::json!({
+                "header": { "event_type": "card.action.trigger" },
+                "event": {
+                    "action": { "value": { "approval_id": "AUTH0001", "decision": "approve" } },
+                    "context": { "open_chat_id": "oc_origin" },
+                    "operator": { "open_id": "ou_testuser123" }
+                }
+            }),
+        ];
+
+        for envelope in &envelopes {
+            let event_type = envelope
+                .pointer("/header/event_type")
+                .and_then(serde_json::Value::as_str)
+                .expect("outer card-action event type");
+            assert!(
+                ch.handle_card_action_ingress(event_type, envelope.get("event"))
+                    .await,
+                "card-action envelopes must be consumed before ordinary message dispatch"
+            );
+            assert!(
+                ch.parse_event_payload(envelope).await.is_empty(),
+                "card-action envelopes must not produce ChannelMessage values"
+            );
+        }
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), approved_rx)
+                .await
+                .expect("authorized callback should resolve")
+                .expect("approval sender should stay open"),
+            ChannelApprovalResponse::Approve
+        );
+        let approvals = ch.pending_approvals.lock().await;
+        assert!(approvals.contains_key("WRONG001"));
+        assert!(approvals.contains_key("OTHER001"));
     }
 
     #[tokio::test]
