@@ -15,7 +15,40 @@ use zeroclaw_api::tool::ToolSpec;
 const TEMPERATURE_DEFAULT: f64 = 1.0;
 /// Anthropic's public API endpoint. Overrideable via `model_providers.<name>.base_url`.
 pub(crate) const BASE_URL: &str = "https://api.anthropic.com";
+/// Anthropic's documented per-image ceiling for the direct API: 10 MB
+/// **base64-encoded**. Measured on the encoded payload length, unlike the
+/// multimodal config's `max_image_size_mb`, which bounds decoded bytes. MB is
+/// read as 1024 * 1024 here, the same way `max_image_size_mb` reads it, so the
+/// two ceilings stay consistent with each other. Anthropic's separate
+/// per-request budget (32 MB across all images) is not enforced here.
+const MAX_ENCODED_IMAGE_PAYLOAD_BYTES: usize = 10 * 1024 * 1024;
+/// Replaces a raw `data:<media type>;base64,<payload>` run that survived marker
+/// parsing and would otherwise sit in a text position. See
+/// [`AnthropicModelProvider::sweep_residual_image_data`].
+///
+/// Worded without "image" on purpose. The sweep matches any media type, because
+/// any base64 blob in a text position is the token blowup it exists to stop, so
+/// a note claiming an image was removed would be false for
+/// `data:application/json;base64,…`. Like the omission note, this is prompt text
+/// the model reads as fact.
+const TRUNCATED_DATA_NOTE: &str = "[truncated inline data removed]";
+/// Stand-in prose for a message whose only content is an image, so the message
+/// never ends on an `image` block. See
+/// [`AnthropicModelProvider::unpaired_tool_output_blocks`].
+const IMAGE_ONLY_TEXT_PLACEHOLDER: &str = "[image]";
+/// Prefix on tool output demoted to top-level blocks because an earlier block in
+/// the same message already answered its `tool_use`. Without it the model reads
+/// a tool's second answer as something the user typed. See
+/// [`AnthropicModelProvider::demoted_tool_result_blocks`].
+const DEMOTED_TOOL_RESULT_PREFIX: &str = "[duplicate result for tool call";
+/// Narrowest line width the residual sweep will read as line-wrapped base64. No
+/// encoder wraps this narrow — MIME uses 76, PEM and `base64` use 64, Ruby uses
+/// 60 — so below it a column of equal-length short tokens is far likelier than a
+/// wrapped payload. See [`AnthropicModelProvider::residual_payload_end`].
+const WRAPPED_BASE64_WIDTH_MIN: usize = 16;
+
 use crate::stream_guard::AbortOnDrop;
+use std::borrow::Cow;
 
 /// Maximum silence between body reads for Anthropic SSE streams.
 const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
@@ -93,6 +126,18 @@ fn anthropic_model_supports_native_thinking(model: &str) -> bool {
     !model.contains("claude-opus-4-7")
 }
 
+/// Characters legal between `data:` and `;base64,` in a data URI header: the
+/// media type plus any parameters. Whitespace, commas and brackets are excluded
+/// so a stray `data:` in prose cannot claim a `;base64,` further down the string.
+fn is_data_uri_header_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '/' | '+' | '-' | '.' | '_' | ';' | '=')
+}
+
+/// The standard base64 alphabet plus its padding character.
+fn is_base64_payload_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '+' | '/' | '=')
+}
+
 #[derive(Debug, Serialize)]
 struct NativeMessage {
     role: String,
@@ -129,7 +174,7 @@ enum NativeContentOut {
     #[serde(rename = "tool_result")]
     ToolResult {
         tool_use_id: String,
-        content: String,
+        content: ToolResultContent,
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
     },
@@ -142,6 +187,42 @@ enum NativeContentOut {
         #[serde(skip_serializing_if = "Option::is_none")]
         signature: Option<String>,
     },
+}
+
+/// `tool_result.content` accepts either a plain string or a list of nested
+/// blocks. The string shape is **untagged**, so an image-free tool result still
+/// serializes as a bare JSON string for `content` — byte-identical to what this
+/// adapter sent before nested blocks existed.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum ToolResultContent {
+    Text(String),
+    Blocks(Vec<ToolResultBlock>),
+}
+
+/// A block nested inside a `tool_result`. Anthropic also accepts `document` and
+/// `search_result` here, but this adapter can only build `text` and `image`.
+/// Keeping this separate from [`NativeContentOut`] makes a `tool_use` or a
+/// nested `tool_result` — both of which the API rejects — unrepresentable.
+#[derive(Debug, Serialize)]
+#[serde(tag = "type")]
+enum ToolResultBlock {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image")]
+    Image { source: ImageSource },
+}
+
+/// The tool-result envelope this crate's runtime writes for a native tool call:
+/// `{"tool_call_id": …, "content": "…"}`. Parsed, never serialized.
+struct ToolResultEnvelope {
+    /// `None` when `tool_call_id` is present but not a string — a shape the
+    /// current turn engine does not emit but restored or externally supplied
+    /// history can. The caller then tries to recover the id from the assistant
+    /// turn this message follows.
+    tool_use_id: Option<String>,
+    /// The tool's own output, with the envelope scaffolding removed.
+    content: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -475,30 +556,404 @@ impl AnthropicModelProvider {
         Some(blocks)
     }
 
-    fn parse_tool_result_message(content: &str) -> Option<NativeMessage> {
+    /// Note appended to text when an image reference could not be sent.
+    ///
+    /// This is prompt text the model reads as fact, not user-facing UI text, so
+    /// it stays an English literal rather than going through the Fluent
+    /// catalogue.
+    fn image_omission_note(count: usize) -> String {
+        format!("[{count} image(s) omitted: unsupported or oversized image reference]")
+    }
+
+    /// Builds `tool_result.content` from tool-result text, turning image
+    /// markers into nested `image` blocks.
+    ///
+    /// Multimodal preparation normalizes `[IMAGE:<path>]` to a `data:` URI
+    /// whenever the provider reports `vision`. Before nested blocks existed the
+    /// payload was serialized into a text position and billed as prose — tens of
+    /// thousands of tokens the model reads as gibberish rather than as an image.
+    ///
+    /// References that fail the shared structural check are dropped and counted
+    /// in an omission note instead. With no markers at all the original string
+    /// is returned unchanged, so the common path is byte-identical to before.
+    ///
+    /// Block order is text first, then images, matching Anthropic's own
+    /// documented example. (The user-message arm emits images first and text
+    /// after; the two arms differ, and the ordering rule Anthropic enforces is
+    /// about `tool_result` blocks relative to other blocks in a message, not
+    /// about text relative to image inside a block list.)
+    fn tool_result_content(content: &str) -> ToolResultContent {
+        let (cleaned, refs) = crate::multimodal::parse_image_markers(content);
+        if refs.is_empty() {
+            // The early return still sweeps. An unterminated marker yields zero
+            // references and copies its payload verbatim into the cleaned text,
+            // so returning here without sweeping would leave raw base64 in a
+            // text position on exactly the path that has no references.
+            return ToolResultContent::Text(Self::sweep_residual_image_data(content).into_owned());
+        }
+
+        let (sources, omitted) = Self::deliverable_image_sources(&refs);
+        // Unloadable placeholders stay in `cleaned` as prose and never reach
+        // `refs`, so the count only covers references that were recognised and
+        // still could not be sent.
+        let text = Self::text_with_omission_note(&cleaned, omitted);
+
+        if sources.is_empty() {
+            return ToolResultContent::Text(text);
+        }
+
+        let mut blocks = Vec::with_capacity(sources.len() + 1);
+        if !text.is_empty() {
+            blocks.push(ToolResultBlock::Text { text });
+        }
+        blocks.extend(
+            sources
+                .into_iter()
+                .map(|source| ToolResultBlock::Image { source }),
+        );
+        ToolResultContent::Blocks(blocks)
+    }
+
+    /// Turns image references into deliverable [`ImageSource`]s, returning how
+    /// many were rejected by the shared structural check.
+    fn deliverable_image_sources(refs: &[String]) -> (Vec<ImageSource>, usize) {
+        let mut sources = Vec::new();
+        let mut omitted = 0usize;
+        for reference in refs {
+            match crate::multimodal::split_base64_image_data_uri(
+                reference,
+                MAX_ENCODED_IMAGE_PAYLOAD_BYTES,
+            ) {
+                Ok((media_type, payload)) => sources.push(ImageSource {
+                    source_type: "base64".to_string(),
+                    media_type: media_type.to_ascii_lowercase(),
+                    data: payload.to_string(),
+                }),
+                Err(_) => omitted += 1,
+            }
+        }
+        (sources, omitted)
+    }
+
+    /// Sweeps residual raw base64 out of marker-cleaned prose and appends the
+    /// omission note when references were rejected.
+    fn text_with_omission_note(cleaned: &str, omitted: usize) -> String {
+        let swept = Self::sweep_residual_image_data(cleaned);
+        if omitted == 0 {
+            return swept.into_owned();
+        }
+        let note = Self::image_omission_note(omitted);
+        if swept.is_empty() {
+            note
+        } else {
+            format!("{swept}\n\n{note}")
+        }
+    }
+
+    /// Replaces every residual `data:<media type>;base64,<payload>` run in
+    /// `text` with [`TRUNCATED_DATA_NOTE`].
+    ///
+    /// `crate::multimodal::parse_image_markers` does not extract an
+    /// **unterminated** marker: with no closing `]` it copies the rest of the
+    /// string verbatim into the cleaned text and returns no reference at all. A
+    /// history truncated mid-marker would otherwise still put raw base64 in a
+    /// text position, which is what this adapter must not do.
+    ///
+    /// The scan starts at the `data:` prefix, never at a bare payload — a
+    /// payload whose header was already truncated away is indistinguishable from
+    /// prose and is left alone. A run ends at the first character outside the
+    /// base64 alphabet and its padding, except that it continues into the next
+    /// line when the lines are uniformly wide (see
+    /// [`Self::residual_payload_end`]). The whole run including its header is
+    /// replaced.
+    ///
+    /// A swept run is deliberately **not** added to the omission count: the
+    /// count means "references that were recognised and could not be sent", and
+    /// a truncated marker was never a reference. Keeping it out of the count is
+    /// what stops the sweep from double-reporting.
+    ///
+    /// Prose that legitimately quotes a data URI is rewritten too. That is
+    /// accepted: a documentation-style example in a tool result is far rarer
+    /// than a truncated screenshot, and the replacement says what happened.
+    ///
+    /// **What this does not cover**, stated so a reader does not credit it with
+    /// more than it does:
+    ///
+    /// - A header whose media type holds a non-ASCII or otherwise implausible
+    ///   character, such as `data:imagé/png;base64,…`. Such a header cannot come
+    ///   from this crate's preparation code, and loosening the header rule would
+    ///   let any `data:` in prose claim a `;base64,` further down the string.
+    /// - Assistant message text. This runs on the two tool-result arms and the
+    ///   user arm — the three arms built from `parse_image_markers` output.
+    ///   Assistant content is copied to the wire verbatim, so a data URI the
+    ///   model itself wrote is left as the model wrote it.
+    /// - The last, shorter line of a wrapped payload, and the tail of a run that
+    ///   is not uniformly wrapped. See [`Self::residual_payload_end`].
+    ///
+    /// The whole pass is linear in the length of `text`, and deliberately so:
+    /// tool output is untrusted, and an earlier version that restarted a search
+    /// for `;base64,` from every rejected `data:` cost minutes of CPU on a
+    /// one-megabyte input that repeats `data:`.
+    fn sweep_residual_image_data(text: &str) -> Cow<'_, str> {
+        const SCHEME: &str = "data:";
+
+        let mut out: Option<String> = None;
+        // Everything before `copied` is already in `out`; `scan` is where the
+        // next search for `data:` starts. They differ whenever a `data:` was
+        // examined and left alone.
+        let mut copied = 0usize;
+        let mut scan = 0usize;
+
+        while let Some(relative) = text[scan..].find(SCHEME) {
+            let start = scan + relative;
+            let header_start = start + SCHEME.len();
+            // Walk the header forward rather than searching ahead for
+            // `;base64,`: a real header holds only media-type and parameter
+            // characters, so it either ends at `;base64,` or this `data:` is
+            // prose. Walking keeps the pass linear.
+            let header_end =
+                header_start + Self::run_len(&text[header_start..], is_data_uri_header_char);
+            // `base64` may sit anywhere in the parameter list, which is what
+            // `crate::multimodal::split_base64_image_data_uri` accepts. Requiring
+            // it last would leave `data:image/png;base64;charset=x,<payload>`
+            // unswept while the same header is delivered as an image elsewhere.
+            let mut header_parts = text[header_start..header_end].split(';');
+            let plausible_header = header_parts
+                .next()
+                .is_some_and(|media_type| !media_type.is_empty())
+                && header_parts.any(|parameter| parameter == "base64")
+                && text[header_end..].starts_with(',');
+            if !plausible_header {
+                // Resume at the character after `data:`, not at `header_end`: the
+                // four letters of `data` are header-legal, so a second `data:`
+                // can start inside the header run just walked and jumping past it
+                // would let `data:data:image/png;base64,<payload>` through
+                // untouched. `data:` has no proper prefix that is also a suffix,
+                // so occurrences are at least five bytes apart and resuming here
+                // skips nothing.
+                //
+                // This stays linear. A header walk can only reach the `:` of the
+                // next `data:`, so the walks starting inside one another sum to
+                // at most the length of `text`.
+                scan = header_start;
+                continue;
+            }
+
+            let payload_start = header_end + 1;
+            let end = Self::residual_payload_end(text, payload_start);
+
+            let buffer = out.get_or_insert_with(|| String::with_capacity(text.len()));
+            buffer.push_str(&text[copied..start]);
+            buffer.push_str(TRUNCATED_DATA_NOTE);
+            copied = end;
+            scan = end;
+        }
+
+        match out {
+            Some(mut buffer) => {
+                buffer.push_str(&text[copied..]);
+                Cow::Owned(buffer)
+            }
+            None => Cow::Borrowed(text),
+        }
+    }
+
+    /// Byte length of the leading run of characters satisfying `allowed`.
+    fn run_len(text: &str, allowed: fn(char) -> bool) -> usize {
+        text.find(|ch: char| !allowed(ch)).unwrap_or(text.len())
+    }
+
+    /// End of a residual base64 run that starts at `payload_start`.
+    ///
+    /// A run normally ends at the first character outside the base64 alphabet.
+    /// It continues into the next line only when the text is **uniformly
+    /// line-wrapped**, which is what a wrapped payload looks like and what a list
+    /// of long tokens does not. `crate::multimodal::parse_image_markers` only
+    /// collapses a wrapped marker when it is terminated, so a payload that was
+    /// line-wrapped and then truncated arrives with its newlines intact, and
+    /// stopping at the first newline would leave every line but the first sitting
+    /// in a text position — tens of thousands of prose tokens, which is the
+    /// original bug.
+    ///
+    /// The continuation rule, in full. The gap between two segments must be
+    /// exactly one line terminator — `\n`, `\r\n` or `\r` — so a space, an
+    /// indent or a blank line ends the run. The width of the first continued
+    /// line becomes the wrap width, and it is only accepted as a wrap width when
+    /// either the payload's own first line is exactly that wide (a payload
+    /// pre-wrapped by an encoder and then prefixed with a marker) or the whole
+    /// line the header sits on is exactly that wide (text wrapped as a whole).
+    /// Every later line must then match the same width, and the width itself must
+    /// be at least [`WRAPPED_BASE64_WIDTH_MIN`].
+    ///
+    /// That is what keeps real tool output out of the run. A `sha256sum` listing
+    /// after a quoted data URI has 64-character lines, but the header's line is
+    /// not 64 characters wide and the payload's own first line is not either, so
+    /// the run stops at the first newline and the digests survive. An earlier
+    /// version continued across any whitespace into any segment of 64 or more
+    /// base64 characters, which both ate such listings and missed every wrap
+    /// width below 64.
+    ///
+    /// Two residues are accepted. The last line of a wrapped payload is shorter
+    /// than the wrap width, so it stays in the text — at most a wrap width of
+    /// base64 characters, sitting next to the note that says data was removed.
+    /// Absorbing it would mean deleting whatever short word happens to follow a
+    /// quoted data URI. And a payload wrapped with an indent on its continuation
+    /// lines is not rejoined.
+    fn residual_payload_end(text: &str, payload_start: usize) -> usize {
+        let first_end =
+            payload_start + Self::run_len(&text[payload_start..], is_base64_payload_char);
+        let first_len = first_end - payload_start;
+        let mut end = first_end;
+        let mut wrap_width: Option<usize> = None;
+
+        loop {
+            let rest = &text[end..];
+            let Some(gap) = Self::line_terminator_len(rest) else {
+                // The run ended at punctuation, at a space, or at the end of the
+                // string — not at a line break.
+                return end;
+            };
+            let segment = Self::run_len(&rest[gap..], is_base64_payload_char);
+            match wrap_width {
+                Some(width) if segment == width => {}
+                Some(_) => return end,
+                None => {
+                    // First continuation: decide whether this is wrapping at all.
+                    if segment < WRAPPED_BASE64_WIDTH_MIN
+                        || (segment != first_len
+                            && !Self::line_ends_at_with_width(text, end, segment))
+                    {
+                        return end;
+                    }
+                    wrap_width = Some(segment);
+                }
+            }
+            end += gap + segment;
+        }
+    }
+
+    /// Length of the single line terminator at the start of `text`, or `None`
+    /// when `text` does not start with exactly one.
+    fn line_terminator_len(text: &str) -> Option<usize> {
+        if let Some(rest) = text.strip_prefix('\r') {
+            return Some(if rest.starts_with('\n') { 2 } else { 1 });
+        }
+        if text.starts_with('\n') {
+            return Some(1);
+        }
+        None
+    }
+
+    /// True when the line ending at byte index `line_end` is exactly `width`
+    /// bytes long.
+    ///
+    /// Byte length, not character count: a line holding a multi-byte character
+    /// is simply not recognised as a wrapped line, which costs nothing but a
+    /// sweep this function was never able to justify.
+    fn line_ends_at_with_width(text: &str, line_end: usize, width: usize) -> bool {
+        if line_end < width {
+            return false;
+        }
+        let line_start = line_end - width;
+        if line_start > 0 && !matches!(text.as_bytes()[line_start - 1], b'\n' | b'\r') {
+            return false;
+        }
+        // `get` rejects a boundary that falls inside a multi-byte character.
+        text.get(line_start..line_end)
+            .is_some_and(|line| !line.contains(['\n', '\r']))
+    }
+
+    /// Top-level `image` and `text` blocks for a non-JSON tool message whose
+    /// `tool_use_id` could not be recovered unambiguously.
+    ///
+    /// A `tool_result` block structurally requires a `tool_use_id`, and
+    /// Anthropic rejects an id matching no `tool_use` in the preceding assistant
+    /// turn. With no unambiguous id there is no correct `tool_result` to emit, so
+    /// the choice is between top-level blocks that still deliver the image and
+    /// inventing an id that draws a 400 or attaches the result to the wrong
+    /// call. The image is delivered; only the correlation is lost, and it was
+    /// already lost upstream.
+    ///
+    /// A text block is emitted **after** the images even when the prose is
+    /// empty. `apply_cache_to_last_message` is a silent no-op on an `image`
+    /// block, so an image in last position would cost the request its
+    /// conversation cache breakpoint with nothing reporting it.
+    fn unpaired_tool_output_blocks(content: &str) -> Vec<NativeContentOut> {
+        let (cleaned, refs) = crate::multimodal::parse_image_markers(content);
+        let (sources, omitted) = Self::deliverable_image_sources(&refs);
+
+        let mut blocks: Vec<NativeContentOut> = Vec::with_capacity(sources.len() + 1);
+        blocks.extend(
+            sources
+                .into_iter()
+                .map(|source| NativeContentOut::Image { source }),
+        );
+
+        // With no references at all the sweep still has to run on the original
+        // string, for the same reason as in `tool_result_content`.
+        let base = if refs.is_empty() {
+            content
+        } else {
+            cleaned.as_str()
+        };
+        let mut text = Self::text_with_omission_note(base, omitted);
+        if text.is_empty() {
+            text = IMAGE_ONLY_TEXT_PLACEHOLDER.to_string();
+        }
+        blocks.push(NativeContentOut::Text {
+            text,
+            cache_control: None,
+        });
+        blocks
+    }
+
+    /// Splits a native tool-result envelope into its `tool_use_id` and result
+    /// text. `None` when the message is not such an envelope, which sends the
+    /// caller down the non-JSON carrier path with the raw message.
+    ///
+    /// The presence of a `tool_call_id` key is what identifies the envelope.
+    /// Requiring it means a tool that happens to return a JSON object with a
+    /// `content` field keeps all of its fields, while an envelope whose id is
+    /// unusable still gives up its payload instead of putting
+    /// `{"tool_call_id":null,…}` in front of the model as if the tool had
+    /// written it.
+    ///
+    /// A `content` value that is not a string is rendered as its JSON text
+    /// rather than treated as absent, in **both** branches. A tool that returns
+    /// a structured result meant that object to reach the model; dropping it
+    /// left an empty `tool_result` on the wire with nothing saying so, and on the
+    /// unusable-id branch it put the envelope scaffolding in front of the model
+    /// instead. With no `content` key at all there is no payload, and the caller
+    /// treats empty content as a message to skip.
+    fn parse_tool_result_envelope(content: &str) -> Option<ToolResultEnvelope> {
         let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
-        let tool_use_id = value
-            .get("tool_call_id")
-            .and_then(serde_json::Value::as_str)?
-            .to_string();
-        let result = value
+        let object = value.as_object()?;
+        let id_field = object.get("tool_call_id")?;
+        let result = object
             .get("content")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        Some(NativeMessage {
-            role: "user".to_string(),
-            content: vec![NativeContentOut::ToolResult {
-                tool_use_id,
-                content: result,
-                cache_control: None,
-            }],
+            .filter(|payload| !payload.is_null())
+            .map(|payload| match payload.as_str() {
+                Some(text) => text.to_string(),
+                None => payload.to_string(),
+            });
+        Some(ToolResultEnvelope {
+            tool_use_id: id_field.as_str().map(str::to_string),
+            content: result.unwrap_or_default(),
         })
     }
 
     fn convert_messages(messages: &[ChatMessage]) -> (Option<SystemPrompt>, Vec<NativeMessage>) {
         let mut system_text = None;
         let mut native_messages = Vec::new();
+        // The `tool_use` ids emitted by the most recent assistant message, and
+        // the subset a tool result has already answered. Together they let the
+        // non-JSON tool carrier below recover its `tool_use_id` when exactly one
+        // candidate is left. Both are cleared by any message that ends the
+        // tool-result run, so recovery only ever pairs a result with the
+        // assistant turn it actually follows.
+        let mut pending_tool_use_ids: Vec<String> = Vec::new();
+        let mut answered_tool_use_ids: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
 
         for (index, msg) in messages.iter().enumerate() {
             if ChatMessage::should_skip_internal_pruning_marker(messages, index) {
@@ -506,17 +961,36 @@ impl AnthropicModelProvider {
             }
             match msg.role.as_str() {
                 "system" => {
+                    // A system message is not emitted into the message list — it
+                    // becomes the request's `system` field, or is dropped — so it
+                    // cannot break the adjacency between a `tool_use` and its
+                    // `tool_result` on the wire, which is the adjacency the
+                    // candidate set exists to protect. It therefore does not end
+                    // a tool-result run. The same holds for the other messages
+                    // that produce no wire content: an empty assistant message
+                    // and a skipped pruning marker.
                     if system_text.is_none() {
                         system_text = Some(msg.content.clone());
                     }
                 }
                 "assistant" => {
                     if let Some(blocks) = Self::parse_assistant_tool_call_message(&msg.content) {
+                        pending_tool_use_ids = blocks
+                            .iter()
+                            .filter_map(|block| match block {
+                                NativeContentOut::ToolUse { id, .. } => Some(id.clone()),
+                                _ => None,
+                            })
+                            .collect();
+                        answered_tool_use_ids.clear();
                         native_messages.push(NativeMessage {
                             role: "assistant".to_string(),
                             content: blocks,
                         });
                     } else if !msg.content.trim().is_empty() {
+                        // An assistant message without tool calls ends the run.
+                        pending_tool_use_ids.clear();
+                        answered_tool_use_ids.clear();
                         native_messages.push(NativeMessage {
                             role: "assistant".to_string(),
                             content: vec![NativeContentOut::Text {
@@ -527,15 +1001,61 @@ impl AnthropicModelProvider {
                     }
                 }
                 "tool" => {
-                    let tool_msg = if let Some(tr) = Self::parse_tool_result_message(&msg.content) {
-                        tr
-                    } else if !msg.content.trim().is_empty() {
+                    let envelope = Self::parse_tool_result_envelope(&msg.content);
+                    // The tool's own output: the envelope's `content` when this
+                    // is an envelope at all, the raw message otherwise.
+                    let carrier = match &envelope {
+                        Some(parsed) => parsed.content.as_str(),
+                        None => msg.content.as_str(),
+                    };
+                    let tool_msg = if let Some(tool_use_id) = envelope
+                        .as_ref()
+                        .and_then(|parsed| parsed.tool_use_id.clone())
+                    {
+                        answered_tool_use_ids.insert(tool_use_id.clone());
                         NativeMessage {
                             role: "user".to_string(),
-                            content: vec![NativeContentOut::Text {
-                                text: msg.content.clone(),
+                            content: vec![NativeContentOut::ToolResult {
+                                tool_use_id,
+                                content: Self::tool_result_content(carrier),
                                 cache_control: None,
                             }],
+                        }
+                    } else if !carrier.trim().is_empty() {
+                        // Non-JSON tool carrier: `ChatMessage::tool` accepts any
+                        // string, and an envelope with a non-string
+                        // `tool_call_id` lands here too. Recover the id when the
+                        // assistant turn this message still follows left exactly
+                        // one call unanswered — that also stops
+                        // `backfill_orphaned_tool_uses` from putting a "tool
+                        // result missing" stub next to the real result.
+                        let recovered = {
+                            let mut unanswered = pending_tool_use_ids
+                                .iter()
+                                .filter(|id| !answered_tool_use_ids.contains(*id));
+                            match (unanswered.next(), unanswered.next()) {
+                                (Some(only), None) => Some(only.clone()),
+                                // Zero candidates, or two or more: the pairing is
+                                // ambiguous and an id is never invented.
+                                _ => None,
+                            }
+                        };
+                        match recovered {
+                            Some(tool_use_id) => {
+                                answered_tool_use_ids.insert(tool_use_id.clone());
+                                NativeMessage {
+                                    role: "user".to_string(),
+                                    content: vec![NativeContentOut::ToolResult {
+                                        tool_use_id,
+                                        content: Self::tool_result_content(carrier),
+                                        cache_control: None,
+                                    }],
+                                }
+                            }
+                            None => NativeMessage {
+                                role: "user".to_string(),
+                                content: Self::unpaired_tool_output_blocks(carrier),
+                            },
                         }
                     } else {
                         continue;
@@ -557,22 +1077,38 @@ impl AnthropicModelProvider {
                     }
                 }
                 _ => {
+                    // A user message ends the tool-result run, so a later
+                    // non-JSON tool message must not be paired with the assistant
+                    // turn before it.
+                    pending_tool_use_ids.clear();
+                    answered_tool_use_ids.clear();
+
                     // Parse image markers from user message content
                     let (text, image_refs) = crate::multimodal::parse_image_markers(&msg.content);
                     let mut content_blocks: Vec<NativeContentOut> = Vec::new();
+                    let mut omitted = 0usize;
 
                     // Add image content blocks for each image reference
                     for img_ref in &image_refs {
                         let (media_type, data) = if img_ref.starts_with("data:") {
-                            // Data URI format: data:image/jpeg;base64,/9j/4AAQ...
-                            if let Some(comma) = img_ref.find(',') {
-                                let header = &img_ref[5..comma];
-                                let mime =
-                                    header.split(';').next().unwrap_or("image/jpeg").to_string();
-                                let b64 = img_ref[comma + 1..].trim().to_string();
-                                (mime, b64)
-                            } else {
-                                continue;
+                            // Routed through the same shared structural check the
+                            // tool arms use, so every arm agrees on what a
+                            // deliverable image is. Stricter than the old
+                            // split-on-first-comma: a header without `;base64`, a
+                            // media type off the allowlist, a non-canonical
+                            // payload, or one over the per-image ceiling is now
+                            // skipped here instead of drawing a 400 from the API.
+                            match crate::multimodal::split_base64_image_data_uri(
+                                img_ref,
+                                MAX_ENCODED_IMAGE_PAYLOAD_BYTES,
+                            ) {
+                                Ok((mime, payload)) => {
+                                    (mime.to_ascii_lowercase(), payload.to_string())
+                                }
+                                Err(_) => {
+                                    omitted += 1;
+                                    continue;
+                                }
                             }
                         } else if std::path::Path::new(img_ref.trim()).exists() {
                             // Local file path
@@ -593,9 +1129,13 @@ impl AnthropicModelProvider {
                                     .to_string();
                                     (mime, b64)
                                 }
-                                Err(_) => continue,
+                                Err(_) => {
+                                    omitted += 1;
+                                    continue;
+                                }
                             }
                         } else {
+                            omitted += 1;
                             continue;
                         };
 
@@ -608,10 +1148,19 @@ impl AnthropicModelProvider {
                         });
                     }
 
-                    // Add text content block (skip empty text when images are present)
-                    if text.is_empty() && !image_refs.is_empty() {
+                    // Every reference that produced no block is counted, so a
+                    // message whose images were all rejected says so instead of
+                    // serializing as empty content.
+                    let text = Self::text_with_omission_note(&text, omitted);
+
+                    // The `[image]` placeholder is gated on a block having been
+                    // built, not on references existing: after the stricter
+                    // validation above a reference can be present and produce
+                    // nothing, and telling the model an image is attached with
+                    // none on the wire is worse than saying nothing.
+                    if text.is_empty() && !content_blocks.is_empty() {
                         content_blocks.push(NativeContentOut::Text {
-                            text: "[image]".to_string(),
+                            text: IMAGE_ONLY_TEXT_PLACEHOLDER.to_string(),
                             cache_control: None,
                         });
                     } else if !text.trim().is_empty() {
@@ -640,6 +1189,8 @@ impl AnthropicModelProvider {
             }
         }
 
+        Self::dedupe_tool_results_by_id(&mut native_messages);
+        Self::order_tool_results_first(&mut native_messages);
         Self::backfill_orphaned_tool_uses(&mut native_messages);
 
         // Always use Blocks format with cache_control for system prompts
@@ -652,6 +1203,166 @@ impl AnthropicModelProvider {
         });
 
         (system_prompt, native_messages)
+    }
+
+    /// Keep at most one `tool_result` per `tool_use_id` in each user-role
+    /// message, demoting any later duplicate to top-level blocks.
+    ///
+    /// Anthropic accepts one `tool_result` per `tool_use`; answering the same
+    /// call twice in one message is a 400. That shape is reachable: the non-JSON
+    /// carrier recovers the single outstanding id from the assistant turn it
+    /// follows, and a JSON envelope naming that same id later in the same run
+    /// merges into the same user message. A history restored with the same
+    /// envelope twice reaches it too.
+    ///
+    /// The first block wins, because it is the one adjacent to its `tool_use`.
+    /// The later one is not thrown away: its blocks move to the end of the
+    /// message as top-level content, so its output — including any image — still
+    /// reaches the model, with only the correlation lost. Runs before
+    /// [`Self::order_tool_results_first`], which then moves the surviving
+    /// `tool_result` blocks back to the front.
+    fn dedupe_tool_results_by_id(messages: &mut [NativeMessage]) {
+        for message in messages.iter_mut() {
+            if message.role != "user" {
+                continue;
+            }
+            // A message with fewer than two `tool_result` blocks cannot hold a
+            // duplicate, which is every message this converter normally builds.
+            // Checking the count first keeps the common path off the allocating
+            // path below: `convert_messages` runs over the whole replayed history
+            // on every turn.
+            let mut ids: Vec<&str> = Vec::new();
+            for block in &message.content {
+                if let NativeContentOut::ToolResult { tool_use_id, .. } = block {
+                    ids.push(tool_use_id.as_str());
+                }
+            }
+            if ids.len() < 2 {
+                continue;
+            }
+            // A handful of blocks per message, so a linear scan beats hashing and
+            // allocates nothing.
+            let duplicated = ids
+                .iter()
+                .enumerate()
+                .any(|(index, id)| ids[..index].contains(id));
+            if !duplicated {
+                continue;
+            }
+
+            let mut seen: Vec<String> = Vec::new();
+            let mut kept: Vec<NativeContentOut> = Vec::with_capacity(message.content.len());
+            let mut demoted: Vec<NativeContentOut> = Vec::new();
+            for block in std::mem::take(&mut message.content) {
+                match block {
+                    NativeContentOut::ToolResult {
+                        tool_use_id,
+                        content,
+                        cache_control,
+                    } => {
+                        if seen.contains(&tool_use_id) {
+                            demoted.extend(Self::demoted_tool_result_blocks(&tool_use_id, content));
+                        } else {
+                            seen.push(tool_use_id.clone());
+                            kept.push(NativeContentOut::ToolResult {
+                                tool_use_id,
+                                content,
+                                cache_control,
+                            });
+                        }
+                    }
+                    other => kept.push(other),
+                }
+            }
+            kept.extend(demoted);
+            message.content = kept;
+        }
+    }
+
+    /// Top-level blocks for a `tool_result` dropped because an earlier block in
+    /// the same message already answered its `tool_use`.
+    ///
+    /// Images come first and text last, for the same reason as
+    /// [`Self::unpaired_tool_output_blocks`]: `apply_cache_to_last_message` is a
+    /// silent no-op on an `image` block, so a message ending on one loses its
+    /// conversation cache breakpoint with nothing reporting it. An empty tool
+    /// result yields no blocks at all rather than a placeholder claiming an
+    /// image is attached.
+    ///
+    /// The text block names what it is, with the `tool_use_id` it came from. A
+    /// top-level block in a user message otherwise reads as something the user
+    /// typed, so the model would take a tool's second answer — or a bare
+    /// `[image]` — as a user attachment.
+    fn demoted_tool_result_blocks(
+        tool_use_id: &str,
+        content: ToolResultContent,
+    ) -> Vec<NativeContentOut> {
+        let mut blocks: Vec<NativeContentOut> = Vec::new();
+        let mut texts: Vec<String> = Vec::new();
+        match content {
+            ToolResultContent::Text(text) => texts.push(text),
+            ToolResultContent::Blocks(nested) => {
+                for block in nested {
+                    match block {
+                        ToolResultBlock::Text { text } => texts.push(text),
+                        ToolResultBlock::Image { source } => {
+                            blocks.push(NativeContentOut::Image { source });
+                        }
+                    }
+                }
+            }
+        }
+
+        let body = texts.join("\n");
+        let body = body.trim();
+        if body.is_empty() && blocks.is_empty() {
+            return blocks;
+        }
+        let label = format!("{DEMOTED_TOOL_RESULT_PREFIX} {tool_use_id}]");
+        let text = if body.is_empty() {
+            label
+        } else {
+            format!("{label}\n{body}")
+        };
+        blocks.push(NativeContentOut::Text {
+            text,
+            cache_control: None,
+        });
+        blocks
+    }
+
+    /// Move `tool_result` blocks to the front of every user-role message,
+    /// preserving relative order within each group.
+    ///
+    /// Anthropic returns a 400 when text precedes a `tool_result` in the same
+    /// user message. This converter merges consecutive tool messages into one
+    /// user message and merges a user message into a preceding user-role
+    /// message — and a converted tool result *is* a user-role message — so any
+    /// user-role text immediately before a tool result lands in the same message
+    /// with the text first.
+    ///
+    /// Runs before [`Self::backfill_orphaned_tool_uses`] so the stub inserter
+    /// sees final ordering; the backfill prepends its stubs, so the invariant
+    /// still holds afterwards. Assistant messages are untouched.
+    fn order_tool_results_first(messages: &mut [NativeMessage]) {
+        for message in messages.iter_mut() {
+            if message.role != "user" {
+                continue;
+            }
+            let out_of_order = message
+                .content
+                .iter()
+                .skip_while(|block| matches!(block, NativeContentOut::ToolResult { .. }))
+                .any(|block| matches!(block, NativeContentOut::ToolResult { .. }));
+            if !out_of_order {
+                continue;
+            }
+            let (tool_results, others): (Vec<NativeContentOut>, Vec<NativeContentOut>) =
+                std::mem::take(&mut message.content)
+                    .into_iter()
+                    .partition(|block| matches!(block, NativeContentOut::ToolResult { .. }));
+            message.content = tool_results.into_iter().chain(others).collect();
+        }
     }
 
     /// Pair any orphaned `tool_use` with a stub `tool_result` so interrupted
@@ -694,9 +1405,11 @@ impl AnthropicModelProvider {
                 .filter(|id| !answered.contains(id))
                 .map(|tool_use_id| NativeContentOut::ToolResult {
                     tool_use_id,
-                    content: "[tool result missing from history — the turn was \
-                              interrupted before this tool finished]"
-                        .to_string(),
+                    content: ToolResultContent::Text(
+                        "[tool result missing from history — the turn was \
+                         interrupted before this tool finished]"
+                            .to_string(),
+                    ),
                     cache_control: None,
                 })
                 .collect();
@@ -1720,6 +2433,114 @@ mod tests {
     use super::*;
     use crate::auth::anthropic_token::{AnthropicAuthKind, detect_auth_kind};
 
+    /// Canonical base64 for a 1x1 PNG: 68 characters, a multiple of four,
+    /// standard alphabet, no padding. Anything shorter that merely looks like a
+    /// PNG prefix is not canonical base64 and is rejected before it reaches the
+    /// wire.
+    const CANONICAL_PNG_B64: &str =
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA6fptVAAAACklEQVR4nGMAAQAABQAB";
+    /// A second canonical payload, so a test with two images can tell them
+    /// apart. Decodes to a JPEG SOI + APP0 header.
+    const CANONICAL_JPEG_B64: &str = "/9j/4AAQ";
+    /// The omission note for a single rejected reference, spelled out once so
+    /// the tests pin the exact prompt text the model reads.
+    const OMISSION_NOTE_ONE: &str =
+        "[1 image(s) omitted: unsupported or oversized image reference]";
+
+    /// Serializes converted messages and returns the first `tool_result` block
+    /// as JSON. Assertions go through the wire shape because that is where the
+    /// difference between a bare string and a block list lives.
+    fn first_tool_result_on_the_wire(native_msgs: &[NativeMessage]) -> serde_json::Value {
+        let wire = serde_json::to_value(native_msgs).expect("serialize native messages");
+        wire.as_array()
+            .expect("messages array")
+            .iter()
+            .flat_map(|message| message["content"].as_array().expect("content array").iter())
+            .find(|block| block["type"] == "tool_result")
+            .cloned()
+            .expect("a tool_result block")
+    }
+
+    /// Every `tool_result` block on the wire, in message then block order.
+    fn tool_results_on_the_wire(native_msgs: &[NativeMessage]) -> Vec<serde_json::Value> {
+        let wire = serde_json::to_value(native_msgs).expect("serialize native messages");
+        wire.as_array()
+            .expect("messages array")
+            .iter()
+            .flat_map(|message| message["content"].as_array().expect("content array").iter())
+            .filter(|block| block["type"] == "tool_result")
+            .cloned()
+            .collect()
+    }
+
+    /// The content blocks of the last user-role message on the wire. That is the
+    /// message tool results merge into, and the one
+    /// `apply_cache_to_last_message` writes its breakpoint to.
+    fn last_user_blocks(native_msgs: &[NativeMessage]) -> Vec<serde_json::Value> {
+        let wire = serde_json::to_value(native_msgs).expect("serialize native messages");
+        wire.as_array()
+            .expect("messages array")
+            .iter()
+            .rfind(|message| message["role"] == "user")
+            .expect("a user message")["content"]
+            .as_array()
+            .expect("content array")
+            .clone()
+    }
+
+    /// Index of the first block of `kind` in a block list.
+    fn block_position(blocks: &[serde_json::Value], kind: &str) -> Option<usize> {
+        blocks.iter().position(|block| block["type"] == kind)
+    }
+
+    /// Every string held by a `text` field anywhere in a JSON tree.
+    fn text_fields(value: &serde_json::Value, out: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, child) in map {
+                    if key == "text"
+                        && let Some(text) = child.as_str()
+                    {
+                        out.push(text.to_string());
+                    }
+                    text_fields(child, out);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    text_fields(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A history whose last message is a JSON tool-result envelope answering a
+    /// single `tool_use`, so the converted `tool_result` is well-formed and the
+    /// cache breakpoint lands on it.
+    fn history_with_tool_result(result_text: &str) -> Vec<ChatMessage> {
+        vec![
+            ChatMessage::system("You take screenshots."),
+            ChatMessage::user("take a screenshot"),
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": "",
+                    "tool_calls": [
+                        {"id": "toolu_screenshot", "name": "screenshot", "arguments": "{}"}
+                    ]
+                })
+                .to_string(),
+            ),
+            ChatMessage::tool(
+                serde_json::json!({
+                    "tool_call_id": "toolu_screenshot",
+                    "content": result_text,
+                })
+                .to_string(),
+            ),
+        ]
+    }
+
     fn fake_anthropic_sse() -> &'static [u8] {
         b"event: message_start\n\
 data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-5\",\"usage\":{\"input_tokens\":314,\"cache_read_input_tokens\":42,\"cache_creation_input_tokens\":100}}}\n\n\
@@ -2441,7 +3262,7 @@ data: {\"type\":\"message_stop\"}\n\n";
     fn native_content_tool_result_with_cache_control() {
         let content = NativeContentOut::ToolResult {
             tool_use_id: "tool_123".to_string(),
-            content: "Result data".to_string(),
+            content: ToolResultContent::Text("Result data".to_string()),
             cache_control: Some(CacheControl::ephemeral()),
         };
         let json = serde_json::to_string(&content).unwrap();
@@ -2564,7 +3385,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             role: "user".to_string(),
             content: vec![NativeContentOut::ToolResult {
                 tool_use_id: "tool_123".to_string(),
-                content: "Result".to_string(),
+                content: ToolResultContent::Text("Result".to_string()),
                 cache_control: None,
             }],
         }];
@@ -3144,9 +3965,12 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[test]
     fn convert_messages_with_only_image_marker() {
+        // Payload is the canonical 1x1 PNG. The 11-character `iVBORw0KGgo`
+        // this fixture used before is not a multiple of four, so it is not
+        // canonical base64 and Anthropic's decoder would reject it.
         let messages = vec![ChatMessage {
             role: "user".to_string(),
-            content: "[IMAGE:data:image/png;base64,iVBORw0KGgo]".to_string(),
+            content: format!("[IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}]"),
         }];
 
         let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
@@ -3471,6 +4295,1506 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert!(
             elapsed < Duration::from_secs(3),
             "request waited for the server response instead of using configured timeout: {elapsed:?}"
+        );
+    }
+
+    /// The issue's exact repro, through the mock server so the assertion is on
+    /// the body actually posted: a normalized image marker inside a native tool
+    /// result must reach Anthropic as an `image` block nested in the
+    /// `tool_result`, with the base64 only ever inside a `source`.
+    ///
+    /// Before the change this fails on the nested block: `tool_result.content`
+    /// was a `String`, so no image block could exist inside a tool result
+    /// anywhere. The "no base64 in a text position" half already passed on
+    /// `774fc36cd` — the payload was simply dropped — so the nested-block
+    /// assertion is the only discriminator here.
+    #[tokio::test]
+    async fn tool_result_image_delivered_as_nested_block() {
+        use axum::{Json, Router, routing::post};
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        let captured: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+        let captured_clone = captured.clone();
+
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let cap = captured_clone.clone();
+                async move {
+                    *cap.lock().expect("capture lock") = Some(body);
+                    Json(serde_json::json!({
+                        "id": "msg_test",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "I see a 1x1 pixel."}],
+                        "model": "claude-opus-4-6",
+                        "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 100, "output_tokens": 20}
+                    }))
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let server_handle = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+
+        let model_provider = AnthropicModelProvider {
+            alias: "test".to_string(),
+            credential: Some("test-key".to_string()),
+            base_url: format!("http://{addr}"),
+            max_tokens: 4096,
+            timeout_secs: 120,
+        };
+
+        let messages = history_with_tool_result(&format!(
+            "saved screenshot [IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}]"
+        ));
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "screenshot",
+                "description": "Take a screenshot",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        })];
+
+        let result = model_provider
+            .chat_with_tools(&messages, &tools, "claude-opus-4-6", Some(0.7))
+            .await;
+        assert!(result.is_ok(), "chat_with_tools failed: {:?}", result.err());
+
+        let body = captured
+            .lock()
+            .expect("capture lock")
+            .take()
+            .expect("no request captured");
+
+        let tool_result = body["messages"]
+            .as_array()
+            .expect("messages array")
+            .iter()
+            .flat_map(|message| message["content"].as_array().expect("content array").iter())
+            .find(|block| block["type"] == "tool_result")
+            .cloned()
+            .expect("a tool_result block in the posted body");
+
+        assert_eq!(tool_result["tool_use_id"], "toolu_screenshot");
+
+        let blocks = tool_result["content"]
+            .as_array()
+            .unwrap_or_else(|| panic!("tool_result.content must be a block list: {tool_result}"));
+        let image = blocks
+            .iter()
+            .find(|block| block["type"] == "image")
+            .unwrap_or_else(|| panic!("no image block nested in the tool_result: {tool_result}"));
+        assert_eq!(image["source"]["type"], "base64");
+        assert_eq!(image["source"]["media_type"], "image/png");
+        assert_eq!(image["source"]["data"], CANONICAL_PNG_B64);
+
+        assert!(
+            blocks.iter().any(|block| block["type"] == "text"
+                && block["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("saved screenshot"))),
+            "the prose around the image must survive: {tool_result}"
+        );
+
+        // The payload occurs exactly once in the whole posted body, and that
+        // occurrence is the `source.data` asserted above.
+        let posted = body.to_string();
+        assert_eq!(
+            posted.matches(CANONICAL_PNG_B64).count(),
+            1,
+            "base64 payload must appear exactly once, inside `source`: {posted}"
+        );
+        let mut texts = Vec::new();
+        text_fields(&body, &mut texts);
+        assert!(
+            texts.iter().all(|text| !text.contains(CANONICAL_PNG_B64)),
+            "base64 payload must never sit in a text position: {texts:?}"
+        );
+
+        // The rest of the request assembly still holds with block content:
+        // system prompt, tool specs, and the conversation cache breakpoint.
+        assert!(
+            body["system"].to_string().contains("You take screenshots."),
+            "system prompt missing: {}",
+            body["system"]
+        );
+        assert_eq!(
+            body["tools"]
+                .as_array()
+                .expect("tools array")
+                .first()
+                .expect("one tool")["name"],
+            "screenshot"
+        );
+        assert_eq!(
+            tool_result["cache_control"]["type"], "ephemeral",
+            "the posted request lost its cache breakpoint: {tool_result}"
+        );
+
+        server_handle.abort();
+    }
+
+    /// Two valid data URIs plus prose: both images are delivered, in reference
+    /// order, after the text block.
+    ///
+    /// Before the change both payloads were stripped and replaced by an
+    /// omission note, so there were zero image blocks.
+    #[test]
+    fn tool_result_with_several_images() {
+        let messages = history_with_tool_result(&format!(
+            "two shots [IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}] \
+             and [IMAGE:data:image/jpeg;base64,{CANONICAL_JPEG_B64}]"
+        ));
+
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let tool_result = first_tool_result_on_the_wire(&native_msgs);
+        let blocks = tool_result["content"]
+            .as_array()
+            .unwrap_or_else(|| panic!("expected a block list: {tool_result}"));
+
+        assert_eq!(blocks.len(), 3, "expected text + two images: {tool_result}");
+        assert_eq!(blocks[0]["type"], "text");
+        assert!(
+            blocks[0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("two shots")),
+            "prose must lead the block list: {tool_result}"
+        );
+        assert_eq!(blocks[1]["type"], "image");
+        assert_eq!(blocks[1]["source"]["media_type"], "image/png");
+        assert_eq!(blocks[1]["source"]["data"], CANONICAL_PNG_B64);
+        assert_eq!(blocks[2]["type"], "image");
+        assert_eq!(blocks[2]["source"]["media_type"], "image/jpeg");
+        assert_eq!(blocks[2]["source"]["data"], CANONICAL_JPEG_B64);
+
+        let wire = serde_json::to_string(&native_msgs).expect("serialize");
+        assert_eq!(wire.matches(CANONICAL_PNG_B64).count(), 1);
+        assert_eq!(wire.matches(CANONICAL_JPEG_B64).count(), 1);
+        assert!(
+            !wire.contains("image(s) omitted"),
+            "nothing was omitted, so no note belongs here: {wire}"
+        );
+    }
+
+    /// One deliverable PNG, one media type outside the allowlist, one
+    /// `http://` URL: one image block plus a note counting the other two.
+    ///
+    /// Before the change this fails twice over: there were zero image blocks,
+    /// and the note counted three, because `parse_image_markers` treats an
+    /// `http://` reference as loadable and the old code counted every
+    /// reference it saw.
+    #[test]
+    fn tool_result_mixes_valid_and_rejected_images() {
+        let svg_payload = "PHN2Zz48L3N2Zz4=";
+        let messages = history_with_tool_result(&format!(
+            "mixed bag [IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}] \
+             [IMAGE:data:image/svg+xml;base64,{svg_payload}] \
+             [IMAGE:http://example.com/remote.png]"
+        ));
+
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let tool_result = first_tool_result_on_the_wire(&native_msgs);
+        let blocks = tool_result["content"]
+            .as_array()
+            .unwrap_or_else(|| panic!("expected a block list: {tool_result}"));
+
+        let images: Vec<&serde_json::Value> = blocks
+            .iter()
+            .filter(|block| block["type"] == "image")
+            .collect();
+        assert_eq!(
+            images.len(),
+            1,
+            "only the PNG is deliverable: {tool_result}"
+        );
+        assert_eq!(images[0]["source"]["data"], CANONICAL_PNG_B64);
+
+        let text = blocks
+            .iter()
+            .find(|block| block["type"] == "text")
+            .and_then(|block| block["text"].as_str())
+            .unwrap_or_else(|| panic!("expected a text block: {tool_result}"));
+        assert!(text.contains("mixed bag"), "prose must survive: {text}");
+        assert!(
+            text.contains("[2 image(s) omitted: unsupported or oversized image reference]"),
+            "the two rejected references must be counted, and only those: {text}"
+        );
+
+        let wire = serde_json::to_string(&native_msgs).expect("serialize");
+        assert!(
+            !wire.contains(svg_payload),
+            "a rejected payload must not reach the wire: {wire}"
+        );
+        assert!(
+            !wire.contains("example.com"),
+            "a rejected remote reference must not reach the wire: {wire}"
+        );
+    }
+
+    /// An image with no prose around it produces an image block and no empty
+    /// text block.
+    ///
+    /// Before the change the content became the bare omission note.
+    #[test]
+    fn tool_result_image_only_has_no_empty_text_block() {
+        let messages = history_with_tool_result(&format!(
+            "[IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}]"
+        ));
+
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let tool_result = first_tool_result_on_the_wire(&native_msgs);
+        let blocks = tool_result["content"]
+            .as_array()
+            .unwrap_or_else(|| panic!("expected a block list: {tool_result}"));
+
+        assert_eq!(blocks.len(), 1, "expected the image alone: {tool_result}");
+        assert_eq!(blocks[0]["type"], "image");
+        assert_eq!(blocks[0]["source"]["data"], CANONICAL_PNG_B64);
+    }
+
+    /// Each rejection class, every case carrying a deliverable PNG alongside
+    /// the rejected reference.
+    ///
+    /// The valid sibling is what makes this fail before the change: without it
+    /// the old converter's "no image block plus an omission note" is already
+    /// true for all-rejected input, because it stripped every reference
+    /// regardless of validity. The exact note wording is asserted too — the old
+    /// wording claimed Anthropic tool results cannot carry images, which is
+    /// false.
+    #[test]
+    fn rejected_tool_result_data_uris_are_counted_not_sent() {
+        // Over the 10 MB encoded ceiling. Canonical base64 otherwise, so the
+        // size is the only thing wrong with it.
+        let oversized = "A".repeat(MAX_ENCODED_IMAGE_PAYLOAD_BYTES + 4);
+        let cases: Vec<(&str, String)> = vec![
+            (
+                "header does not declare ;base64",
+                format!("data:image/png,{CANONICAL_JPEG_B64}"),
+            ),
+            (
+                "media type outside the allowlist",
+                "data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=".to_string(),
+            ),
+            (
+                "payload length is not a multiple of four",
+                "data:image/gif;base64,R0lGODlhAQABAA".to_string(),
+            ),
+            (
+                "payload over the encoded ceiling",
+                format!("data:image/png;base64,{oversized}"),
+            ),
+        ];
+
+        for (label, rejected) in cases {
+            let messages = history_with_tool_result(&format!(
+                "prose [IMAGE:{rejected}] [IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}]"
+            ));
+
+            let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+            let tool_result = first_tool_result_on_the_wire(&native_msgs);
+            let blocks = tool_result["content"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{label}: expected a block list"));
+
+            let images: Vec<&serde_json::Value> = blocks
+                .iter()
+                .filter(|block| block["type"] == "image")
+                .collect();
+            assert_eq!(
+                images.len(),
+                1,
+                "{label}: only the valid sibling should become an image block"
+            );
+            assert_eq!(images[0]["source"]["data"], CANONICAL_PNG_B64, "{label}");
+
+            let text = blocks
+                .iter()
+                .find(|block| block["type"] == "text")
+                .and_then(|block| block["text"].as_str())
+                .unwrap_or_else(|| panic!("{label}: expected a text block"));
+            assert!(
+                text.contains(OMISSION_NOTE_ONE),
+                "{label}: expected the omission note, got {text}"
+            );
+
+            let wire = serde_json::to_string(&native_msgs).expect("serialize");
+            let rejected_payload = rejected
+                .rsplit(',')
+                .next()
+                .expect("data URI payload after the comma");
+            assert!(
+                !wire.contains(rejected_payload),
+                "{label}: the rejected payload must not reach the wire"
+            );
+        }
+    }
+
+    /// A tool result whose content is a block list still takes the conversation
+    /// cache breakpoint.
+    ///
+    /// The cache-control half alone already passes: `cache_control` is a
+    /// sibling of `content` and ignores its shape. The block-list half is what
+    /// fails before the change.
+    #[test]
+    fn tool_result_block_list_still_takes_cache_control() {
+        let messages = history_with_tool_result(&format!(
+            "shot [IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}]"
+        ));
+
+        let (_, mut native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        assert!(
+            AnthropicModelProvider::should_cache_conversation(&messages),
+            "this history must be long enough to be cached, or the test is vacuous"
+        );
+        AnthropicModelProvider::apply_cache_to_last_message(&mut native_msgs);
+
+        let tool_result = first_tool_result_on_the_wire(&native_msgs);
+        let blocks = tool_result["content"]
+            .as_array()
+            .unwrap_or_else(|| panic!("expected a block list: {tool_result}"));
+        assert!(
+            blocks.iter().any(|block| block["type"] == "image"),
+            "expected an image inside the tool result: {tool_result}"
+        );
+        assert_eq!(
+            tool_result["cache_control"]["type"], "ephemeral",
+            "block-list content must not cost the request its cache breakpoint: {tool_result}"
+        );
+    }
+
+    /// A non-JSON tool message that still sits inside the run following an
+    /// assistant turn with exactly one unanswered `tool_use` becomes a real
+    /// `tool_result` carrying that id, with the image nested inside it.
+    ///
+    /// Both halves fail before the change. The arm emitted top-level user text
+    /// with the payload stripped, and because the message held no `tool_result`,
+    /// `backfill_orphaned_tool_uses` inserted a "tool result missing" stub right
+    /// beside the real result.
+    #[test]
+    fn non_json_tool_carrier_recovers_tool_use_id() {
+        let messages = vec![
+            ChatMessage::user("take a screenshot"),
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": "",
+                    "tool_calls": [
+                        {"id": "toolu_only", "name": "screenshot", "arguments": "{}"}
+                    ]
+                })
+                .to_string(),
+            ),
+            ChatMessage::tool(format!(
+                "raw output [IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}]"
+            )),
+        ];
+
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+
+        let tool_results = tool_results_on_the_wire(&native_msgs);
+        assert_eq!(
+            tool_results.len(),
+            1,
+            "the recovered result must be the only one — a stub beside it is the \
+             bug this fixes: {tool_results:?}"
+        );
+        assert_eq!(tool_results[0]["tool_use_id"], "toolu_only");
+
+        let blocks = tool_results[0]["content"]
+            .as_array()
+            .unwrap_or_else(|| panic!("expected a block list: {}", tool_results[0]));
+        assert!(
+            blocks
+                .iter()
+                .any(|block| block["type"] == "image"
+                    && block["source"]["data"] == CANONICAL_PNG_B64),
+            "the image must be nested in the recovered tool_result: {}",
+            tool_results[0]
+        );
+        assert!(
+            blocks.iter().any(|block| block["type"] == "text"
+                && block["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("raw output"))),
+            "the surrounding prose must survive: {}",
+            tool_results[0]
+        );
+
+        let wire = serde_json::to_string(&native_msgs).expect("serialize");
+        assert!(
+            !wire.contains("tool result missing"),
+            "recovery must stop the bogus stub: {wire}"
+        );
+    }
+
+    /// With no single unanswered `tool_use` to pair against, the output degrades
+    /// to top-level blocks: the image is still delivered, a text block always
+    /// follows it, and no `tool_use_id` is invented.
+    ///
+    /// The image-block assertion is the discriminator. Before the change the
+    /// payload was stripped and replaced by a note, so nothing was delivered.
+    /// "No invented id" passes trivially today, because there was no recovery
+    /// mechanism at all.
+    #[test]
+    fn non_json_tool_carrier_ambiguous_uses_top_level_blocks() {
+        // Two unanswered calls, and a single unanswered call with no assistant
+        // turn at all: both are ambiguous and must degrade the same way.
+        let two_candidates = vec![
+            ChatMessage::user("do two things"),
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": "",
+                    "tool_calls": [
+                        {"id": "toolu_a", "name": "shell", "arguments": "{}"},
+                        {"id": "toolu_b", "name": "shell", "arguments": "{}"}
+                    ]
+                })
+                .to_string(),
+            ),
+            ChatMessage::tool(format!(
+                "raw output [IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}]"
+            )),
+        ];
+        let no_candidates = vec![
+            ChatMessage::user("look"),
+            ChatMessage::tool(format!(
+                "raw output [IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}]"
+            )),
+        ];
+
+        for (label, messages) in [
+            ("two unanswered tool_use blocks", two_candidates),
+            ("no assistant turn at all", no_candidates),
+        ] {
+            let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+            let blocks = last_user_blocks(&native_msgs);
+
+            let image_at = block_position(&blocks, "image")
+                .unwrap_or_else(|| panic!("{label}: expected a top-level image block: {blocks:?}"));
+            assert_eq!(
+                blocks[image_at]["source"]["data"], CANONICAL_PNG_B64,
+                "{label}: the payload must be delivered, not dropped"
+            );
+            assert!(
+                blocks[image_at + 1..]
+                    .iter()
+                    .any(|block| block["type"] == "text"),
+                "{label}: a text block must follow the images, or the request \
+                 silently loses its cache breakpoint: {blocks:?}"
+            );
+            assert_eq!(
+                blocks.last().expect("blocks present")["type"],
+                "text",
+                "{label}: the message must not end on an image block: {blocks:?}"
+            );
+
+            for tool_result in tool_results_on_the_wire(&native_msgs) {
+                let id = tool_result["tool_use_id"].as_str().unwrap_or_default();
+                assert!(
+                    ["toolu_a", "toolu_b"].contains(&id),
+                    "{label}: no tool_use_id may be invented, saw {id}"
+                );
+                assert!(
+                    !tool_result.to_string().contains("raw output"),
+                    "{label}: unpaired output must not be attached to a call: {tool_result}"
+                );
+            }
+        }
+    }
+
+    /// `assistant(tool A) -> user("cancel") -> non-JSON tool output`. The
+    /// intervening user message ends the tool-result run, so the output is not
+    /// paired with call A — but the image is still delivered as a top-level
+    /// block.
+    ///
+    /// The negative half passes trivially before the change (there was no
+    /// recovery to mispair with), so the delivery half is what makes this fail.
+    /// Its counterpart is `non_json_tool_carrier_recovers_tool_use_id`, which is
+    /// the same sequence without the intervening user message.
+    #[test]
+    fn non_json_tool_carrier_is_not_paired_across_a_user_turn() {
+        let messages = vec![
+            ChatMessage::user("go"),
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": "",
+                    "tool_calls": [{"id": "toolu_a", "name": "shell", "arguments": "{}"}]
+                })
+                .to_string(),
+            ),
+            ChatMessage::user("cancel"),
+            ChatMessage::tool(format!(
+                "raw output [IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}]"
+            )),
+        ];
+
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+
+        let tool_results = tool_results_on_the_wire(&native_msgs);
+        assert_eq!(
+            tool_results.len(),
+            1,
+            "only the orphan stub: {tool_results:?}"
+        );
+        assert_eq!(tool_results[0]["tool_use_id"], "toolu_a");
+        assert!(
+            tool_results[0]["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("tool result missing")),
+            "call A must stay unanswered, not be paired with stale output: {}",
+            tool_results[0]
+        );
+
+        let blocks = last_user_blocks(&native_msgs);
+        let image_at = block_position(&blocks, "image")
+            .unwrap_or_else(|| panic!("the image must still be delivered: {blocks:?}"));
+        assert_eq!(blocks[image_at]["source"]["data"], CANONICAL_PNG_B64);
+        assert_eq!(
+            blocks.last().expect("blocks present")["type"],
+            "text",
+            "the message must not end on an image block: {blocks:?}"
+        );
+    }
+
+    /// A tool-result envelope whose `tool_call_id` is `null` is not a shape the
+    /// current turn engine emits — every native call carries an id all the way
+    /// through `append_tool_round_to_history`. It is reachable from restored or
+    /// externally supplied history and from the public `ChatMessage::tool`
+    /// constructor, so the adapter must handle it: it takes the non-JSON carrier
+    /// arm and still delivers the image.
+    ///
+    /// Delivery is what fails before the change. The "no base64 in the envelope
+    /// text" half already held, because the payload was stripped.
+    ///
+    /// The envelope scaffolding must not reach the model either: an earlier
+    /// version of this arm passed the whole raw message down, so the recovered
+    /// `tool_result` read `{"tool_call_id":null,"content":"shot "}` as if the
+    /// tool had written that JSON itself.
+    #[test]
+    fn null_id_envelope_still_delivers_the_image() {
+        let envelope = serde_json::json!({
+            "tool_call_id": serde_json::Value::Null,
+            "content": format!("shot [IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}]"),
+        })
+        .to_string();
+        let messages = vec![
+            ChatMessage::user("screenshot please"),
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": "",
+                    "tool_calls": [
+                        {"id": "toolu_shot", "name": "screenshot", "arguments": "{}"}
+                    ]
+                })
+                .to_string(),
+            ),
+            ChatMessage::tool(envelope),
+        ];
+
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+
+        let tool_results = tool_results_on_the_wire(&native_msgs);
+        assert_eq!(tool_results.len(), 1, "{tool_results:?}");
+        assert_eq!(
+            tool_results[0]["tool_use_id"], "toolu_shot",
+            "the id is recovered from the assistant turn, not from the envelope"
+        );
+        let blocks = tool_results[0]["content"]
+            .as_array()
+            .unwrap_or_else(|| panic!("expected a block list: {}", tool_results[0]));
+        assert!(
+            blocks
+                .iter()
+                .any(|block| block["type"] == "image"
+                    && block["source"]["data"] == CANONICAL_PNG_B64),
+            "the image must be delivered: {}",
+            tool_results[0]
+        );
+
+        assert!(
+            blocks
+                .iter()
+                .any(|block| block["type"] == "text" && block["text"].as_str() == Some("shot")),
+            "the tool's own output must survive without the envelope around it: {}",
+            tool_results[0]
+        );
+
+        let wire = serde_json::to_value(&native_msgs).expect("serialize");
+        let mut texts = Vec::new();
+        text_fields(&wire, &mut texts);
+        assert!(
+            texts.iter().all(|text| !text.contains(CANONICAL_PNG_B64)),
+            "the payload must never sit in a text position: {texts:?}"
+        );
+        assert!(
+            texts.iter().all(|text| !text.contains("tool_call_id")),
+            "the envelope scaffolding must not be handed to the model as prose: {texts:?}"
+        );
+    }
+
+    /// One `tool_use` answered twice in the same merged user message collapses to
+    /// a single `tool_result`, and the loser's output is still delivered.
+    ///
+    /// The non-JSON carrier recovers the only outstanding id, marks it answered,
+    /// and a JSON envelope naming that same id then merges into the same user
+    /// message. Two `tool_result` blocks with one id is a 400 — the exact class of
+    /// failure `backfill_orphaned_tool_uses` exists to prevent — and id recovery
+    /// introduced it, so it is fixed here rather than in the recovery rule, which
+    /// cannot see a duplicate that arrives later.
+    #[test]
+    fn duplicate_tool_result_ids_are_collapsed_in_one_message() {
+        let messages = vec![
+            ChatMessage::user("go"),
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": "",
+                    "tool_calls": [{"id": "toolu_a", "name": "screenshot", "arguments": "{}"}]
+                })
+                .to_string(),
+            ),
+            // Non-JSON: recovery pairs this with toolu_a.
+            ChatMessage::tool(format!(
+                "raw output [IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}]"
+            )),
+            // An envelope for the same call, from restored or externally supplied
+            // history.
+            ChatMessage::tool(
+                serde_json::json!({"tool_call_id": "toolu_a", "content": "second answer"})
+                    .to_string(),
+            ),
+        ];
+
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+
+        let tool_results = tool_results_on_the_wire(&native_msgs);
+        assert_eq!(
+            tool_results.len(),
+            1,
+            "a tool_use may only be answered once per message: {tool_results:?}"
+        );
+        assert_eq!(tool_results[0]["tool_use_id"], "toolu_a");
+
+        let blocks = last_user_blocks(&native_msgs);
+        let wire = serde_json::to_string(&native_msgs).expect("serialize");
+        assert!(
+            wire.contains("raw output"),
+            "the first answer must stay in the tool_result: {wire}"
+        );
+        assert!(
+            wire.contains("second answer"),
+            "the demoted answer must still reach the model: {wire}"
+        );
+        assert!(
+            wire.contains("[duplicate result for tool call toolu_a]"),
+            "demoted output must say it is a tool's second answer, not user prose: {wire}"
+        );
+        assert_eq!(
+            blocks.last().expect("blocks present")["type"],
+            "text",
+            "the message must not end on an image block: {blocks:?}"
+        );
+    }
+
+    /// A `tool_use` id is still recovered across a system message.
+    ///
+    /// A system message is not emitted into the message list, so it cannot break
+    /// the `tool_use`-to-`tool_result` adjacency on the wire and does not end the
+    /// tool-result run. Pinned because a user message and a plain assistant
+    /// message both do end the run, and the difference is deliberate.
+    #[test]
+    fn system_message_does_not_end_the_tool_result_run() {
+        let messages = vec![
+            ChatMessage::user("go"),
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": "",
+                    "tool_calls": [{"id": "toolu_a", "name": "screenshot", "arguments": "{}"}]
+                })
+                .to_string(),
+            ),
+            ChatMessage::system("You take screenshots."),
+            ChatMessage::tool(format!(
+                "raw output [IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}]"
+            )),
+        ];
+
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+
+        let tool_results = tool_results_on_the_wire(&native_msgs);
+        assert_eq!(tool_results.len(), 1, "{tool_results:?}");
+        assert_eq!(
+            tool_results[0]["tool_use_id"], "toolu_a",
+            "an intervening system message must not block recovery"
+        );
+        let wire = serde_json::to_string(&native_msgs).expect("serialize");
+        assert!(
+            !wire.contains("tool result missing"),
+            "no stub may sit beside the real result: {wire}"
+        );
+    }
+
+    /// A line-wrapped unterminated marker leaves no base64 behind either, and
+    /// ordinary prose after a data URI survives.
+    ///
+    /// `parse_image_markers` only collapses a wrapped marker when it is
+    /// terminated, so a truncated wrapped payload arrives with its newlines
+    /// intact. Sweeping only to the first newline left every later line in a text
+    /// position — tens of thousands of prose tokens, which is the original bug.
+    #[test]
+    fn wrapped_unterminated_marker_leaves_no_base64_in_text() {
+        // Two lines, each a full canonical payload, with no closing bracket.
+        let wrapped =
+            format!("[IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}\n{CANONICAL_PNG_B64}");
+        let messages = history_with_tool_result(&format!("saved {wrapped}"));
+
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let wire = serde_json::to_string(&native_msgs).expect("serialize");
+        assert!(
+            !wire.contains(CANONICAL_PNG_B64),
+            "no wrapped line may survive on the wire: {wire}"
+        );
+        assert!(
+            wire.contains("[truncated inline data removed]"),
+            "the replacement literal must say what happened: {wire}"
+        );
+
+        // The continuation rule must not eat prose: a short word after the
+        // payload is not a wrapped line.
+        let with_prose = history_with_tool_result(&format!(
+            "[IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}\nthe screenshot was truncated"
+        ));
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&with_prose);
+        let wire = serde_json::to_string(&native_msgs).expect("serialize");
+        assert!(
+            wire.contains("the screenshot was truncated"),
+            "prose after a swept run must survive: {wire}"
+        );
+    }
+
+    /// The residual sweep makes one pass over its input, and says so by the
+    /// clock rather than by hanging.
+    ///
+    /// Tool output is untrusted. An earlier version restarted a search for
+    /// `;base64,` from every rejected `data:`, which is quadratic: this input took
+    /// tens of seconds of CPU inside `convert_messages`, on every turn for as long
+    /// as the message stayed in history.
+    ///
+    /// Two things are pinned deliberately. The repeat count is **odd**, so the
+    /// examined `data:` positions do not land on the real header by arithmetic
+    /// accident — with an even count they do, and the earlier version of this test
+    /// passed even while the sweep could be bypassed entirely. And the elapsed
+    /// time is asserted, so a quadratic regression names itself instead of
+    /// stalling the whole suite with no attribution. The bound is three orders of
+    /// magnitude above the measured cost (tens of milliseconds) and three orders
+    /// below the quadratic version, so a loaded CI machine cannot flake it.
+    #[test]
+    fn residual_sweep_stays_linear_on_repeated_data_prefixes() {
+        let mut text = "data:".repeat(100_001);
+        text.push_str("data:image/png;base64,AAAA");
+
+        let started = std::time::Instant::now();
+        let swept = AnthropicModelProvider::sweep_residual_image_data(&text);
+        let elapsed = started.elapsed();
+
+        assert!(
+            swept.ends_with(TRUNCATED_DATA_NOTE),
+            "the real run at the end must still be swept"
+        );
+        assert!(
+            !swept.contains(";base64,"),
+            "no header may survive the sweep"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "the sweep must stay linear; took {elapsed:?} on {} bytes",
+            text.len()
+        );
+    }
+
+    /// A `data:` that starts inside another `data:` header is still examined.
+    ///
+    /// The four letters of `data` are legal header characters and only the `:`
+    /// stops the header walk, so resuming the search at the end of a rejected
+    /// header jumped straight over the nested occurrence. That let
+    /// `data:data:image/png;base64,<payload>` through with the payload intact —
+    /// the one thing the sweep exists to prevent, defeated by five extra
+    /// characters of untrusted tool output.
+    #[test]
+    fn nested_data_prefix_does_not_bypass_the_sweep() {
+        for (label, text) in [
+            (
+                "nested scheme",
+                format!("data:data:image/png;base64,{CANONICAL_PNG_B64}"),
+            ),
+            (
+                "rejected header holding the real one",
+                format!("xdata:image/pngdata:image/png;base64,{CANONICAL_PNG_B64}"),
+            ),
+            (
+                "three deep",
+                format!("data:data:data:image/png;base64,{CANONICAL_PNG_B64}"),
+            ),
+        ] {
+            let swept = AnthropicModelProvider::sweep_residual_image_data(&text);
+            assert!(
+                !swept.contains(CANONICAL_PNG_B64),
+                "{label}: the payload must not survive: {swept}"
+            );
+            assert!(
+                swept.contains(TRUNCATED_DATA_NOTE),
+                "{label}: the replacement literal must say what happened: {swept}"
+            );
+        }
+    }
+
+    /// A truncated wrapped payload is swept at every wrap width, not only at 64
+    /// columns and wider.
+    ///
+    /// The rule keys on uniform line width, so it does not care what the width
+    /// is. An earlier version needed each continued line to hold at least 64
+    /// base64 characters, which left a payload wrapped at 40, 56, 60 or 63
+    /// columns almost entirely in a text position — the bug it was written to
+    /// fix. Ruby's `Base64.encode64` wraps at 60.
+    #[test]
+    fn wrapped_payload_is_swept_at_every_wrap_width() {
+        for width in [40usize, 56, 60, 63, 64, 76] {
+            // The whole marker text wrapped at `width`, the shape a producer that
+            // hard-wraps its output emits: every line is exactly `width` wide.
+            // `Z` appears in neither the marker prefix nor the replacement
+            // literal, so counting it counts payload characters only.
+            let mut raw = format!("[IMAGE:data:image/png;base64,{}", "Z".repeat(4_000));
+            let mut wrapped = String::new();
+            while raw.len() > width {
+                let line: String = raw.drain(..width).collect();
+                wrapped.push_str(&line);
+                wrapped.push('\n');
+            }
+            let tail_len = raw.len();
+            wrapped.push_str(&raw);
+
+            let swept = AnthropicModelProvider::sweep_residual_image_data(&wrapped);
+
+            // Only the last, shorter line may survive: it is not a wrap-width
+            // line, and absorbing it would mean deleting whatever short word
+            // follows a quoted data URI.
+            let left = swept.chars().filter(|ch| *ch == 'Z').count();
+            assert!(
+                left <= tail_len,
+                "width {width}: {left} base64 characters left in text, at most {tail_len} allowed: {swept}"
+            );
+            assert!(
+                swept.contains(TRUNCATED_DATA_NOTE),
+                "width {width}: the replacement literal must be present: {swept}"
+            );
+        }
+    }
+
+    /// Real tool output after a quoted data URI is not swallowed by the
+    /// continuation rule.
+    ///
+    /// A sha256 digest is exactly 64 characters of base64-alphabet text, so an
+    /// earlier rule that continued a run across any whitespace into any segment
+    /// of 64 or more such characters silently deleted digest listings, hex id
+    /// columns and PEM bodies that happened to follow a data URI. The
+    /// continuation now needs uniform line width, and none of these has it.
+    #[test]
+    fn output_after_a_quoted_data_uri_survives_the_sweep() {
+        let digest_a = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let digest_b = "d2a84f4b8b650937ec8f73cd8be2c74add5a911ba64df27458ed8229da804a26";
+        for (label, text, must_survive) in [
+            (
+                "sha256sum listing",
+                format!("data:image/png;base64,AAAA\n{digest_a}  a.png\n{digest_b}  b.png"),
+                vec![digest_a, digest_b, "a.png", "b.png"],
+            ),
+            (
+                "single digest then prose",
+                format!("icon: data:image/png;base64,AAAA\n{digest_a}\nDone."),
+                vec![digest_a, "Done."],
+            ),
+            (
+                "a long token after one space",
+                format!("data:image/png;base64,AAAA {digest_a}"),
+                vec![digest_a],
+            ),
+            (
+                "uniform id column",
+                format!("data:image/png;base64,AAAA\n{digest_a}\n{digest_b}\n{digest_a}\nsummary"),
+                vec![digest_a, digest_b, "summary"],
+            ),
+            (
+                // Equal-length lines, but four characters is not a wrap width.
+                "uniform column of short codes",
+                "data:image/png;base64,AAAA\nQ4XZ\nP7KM\nR2VB\ndone".to_string(),
+                vec!["Q4XZ", "P7KM", "R2VB", "done"],
+            ),
+        ] {
+            let swept = AnthropicModelProvider::sweep_residual_image_data(&text);
+            for expected in must_survive {
+                assert!(
+                    swept.contains(expected),
+                    "{label}: {expected} was real tool output and must survive: {swept}"
+                );
+            }
+            assert!(
+                swept.contains(TRUNCATED_DATA_NOTE),
+                "{label}: the data URI itself is still swept: {swept}"
+            );
+        }
+    }
+
+    /// The sweep's replacement literal does not claim an image was removed.
+    ///
+    /// The header rule accepts any media type, deliberately: any base64 blob in a
+    /// text position is the token blowup the sweep exists to stop. Saying "image"
+    /// would then be false for a JSON or text data URI — the same class of defect
+    /// as the old omission note that told the model Anthropic cannot carry images.
+    #[test]
+    fn sweep_note_does_not_claim_an_image_for_other_media_types() {
+        let swept = AnthropicModelProvider::sweep_residual_image_data(
+            "config blob: data:application/json;base64,eyJhIjoxfQ== (decode it)",
+        );
+
+        assert_eq!(
+            swept, "config blob: [truncated inline data removed] (decode it)",
+            "the note must not name a media type it did not see"
+        );
+    }
+
+    /// `;base64` is recognised anywhere in the header's parameter list.
+    ///
+    /// `crate::multimodal::split_base64_image_data_uri` accepts it in any
+    /// position, so a terminated `data:image/png;base64;charset=x,<payload>`
+    /// marker is delivered as an image. Requiring it last here left the same
+    /// header unswept when the marker was truncated, so the payload was billed as
+    /// prose.
+    #[test]
+    fn sweep_accepts_base64_before_other_header_parameters() {
+        let text = format!("data:image/png;base64;charset=utf-8,{CANONICAL_PNG_B64} tail");
+        let swept = AnthropicModelProvider::sweep_residual_image_data(&text);
+
+        assert!(
+            !swept.contains(CANONICAL_PNG_B64),
+            "the payload must not survive: {swept}"
+        );
+        assert!(swept.ends_with(" tail"), "prose must survive: {swept}");
+    }
+
+    /// A tool result whose `content` is structured JSON still reaches the model.
+    ///
+    /// Only a string `content` was read, so an envelope carrying an object or an
+    /// array emitted an empty `tool_result` with nothing on the wire saying the
+    /// output had been dropped — and on the unusable-id branch it handed the whole
+    /// envelope to the model as if the tool had written the scaffolding.
+    #[test]
+    fn envelope_with_structured_content_still_delivers_the_output() {
+        for (label, envelope) in [
+            (
+                "usable id",
+                serde_json::json!({"tool_call_id": "toolu_a", "content": {"rows": 2}}),
+            ),
+            (
+                "null id",
+                serde_json::json!({"tool_call_id": null, "content": {"rows": 2}}),
+            ),
+            (
+                "numeric id",
+                serde_json::json!({"tool_call_id": 7, "content": ["a", "b"]}),
+            ),
+        ] {
+            let messages = vec![
+                ChatMessage::user("go"),
+                ChatMessage::assistant(
+                    serde_json::json!({
+                        "content": "",
+                        "tool_calls": [{"id": "toolu_a", "name": "query", "arguments": "{}"}]
+                    })
+                    .to_string(),
+                ),
+                ChatMessage::tool(envelope.to_string()),
+            ];
+
+            let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+            let wire = serde_json::to_value(&native_msgs).expect("serialize");
+            let mut texts = Vec::new();
+            text_fields(&wire, &mut texts);
+            let flat = serde_json::to_string(&wire).expect("serialize");
+
+            assert!(
+                flat.contains("rows") || flat.contains(r#"\"a\""#),
+                "{label}: the tool's own output must reach the model: {flat}"
+            );
+            assert!(
+                texts.iter().all(|text| !text.contains("tool_call_id")),
+                "{label}: the envelope scaffolding must stay off the wire: {texts:?}"
+            );
+        }
+    }
+
+    /// An envelope with an unusable id and no `content` key is dropped, not
+    /// printed.
+    ///
+    /// There is no payload to keep, so the only alternative was handing
+    /// `{"tool_call_id":null}` to the model as the tool's output. The call is left
+    /// to `backfill_orphaned_tool_uses`, which says plainly that the result is
+    /// missing.
+    #[test]
+    fn envelope_with_no_content_and_no_usable_id_is_dropped() {
+        let messages = vec![
+            ChatMessage::user("go"),
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": "",
+                    "tool_calls": [{"id": "toolu_a", "name": "query", "arguments": "{}"}]
+                })
+                .to_string(),
+            ),
+            ChatMessage::tool(serde_json::json!({"tool_call_id": null}).to_string()),
+        ];
+
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let wire = serde_json::to_string(&native_msgs).expect("serialize");
+
+        assert!(
+            !wire.contains("tool_call_id"),
+            "the envelope scaffolding must not be handed to the model: {wire}"
+        );
+        assert!(
+            wire.contains("tool result missing"),
+            "the unanswered call must still be backfilled: {wire}"
+        );
+    }
+
+    /// A user-message reference that is neither a deliverable data URI nor a
+    /// readable local file produces no `image` block, is counted in the omission
+    /// note, and never makes the converter fetch anything.
+    ///
+    /// Pins the two branches the stricter validation left untested: a local path
+    /// that does not exist, and an `http` URL, which `parse_image_markers` returns
+    /// as a reference. Both are reported the same way the tool arms report them —
+    /// the converter does no network I/O, so an unfetched URL is simply not
+    /// deliverable from here.
+    #[test]
+    fn unloadable_user_message_references_are_counted_not_sent() {
+        for (label, reference) in [
+            ("missing local path", "/definitely/not/here.png"),
+            ("remote url", "http://example.com/a.png"),
+        ] {
+            let messages = vec![ChatMessage::user(format!("look at [IMAGE:{reference}]"))];
+
+            let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+            let blocks = last_user_blocks(&native_msgs);
+
+            assert!(
+                block_position(&blocks, "image").is_none(),
+                "{label}: nothing deliverable, so no image block: {blocks:?}"
+            );
+            let wire = serde_json::to_string(&native_msgs).expect("serialize");
+            assert!(
+                wire.contains(OMISSION_NOTE_ONE),
+                "{label}: the drop must be visible to the model: {wire}"
+            );
+            assert!(
+                !wire.contains("\"[image]\""),
+                "{label}: no placeholder may claim an image is attached: {wire}"
+            );
+        }
+    }
+
+    /// Every `tool_result` block precedes every other block in a merged user
+    /// message, and the orphan backfill still lands in front of them.
+    ///
+    /// Anthropic returns a 400 when text precedes a `tool_result` in the same
+    /// message, and this history produces exactly that on the unmodified branch:
+    /// the ambiguous non-JSON output becomes top-level blocks and the JSON
+    /// envelope that follows appends a `tool_result` after them.
+    ///
+    /// Two unanswered `tool_use` blocks make the recovery in step 4 ambiguous on
+    /// purpose. With a single call the id would be recovered, the top-level text
+    /// block would disappear, and the ordering assertion would be vacuous.
+    #[test]
+    fn tool_results_precede_other_blocks_in_a_merged_user_message() {
+        let messages = vec![
+            ChatMessage::user("do two things"),
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": "",
+                    "tool_calls": [
+                        {"id": "toolu_a", "name": "shell", "arguments": "{}"},
+                        {"id": "toolu_b", "name": "shell", "arguments": "{}"}
+                    ]
+                })
+                .to_string(),
+            ),
+            // Ambiguous: two candidates, so this stays top-level text + image.
+            ChatMessage::tool(format!(
+                "raw output [IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}]"
+            )),
+            // Answers A. B stays orphaned, so the backfill has work to do.
+            ChatMessage::tool(
+                serde_json::json!({"tool_call_id": "toolu_a", "content": "done"}).to_string(),
+            ),
+        ];
+
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let blocks = last_user_blocks(&native_msgs);
+
+        let last_tool_result = blocks
+            .iter()
+            .rposition(|block| block["type"] == "tool_result")
+            .unwrap_or_else(|| panic!("expected a tool_result: {blocks:?}"));
+        assert!(
+            blocks[..last_tool_result]
+                .iter()
+                .all(|block| block["type"] == "tool_result"),
+            "no block may precede a tool_result in a merged user message: {blocks:?}"
+        );
+
+        let ids: Vec<&str> = blocks[..=last_tool_result]
+            .iter()
+            .map(|block| block["tool_use_id"].as_str().unwrap_or_default())
+            .collect();
+        assert!(
+            ids.contains(&"toolu_a") && ids.contains(&"toolu_b"),
+            "the orphan backfill must still answer B: {blocks:?}"
+        );
+
+        // The ordering pass must not push the image into last position, where
+        // `apply_cache_to_last_message` silently attaches nothing.
+        assert_eq!(
+            blocks.last().expect("blocks present")["type"],
+            "text",
+            "the message must not end on an image block: {blocks:?}"
+        );
+        assert!(
+            blocks
+                .iter()
+                .any(|block| block["type"] == "image"
+                    && block["source"]["data"] == CANONICAL_PNG_B64),
+            "the image must still be delivered: {blocks:?}"
+        );
+    }
+
+    /// A marker with no closing `]` leaves raw base64 in a text position:
+    /// `parse_image_markers` copies the remainder verbatim into the cleaned text
+    /// and returns no reference, so the zero-reference early return passed it
+    /// straight through. Asserted on both a tool result and a user message,
+    /// because both consume the same parser.
+    ///
+    /// Fails before the change on both arms: the payload survives in a `text`
+    /// field and no replacement literal is written.
+    #[test]
+    fn unterminated_marker_leaves_no_base64_in_text() {
+        let unterminated = format!("[IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}");
+
+        let tool_messages = history_with_tool_result(&format!("saved {unterminated}"));
+        let user_messages = vec![ChatMessage::user(format!("look at {unterminated}"))];
+
+        for (label, messages) in [
+            ("tool result", tool_messages),
+            ("user message", user_messages),
+        ] {
+            let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+            // The whole serialized request, not just `text` fields: an
+            // image-free tool result carries its prose as a bare JSON string on
+            // `content`, which is a text position all the same.
+            let wire = serde_json::to_string(&native_msgs).expect("serialize");
+
+            assert!(
+                !wire.contains(CANONICAL_PNG_B64),
+                "{label}: raw base64 must not survive anywhere on the wire: {wire}"
+            );
+            assert!(
+                wire.contains("[truncated inline data removed]"),
+                "{label}: the replacement literal must say what happened: {wire}"
+            );
+            // A truncated marker was never a reference, so it is not counted.
+            assert!(
+                !wire.contains("image(s) omitted"),
+                "{label}: a swept run must not be double-reported as an omission: {wire}"
+            );
+        }
+    }
+
+    /// The user arm now runs its data URIs through the same structural check the
+    /// tool arms use. Each rejection class carries a deliverable PNG alongside
+    /// it, and the all-rejected case must not claim an image is attached.
+    ///
+    /// Nothing else exercises the user arm's validation: the tool-arm rejection
+    /// test asserts a note only the tool path wrote, and
+    /// `user_message_images_still_become_image_blocks` uses a payload both the
+    /// old split and the new check accept. Before the change the old code split
+    /// on the first comma and trusted whatever came out, so every rejected
+    /// reference below became an `image` block on the wire.
+    #[test]
+    fn rejected_user_message_data_uris_produce_no_image_block() {
+        let oversized = "A".repeat(MAX_ENCODED_IMAGE_PAYLOAD_BYTES + 4);
+        let cases: Vec<(&str, String)> = vec![
+            (
+                "header does not declare ;base64",
+                format!("data:image/png,{CANONICAL_JPEG_B64}"),
+            ),
+            (
+                "media type outside the allowlist",
+                "data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=".to_string(),
+            ),
+            (
+                "payload length is not a multiple of four",
+                "data:image/gif;base64,R0lGODlhAQABAA".to_string(),
+            ),
+            (
+                "payload over the encoded ceiling",
+                format!("data:image/png;base64,{oversized}"),
+            ),
+        ];
+
+        for (label, rejected) in cases {
+            let messages = vec![ChatMessage::user(format!(
+                "prose [IMAGE:{rejected}] [IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}]"
+            ))];
+
+            let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+            let blocks = last_user_blocks(&native_msgs);
+
+            let images: Vec<&serde_json::Value> = blocks
+                .iter()
+                .filter(|block| block["type"] == "image")
+                .collect();
+            assert_eq!(
+                images.len(),
+                1,
+                "{label}: only the valid sibling may become an image block: {blocks:?}"
+            );
+            assert_eq!(images[0]["source"]["data"], CANONICAL_PNG_B64, "{label}");
+
+            let text = blocks
+                .iter()
+                .find(|block| block["type"] == "text")
+                .and_then(|block| block["text"].as_str())
+                .unwrap_or_else(|| panic!("{label}: expected a text block: {blocks:?}"));
+            assert!(
+                text.contains(OMISSION_NOTE_ONE),
+                "{label}: the rejection must be visible to the model, got {text}"
+            );
+
+            let wire = serde_json::to_string(&native_msgs).expect("serialize");
+            let rejected_payload = rejected
+                .rsplit(',')
+                .next()
+                .expect("data URI payload after the comma");
+            assert!(
+                !wire.contains(rejected_payload),
+                "{label}: a rejected payload must not reach the wire"
+            );
+        }
+
+        // A user message whose only reference is rejected must not tell the
+        // model an image is attached with nothing on the wire.
+        let only_rejected = vec![ChatMessage::user(
+            "[IMAGE:data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=]",
+        )];
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&only_rejected);
+        let blocks = last_user_blocks(&native_msgs);
+
+        assert!(
+            block_position(&blocks, "image").is_none(),
+            "a rejected reference must not produce an image block: {blocks:?}"
+        );
+        assert!(
+            !blocks
+                .iter()
+                .any(|block| block["text"] == IMAGE_ONLY_TEXT_PLACEHOLDER),
+            "the bare `[image]` placeholder must be gated on a block being \
+             built, not on references existing: {blocks:?}"
+        );
+        assert!(
+            blocks.iter().any(|block| block["text"]
+                .as_str()
+                .is_some_and(|text| text.contains(OMISSION_NOTE_ONE))),
+            "an all-rejected user message must still say so: {blocks:?}"
+        );
+    }
+
+    /// The composition test: a real PNG on disk, run through multimodal
+    /// preparation and then through the converter, reaches the wire as a nested
+    /// `image` block. Every other test here starts from an already-normalized
+    /// data URI, which proves nothing about the join between the two halves, and
+    /// the existing preparation tests stop at "the data URI is inside the
+    /// tool-result JSON" without ever converting it.
+    ///
+    /// Fails before the change: preparation already produced the data URI, and
+    /// the converter then stripped it and wrote an omission note.
+    ///
+    /// The tool message has to be last. `latest_tool_result_indices` only
+    /// normalizes the trailing run of tool results; anywhere else the marker is
+    /// replaced with `[image removed from history]` and this test asserts
+    /// nothing.
+    #[tokio::test]
+    async fn prepared_local_image_reaches_the_wire_as_a_nested_block() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let image_path = temp.path().join("screenshot.png");
+        // A PNG signature is enough for MIME detection, and its 12-character
+        // base64 is canonical.
+        std::fs::write(
+            &image_path,
+            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+        )
+        .expect("write png");
+
+        let messages = vec![
+            ChatMessage::user("take a screenshot"),
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": "",
+                    "tool_calls": [
+                        {"id": "toolu_shot", "name": "screenshot", "arguments": "{}"}
+                    ]
+                })
+                .to_string(),
+            ),
+            ChatMessage::tool(
+                serde_json::json!({
+                    "tool_call_id": "toolu_shot",
+                    // Drive-letter paths are loadable references, so this works
+                    // on Windows as well as Unix.
+                    "content": format!("saved [IMAGE:{}]", image_path.display()),
+                })
+                .to_string(),
+            ),
+        ];
+
+        let prepared = crate::multimodal::prepare_messages_for_provider(
+            &messages,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+        )
+        .await
+        .expect("preparation should succeed for a local PNG");
+        assert!(
+            prepared.contains_images,
+            "preparation must have found the marker, or the rest asserts nothing"
+        );
+
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&prepared.messages);
+        let tool_result = first_tool_result_on_the_wire(&native_msgs);
+        assert_eq!(tool_result["tool_use_id"], "toolu_shot");
+
+        let blocks = tool_result["content"]
+            .as_array()
+            .unwrap_or_else(|| panic!("expected a block list: {tool_result}"));
+        let image = blocks
+            .iter()
+            .find(|block| block["type"] == "image")
+            .unwrap_or_else(|| panic!("no nested image block: {tool_result}"));
+        assert_eq!(image["source"]["type"], "base64");
+        assert_eq!(image["source"]["media_type"], "image/png");
+        let data = image["source"]["data"]
+            .as_str()
+            .expect("base64 payload string");
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .expect("payload must be decodable base64"),
+            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+            "the bytes written to disk must be the bytes on the wire"
+        );
+
+        let wire = serde_json::to_value(&native_msgs).expect("serialize");
+        let mut texts = Vec::new();
+        text_fields(&wire, &mut texts);
+        assert!(
+            texts.iter().all(|text| !text.contains(data)),
+            "the payload must never sit in a text position: {texts:?}"
+        );
+        assert!(
+            !wire.to_string().contains("image(s) omitted"),
+            "a prepared local image must not be reported as omitted: {wire}"
+        );
+        assert!(
+            !wire.to_string().contains("screenshot.png"),
+            "the raw local path must not leak onto the wire: {wire}"
+        );
+    }
+
+    /// Regression guard: ordinary user-message images take the user arm and
+    /// must still become real image blocks. This fix must not touch them. The
+    /// payload is canonical, which is why this pin survives the stricter
+    /// validation and also why it cannot demonstrate it.
+    #[test]
+    fn user_message_images_still_become_image_blocks() {
+        let messages = vec![ChatMessage::user(
+            "what is this [IMAGE:data:image/jpeg;base64,/9j/4AAQ]",
+        )];
+
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+
+        let has_image = native_msgs
+            .iter()
+            .flat_map(|m| &m.content)
+            .any(|block| matches!(block, NativeContentOut::Image { .. }));
+        assert!(has_image, "user-message images must still be delivered");
+    }
+
+    /// The wire-shape pin for the two-shape content: an image-free tool result
+    /// must still serialize `content` as a bare JSON string, byte-identically
+    /// to before nested blocks existed.
+    ///
+    /// This passes today by design; it is not a proof of the fix. It has to
+    /// assert on serialized JSON, because a value comparison against a Rust
+    /// string passes for any serde encoding — including a tagged one that would
+    /// put an object on the wire for every existing image-free tool result,
+    /// which is exactly the regression this test exists to catch.
+    #[test]
+    fn image_free_tool_result_serializes_as_a_bare_string() {
+        let tool_env = serde_json::json!({
+            "tool_call_id": "toolu_ls",
+            "content": "a.txt\nb.txt",
+        })
+        .to_string();
+        let messages = vec![ChatMessage::user("list"), ChatMessage::tool(tool_env)];
+
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+
+        let tool_result = first_tool_result_on_the_wire(&native_msgs);
+        assert!(
+            tool_result["content"].is_string(),
+            "content must be a bare JSON string, not an object or a list: {tool_result}"
+        );
+        assert_eq!(tool_result["content"], "a.txt\nb.txt");
+
+        let wire = serde_json::to_string(&native_msgs).expect("serialize");
+        assert!(
+            wire.contains(r#""content":"a.txt\nb.txt""#),
+            "the string shape must serialize untagged: {wire}"
+        );
+    }
+
+    /// Unloadable placeholders are prose, not payloads: they must survive
+    /// untouched and must not be counted as omitted images.
+    ///
+    /// This passes today by design; it guards against the new block logic
+    /// starting to count placeholders as omitted images.
+    #[test]
+    fn unloadable_image_placeholder_stays_literal_in_tool_result() {
+        let tool_env = serde_json::json!({
+            "tool_call_id": "toolu_doc",
+            "content": "see [IMAGE:<path>] for details",
+        })
+        .to_string();
+        let messages = vec![ChatMessage::user("doc"), ChatMessage::tool(tool_env)];
+
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+
+        let tool_result = first_tool_result_on_the_wire(&native_msgs);
+        assert_eq!(tool_result["content"], "see [IMAGE:<path>] for details");
+        assert!(
+            !tool_result.to_string().contains("image(s) omitted"),
+            "a placeholder is prose and must not be counted: {tool_result}"
         );
     }
 }
