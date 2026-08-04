@@ -120,10 +120,10 @@ use zeroclaw_memory::{self, Memory};
 use zeroclaw_providers::reliable::{scope_provider_fallback, take_last_provider_fallback};
 use zeroclaw_providers::{self, ChatMessage, ModelProvider, ProviderDispatch};
 use zeroclaw_runtime::agent::loop_::{
-    LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
-    ToolLoop, append_pinned_mcp_section, apply_text_tool_prompt_policy,
-    build_tool_instructions_for_names, is_model_switch_requested, run_tool_call_loop,
-    scope_session_key, scope_thread_id, scrub_credentials,
+    LoopKnobs, ProgressEvent, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess,
+    ResolvedRuntimeKnobs, StreamDelta, ToolLoop, append_pinned_mcp_section,
+    apply_text_tool_prompt_policy, build_tool_instructions_for_names, is_model_switch_requested,
+    run_tool_call_loop, scope_session_key, scope_thread_id, scrub_credentials,
 };
 use zeroclaw_runtime::approval::ApprovalManager;
 use zeroclaw_runtime::observability::traits::{ObserverEvent, ObserverMetric};
@@ -3134,6 +3134,27 @@ impl NoReplyKind {
             NoReplyKind::Failed => "⚠️",
         }
     }
+
+    /// Localization key for the short text notice sent alongside the
+    /// reaction. `Informational` has none — a reaction is the whole
+    /// response for messages that never needed one.
+    fn notice_key(self) -> Option<&'static str> {
+        match self {
+            NoReplyKind::Informational => None,
+            NoReplyKind::Refused => Some("channel-runtime-no-reply-refused"),
+            NoReplyKind::Failed => Some("channel-runtime-no-reply-failed"),
+        }
+    }
+}
+
+/// Build the outbound `SendMessage` for a no-reply notice: a threaded reply
+/// to the original inbound message carrying the localized notice text, with
+/// voice synthesis suppressed. Kept as a small, pure, dependency-free helper
+/// so tests can assert its exact shape (reply target, `thread_ts`,
+/// `in_reply_to`, subject, voice suppression) without standing up a live
+/// channel.
+fn build_no_reply_notice(msg: &ChannelMessage, notice_text: impl Into<String>) -> SendMessage {
+    SendMessage::reply_to(msg, notice_text).suppress_voice()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5069,16 +5090,6 @@ async fn process_channel_message_body(
     };
 
     if let AssistantChannelOutcome::NoReply { kind, reason } = reply_intent {
-        let history_response = AssistantChannelOutcome::NoReply {
-            kind,
-            reason: reason.clone(),
-        }
-        .history_marker();
-        append_sender_turn(
-            ctx.as_ref(),
-            &history_key,
-            ChatMessage::assistant(&history_response),
-        );
         reconcile_early_ack(
             ctx.as_ref(),
             &msg,
@@ -5105,6 +5116,61 @@ async fn process_channel_message_body(
                 );
             }
         }
+        // A refusal or failure deserves a short explanation, not just a
+        // reaction. The sender otherwise has no idea why nothing happened.
+        // Informational no-replies stay silent (reaction only, above), and
+        // the raw classifier reason is never surfaced verbatim.
+        let notice_outcome = if let Some(channel) = target_channel
+            .as_ref()
+            .filter(|channel| channel.supports_outbound_send())
+            && let Some(notice_key) = kind.notice_key()
+        {
+            let notice_text = zeroclaw_runtime::i18n::get_required_cli_string(notice_key);
+            let send_result = channel
+                .send(&build_no_reply_notice(&msg, notice_text.clone()))
+                .await;
+            Some((notice_text, send_result))
+        } else {
+            None
+        };
+        // The persisted history marker must reflect what actually reached the
+        // sender: a delivered notice claims delivery by carrying the exact
+        // delivered text, while a failed send or the no-notice case fall back
+        // to the reason-only form and never claim the notice went out. The
+        // raw classifier reason stays out of the visible marker either way;
+        // it is only logged (below, and structurally in the event that
+        // follows).
+        let history_response = match &notice_outcome {
+            Some((notice_text, Ok(()))) => notice_text.clone(),
+            Some((_, Err(e))) => {
+                let safe_error = zeroclaw_providers::sanitize_api_error(&e.to_string());
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "phase": "no_reply_notice",
+                            "error": safe_error,
+                        })),
+                    "failed to send no-reply notice"
+                );
+                AssistantChannelOutcome::NoReply {
+                    kind,
+                    reason: reason.clone(),
+                }
+                .history_marker()
+            }
+            None => AssistantChannelOutcome::NoReply {
+                kind,
+                reason: reason.clone(),
+            }
+            .history_marker(),
+        };
+        append_sender_turn(
+            ctx.as_ref(),
+            &history_key,
+            ChatMessage::assistant(&history_response),
+        );
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Skip)
@@ -5140,9 +5206,7 @@ async fn process_channel_message_body(
     let draft_message_id = if use_draft_streaming {
         if let Some(channel) = target_channel.as_ref() {
             match channel
-                .send_draft(
-                    &SendMessage::new("...", &msg.reply_target).in_thread(msg.thread_ts.clone()),
-                )
+                .send_draft(&SendMessage::reply_to(&msg, "..."))
                 .await
             {
                 Ok(id) => id,
@@ -5179,6 +5243,22 @@ async fn process_channel_message_body(
                 let mut accumulated = String::new();
                 while let Some(event) = rx.recv().await {
                     match event {
+                        StreamDelta::Lifecycle(event) => {
+                            if let Err(e) = channel
+                                .update_draft_lifecycle(&reply_target, &draft_id, event)
+                                .await
+                            {
+                                ::zeroclaw_log::record!(
+                                    DEBUG,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
+                                    )
+                                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                                    "Draft lifecycle update failed"
+                                );
+                            }
+                        }
                         StreamDelta::Status(text) => {
                             let visible = strip_think_tags_inline(&text);
                             if let Err(e) = channel
@@ -5223,6 +5303,17 @@ async fn process_channel_message_body(
     } else {
         None
     };
+
+    // Give draft-capable channels a stable lifecycle signal before model work
+    // begins. Channel implementations decide how to render or rate-limit it.
+    if let Some(tx) = delta_tx.as_ref() {
+        let _ = tx
+            .send(StreamDelta::Lifecycle(ProgressEvent::Received))
+            .await;
+        let _ = tx
+            .send(StreamDelta::Lifecycle(ProgressEvent::Planning))
+            .await;
+    }
 
     // Skip typing only for Partial mode — the draft message itself provides
     // visual feedback. MultiMessage and Off both keep typing active.
@@ -5558,6 +5649,14 @@ async fn process_channel_message_body(
         (llm_result, fb)
     })
     .await;
+
+    if matches!(llm_result, LlmExecutionResult::Completed(Ok(Ok(_))))
+        && let Some(tx) = delta_tx.as_ref()
+    {
+        let _ = tx
+            .send(StreamDelta::Lifecycle(ProgressEvent::FinalizingResponse))
+            .await;
+    }
 
     // Attribute the closing event to the final route and attach aggregate
     // usage. Explicit completion records the normal duration; the guard's
@@ -7258,6 +7357,24 @@ fn one_shot_channel_workspace_dir(config: &Config, channel_type: &str, alias: &s
     config.channel_workspace_dir(&format!("{channel_type}.{alias}"))
 }
 
+#[cfg(feature = "channel-slack")]
+fn slack_thread_context_max_messages_resolver(
+    config_arc: &Arc<RwLock<Config>>,
+    alias: &str,
+) -> Arc<dyn Fn() -> usize + Send + Sync> {
+    let cfg_arc = Arc::clone(config_arc);
+    let alias = alias.to_string();
+    Arc::new(move || {
+        cfg_arc
+            .read()
+            .channels
+            .slack
+            .get(&alias)
+            .map(zeroclaw_config::schema::SlackConfig::effective_thread_context_max_messages)
+            .unwrap_or(zeroclaw_config::schema::DEFAULT_SLACK_THREAD_CONTEXT_MAX_MESSAGES)
+    })
+}
+
 /// Returned by [`build_channel_by_id`] when no arm claims `channel_id`.
 ///
 /// One-off callers match on this sentinel instead of the error text so the
@@ -7384,6 +7501,8 @@ fn build_channel_by_id(
                 let alias = alias.clone();
                 Arc::new(move || cfg_arc.read().channel_external_peers("slack", &alias))
             };
+            let thread_context_max_messages_resolver =
+                slack_thread_context_max_messages_resolver(config_arc, &alias);
             let workspace_dir = one_shot_channel_workspace_dir(&config, "slack", &alias);
             let bot_token = sl.resolved_bot_token().with_context(|| {
                 format!(
@@ -7400,6 +7519,7 @@ fn build_channel_by_id(
                     alias,
                     peer_resolver,
                 )
+                .with_thread_context_max_messages_resolver(thread_context_max_messages_resolver)
                 .with_workspace_dir(workspace_dir)
                 .with_markdown_blocks(sl.use_markdown_blocks)
                 .with_transcription(config.transcription.clone())
@@ -8618,6 +8738,8 @@ fn collect_configured_channels(
             let alias = alias.clone();
             Arc::new(move || cfg_arc.read().channel_external_peers("slack", &alias))
         };
+        let thread_context_max_messages_resolver =
+            slack_thread_context_max_messages_resolver(config_arc, alias);
         let Some(bot_token) = sl.resolved_bot_token() else {
             ::zeroclaw_log::record!(
                 ERROR,
@@ -8641,6 +8763,7 @@ fn collect_configured_channels(
                         alias.clone(),
                         peer_resolver,
                     )
+                    .with_thread_context_max_messages_resolver(thread_context_max_messages_resolver)
                     .with_thread_replies(sl.thread_replies.unwrap_or(true))
                     .with_group_reply_policy(sl.mention_only, Vec::new())
                     .with_strict_mention_in_thread(sl.strict_mention_in_thread)
@@ -10047,6 +10170,24 @@ fn no_real_time_channels_message() -> &'static str {
     "No real-time channels configured. Run `zeroclaw quickstart` to set one up."
 }
 
+/// Display-ready `channel doctor` lines for every dangling
+/// `peer_groups.<name>.channel` reference.
+///
+/// The diagnostic is derived from `Config::collect_warnings()` (the single
+/// source of truth for the `peer_group_channel_dangling` class) rather than a
+/// second peer-group validator, so the channel-doctor surface stays in lockstep
+/// with the general doctor and gateway config API. Returns an empty vector when
+/// there are no dangling references. Kept separate from the health-check loop so
+/// it can also run on the early-return path where no real-time channel is active.
+fn peer_group_dangling_warning_lines(config: &Config) -> Vec<String> {
+    config
+        .collect_warnings()
+        .into_iter()
+        .filter(|w| w.code == "peer_group_channel_dangling")
+        .map(|w| format!("  ⚠️  peer group   {}", w.message))
+        .collect()
+}
+
 /// Run health checks for configured channels.
 pub async fn doctor_channels(config: Config) -> Result<()> {
     let config_arc = Arc::new(RwLock::new(config));
@@ -10105,12 +10246,31 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     }
 
     if channels.is_empty() {
+        // Surface dangling peer-group channel references even when no
+        // real-time channel is active — the general doctor and gateway API
+        // already expose this via `Config::collect_warnings()`, so the
+        // `channel doctor` path should report the same diagnostic.
+        let dangling = { peer_group_dangling_warning_lines(&config_arc.read()) };
+        if !dangling.is_empty() {
+            println!("🩺 ZeroClaw Channel Doctor");
+            println!();
+            for line in &dangling {
+                println!("{line}");
+            }
+            println!();
+        }
         println!("{}", no_real_time_channels_message());
         return Ok(());
     }
 
     println!("🩺 ZeroClaw Channel Doctor");
     println!();
+
+    // Report dangling peer-group channel references alongside health results,
+    // derived from the shared `Config::collect_warnings()` source of truth.
+    for line in peer_group_dangling_warning_lines(&config_arc.read()) {
+        println!("{line}");
+    }
 
     let mut healthy = 0_u32;
     let mut unhealthy = 0_u32;
@@ -11772,6 +11932,70 @@ mod tests {
         assert!(
             msg.contains("zeroclaw quickstart"),
             "expected `zeroclaw quickstart` reference, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn channel_doctor_surfaces_dangling_peer_group_channel_warning() {
+        // The dangling `peer_groups.<name>.channel` diagnostic belongs on the
+        // `zeroclaw channel doctor` path, not only the general doctor.
+        // `doctor_channels()` reaches the user through
+        // `peer_group_dangling_warning_lines`, which is derived from the shared
+        // `Config::collect_warnings()` source of truth (no second validator).
+        use zeroclaw_config::multi_agent::PeerGroupConfig;
+
+        let mut config = Config::default();
+        // A dangling reference: `telegram.typo` names no configured
+        // `[channels.telegram.typo]` block.
+        config.peer_groups.insert(
+            "ops".to_string(),
+            PeerGroupConfig {
+                channel: "telegram.typo".into(),
+                ..Default::default()
+            },
+        );
+
+        let lines = super::peer_group_dangling_warning_lines(&config);
+        assert_eq!(
+            lines.len(),
+            1,
+            "exactly one dangling peer-group warning expected: {lines:?}"
+        );
+        assert!(
+            lines[0].contains("peer group") && lines[0].contains("peer_groups.ops.channel"),
+            "warning line must name the offending peer group and path: {}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains("telegram.typo"),
+            "warning line must echo the dangling reference: {}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn channel_doctor_silent_when_no_dangling_peer_group_ref() {
+        // Control: a peer group whose channel resolves to a configured block
+        // must not produce a dangling warning on the channel-doctor path.
+        use zeroclaw_config::multi_agent::PeerGroupConfig;
+
+        let mut config = Config::default();
+        config.channels.telegram.insert(
+            "work".to_string(),
+            zeroclaw_config::schema::TelegramConfig::default(),
+        );
+        config.peer_groups.insert(
+            "ops".to_string(),
+            PeerGroupConfig {
+                channel: "telegram.work".into(),
+                ..Default::default()
+            },
+        );
+
+        let lines = super::peer_group_dangling_warning_lines(&config);
+        assert!(
+            lines.is_empty(),
+            "no dangling warning expected for a resolvable ref: {lines:?}"
         );
     }
 
@@ -13754,12 +13978,20 @@ api_key = "anthropic-key"
         send_calls: AtomicUsize,
     }
 
+    #[derive(Default)]
+    struct InputOnlyNoopChannel {
+        send_calls: AtomicUsize,
+    }
+
     struct DraftRecordingChannel {
         finalize_should_fail: bool,
         fallback_send_should_fail: bool,
         sent_messages: tokio::sync::Mutex<Vec<String>>,
         draft_messages: tokio::sync::Mutex<Vec<String>>,
+        progress_messages: tokio::sync::Mutex<Vec<String>>,
+        lifecycle_events: tokio::sync::Mutex<Vec<ProgressEvent>>,
         finalized_messages: tokio::sync::Mutex<Vec<String>>,
+        cancelled_drafts: tokio::sync::Mutex<Vec<String>>,
     }
 
     impl DraftRecordingChannel {
@@ -13769,7 +14001,10 @@ api_key = "anthropic-key"
                 fallback_send_should_fail,
                 sent_messages: tokio::sync::Mutex::new(Vec::new()),
                 draft_messages: tokio::sync::Mutex::new(Vec::new()),
+                progress_messages: tokio::sync::Mutex::new(Vec::new()),
+                lifecycle_events: tokio::sync::Mutex::new(Vec::new()),
                 finalized_messages: tokio::sync::Mutex::new(Vec::new()),
+                cancelled_drafts: tokio::sync::Mutex::new(Vec::new()),
             }
         }
     }
@@ -13939,6 +14174,17 @@ api_key = "anthropic-key"
         }
     }
 
+    impl ::zeroclaw_api::attribution::Attributable for InputOnlyNoopChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+        fn alias(&self) -> &str {
+            "test"
+        }
+    }
+
     impl ::zeroclaw_api::attribution::Attributable for DraftRecordingChannel {
         fn role(&self) -> ::zeroclaw_api::attribution::Role {
             ::zeroclaw_api::attribution::Role::Channel(
@@ -13966,6 +14212,29 @@ api_key = "anthropic-key"
             _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
         ) -> anyhow::Result<()> {
             Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for InputOnlyNoopChannel {
+        fn name(&self) -> &str {
+            "test-channel"
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            self.send_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn supports_outbound_send(&self) -> bool {
+            false
         }
     }
 
@@ -14005,6 +14274,26 @@ api_key = "anthropic-key"
             Ok(Some("draft-1".to_string()))
         }
 
+        async fn update_draft_progress(
+            &self,
+            _recipient: &str,
+            _message_id: &str,
+            text: &str,
+        ) -> anyhow::Result<()> {
+            self.progress_messages.lock().await.push(text.to_string());
+            Ok(())
+        }
+
+        async fn update_draft_lifecycle(
+            &self,
+            _recipient: &str,
+            _message_id: &str,
+            event: ProgressEvent,
+        ) -> anyhow::Result<()> {
+            self.lifecycle_events.lock().await.push(event);
+            Ok(())
+        }
+
         async fn finalize_draft(
             &self,
             recipient: &str,
@@ -14019,6 +14308,14 @@ api_key = "anthropic-key"
                 .lock()
                 .await
                 .push(format!("{recipient}:{message_id}:{text}"));
+            Ok(())
+        }
+
+        async fn cancel_draft(&self, recipient: &str, message_id: &str) -> anyhow::Result<()> {
+            self.cancelled_drafts
+                .lock()
+                .await
+                .push(format!("{recipient}:{message_id}"));
             Ok(())
         }
     }
@@ -14138,6 +14435,39 @@ api_key = "anthropic-key"
         hooks: Option<Arc<zeroclaw_runtime::hooks::HookRunner>>,
         observer: Arc<dyn Observer>,
     ) -> Arc<ChannelRuntimeContext> {
+        test_runtime_ctx_with_observer_and_tools(
+            channel,
+            model_provider,
+            prompt_config,
+            agent_cfg,
+            model_provider_ref,
+            hooks,
+            observer,
+            vec![],
+        )
+    }
+
+    /// `test_runtime_ctx_with_observer` plus a populated tool registry, so a
+    /// turn can actually execute a tool instead of resolving an unknown name.
+    #[allow(clippy::too_many_arguments)]
+    fn test_runtime_ctx_with_observer_and_tools(
+        channel: Arc<dyn Channel>,
+        model_provider: Arc<dyn ModelProvider>,
+        prompt_config: zeroclaw_config::schema::Config,
+        agent_cfg: zeroclaw_config::schema::AliasedAgentConfig,
+        model_provider_ref: &str,
+        hooks: Option<Arc<zeroclaw_runtime::hooks::HookRunner>>,
+        observer: Arc<dyn Observer>,
+        tools: Vec<Box<dyn Tool>>,
+    ) -> Arc<ChannelRuntimeContext> {
+        // Auto-approve the registered tools so the turn actually executes them
+        // instead of short-circuiting on a denial, which would skip the
+        // tool-phase lifecycle emissions entirely.
+        let risk_profile = zeroclaw_config::schema::RiskProfileConfig {
+            level: zeroclaw_config::autonomy::AutonomyLevel::Full,
+            auto_approve: tools.iter().map(|tool| tool.name().to_string()).collect(),
+            ..Default::default()
+        };
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
 
@@ -14156,7 +14486,7 @@ api_key = "anthropic-key"
                 ),
             ),
             tools_registry: Arc::new(
-                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(tools),
             ),
             observer,
             system_prompt: Arc::new("You are a helpful assistant.".to_string()),
@@ -14199,9 +14529,7 @@ api_key = "anthropic-key"
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
-            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::RiskProfileConfig::default(),
-            )),
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(&risk_profile)),
             activated_tools: None,
             cost_tracking: None,
             pacing: zeroclaw_config::schema::PacingConfig::default(),
@@ -14602,6 +14930,183 @@ api_key = "anthropic-key"
     }
 
     #[tokio::test]
+    async fn process_channel_message_emits_stable_lifecycle_progress() {
+        let channel_impl = Arc::new(DraftRecordingChannel::new(false, false));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(DummyModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        process_channel_message(
+            runtime_ctx,
+            message_sent_hook_test_message(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(
+            channel_impl.lifecycle_events.lock().await.as_slice(),
+            [
+                ProgressEvent::Received,
+                ProgressEvent::Planning,
+                ProgressEvent::WaitingOnModel,
+                ProgressEvent::FinalizingResponse,
+            ]
+        );
+        // Negative control for the cancellation/error regressions below: a
+        // successful turn finalizes and must never cancel its draft. Without
+        // this, a `cancel_draft` called unconditionally would make those two
+        // tests pass vacuously.
+        assert!(
+            channel_impl.cancelled_drafts.lock().await.is_empty(),
+            "a successful turn must not cancel its draft"
+        );
+        assert!(
+            !channel_impl.finalized_messages.lock().await.is_empty(),
+            "a successful turn must finalize its draft"
+        );
+    }
+
+    /// A turn that actually calls a tool must surface `RunningTool` and the
+    /// post-tool `Planning` hand-back at their real emitters, not only in the
+    /// enumeration and locale tables. Without a tool in the loop the six-state
+    /// contract is only half exercised.
+    #[tokio::test]
+    async fn process_channel_message_emits_running_tool_and_post_tool_planning() {
+        let channel_impl = Arc::new(DraftRecordingChannel::new(false, false));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let runtime_ctx = test_runtime_ctx_with_observer_and_tools(
+            channel,
+            Arc::new(ToolCallingModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+            Arc::new(NoopObserver),
+            vec![Box::new(MockPriceTool)],
+        );
+
+        process_channel_message(
+            runtime_ctx,
+            message_sent_hook_test_message(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        let events = channel_impl.lifecycle_events.lock().await.clone();
+        let progress = channel_impl.progress_messages.lock().await.clone();
+        let running_tool = events
+            .iter()
+            .position(|event| *event == ProgressEvent::RunningTool)
+            .unwrap_or_else(|| {
+                panic!(
+                    "a tool-calling turn must emit RunningTool, got lifecycle={events:?} progress={progress:?}"
+                )
+            });
+        assert!(
+            events[..running_tool].contains(&ProgressEvent::WaitingOnModel),
+            "the model wait must precede the tool run, got {events:?}"
+        );
+        assert!(
+            events[running_tool + 1..].contains(&ProgressEvent::Planning),
+            "the post-tool hand-back must re-enter Planning, got {events:?}"
+        );
+        assert_eq!(
+            events.last(),
+            Some(&ProgressEvent::FinalizingResponse),
+            "a completed turn must end on FinalizingResponse, got {events:?}"
+        );
+    }
+
+    /// Cancellation mid-turn must reach the channel's draft cancellation so the
+    /// Slack side can clear its turn-bound Assistant status, and must not
+    /// finalize a draft for a turn that never produced an answer.
+    #[tokio::test]
+    async fn process_channel_message_cancellation_cancels_the_draft() {
+        let token = CancellationToken::new();
+        let channel_impl = Arc::new(DraftRecordingChannel::new(false, false));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(CancelMidTurnModelProvider {
+                token: token.clone(),
+            }),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        process_channel_message(runtime_ctx, message_sent_hook_test_message(), token).await;
+
+        assert!(
+            !channel_impl.cancelled_drafts.lock().await.is_empty(),
+            "a cancelled turn must cancel its draft so terminal cleanup runs"
+        );
+        assert!(
+            channel_impl.finalized_messages.lock().await.is_empty(),
+            "a cancelled turn must not finalize a draft"
+        );
+        // A turn that never produced an answer must not claim it is finalizing
+        // one, and the states it did show must be the real pre-model ones.
+        let events = channel_impl.lifecycle_events.lock().await.clone();
+        assert!(
+            !events.contains(&ProgressEvent::FinalizingResponse),
+            "a cancelled turn must not emit FinalizingResponse, got {events:?}"
+        );
+        assert_eq!(
+            events.first(),
+            Some(&ProgressEvent::Received),
+            "the turn must still have announced receipt, got {events:?}"
+        );
+    }
+
+    /// A provider/turn error must also reach draft cancellation. This is the
+    /// error-path counterpart of the cancellation regression: both exits are
+    /// what clear a lifecycle state that was already shown to the user.
+    #[tokio::test]
+    async fn process_channel_message_turn_error_cancels_the_draft() {
+        let channel_impl = Arc::new(DraftRecordingChannel::new(false, false));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(FormatErrorModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        let mut msg = message_sent_hook_test_message();
+        msg.content = "trigger format error".to_string();
+
+        process_channel_message(runtime_ctx, msg, CancellationToken::new()).await;
+
+        assert!(
+            !channel_impl.cancelled_drafts.lock().await.is_empty(),
+            "a failed turn must cancel its draft so a shown lifecycle state is cleared"
+        );
+        let events = channel_impl.lifecycle_events.lock().await.clone();
+        assert!(
+            !events.contains(&ProgressEvent::FinalizingResponse),
+            "a failed turn must not emit FinalizingResponse, got {events:?}"
+        );
+        assert!(
+            events.contains(&ProgressEvent::WaitingOnModel),
+            "the failure happened at the provider, so the model wait must have been shown: {events:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn process_channel_message_fires_message_sent_hook_after_draft_fallback_send() {
         let channel_impl = Arc::new(DraftRecordingChannel::new(true, false));
         let channel: Arc<dyn Channel> = channel_impl.clone();
@@ -14727,6 +15232,60 @@ api_key = "anthropic-key"
         }
         fn alias(&self) -> &str {
             "NoReplyModelProvider"
+        }
+    }
+
+    struct NoReplyRefusedModelProvider;
+
+    #[async_trait::async_trait]
+    impl ModelProvider for NoReplyRefusedModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("NO_REPLY[REFUSE]: prompt injection attempt".to_string())
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for NoReplyRefusedModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "NoReplyRefusedModelProvider"
+        }
+    }
+
+    struct NoReplyFailedModelProvider;
+
+    #[async_trait::async_trait]
+    impl ModelProvider for NoReplyFailedModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("NO_REPLY[FAIL]: requested URL 404s".to_string())
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for NoReplyFailedModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "NoReplyFailedModelProvider"
         }
     }
 
@@ -19726,6 +20285,614 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             removed.iter().any(|r| r.2 == "\u{1F440}"),
             "the early eyes ack must be reconciled (removed) on the no_reply path, got {removed:?}"
+        );
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert!(
+            sent.is_empty(),
+            "informational no-reply must stay silent (reaction only), got {sent:?}"
+        );
+    }
+
+    // Pins the decline-notice behavior: a refused message still gets its 🚫
+    // reaction, but the sender also gets a short localized text notice so
+    // they know why nothing happened instead of just seeing an emoji.
+    #[tokio::test]
+    async fn process_channel_message_no_reply_refused_sends_notice() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            model_provider: Arc::new(NoReplyRefusedModelProvider),
+            model_provider_ref: Arc::new("test-provider".to_string()),
+            agent_alias: Arc::new("test-agent".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
+            memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+            ),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: Some(0.0),
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
+            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+            provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+                whatsapp: false,
+            },
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+            agent_transcription_provider: String::new(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: zeroclaw_config::schema::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+                Duration::ZERO,
+            )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
+            last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "noreply-refused-msg".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-noreply-refused".to_string(),
+                content: "do something disallowed".to_string(),
+                channel: "test-channel".into(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let added = channel_impl.reactions_added.lock().await;
+        assert!(
+            added.iter().any(|r| r.2 == "\u{1F6AB}"),
+            "the refused no-reply emoji must still be added, got {added:?}"
+        );
+
+        let expected_notice = channel_runtime_cli_string("channel-runtime-no-reply-refused");
+        let sent = channel_impl.sent_messages.lock().await;
+        assert!(
+            sent.iter()
+                .any(|s| s == &format!("chat-noreply-refused:{expected_notice}")),
+            "a refused no-reply must send the localized refusal notice, got {sent:?}"
+        );
+    }
+
+    // Pins the decline-notice behavior for the failure kind: same shape as
+    // the refused case, but with the "couldn't complete" wording and the
+    // ⚠️ reaction.
+    #[tokio::test]
+    async fn process_channel_message_no_reply_failed_sends_notice() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            model_provider: Arc::new(NoReplyFailedModelProvider),
+            model_provider_ref: Arc::new("test-provider".to_string()),
+            agent_alias: Arc::new("test-agent".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
+            memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+            ),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: Some(0.0),
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
+            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+            provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+                whatsapp: false,
+            },
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+            agent_transcription_provider: String::new(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: zeroclaw_config::schema::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+                Duration::ZERO,
+            )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
+            last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "noreply-failed-msg".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-noreply-failed".to_string(),
+                content: "fetch that broken link".to_string(),
+                channel: "test-channel".into(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let added = channel_impl.reactions_added.lock().await;
+        assert!(
+            added.iter().any(|r| r.2 == "\u{26A0}\u{FE0F}"),
+            "the failed no-reply emoji must still be added, got {added:?}"
+        );
+
+        let expected_notice = channel_runtime_cli_string("channel-runtime-no-reply-failed");
+        let sent = channel_impl.sent_messages.lock().await;
+        assert!(
+            sent.iter()
+                .any(|s| s == &format!("chat-noreply-failed:{expected_notice}")),
+            "a failed no-reply must send the localized failure notice, got {sent:?}"
+        );
+    }
+
+    // Pins that the decline notice is NOT gated on ack_reactions: with
+    // reactions disabled, no 🚫 reaction should be added, but the refused
+    // notice must still be sent so the sender isn't left with total silence.
+    #[tokio::test]
+    async fn process_channel_message_no_reply_notice_sent_when_reactions_disabled() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            model_provider: Arc::new(NoReplyRefusedModelProvider),
+            model_provider_ref: Arc::new("test-provider".to_string()),
+            agent_alias: Arc::new("test-agent".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
+            memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+            ),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: Some(0.0),
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
+            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+            provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+                whatsapp: false,
+            },
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+            agent_transcription_provider: String::new(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+            ack_reactions: false,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: zeroclaw_config::schema::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+                Duration::ZERO,
+            )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
+            last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "noreply-refused-msg".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-noreply-refused".to_string(),
+                content: "do something disallowed".to_string(),
+                channel: "test-channel".into(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let added = channel_impl.reactions_added.lock().await;
+        assert!(
+            !added.iter().any(|r| r.2 == "\u{1F6AB}"),
+            "no reaction should be added when ack_reactions is disabled, got {added:?}"
+        );
+        drop(added);
+
+        let expected_notice = channel_runtime_cli_string("channel-runtime-no-reply-refused");
+        let sent = channel_impl.sent_messages.lock().await;
+        assert!(
+            sent.iter()
+                .any(|s| s == &format!("chat-noreply-refused:{expected_notice}")),
+            "the refused no-reply notice must still be sent even with reactions disabled, got {sent:?}"
+        );
+    }
+
+    // Pins the shape of the notice SendMessage at the real orchestrator
+    // boundary: `build_no_reply_notice` is the exact function the outbound
+    // path calls, so asserting on its output here is equivalent to asserting
+    // on what actually gets sent, without needing a live channel.
+    #[test]
+    fn build_no_reply_notice_preserves_reply_target_thread_in_reply_to_subject_and_suppresses_voice()
+     {
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            id: "notice-src-msg".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "chat-notice-target".to_string(),
+            content: "do something disallowed".to_string(),
+            channel: "test-channel".into(),
+            channel_alias: None,
+            timestamp: 1,
+            thread_ts: Some("thread-42".to_string()),
+            interruption_scope_id: None,
+            attachments: vec![],
+            subject: Some("Weekly digest".to_string()),
+
+            ..Default::default()
+        };
+
+        let notice = build_no_reply_notice(&msg, "sorry, can't help with that");
+
+        assert_eq!(notice.recipient, "chat-notice-target");
+        assert_eq!(notice.content, "sorry, can't help with that");
+        assert_eq!(
+            notice.thread_ts,
+            Some("thread-42".to_string()),
+            "the notice must stay in the same thread as the inbound message"
+        );
+        assert_eq!(
+            notice.in_reply_to,
+            Some("notice-src-msg".to_string()),
+            "the notice must set in_reply_to to the inbound message id"
+        );
+        assert_eq!(
+            notice.subject,
+            Some("Re: Weekly digest".to_string()),
+            "the notice must preserve (and reply-prefix) the inbound subject"
+        );
+        assert!(
+            notice.suppress_voice,
+            "the no-reply notice must suppress voice synthesis"
+        );
+        assert!(!notice.force_voice);
+    }
+
+    // Pins the delivery-outcome-aware history marker: when the notice send
+    // succeeds, the persisted assistant turn must carry the exact delivered
+    // notice text, not the raw classifier reason. Inspects conversation
+    // history directly (not just the outbound recording) because that is
+    // what future turns and other surfaces actually read back.
+    #[tokio::test]
+    async fn process_channel_message_no_reply_refused_marker_reflects_delivered_notice() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(NoReplyRefusedModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            id: "noreply-refused-marker-msg".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "chat-noreply-refused-marker".to_string(),
+            content: "do something disallowed".to_string(),
+            channel: "test-channel".into(),
+            channel_alias: None,
+            timestamp: 1,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+            subject: None,
+
+            ..Default::default()
+        };
+        let history_key = conversation_history_key(&msg);
+
+        process_channel_message(runtime_ctx.clone(), msg, CancellationToken::new()).await;
+
+        let expected_notice = channel_runtime_cli_string("channel-runtime-no-reply-refused");
+        let histories = runtime_ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let turns = histories
+            .peek(history_key.as_str())
+            .expect("history should be stored for sender");
+        let marker = turns
+            .iter()
+            .rev()
+            .find(|t| t.role == "assistant")
+            .expect("a no-reply turn should append an assistant history marker");
+        assert_eq!(
+            marker.content, expected_notice,
+            "a delivered no-reply notice must be reflected verbatim in the persisted history marker, got: {}",
+            marker.content
+        );
+        assert!(
+            !marker.content.contains("prompt injection attempt"),
+            "the raw classifier reason must not leak into the visible history marker, got: {}",
+            marker.content
+        );
+    }
+
+    // Companion to the delivered-notice case above: when the notice send
+    // fails, the persisted history marker must NOT claim the notice was
+    // delivered. It must fall back to the reason-only no-reply form instead
+    // of silently recording success.
+    #[tokio::test]
+    async fn process_channel_message_no_reply_refused_marker_does_not_claim_delivery_on_send_failure()
+     {
+        let channel: Arc<dyn Channel> = Arc::new(FailingSendChannel::default());
+
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(NoReplyRefusedModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            id: "noreply-refused-failure-msg".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "chat-noreply-refused-failure".to_string(),
+            content: "do something disallowed".to_string(),
+            channel: "test-channel".into(),
+            channel_alias: None,
+            timestamp: 1,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+            subject: None,
+
+            ..Default::default()
+        };
+        let history_key = conversation_history_key(&msg);
+
+        process_channel_message(runtime_ctx.clone(), msg, CancellationToken::new()).await;
+
+        let expected_notice = channel_runtime_cli_string("channel-runtime-no-reply-refused");
+        let histories = runtime_ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let turns = histories
+            .peek(history_key.as_str())
+            .expect("history should be stored for sender");
+        let marker = turns
+            .iter()
+            .rev()
+            .find(|t| t.role == "assistant")
+            .expect(
+                "a no-reply turn should append an assistant history marker even when the notice send fails",
+            );
+        assert_ne!(
+            marker.content, expected_notice,
+            "a failed notice send must not be recorded in history as delivered, got: {}",
+            marker.content
+        );
+        assert!(
+            marker.content.starts_with("[No reply sent"),
+            "a failed notice send must fall back to the no-reply marker form, got: {}",
+            marker.content
+        );
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_no_reply_input_only_channel_does_not_claim_delivery() {
+        let channel_impl = Arc::new(InputOnlyNoopChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(NoReplyRefusedModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            id: "noreply-input-only-msg".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "input-only-source".to_string(),
+            content: "do something disallowed".to_string(),
+            channel: "test-channel".into(),
+            timestamp: 1,
+            ..Default::default()
+        };
+        let history_key = conversation_history_key(&msg);
+
+        process_channel_message(runtime_ctx.clone(), msg, CancellationToken::new()).await;
+
+        assert_eq!(
+            channel_impl.send_calls.load(Ordering::SeqCst),
+            0,
+            "the orchestrator must not call send on an input-only channel"
+        );
+        let expected_notice = channel_runtime_cli_string("channel-runtime-no-reply-refused");
+        let histories = runtime_ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let marker = histories
+            .peek(history_key.as_str())
+            .and_then(|turns| turns.iter().rev().find(|turn| turn.role == "assistant"))
+            .expect("an input-only no-reply turn should retain an internal history marker");
+        assert_ne!(
+            marker.content, expected_notice,
+            "an input-only channel must not record an undelivered notice as delivered"
+        );
+        assert!(
+            marker.content.starts_with("[No reply sent"),
+            "an input-only channel must retain the internal no-reply marker, got: {}",
+            marker.content
         );
     }
 
@@ -25560,6 +26727,31 @@ This is an example JSON object for profile settings."#;
 
         assert_eq!(resolved, config.agent_workspace_dir("alice"));
         assert_ne!(resolved, config.data_dir);
+    }
+
+    #[cfg(feature = "channel-slack")]
+    #[test]
+    fn slack_thread_context_resolver_tracks_live_alias_config() {
+        let mut config = Config::default();
+        config.channels.slack.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::SlackConfig {
+                thread_context_max_messages: Some(3),
+                ..Default::default()
+            },
+        );
+        let config_arc = Arc::new(RwLock::new(config));
+        let resolver = slack_thread_context_max_messages_resolver(&config_arc, "default");
+
+        assert_eq!(resolver(), 3);
+        config_arc
+            .write()
+            .channels
+            .slack
+            .get_mut("default")
+            .unwrap()
+            .thread_context_max_messages = Some(8);
+        assert_eq!(resolver(), 8);
     }
 
     // ── Query classification in channel message processing ─────────

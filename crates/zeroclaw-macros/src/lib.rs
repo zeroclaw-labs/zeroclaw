@@ -13,7 +13,7 @@ fn is_compound_type(ty: &syn::Type) -> bool {
     let Some(ident) = type_path.path.segments.last().map(|s| &s.ident) else {
         return false;
     };
-    ident == "Vec" || ident == "HashMap" || ident == "PathBuf"
+    ident == "Vec" || ident == "HashMap"
 }
 
 /// Check if any `#[serde(...)]` attribute on the field contains `skip`.

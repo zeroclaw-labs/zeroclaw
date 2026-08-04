@@ -1516,7 +1516,7 @@ fn build_curl_command(url: &str) -> Option<String> {
         return None;
     }
 
-    let escaped = url.replace('\'', r#"'\\''"#);
+    let escaped = url.replace('\'', r#"'"'"'"#);
     Some(format!("curl -s '{}'", escaped))
 }
 
@@ -3605,12 +3605,18 @@ Done."#;
         let calls = parse_glm_style_tool_calls(response);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "shell");
-        assert!(calls[0].1["command"].as_str().unwrap().contains("curl"));
-        assert!(
-            calls[0].1["command"]
-                .as_str()
-                .unwrap()
-                .contains("example.com")
+        assert_eq!(calls[0].1["command"], "curl -s 'https://example.com'");
+    }
+
+    #[test]
+    fn parse_glm_style_quotes_url_apostrophes_and_metacharacters() {
+        let calls =
+            parse_glm_style_tool_calls("browser_open/url>https://example.com/it's;still=one");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "shell");
+        assert_eq!(
+            calls[0].1["command"],
+            r#"curl -s 'https://example.com/it'"'"'s;still=one'"#
         );
     }
 

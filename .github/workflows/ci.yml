@@ -155,6 +155,8 @@ jobs:
         run: |
           bash scripts/ci/comment_hygiene_gate.test.sh
           bash scripts/ci/comment_hygiene_gate.sh
+      - name: act-local artifact compatibility tests
+        run: bash scripts/dev/act-local.test.sh
 
   windows-clippy-tools-changes:
     name: Detect Windows Clippy changes
@@ -416,6 +418,45 @@ jobs:
       - name: Run channel plugin component test
         if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
         run: cargo test --locked -p zeroclaw-plugins --features plugins-wasm-cranelift --test channel_plugin_e2e
+
+  msrv:
+    name: MSRV (declared floor)
+    needs: [fmt]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      # Read the floor from the manifest instead of hardcoding it, so this job
+      # cannot drift from `rust-version` the way the container pins did.
+      - name: Resolve declared MSRV
+        id: msrv
+        shell: bash
+        run: |
+          set -euo pipefail
+          msrv="$(sed -n 's/^rust-version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          if [[ ! "$msrv" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+            echo "::error::could not read [workspace.package] rust-version from Cargo.toml (got '${msrv}')"
+            exit 1
+          fi
+          echo "version=$msrv" >> "$GITHUB_OUTPUT"
+          echo "Declared MSRV: $msrv"
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Install system dependencies
+        run: bash scripts/ci/apt_install.sh libudev-dev
+      - name: Ensure web/dist placeholder exists
+        run: mkdir -p web/dist && touch web/dist/.gitkeep
+      # ci-all is the load-bearing one: the container variant that regressed
+      # compiles the widest feature set, and a default-features pass would not
+      # have caught it.
+      - name: Check at the declared MSRV
+        run: |
+          cargo check --locked --workspace --exclude zeroclaw-desktop --features ci-all
 
   check-32bit:
     name: Check (32-bit)
@@ -822,7 +863,7 @@ jobs:
   gate:
     name: CI Required Gate
     if: always()
-    needs: [fmt, repo-structure, lint, windows-clippy-tools-changes, windows-clippy-tools, build, check, check-plugin-backends, check-32bit, bench, test, parallel-runtime-test-changes, parallel-runtime-test, test-landlock, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary, web-permission-tests]
+    needs: [fmt, repo-structure, lint, windows-clippy-tools-changes, windows-clippy-tools, build, check, check-plugin-backends, msrv, check-32bit, bench, test, parallel-runtime-test-changes, parallel-runtime-test, test-landlock, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary, web-permission-tests]
     runs-on: ubuntu-latest
     steps:
       - name: Check results
