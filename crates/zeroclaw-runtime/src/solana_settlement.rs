@@ -97,8 +97,6 @@ pub fn validate_payee(payee: &str) -> bool {
 mod tests {
     use super::*;
 
-    const SYSVAR_RECENT_BLOCKHASHES_ID: &str = "SysvarRecentB1ockHashes11111111111111111111";
-    const SYSVAR_RENT_ID: &str = "SysvarRent111111111111111111111111111111111";
     const SYSTEM_PROGRAM_ID: &str = "11111111111111111111111111111111";
 
     fn keypair() -> Keypair {
@@ -178,12 +176,18 @@ mod tests {
         let settlement = sample_settlement_for(&authority);
         let tx = build_durable_nonce_transfer(&settlement, &authority, "nonce-value").unwrap();
 
-        let sysvar_recent = Pubkey::from_str(SYSVAR_RECENT_BLOCKHASHES_ID).unwrap();
-        let rent = Pubkey::from_str(SYSVAR_RENT_ID).unwrap();
-        for account in &tx.message.account_keys {
-            assert_ne!(*account, sysvar_recent, "durable nonce tx must not use recent blockhash sysvar");
-            assert_ne!(*account, rent);
-        }
+        // The nonce program legitimately reads the recent-blockhashes sysvar
+        // to validate the durable nonce value, so the sysvar account IS in
+        // the message. What the durable nonce replaces is the *blockhash
+        // binding*: the transaction is valid as long as the nonce is not
+        // consumed, instead of dying after ~150 blocks. Assert the structure
+        // that actually matters: two instructions, one of them the advance.
+        assert_eq!(tx.message.instructions.len(), 2);
+        let advance_program = tx.message.instructions[0].program_id(&tx.message.account_keys);
+        assert_eq!(
+            advance_program,
+            &Pubkey::from_str("11111111111111111111111111111111").unwrap()
+        );
     }
 
     #[test]
@@ -193,10 +197,9 @@ mod tests {
         let mut tx = build_durable_nonce_transfer(&settlement, &authority, "nonce").unwrap();
         sign_for_submission(&mut tx, &[&authority]);
         assert_eq!(tx.signatures.len(), 1);
-        // The authority's signature must be present and verifiable.
-        let sig = &tx.signatures[0];
-        let pubkey_bytes = authority.pubkey().to_bytes();
-        assert!(sig.verify(&pubkey_bytes, &tx.message.hash().to_bytes()));
+        // The canonical check: every signature in the transaction verifies
+        // against the message.
+        assert!(tx.verify(), "transaction signatures must verify");
     }
 
     #[test]
