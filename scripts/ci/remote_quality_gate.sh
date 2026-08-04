@@ -51,14 +51,21 @@ have="\$(rustc --version | awk '{print \$2}')"
 echo "--- fmt ---"
 cargo fmt --all -- --check
 
+# `zeroclaw-desktop` is excluded the way every upstream gate excludes it
+# (rust_quality_gate.sh, .githooks/pre-push): it pulls tao -> dbus ->
+# libdbus-sys, which needs the dbus-1 system library. That is a desktop GUI
+# dependency with no bearing on the daemon this fork ships, and requiring it
+# would mean installing a display stack on a headless build box.
 echo "--- clippy ---"
-cargo clippy --all-targets --features "$FEATURES" -- -D warnings
+cargo clippy --workspace --exclude zeroclaw-desktop --all-targets \
+  --features "$FEATURES" -- -D warnings
 
 # Serial: several tests in this workspace share global logging state and flake
 # under the parallel runner, which produces failures that have nothing to do
 # with the change being pushed.
 echo "--- tests (serial) ---"
-cargo test --workspace --features "$FEATURES" -- --test-threads=1
+cargo test --locked --workspace --exclude zeroclaw-desktop \
+  --features "$FEATURES" -- --test-threads=1
 REMOTE
 
 log "quality gate passed on $HOST"

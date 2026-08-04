@@ -86,15 +86,24 @@ jobs:
           zig version
 
       - name: Format and lint
+        # `zeroclaw-desktop` is excluded the way every upstream gate excludes
+        # it: it pulls tao -> dbus -> libdbus-sys, which needs the dbus-1
+        # system library. That is a GUI dependency with no bearing on the
+        # daemon this fork ships, and requiring it would mean installing a
+        # display stack on a headless build box.
         run: |
           export PATH="$HOME/.cargo/bin:/usr/local/bin:$PATH"
           cargo fmt --all -- --check
-          cargo clippy --all-targets --features "$FEATURES" -- -D warnings
+          cargo clippy --workspace --exclude zeroclaw-desktop --all-targets \
+            --features "$FEATURES" -- -D warnings
 
       - name: Test
+        # Serial: several tests share global logging state and flake under the
+        # parallel runner, producing failures unrelated to the change.
         run: |
           export PATH="$HOME/.cargo/bin:/usr/local/bin:$PATH"
-          cargo test --workspace --features "$FEATURES"
+          cargo test --locked --workspace --exclude zeroclaw-desktop \
+            --features "$FEATURES" -- --test-threads=1
 
       - name: Cross-build for the production host
         run: |
