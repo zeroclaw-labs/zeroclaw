@@ -5854,8 +5854,9 @@ mod tests {
     fn effective_content_preserves_unclosed_think_tag() {
         // An unclosed literal `<think>` tag must NOT discard the rest of the
         // response. The old `strip_think_tags()` helper saw no closing
-        // ` closing ` and dropped the trailing tail ("Visible  think"
-        // → "Visible"). The new path returns the input unchanged.
+        // `</think>` and dropped the trailing tail, collapsing
+        // "Visible <think>hidden tail" to "Visible". The new path returns
+        // the input unchanged.
         let json = r#"{"choices":[{"message":{"content":"Visible <think>hidden tail"}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         let msg = &resp.choices[0].message;
@@ -5866,8 +5867,10 @@ mod tests {
     fn effective_content_preserves_multiple_think_blocks() {
         // Multiple literal `<think>` blocks in `content` survive the removal
         // intact. The old `strip_think_tags()` helper would have collapsed
-        // the visible text to "Answer A  and B  done", losing the
-        // inter-block separators and the tag delimiters themselves.
+        // the visible text to "Answer A  and B  done" — the double spaces
+        // mark where `<think>hidden 1</think>` and `<think>hidden 2</think>`
+        // used to be — losing the inter-block separators and the tag
+        // delimiters themselves.
         let json = r#"{"choices":[{"message":{"content":"Answer A <think>hidden 1</think> and B <think>hidden 2</think> done"}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         let msg = &resp.choices[0].message;
