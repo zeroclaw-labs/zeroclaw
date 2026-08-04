@@ -889,27 +889,30 @@ fn fold_providers_globals_into_models(
         return None;
     }
 
+    // `source_key` is `Some(raw)` only when this fold introduces a *new*
+    // producer of the target slot that `alias_provider_models` could not
+    // already know about: an explicit `default_provider` string, or the
+    // synthesized `openrouter` fallback when no models exist at all. When
+    // `default_provider` is absent and the fold instead reuses the first
+    // already-materialized alias family (`aliased_models.keys().next()`),
+    // that family's raw source(s) are already registered in `provenance` —
+    // re-inserting the canonical family name here would count the same
+    // source twice and falsely mark the slot ambiguous.
     let (target_type, target_alias, colon_url, normalized_extras, source_key) =
         match g_default_provider.as_ref().and_then(toml::Value::as_str) {
             Some(s) => {
                 let (raw_type, url) = split_colon_url_provider(s);
                 let (canonical, alias, extras) = normalize_provider_type(&raw_type, "default");
-                (canonical, alias, url, extras, raw_type)
+                (canonical, alias, url, extras, Some(raw_type))
             }
             None => match aliased_models.keys().next() {
-                Some(k) => (
-                    k.clone(),
-                    "default".to_string(),
-                    None,
-                    Vec::new(),
-                    k.clone(),
-                ),
+                Some(k) => (k.clone(), "default".to_string(), None, Vec::new(), None),
                 None => (
                     "openrouter".to_string(),
                     "default".to_string(),
                     None,
                     Vec::new(),
-                    "openrouter".to_string(),
+                    Some("openrouter".to_string()),
                 ),
             },
         };
@@ -974,7 +977,7 @@ fn fold_providers_globals_into_models(
             "[providers] globals folded onto model_providers.."
         );
     }
-    Some(source_key)
+    source_key
 }
 
 /// Pull `prices` (a per-model HashMap) out of a V2 `[cost]` block.
