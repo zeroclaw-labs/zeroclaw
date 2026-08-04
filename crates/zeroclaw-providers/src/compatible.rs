@@ -2585,6 +2585,36 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         }
     }
 
+    fn capabilities_for_model(
+        &self,
+        model: &str,
+    ) -> zeroclaw_api::model_provider::ProviderCapabilities {
+        // Start with provider-level capabilities as the base.
+        let mut capabilities = self.capabilities();
+
+        // If this provider has a models.dev catalog key, try to resolve per-model
+        // vision support from the cached catalog. The catalog is fetched async on
+        // first use (e.g. during `list_models`), so this only works after the
+        // catalog has been populated. Until then, we fall back to provider-level.
+        //
+        // TODO: To make this fully reliable, thread the catalog through Config or
+        // change the trait to async. For now this is best-effort: once some async
+        // path has fetched the catalog, subsequent sync calls to
+        // `capabilities_for_model` can use it.
+        if let Some(ref catalog_key) = self.models_dev_key {
+            // Non-blocking attempt to use the cached catalog. If not ready yet,
+            // we silently fall back to the provider-level default.
+            if let Some(catalog) = crate::models_dev::CACHED_CATALOG.get()
+                && let Some(vision) =
+                    crate::models_dev::model_supports_vision(catalog, catalog_key, model)
+            {
+                capabilities.vision = vision;
+            }
+        }
+
+        capabilities
+    }
+
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {
         // When a credential is present, hit the model_provider's native /models endpoint
         // (OpenAI-compatible: GET {base_url}/models). Local OpenAI-compatible
