@@ -110,9 +110,23 @@ pub(crate) fn is_cloud_metadata_ip(ip: std::net::IpAddr) -> bool {
     // https://www.alibabacloud.com/help/en/ecs/user-guide/use-instance-identities
     const ALIBABA_IMDS_V4: std::net::Ipv4Addr = std::net::Ipv4Addr::new(100, 100, 100, 200);
 
+    fn is_v4_metadata(v4: std::net::Ipv4Addr) -> bool {
+        v4 == EC2_IMDS_V4 || v4 == ALIBABA_IMDS_V4
+    }
+
     match ip {
-        std::net::IpAddr::V4(v4) => v4 == EC2_IMDS_V4 || v4 == ALIBABA_IMDS_V4,
-        std::net::IpAddr::V6(v6) => v6 == EC2_IMDS_V6,
+        std::net::IpAddr::V4(v4) => is_v4_metadata(v4),
+        std::net::IpAddr::V6(v6) => {
+            v6 == EC2_IMDS_V6
+                // IPv4-mapped IPv6 (::ffff:a.b.c.d) must be canonicalized to
+                // its IPv4 form before classification, otherwise the allowlist
+                // carve-out path could reach the metadata service through a
+                // dual-stack socket (e.g. ::ffff:169.254.169.254).
+                || match v6.to_ipv4_mapped() {
+                    Some(v4) => is_v4_metadata(v4),
+                    None => false,
+                }
+        }
     }
 }
 
@@ -442,5 +456,52 @@ mod tests {
             err.contains("cloud metadata address"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn validate_resolved_ips_blocks_mapped_ec2_metadata_even_for_private_opt_in() {
+        // ::ffff:169.254.169.254 — the IPv4-mapped form of the EC2 metadata
+        // address. It must be rejected under the private-host carve-out.
+        let ips = ["::ffff:169.254.169.254".parse().unwrap()];
+        let err = validate_resolved_ips_exclude_metadata("metadata.test", &ips)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cloud metadata address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_resolved_ips_blocks_mapped_alibaba_metadata_even_for_private_opt_in() {
+        // ::ffff:100.100.100.200 — the IPv4-mapped form of the Alibaba ECS
+        // metadata address. Same carve-out bypass as the AWS-mapped case.
+        let ips = ["::ffff:100.100.100.200".parse().unwrap()];
+        let err = validate_resolved_ips_exclude_metadata("metadata.test", &ips)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cloud metadata address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_resolved_ips_blocks_mapped_metadata_on_public_path() {
+        let ips = ["::ffff:169.254.169.254".parse().unwrap()];
+        let err = validate_resolved_ips_are_public("metadata.test", &ips)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cloud metadata address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn is_cloud_metadata_ip_rejects_non_metadata_mapped_addresses() {
+        // A mapped loopback is not a metadata address and must stay allowed by
+        // the predicate (the caller's loopback policy decides it separately).
+        assert!(!is_cloud_metadata_ip("::ffff:127.0.0.1".parse().unwrap()));
     }
 }

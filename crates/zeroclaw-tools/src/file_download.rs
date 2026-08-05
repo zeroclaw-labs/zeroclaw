@@ -9,7 +9,6 @@ use tokio::io::AsyncWriteExt;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, with_ephemeral_workspace_warning};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::FileDownloadConfig;
-use zeroclaw_infra::net_guard::is_private_or_local_host;
 
 const RESPONSE_BODY_LIMIT_BYTES: usize = 4 * 1024;
 const TOOL_DESCRIPTION_KEY: &str = "tool-file-download";
@@ -288,27 +287,19 @@ fn ssrf_check_endpoint(
 ) -> Result<(), String> {
     let ips: Vec<std::net::IpAddr> = resolved_addrs.iter().map(|sa| sa.ip()).collect();
     let private_allowed = domain_guard::host_matches_allowlist(policy_host, allowed_hosts);
-    if private_allowed {
+
+    // Every blocked endpoint must emit a WARN rejection event — not just
+    // literal private hosts. The resolved-IP validator below already covers
+    // literal `127.0.0.1`/`::1`/`localhost`, so the old literal-host branch
+    // was unreachable; keep the audit signal here instead.
+    let validation_err = if private_allowed {
         domain_guard::validate_resolved_ips_exclude_metadata(policy_host, &ips)
     } else {
         domain_guard::validate_resolved_ips_are_public(policy_host, &ips)
     }
-    .map_err(|e| {
-        tool_msg_with_args(
-            "tool-file-download-error-private-host",
-            &[
-                ("host", policy_host),
-                ("config_key", "file_download.allowed_private_hosts"),
-                ("err", &e.to_string()),
-            ],
-        )
-    })?;
+    .err();
 
-    // Keep the literal-host audit signal: even though
-    // validate_resolved_ips_are_public covers the resolved-IP case, the
-    // literal-host WARN event below is part of the established
-    // operator-visibility contract and should be preserved.
-    if is_private_or_local_host(policy_host) && !private_allowed {
+    if let Some(err) = validation_err {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
@@ -324,11 +315,22 @@ fn ssrf_check_endpoint(
             &[
                 ("host", policy_host),
                 ("config_key", "file_download.allowed_private_hosts"),
+                ("err", &err.to_string()),
             ],
         ));
     }
 
-    if private_allowed {
+    // The INFO audit event describes what actually happened, not merely that
+    // the hostname matched the allowlist. A wildcard allowlist that admits a
+    // public endpoint must not log "allowing private host"; only when the
+    // resolved addresses actually use the private carve-out is the event
+    // accurate.
+    let resolved_uses_private = ips.iter().any(|ip| match ip {
+        std::net::IpAddr::V4(v4) => domain_guard::is_non_global_v4(*v4),
+        std::net::IpAddr::V6(v6) => domain_guard::is_non_global_v6(*v6),
+    });
+
+    if private_allowed && resolved_uses_private {
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -785,6 +787,19 @@ mod tests {
     impl Drop for RuntimeProxyGuard {
         fn drop(&mut self) {
             set_runtime_proxy_config(ProxyConfig::default());
+        }
+    }
+
+    /// Scoped cleanup for the process-wide log broadcast hook: clears the hook
+    /// on drop so a panicking assertion cannot leak the installed hook into
+    /// later tests. Declare after `__private_test_hook_lock()` so the clear
+    /// runs while the hook lock is still held (guards drop in reverse
+    /// declaration order).
+    struct BroadcastHookGuard;
+
+    impl Drop for BroadcastHookGuard {
+        fn drop(&mut self) {
+            zeroclaw_log::clear_broadcast_hook();
         }
     }
 
@@ -1843,6 +1858,89 @@ mod tests {
             &[],
         )
         .expect("public-IP hostname must pass without opt-in");
+    }
+
+    /// Operator-visibility contract for the SSRF audit events: every blocked
+    /// endpoint emits a WARN rejection, an allowlisted host whose resolved
+    /// addresses actually use the private carve-out emits an INFO admission,
+    /// and a wildcard allowlist that admits a public endpoint must NOT claim
+    /// it as private.
+    #[test]
+    fn ssrf_check_endpoint_audit_events_match_decisions() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        let _hook_cleanup = BroadcastHookGuard;
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        // 1. Rejection: private IP without opt-in → WARN reject event.
+        ssrf_check_endpoint(
+            "blocked.example.com",
+            &[std::net::SocketAddr::from(([10, 0, 0, 5], 80))],
+            &[],
+        )
+        .expect_err("private IP without opt-in must be rejected");
+
+        // 2. Admission via carve-out: allowlisted hostname resolving to a
+        //    private IP → INFO "allowing private host" event.
+        ssrf_check_endpoint(
+            "corp-files.example.com",
+            &[std::net::SocketAddr::from(([10, 0, 0, 9], 80))],
+            &["corp-files.example.com".into()],
+        )
+        .expect("allowlisted private resolve must pass");
+
+        // 3. Wildcard allowlist + public resolve → passes but must NOT emit
+        //    the private-carve-out INFO event.
+        ssrf_check_endpoint(
+            "public.example.com",
+            &[std::net::SocketAddr::from(([8, 8, 8, 8], 443))],
+            &["*".into()],
+        )
+        .expect("public IP must pass");
+
+        let mut warn_found = false;
+        let mut info_found = false;
+        let mut wildcard_public_info_found = false;
+        while let Ok(value) = rx.try_recv() {
+            let msg = value.get("message").and_then(|v| v.as_str()).unwrap_or("");
+            if msg.contains("rejected private/local endpoint host") {
+                warn_found = true;
+                assert_eq!(
+                    value.get("severity_text").and_then(|v| v.as_str()),
+                    Some("WARN"),
+                    "rejection must be a WARN event: {value}"
+                );
+            }
+            if msg.contains("allowing private host via allowed_private_hosts") {
+                info_found = true;
+                assert_eq!(
+                    value.get("severity_text").and_then(|v| v.as_str()),
+                    Some("INFO"),
+                    "carve-out admission must be an INFO event: {value}"
+                );
+                let host = value
+                    .get("attributes")
+                    .and_then(|v| v.get("host"))
+                    .and_then(|v| v.as_str());
+                if host == Some("public.example.com") {
+                    wildcard_public_info_found = true;
+                }
+            }
+        }
+        assert!(
+            warn_found,
+            "a blocked endpoint must emit a WARN rejection audit event"
+        );
+        assert!(
+            info_found,
+            "a real private carve-out admission must emit an INFO audit event"
+        );
+        assert!(
+            !wildcard_public_info_found,
+            "a wildcard allowlist admitting a public endpoint must not log it as private"
+        );
     }
 
     /// Wire-up contract for the resolve_to_addrs binding the production
