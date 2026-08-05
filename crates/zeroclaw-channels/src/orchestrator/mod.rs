@@ -4805,36 +4805,6 @@ async fn process_channel_message_body(
         msg.content = thinking.effective_content.clone();
     }
 
-    // ── Media pipeline: enrich inbound message with media annotations ──
-    if ctx.media_pipeline.enabled && !msg.attachments.is_empty() {
-        let vision = media_pipeline_vision_available(
-            ctx.model_provider.as_ref(),
-            ctx.model.as_str(),
-            ctx.multimodal.vision_model_provider.is_some(),
-        );
-        // Build from legacy config; if that fails (e.g. no legacy api_key
-        // but typed providers are configured), fall back to an empty shell
-        // so with_typed_providers() can still populate the registry.
-        let transcription_manager = {
-            let base = crate::transcription::TranscriptionManager::new(&ctx.transcription_config)
-                .unwrap_or_else(|_| crate::transcription::TranscriptionManager::empty());
-            let m = base
-                .with_typed_providers(&ctx.prompt_config.providers.transcription)
-                .with_agent_transcription_provider(ctx.agent_transcription_provider.clone());
-            if m.available_providers().is_empty() {
-                None
-            } else {
-                Some(m)
-            }
-        };
-        let pipeline = media_pipeline::MediaPipeline::new(
-            &ctx.media_pipeline,
-            transcription_manager.as_ref(),
-            vision,
-        );
-        msg.content = Box::pin(pipeline.process(&msg.content, &msg.attachments)).await;
-    }
-
     // ── Link enricher: prepend URL summaries before agent sees the message ──
     let le_config = &ctx.prompt_config.link_enricher;
     if le_config.enabled {
@@ -4926,6 +4896,47 @@ async fn process_channel_message_body(
             return;
         }
     };
+
+    // ── Media pipeline: enrich inbound message with media annotations ──
+    // Runs after the effective route and provider are resolved so the
+    // image-marker decision uses the selected provider/model, not the startup
+    // default. The catalog is warmed first so a credentialed compatible
+    // provider resolves per-model vision instead of the family default.
+    if ctx.media_pipeline.enabled && !msg.attachments.is_empty() {
+        // Warm the effective provider's capability metadata (e.g. the models.dev
+        // catalog) so the image-preservation decision below resolves per-model
+        // vision instead of silently falling back to the family default. The
+        // leaf provider records its own warning on failure; this call never
+        // propagates an error.
+        active_model_provider.warm_capabilities_metadata().await;
+        let vision = media_pipeline_vision_available(
+            active_model_provider.as_ref(),
+            route.model.as_str(),
+            ctx.multimodal.vision_model_provider.is_some(),
+        );
+        // Build from legacy config; if that fails (e.g. no legacy api_key
+        // but typed providers are configured), fall back to an empty shell
+        // so with_typed_providers() can still populate the registry.
+        let transcription_manager = {
+            let base = crate::transcription::TranscriptionManager::new(&ctx.transcription_config)
+                .unwrap_or_else(|_| crate::transcription::TranscriptionManager::empty());
+            let m = base
+                .with_typed_providers(&ctx.prompt_config.providers.transcription)
+                .with_agent_transcription_provider(ctx.agent_transcription_provider.clone());
+            if m.available_providers().is_empty() {
+                None
+            } else {
+                Some(m)
+            }
+        };
+        let pipeline = media_pipeline::MediaPipeline::new(
+            &ctx.media_pipeline,
+            transcription_manager.as_ref(),
+            vision,
+        );
+        msg.content = Box::pin(pipeline.process(&msg.content, &msg.attachments)).await;
+    }
+
     let history_user_content = msg.content.clone();
     // Autosave must not persist heavy/private inline `data:` image bytes into
     // durable memory. Strip them here (path/markers are preserved) before the
@@ -26513,6 +26524,190 @@ This is an example JSON object for profile settings."#;
                 .to_string()
                 .contains("data:image/png;base64,AQIDBA=="),
             "vision provider request must contain the preserved attachment bytes: {vision_body}"
+        );
+    }
+
+    /// Provider whose family-level capability has NO vision, but whose
+    /// `capabilities_for_model` marks the configured model as image-capable
+    /// once the capability catalog is warmed — the "catalog-only image model"
+    /// shape (e.g. Pixtral under a pure compatible family where the models.dev
+    /// catalog carries the per-model modality). Before the warm call the
+    /// catalog is empty and per-model vision falls back to the family default,
+    /// exactly like a credentialed compatible provider in a fresh process.
+    /// Records messages and warm invocations.
+    struct CatalogOnlyVisionModelProvider {
+        calls: std::sync::Mutex<Vec<Vec<(String, String)>>>,
+        warm_calls: std::sync::Arc<AtomicUsize>,
+        catalog_loaded: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for CatalogOnlyVisionModelProvider {
+        fn capabilities(&self) -> zeroclaw_providers::traits::ProviderCapabilities {
+            zeroclaw_providers::traits::ProviderCapabilities {
+                vision: false,
+                ..Default::default()
+            }
+        }
+
+        fn capabilities_for_model(
+            &self,
+            model: &str,
+        ) -> zeroclaw_providers::traits::ProviderCapabilities {
+            zeroclaw_providers::traits::ProviderCapabilities {
+                vision: self.catalog_loaded.load(Ordering::SeqCst)
+                    && model == "catalog-image-model",
+                ..Default::default()
+            }
+        }
+
+        async fn warm_capabilities_metadata(&self) {
+            self.catalog_loaded.store(true, Ordering::SeqCst);
+            self.warm_calls.fetch_add(1, Ordering::SeqCst);
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("fallback".to_string())
+        }
+
+        async fn chat_with_history(
+            &self,
+            messages: &[ChatMessage],
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            let snapshot = messages
+                .iter()
+                .map(|m| (m.role.clone(), m.content.clone()))
+                .collect::<Vec<_>>();
+            let mut calls = self.calls.lock().unwrap_or_else(|e| e.into_inner());
+            calls.push(snapshot);
+            Ok(format!("response-{}", calls.len()))
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for CatalogOnlyVisionModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "CatalogOnlyVisionModelProvider"
+        }
+    }
+
+    #[tokio::test]
+    async fn media_pipeline_preserves_image_marker_for_catalog_only_vision_model() {
+        // Regression for the channel media boundary: the image-preservation
+        // decision must run AFTER the effective route/provider are resolved and
+        // the capability catalog is warmed, so a catalog-only image model keeps
+        // the `IMAGE:data:...` marker. Before the fix the decision ran against
+        // the startup provider with an empty catalog and fell back to the
+        // family default (no vision), dropping the marker before any turn could
+        // restore the bytes.
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let leaf = Arc::new(CatalogOnlyVisionModelProvider {
+            calls: Default::default(),
+            warm_calls: Arc::new(AtomicUsize::new(0)),
+            catalog_loaded: AtomicBool::new(false),
+        });
+        // Production shape: the effective provider is the resilient composite
+        // returned by the factory; it must delegate warm to the cataloged leaf.
+        let wrapper: Arc<dyn ModelProvider> =
+            Arc::new(zeroclaw_providers::reliable::ReliableModelProvider::new(
+                "test",
+                vec![(
+                    "primary".into(),
+                    Box::new(Arc::clone(&leaf)) as Box<dyn ModelProvider>,
+                )],
+                0,
+                0,
+            ));
+
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            wrapper,
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            model: Arc::new("catalog-image-model".to_string()),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig {
+                enabled: true,
+                describe_images: true,
+                ..Default::default()
+            },
+            ..(*runtime_ctx).clone()
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-catalog-vision".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-catalog-vision".to_string(),
+                content: "please inspect this".to_string(),
+                channel: "test-channel".into(),
+                channel_alias: None,
+                timestamp: 1,
+                passive_context: false,
+                explicitly_addressed: false,
+                conversation_scope: zeroclaw_api::channel::ChannelConversationScope::Sender,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![zeroclaw_api::media::MediaAttachment {
+                    file_name: "catalog.png".to_string(),
+                    data: vec![1, 2, 3, 4],
+                    mime_type: Some("image/png".to_string()),
+                }],
+                subject: None,
+                internal_sop_event: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert!(
+            leaf.warm_calls.load(Ordering::SeqCst) >= 1,
+            "the resilient wrapper must delegate the warm call to the cataloged leaf"
+        );
+
+        {
+            let calls = leaf.calls.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(
+                calls.len(),
+                1,
+                "the cataloged provider should receive one turn"
+            );
+            let current_user = calls[0]
+                .iter()
+                .rev()
+                .find(|(role, _)| role == "user")
+                .expect("provider call should include the current user message");
+            assert!(
+                current_user.1.contains("[IMAGE:data:image/png;base64,"),
+                "catalog-only image model must preserve the IMAGE:data marker; got: {:?}",
+                current_user.1
+            );
+            assert!(current_user.1.contains("please inspect this"));
+        }
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert!(
+            !sent_messages.is_empty(),
+            "the cataloged provider should produce an assistant reply"
         );
     }
 

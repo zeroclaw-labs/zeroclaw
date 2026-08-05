@@ -638,7 +638,8 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             multimodal_config,
             provider_name,
             model,
-        )?;
+        )
+        .await?;
 
         let (active_model_provider, active_model_provider_name, active_model): (
             &dyn ModelProvider,

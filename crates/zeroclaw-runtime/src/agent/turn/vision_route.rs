@@ -10,7 +10,7 @@ pub(crate) struct ResolvedVisionProvider {
     pub(crate) model: String,
 }
 
-pub(crate) fn resolve_vision_provider(
+pub(crate) async fn resolve_vision_provider(
     config: Option<&Config>,
     model_provider: &dyn ModelProvider,
     history: &[ChatMessage],
@@ -66,6 +66,11 @@ pub(crate) fn resolve_vision_provider(
                 .map(ToString::to_string)
                 .or(alias_model)
                 .unwrap_or_else(|| model.to_string());
+            // Warm the vision provider's capability metadata (e.g. its
+            // models.dev catalog) before the synchronous capability check, so
+            // a credentialed compatible vision provider resolves per-model
+            // vision instead of silently falling back to the family default.
+            vp_instance.warm_capabilities_metadata().await;
             if !vp_instance.capabilities_for_model(&vision_model).vision {
                 // Operator misconfiguration (named a non-vision provider as
                 // the vision route) — surface it loudly rather than silently
@@ -294,8 +299,8 @@ mod tests {
     /// provider is honored as non-vision and the capability error surfaces -
     /// proving the alias flag is read (the legacy `create_model_provider(vp,
     /// None)` path ignored it entirely).
-    #[test]
-    fn resolve_vision_provider_honors_configured_alias_vision_override() {
+    #[tokio::test]
+    async fn resolve_vision_provider_honors_configured_alias_vision_override() {
         use zeroclaw_config::schema::{Config, MultimodalConfig};
 
         struct NonVisionPrimary;
@@ -349,6 +354,7 @@ vision = false
             "primary",
             "primary-model",
         )
+        .await
         .err()
         .expect("a forced-off vision route must surface a capability error once its alias vision override is honored");
         assert!(
@@ -450,6 +456,7 @@ model = "vision-model"
             "primary",
             "primary-model",
         )
+        .await
         .expect("a configured vision-capable alias must build");
         let vision_provider =
             vision_provider.expect("the configured vision_model_provider must be returned");
@@ -497,6 +504,7 @@ model = "vision-model"
             "primary",
             "primary-model",
         )
+        .await
         .expect("an explicit vision model must resolve");
         assert_eq!(
             vision_provider

@@ -348,6 +348,15 @@ impl ModelProvider for RouterModelProvider {
             .unwrap_or_default()
     }
 
+    async fn warm_capabilities_metadata(&self) {
+        // Warm every routed provider: route selection happens inside the
+        // synchronous capability gate, so each candidate (e.g. a credentialed
+        // compatible provider) must preload its catalog beforehand.
+        for (_, provider) in &self.model_providers {
+            provider.warm_capabilities_metadata().await;
+        }
+    }
+
     fn supports_vision(&self) -> bool {
         self.model_providers
             .get(self.default_index)
@@ -1466,5 +1475,77 @@ mod tests {
             "outer capabilities().vision must match the delegated supports_vision()"
         );
         assert_eq!(router.capabilities().vision, router.supports_vision());
+    }
+
+    /// Child that records `warm_capabilities_metadata` invocations.
+    struct WarmRecordingMock {
+        warm_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for WarmRecordingMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
+        async fn warm_capabilities_metadata(&self) {
+            self.warm_calls.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for WarmRecordingMock {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "WarmRecordingMock"
+        }
+    }
+
+    #[tokio::test]
+    async fn warm_capabilities_metadata_delegates_to_all_routes() {
+        let warm_calls = Arc::new(AtomicUsize::new(0));
+        let router = RouterModelProvider::new(
+            "test",
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(WarmRecordingMock {
+                        warm_calls: Arc::clone(&warm_calls),
+                    }),
+                ),
+                (
+                    "secondary".into(),
+                    Box::new(WarmRecordingMock {
+                        warm_calls: Arc::clone(&warm_calls),
+                    }),
+                ),
+            ],
+            vec![(
+                "hint".into(),
+                Route {
+                    provider_name: "secondary".into(),
+                    model: "other-model".into(),
+                },
+            )],
+            "default-model".into(),
+        );
+
+        router.warm_capabilities_metadata().await;
+
+        assert_eq!(
+            warm_calls.load(Ordering::SeqCst),
+            2,
+            "warm_capabilities_metadata must delegate to every routed provider"
+        );
     }
 }

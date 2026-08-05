@@ -2,7 +2,8 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::pricing::{ModelRates, sane_mtok};
 use anyhow::Result;
@@ -11,6 +12,22 @@ use tokio::sync::OnceCell;
 
 const CATALOG_URL: &str = "https://models.dev/api.json";
 const FETCH_TIMEOUT_SECS: u64 = 10;
+/// Minimum gap between retry attempts after a failed catalog fetch. Without
+/// this, a models.dev outage adds a full 10-second timeout to every tool-loop
+/// iteration that runs the per-turn warm call.
+const CATALOG_FETCH_RETRY_BACKOFF_SECS: i64 = 60;
+
+/// UNIX seconds of the last failed catalog fetch, or `0` if none failed yet.
+/// Consulted by [`ensure_catalog_loaded`] to bound retry frequency; the
+/// `get_or_try_init` path used by explicit listings is unaffected.
+static LAST_CATALOG_FETCH_FAILURE_UNIX: AtomicI64 = AtomicI64::new(0);
+
+fn now_unix_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ProviderEntry {
@@ -127,10 +144,22 @@ pub(crate) fn filter_models(catalog: &Catalog, provider_key: &str) -> Result<Vec
 /// through their native `/models` endpoint). No-op once loaded.
 /// Called from async agent-turn context before the capability query.
 pub(crate) async fn ensure_catalog_loaded() -> Result<()> {
-    CACHED_CATALOG
-        .get_or_try_init(fetch_catalog)
-        .await
-        .map(|_| ())
+    // Bounded failure caching: after a fetch failure, skip re-fetching for
+    // `CATALOG_FETCH_RETRY_BACKOFF_SECS` so a models.dev outage does not add a
+    // 10-second timeout to every tool-loop iteration's warm call.
+    let last_failure = LAST_CATALOG_FETCH_FAILURE_UNIX.load(Ordering::Relaxed);
+    if last_failure != 0
+        && now_unix_secs().saturating_sub(last_failure) < CATALOG_FETCH_RETRY_BACKOFF_SECS
+    {
+        anyhow::bail!("models.dev catalog fetch is in retry backoff after a recent failure");
+    }
+    match CACHED_CATALOG.get_or_try_init(fetch_catalog).await {
+        Ok(_) => Ok(()),
+        Err(err) => {
+            LAST_CATALOG_FETCH_FAILURE_UNIX.store(now_unix_secs(), Ordering::Relaxed);
+            Err(err)
+        }
+    }
 }
 
 /// Look up model IDs for a model_provider, keyed by `models.dev`'s model_provider name.
@@ -498,5 +527,40 @@ mod tests {
             model_supports_vision(&catalog, "fake", "alias-2"),
             Some(false)
         );
+    }
+
+    #[tokio::test]
+    async fn ensure_catalog_loaded_respects_retry_backoff() {
+        // Regression for the tool-loop retry gap: after a failed fetch, a
+        // models.dev outage must not add a 10-second timeout to every
+        // iteration's warm call. Within the backoff window the call bails
+        // immediately instead of re-entering the network fetch.
+        LAST_CATALOG_FETCH_FAILURE_UNIX.store(now_unix_secs() - 5, Ordering::Relaxed);
+        let err = ensure_catalog_loaded()
+            .await
+            .expect_err("a recent fetch failure must put the warm call in backoff");
+        assert!(
+            err.to_string().contains("backoff"),
+            "backoff error must be descriptive, got: {err}"
+        );
+        // Cleanup so other tests are not put in backoff.
+        LAST_CATALOG_FETCH_FAILURE_UNIX.store(0, Ordering::Relaxed);
+    }
+
+    #[tokio::test]
+    async fn ensure_catalog_loaded_does_not_backoff_without_prior_failure() {
+        // No prior failure recorded (the default state) must never trigger the
+        // backoff branch; this also keeps the explicit-listing paths free of
+        // backoff semantics.
+        LAST_CATALOG_FETCH_FAILURE_UNIX.store(0, Ordering::Relaxed);
+        // When the cache is already populated (e.g. by the catalog-injection
+        // tests elsewhere in this crate) this resolves Ok without any network.
+        if let Err(err) = ensure_catalog_loaded().await {
+            assert!(
+                !err.to_string().contains("backoff"),
+                "no prior failure must not put the call in backoff, got: {err}"
+            );
+        }
+        LAST_CATALOG_FETCH_FAILURE_UNIX.store(0, Ordering::Relaxed);
     }
 }
