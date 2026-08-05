@@ -1071,10 +1071,25 @@ mod tests {
         // production assembly boundary: a real deferred MCP server advertising
         // one allowed and one denied tool, a policy that denies the latter, and
         // then assertions on the assembled prompt section AND the assembled
-        // `tool_search` execution/activation. The deferred set is built by
-        // `DeferredMcpToolSet::from_registry` from the connected registry, so a
-        // future edit that drops the production `filter_by_policy(...)` call
-        // fails this test (the denied stub would surface in prompt and search).
+        // `tool_search` execution/activation.
+        //
+        // The setup pins two preconditions so the negative assertions below
+        // cannot pass vacuously:
+        // - BOTH advertised tools are asserted to have entered the source
+        //   registry before assembly (the denied tool is not absent because it
+        //   was never advertised).
+        // - The allowed tool is positively asserted to become ACTIVATED through
+        //   `tool_search`, not merely rendered as a schema.
+        //
+        // The keyword-search negative control is the observable signal for the
+        // `filter_by_policy(...)` handoff: with the pre-filtered set, a search
+        // for the denied keyword returns "No matching deferred tools found."
+        // because the denied stub was removed before `ToolSearchTool` was
+        // constructed. If a future edit feeds the UNfiltered stub set to the
+        // consumers (while leaving their defense-in-depth `with_access_policy`
+        // / prompt re-filter intact), the denied stub is still present in the
+        // searchable set and the search returns an empty `<functions>` block
+        // instead — failing this assertion.
         let server = mock_mcp_http_server_with_tools(&[
             ("allowed", "Allowed tool"),
             ("denied", "Denied tool"),
@@ -1124,6 +1139,30 @@ mod tests {
             ..SecurityPolicy::default()
         });
 
+        // Setup: connect the source registry through the real
+        // `McpRegistry::connect_all` + `DeferredMcpToolSet::from_registry` path
+        // and assert BOTH advertised tools entered it. Feeding this same
+        // registry into `assemble` (via `mcp_registry`) proves the denied tool
+        // started from a non-empty registry — the negative assertions below
+        // cannot pass just because the denied tool was never advertised.
+        let agent_mcp_servers = config.mcp_servers_for_agent("test-agent");
+        let registry = Arc::new(
+            tools::McpRegistry::connect_all(&agent_mcp_servers)
+                .await
+                .expect("source registry must connect to the mock MCP server"),
+        );
+        {
+            let names = registry.tool_names();
+            assert!(
+                names.contains(&"test-srv__allowed".to_string()),
+                "source registry must advertise the allowed tool: {names:?}"
+            );
+            assert!(
+                names.contains(&"test-srv__denied".to_string()),
+                "source registry must advertise the denied tool: {names:?}"
+            );
+        }
+
         let out = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             ScopedToolRegistry::assemble(ScopedAssembly {
@@ -1140,7 +1179,7 @@ mod tests {
                 acp_delivery: false,
                 list_deferred_mcp_specs: false,
                 emit_assembly_logs: false,
-                mcp_registry: None,
+                mcp_registry: Some(Arc::clone(&registry)),
             }),
         )
         .await
@@ -1171,10 +1210,16 @@ mod tests {
             .execute(serde_json::json!({"query": "denied"}))
             .await
             .expect("tool_search must execute");
-        assert!(
-            !denied_keyword.output.contains("test-srv__denied"),
-            "keyword search must not return the denied tool: {}",
-            denied_keyword.output
+        // Observable signal for the `filter_by_policy(...)` handoff: with the
+        // pre-filtered set the denied stub is not searchable, so the query
+        // finds nothing. If the UNfiltered set leaked into `ToolSearchTool`,
+        // the search would find the denied stub and return an empty
+        // `<functions>` block instead — failing this exact-output assertion.
+        assert_eq!(
+            denied_keyword.output, "No matching deferred tools found.",
+            "keyword search for the denied tool must find nothing because the \
+             pre-filtered stub set carries no denied stub; an empty <functions> \
+             block would mean the unfiltered set leaked through filter_by_policy"
         );
 
         let denied_select = tool_search
@@ -1216,5 +1261,29 @@ mod tests {
             "allowed tool must remain searchable: {}",
             allowed_hit.output
         );
+
+        // 4. Positive activation control: selecting the allowed tool must
+        //    ACTIVATE it (not merely render its schema). This keeps the test
+        //    from passing when schema rendering still works but the
+        //    activation path is broken.
+        let allowed_select = tool_search
+            .execute(serde_json::json!({"query": "select:test-srv__allowed"}))
+            .await
+            .expect("tool_search must execute");
+        assert!(
+            allowed_select.output.contains("test-srv__allowed"),
+            "select must return the allowed tool schema: {}",
+            allowed_select.output
+        );
+        {
+            let activated = activated_handle
+                .as_ref()
+                .expect("tool_search registers the activation handle");
+            let activated = activated.lock().unwrap();
+            assert!(
+                activated.is_activated("test-srv__allowed"),
+                "the allowed tool must be activated after a select, not just schema-rendered"
+            );
+        }
     }
 }
