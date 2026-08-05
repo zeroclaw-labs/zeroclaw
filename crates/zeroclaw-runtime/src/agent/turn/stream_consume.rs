@@ -70,22 +70,31 @@ pub(crate) async fn consume_provider_streaming_response(
     macro_rules! forward_visible {
         ($text:expr, $count_visible:tt) => {{
             let visible = $text;
-            if event_tx.is_some() || delta_sender.is_some() {
-                outcome.forwarded_visible_text.push_str(&visible);
-            }
-            if let Some(tx) = event_tx {
-                outcome.forwarded_live_deltas = true;
-                forward_visible!(@count $count_visible, visible);
-                let _ = tx
-                    .send(TurnEvent::Chunk {
-                        delta: visible.clone(),
-                    })
-                    .await;
-            }
-            if let Some(tx) = delta_sender {
-                outcome.forwarded_live_deltas = true;
-                if tx.send(StreamDelta::Text(visible)).await.is_err() {
-                    delta_sender = None;
+            // Empty visible text is not output: a strict-mode marker-only delta
+            // (or a trailing flush that stripped a marker) yields an empty
+            // string here, and forwarding it would record an empty Chunk as
+            // visible output. That would make a later provider error take the
+            // StreamInterruptedAfterOutput path and disable the non-streaming
+            // fallback even though the user saw no text. Guard so empty text is
+            // never counted as visible output.
+            if !visible.is_empty() {
+                if event_tx.is_some() || delta_sender.is_some() {
+                    outcome.forwarded_visible_text.push_str(&visible);
+                }
+                if let Some(tx) = event_tx {
+                    outcome.forwarded_live_deltas = true;
+                    forward_visible!(@count $count_visible, visible);
+                    let _ = tx
+                        .send(TurnEvent::Chunk {
+                            delta: visible.clone(),
+                        })
+                        .await;
+                }
+                if let Some(tx) = delta_sender {
+                    outcome.forwarded_live_deltas = true;
+                    if tx.send(StreamDelta::Text(visible)).await.is_err() {
+                        delta_sender = None;
+                    }
                 }
             }
         }};
@@ -517,6 +526,135 @@ mod tests {
         assert_eq!(
             outcome.response_text, "Summary",
             "terminal marker <eom> should be stripped even in strict_tool_parsing mode"
+        );
+    }
+
+    /// Provider that emits a single marker-only text delta (`<eom>`) and then
+    /// a stream error, with no text ever produced. Used to pin the strict-mode
+    /// fallback eligibility: a marker-only delta yields empty stripped text,
+    /// which must NOT count as visible output.
+    struct MarkerOnlyThenErrorProvider;
+
+    impl ::zeroclaw_api::attribution::Attributable for MarkerOnlyThenErrorProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "MarkerOnlyThenErrorProvider"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for MarkerOnlyThenErrorProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                native_tool_calling: true,
+                vision: false,
+                prompt_caching: false,
+                extended_thinking: false,
+            }
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            anyhow::bail!("unused")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn supports_streaming_tool_events(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            let events: Vec<StreamResult<StreamEvent>> = vec![
+                Ok(StreamEvent::TextDelta(StreamChunk::delta("<eom>"))),
+                Err(::zeroclaw_api::model_provider::StreamError::ModelProvider(
+                    "provider exploded after marker-only delta".into(),
+                )),
+            ];
+            Box::pin(futures_util::stream::iter(events))
+        }
+    }
+
+    /// Strict-mode marker-only deltas must not count as visible output: if a
+    /// marker-only delta (stripped to empty text) is forwarded as a visible
+    /// Chunk, a later provider error turns the failure into
+    /// `StreamInterruptedAfterOutput`, which disables the non-streaming
+    /// fallback even though the user received no text. The error must instead
+    /// surface as a plain error with an empty visible prefix, keeping the
+    /// pre-output fallback eligible.
+    #[tokio::test]
+    async fn strict_marker_only_delta_does_not_disable_fallback_on_provider_error() {
+        let provider = MarkerOnlyThenErrorProvider;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+
+        let result = consume_provider_streaming_response(
+            &provider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            None,      // on_delta (draft sink)
+            Some(&tx), // event_tx
+            true,      // strict_tool_parsing = true
+        )
+        .await;
+
+        // The event sink must have seen zero Chunks (the marker-only delta was
+        // stripped to empty and must not be forwarded).
+        drop(tx);
+        let mut chunks = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            chunks.push(ev);
+        }
+        assert!(
+            chunks.is_empty(),
+            "no Chunk event may be forwarded for a marker-only delta: {chunks:?}"
+        );
+
+        // The failure must be a plain error, NOT StreamInterruptedAfterOutput
+        // (which would disable the non-streaming fallback despite no visible
+        // text). Asserting the error type is not the interruption type is the
+        // observable fallback-eligibility signal.
+        let err = result.expect_err("provider error must surface");
+        assert!(
+            err.downcast_ref::<crate::agent::turn::outcome::StreamInterruptedAfterOutput>()
+                .is_none(),
+            "a marker-only delta followed by a provider error must stay eligible for the \
+             non-streaming fallback; got StreamInterruptedAfterOutput instead"
+        );
+        assert!(
+            err.to_string().contains("provider exploded"),
+            "the underlying provider error must be surfaced: {err}"
         );
     }
 

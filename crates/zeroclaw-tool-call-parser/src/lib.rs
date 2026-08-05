@@ -66,33 +66,26 @@ pub fn strip_trailing_terminal_markers(text: &str) -> String {
     let mut result = text.to_string();
 
     loop {
-        let original_len = result.len();
+        // Look for a recognized marker at the end of the trailing-whitespace-
+        // trimmed tail. When the trimmed tail ends in a marker, remove the
+        // marker AND the whitespace that followed it (the marker suffix).
+        // Whitespace BEFORE the marker belongs to the response text and is
+        // preserved — this matches the streaming stripper, which keeps e.g.
+        // `"Answer\n<eom>"` as `"Answer\n"`. If no marker is found, unmarked
+        // trailing whitespace (e.g. `"Answer\n"`) is ordinary text and is
+        // preserved too, so the two paths share one policy.
         let trimmed = result.trim_end();
-
-        // Try to strip each known terminal marker
-        let mut new_result: Option<String> = None;
-
+        let mut stripped = false;
         for marker in TERMINAL_MARKERS {
-            if let Some(suffix) = trimmed.strip_suffix(marker) {
-                new_result = Some(suffix.to_string());
+            if let Some(prefix) = trimmed.strip_suffix(marker) {
+                result = prefix.to_string();
+                stripped = true;
                 break;
             }
         }
-
-        // If a marker was stripped, use the new result
-        if let Some(suffix) = new_result {
-            result = suffix;
-            continue;
+        if !stripped {
+            break;
         }
-
-        // If no marker but there was whitespace, remove trailing whitespace
-        if trimmed.len() < original_len {
-            result = trimmed.to_string();
-            continue;
-        }
-
-        // If nothing changed, we're done
-        break;
     }
 
     result
@@ -4261,6 +4254,35 @@ Let me check the result."#;
     }
 
     #[test]
+    fn strip_trailing_terminal_markers_preserves_unmarked_whitespace() {
+        // No marker present: trailing whitespace is ordinary text and must be
+        // preserved, matching the streaming path which never trims whitespace
+        // that is not part of a marker suffix.
+        assert_eq!(strip_trailing_terminal_markers("Answer\n"), "Answer\n");
+        assert_eq!(strip_trailing_terminal_markers("Answer  "), "Answer  ");
+        assert_eq!(
+            strip_trailing_terminal_markers("Plain response\n\n"),
+            "Plain response\n\n"
+        );
+    }
+
+    #[test]
+    fn strip_trailing_terminal_markers_whitespace_before_marker() {
+        // Whitespace BEFORE a recognized marker belongs to the response text
+        // and is preserved, matching the streaming stripper ("Answer\n<eom>"
+        // streams as "Answer\n"). Only the marker itself (plus any whitespace
+        // that followed it) is removed.
+        assert_eq!(
+            strip_trailing_terminal_markers("Summary  <eom>"),
+            "Summary  "
+        );
+        assert_eq!(
+            strip_trailing_terminal_markers("Summary \n\t<|eom|>"),
+            "Summary \n\t"
+        );
+    }
+
+    #[test]
     fn strip_trailing_terminal_markers_stacked() {
         assert_eq!(
             strip_trailing_terminal_markers("Summary<eom><|eom|>"),
@@ -4303,7 +4325,9 @@ Let me check the result."#;
     #[test]
     fn strip_trailing_terminal_markers_empty() {
         assert_eq!(strip_trailing_terminal_markers(""), "");
-        assert_eq!(strip_trailing_terminal_markers("   "), "");
+        // Pure whitespace with no marker is ordinary text and is preserved,
+        // matching the streaming path (which never trims unmarked whitespace).
+        assert_eq!(strip_trailing_terminal_markers("   "), "   ");
         assert_eq!(strip_trailing_terminal_markers("<eom>"), "");
     }
 
