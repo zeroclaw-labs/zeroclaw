@@ -2030,7 +2030,7 @@ fn auto_detect_heartbeat_channel(config: &Config) -> Option<(String, String)> {
     // channel block).
     if !config.channels.telegram.is_empty() {
         for alias in config.channels.telegram.keys() {
-            let peers = config.channel_external_peers("telegram", alias);
+            let peers = config.channel_addressable_peers("telegram", alias);
             if let Some(target) = peers.into_iter().next() {
                 return Some(("telegram".to_string(), target));
             }
@@ -2765,6 +2765,49 @@ mod tests {
         let config = Config::default();
         let target = auto_detect_heartbeat_channel(&config);
         assert!(target.is_none());
+    }
+
+    #[test]
+    fn auto_detect_skips_peers_that_are_not_addresses() {
+        use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
+
+        // The resolved peer list answers "who is authorized", so it carries a
+        // wildcard and the deny markers for `ignore`. Neither is somewhere a
+        // heartbeat can be sent, and an ignored peer least of all.
+        let mut config = Config::default();
+        config.channels.telegram.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::TelegramConfig {
+                enabled: true,
+                bot_token: "bot-token".into(),
+                api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
+                stream_mode: zeroclaw_config::schema::StreamMode::default(),
+                draft_update_interval_ms: 1000,
+                interrupt_on_new_message: false,
+                mention_only: false,
+                ack_reactions: None,
+                proxy_url: None,
+                approval_timeout_secs: 120,
+                excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
+                debounce_ms: None,
+            },
+        );
+        config.peer_groups.insert(
+            "telegram_default".to_string(),
+            PeerGroupConfig {
+                channel: "telegram".into(),
+                external_peers: vec![PeerUsername::new("*"), PeerUsername::new("user123")],
+                ignore: vec![PeerUsername::new("user123")],
+                ..PeerGroupConfig::default()
+            },
+        );
+
+        assert!(
+            auto_detect_heartbeat_channel(&config).is_none(),
+            "a wildcard and an ignored peer leave no heartbeat target"
+        );
     }
 
     #[cfg(unix)]

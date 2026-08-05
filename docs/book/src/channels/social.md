@@ -6,9 +6,15 @@ Broadcast / social-feed integrations. These differ from chat channels in two way
 
 ## Bluesky (AT Protocol)
 
+{{#peer-group bluesky}}
+
 - **Auth:** Bluesky app-password (not your real password). Create one in settings.
+- **Inbound:** `mention` and `reply` notifications, from peers only.
 - **Outbound:** 300-character posts; longer responses auto-thread.
 - **Protocol:** AT Protocol via the `atrium-api` crate.
+
+A peer entry may be either the handle or the DID. Prefer the DID if you want the
+entry to survive the account renaming itself.
 
 ## Nostr
 
@@ -30,9 +36,15 @@ Broadcast / social-feed integrations. These differ from chat channels in two way
 
 ## Reddit
 
+{{#peer-group reddit}}
+
 - **Auth:** OAuth 2.0 with a refresh token. Generate one with a script-type Reddit app and the `password` or `code` flow.
-- **Inbound:** new posts and comments in the configured subreddits (or all subreddits the bot has access to when `subreddits` is empty), plus replies to the agent's own posts.
+- **Inbound:** the unread inbox, which is mentions, comment replies and DMs. Every item must come from a peer.
 - **Outbound:** posts, comments, private messages.
+
+`subreddits` narrows *where* an item may come from; the peer set decides *who*
+may send one. Both apply, and neither substitutes for the other. A DM carries no
+subreddit, so `subreddits` cannot filter it and the peer set is the only gate.
 
 ---
 
@@ -40,7 +52,7 @@ Broadcast / social-feed integrations. These differ from chat channels in two way
 
 Bots on public social networks attract adversarial input. Two precautions:
 
-1. **Restrict who the agent will respond to.** Gate inbound senders with a peer group (per channel, above): an empty peer set denies everyone, `["*"]` accepts anyone. Bluesky has no peer-group sender field; gate at the autonomy / tool layer instead.
+1. **Restrict who the agent will respond to.** Gate inbound senders with a peer group (per channel, above): an empty peer set denies everyone, `["*"]` accepts anyone. This applies to every social channel, so an enabled channel with no peer group configured answers no one until you populate it.
 2. **Keep autonomy level at `Supervised` or lower.** A public-facing agent in `Full` autonomy is effectively a public shell. For public-facing channels, restrict the tool surface in the global tool-policy config rather than expecting per-channel `tools_allow` (no such per-channel field exists).
 
 ## Rate limits and backoff

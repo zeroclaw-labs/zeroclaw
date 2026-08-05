@@ -678,7 +678,7 @@ impl WeChatChannel {
         let cdn_base_url = https_base_url("cdn_base_url", cdn_base_url, CDN_BASE_URL)?;
 
         let alias = alias.into();
-        let has_peers = !peer_resolver().is_empty();
+        let has_peers = crate::allowlist::grants_anyone(&peer_resolver());
         let pairing = if has_peers {
             None
         } else {

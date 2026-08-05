@@ -722,7 +722,9 @@ impl LineChannel {
 
         let alias = alias.into();
         let configured_peers = peer_resolver();
-        let pairing = if dm_policy == LineDmPolicy::Pairing && configured_peers.is_empty() {
+        let pairing = if dm_policy == LineDmPolicy::Pairing
+            && !crate::allowlist::grants_anyone(&configured_peers)
+        {
             let guard = PairingGuard::new(true, &[]);
             if let Some(code) = guard.pairing_code() {
                 // Mirror Telegram/WeChat: a backgrounded daemon discards

@@ -607,7 +607,7 @@ impl TelegramChannel {
         mention_only: bool,
     ) -> Self {
         let alias = alias.into();
-        let has_peers = !peer_resolver().is_empty();
+        let has_peers = crate::allowlist::grants_anyone(&peer_resolver());
         let pairing = if has_peers {
             None
         } else {
@@ -968,6 +968,15 @@ impl TelegramChannel {
             .as_ref()
             .and_then(PairingGuard::pairing_code)
             .is_some()
+    }
+
+    /// Whether any peer group has authorized someone on this channel.
+    ///
+    /// Grants only. The resolved list also carries the denies for `ignore`, so a
+    /// config holding nothing but denies has authorized no one and the channel is
+    /// still unpaired.
+    fn has_authorized_peer(&self) -> bool {
+        crate::allowlist::grants_anyone(&(self.peer_resolver)())
     }
 
     /// Build the operator-facing `zeroclaw channel bind-telegram` command for
@@ -1482,21 +1491,36 @@ impl TelegramChannel {
         Some(Self::normalize_incoming_content(caption, bot_username))
     }
 
+    /// Single-identifier convenience kept for the unit tests; the polling
+    /// path authorizes the whole identity set at once.
+    #[cfg(test)]
     fn is_user_allowed(&self, username: &str) -> bool {
-        let identity = Self::normalize_identity(username);
+        self.is_any_user_allowed([username])
+    }
+
+    /// A Telegram sender is known by both a username and a numeric ID, so they
+    /// are evaluated together against one snapshot of the peer list. Asking per
+    /// identifier lets a deny on one be defeated by a wildcard reached through
+    /// the other.
+    fn is_any_user_allowed<'a, I>(&self, identities: I) -> bool
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let owned: Vec<String> = identities
+            .into_iter()
+            .map(Self::normalize_identity)
+            .collect();
+        let identities: Vec<&str> = owned.iter().map(String::as_str).collect();
         let peers: Vec<String> = (self.peer_resolver)()
             .into_iter()
             .map(|p| Self::normalize_identity(&p))
             .filter(|p| !p.is_empty())
             .collect();
-        crate::allowlist::is_user_allowed(&peers, &identity, crate::allowlist::Match::Sensitive)
-    }
-
-    fn is_any_user_allowed<'a, I>(&self, identities: I) -> bool
-    where
-        I: IntoIterator<Item = &'a str>,
-    {
-        identities.into_iter().any(|id| self.is_user_allowed(id))
+        crate::allowlist::is_identity_allowed(
+            &peers,
+            &identities,
+            crate::allowlist::Match::Sensitive,
+        )
     }
 
     async fn handle_unauthorized_message(&self, update: &serde_json::Value) {
@@ -1675,7 +1699,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         // unpaired. Once peers exist (resolved live), the one-time code is
         // moot and the hint just confuses an operator who already authorized
         // someone — the "already assigned but still asks" complaint.
-        if self.pairing_code_active() && (self.peer_resolver)().is_empty() {
+        if self.pairing_code_active() && !self.has_authorized_peer() {
             let _ = self
                 .send(&SendMessage::new(
                     "ℹ️ If the operator provides a one-time pairing code, you can also run `/bind <code>`.",
@@ -4876,6 +4900,29 @@ mod tests {
     }
 
     #[test]
+    fn telegram_deny_on_one_identity_is_not_defeated_by_the_other() {
+        // A sender is authorized from its username and its numeric ID, so a
+        // deny naming either must not lose to the wildcard on the other.
+        let mention_only = false;
+        let ch = TelegramChannel::new(
+            "t".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into(), "!alice".into()]),
+            mention_only,
+        );
+        assert!(!ch.is_any_user_allowed(["alice", "123456789"]));
+        assert!(ch.is_any_user_allowed(["bob", "987654321"]));
+
+        let ch = TelegramChannel::new(
+            "t".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into(), "!123456789".into()]),
+            mention_only,
+        );
+        assert!(!ch.is_any_user_allowed(["alice", "123456789"]));
+    }
+
+    #[test]
     fn telegram_user_allowed_by_numeric_id_identity() {
         let mention_only = false;
         let ch = TelegramChannel::new(
@@ -4921,6 +4968,22 @@ mod tests {
             mention_only,
         );
         assert!(!ch.pairing_code_active());
+    }
+
+    #[test]
+    fn telegram_pairing_stays_active_when_only_denies_are_configured() {
+        // The resolved peer list carries a deny for every `ignore` entry, so a
+        // config with `ignore` and no grant resolves non-empty while having
+        // authorized nobody. Reading that as "already paired" would leave the
+        // operator unable to pair at all.
+        let ch = TelegramChannel::new(
+            "t".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["!alice".into()]),
+            false,
+        );
+        assert!(ch.pairing_code_active());
+        assert!(!ch.has_authorized_peer());
     }
 
     #[test]

@@ -74,14 +74,17 @@ pub(crate) fn merge_external_peer(
     }
 
     // Already authorized through any group the reader matches (including
-    // type-wide groups)? Then there is nothing to persist. This reuses the
-    // reader itself, so writer and reader cannot disagree about what
-    // "already authorized" means.
-    if cfg
-        .channel_external_peers(channel_type, alias)
-        .iter()
-        .any(|peer| peer == normalized)
-    {
+    // type-wide groups)? Then there is nothing to persist. This asks the same
+    // question the runtime asks, through the same helper, so writer and reader
+    // cannot disagree about what "already authorized" means. Comparing the
+    // resolved entries by string would not: a grant this identity matches may
+    // sit alongside an `ignore` that denies it, and pairing must not report an
+    // ignored identity as authorized.
+    if crate::allowlist::is_user_allowed(
+        &cfg.channel_external_peers(channel_type, alias),
+        normalized,
+        crate::allowlist::Match::CaseInsensitive,
+    ) {
         return Ok(false);
     }
 
@@ -496,6 +499,32 @@ mod tests {
             "already authorized via the type-wide group"
         );
         assert_eq!(config.peer_groups.len(), 1, "no new group created");
+    }
+
+    #[test]
+    fn merge_does_not_treat_an_ignored_identity_as_already_authorized() {
+        use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
+        use zeroclaw_config::providers::ChannelRef;
+
+        // The resolved list carries grants and denies together, so a grant this
+        // identity matches can sit beside an `ignore` that denies it. Comparing
+        // the entries by string would find the grant and report the identity as
+        // already authorized, which is the opposite of the truth.
+        let mut config = config_with_whatsapp("admin");
+        config.peer_groups.insert(
+            "whatsapp_everyone".to_string(),
+            PeerGroupConfig {
+                channel: ChannelRef::new("whatsapp".to_string()),
+                external_peers: vec![PeerUsername::new("+15551234567".to_string())],
+                ignore: vec![PeerUsername::new("+15551234567".to_string())],
+                ..Default::default()
+            },
+        );
+
+        assert!(
+            merge_external_peer(&mut config, "whatsapp", "admin", "+15551234567").unwrap(),
+            "an ignored identity is not authorized, so pairing has work to do"
+        );
     }
 
     #[tokio::test]
