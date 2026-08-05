@@ -1,25 +1,38 @@
-workspace_dir = "/zeroclaw-data/workspace"
-config_path = "/zeroclaw-data/.zeroclaw/config.toml"
-# API key: set via .env or environment variable at runtime
-api_key = "http://host.docker.internal:11434"
-default_provider = "ollama"
-default_model = "llama3.2"
-default_temperature = 0.7
+schema_version = 3
+
+# Ollama runs on the host. This is an endpoint, not a bearer credential.
+[providers.models.ollama.default]
+model = "llama3.2"
+uri = "http://host.docker.internal:11434"
+temperature = 0.7
+
+[agents.default]
+enabled = true
+model_provider = "ollama.default"
+risk_profile = "default"
+runtime_profile = "default"
+
+[agents.default.workspace]
+path = "/zeroclaw-data/workspace"
+
+[risk_profiles.default]
+level = "supervised"
+auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory_store", "web_search_tool", "web_fetch", "calculator", "glob_search", "content_search", "image_info", "git_operations"]
+
+[runtime_profiles.default]
+max_tool_iterations = 50
+max_tool_result_chars = 50000
+max_context_tokens = 32000
+
+[runtime_profiles.default.context_compression]
+enabled = false
+tool_result_retrim_chars = 2000
 
 [gateway]
 port = 42617
 host = "[::]"
 allow_public_bind = true
 require_pairing = false
-
-[agent]
-max_tool_iterations = 50
-max_tool_result_chars = 50000
-max_context_tokens = 32000
-
-[agent.context_compression]
-enabled = false
-tool_result_retrim_chars = 2000
 
 [memory]
 backend = "sqlite"
@@ -28,7 +41,3 @@ hygiene_enabled = true
 archive_after_days = 7
 purge_after_days = 30
 embedding_provider = "none"
-
-[autonomy]
-level = "supervised"
-auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory_store", "web_search_tool", "web_fetch", "calculator", "glob_search", "content_search", "image_info", "git_operations"]

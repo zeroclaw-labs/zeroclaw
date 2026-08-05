@@ -60,4 +60,12 @@ mod tests {
         // is_alphanumeric() treats unicode letters/digits as alphanumeric.
         assert_eq!(sanitize_session_key("user_Алиса"), "user_Алиса");
     }
+
+    #[test]
+    fn replaces_path_separator_characters() {
+        assert_eq!(
+            sanitize_session_key("../tenant\\user/channel"),
+            "___tenant_user_channel"
+        );
+    }
 }

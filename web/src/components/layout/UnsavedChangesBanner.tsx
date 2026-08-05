@@ -11,6 +11,7 @@ import { Save, X } from 'lucide-react';
 import { Button } from '@/components/ui';
 import { t } from '@/lib/i18n';
 import { ApiError, getSections, type ValidationWarning } from '@/lib/api';
+import { validationWarningMessage } from '@/lib/validationWarnings';
 import {
   useConfigDirtyCount,
   useConfigDirtySections,
@@ -128,7 +129,7 @@ export default function UnsavedChangesBanner() {
         <ul className="text-xs flex flex-col gap-0.5 text-pc-text-secondary">
           {warnings.map((w, i) => (
             <li key={`${w.path}-${i}`}>
-              ⚠ {w.path}: {w.message}
+              ⚠ {w.path}: {validationWarningMessage(w)}
             </li>
           ))}
         </ul>

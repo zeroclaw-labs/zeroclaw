@@ -985,6 +985,7 @@ Write it.
                     max_length: None,
                 },
             ],
+            always: false,
             location: None,
         };
         let mapped = map_skill_slash_options(&skill);
@@ -1022,6 +1023,7 @@ Write it.
             tools: Vec::new(),
             prompts: Vec::new(),
             slash_options,
+            always: false,
             location: None,
         }
     }
