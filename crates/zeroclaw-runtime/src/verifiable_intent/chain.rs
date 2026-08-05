@@ -11,17 +11,17 @@
 //! constraint here: every value is derived from verified layer data.
 
 use crate::verifiable_intent::crypto::{
-    b64u_decode, jws_decode_header, jws_decode_payload, jws_verify, jwk_to_public_bytes,
+    b64u_decode, jwk_to_public_bytes, jws_decode_header, jws_decode_payload, jws_verify,
     parse_sd_jwt, sd_hash,
 };
 use crate::verifiable_intent::error::{ViError, ViErrorKind};
 use crate::verifiable_intent::types::{
-    CheckoutL3Mandate, Constraint, CredentialChain, Cnf, Entity, Fulfillment, FulfillmentLineItem,
-    Jwk, Layer1, MandateMode, PaymentL3Mandate, PaymentInstrument,
+    CheckoutL3Mandate, Cnf, Constraint, CredentialChain, Entity, Fulfillment, FulfillmentLineItem,
+    Jwk, Layer1, MandateMode, PaymentInstrument, PaymentL3Mandate,
 };
 use crate::verifiable_intent::verification::{
-    check_constraints, infer_mode_from_vct, verify_checkout_hash_binding,
-    verify_l3_cross_reference, verify_sd_hash_binding, verify_timestamps, StrictnessMode,
+    StrictnessMode, check_constraints, infer_mode_from_vct, verify_checkout_hash_binding,
+    verify_l3_cross_reference, verify_sd_hash_binding, verify_timestamps,
 };
 
 /// A serialized credential chain, layer by layer.
@@ -106,7 +106,8 @@ pub fn verify_chain(
     let _ = l1_disclosures; // L1 disclosures are not consumed by the verifier.
 
     // ── L2: user-signed KB-SD-JWT binding the L1 ─────────────────────
-    let (l2_issuer, l2_disclosures, l2_kb) = parse_sd_jwt(req.serialized_l2).map_err(|e| vec![e])?;
+    let (l2_issuer, l2_disclosures, l2_kb) =
+        parse_sd_jwt(req.serialized_l2).map_err(|e| vec![e])?;
     // The L2 issuer segment is the L1 JWS (the full serialized L1 is nested
     // inside L2 with its own `~` separators). The authoritative binding
     // between the layers is the `sd_hash` claim, verified below; the issuer
@@ -174,10 +175,7 @@ pub fn verify_chain(
         if !bound_sd_hashes.contains(&d.hash) {
             errors.push(ViError::new(
                 ViErrorKind::SdHashMismatch,
-                format!(
-                    "disclosure '{}' hash not bound in L2 _sd",
-                    d.claim_name
-                ),
+                format!("disclosure '{}' hash not bound in L2 _sd", d.claim_name),
             ));
         }
     }
@@ -219,52 +217,52 @@ pub fn verify_chain(
     }
 
     // ── Mode-specific mandate pairing ────────────────────────────────
-    let (constraints, l2_cnf) = match mode {
-        MandateMode::Autonomous => {
-            let c_checkout: Cnf =
-                serde_json::from_value(checkout.get("cnf").cloned().unwrap_or_default())
-                    .map_err(|e| {
-                        vec![ViError::new(
-                            ViErrorKind::ModeMismatch,
-                            format!("checkout mandate cnf parse: {e}"),
-                        )]
-                    })?;
-            let c_payment: Cnf =
-                serde_json::from_value(payment.get("cnf").cloned().unwrap_or_default()).map_err(
-                    |e| {
-                        vec![ViError::new(
-                            ViErrorKind::ModeMismatch,
-                            format!("payment mandate cnf parse: {e}"),
-                        )]
-                    },
-                )?;
-            if c_checkout != c_payment {
-                return Err(vec![ViError::new(
-                    ViErrorKind::ModeMismatch,
-                    "checkout and payment mandates must bind the same agent key (cnf mismatch)",
-                )]);
+    let (constraints, l2_cnf) =
+        match mode {
+            MandateMode::Autonomous => {
+                let c_checkout: Cnf =
+                    serde_json::from_value(checkout.get("cnf").cloned().unwrap_or_default())
+                        .map_err(|e| {
+                            vec![ViError::new(
+                                ViErrorKind::ModeMismatch,
+                                format!("checkout mandate cnf parse: {e}"),
+                            )]
+                        })?;
+                let c_payment: Cnf =
+                    serde_json::from_value(payment.get("cnf").cloned().unwrap_or_default())
+                        .map_err(|e| {
+                            vec![ViError::new(
+                                ViErrorKind::ModeMismatch,
+                                format!("payment mandate cnf parse: {e}"),
+                            )]
+                        })?;
+                if c_checkout != c_payment {
+                    return Err(vec![ViError::new(
+                        ViErrorKind::ModeMismatch,
+                        "checkout and payment mandates must bind the same agent key (cnf mismatch)",
+                    )]);
+                }
+                let constraints: Vec<Constraint> =
+                    serde_json::from_value(payment.get("constraints").cloned().unwrap_or_default())
+                        .map_err(|e| {
+                            vec![ViError::new(
+                                ViErrorKind::InvalidPayload,
+                                format!("payment constraints parse: {e}"),
+                            )]
+                        })?;
+                (constraints, c_checkout)
             }
-            let constraints: Vec<Constraint> =
-                serde_json::from_value(payment.get("constraints").cloned().unwrap_or_default())
-                    .map_err(|e| {
-                        vec![ViError::new(
-                            ViErrorKind::InvalidPayload,
-                            format!("payment constraints parse: {e}"),
-                        )]
-                    })?;
-            (constraints, c_checkout)
-        }
-        MandateMode::Immediate => {
-            // Immediate mode: no cnf in the mandates (per spec).
-            if checkout.get("cnf").is_some() || payment.get("cnf").is_some() {
-                return Err(vec![ViError::new(
-                    ViErrorKind::ModeMismatch,
-                    "Immediate mode mandates must not carry cnf",
-                )]);
+            MandateMode::Immediate => {
+                // Immediate mode: no cnf in the mandates (per spec).
+                if checkout.get("cnf").is_some() || payment.get("cnf").is_some() {
+                    return Err(vec![ViError::new(
+                        ViErrorKind::ModeMismatch,
+                        "Immediate mode mandates must not carry cnf",
+                    )]);
+                }
+                (Vec::new(), l1.cnf.clone())
             }
-            (Vec::new(), l1.cnf.clone())
-        }
-    };
+        };
 
     // ── L3 verification (Autonomous only) ────────────────────────────
     let mut l3a: Option<PaymentL3Mandate> = None;
@@ -415,13 +413,12 @@ fn resolve_disclosures(raw: &[&str]) -> Result<Vec<Disclosure>, ViError> {
             continue;
         }
         let bytes = b64u_decode(d)?;
-        let arr: Vec<serde_json::Value> =
-            serde_json::from_slice(&bytes).map_err(|e| {
-                ViError::new(
-                    ViErrorKind::InvalidDisclosure,
-                    format!("disclosure JSON: {e}"),
-                )
-            })?;
+        let arr: Vec<serde_json::Value> = serde_json::from_slice(&bytes).map_err(|e| {
+            ViError::new(
+                ViErrorKind::InvalidDisclosure,
+                format!("disclosure JSON: {e}"),
+            )
+        })?;
         if arr.len() != 3 {
             return Err(ViError::new(
                 ViErrorKind::InvalidDisclosure,
@@ -464,9 +461,10 @@ fn build_fulfillment(
             let mut f = Fulfillment::default();
             for d in resolved {
                 if d.claim_name == "payment_mandate" {
-                    let payee: Option<Entity> =
-                        serde_json::from_value(d.claim_value.get("payee").cloned().unwrap_or_default())
-                            .ok();
+                    let payee: Option<Entity> = serde_json::from_value(
+                        d.claim_value.get("payee").cloned().unwrap_or_default(),
+                    )
+                    .ok();
                     let instrument: Option<PaymentInstrument> = serde_json::from_value(
                         d.claim_value
                             .get("payment_instrument")
@@ -487,10 +485,7 @@ fn build_fulfillment(
                 }
                 if d.claim_name == "checkout_mandate" {
                     let line_items: Option<Vec<FulfillmentLineItem>> = serde_json::from_value(
-                        d.claim_value
-                            .get("line_items")
-                            .cloned()
-                            .unwrap_or_default(),
+                        d.claim_value.get("line_items").cloned().unwrap_or_default(),
                     )
                     .ok();
                     f.line_items = line_items;

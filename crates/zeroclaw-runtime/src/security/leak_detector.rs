@@ -613,12 +613,7 @@ const BASE58_ALPHABET: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmno
 
 /// Whether `s` consists entirely of base58 characters.
 fn is_base58(s: &str) -> bool {
-    !s.is_empty()
-        && s.bytes().all(|b| {
-            BASE58_ALPHABET
-                .iter()
-                .any(|&a| a == b)
-        })
+    !s.is_empty() && s.bytes().all(|b| BASE58_ALPHABET.iter().any(|&a| a == b))
 }
 
 /// Whether `s` is a Solana public identifier:
@@ -1430,8 +1425,7 @@ MIIEowIBAAKCAQEA0ZPr5JeyVDonXsKhfq...
     // ── Solana identifier allowlist (issue #9486) ────────────────────
 
     // Real Solana testnet address (base58, 44 chars).
-    const SOLANA_ADDRESS: &str =
-        "7RJWhvQBQPEjJmki5fhBboGBWRJhmcFkMvrr4Fu3tMSJ";
+    const SOLANA_ADDRESS: &str = "7RJWhvQBQPEjJmki5fhBboGBWRJhmcFkMvrr4Fu3tMSJ";
     // Real Solana transaction signature shape (88 base58 chars).
     const SOLANA_TX_SIG: &str =
         "h82pJGF9p7kpzb6eU326EFZf2cDnimbTFVeJtx1qtBmUNJAEqN76R7PwPfHt3oWb8R6cKvhgyxQdDn53jFrK6wFx";
@@ -1444,10 +1438,7 @@ MIIEowIBAAKCAQEA0ZPr5JeyVDonXsKhfq...
             is_high_entropy_candidate(SOLANA_ADDRESS, 3.5 + 0.7 * 1.25),
             "test address must be high-entropy to be a meaningful regression"
         );
-        let content = format!(
-            "Send the payment to {} on Solana",
-            SOLANA_ADDRESS
-        );
+        let content = format!("Send the payment to {} on Solana", SOLANA_ADDRESS);
         match detector.scan(&content) {
             LeakResult::Clean => {}
             LeakResult::Detected { redacted, .. } => {
@@ -1462,10 +1453,7 @@ MIIEowIBAAKCAQEA0ZPr5JeyVDonXsKhfq...
     #[test]
     fn solana_tx_signature_is_not_redacted_by_default() {
         let detector = LeakDetector::new();
-        let content = format!(
-            "Settled: https://solscan.io/tx/{}",
-            SOLANA_TX_SIG
-        );
+        let content = format!("Settled: https://solscan.io/tx/{}", SOLANA_TX_SIG);
         match detector.scan(&content) {
             LeakResult::Clean => {}
             LeakResult::Detected { redacted, .. } => {
@@ -1503,10 +1491,7 @@ MIIEowIBAAKCAQEA0ZPr5JeyVDonXsKhfq...
         let mut config = LeakDetectionConfig::default();
         config.solana_identifiers = false;
         let detector = LeakDetector::with_config(&config);
-        let content = format!(
-            "Send the payment to {} on Solana",
-            SOLANA_ADDRESS
-        );
+        let content = format!("Send the payment to {} on Solana", SOLANA_ADDRESS);
         match detector.scan(&content) {
             LeakResult::Detected { redacted, .. } => {
                 assert!(

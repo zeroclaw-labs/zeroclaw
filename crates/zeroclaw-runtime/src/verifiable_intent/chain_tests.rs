@@ -3,14 +3,16 @@
 
 use ring::signature::EcdsaKeyPair;
 
-use crate::verifiable_intent::chain::{verify_chain, ChainVerifyRequest};
-use crate::verifiable_intent::crypto::{generate_ec_p256, jwk_to_public_bytes, load_key_pair, sd_hash};
+use crate::verifiable_intent::chain::{ChainVerifyRequest, verify_chain};
+use crate::verifiable_intent::crypto::{
+    generate_ec_p256, jwk_to_public_bytes, load_key_pair, sd_hash,
+};
 use crate::verifiable_intent::error::ViErrorKind;
 use crate::verifiable_intent::issuance::{
     create_layer2_autonomous, create_layer3_checkout, create_layer3_payment,
 };
 use crate::verifiable_intent::types::{
-    CheckoutL3Mandate, Constraint, Cnf, Entity, FulfillmentLineItem, Jwk, OpenCheckoutMandate,
+    CheckoutL3Mandate, Cnf, Constraint, Entity, FulfillmentLineItem, Jwk, OpenCheckoutMandate,
     OpenPaymentMandate, PaymentAmount, PaymentInstrument, PaymentL3Mandate,
 };
 use crate::verifiable_intent::verification::StrictnessMode;
@@ -188,7 +190,10 @@ fn valid_autonomous_chain_verifies() {
         serialized_l3b: Some(&chain.serialized_l3b),
     };
     let result = verify_chain(&req, &chain.issuer_jwk, StrictnessMode::Strict).unwrap();
-    assert_eq!(result.fulfillment.payee.as_ref().unwrap().id, Some("solana:contractor-alice".into()));
+    assert_eq!(
+        result.fulfillment.payee.as_ref().unwrap().id,
+        Some("solana:contractor-alice".into())
+    );
     assert_eq!(result.fulfillment.amount, Some(250));
     assert_eq!(result.constraints.len(), 2);
     let _ = jwk_to_public_bytes(&chain.agent_jwk).unwrap();
@@ -211,7 +216,13 @@ fn tampered_l3a_signature_is_rejected() {
     let mutated: String = tail
         .chars()
         .enumerate()
-        .map(|(i, c)| if i == 0 { if c == 'A' { 'B' } else { 'A' } } else { c })
+        .map(|(i, c)| {
+            if i == 0 {
+                if c == 'A' { 'B' } else { 'A' }
+            } else {
+                c
+            }
+        })
         .collect();
     chain.serialized_l3a = format!("{head}{mutated}");
     let req = ChainVerifyRequest {
@@ -245,7 +256,13 @@ fn tampered_l1_signature_is_rejected() {
     let mutated_sig: String = jws_parts[2]
         .chars()
         .enumerate()
-        .map(|(i, c)| if i == 1 { if c == 'A' { 'B' } else { 'A' } } else { c })
+        .map(|(i, c)| {
+            if i == 1 {
+                if c == 'A' { 'B' } else { 'A' }
+            } else {
+                c
+            }
+        })
         .collect();
     let mutated_jws = format!("{}.{}.{}", jws_parts[0], jws_parts[1], mutated_sig);
     chain.serialized_l1 = format!("{mutated_jws}~");
@@ -362,7 +379,8 @@ fn missing_l3_in_autonomous_mode_is_rejected() {
     };
     let errs = verify_chain(&req, &chain.issuer_jwk, StrictnessMode::Strict).unwrap_err();
     assert!(
-        errs.iter().any(|e| e.kind == ViErrorKind::IncompleteMandatePair),
+        errs.iter()
+            .any(|e| e.kind == ViErrorKind::IncompleteMandatePair),
         "expected IncompleteMandatePair, got {errs:?}"
     );
 }

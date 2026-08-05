@@ -223,6 +223,11 @@ mod tests {
         });
         let out = scrub_credentials_value(input);
         assert!(out["api_key"].as_str().unwrap().contains("[REDACTED]"));
-        assert!(out["url"].as_str().unwrap().contains("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"));
+        assert!(
+            out["url"]
+                .as_str()
+                .unwrap()
+                .contains("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
+        );
     }
 }

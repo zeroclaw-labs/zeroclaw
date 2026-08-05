@@ -9,7 +9,7 @@
 //!
 //! Devnet only. No mainnet paths exist in this module.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
@@ -69,7 +69,8 @@ pub fn build_durable_nonce_transfer(
     let advance = system_instruction::advance_nonce_account(&nonce_account, &authority_pubkey);
 
     // Instruction 2: the transfer itself, from the mandate holder to the payee.
-    let transfer = system_instruction::transfer(&authority_pubkey, &payee_pubkey, settlement.lamports);
+    let transfer =
+        system_instruction::transfer(&authority_pubkey, &payee_pubkey, settlement.lamports);
 
     let message = Message::new(&[advance, transfer], Some(&authority_pubkey));
 
