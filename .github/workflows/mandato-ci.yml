@@ -37,6 +37,9 @@ jobs:
       - name: Test the leak detector, incl. Solana allowlist (issue #9486)
         run: cargo test -p zeroclaw-runtime leak_detector
 
+      - name: Test the credential scrubber (spl-token exemption)
+        run: cargo test -p zeroclaw-runtime agent::turn::redact
+
       - name: Build the settlement module (solana-sdk feature)
         run: cargo build -p zeroclaw-runtime --features solana-sdk
 
@@ -48,4 +51,3 @@ jobs:
 
       - name: Clippy on changed surface
         run: cargo clippy -p zeroclaw-runtime --features solana-sdk -- -D warnings
-        continue-on-error: true
