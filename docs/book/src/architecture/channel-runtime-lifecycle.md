@@ -105,10 +105,10 @@ clearest example because slow local models can exceed provider webhook
 timeouts.
 
 That fast acknowledgement requirement should not make the gateway own a
-separate agent lifecycle. Some current gateway-backed handlers still carry
-duplicated `parse -> autosave -> chat -> send` chains. Treat that as migration
-debt and transition context, not as the pattern for new webhook-backed channel
-work. A webhook handler can:
+separate agent lifecycle. The current gateway-backed handlers still use a
+gateway-specific post-verification dispatch path. Treat that as migration debt
+and transition context, not as the target pattern for new webhook-backed
+channel work. A webhook handler follows a fixed order:
 
 1. verify the request;
 2. decode the payload;
@@ -116,10 +116,38 @@ work. A webhook handler can:
 4. choose synchronous or background dispatch;
 5. return the transport-appropriate HTTP response.
 
-The message processing behind step 4 should reuse the channel lifecycle:
-autosave/session policy, agent dispatch, quickstart fallback, reply/error
-delivery, cancellation, and future ingress stamping should not be re-copied
-for each webhook-backed channel.
+For message-dispatching channel webhooks, steps 1 and 4 are structural, not
+conventional. The gateway's `webhook_ingress` module owns an
+authenticated-ingress contract:
+
+- every message-dispatching webhook adapter declares its authentication mode
+  in one registry (`MESSAGE_DISPATCHING_WEBHOOKS`), and drift-guard tests
+  reconcile the gateway route table against that registry;
+- `authenticate` enforces the fail-closed credential policy. A missing,
+  blank, or unresolved required secret refuses the request with `401` before
+  any payload byte is parsed. The provider-specific signature algorithm and
+  header format stay with the transport handler, as a closure that runs only
+  after the credential resolves;
+- a successful check mints a `VerifiedWebhookIngress` proof that carries the
+  verified bytes. The proof cannot be constructed or cloned elsewhere;
+- `dispatch_verified_webhook` is the shared gateway-webhook helper for the
+  current inbound log, session key, autosave, agent dispatch, quickstart
+  fallback, reply/error delivery, and synchronous or fast-ack execution. It
+  consumes the proof, so webhook content cannot enter agent dispatch without
+  a verification result for the same request.
+
+That helper removes the duplicated gateway `parse -> autosave -> chat -> send`
+chains and gives authenticated ingress one enforced chokepoint. It still calls
+the gateway chat path, however, so it is not the shared channel turn lifecycle
+described above. Gateway webhooks still need to converge on that lifecycle for
+hooks, self-loop control, passive context, media/link handling, runtime
+commands, cancellation, reply intent, receipts, and cost tracking. That future
+convergence must preserve the authenticated-ingress proof and each transport's
+synchronous or fast-ack response behavior.
+
+An adapter with no inbound credential mechanism does not get optional
+verification; its registry entry is declared unverifiable and every dispatch
+request is refused. Silent fall-through is not an authentication mode.
 
 When reviewing webhook changes, compare synchronous handlers and fast-ack
 handlers separately:
@@ -128,8 +156,11 @@ handlers separately:
   behavior, autosave keys, and reply delivery;
 - fast-ack handlers must prove the HTTP acknowledgement happens before the
   model call can block the provider timeout;
-- both shapes should avoid adding another `parse -> autosave -> chat -> send`
-  chain if a shared helper can own that work.
+- while the gateway-specific path remains, both shapes must enter dispatch
+  through `dispatch_verified_webhook` rather than adding another
+  `parse -> autosave -> chat -> send` chain. A pinned callsite inventory fails
+  the build when a handler bypasses the authenticated funnel. This requirement
+  does not make the helper the target channel lifecycle.
 
 ## Reload and listener lifecycle
 
