@@ -12,8 +12,18 @@ use regex::Regex;
 use std::sync::LazyLock;
 
 static SENSITIVE_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)(authorization|token|api[_-]?key|password|secret|user[_-]?key|bearer|credential|set[_-]?cookie|cookie)["']?\s*[:=]\s*(?:"([^"]{8,})"|'([^']{8,})'|([a-zA-Z0-9_\-\./+=]{8,}))"#).unwrap()
+    // The optional `spl[-_]` prefix group lets the closure skip Solana Pay's
+    // `spl-token`/`spl_token` keys: without it, the `token` alternative
+    // matches the substring inside the key name and redacts the public mint
+    // address in every payment URL.
+    Regex::new(r#"(?i)((?:spl[-_])?(?:authorization|token|api[_-]?key|password|secret|user[_-]?key|bearer|credential|set[_-]?cookie|cookie))["']?\s*[:=]\s*(?:"([^"]{8,})"|'([^']{8,})'|([a-zA-Z0-9_\-\./+=]{8,}))"#).unwrap()
 });
+
+/// Whether a matched key is a Solana Pay token key that must not be redacted.
+fn is_spl_token_key(key: &str) -> bool {
+    let lowered = key.to_ascii_lowercase();
+    lowered == "spl-token" || lowered == "spl_token"
+}
 
 /// Whether a key names a credential the scrubber must redact.
 /// `spl-token` (Solana Pay) is exempt: it names a public mint address, not a
@@ -33,7 +43,7 @@ pub fn scrub_credentials(input: &str) -> String {
             let key = &caps[1];
             // Solana Pay URLs carry `spl-token=<public mint>`; the key
             // contains "token" but names a public address. Leave it intact.
-            if key.eq_ignore_ascii_case("spl-token") || key.eq_ignore_ascii_case("spl_token") {
+            if is_spl_token_key(key) {
                 return full_match.to_string();
             }
             let val = caps
