@@ -218,6 +218,7 @@ mod tests {
         let map = format_ftl_messages(EN_FTL, "en");
         assert!(map.contains_key("zc-pane-dashboard"));
         assert!(map.contains_key("zc-pane-chat"));
+        assert!(map.contains_key("zc-sidebar-title"));
         let mismatch = format_ftl_message(
             EN_FTL,
             "en",
@@ -259,6 +260,15 @@ mod tests {
             assert!(controls.contains('↑'));
             assert!(controls.contains('↓'));
             assert!(controls.contains("Esc"));
+
+            let picker_error = format_ftl_message(
+                source,
+                locale,
+                "zc-sidebar-picker-error",
+                &[("error", "socket closed")],
+            )
+            .unwrap_or_else(|| panic!("sidebar picker error must format for {locale}"));
+            assert!(picker_error.contains("socket closed"));
         }
     }
 

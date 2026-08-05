@@ -147,7 +147,6 @@ const MODES: &[Mode] = &[
     Mode::Chat,
     Mode::Logs,
     Mode::Doctor,
-    Mode::Quickstart,
 ];
 
 // ── Mode enum ────────────────────────────────────────────────────
@@ -266,11 +265,16 @@ impl Mode {
 
     fn cycle(self, offset: isize) -> Mode {
         let len = MODES.len() as isize;
-        let cur = MODES
-            .iter()
-            .position(|m| *m == self)
-            .expect("mode missing from MODES") as isize;
-        let next = ((cur + offset).rem_euclid(len)) as usize;
+        // Modes outside the nav bar (Quickstart via the sidebar, Sop) cycle
+        // onto a bar edge instead of panicking.
+        let Some(cur) = MODES.iter().position(|m| *m == self) else {
+            return if offset >= 0 {
+                MODES[0]
+            } else {
+                MODES[MODES.len() - 1]
+            };
+        };
+        let next = ((cur as isize + offset).rem_euclid(len)) as usize;
         MODES[next]
     }
 }
@@ -364,6 +368,9 @@ pub async fn run(
     let mut reload_status: Option<String> = None;
     let mut bar_area = Rect::default();
     let mut content_area = Rect::default();
+    let mut sidebar = crate::agent_sidebar::AgentSidebar::from_config_dir(config_dir);
+    // Where Esc from the (sidebar-launched) Quickstart wizard returns to.
+    let mut quickstart_return = Mode::Dashboard;
     let mut reconnect_last_attempt: Option<std::time::Instant> = None;
     let mut ephemeral_respawn_done = false;
     let mut needs_intervention = false;
@@ -382,15 +389,14 @@ pub async fn run(
                 config_app.init().await?;
                 let doctor_pane = doctor::Doctor::new(rpc.clone());
                 let mut acp_pane = acp::Acp::new(rpc.clone());
-                // Carry the pre-disconnect session across a reconnect rebuild so
-                // the rebuilt pane resumes the daemon-retained session
-                // instead of minting a fresh one. None on first build.
-                acp_pane.set_resume_session_id($resume_acp.0);
-                acp_pane.set_resume_agent_alias($resume_acp.1);
+                // Carry the pre-disconnect sessions across a reconnect rebuild
+                // so the rebuilt pane reattaches every daemon-retained session
+                // (focused + sidebar backgrounds) instead of minting a fresh
+                // one. Empty on first build.
+                acp_pane.set_resume_sessions($resume_acp);
                 acp_pane.init().await?;
                 let mut chat_pane = chat::Chat::new(rpc.clone(), chat::PaneKind::Chat);
-                chat_pane.set_resume_session_id($resume_chat.0);
-                chat_pane.set_resume_agent_alias($resume_chat.1);
+                chat_pane.set_resume_sessions($resume_chat);
                 chat_pane.init().await?;
                 let pending_start_chat = take_pending_quickstart_chat(
                     &reconnect_state,
@@ -430,10 +436,127 @@ pub async fn run(
         mut logs_pane,
         mut quickstart,
         mut sop_pane,
-    ) = build_panes!(
-        (None::<String>, None::<String>),
-        (None::<String>, None::<String>)
-    )?;
+    ) = build_panes!(Vec::new(), Vec::new())?;
+
+    // Route one sidebar event: switch to the owning pane's mode and call
+    // into it. A macro (like `build_panes!`) because the routing needs the
+    // same pile of `&mut` locals. Session-touching events are gated on a
+    // live connection; the Quickstart launcher works offline like the mode
+    // bar always has.
+    macro_rules! apply_sidebar_event {
+        ($event:expr, $conn_state:expr) => {{
+            let connected = !matches!($conn_state, ConnectionState::Disconnected { .. });
+            match $event {
+                crate::agent_sidebar::SidebarEvent::FocusSession { pane, session_id }
+                    if connected =>
+                {
+                    let next = match pane {
+                        chat::PaneKind::Chat => Mode::Chat,
+                        chat::PaneKind::Acp => Mode::Acp,
+                    };
+                    switch_mode(
+                        &mut mode,
+                        next,
+                        &$conn_state,
+                        &mut dashboard_pane,
+                        &mut quickstart,
+                        &mut acp_pane,
+                        &mut chat_pane,
+                        &mut sop_pane,
+                    )
+                    .await;
+                    match pane {
+                        chat::PaneKind::Chat => {
+                            chat_pane.focus_session(&session_id).await;
+                        }
+                        chat::PaneKind::Acp => {
+                            acp_pane.focus_session(&session_id).await;
+                        }
+                    }
+                }
+                crate::agent_sidebar::SidebarEvent::CloseSession { pane, session_id }
+                    if connected =>
+                {
+                    match pane {
+                        chat::PaneKind::Chat => {
+                            chat_pane.close_session(&session_id).await;
+                        }
+                        chat::PaneKind::Acp => {
+                            acp_pane.close_session(&session_id).await;
+                        }
+                    }
+                }
+                crate::agent_sidebar::SidebarEvent::OpenPicker if connected => {
+                    // The picker adds to the pane you're in; other modes
+                    // default to Chat.
+                    let target = if mode == Mode::Acp {
+                        chat::PaneKind::Acp
+                    } else {
+                        chat::PaneKind::Chat
+                    };
+                    let summaries = match target {
+                        chat::PaneKind::Chat => chat_pane.session_summaries(),
+                        chat::PaneKind::Acp => acp_pane.session_summaries(),
+                    };
+                    let open_by_alias = summaries
+                        .into_iter()
+                        .map(|s| (s.agent_alias, s.session_id))
+                        .collect();
+                    sidebar.open_picker(target, open_by_alias, &rpc);
+                }
+                crate::agent_sidebar::SidebarEvent::PickAgent {
+                    pane,
+                    alias,
+                    existing_session,
+                } if connected => {
+                    let next = match pane {
+                        chat::PaneKind::Chat => Mode::Chat,
+                        chat::PaneKind::Acp => Mode::Acp,
+                    };
+                    switch_mode(
+                        &mut mode,
+                        next,
+                        &$conn_state,
+                        &mut dashboard_pane,
+                        &mut quickstart,
+                        &mut acp_pane,
+                        &mut chat_pane,
+                        &mut sop_pane,
+                    )
+                    .await;
+                    match (pane, existing_session) {
+                        (chat::PaneKind::Chat, Some(sid)) => {
+                            chat_pane.focus_session(&sid).await;
+                        }
+                        (chat::PaneKind::Chat, None) => {
+                            chat_pane.add_agent_session(&alias).await;
+                        }
+                        (chat::PaneKind::Acp, Some(sid)) => {
+                            acp_pane.focus_session(&sid).await;
+                        }
+                        (chat::PaneKind::Acp, None) => {
+                            acp_pane.add_agent_session(&alias).await;
+                        }
+                    }
+                }
+                crate::agent_sidebar::SidebarEvent::OpenQuickstart if mode != Mode::Quickstart => {
+                    quickstart_return = mode;
+                    switch_mode(
+                        &mut mode,
+                        Mode::Quickstart,
+                        &$conn_state,
+                        &mut dashboard_pane,
+                        &mut quickstart,
+                        &mut acp_pane,
+                        &mut chat_pane,
+                        &mut sop_pane,
+                    )
+                    .await;
+                }
+                _ => {}
+            }
+        }};
+    }
     let mut chrome_status = ChromeStatus::default();
     chrome_status.tick(&rpc);
     let mut pending_event = None;
@@ -443,8 +566,11 @@ pub async fn run(
         let conn_state = rpc.connection_state();
         if matches!(conn_state, ConnectionState::Disconnected { .. }) {
             chrome_status.clear();
+            // The picker's agent list would be stale by reconnect time.
+            sidebar.close_picker();
         } else {
             chrome_status.tick(&rpc);
+            sidebar.drain_picker_fetch();
         }
         let chrome_summary = chrome_status.summary_line();
         doctor_pane.poll_refresh().await;
@@ -460,6 +586,20 @@ pub async fn run(
         if let Some(t) = frame_theme {
             theme::set_active(t);
         }
+
+        // Sidebar rows: Code group first, then Chat, matching the mode bar
+        // order. Derived fresh each frame — the panes own the state.
+        let mut sidebar_rows = acp_pane.session_summaries();
+        sidebar_rows.extend(chat_pane.session_summaries());
+        let sidebar_ctx = crate::agent_sidebar::SidebarCtx {
+            active_pane: match mode {
+                Mode::Acp => Some(chat::PaneKind::Acp),
+                Mode::Chat => Some(chat::PaneKind::Chat),
+                _ => None,
+            },
+            quickstart_active: mode == Mode::Quickstart,
+            connected: !matches!(conn_state, ConnectionState::Disconnected { .. }),
+        };
 
         term.draw(|frame| {
             // Theme backdrop: paint the whole screen with the active
@@ -500,24 +640,31 @@ pub async fn run(
 
             bar_area = chunks[0];
             draw_mode_bar(frame, chunks[0], mode, chrome_summary.as_ref());
-            content_area = chunks[1];
+            // The sidebar carves the left edge of the content row; the mode,
+            // info, and status bars stay full-width. Panes render into (and
+            // hit-test against) the remaining `content_area` untouched.
+            let (sidebar_area, body) = sidebar.carve(chunks[1]);
+            content_area = body;
+            if let Some(sidebar_area) = sidebar_area {
+                sidebar.draw(frame, sidebar_area, &sidebar_rows, &sidebar_ctx);
+            }
 
             match mode {
                 Mode::Dashboard => dashboard_pane.draw(
                     frame,
-                    chunks[1],
+                    content_area,
                     chrome_status.status.as_ref(),
                     chrome_status.health.as_ref(),
                     acp_pane.current_cwd(),
                     chat_pane.current_cwd(),
                 ),
-                Mode::Config => config_app.draw_into(frame, chunks[1]),
-                Mode::Doctor => doctor_pane.draw(frame, chunks[1]),
-                Mode::Acp => acp_pane.draw(frame, chunks[1]),
-                Mode::Chat => chat_pane.draw(frame, chunks[1]),
-                Mode::Logs => logs_pane.draw(frame, chunks[1]),
-                Mode::Quickstart => quickstart.draw(frame, chunks[1]),
-                Mode::Sop => sop_pane.render(frame, chunks[1]),
+                Mode::Config => config_app.draw_into(frame, content_area),
+                Mode::Doctor => doctor_pane.draw(frame, content_area),
+                Mode::Acp => acp_pane.draw(frame, content_area),
+                Mode::Chat => chat_pane.draw(frame, content_area),
+                Mode::Logs => logs_pane.draw(frame, content_area),
+                Mode::Quickstart => quickstart.draw(frame, content_area),
+                Mode::Sop => sop_pane.render(frame, content_area),
             }
 
             let status_idx = if has_info {
@@ -551,6 +698,10 @@ pub async fn run(
                 needs_intervention,
                 browse_mode,
             );
+
+            // Sidebar "+" picker modal: above the panes, below the help and
+            // confirm overlays.
+            sidebar.draw_picker(frame, frame.area());
 
             // Help modal overlay (drawn last so it sits on top).
             if let Some(state) = help_overlay.as_mut() {
@@ -613,14 +764,8 @@ pub async fn run(
                         .await
                     {
                         rpc = Arc::new(new_client);
-                        let resume_chat = (
-                            chat_pane.current_session_id().map(String::from),
-                            chat_pane.current_agent_alias().map(String::from),
-                        );
-                        let resume_acp = (
-                            acp_pane.current_session_id().map(String::from),
-                            acp_pane.current_agent_alias().map(String::from),
-                        );
+                        let resume_chat = chat_pane.resume_entries();
+                        let resume_acp = acp_pane.resume_entries();
                         match build_panes!(resume_chat, resume_acp) {
                             Ok(panes) => {
                                 dashboard_pane = panes.0;
@@ -633,6 +778,7 @@ pub async fn run(
                                 sop_pane = panes.7;
                                 chrome_status.clear();
                                 chrome_status.tick(&rpc);
+                                sidebar.close_picker();
                                 reconnect_last_attempt = None;
                                 ephemeral_respawn_done = false;
                                 needs_intervention = false;
@@ -750,6 +896,7 @@ pub async fn run(
                     help_overlay = None;
                     reload_confirm = false;
                     reload_status = None;
+                    sidebar.close_picker();
                     quit_confirm = true;
                     continue;
                 }
@@ -789,6 +936,21 @@ pub async fn run(
                 if let Some(state) = help_overlay.as_mut() {
                     if global == Some(GlobalAction::Help) || state.handle_key(&key) {
                         help_overlay = None;
+                    }
+                    continue;
+                }
+
+                // Sidebar visibility toggle: a modified chord, so it stays
+                // live inside text inputs like the pane-nav chords.
+                if global == Some(GlobalAction::ToggleSidebar) {
+                    sidebar.toggle(config_dir);
+                    continue;
+                }
+
+                // The "+" picker owns keys while open.
+                if sidebar.picker_open() {
+                    if let Some(event) = sidebar.handle_picker_key(&key) {
+                        apply_sidebar_event!(event, conn_state);
                     }
                     continue;
                 }
@@ -849,9 +1011,16 @@ pub async fn run(
                     _ => {}
                 }
                 if mode == Mode::Quickstart && quickstart.take_leave_request() {
+                    // Return to wherever the sidebar launched the wizard from
+                    // (sanitized: never back into the wizard itself).
+                    let back = if quickstart_return == Mode::Quickstart {
+                        Mode::Dashboard
+                    } else {
+                        quickstart_return
+                    };
                     switch_mode(
                         &mut mode,
-                        Mode::Dashboard,
+                        back,
                         &conn_state,
                         &mut dashboard_pane,
                         &mut quickstart,
@@ -918,6 +1087,20 @@ pub async fn run(
                     && mouse::help_hint_click(mouse.column, mouse.row, content_area)
                 {
                     help_overlay = Some(HelpOverlayState::default());
+                    continue;
+                }
+                // Sidebar "+" picker is modal to the mouse while open; then
+                // clicks and wheel inside the sidebar itself.
+                if sidebar.picker_open() {
+                    if let Some(event) = sidebar.handle_mouse(&mouse) {
+                        apply_sidebar_event!(event, conn_state);
+                    }
+                    continue;
+                }
+                if sidebar.contains(mouse.column, mouse.row) {
+                    if let Some(event) = sidebar.handle_mouse(&mouse) {
+                        apply_sidebar_event!(event, conn_state);
+                    }
                     continue;
                 }
                 // Forward to active pane (skip when disconnected).
@@ -1008,6 +1191,10 @@ fn global_help_entries() -> Vec<HelpEntry> {
             crate::i18n::t("zc-app-help-reload"),
         ),
         HelpEntry::new(
+            action_key_labels(GlobalAction::ToggleSidebar),
+            crate::i18n::t("zc-app-help-toggle-sidebar"),
+        ),
+        HelpEntry::new(
             action_key_labels(GlobalAction::Quit),
             crate::i18n::t("zc-app-help-quit"),
         ),
@@ -1040,7 +1227,9 @@ fn draw_mode_bar(
 ) {
     use ratatui::widgets::Tabs;
 
-    let active_idx = MODES.iter().position(|m| *m == active).unwrap_or(0);
+    // A mode outside the bar (Quickstart via the sidebar, Sop) highlights
+    // no tab rather than falsely lighting the first one.
+    let active_idx = MODES.iter().position(|m| *m == active);
     let titles: Vec<ratatui::text::Line> = MODES
         .iter()
         .map(|m| {
@@ -1883,6 +2072,38 @@ mod tests {
             .expect("request channel should stay open");
         let request: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(request["method"], crate::client::method::STATUS);
+    }
+
+    #[test]
+    fn quickstart_left_the_mode_bar_but_stays_reachable() {
+        assert!(
+            !MODES.contains(&Mode::Quickstart),
+            "Quickstart is launched from the agent sidebar, not the mode bar"
+        );
+    }
+
+    #[test]
+    fn cycle_from_off_bar_modes_lands_on_a_bar_edge() {
+        // Quickstart (sidebar-launched) and Sop are not in MODES; cycling
+        // from them must not panic and must land on a bar edge.
+        assert_eq!(Mode::Quickstart.cycle(1), MODES[0]);
+        assert_eq!(Mode::Quickstart.cycle(-1), MODES[MODES.len() - 1]);
+        assert_eq!(Mode::Sop.cycle(1), MODES[0]);
+        // Regular members still rotate.
+        assert_eq!(MODES[0].cycle(1), MODES[1]);
+        assert_eq!(MODES[0].cycle(-1), MODES[MODES.len() - 1]);
+    }
+
+    #[test]
+    fn global_help_entries_include_sidebar_toggle() {
+        use crate::keymap::{GlobalAction, action_key_labels};
+
+        let entries = global_help_entries();
+        let toggle = entries
+            .iter()
+            .find(|entry| entry.action == crate::i18n::t("zc-app-help-toggle-sidebar"))
+            .expect("global help should list the sidebar toggle");
+        assert_eq!(toggle.keys, action_key_labels(GlobalAction::ToggleSidebar));
     }
 
     #[test]

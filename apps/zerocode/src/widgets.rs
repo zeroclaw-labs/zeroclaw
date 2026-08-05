@@ -268,8 +268,8 @@ impl<'a> InfoBar<'a> {
 
 /// Truncate `s` to at most `width` display columns, appending an ellipsis when
 /// it overflows. Approximates width by `char` count — adequate for the
-/// single-line status text the info bar carries.
-fn truncate_to_width(s: &str, width: usize) -> String {
+/// single-line status text the info bar and sidebar rows carry.
+pub(crate) fn truncate_to_width(s: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
     }
