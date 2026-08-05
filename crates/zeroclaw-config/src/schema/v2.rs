@@ -891,13 +891,15 @@ fn fold_providers_globals_into_models(
 
     // `source_key` is `Some(raw)` only when this fold introduces a *new*
     // producer of the target slot that `alias_provider_models` could not
-    // already know about: an explicit `default_provider` string, or the
-    // synthesized `openrouter` fallback when no models exist at all. When
-    // `default_provider` is absent and the fold instead reuses the first
-    // already-materialized alias family (`aliased_models.keys().next()`),
+    // already know about: an explicit `default_provider` string, the
+    // synthesized `openrouter` fallback when no models exist at all, or a
+    // missing `default` alias created beside an existing non-default alias.
+    // When `default_provider` is absent and the fold overlays an
+    // already-materialized `default` alias (`aliased_models.keys().next()`),
     // that family's raw source(s) are already registered in `provenance` —
     // re-inserting the canonical family name here would count the same
-    // source twice and falsely mark the slot ambiguous.
+    // source twice and falsely mark the slot ambiguous. Only when the target
+    // `default` alias does not yet exist does the fold become the producer.
     let (target_type, target_alias, colon_url, normalized_extras, source_key) =
         match g_default_provider.as_ref().and_then(toml::Value::as_str) {
             Some(s) => {
@@ -906,7 +908,20 @@ fn fold_providers_globals_into_models(
                 (canonical, alias, url, extras, Some(raw_type))
             }
             None => match aliased_models.keys().next() {
-                Some(k) => (k.clone(), "default".to_string(), None, Vec::new(), None),
+                Some(k) => {
+                    let default_existed = aliased_models
+                        .get(k)
+                        .and_then(toml::Value::as_table)
+                        .is_some_and(|t| t.contains_key("default"));
+                    let source_key = (!default_existed).then(|| k.clone());
+                    (
+                        k.clone(),
+                        "default".to_string(),
+                        None,
+                        Vec::new(),
+                        source_key,
+                    )
+                }
                 None => (
                     "openrouter".to_string(),
                     "default".to_string(),
