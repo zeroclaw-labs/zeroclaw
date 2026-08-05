@@ -1,18 +1,4 @@
 //! Structured error type for the gateway HTTP CRUD surface and its CLI peer.
-//!
-//! Every fallible operation against the new per-property endpoints (`/api/config/prop`,
-//! `/api/config/list`, `OPTIONS /api/config*`, `PATCH /api/config`) and the matching
-//! `zeroclaw config` CLI subcommands returns this error type. The `code` field is
-//! a stable string the dashboard / scripts can match programmatically; `message`
-//! is human-readable for terminal output and tooltip text. `path` carries the
-//! offending field (when applicable) so the dashboard can render the error
-//! contextually next to the input.
-//!
-//! This replaces the prior pattern of returning `anyhow::Error` strings that
-//! consumers had to substring-match. Existing `anyhow::bail!(...)` sites in
-//! `Config::validate()` are wrapped via `ConfigApiError::from_validation` —
-//! the friendly text becomes `message`, the code stays generic
-//! (`validation_failed`) until callers refine to a more specific code.
 
 use serde::{Deserialize, Serialize};
 
@@ -32,7 +18,7 @@ pub enum ConfigApiCode {
     /// The daemon-reload step after a successful save failed; on-disk config
     /// has been reverted to the pre-write snapshot to keep state consistent.
     ReloadFailed,
-    /// JSON Patch operation type is not supported in this PR (`move` / `copy`).
+    /// JSON Patch operation type is not supported (`move` / `copy`).
     OpNotSupported,
     /// JSON Patch `test` operation targeted a secret or derived-from-secret
     /// path; rejected to prevent differential value inference.
@@ -139,17 +125,6 @@ impl ConfigApiError {
         self
     }
 
-    /// Wrap an `anyhow::Error` from `Config::validate()` (or similar bail
-    /// sites) into a structured error. The error string becomes `message`;
-    /// the code is best-effort classified by matching the error text against
-    /// known patterns from `Config::validate()`. Unrecognized text falls
-    /// through to `ValidationFailed`.
-    ///
-    /// First tries to downcast — `Config::validate()` and friends now use
-    /// the `validation_bail!` macro to attach a structured `ConfigApiError`
-    /// directly to the anyhow chain. The classifier remains as the
-    /// fallback for any bail sites not yet converted, so the contract
-    /// degrades gracefully across the refactor.
     pub fn from_validation(err: anyhow::Error) -> Self {
         if let Some(structured) = err.downcast_ref::<ConfigApiError>() {
             return structured.clone();
@@ -160,11 +135,6 @@ impl ConfigApiError {
     }
 }
 
-/// Best-effort classify a `Config::validate()` error string into a stable
-/// code. Matches against the specific message text the validator emits today
-/// (`crates/zeroclaw-config/src/schema.rs:10151+`). Adding a new pattern here
-/// is the safe step until `validate()` itself is refactored to return
-/// structured errors per bail site.
 pub fn classify_validation_message(msg: &str) -> ConfigApiCode {
     let lower = msg.to_lowercase();
     if lower.contains("type mismatch") || lower.contains("invalid value") {
@@ -221,24 +191,6 @@ impl std::fmt::Display for ConfigApiError {
 
 impl std::error::Error for ConfigApiError {}
 
-/// Per-bail-site shorthand for emitting a structured `ConfigApiError`
-/// inside a `validate()` chain that returns `anyhow::Result<()>`. Wraps
-/// the structured error as the anyhow source so
-/// `ConfigApiError::from_validation` downcasts to it without having to
-/// re-classify the message text. Pattern:
-///
-/// ```ignore
-/// validation_bail!(
-///     RequiredFieldEmpty,
-///     "gateway.host",
-///     "gateway.host must not be empty",
-/// );
-/// ```
-///
-/// Sites not yet converted still bail through `anyhow::bail!` — the
-/// classifier in `from_validation` covers them as fallback. Migration
-/// is incremental: each PR that touches a `validate()` site swaps the
-/// macro in.
 #[macro_export]
 macro_rules! validation_bail {
     ($code:ident, $path:expr, $($msg:tt)*) => {{

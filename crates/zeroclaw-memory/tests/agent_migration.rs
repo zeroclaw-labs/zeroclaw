@@ -1,18 +1,4 @@
 //! Integration tests for the SQLite multi-agent DB migration.
-//!
-//! Each test exercises the real `SqliteMemory::new` init path against a
-//! fresh `tempfile::TempDir`, which is what the runtime walks in
-//! production. The tests cover:
-//!
-//! - Fresh install: agents table created, default agent inserted with a
-//!   stable UUID, agent_id column present, no backup file emitted (no
-//!   data to back up yet).
-//! - Pre-migration data: existing memory rows get backfilled to the
-//!   default agent's UUID, and an atomic backup file lands in the
-//!   memory directory before the destructive ALTER fires.
-//! - Idempotent re-run: invoking the init path twice on an
-//!   already-migrated DB is a true no-op (no extra agents row, no new
-//!   backup file, the default agent's UUID is preserved).
 
 use rusqlite::{Connection, OptionalExtension};
 use std::path::Path;
@@ -141,14 +127,6 @@ async fn pre_migration_rows_get_backfilled_to_default_agent_with_backup() {
     std::fs::create_dir_all(&memory_dir).expect("memory dir");
     {
         let conn = Connection::open(db_path(workspace.path())).expect("open legacy db");
-        // Mirror the pre-multi-agent schema produced by `init_schema`
-        // (memories + indices + FTS5 virtual table + triggers) so the
-        // production init path's `CREATE VIRTUAL TABLE IF NOT EXISTS`
-        // is a true no-op and nothing about FTS pre-existing trips
-        // the migration. The only difference vs current head is the
-        // missing `agents` table and the missing `agent_id` column on
-        // memories, which is exactly what migrate_multi_agent
-        // adds.
         conn.execute_batch(
             "CREATE TABLE memories (
                 id          TEXT PRIMARY KEY,

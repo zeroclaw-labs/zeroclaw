@@ -63,25 +63,12 @@ fn parse_version(tag: &str) -> Option<Version> {
     })
 }
 
-/// True when a gh-pages root directory name denotes a deployable docs version:
-/// `master` or a `vX.Y.Z[-pre]` tag. `stable` is intentionally NOT a version
-/// dir. Stable resolves to a real version via the committed pointer, never a
-/// duplicate `stable/` tree. A leftover `stable/` from the old layout is treated
-/// as a non-version dir and pruned by `prune_root`. Single source of truth
-/// shared by versions.json generation, root pruning, and selector retrofit.
 pub fn is_version_dir(name: &str) -> bool {
     name == "master" || parse_version(name).is_some()
 }
 
 const ROOT_KEEP_DIRS: &[&str] = &["_shared", "api", ".git"];
 
-/// Remove orphaned root *directories* left over from the pre-versioned docs
-/// layout (e.g. top-level `en/`, `fr/`, `api/`). Keeps the shared chrome dir
-/// and every recognized version dir. Root *files* are never touched — the
-/// orphans are all directories, and a closed file allowlist would silently
-/// delete legitimate root files a future deploy might add (`404.html`,
-/// `robots.txt`, `sitemap.xml`, ...). Operates on the current working
-/// directory (the gh-pages clone root).
 pub fn prune_root() -> anyhow::Result<()> {
     let entries = fs::read_dir(".")?;
     for entry in entries.flatten() {
@@ -109,12 +96,6 @@ fn keep_versions_limit() -> usize {
         .unwrap_or(DEFAULT_KEEP_VERSIONS)
 }
 
-/// Decide which version dirs survive a retention pass. `master` and the stable
-/// pointer target (when present) are always kept, regardless of recency, so the
-/// root redirect and "Stable (latest release)" entry can never point at a pruned
-/// dir. Among the remaining `vX.Y.Z` final releases, the newest `keep` survive;
-/// every pre-release and every older final is dropped. Pure decision over names
-/// so it is unit-testable without touching the filesystem.
 fn retained_versions(present: &[String], keep: usize, stable: Option<&str>) -> Vec<String> {
     let mut kept: Vec<String> = present
         .iter()
@@ -143,12 +124,6 @@ fn retained_versions(present: &[String], keep: usize, stable: Option<&str>) -> V
     kept
 }
 
-/// Retention pass for the ephemeral gh-pages tree: keep `master`, the stable
-/// pointer target, and the newest `DOCS_KEEP_VERSIONS` final releases; remove
-/// every other version dir (other pre-releases and older finals). Non-version
-/// root entries are left to `prune_root`. Operates on the gh-pages clone root.
-/// Every clone pays a roughly linear packed cost per retained version, so
-/// capping the set caps clone size.
 pub fn prune_versions() -> anyhow::Result<()> {
     let keep = keep_versions_limit();
     let mut present = Vec::new();
@@ -174,12 +149,6 @@ pub fn prune_versions() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Inject the shared version-selector script into every deployed version page
-/// that lacks it. Old tags built before the selector existed render without a
-/// version dropdown; this retrofits the `<script>` reference so any deployed
-/// version — past, present, or future — surfaces the dropdown that reads the
-/// root `versions.json`. Idempotent: pages that already reference the selector
-/// are left untouched. Operates on the gh-pages clone root.
 pub fn retrofit_selector() -> anyhow::Result<()> {
     let mut patched = 0usize;
     for entry in fs::read_dir(".")?.flatten() {
@@ -238,11 +207,6 @@ fn retrofit_file(path: &Path) -> anyhow::Result<bool> {
     Ok(true)
 }
 
-/// Relative prefix from `file` (under the gh-pages root) up to the root, where
-/// `_shared/` lives. One `../` per directory level above the file. E.g.
-/// `master/en/index.html` -> `../../`, `v1.2.3/en/a/b.html` -> `../../../`.
-/// Only real path segments count — a leading `./` from `read_dir(".")` must not
-/// inflate the depth, or the injected `_shared` ref would 404.
 fn shared_prefix(file: &Path) -> Option<String> {
     let depth = file
         .components()
@@ -254,12 +218,6 @@ fn shared_prefix(file: &Path) -> Option<String> {
     Some("../".repeat(depth - 1))
 }
 
-/// Resolve the stable tag for the docs site. Source of truth is the committed
-/// pointer `docs/book/stable-version.txt`, copied to the gh-pages root as
-/// `stable-version.txt` at deploy. Running `bump-version` writes it, so it
-/// records the maintainer's explicit "this version is stable" decision rather
-/// than inferring it by numeric comparison. Returns None when absent or when
-/// the pointed-at version dir is not present in the deployed set.
 fn resolve_stable(present: &[String]) -> Option<String> {
     let raw = fs::read_to_string("stable-version.txt").ok()?;
     let tag = raw.trim().to_string();
@@ -269,11 +227,6 @@ fn resolve_stable(present: &[String]) -> Option<String> {
     present.contains(&tag).then_some(tag)
 }
 
-/// Build the versions.json payload from the version dirs present in the gh-pages
-/// root. `master` is labeled Development; the stable tag (from the committed
-/// pointer) is labeled "Stable (latest release)"; all other tags use their bare
-/// tag as label. There is no synthetic `stable` entry or `stable/` dir. Stable
-/// resolves to the real version dir, never a duplicate copy.
 fn build_versions_json(present: &[String], stable: Option<&str>) -> serde_json::Value {
     let min_parsed = env::var("DOCS_MIN_VERSION")
         .ok()

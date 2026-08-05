@@ -9,7 +9,7 @@ The shape mirrors `services.restic.backups` (multi-instance Rust services
 already in nixpkgs), and the hardening profile mirrors `services.atticd`
 (another Rust server in nixpkgs).
 
-This module pairs with the package work in #5987 — the package gives you
+This module pairs with the packaging work — the package gives you
 `pkgs.zeroclaw`, the module gives you `services.zeroclaw.instances.<name>`.
 Either can land first; once both are merged a single-host user can write
 `services.zeroclaw.instances.me = { settings = { ... }; };` and have a

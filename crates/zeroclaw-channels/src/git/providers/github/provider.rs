@@ -1,12 +1,4 @@
 //! `GithubProvider` — GitHub's implementation of the [`GitProvider`] seam.
-//!
-//! Layer: provider composition root. Wraps `auth` (JWT/token), `api`
-//! (REST), and `mapping` (payload→event), and owns every GitHub-specific
-//! quirk so the generic `git` core stays forge-agnostic: installation/slug
-//! discovery, the releases endpoint's missing `since` filter, the
-//! pending-run-aware workflow-runs cursor, and the events-feed
-//! ETag/304/page≥100 backbone. The core calls these per poll tick and per
-//! outbound message; the provider caches auth internally.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -33,12 +25,12 @@ pub struct GithubProvider {
 impl GithubProvider {
     pub fn new(
         app_id: u64,
-        private_key_path: String,
+        private_key_pem: Option<String>,
         installation_id: Option<u64>,
         proxy_url: Option<String>,
     ) -> Self {
         Self {
-            auth: AppAuth::new(app_id, private_key_path),
+            auth: AppAuth::new(app_id, private_key_pem),
             api: GithubApi::new(proxy_url),
             configured_installation: installation_id,
             slug: parking_lot::Mutex::new(None),
@@ -46,7 +38,6 @@ impl GithubProvider {
         }
     }
 
-    /// Swap in an API client pointed at a mock server.
     #[cfg(test)]
     pub(crate) fn with_api(mut self, api: GithubApi) -> Self {
         self.api = api;
@@ -116,19 +107,6 @@ impl GithubProvider {
             if let Some(transition) = mapping::from_pull_transition(&issue, repo) {
                 events.push(transition);
             }
-            // Advance on `updated_at`, the dimension `since` filters and the
-            // endpoint is sorted by (oldest-updated first, see
-            // `list_issues_since`). With all three aligned, the max updated
-            // time in a page is a monotonically forward watermark: every
-            // item at or below it was on this or an earlier page, and the
-            // page cap only defers strictly-newer items to the next tick
-            // rather than starving them. Advancing on `created_at` instead
-            // stalled here: an old item re-updated after the cursor kept
-            // matching `since` while never moving the watermark. Which
-            // events are *dispatched* is unaffected: `is_fresh` gates each
-            // event on its own timestamp (a reopened old issue's opening
-            // post stays below the cold-start floor; a close/merge carries
-            // its recent `closed_at`), independent of this cursor.
             let updated = issue.updated_at();
             advance_to = Some(advance_to.map_or(updated, |m| m.max(updated)));
         }
@@ -388,6 +366,19 @@ impl GitProvider for GithubProvider {
             }
         }
     }
+
+    async fn forge_request(
+        &self,
+        req: crate::git::types::ForgeRequest,
+    ) -> Result<crate::git::types::ForgeResponse, GitChannelError> {
+        let token = self.token().await?;
+        let method = crate::git::providers::forge_method_to_reqwest(req.method);
+        let (status, body) = self
+            .api
+            .forge_call(&token, method, &req.path, req.body.as_ref())
+            .await?;
+        Ok(crate::git::types::ForgeResponse { status, body })
+    }
 }
 
 #[cfg(test)]
@@ -397,15 +388,6 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    // Regression for the capped-pagination livelock: a busy repo can fill
-    // more than one poll's worth of pages with OLD issues/PRs (created long
-    // ago) that keep matching `since` because they were just updated (e.g. a
-    // PR closed/merged after the cursor). Sorting by `created` and advancing
-    // the cursor on `created_at` left the watermark <= `since` forever, so
-    // the page cap refetched the same leading prefix every tick and pages
-    // beyond it were never reached. Sorting by `updated` and advancing on
-    // `updated_at` makes the capped window advance the watermark past itself,
-    // so the next tick reaches later pages instead of starving them.
     #[tokio::test]
     async fn capped_issue_window_advances_cursor_by_updated_at() {
         // Fixed base so timestamps round-trip through RFC 3339 exactly.
@@ -447,7 +429,7 @@ mod tests {
                 .await;
         }
 
-        let provider = GithubProvider::new(0, String::new(), Some(1), None)
+        let provider = GithubProvider::new(0, None, Some(1), None)
             .with_api(GithubApi::with_base(server.uri()));
         let repo = RepoRef::parse("octo/repo").unwrap();
         let page = provider.fetch_issues("t", &repo, start).await.unwrap();

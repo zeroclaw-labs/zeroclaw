@@ -1,19 +1,8 @@
 //! ZeroClaw serial JSON protocol — the firmware contract.
-//!
-//! These types define the newline-delimited JSON wire format shared between
-//! the ZeroClaw host and device firmware (Pico, Arduino, ESP32, Nucleo).
-//!
-//! Wire format:
-//!   Host → Device:  `{"cmd":"gpio_write","params":{"pin":25,"value":1}}\n`
-//!   Device → Host:  `{"ok":true,"data":{"pin":25,"value":1,"state":"HIGH"}}\n`
-//!
-//! Both sides MUST agree on these struct definitions. Any change here is a
-//! breaking firmware contract change.
 
 use serde::{Deserialize, Serialize};
 
 /// Host-to-device command.
-///
 /// Serialized as one JSON line terminated by `\n`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ZcCommand {
@@ -43,7 +32,6 @@ impl ZcCommand {
 }
 
 /// Device-to-host response.
-///
 /// Serialized as one JSON line terminated by `\n`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ZcResponse {

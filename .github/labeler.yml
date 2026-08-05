@@ -30,6 +30,17 @@
       - any-glob-to-any-file:
           - "src/*.rs"
 
+"cli":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/main.rs"
+          - "src/lib.rs"
+          - "src/commands/**"
+          - "src/alias_cli/**"
+          - "src/cli_input.rs"
+          - "crates/zeroclaw-commands/**"
+          - "crates/zeroclaw-runtime/src/cli_input.rs"
+
 "agent":
   - changed-files:
       - any-glob-to-any-file:
@@ -216,6 +227,11 @@
           - "src/channels/wati.rs"
           - "crates/zeroclaw-channels/src/wati.rs"
 
+"channel:wechat":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "crates/zeroclaw-channels/src/wechat.rs"
+
 "channel:webhook":
   - changed-files:
       - any-glob-to-any-file:
@@ -373,6 +389,30 @@
           - "crates/zeroclaw-gateway/src/api_quickstart.rs"
           - "apps/zerocode/src/quickstart_pane.rs"
           - "web/src/pages/quickstart/**"
+
+"desktop":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "apps/tauri/**"
+
+"hardware":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/hardware/**"
+          - "crates/zeroclaw-hardware/**"
+          - "crates/robot-kit/**"
+          - "crates/aardvark-sys/**"
+          - "firmware/**"
+
+"web":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "web/**"
+
+"zerocode":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "apps/zerocode/**"
 
 "provider":
   - changed-files:

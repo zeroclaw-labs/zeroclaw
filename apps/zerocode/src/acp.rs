@@ -70,6 +70,10 @@ impl Acp {
         self.inner.wants_quit_chord()
     }
 
+    pub(crate) fn take_help_request(&mut self) -> bool {
+        self.inner.take_help_request()
+    }
+
     pub(crate) fn exit_browse_mode(&mut self) {
         self.inner.exit_browse_mode();
     }
@@ -88,6 +92,10 @@ impl Acp {
 
     pub(crate) fn selected_agent(&self) -> Option<&str> {
         self.inner.selected_agent()
+    }
+
+    pub(crate) fn current_cwd(&self) -> Option<&str> {
+        self.inner.current_cwd()
     }
 }
 

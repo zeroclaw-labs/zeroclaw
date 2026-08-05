@@ -1,26 +1,8 @@
 //! Internal link integrity check for the built book.
-//!
-//! mdBook does not validate that a page's `href` resolves to a real file, so a
-//! relative link that points nowhere (commonly from an `{{#include}}` that
-//! drags a page's own relative links into a different directory) renders as a
-//! dead link and ships silently. This walks the generated HTML for one locale,
-//! resolves every internal `href` against the file it appears in, and fails the
-//! build if any target is missing.
-//!
-//! Only same-site relative links are checked. External (`http(s)://`,
-//! `mailto:`), in-page anchors (`#...`), and the generated rustdoc `api/` tree
-//! are skipped — the api tree is copied in `assemble()` after this runs, and is
-//! rustdoc's own output, not authored.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-/// Check internal links in the built HTML for `tag`'s first locale.
-///
-/// Run after `build_locales` (HTML present) and before `assemble` (which adds
-/// the `api/` tree). Checking one locale is sufficient: every locale is built
-/// from the same Markdown source, so a broken authored link breaks identically
-/// in all of them.
 pub fn check_internal_links(root: &Path, tag: &str) -> anyhow::Result<()> {
     let locale = crate::util::locale_entries()
         .into_iter()

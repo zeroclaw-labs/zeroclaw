@@ -14,6 +14,52 @@ Multi-arch: `linux/amd64`, `linux/arm64`.
 
 > **Note on shell access:** The default `latest` image is intentionally distroless and does not include `sh`, `ash`, or `bash`. Use the `debian` tag if you need a shell inside the container (for example, to run `docker exec` for debugging).
 
+## Alpine image (local build)
+
+`Dockerfile.alpine` builds an opt-in Alpine image with statically linked musl binaries for `linux/amd64` and `linux/arm64`. It is not published to `ghcr.io`.
+
+For the local platform:
+
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
+docker build -f Dockerfile.alpine -t zeroclaw:alpine .
+```
+
+</div>
+
+For a multi-platform registry image, create a builder once and push the manifest. If you already have a buildx builder selected, omit the first command:
+
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
+docker buildx create --use --name zeroclaw-multiarch
+docker buildx build -f Dockerfile.alpine \
+  --platform linux/amd64,linux/arm64 \
+  -t registry.example.com/zeroclaw:alpine \
+  --push .
+```
+
+</div>
+
+The bundled Compose example builds the image for the current platform:
+
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.alpine.yml up --build
+```
+
+</div>
+
+The Alpine image uses the same `/zeroclaw-data` mount, schema-mirror environment variables, dashboard path, and gateway port as the existing images.
+
 ## Minimum run
 
 <div class="os-tabs-src">
@@ -46,7 +92,7 @@ docker exec -it zeroclaw zeroclaw quickstart
 
 ## Running zerocode (the TUI)
 
-The image ships the [zerocode](../zerocode/overview.md) terminal interface alongside the `zeroclaw` binary. The default entrypoint is `zeroclaw`, so launch zerocode by overriding it with `--entrypoint zerocode` and an interactive TTY (`-it`). Both image variants carry it:
+The image ships the [zerocode](../zerocode/overview.md) terminal interface alongside the `zeroclaw` binary. The default entrypoint is `zeroclaw`, so launch zerocode by overriding it with `--entrypoint zerocode` and an interactive TTY (`-it`). Both published image variants carry it:
 
 <div class="os-tabs-src">
 
@@ -273,7 +319,7 @@ Configure a tunnel by setting the top-level `[tunnel]` `tunnel_provider` (overri
 
 ## Kubernetes
 
-Helm chart templates are published to the [zeroclaw-templates](https://github.com/zeroclaw-labs/zeroclaw-templates) repo. Typical manifest fragment:
+Sample Kubernetes manifests are provided in the [`deploy-k8s/`](https://github.com/zeroclaw-labs/zeroclaw/tree/master/deploy-k8s) directory. Typical manifest fragment:
 
 ```yaml
 apiVersion: apps/v1

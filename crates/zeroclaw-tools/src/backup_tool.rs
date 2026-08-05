@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tokio::fs;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 
 /// Workspace backup tool: create, list, verify, and restore timestamped backups
 /// with SHA-256 manifest integrity checking.
@@ -55,7 +55,8 @@ impl BackupTool {
                 "backup": name,
                 "file_count": file_count,
             })
-            .to_string(),
+            .to_string()
+            .into(),
             error: None,
         })
     }
@@ -119,7 +120,7 @@ impl BackupTool {
         }
         Ok(ToolResult {
             success: true,
-            output: serde_json::to_string_pretty(&items)?,
+            output: serde_json::to_string_pretty(&items)?.into(),
             error: None,
         })
     }
@@ -129,7 +130,7 @@ impl BackupTool {
         if !backup_dir.is_dir() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Backup not found: {backup_name}")),
             });
         }
@@ -162,7 +163,8 @@ impl BackupTool {
                 "checked": expected.len(),
                 "mismatches": mismatches,
             })
-            .to_string(),
+            .to_string()
+            .into(),
             error: if pass {
                 None
             } else {
@@ -176,7 +178,7 @@ impl BackupTool {
         if !backup_dir.is_dir() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Backup not found: {backup_name}")),
             });
         }
@@ -202,7 +204,8 @@ impl BackupTool {
                     "backup": backup_name,
                     "would_restore": restore_items,
                 })
-                .to_string(),
+                .to_string()
+                .into(),
                 error: None,
             });
         }
@@ -218,7 +221,8 @@ impl BackupTool {
                 "restored": backup_name,
                 "directories": restore_items,
             })
-            .to_string(),
+            .to_string()
+            .into(),
             error: None,
         })
     }
@@ -262,7 +266,7 @@ impl Tool for BackupTool {
             None => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some("Missing 'command' parameter".into()),
                 });
             }
@@ -321,7 +325,7 @@ impl Tool for BackupTool {
             }
             other => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Unknown command: {other}")),
             }),
         }

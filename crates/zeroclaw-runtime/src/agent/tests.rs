@@ -1,38 +1,15 @@
 //! Comprehensive agent-loop test suite.
-//!
-//! Tests exercise the full `Agent.turn()` cycle with mock model_providers and tools,
-//! covering every edge case an agentic tool loop must handle:
-//!
-//!   1. Simple text response (no tools)
-//!   2. Single tool call → final response
-//!   3. Multi-step tool chain (tool A → tool B → response)
-//!   4. Max-iteration bailout
-//!   5. Unknown tool name recovery
-//!   6. Tool execution failure recovery
-//!   7. Parallel tool dispatch
-//!   8. History trimming during long conversations
-//!   9. Memory auto-save round-trip
-//!  10. Native vs XML dispatcher integration
-//!  11. Empty / whitespace-only LLM responses
-//!  12. Mixed text + tool call responses
-//!  13. Multi-tool batch in a single response
-//!  14. System prompt generation & tool instructions
-//!  15. Context enrichment from memory loader
-//!  16. ConversationMessage serialization round-trip
-//!  17. Tool call with stringified JSON arguments
-//!  18. Conversation history fidelity (tool call → tool result → assistant)
-//!  19. Builder validation (missing required fields)
-//!  20. Idempotent system prompt insertion
 
 use crate::agent::agent::Agent;
 use crate::agent::dispatcher::{
     NativeToolDispatcher, ToolDispatcher, ToolExecutionResult, XmlToolDispatcher,
 };
 use crate::observability::{NoopObserver, Observer};
-use crate::tools::{Tool, ToolResult};
+use crate::tools::{Tool, ToolOutput, ToolResult};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
+use zeroclaw_api::agent::TurnEvent;
 use zeroclaw_config::schema::{AliasedAgentConfig, MemoryConfig};
 use zeroclaw_memory::{self, Memory};
 
@@ -170,7 +147,7 @@ impl Tool for EchoTool {
             .to_string();
         Ok(ToolResult {
             success: true,
-            output: msg,
+            output: msg.into(),
             error: None,
         })
     }
@@ -196,7 +173,7 @@ impl Tool for FailingTool {
     async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult> {
         Ok(ToolResult {
             success: false,
-            output: String::new(),
+            output: ToolOutput::default(),
             error: Some("intentional failure".into()),
         })
     }
@@ -260,7 +237,7 @@ impl Tool for CountingTool {
         *c += 1;
         Ok(ToolResult {
             success: true,
-            output: format!("call #{}", *c),
+            output: format!("call #{}", *c).into(),
             error: None,
         })
     }
@@ -758,14 +735,37 @@ async fn history_trims_after_max_messages() {
         let _ = agent.turn(&format!("msg {i}")).await.unwrap();
     }
 
-    // System prompt (1) + trimmed messages
-    // Should not exceed max_history + 1 (system prompt)
+    let breadcrumb = crate::i18n::get_required_cli_string("history-trim-breadcrumb");
+    let retained_messages: Vec<_> = agent
+        .history()
+        .iter()
+        .filter(|message| match message {
+            ConversationMessage::Chat(chat) => chat.role != "system" && chat.content != breadcrumb,
+            _ => true,
+        })
+        .collect();
+
     assert!(
-        agent.history().len() <= max_history + 1,
-        "History length {} exceeds max {} + 1 (system)",
-        agent.history().len(),
+        retained_messages.len() <= max_history,
+        "Retained history length {} exceeds max {}",
+        retained_messages.len(),
         max_history,
     );
+    let mut turns = retained_messages.chunks_exact(2);
+    assert!(
+        turns.remainder().is_empty(),
+        "history must retain whole turns"
+    );
+    assert!(turns.all(|turn| matches!(
+        turn,
+        [ConversationMessage::Chat(user), ConversationMessage::Chat(assistant)]
+            if user.role == "user" && assistant.role == "assistant"
+    )));
+    assert!(agent.history().iter().any(|message| matches!(
+        message,
+        ConversationMessage::Chat(chat)
+            if chat.role == "user" && chat.content.ends_with("msg 10")
+    )));
 
     // System prompt should always be preserved
     let first = &agent.history()[0];
@@ -1079,12 +1079,6 @@ async fn history_contains_all_expected_entries_after_tool_loop() {
 
     let _ = agent.turn("test").await.unwrap();
 
-    // Expected history entries:
-    //   0: system prompt
-    //   1: user message "test"
-    //   2: AssistantToolCalls
-    //   3: ToolResults
-    //   4: assistant "final answer"
     let history = agent.history();
     assert!(
         history.len() >= 5,
@@ -1476,12 +1470,10 @@ fn native_dispatcher_converts_tool_results_to_tool_messages() {
     assert_eq!(messages.len(), 2);
     assert_eq!(messages[0].role, "tool");
     assert_eq!(messages[1].role, "tool");
-    assert!(messages[0].content.contains("[IMAGE:"));
-    assert!(
-        messages[0]
-            .content
-            .contains(&image_path.display().to_string())
-    );
+    let payload: serde_json::Value = serde_json::from_str(&messages[0].content).unwrap();
+    let content = payload["content"].as_str().unwrap();
+    assert!(content.contains("[IMAGE:"));
+    assert!(content.contains(&image_path.display().to_string()));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1563,5 +1555,89 @@ async fn run_single_delegates_to_turn() {
     assert!(
         !response.is_empty(),
         "Expected non-empty response from run_single"
+    );
+}
+
+#[tokio::test]
+async fn turn_history_has_exact_one_user_one_assistant() {
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![text_response(
+        "hello back",
+    )]));
+    let mut agent = build_agent_with(
+        model_provider,
+        vec![Box::new(EchoTool)],
+        Box::new(NativeToolDispatcher),
+    );
+
+    let _ = agent.turn("hi").await.unwrap();
+    let history = agent.history();
+
+    // First turn: system + user + assistant = 3
+    assert_eq!(
+        history.len(),
+        3,
+        "single-exchange turn should produce system + user + assistant, got {}: {history:?}",
+        history.len()
+    );
+
+    let roles: Vec<&str> = history
+        .iter()
+        .filter_map(|m| match m {
+            ConversationMessage::Chat(c) => Some(c.role.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        roles,
+        vec!["system", "user", "assistant"],
+        "history role sequence"
+    );
+
+    // No duplicate user messages
+    let user_count = roles.iter().filter(|&&r| r == "user").count();
+    assert_eq!(user_count, 1, "exactly one user message, no duplicates");
+}
+
+#[tokio::test]
+async fn turn_streamed_history_no_duplicate_user_message() {
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![text_response(
+        "streamed back",
+    )]));
+    let mut agent = build_agent_with(
+        model_provider,
+        vec![Box::new(EchoTool)],
+        Box::new(NativeToolDispatcher),
+    );
+
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+    let (_response, new_msgs) = agent.turn_streamed("hi", event_tx, None).await.unwrap();
+    // Drain events
+    while event_rx.try_recv().is_ok() {}
+
+    // Returned messages: exactly one user and one assistant.
+    let returned_user_count = new_msgs
+        .iter()
+        .filter(|m| matches!(m, ConversationMessage::Chat(c) if c.role == "user"))
+        .count();
+    assert_eq!(
+        returned_user_count, 1,
+        "returned new_msgs must have exactly one user, got {returned_user_count}: {new_msgs:?}"
+    );
+    assert!(
+        new_msgs
+            .iter()
+            .any(|m| matches!(m, ConversationMessage::Chat(c) if c.role == "assistant")),
+        "returned new_msgs must include an assistant: {new_msgs:?}"
+    );
+
+    // Durable history: exactly one user message (no duplicates).
+    let history = agent.history();
+    let history_user_count = history
+        .iter()
+        .filter(|m| matches!(m, ConversationMessage::Chat(c) if c.role == "user"))
+        .count();
+    assert_eq!(
+        history_user_count, 1,
+        "exactly one user message after turn_streamed, got {history_user_count}: {history:?}"
     );
 }

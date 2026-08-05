@@ -25,7 +25,7 @@ Handshake. Returns server capabilities.
     "protocolVersion": 1,
     "agentCapabilities": {
       "loadSession": true,
-      "promptCapabilities": {"image": false, "audio": false, "embeddedContext": false},
+      "promptCapabilities": {"image": false, "audio": false, "embeddedContext": true},
       "mcpCapabilities": {"http": false, "sse": false},
       "sessionCapabilities": {"resume": {}, "close": {}}
     },
@@ -49,6 +49,8 @@ Handshake. Returns server capabilities.
 
 `_meta.zeroclaw` carries ZeroClaw-specific extension fields not in the base ACP spec. Clients that only implement the base spec can ignore this object.
 
+`promptCapabilities.embeddedContext: true` means clients may send embedded `resource` blocks with a base64 `blob` in `session/prompt` (see below). `image` and `audio` remain `false` for now. Native ACP Image/Audio ContentBlocks are not advertised yet.
+
 The server always responds `protocolVersion: 1`. If you send a client-side `protocolVersion: 0`, you still get `1` back, v0 clients will see parse errors on the new message shapes; see [version compatibility](#version-compatibility) below.
 
 ### `session/new`
@@ -56,6 +58,18 @@ The server always responds `protocolVersion: 1`. If you send a client-side `prot
 Open an isolated agent session.
 
 **`agentAlias`** names which configured `[agents.<alias>]` entry to use. It is required when more than one agent is configured; when exactly one agent exists, it is auto-selected and the field may be omitted. The alias accepts the camelCase `agentAlias`, the snake_case `agent_alias`, or the short `agent` form.
+
+When connecting through the **gateway WebSocket** endpoint, the connection URL may also carry a **`?agent=<alias>`** query parameter. That value is a **connection-scoped default**, not a config change. Alias resolution for `session/new` follows this precedence:
+
+1. explicit `agentAlias` / `agent_alias` / `agent` in the `session/new` params
+2. gateway `?agent=<alias>` on the WebSocket URL
+3. `[acp].default_agent`
+4. sole configured `[agents.<alias>]` entry when exactly one exists
+5. error when no alias can be resolved
+
+Every resolved alias, regardless of which step selected it, must name an **enabled, dispatchable** agent. Unknown aliases and configured-but-disabled agents fail `session/new` with `-32602 INVALID_PARAMS`. A blank or whitespace-only `?agent=` is treated as absent and falls through to the next step.
+
+Standalone **`zeroclaw acp`** (stdio subprocess) does not read `?agent=`; use an explicit `agentAlias` or `[acp].default_agent` there instead.
 
 The optional **`cwd`** parameter (aliases: `workspaceDir`, `workspace_dir`) pins the per-session file-access boundary, it becomes the `workspace_dir` inside the `SecurityPolicy` that all file tools enforce. The agent's persistent data directory (memory, identity, cron) remains the daemon-level `workspace_dir` from config.
 
@@ -79,7 +93,11 @@ Send a prompt. The response is a sequence of `session/update` notifications stre
 The `prompt` parameter accepts either a plain string or an array of content parts:
 
 - **String:** `"prompt": "Summarise the changes in the last commit."`
-- **Array:** each element is a text part `{"text": "..."}` or an ACP resource block `{"type": "resource", "resource": {"uri": "file:///path/to/file.rs", "text": "<file contents>"}}`. Resource blocks carry `@`-notation file attachments from the editor. Parts are joined with double newlines in the order they appear.
+- **Array:** each element is a text part `{"text": "..."}` or an ACP resource block:
+  - **Text resource:** `{"type": "resource", "resource": {"uri": "file:///path/to/file.rs", "text": "<file contents>"}}`. Editor `@`-notation attachments with inline text.
+  - **Blob resource:** `{"type": "resource", "resource": {"uri": "file:///path/to/report.pdf", "mimeType": "application/pdf", "blob": "<base64>"}}`. Binary embeds (PDF, DOCX, images, etc.). ZeroClaw decodes the blob, writes it under `{session.workspaceDir}/uploads/` (SHA-named), and surfaces a marker in the agent prompt (`[Document: …]` or `[IMAGE: …]` for `image/*`). Maximum decoded size is **10 MB**; invalid base64 or oversize blobs return `INVALID_PARAMS`.
+
+Parts are joined with double newlines in the order they appear. Blob intake is store-agnostic (it does not call RPC `file/attach`). The same materialization helper is used when MCP tool results contain `resource`+`blob` content (see [MCP embedded resource blobs](../tools/mcp.md#embedded-resource-blobs-in-tool-results)).
 
 ```json
 → {"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{
@@ -132,6 +150,28 @@ ZeroClaw sends four kinds of `session/update` notification during a prompt turn.
 `toolCallId` on `tool_call` and `tool_call_update` are stable and correlated, the update completing a call carries the same `toolCallId` as the one that opened it.
 
 The `name` field on `tool_call_update` is a ZeroClaw extension (not required by the base ACP spec). Clients can use it for display; it's safe to ignore.
+
+#### Delivering files to the client (`deliver_file`)
+
+When the agent should hand a workspace file back for download or preview, it calls the **`deliver_file`** tool (`path`, optional `mimeType`, optional `title`). On completion, ZeroClaw emits a normal `tool_call_update` whose `rawOutput` / `body` stay small (a short human summary, **no** base64 dump and **no** machine trailer; every delivery field travels structurally on the typed tool artifact). The standard `tool_call_update.title` carries a human-readable chat label: the caller's `title` (any prose, e.g. `"Quarterly report"`) or the filename by default. The `content` array additionally includes a standard ACP embedded resource:
+
+```json
+{
+  "type": "content",
+  "content": {
+    "type": "resource",
+    "resource": {
+      "uri": "attachment://deliver/9f2c1a7b0e4d5f6a3b8c2d1e0f4a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d.pdf",
+      "mimeType": "application/pdf",
+      "blob": "<base64>"
+    }
+  }
+}
+```
+
+The `uri` is an opaque, content-addressed identity: `attachment://deliver/<sha256>.<ext>`, the full hex SHA-256 digest of the file's bytes. It is URI-safe and collision-resistant at the full 256-bit digest strength, and is never derived from the caller-supplied filename. The same full digest is the on-disk `uploads/` storage name, so distinct content never aliases one file or one uri. The same `uri` is carried structurally on the tool result (JSON field `uri`) and on the typed tool artifact; there is no machine trailer in the model-facing text. Before embedding the blob, the ACP layer re-reads the file and recomputes this hash, refusing to attach when it no longer matches; a swap between the tool's validation and delivery is detected, not trusted. Clients such as Thunderbolt materialize the outbound blob and build a citation ref-map keyed by that uri; agents must copy the returned `uri` into `<widget:document-result fileId="…">` / `[N]` citations and must not invent prefixes. The **chat display name** is the standard `tool_call_update.title` (the caller's `title`, else the filename). There is **no** `filename` field on the ACP `resource` object, and the `title` is display-only, never the on-disk name.
+
+The file must stay inside the session workspace (same jail as `file_read`); oversize files (>10 MB) are rejected by the tool.
 
 ### `session/request_permission` (agent → client, outbound request)
 
@@ -236,6 +276,8 @@ Restore a previously persisted session with **full history replay**. The server 
 
 After `session/load` returns, the session is active and ready to accept `session/prompt` calls.
 
+When restoring a persisted session, the server reuses the stored owner alias only if that agent is still dispatchable. Otherwise it falls back through the operator-controlled `[acp].default_agent` → sole-agent chain, skipping any disabled aliases along the way. Gateway `?agent=` is a `session/new` default only and does not rebind restore.
+
 `session_id` is accepted as a snake_case alias for `sessionId`.
 
 Errors:
@@ -256,7 +298,7 @@ Restore a previously persisted session **without history replay**. The agent is 
 ← {"jsonrpc":"2.0","id":5,"result":{}}
 ```
 
-After `session/resume` returns, the session is active and ready to accept `session/prompt` calls. Same errors as `session/load`.
+After `session/resume` returns, the session is active and ready to accept `session/prompt` calls. Same errors as `session/load`. Restore alias selection follows the same dispatchable-owner fallback rules as `session/load`.
 
 **Load vs. resume:** use `session/load` when reconnecting after an unexpected disconnect and the client needs to rebuild its UI from the stored history. Use `session/resume` when the client already has the history (e.g., it stored it locally) and only needs the server-side agent state restored.
 
@@ -281,7 +323,7 @@ Returns `SESSION_NOT_FOUND` (`-32000`) if the session is not currently active (i
 
 `default_agent` is consulted when `session/new` omits `agentAlias` and more than one agent is configured; if it is absent and exactly one `[agents.<alias>]` entry exists, that agent is auto-selected.
 
-When running `zeroclaw acp` as a subprocess, the command starts the server unconditionally. When running as a daemon, the gateway exposes ACP over WebSocket at `/acp` with no additional config required.
+When running `zeroclaw acp` as a subprocess, the command starts the server unconditionally. When running as a daemon, the gateway exposes ACP over WebSocket at `/acp` with no additional config required. Gateway clients may append `?agent=<alias>` to that URL so each configured agent can be addressed from a spec-vanilla one-agent-per-endpoint client; authentication (`Authorization`, `Sec-WebSocket-Protocol`, or `?token=`) is enforced before the connection is upgraded, and the query parameter grants no access beyond selecting among already-configured agents.
 
 ## Running
 
@@ -301,7 +343,7 @@ The binary reads stdin, writes stdout, exits on EOF.
 
 **Via the daemon gateway (remote or same-host):**
 
-Start the daemon normally. The gateway always exposes ACP over WebSocket at `/acp`, no extra config flag is required. Clients connect directly, or through `zeroclaw-acp-bridge`, which bridges the stdio ACP protocol to the gateway WebSocket:
+Start the daemon normally. The gateway always exposes ACP over WebSocket at `/acp`, no extra config flag is required. Clients connect directly: for multi-agent installs, use a URL such as `ws://127.0.0.1:8080/acp?agent=myagent` so `session/new` can omit `agentAlias`, or through `zeroclaw-acp-bridge`, which bridges the stdio ACP protocol to the gateway WebSocket:
 
 <div class="os-tabs-src">
 

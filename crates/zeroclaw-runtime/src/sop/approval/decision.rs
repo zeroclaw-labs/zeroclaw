@@ -6,12 +6,26 @@ use crate::sop::types::SopRunAction;
 
 /// Approve or deny a waiting SOP gate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalDecision {
     Approve,
     Deny {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
+    },
+    /// Approve a deterministic checkpoint WITH an operator amendment: `text`
+    /// replaces the step's declared editable field (`- edit:` bullet) in the
+    /// piped value before the run resumes. Checkpoint-only; an approval gate
+    /// (broker-owned `WaitingApproval`) refuses it fail-closed.
+    Amend {
+        text: String,
+    },
+    /// Ask for a re-draft: re-run the checkpoint's predecessor `llm.generate`
+    /// step with `guidance` framed as reviewer feedback, then re-present the
+    /// gate (revision + 1). Checkpoint-only, same as `Amend`.
+    Revise {
+        guidance: String,
     },
 }
 
@@ -23,6 +37,9 @@ pub enum ResolveOutcome {
     Resumed(Box<SopRunAction>),
     /// Denied: the run is Cancelled; no further action.
     Denied,
+    /// Revised: the checkpoint's predecessor re-drafted with the operator's
+    /// guidance and the gate re-presented (revision + 1). The run stays parked.
+    Revised,
     /// Idempotent: the run was already resolved within the grace window (a late
     /// timeout racing a human decision). No double ledger row, no double persist.
     AlreadyResolved,
@@ -31,6 +48,12 @@ pub enum ResolveOutcome {
     /// `approval_mode` forbids this principal from clearing the gate (an agent under
     /// `OutOfBandRequired`, or a non-agent under `AgentTool`). The gate stays open.
     RejectedSelfApproval,
+    /// Approved, but every execution slot is full: re-admitting the run would exceed
+    /// the SOP's `max_concurrent` or the global `max_concurrent_total`. The gate is
+    /// left `WaitingApproval` (untouched, re-resolvable, no ledger row, no claim);
+    /// a later resolve or the timeout tick's retry resumes it once a slot frees. This
+    /// is routine backpressure, not a rejection - the caps are enforced on resume.
+    DeferredAtCapacity,
 }
 
 impl ResolveOutcome {
@@ -44,9 +67,11 @@ impl ResolveOutcome {
         match self {
             ResolveOutcome::Resumed(_) => "resumed",
             ResolveOutcome::Denied => "denied",
+            ResolveOutcome::Revised => "revised",
             ResolveOutcome::AlreadyResolved => "already_resolved",
             ResolveOutcome::NotWaiting => "not_waiting",
             ResolveOutcome::RejectedSelfApproval => "rejected_self_approval",
+            ResolveOutcome::DeferredAtCapacity => "deferred_at_capacity",
         }
     }
 }
