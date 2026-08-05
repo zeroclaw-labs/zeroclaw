@@ -366,14 +366,17 @@ impl ImageGenTool {
             anyhow::Error::msg(Self::tool_msg("tool-image-gen-error-resolved-url-no-host"))
         })?;
         // Same bracket normalization as `validate_image_url`: the policy
-        // comparison uses the bare IPv6 form (`::1`), while the transport
-        // host keeps the URL representation for `resolve_host`.
+        // comparison uses the bare IPv6 form (`::1`), and the resolver also
+        // receives the bare form — `tokio::net::lookup_host` parses bare
+        // IPv6 addresses but delegates a bracketed `[::1]` to the system
+        // resolver, which cannot resolve it. The transport host keeps the
+        // URL representation for the connection.
         let policy_host = bare_policy_host(host);
         let port = parsed.port_or_known_default().ok_or_else(|| {
             anyhow::Error::msg(Self::tool_msg("tool-image-gen-error-resolved-url-no-port"))
         })?;
 
-        let addrs = resolve_host(host.to_string(), port).await?;
+        let addrs = resolve_host(policy_host.to_string(), port).await?;
 
         if addrs.is_empty() {
             anyhow::bail!(Self::tool_msg_with_args(
@@ -1339,6 +1342,71 @@ mod tests {
             host, "localhost",
             "host must be the bare hostname, not the full URL — \
              reqwest::Client::resolve_to_addrs keys by hostname"
+        );
+    }
+
+    /// The production resolver path (`resolve_host_for_download`) must
+    /// receive the bare IPv6 form: `tokio::net::lookup_host` parses bare
+    /// `::1` but delegates a bracketed `[::1]` to the system resolver and
+    /// fails. This drives `validate_image_url_resolved` (which uses the
+    /// production resolver) against an IPv6 literal and asserts the resolved
+    /// set comes back as loopback — not a resolve failure from a bracketed
+    /// host.
+    #[tokio::test]
+    async fn validate_image_url_resolved_ipv6_production_resolver_uses_bare_host() {
+        let tool = test_tool_with_private_hosts(vec!["::1"]);
+        let (host, addrs) = tool
+            .validate_image_url_resolved("http://[::1]/x.png")
+            .await
+            .expect("production resolver must parse the bare IPv6 host");
+        assert_eq!(host, "[::1]");
+        assert!(
+            addrs.iter().any(|sa| sa.ip().is_loopback()),
+            "resolved IPv6 addresses must be loopback, got: {addrs:?}"
+        );
+    }
+
+    #[test]
+    fn bare_policy_host_strips_ipv6_url_brackets() {
+        assert_eq!(bare_policy_host("[::1]"), "::1");
+        assert_eq!(bare_policy_host("[2001:db8::1]"), "2001:db8::1");
+        assert_eq!(bare_policy_host("example.com"), "example.com");
+        assert_eq!(bare_policy_host("127.0.0.1"), "127.0.0.1");
+    }
+
+    /// The allowlist resolver must read the shared config live at each call,
+    /// not capture a snapshot at construction. This simulates the runtime's
+    /// live `Config` handle: an operator removing an internal CDN entry after
+    /// the tool was built must change the next policy decision without
+    /// rebuilding the tool.
+    #[test]
+    fn live_allowlist_resolver_reflects_config_mutation() {
+        use std::sync::Arc;
+        let shared = Arc::new(parking_lot::RwLock::new(vec!["127.0.0.1".to_string()]));
+        let resolver_shared = Arc::clone(&shared);
+        let tool = ImageGenTool::new_with_config_resolver(
+            test_security(),
+            std::env::temp_dir(),
+            "fal-ai/flux/schnell".into(),
+            "FAL_API_KEY".into(),
+            true,
+            move || resolver_shared.read().clone(),
+        )
+        .expect("tool construction with live resolver");
+
+        tool.validate_image_url("http://127.0.0.1/img.png")
+            .expect("allowlisted loopback must pass before the mutation");
+
+        // Operator removes the loopback entry from the live config.
+        shared.write().clear();
+
+        let err = tool
+            .validate_image_url("http://127.0.0.1/img.png")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("local/private"),
+            "after removing the entry the same URL must be rejected; got: {err}"
         );
     }
 

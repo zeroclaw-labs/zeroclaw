@@ -1566,7 +1566,7 @@ impl Agent {
             tui_env,
             sop_engine,
             sop_audit,
-            None,
+            live_config.clone(),
         );
         // Skills are loaded here and handed to `assemble`, which owns skill
         // registration and resolves builtin/MCP elevation against the pre-filter
