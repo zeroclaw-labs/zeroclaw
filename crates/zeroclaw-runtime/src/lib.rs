@@ -44,3 +44,6 @@ pub mod tools;
 pub mod trust;
 pub mod tunnel;
 pub mod verifiable_intent;
+
+#[cfg(feature = "solana-sdk")]
+pub mod solana_settlement;

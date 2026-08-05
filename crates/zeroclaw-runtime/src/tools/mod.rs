@@ -1450,10 +1450,32 @@ pub fn all_tools_with_runtime(
             "permissive" => crate::verifiable_intent::StrictnessMode::Permissive,
             _ => crate::verifiable_intent::StrictnessMode::Strict,
         };
-        tool_arcs.push(Arc::new(VerifiableIntentTool::new(
-            security.clone(),
-            strictness,
-        )));
+        let mut tool = VerifiableIntentTool::new(security.clone(), strictness);
+        // The issuer trust anchor is operator-owned config, never a model
+        // argument (review #9762: verify_chain must not accept trust context
+        // from the model).
+        if let Some(jwk_value) = root_config.verifiable_intent.issuer_jwk.clone() {
+            if let Ok(jwk) = serde_json::from_value(jwk_value) {
+                tool = tool.with_issuer_jwk(jwk);
+            } else {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"param": "verifiable_intent.issuer_jwk"})),
+                    "verifiable_intent.issuer_jwk is not a valid JWK; vi_verify verify_chain will be unavailable"
+                );
+            }
+        } else {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"param": "verifiable_intent.issuer_jwk"})),
+                "verifiable_intent.issuer_jwk not configured; vi_verify verify_chain will be unavailable"
+            );
+        }
+        tool_arcs.push(Arc::new(tool));
     }
 
     // ── WASM plugin tools (requires plugins-wasm feature) ──

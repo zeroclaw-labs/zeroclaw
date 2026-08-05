@@ -5054,6 +5054,14 @@ pub struct VerifiableIntentConfig {
     /// Default: "strict".
     #[serde(default = "default_vi_strictness")]
     pub strictness: String,
+
+    /// The runtime-owned issuer trust anchor: the public JWK (JSON object
+    /// with kty/crv/x/y) of the credential provider that signs L1. The chain
+    /// verifier recovers every downstream key from the chain itself, but the
+    /// issuer key is the ONE piece of trust context that must come from the
+    /// operator, never from model-supplied tool arguments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer_jwk: Option<serde_json::Value>,
 }
 
 fn default_vi_strictness() -> String {
@@ -5065,6 +5073,7 @@ impl Default for VerifiableIntentConfig {
         Self {
             enabled: false,
             strictness: default_vi_strictness(),
+            issuer_jwk: None,
         }
     }
 }
@@ -16123,6 +16132,22 @@ pub struct LeakDetectionConfig {
     /// Enable high-entropy token redaction; deterministic patterns still run when false.
     #[serde(default = "default_leak_detection_high_entropy_tokens")]
     pub high_entropy_tokens: bool,
+
+    /// Allow Solana public identifiers (wallet addresses, transaction
+    /// signatures, program IDs) through high-entropy redaction. These are
+    /// public by design and always appear as base58 strings; redacting them
+    /// makes every Solana-capable agent unusable. See issue #9486.
+    ///
+    /// Off by default: length + alphabet alone do not distinguish a Solana
+    /// address from a randomly generated base58 secret of the same length,
+    /// and a default-on exemption would let such secrets bypass redaction.
+    /// Operators running Solana-capable agents opt in explicitly.
+    #[serde(default = "default_leak_detection_solana_identifiers")]
+    pub solana_identifiers: bool,
+}
+
+fn default_leak_detection_solana_identifiers() -> bool {
+    false
 }
 
 fn default_leak_detection_enabled() -> bool {
@@ -16143,6 +16168,7 @@ impl Default for LeakDetectionConfig {
             enabled: default_leak_detection_enabled(),
             sensitivity: default_leak_detection_sensitivity(),
             high_entropy_tokens: default_leak_detection_high_entropy_tokens(),
+            solana_identifiers: default_leak_detection_solana_identifiers(),
         }
     }
 }
@@ -23324,6 +23350,34 @@ max_height = 8
         assert!((def.mmr_lambda - cfg.mmr_lambda).abs() < f64::EPSILON);
         assert!((def.importance_weight - cfg.importance_weight).abs() < f64::EPSILON);
         assert!((def.recency_weight - cfg.recency_weight).abs() < f64::EPSILON);
+    }
+
+    #[::core::prelude::v1::test]
+    fn leak_detection_defaults_are_strict_and_round_trip() {
+        // An empty [security.leak_detection] block resolves strict defaults:
+        // high-entropy redaction on, sensitivity at the standard threshold,
+        // and the Solana identifier exemption OFF (opt-in, see #9486 review).
+        let cfg: super::LeakDetectionConfig = serde_json::from_str("{}").unwrap();
+        assert!(cfg.enabled);
+        assert!(cfg.high_entropy_tokens);
+        assert!((cfg.sensitivity - 0.7).abs() < f64::EPSILON);
+        assert!(
+            !cfg.solana_identifiers,
+            "solana_identifiers must default to false (opt-in)"
+        );
+
+        // The Default impl agrees with the serde defaults.
+        let def = super::LeakDetectionConfig::default();
+        assert_eq!(def.enabled, cfg.enabled);
+        assert_eq!(def.high_entropy_tokens, cfg.high_entropy_tokens);
+        assert_eq!(def.solana_identifiers, cfg.solana_identifiers);
+        assert!((def.sensitivity - cfg.sensitivity).abs() < f64::EPSILON);
+
+        // TOML parsing of the opt-in flag round-trips.
+        let toml_cfg: super::LeakDetectionConfig =
+            toml::from_str("solana_identifiers = true").unwrap();
+        assert!(toml_cfg.solana_identifiers);
+        assert_eq!(toml_cfg.enabled, cfg.enabled);
     }
 
     #[::core::prelude::v1::test]

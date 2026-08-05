@@ -1,19 +1,51 @@
 //! Credential redaction for the rendering layer (logs, observer events, and
 //! UI-facing turn events). This never runs on the data path: tool results fed
 //! back to the model and signed by HMAC receipts always carry raw bytes.
+//!
+//! Solana Pay URLs use `spl-token` as a query parameter naming a public mint
+//! address. The key contains the substring "token", which the credential
+//! scrubber would otherwise match and redact — breaking payment links in
+//! every channel. `spl-token` is explicitly exempted below (same class of
+//! false positive as issue #9486).
 
 use regex::Regex;
 use std::sync::LazyLock;
 
 static SENSITIVE_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)(authorization|token|api[_-]?key|password|secret|user[_-]?key|bearer|credential|set[_-]?cookie|cookie)["']?\s*[:=]\s*(?:"([^"]{8,})"|'([^']{8,})'|([a-zA-Z0-9_\-\./+=]{8,}))"#).unwrap()
+    // The optional `spl[-_]` prefix group lets the closure skip Solana Pay's
+    // `spl-token`/`spl_token` keys: without it, the `token` alternative
+    // matches the substring inside the key name and redacts the public mint
+    // address in every payment URL.
+    Regex::new(r#"(?i)((?:spl[-_])?(?:authorization|token|api[_-]?key|password|secret|user[_-]?key|bearer|credential|set[_-]?cookie|cookie))["']?\s*[:=]\s*(?:"([^"]{8,})"|'([^']{8,})'|([a-zA-Z0-9_\-\./+=]{8,}))"#).unwrap()
 });
+
+/// Whether a matched key is a Solana Pay token key that must not be redacted.
+fn is_spl_token_key(key: &str) -> bool {
+    let lowered = key.to_ascii_lowercase();
+    lowered == "spl-token" || lowered == "spl_token"
+}
+
+/// Whether a key names a credential the scrubber must redact.
+/// `spl-token` (Solana Pay) is exempt: it names a public mint address, not a
+/// credential, and redacting it breaks payment URLs.
+fn is_sensitive_key(key: &str) -> bool {
+    let lowered = key.to_ascii_lowercase();
+    if lowered == "spl-token" || lowered == "spl_token" {
+        return false;
+    }
+    SENSITIVE_KEY_REGEX.is_match(key)
+}
 
 pub fn scrub_credentials(input: &str) -> String {
     SENSITIVE_KV_REGEX
         .replace_all(input, |caps: &regex::Captures| {
             let full_match = &caps[0];
             let key = &caps[1];
+            // Solana Pay URLs carry `spl-token=<public mint>`; the key
+            // contains "token" but names a public address. Leave it intact.
+            if is_spl_token_key(key) {
+                return full_match.to_string();
+            }
             let val = caps
                 .get(2)
                 .or(caps.get(3))
@@ -69,7 +101,7 @@ pub fn scrub_credentials_value(value: serde_json::Value) -> serde_json::Value {
             let scrubbed = map
                 .into_iter()
                 .map(|(key, val)| {
-                    if SENSITIVE_KEY_REGEX.is_match(&key) {
+                    if is_sensitive_key(&key) {
                         (key, redact_credential_leaf(val))
                     } else {
                         (key, scrub_credentials_value(val))
@@ -163,5 +195,49 @@ mod tests {
         assert_eq!(scrubbed, r#"secret="QWxh*[REDACTED]""#);
         assert!(!scrubbed.contains("IHNlc2FtZQ"));
         assert!(!scrubbed.contains("=="));
+    }
+
+    #[test]
+    fn spl_token_in_solana_pay_url_is_not_redacted() {
+        // A Solana Pay URL: `spl-token` names a public mint, and the value is
+        // a public base58 address. Redacting it breaks the payment link.
+        let url = "solana:7RJWhvQBQPEjJmki5fhBboGBWRJhmcFkMvrr4Fu3tMSJ?amount=25&spl-token=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v&reference=9zP1oXqBkLmNvW3yZ7aC4eF6gH8jK0nQ2rT5uV7xW9yZ1b";
+        let scrubbed = scrub_credentials(url);
+        assert!(
+            scrubbed.contains("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"),
+            "USDC mint must survive the plain-text scrubber: {scrubbed}"
+        );
+        assert!(scrubbed.contains("spl-token="));
+        assert!(!scrubbed.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn spl_token_survives_structured_scrubber() {
+        let input = serde_json::json!({
+            "url": "solana:7RJWhvQBQPEjJmki5fhBboGBWRJhmcFkMvrr4Fu3tMSJ?amount=25&spl-token=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+        });
+        let out = scrub_credentials_value(input);
+        let url = out["url"].as_str().unwrap();
+        assert!(
+            url.contains("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"),
+            "USDC mint must survive the structured scrubber: {url}"
+        );
+        assert!(!url.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn real_credentials_still_redacted_after_spl_exemption() {
+        let input = serde_json::json!({
+            "api_key": "sk-«redacted:1234567890abcdef»",
+            "url": "solana:7RJWhvQBQPEjJmki5fhBboGBWRJhmcFkMvrr4Fu3tMSJ?amount=25&spl-token=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+        });
+        let out = scrub_credentials_value(input);
+        assert!(out["api_key"].as_str().unwrap().contains("[REDACTED]"));
+        assert!(
+            out["url"]
+                .as_str()
+                .unwrap()
+                .contains("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
+        );
     }
 }

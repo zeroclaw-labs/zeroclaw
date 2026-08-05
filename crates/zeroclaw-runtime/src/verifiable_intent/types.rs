@@ -238,6 +238,12 @@ pub struct Fulfillment {
     pub currency: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub amount: Option<i64>,
+    /// Verified transaction reference (L3a transaction_id in Autonomous mode;
+    /// the payment mandate's reference in Immediate mode). The
+    /// `PaymentReference` constraint checks against this — it is populated by
+    /// the verifier from the signed chain, never from caller input.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transaction_reference: Option<String>,
 }
 
 // ── Credential chain layers (serialized form) ────────────────────────

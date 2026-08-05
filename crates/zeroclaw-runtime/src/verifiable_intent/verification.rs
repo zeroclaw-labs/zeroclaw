@@ -2,7 +2,7 @@
 
 use crate::verifiable_intent::error::{ViError, ViErrorKind};
 use crate::verifiable_intent::types::{
-    CheckoutL3Mandate, Constraint, Entity, Fulfillment, LineItemEntry, MandateMode,
+    CheckoutL3Mandate, Constraint, Entity, Fulfillment, Jwk, LineItemEntry, MandateMode,
     PaymentL3Mandate,
 };
 
@@ -115,6 +115,52 @@ pub fn verify_sd_hash_binding(expected_hash: &str, serialized_parent: &str) -> R
 
 // ── L3 cross-reference binding ───────────────────────────────────────
 
+/// Validate an L3 header against the issuance contract.
+///
+/// `jws_verify` fixes the ES256 primitive, so a header declaring a different
+/// `alg` would still pass signature verification while claiming a different
+/// algorithm — the header must be checked explicitly. The `typ` must be the
+/// kb-sd-jwt form used by L3 issuance, `kid` must name the agent key from the
+/// L2 Autonomous `cnf`, and an embedded `jwk` (when present) must match that
+/// same key.
+pub fn validate_l3_header(header: &serde_json::Value, l2_cnf_jwk: &Jwk) -> Result<(), ViError> {
+    let alg = header.get("alg").and_then(|v| v.as_str()).unwrap_or("");
+    if alg != "ES256" {
+        return Err(ViError::new(
+            ViErrorKind::InvalidHeader,
+            format!("L3 header alg must be ES256, got '{alg}'"),
+        ));
+    }
+    let typ = header.get("typ").and_then(|v| v.as_str()).unwrap_or("");
+    if typ != "kb-sd-jwt" {
+        return Err(ViError::new(
+            ViErrorKind::InvalidHeader,
+            format!("L3 header typ must be 'kb-sd-jwt', got '{typ}'"),
+        ));
+    }
+    // kid must name the agent key (its base64url x-coordinate, per issuance).
+    let kid = header.get("kid").and_then(|v| v.as_str()).unwrap_or("");
+    if !kid.is_empty() && kid != l2_cnf_jwk.x {
+        return Err(ViError::new(
+            ViErrorKind::InvalidHeader,
+            format!("L3 header kid '{kid}' does not match the L2 agent key"),
+        ));
+    }
+    // An embedded jwk must match the L2 agent key, so a different signing key
+    // cannot be smuggled in via the header.
+    if let Some(jwk) = header.get("jwk") {
+        let embedded_x = jwk.get("x").and_then(|v| v.as_str()).unwrap_or("");
+        let embedded_y = jwk.get("y").and_then(|v| v.as_str()).unwrap_or("");
+        if embedded_x != l2_cnf_jwk.x || embedded_y != l2_cnf_jwk.y {
+            return Err(ViError::new(
+                ViErrorKind::InvalidHeader,
+                "L3 header jwk does not match the L2 agent key",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Verify that L3a `transaction_id` equals L3b `checkout_hash`.
 pub fn verify_l3_cross_reference(
     l3a: &PaymentL3Mandate,
@@ -197,11 +243,36 @@ fn check_single_constraint(
         Constraint::PaymentReference {
             conditional_transaction_id,
         } => {
-            // Reference binding is verified structurally, not against fulfillment.
-            ConstraintCheckResult::ok(&format!(
-                "payment.reference({})",
-                &conditional_transaction_id[..8.min(conditional_transaction_id.len())]
-            ))
+            // The reference must match the verifier-populated transaction
+            // reference from the signed chain. A chain with an arbitrary
+            // signed conditional_transaction_id while the fulfillment carries
+            // a different reference is a ReferenceBindingMismatch.
+            match &fulfillment.transaction_reference {
+                Some(actual) if actual == conditional_transaction_id => {
+                    ConstraintCheckResult::ok(&format!(
+                        "payment.reference({})",
+                        &conditional_transaction_id[..8.min(conditional_transaction_id.len())]
+                    ))
+                }
+                Some(actual) => ConstraintCheckResult::violation(
+                    "payment.reference",
+                    ViError::new(
+                        ViErrorKind::ReferenceBindingMismatch,
+                        format!(
+                            "reference mismatch: constraint expects \
+                             {conditional_transaction_id}, fulfillment carries {actual}"
+                        ),
+                    ),
+                ),
+                None => ConstraintCheckResult::violation(
+                    "payment.reference",
+                    ViError::new(
+                        ViErrorKind::ReferenceBindingMismatch,
+                        "reference constraint present but no transaction reference \
+                         was carried into the fulfillment",
+                    ),
+                ),
+            }
         }
         Constraint::PaymentRecurrence { .. } | Constraint::AgentRecurrence { .. } => {
             // Recurrence constraints are informational for the payment network
