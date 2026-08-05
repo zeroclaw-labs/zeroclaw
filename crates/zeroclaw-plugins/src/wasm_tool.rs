@@ -1,17 +1,15 @@
 //! Bridge between WASM plugins and the Tool trait.
 
-use crate::PluginPermission;
+use crate::PluginCapability;
 use crate::component::PluginLimits;
+use crate::instance::PluginInstanceScope;
 use crate::runtime;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use zeroclaw_api::attribution::ToolKind;
+use zeroclaw_api::attribution::{Attributable, Role, ToolKind};
 use zeroclaw_api::tool::{Tool, ToolResult};
-use zeroclaw_api::tool_attribution;
-
-tool_attribution!(WasmTool, ToolKind::Plugin);
 
 /// A tool backed by a WASM plugin function.
 pub struct WasmTool {
@@ -19,9 +17,23 @@ pub struct WasmTool {
     description: String,
     parameters_schema: Value,
     wasm_path: PathBuf,
-    permissions: Vec<PluginPermission>,
+    scope: PluginInstanceScope,
     config: HashMap<String, String>,
     limits: PluginLimits,
+}
+
+impl Attributable for WasmTool {
+    fn role(&self) -> Role {
+        Role::Tool(ToolKind::Plugin)
+    }
+
+    fn alias(&self) -> &str {
+        // `Role::Tool` writes this value to the canonical `tool` attribution
+        // field. Keep it aligned with the callable export; package/capability/
+        // binding identity remains on the host-issued scope and is emitted by
+        // component logging under distinct plugin attributes.
+        &self.name
+    }
 }
 
 impl WasmTool {
@@ -30,68 +42,52 @@ impl WasmTool {
         description: String,
         parameters_schema: Value,
         wasm_path: PathBuf,
-        permissions: Vec<PluginPermission>,
+        scope: PluginInstanceScope,
         config: HashMap<String, String>,
         limits: PluginLimits,
-    ) -> Self {
-        Self {
+    ) -> anyhow::Result<Self> {
+        scope.require_capability(PluginCapability::Tool)?;
+        Ok(Self {
             name,
             description,
             parameters_schema,
             wasm_path,
-            permissions,
+            scope,
             config,
             limits,
-        }
+        })
     }
 
-    /// Create a WasmTool by loading metadata from the plugin's `tool` export.
-    /// Falls back to manifest-supplied values if the export is missing.
+    /// Create a `WasmTool` by loading its required metadata exports.
+    ///
+    /// Components that cannot be loaded, instantiated, or queried are rejected
+    /// instead of being registered with synthetic metadata.
     pub fn from_wasm(
         wasm_path: PathBuf,
-        permissions: Vec<PluginPermission>,
-        fallback_name: String,
-        fallback_description: String,
+        scope: PluginInstanceScope,
         config: HashMap<String, String>,
         limits: PluginLimits,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
+        scope.require_capability(PluginCapability::Tool)?;
         let probe = {
             let wasm_path = wasm_path.clone();
-            let permissions = permissions.clone();
+            let scope = scope.clone();
             block_probe(async move {
-                let mut plugin = runtime::create_plugin(&wasm_path, &permissions, limits).await?;
+                let mut plugin = runtime::create_plugin(&wasm_path, &scope, limits).await?;
                 runtime::call_tool_metadata(&mut plugin).await
             })
         };
-        let (name, description, schema) = match probe {
-            Ok(meta) => (meta.name, meta.description, meta.parameters_schema),
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                    &format!(
-                        "failed to load WASM plugin at {} for metadata: {e}",
-                        wasm_path.display()
-                    )
-                );
-                (
-                    fallback_name.clone(),
-                    fallback_description.clone(),
-                    default_schema(),
-                )
-            }
-        };
+        let meta = probe?;
 
-        Self {
-            name,
-            description,
-            parameters_schema: schema,
+        Ok(Self {
+            name: meta.name,
+            description: meta.description,
+            parameters_schema: meta.parameters_schema,
             wasm_path,
-            permissions,
+            scope,
             config,
             limits,
-        }
+        })
     }
 }
 
@@ -116,22 +112,6 @@ where
     })
 }
 
-/// The JSON Schema returned when a plugin lacks a tool metadata export or fails
-/// to load at discovery time. Single source of truth so the fallback shape stays
-/// consistent across code paths.
-fn default_schema() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "input": {
-                "type": "string",
-                "description": "Input for the plugin"
-            }
-        },
-        "required": ["input"]
-    })
-}
-
 #[async_trait]
 impl Tool for WasmTool {
     fn name(&self) -> &str {
@@ -148,9 +128,8 @@ impl Tool for WasmTool {
 
     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
         let args_json = serde_json::to_vec(&args)?;
-        let mut plugin =
-            runtime::create_plugin(&self.wasm_path, &self.permissions, self.limits).await?;
-        runtime::call_execute(&mut plugin, &args_json, &self.config, &self.permissions).await
+        let mut plugin = runtime::create_plugin(&self.wasm_path, &self.scope, self.limits).await?;
+        runtime::call_execute(&mut plugin, &args_json, &self.config).await
     }
 }
 
@@ -158,36 +137,57 @@ impl Tool for WasmTool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn new_exposes_metadata_via_tool_accessors() {
-        let schema = serde_json::json!({"type": "object", "properties": {}});
-        let tool = WasmTool::new(
-            "my_tool".to_string(),
-            "does things".to_string(),
-            schema.clone(),
-            PathBuf::from("/tmp/plugin.wasm"),
-            Vec::new(),
-            HashMap::new(),
-            PluginLimits {
-                call_fuel: 0,
-                max_memory_bytes: 256 * 1024 * 1024,
-                max_table_elements: 100_000,
-                max_instances: 64,
-            },
-        );
-        assert_eq!(tool.name(), "my_tool");
-        assert_eq!(tool.description(), "does things");
-        assert_eq!(tool.parameters_schema(), schema);
+    fn tool_scope() -> PluginInstanceScope {
+        crate::instance::test_scope(PluginCapability::Tool, "redaction-primary", [])
     }
 
     #[test]
-    fn default_schema_requires_a_string_input() {
-        let schema = default_schema();
-        assert_eq!(schema["type"].as_str(), Some("object"));
-        assert_eq!(
-            schema["properties"]["input"]["type"].as_str(),
-            Some("string")
+    fn tool_attribution_keeps_callable_and_instance_identities_distinct() {
+        let schema = serde_json::json!({"type": "object", "properties": {}});
+        let tool = WasmTool::new(
+            "redact".to_string(),
+            "does things".to_string(),
+            schema.clone(),
+            PathBuf::from("/tmp/plugin.wasm"),
+            tool_scope(),
+            HashMap::new(),
+            crate::component::test_limits(1_000),
+        )
+        .expect("tool scope matches adapter");
+        assert_eq!(tool.name(), "redact");
+        assert_eq!(tool.description(), "does things");
+        assert_eq!(tool.parameters_schema(), schema);
+        assert_eq!(tool.alias(), "redact");
+        assert_eq!(tool.scope.id().package(), "fixture");
+        assert_eq!(tool.scope.id().capability(), PluginCapability::Tool);
+        assert_eq!(tool.scope.id().binding(), "redaction-primary");
+    }
+
+    #[test]
+    fn new_rejects_a_scope_for_another_capability() {
+        let scope = crate::instance::test_scope(PluginCapability::Channel, "main", []);
+        let result = WasmTool::new(
+            "my_tool".to_string(),
+            "does things".to_string(),
+            serde_json::json!({}),
+            PathBuf::from("/tmp/plugin.wasm"),
+            scope,
+            HashMap::new(),
+            crate::component::test_limits(0),
         );
-        assert_eq!(schema["required"][0].as_str(), Some("input"));
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn from_wasm_rejects_a_missing_component() {
+        let result = WasmTool::from_wasm(
+            PathBuf::from("/path/that/must/not/exist.wasm"),
+            tool_scope(),
+            HashMap::new(),
+            crate::component::test_limits(0),
+        );
+
+        assert!(result.is_err());
     }
 }

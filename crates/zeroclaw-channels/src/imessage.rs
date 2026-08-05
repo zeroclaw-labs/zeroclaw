@@ -5,15 +5,6 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 
-/// Extract plain text from an iMessage `attributedBody` typedstream blob.
-///
-/// Modern macOS (Ventura+) stores message content in `attributedBody` as an
-/// `NSMutableAttributedString` serialized via Apple's typedstream format,
-/// rather than the plain `text` column.
-///
-/// This follows the well-documented marker-based approach used by LangChain,
-/// steipete/imsg, and mac_apt (all MIT-licensed). See:
-/// <https://chrissardegna.com/blog/reverse-engineering-apples-typedstream-format/>
 fn extract_text_from_attributed_body(blob: &[u8]) -> Option<String> {
     // Find the start-of-text marker: [0x01, 0x2B]
     // 0x2B is the C-string type tag in Apple's typedstream format.
@@ -24,15 +15,6 @@ fn extract_text_from_attributed_body(blob: &[u8]) -> Option<String> {
         return None;
     }
 
-    // Read variable-length prefix immediately after the marker.
-    // The length determines text extent — we do NOT scan for an end marker,
-    // because byte pairs like [0x86, 0x84] can appear inside valid UTF-8
-    // (e.g. U+2184 LATIN SMALL LETTER REVERSED C encodes to E2 86 84).
-    //
-    //   0x00-0x7F => literal length (1 byte)
-    //   0x81      => next 2 bytes are little-endian u16 length
-    //   0x82      => next 4 bytes are little-endian u32 length
-    //   0x80, 0x83+ are not observed in iMessage typedstreams; reject gracefully.
     let (length, text_start) = match rest[0] {
         0x81 if rest.len() >= 3 => {
             let len = u16::from_le_bytes([rest[1], rest[2]]) as usize;
@@ -50,11 +32,6 @@ fn extract_text_from_attributed_body(blob: &[u8]) -> Option<String> {
     std::str::from_utf8(text_bytes).ok().map(str::to_owned)
 }
 
-/// Resolve message content from the `text` column with `attributedBody` fallback.
-///
-/// Prefers the plain `text` column when present. Falls back to parsing the
-/// typedstream blob in `attributedBody` (modern macOS). Logs a warning when
-/// `attributedBody` exists but cannot be parsed.
 fn resolve_message_content(rowid: i64, text: Option<String>, body: Option<Vec<u8>>) -> String {
     text.filter(|t| !t.trim().is_empty())
         .or_else(|| {
@@ -110,12 +87,6 @@ impl IMessageChannel {
     }
 }
 
-/// Escape a string for safe interpolation into `AppleScript`.
-///
-/// This prevents injection attacks by escaping:
-/// - Backslashes (`\` → `\\`)
-/// - Double quotes (`"` → `\"`)
-/// - Newlines (`\n` → `\\n`, `\r` → `\\r`) to prevent code injection via line breaks
 fn escape_applescript(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('"', "\\\"")
@@ -123,14 +94,6 @@ fn escape_applescript(s: &str) -> String {
         .replace('\r', "\\r")
 }
 
-/// Validate that a target looks like a valid phone number or email address.
-///
-/// This is a defense-in-depth measure to reject obviously malicious targets
-/// before they reach `AppleScript` interpolation.
-///
-/// Valid patterns:
-/// - Phone: starts with `+` followed by digits (with optional spaces/dashes)
-/// - Email: contains `@` with alphanumeric chars on both sides
 fn is_valid_imessage_target(target: &str) -> bool {
     let target = target.trim();
     if target.is_empty() {
@@ -391,8 +354,6 @@ end tell"#
     }
 }
 
-/// Get the current max ROWID from the messages table.
-/// Uses rusqlite with parameterized queries for security (CWE-89 prevention).
 #[cfg(test)]
 async fn get_max_rowid(db_path: &std::path::Path) -> anyhow::Result<i64> {
     let path = db_path.to_path_buf();
@@ -409,9 +370,6 @@ async fn get_max_rowid(db_path: &std::path::Path) -> anyhow::Result<i64> {
     Ok(result)
 }
 
-/// Fetch messages newer than `since_rowid`.
-/// Uses rusqlite with parameterized queries for security (CWE-89 prevention).
-/// The `since_rowid` parameter is bound safely, preventing SQL injection.
 #[cfg(test)]
 async fn fetch_new_messages(
     db_path: &std::path::Path,

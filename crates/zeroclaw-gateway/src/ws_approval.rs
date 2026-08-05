@@ -1,18 +1,5 @@
 //! WebSocket-backed [`Channel`] implementation that surfaces tool approval
 //! prompts to the gateway client and waits for the operator's decision.
-//!
-//! The agent's tool loop calls
-//! [`zeroclaw_api::channel::Channel::request_approval`]
-//! whenever a supervised-mode tool needs operator consent. This struct mints
-//! a `request_id`, emits a [`TurnEvent::ApprovalRequest`] that the existing
-//! forward loop serialises onto the wire, and parks on a oneshot until the
-//! matching `approval_response` frame arrives.
-//!
-//! The pending-request map is shared with the connection's receive loop; on
-//! `approval_response` the loop pops the oneshot sender keyed by `request_id`
-//! and resolves the agent's pending future. If the operator does not respond
-//! within `timeout_secs` the wait yields `Deny`, matching the policy of every
-//! other channel that implements `request_approval`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -24,7 +11,8 @@ use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 use zeroclaw_api::agent::TurnEvent;
 use zeroclaw_api::channel::{
-    Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
+    ApprovalSource, AttributedApprovalResponse, Channel, ChannelApprovalRequest,
+    ChannelApprovalResponse, ChannelMessage, SendMessage,
 };
 
 /// Shared map keyed by `request_id`. Consumed by the receive loop to resolve
@@ -84,6 +72,14 @@ impl Channel for WsApprovalChannel {
         Ok(())
     }
 
+    /// `send` above is a deliberate no-op (see comment). Surfaces that must
+    /// genuinely deliver — `poll`'s formatted-text fallback and
+    /// `escalate_to_human` — check this so they fail honestly instead of
+    /// claiming success for a message that was never rendered.
+    fn supports_outbound_send(&self) -> bool {
+        false
+    }
+
     async fn listen(&self, _tx: mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         // The gateway WS path does not act as a message source for the
         // channel orchestrator; turns are driven directly by the WS
@@ -92,20 +88,27 @@ impl Channel for WsApprovalChannel {
     }
 
     fn supports_free_form_ask(&self) -> bool {
-        // The gateway WS path only implements structured approval
-        // (request_approval). It cannot transport free-form ask_user
-        // questions through the generic send+listen flow — send() is
-        // a no-op and listen() returns immediately. Returning false
-        // here lets callers fail fast with a clear error instead of
-        // the misleading "Channel closed before receiving a response".
         false
     }
 
+    /// Delegates to [`Self::request_approval_attributed`] and drops the
+    /// provenance, so the prompt/timeout logic lives in exactly one place.
     async fn request_approval(
+        &self,
+        recipient: &str,
+        request: &ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
+        Ok(self
+            .request_approval_attributed(recipient, request)
+            .await?
+            .map(|attributed| attributed.response))
+    }
+
+    async fn request_approval_attributed(
         &self,
         _recipient: &str,
         request: &ChannelApprovalRequest,
-    ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
+    ) -> anyhow::Result<Option<AttributedApprovalResponse>> {
         let request_id = Uuid::new_v4().to_string();
         let (tx, rx) = oneshot::channel();
         self.pending.lock().insert(request_id.clone(), tx);
@@ -126,19 +129,27 @@ impl Channel for WsApprovalChannel {
         }
 
         match tokio::time::timeout(self.timeout, rx).await {
-            Ok(Ok(decision)) => Ok(Some(decision)),
+            Ok(Ok(decision)) => Ok(Some(AttributedApprovalResponse::operator(decision))),
             Ok(Err(_)) => {
                 // Sender dropped without responding (connection closed
                 // mid-prompt). Treat as deny rather than None so the agent
-                // does not silently fall back to "no channel handled this".
+                // does not silently fall back to "no channel handled this" —
+                // but mark it Unreachable, because nobody answered.
                 self.pending.lock().remove(&request_id);
-                Ok(Some(ChannelApprovalResponse::Deny))
+                Ok(Some(AttributedApprovalResponse::from_runtime(
+                    ChannelApprovalResponse::Deny,
+                    ApprovalSource::Unreachable,
+                )))
             }
             Err(_) => {
                 // Timeout: pop and deny. Mirrors Telegram / Slack behaviour
-                // when the operator does not tap a button in time.
+                // when the operator does not tap a button in time. This deny is
+                // the runtime's, not the operator's.
                 self.pending.lock().remove(&request_id);
-                Ok(Some(ChannelApprovalResponse::Deny))
+                Ok(Some(AttributedApprovalResponse::from_runtime(
+                    ChannelApprovalResponse::Deny,
+                    ApprovalSource::TimedOut,
+                )))
             }
         }
     }
@@ -149,13 +160,6 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    /// Regression test: WsApprovalChannel only implements structured
-    /// approval (request_approval).  Its generic send() is a no-op and
-    /// listen() returns immediately, so free-form ask_user / escalate
-    /// must fail fast instead of falling through to the misleading
-    /// "Channel closed before receiving a response" error.  This test
-    /// pins the capability bit so the trait default (true) cannot
-    /// silently regress during later channel cleanup.
     #[test]
     fn ws_approval_channel_declines_free_form_ask() {
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
@@ -166,5 +170,97 @@ mod tests {
             "WsApprovalChannel must refuse free-form ask_user; \
              its send() is a no-op and listen() drops immediately"
         );
+    }
+
+    fn approval_request() -> ChannelApprovalRequest {
+        ChannelApprovalRequest {
+            tool_name: "file_write".to_string(),
+            arguments_summary: "path=a.txt".to_string(),
+            raw_arguments: None,
+        }
+    }
+
+    /// The operator never taps anything and the prompt times out. The channel
+    /// still synthesizes `Some(Deny)` so the agent does not fall through to
+    /// "no channel handled this" — but that deny is the RUNTIME's, and the
+    /// provenance has to say so. Before this, the identical `Some(Deny)` was
+    /// reported to the model as "Denied by user." on a run where no human was
+    /// ever asked.
+    #[tokio::test]
+    async fn timed_out_prompt_denies_with_runtime_provenance() {
+        // Keep the receiver alive so the send succeeds and we reach the timeout
+        // rather than the "forward task gone" early return.
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let pending = new_pending_approvals();
+        let channel = WsApprovalChannel::new(tx, pending, Duration::from_millis(50));
+
+        let attributed = channel
+            .request_approval_attributed("operator", &approval_request())
+            .await
+            .expect("timeout is not an error")
+            .expect("a timeout still yields a deny, not None");
+
+        assert_eq!(attributed.response, ChannelApprovalResponse::Deny);
+        assert_eq!(
+            attributed.source,
+            ApprovalSource::TimedOut,
+            "a prompt nobody answered is not an operator decision"
+        );
+        assert!(attributed.source.is_runtime_fail_closed());
+    }
+
+    /// The connection closes mid-prompt: the pending sender is dropped. Same
+    /// contract as the timeout — a deny, but not the operator's.
+    #[tokio::test]
+    async fn dropped_responder_denies_with_runtime_provenance() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let pending = new_pending_approvals();
+        let channel = WsApprovalChannel::new(tx, Arc::clone(&pending), Duration::from_secs(30));
+
+        let call = async {
+            channel
+                .request_approval_attributed("operator", &approval_request())
+                .await
+        };
+        // Drop the registered oneshot sender out from under the waiter, which is
+        // what a closing WebSocket does.
+        let dropper = async {
+            for _ in 0..100 {
+                {
+                    let mut guard = pending.lock();
+                    if let Some(key) = guard.keys().next().cloned() {
+                        guard.remove(&key);
+                        return;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        let (result, ()) = tokio::join!(call, dropper);
+
+        let attributed = result
+            .expect("a dropped responder is not an error")
+            .expect("a dropped responder still yields a deny, not None");
+        assert_eq!(attributed.response, ChannelApprovalResponse::Deny);
+        assert_eq!(
+            attributed.source,
+            ApprovalSource::Unreachable,
+            "a responder that went away is not an operator decision"
+        );
+    }
+
+    /// The legacy entry point must keep its existing shape: provenance is an
+    /// addition, not a change to what `request_approval` returns.
+    #[tokio::test]
+    async fn legacy_request_approval_still_returns_a_bare_deny_on_timeout() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let pending = new_pending_approvals();
+        let channel = WsApprovalChannel::new(tx, pending, Duration::from_millis(50));
+
+        let response = channel
+            .request_approval("operator", &approval_request())
+            .await
+            .expect("timeout is not an error");
+        assert_eq!(response, Some(ChannelApprovalResponse::Deny));
     }
 }

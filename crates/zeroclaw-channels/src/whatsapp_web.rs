@@ -1,32 +1,4 @@
 //! WhatsApp Web channel using wa-rs (native Rust implementation)
-//!
-//! This channel provides direct WhatsApp Web integration with:
-//! - QR code and pair code linking
-//! - End-to-end encryption via Signal Protocol
-//! - Full Baileys parity (groups, media, presence, reactions, editing/deletion)
-//!
-//! # Feature Flag
-//!
-//! This channel requires the `whatsapp-web` feature flag:
-//! ```sh
-//! cargo build --features whatsapp-web
-//! # If installed to PATH:
-//! cargo install --path . --force --locked --features whatsapp-web
-//! ```
-//!
-//! # Configuration
-//!
-//! ```toml
-//! [channels_config.whatsapp]
-//! session_path = "~/.zeroclaw/whatsapp-session.db"  # Required for Web mode
-//! pair_phone = "15551234567"  # Optional: for pair code linking
-//! allowed_numbers = ["+1234567890", "*"]  # Same as Cloud API
-//! ```
-//!
-//! # Runtime Negotiation
-//!
-//! This channel is automatically selected when `session_path` is set in the config.
-//! The Cloud API channel is used when `phone_number_id` is set.
 
 use super::whatsapp_storage::RusqliteStore;
 use anyhow::{Context, Result};
@@ -41,20 +13,6 @@ use zeroclaw_api::channel::{Channel, ChannelConversationScope, ChannelMessage, S
 use zeroclaw_api::media::MediaAttachment;
 use zeroclaw_runtime::i18n;
 
-/// WhatsApp Web channel using wa-rs with custom rusqlite storage
-///
-/// # Status: Functional Implementation
-///
-/// This implementation uses the wa-rs Bot with our custom RusqliteStore backend.
-///
-/// # Configuration
-///
-/// ```toml
-/// [channels_config.whatsapp]
-/// session_path = "~/.zeroclaw/whatsapp-session.db"
-/// pair_phone = "15551234567"  # Optional
-/// allowed_numbers = ["+1234567890", "*"]
-/// ```
 #[cfg(feature = "whatsapp-web")]
 pub struct WhatsAppWebChannel {
     /// Session database path
@@ -125,15 +83,15 @@ pub struct WhatsAppWebChannel {
     /// Resolves allowed group chats from canonical config at message-time.
     /// Empty = all groups permitted. Direct messages bypass.
     allowed_groups_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    /// Optional pairing-persist handle to the canonical shared `Config`.
+    /// `None` in tests; `Some` in the long-running daemon, wired via
+    /// `.with_persistence(config)`. Same contract as WeChat's handle: on
+    /// connect, the linked account is persisted into `peer_groups` through
+    /// `crate::identity_persist` (no channel-local allowlist cache).
+    persist: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
 }
 
 impl WhatsAppWebChannel {
-    /// Create a new WhatsApp Web channel from a `WhatsAppConfig`.
-    ///
-    /// `config` is the schema block under `[channels.whatsapp.<alias>]`;
-    /// `alias` is that alias key; resolvers read authorization inputs from
-    /// canonical state at message-time (no cache — see AGENTS.md
-    /// "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH").
     #[cfg(feature = "whatsapp-web")]
     pub fn new(
         config: &zeroclaw_config::schema::WhatsAppConfig,
@@ -196,6 +154,7 @@ impl WhatsAppWebChannel {
             dm_mention_patterns: Arc::new(Vec::new()),
             group_mention_patterns: Arc::new(Vec::new()),
             workspace_dir: None,
+            persist: None,
         }
     }
 
@@ -203,6 +162,20 @@ impl WhatsAppWebChannel {
     /// channel handle is bound to.
     pub fn alias(&self) -> &str {
         &self.alias
+    }
+
+    /// Wire the shared Config handle so a completed pairing can persist the
+    /// linked account into `peer_groups` and save — the same contract as
+    /// `WeChatChannel::with_persistence`. The long-running daemon sets this
+    /// from the orchestrator; tests and one-shot callers leave it unset
+    /// (pairing works at runtime, doesn't persist).
+    #[cfg(feature = "whatsapp-web")]
+    pub fn with_persistence(
+        mut self,
+        config: Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>,
+    ) -> Self {
+        self.persist = Some(config);
+        self
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -238,19 +211,9 @@ impl WhatsAppWebChannel {
         self
     }
 
-    /// Configure text-to-speech for outgoing voice replies.
-    ///
-    /// Builds a [`super::tts::TtsManager`] from the
-    /// `[tts_providers.<type>.<alias>]` map. Disabled when `[tts].enabled = false`
-    /// or when the manager fails to construct (logged at warn).
     #[cfg(feature = "whatsapp-web")]
     pub fn with_tts(mut self, config: &zeroclaw_config::schema::Config) -> Self {
         if config.tts.enabled {
-            // Bind the TTS manager to the agent that owns THIS channel so the
-            // voice reply uses that agent's `tts_provider`. Without this the
-            // shared manager resolves the lexicographically-smallest enabled
-            // agent, which silently breaks TTS when that agent has no
-            // `tts_provider` set (e.g. a background/delegate agent).
             let owner = config.agent_for_channel(&format!("whatsapp.{}", self.alias));
             match super::tts::TtsManager::from_config_for_agent(config, owner) {
                 Ok(m) => self.tts_manager = Some(Arc::new(m)),
@@ -295,14 +258,6 @@ impl WhatsAppWebChannel {
         Self::is_number_allowed_for_list(&peers, phone)
     }
 
-    /// Check whether a phone number is allowed against a provided allowlist.
-    ///
-    /// The per-entry comparison is E.164 normalization, which the in-tree
-    /// `crate::allowlist::Match` modes can't express, so it goes through
-    /// `crate::allowlist::is_user_allowed_by` with a custom matcher. `phone`
-    /// is matched only after `normalize_phone_token`; a token with no canonical
-    /// form never matches. `allowed_numbers` is the caller's freshly-resolved
-    /// peer list, so no allowlist state is cached.
     #[cfg(feature = "whatsapp-web")]
     fn is_number_allowed_for_list(allowed_numbers: &[String], phone: &str) -> bool {
         // This channel historically accepted a surrounding-whitespace wildcard
@@ -323,7 +278,6 @@ impl WhatsAppWebChannel {
     }
 
     /// Normalize a phone-like token to canonical E.164 (`+<digits>`).
-    ///
     /// Accepts raw numbers, `+` numbers, and JIDs (uses the user part before `@`).
     #[cfg(feature = "whatsapp-web")]
     fn normalize_phone_token(value: &str) -> Option<String> {
@@ -346,12 +300,6 @@ impl WhatsAppWebChannel {
         }
     }
 
-    /// Build the LID-aware diagnostic suffix appended to allowlist-rejection
-    /// logs so the operator sees why a known phone number didn't match.
-    /// Only meaningful inside an actual rejection branch (`normalized.is_none()`
-    /// under `Allowlist` policy); outside that branch the LID resolution
-    /// state is not the operator's concern, since the message is being
-    /// processed normally.
     #[cfg(feature = "whatsapp-web")]
     fn lid_rejection_diagnostic(
         sender: &wacore_binary::jid::Jid,
@@ -401,23 +349,13 @@ impl WhatsAppWebChannel {
         candidates
     }
 
-    /// Compute the reply target for a chat.
-    ///
-    /// As of whatsapp-rust 0.6+ with PR #636, the library handles LID→PN
-    /// resolution internally and requires consistent LID namespace throughout
-    /// the message stanza. We now pass the chat JID unchanged and let the
-    /// library handle addressing.
-    ///
-    /// Previously (pre-0.6), this function converted LID JIDs to phone JIDs
-    /// because LIDs couldn't receive messages directly. Now the library
-    /// expects LID format when the recipient is LID-addressed.
     #[cfg(feature = "whatsapp-web")]
     fn compute_reply_target(chat_jid: &str) -> String {
         // Pass through unchanged - library handles LID resolution internally
         chat_jid.to_string()
     }
 
-    /// Resolve an outbound recipient. With whatsapp-rust 0.6+ and PR #636,
+    /// Resolve an outbound recipient. With whatsapp-rust 0.6+ and
     /// LID JIDs are handled internally by the library, so we pass through unchanged.
     #[cfg(feature = "whatsapp-web")]
     fn resolve_outbound_recipient(recipient: &str) -> String {
@@ -472,11 +410,6 @@ impl WhatsAppWebChannel {
             .build())
     }
 
-    /// Convert a recipient to a wa-rs JID.
-    ///
-    /// Supports:
-    /// - Full JIDs (e.g. "12345@s.whatsapp.net")
-    /// - E.164-like numbers (e.g. "+1234567890")
     #[cfg(feature = "whatsapp-web")]
     fn recipient_to_jid(&self, recipient: &str) -> Result<wacore_binary::jid::Jid> {
         let trimmed = recipient.trim();
@@ -541,6 +474,27 @@ impl WhatsAppWebChannel {
         retry_count.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Expand `~` in a configured `session_path`. Single source of truth
+    /// for the on-disk location — the run loop and the readiness probe
+    /// must agree on the file they are looking at.
+    fn expand_session_path(session_path: &str) -> String {
+        shellexpand::tilde(session_path).to_string()
+    }
+
+    /// Channel-owned persisted-login probe: reports whether the session
+    /// database at the configured `session_path` holds a device linked to a
+    /// WhatsApp account (`device.pn` written by a completed QR pairing).
+    /// Stricter than the run loop's resume check on purpose — a channel
+    /// waiting for its QR scan persists an unregistered device row, which
+    /// must not read as an authenticated login. Read-only; never creates
+    /// the database or its sidecar files.
+    pub fn has_persisted_session(session_path: &str) -> bool {
+        if session_path.is_empty() {
+            return false;
+        }
+        super::whatsapp_storage::persisted_device_exists(Self::expand_session_path(session_path))
+    }
+
     /// Return the session file paths to remove (primary + WAL + SHM sidecars).
     fn session_file_paths(expanded_session_path: &str) -> [String; 3] {
         [
@@ -550,8 +504,35 @@ impl WhatsAppWebChannel {
         ]
     }
 
-    /// Attempt to download and transcribe a WhatsApp voice note.
+    /// Channel-owned relink hook: delete the persisted session so the next
+    /// channel start finds no device and begins a fresh QR pairing.
     ///
+    /// Removes the same triple the logged-out purge path removes —
+    /// [`Self::session_file_paths`] is the single source of truth for both.
+    /// Returns the paths actually removed; already absent files are not an
+    /// error, so relinking an unpaired channel is a safe no-op that returns
+    /// an empty list. Never creates the database.
+    ///
+    /// This only clears disk state. A currently running channel keeps its
+    /// live connection until it is restarted; callers own scheduling that
+    /// restart (e.g. a daemon reload).
+    pub fn clear_persisted_session(session_path: &str) -> std::io::Result<Vec<String>> {
+        let mut removed = Vec::new();
+        if session_path.is_empty() {
+            return Ok(removed);
+        }
+        let expanded = Self::expand_session_path(session_path);
+        for path in Self::session_file_paths(&expanded) {
+            match std::fs::remove_file(&path) {
+                Ok(()) => removed.push(path),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Attempt to download and transcribe a WhatsApp voice note.
     /// Returns `None` if transcription is disabled, download fails, or
     /// transcription fails (all logged as warnings).
     #[cfg(feature = "whatsapp-web")]
@@ -1279,19 +1260,6 @@ impl WhatsAppWebChannel {
     }
 }
 
-/// Decide whether a `fromMe` message outside the operator's self-chat is an
-/// intentional operator-typed bot trigger.
-///
-/// The default response to a `fromMe` mirror is to drop, because WhatsApp Web
-/// echoes every message the operator types from any linked device and replying
-/// would impersonate them. The exception is when the operator has configured
-/// `dm_mention_patterns` / `group_mention_patterns` and the text matches —
-/// that is the explicit opt-in that distinguishes a deliberate trigger
-/// (e.g. typing `TinyBot foo` in a friend's DM) from a normal mirrored
-/// message.
-///
-/// Returns `true` when the message should fall through to the regular policy
-/// branches; `false` when it should be dropped as a mirror.
 #[cfg(feature = "whatsapp-web")]
 fn fromme_outside_self_chat_is_operator_trigger(
     is_group: bool,
@@ -1310,15 +1278,6 @@ fn fromme_outside_self_chat_is_operator_trigger(
     super::whatsapp::WhatsAppChannel::text_matches_patterns(applicable, text)
 }
 
-/// Returns `true` when a group `chat_jid` is permitted by `allowed_groups`.
-///
-/// An empty list permits every group (current default). A non-empty list
-/// permits a group when some entry matches the chat JID exactly: an entry
-/// matches when it equals the full JID (`123@g.us`) or equals the JID's
-/// user part - the segment before `@` (`123`). Matching is exact, not a
-/// string prefix, so `"123"` admits `123@g.us` but never `123999@g.us`.
-/// Blank entries never match. Callers gate on `is_group` first, so direct
-/// messages bypass this check entirely.
 #[cfg(feature = "whatsapp-web")]
 fn is_group_chat_allowed(chat_jid: &str, allowed_groups: &[String]) -> bool {
     if allowed_groups.is_empty() {
@@ -1417,13 +1376,6 @@ struct WhatsAppMediaMarker {
 #[cfg(feature = "whatsapp-web")]
 use crate::util::WhatsAppLocation;
 
-/// An outbound marker: either a file-based media attachment (resolved against
-/// the workspace and uploaded) or an inline location pin (no file, no upload).
-///
-/// Both variants carry the raw marker target; validation happens on the send
-/// path (`validate_whatsapp_marker_target` for media,
-/// `validate_whatsapp_location_target` for locations) so an invalid target
-/// counts as a failed delivery instead of vanishing silently.
 #[cfg(feature = "whatsapp-web")]
 #[derive(Debug, Clone, PartialEq)]
 enum WhatsAppMarker {
@@ -1572,11 +1524,6 @@ fn validate_whatsapp_marker_target(
     Ok(target_canon)
 }
 
-/// Validate a `[LOCATION:...]` marker target, the location counterpart of
-/// `validate_whatsapp_marker_target`: instead of resolving a workspace file,
-/// it checks that the inline target parses as `lat,lng[,name[,address]]` with
-/// in-range WGS84 coordinates. A malformed target is refused so the send loop
-/// counts it as a failed delivery rather than dropping it silently.
 #[cfg(feature = "whatsapp-web")]
 fn validate_whatsapp_location_target(
     target: &str,
@@ -1878,7 +1825,7 @@ impl Channel for WhatsAppWebChannel {
         // Box::pin the large future (~34KB) so it doesn't inflate the
         // enclosing Send future's stack slot — clippy::large_futures.
         // whatsapp-rust 0.6: send_message returns `SendResult { message_id, to }`
-        // instead of a bare `String` (oxidezap/whatsapp-rust#597).
+        // instead of a bare `String` (oxidezap/whatsapp-rust
         let send_result = Box::pin(client.send_message(to, outgoing)).await?;
         ::zeroclaw_log::record!(
             DEBUG,
@@ -1914,7 +1861,7 @@ impl Channel for WhatsAppWebChannel {
         let retry_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
         loop {
-            let expanded_session_path = shellexpand::tilde(&self.session_path).to_string();
+            let expanded_session_path = Self::expand_session_path(&self.session_path);
 
             ::zeroclaw_log::record!(
                 INFO,
@@ -2001,13 +1948,8 @@ impl Channel for WhatsAppWebChannel {
             let wa_dm_mention_patterns = self.dm_mention_patterns.clone();
             let wa_group_mention_patterns = self.group_mention_patterns.clone();
             let allowed_groups_resolver = Arc::clone(&self.allowed_groups_resolver);
+            let persist_clone = self.persist.clone();
 
-            // whatsapp-rust 0.6: BotBuilder gained a 4th typestate slot for the
-            // async runtime (oxidezap/whatsapp-rust#621). `with_runtime` is
-            // required before `.build()` resolves; we use the bundled
-            // `TokioRuntime`. `with_device_props` switched from three
-            // positional Options to a `DevicePropsOverride` builder
-            // (oxidezap/whatsapp-rust#586).
             let mut builder = Bot::builder()
                 .with_backend(backend)
                 .with_transport_factory(transport_factory)
@@ -2039,9 +1981,10 @@ impl Channel for WhatsAppWebChannel {
                     let wa_dm_mention_patterns = wa_dm_mention_patterns.clone();
                     let wa_group_mention_patterns = wa_group_mention_patterns.clone();
                     let allowed_groups_resolver = Arc::clone(&allowed_groups_resolver);
+                    let persist_inner = persist_clone.clone();
                     async move {
                         // whatsapp-rust 0.6: event handlers receive `Arc<Event>`
-                        // per PR #613, so we match against `&*event` to get a
+                        // per so we match against `&*event` to get a
                         // `&Event` reference and bind variant fields by ref.
                         match &*event {
                             Event::Message(msg, info) => {
@@ -2050,13 +1993,6 @@ impl Channel for WhatsAppWebChannel {
                                 let sender = sender_jid.user().to_string();
                                 let chat = info.source.chat.to_string();
 
-                                // whatsapp-rust 0.6: `Client::get_phone_number_from_lid`
-                                // was replaced by the unified `get_lid_pn_entry`
-                                // (oxidezap/whatsapp-rust#487). The new helper
-                                // returns the full LID↔phone entry; we extract
-                                // the phone field on hit, swallow lookup errors
-                                // back to `None` (consistent with the legacy
-                                // semantics — best-effort enrichment).
                                 let mapped_phone = if sender_jid.is_lid() {
                                     match client.get_lid_pn_entry(&sender_jid).await {
                                         Ok(Some(entry)) => Some(entry.phone_number),
@@ -2082,11 +2018,6 @@ impl Channel for WhatsAppWebChannel {
                                 let is_group = info.source.is_group;
                                 let reply_target = Self::compute_reply_target(&chat);
 
-                                // ── Group allowlist (allowed_groups) ──
-                                // Applies in both business and personal mode,
-                                // before the chat-type policy block. An empty
-                                // list permits all groups; DMs bypass via the
-                                // `is_group` guard.
                                 let allowed_groups = allowed_groups_resolver();
                                 if is_group && !is_group_chat_allowed(&chat, &allowed_groups) {
                                     ::zeroclaw_log::record!(
@@ -2124,14 +2055,6 @@ impl Channel for WhatsAppWebChannel {
                                             msg.text_content().unwrap_or(""),
                                         )
                                     {
-                                        // fromMe outside the self-chat thread is a mirror of the
-                                        // operator's own outbound message to a third party (DM or
-                                        // group). Replying would impersonate the operator. Drop —
-                                        // unless the operator has configured a mention pattern
-                                        // and the text matches it (the workflow @ilteoood uses
-                                        // with `TinyBot ...` triggers), in which case the helper
-                                        // returns true and we fall through to the policy branches
-                                        // below to treat the message like an inbound trigger.
                                         ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"chat": chat, "sender": sender})), "ignoring fromMe message outside self-chat thread (chat=, sender=)");
                                         return;
                                     } else if is_group {
@@ -2216,12 +2139,6 @@ impl Channel for WhatsAppWebChannel {
                                     }
                                 }
 
-                                // ── Mention-pattern gating ──
-                                // If passive group context could record a no-match group message,
-                                // apply group mention gating before STT/media downloads so a
-                                // passive message has no provider/tool side effects. Otherwise,
-                                // defer gating until after STT to preserve the existing active
-                                // voice-note behavior.
                                 let passive_from_mention_gating_possible =
                                     Self::should_record_passive_group_context(
                                         passive_group_context,
@@ -2350,14 +2267,18 @@ impl Channel for WhatsAppWebChannel {
                                 .await;
                             }
                             Event::Connected(_) => {
-                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "connected successfully");
+                                crate::login_events::LoginEvent::Connected.emit(
+                                    "whatsapp",
+                                    alias.as_ref(),
+                                    "WhatsApp Web connected successfully",
+                                );
                                 WhatsAppWebChannel::reset_retry(&retry_count);
+                                let device = client
+                                    .persistence_manager()
+                                    .get_device_snapshot()
+                                    .await;
                                 // Resolve bot identity from the device store
                                 if mention_only {
-                                    let device = client
-                                        .persistence_manager()
-                                        .get_device_snapshot()
-                                    .await;
                                     if let Some(ref pn) = device.pn
                                         && let Some(digits) =
                                             Self::store_jid_digits(&bot_phone_inner, pn.user())
@@ -2371,24 +2292,61 @@ impl Channel for WhatsAppWebChannel {
                                         ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("resolved bot LID from device: {}", digits));
                                     }
                                 }
+                                // Persist the linked account as an authorized
+                                // peer in canonical peer_groups (same shape
+                                // WeChat pairing writes). Idempotent, so the
+                                // reconnect-after-resume case is a no-op.
+                                if let Some(ref pn) = device.pn {
+                                    let digits = Self::jid_digits(pn.user());
+                                    if !digits.is_empty()
+                                        && let Err(e) =
+                                            crate::identity_persist::persist_external_peer(
+                                                persist_inner.as_ref(),
+                                                "whatsapp",
+                                                alias.as_ref(),
+                                                &format!("+{digits}"),
+                                            )
+                                            .await
+                                    {
+                                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("failed to persist linked WhatsApp identity: {e}"));
+                                    }
+                                }
                             }
                             Event::LoggedOut(_) => {
                                 session_revoked.store(true, std::sync::atomic::Ordering::Relaxed);
-                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "WhatsApp Web was logged out — will clear session and reconnect");
+                                crate::login_events::LoginEvent::LoggedOut.emit(
+                                    "whatsapp",
+                                    alias.as_ref(),
+                                    "WhatsApp Web was logged out — will clear session and reconnect",
+                                );
                                 let _ = logout_tx.send(());
                             }
                             Event::StreamError(stream_error) => {
                                 ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure), &format!("stream error: {:?}", stream_error));
                             }
                             Event::PairingCode { code, .. } => {
-                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "pair code received");
-                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Link your phone by entering this code in WhatsApp > Linked Devices");
+                                crate::login_events::LoginEvent::PairCode { code: code.as_str() }
+                                    .emit(
+                                    "whatsapp",
+                                    alias.as_ref(),
+                                    "WhatsApp Web pair code received — enter it in WhatsApp > Linked Devices",
+                                );
                                 eprintln!();
                                 eprintln!("pair code: {code}");
                                 eprintln!();
                             }
                             Event::PairingQrCode { code, .. } => {
-                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "WhatsApp Web QR code received (scan with WhatsApp > Linked Devices)");
+                                crate::login_events::LoginEvent::Qr {
+                                    payload: code.as_str(),
+                                    image_url: None,
+                                    attempt: None,
+                                    max_attempts: None,
+                                }
+                                .emit(
+                                    "whatsapp",
+                                    alias.as_ref(),
+                                    "WhatsApp Web QR code received (scan with WhatsApp > Linked Devices)",
+                                );
                                 match Self::render_pairing_qr(code) {
                                     Ok(rendered) => {
                                         eprintln!();
@@ -2708,6 +2666,39 @@ mod tests {
     use super::*;
     #[cfg(feature = "whatsapp-web")]
     use wacore_binary::jid::Jid;
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn clear_persisted_session_removes_db_triple_and_is_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("session.db");
+        let db_str = db.to_string_lossy().into_owned();
+        std::fs::write(&db, b"db").unwrap();
+        std::fs::write(format!("{db_str}-wal"), b"wal").unwrap();
+        std::fs::write(format!("{db_str}-shm"), b"shm").unwrap();
+
+        let removed = WhatsAppWebChannel::clear_persisted_session(&db_str).unwrap();
+        assert_eq!(removed.len(), 3);
+        for path in WhatsAppWebChannel::session_file_paths(&db_str) {
+            assert!(
+                !std::path::Path::new(&path).exists(),
+                "{path} must be removed"
+            );
+        }
+
+        // Relinking an already unpaired channel is a safe no-op that
+        // must not create the database.
+        let removed = WhatsAppWebChannel::clear_persisted_session(&db_str).unwrap();
+        assert!(removed.is_empty());
+        assert!(!db.exists());
+
+        // Empty session_path (channel saved without one) clears nothing.
+        assert!(
+            WhatsAppWebChannel::clear_persisted_session("")
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     #[test]
     #[cfg(feature = "whatsapp-web")]
@@ -3170,13 +3161,6 @@ mod tests {
             "Group chat must preserve original chat JID"
         );
     }
-
-    // ── lid_rejection_diagnostic: scoped LID warning ────
-    //
-    // The diagnostic fires only inside the `Allowlist::normalized.is_none()`
-    // branch. These tests pin the three shapes the function returns; the
-    // call-site composition (suffix appended to the rejection log) is
-    // covered by reading the surrounding code path.
 
     #[test]
     #[cfg(feature = "whatsapp-web")]

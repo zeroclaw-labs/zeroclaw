@@ -1,10 +1,6 @@
 //! Scoped one-level directory browser. Gateway (`api_browse.rs`), CLI
 //! (`src/browse.rs`), and the future TUI directory picker all reach the
 //! same canonical implementation here.
-//!
-//! Hard-scoped to `<install>/shared/` — the only place skills, knowledge
-//! bundles, and other host-wide content live. `..` traversal that escapes
-//! the root is rejected before any I/O.
 
 use std::path::PathBuf;
 
@@ -113,11 +109,6 @@ fn list_under_root(root: &std::path::Path, raw: &str) -> Result<BrowseResult, Br
     })
 }
 
-/// Top-level shared/ entries that the runtime owns and the operator must
-/// not be able to remove via the dashboard. Backend-enforced so a
-/// compromised or buggy frontend cannot bypass this. Names match what
-/// the install scaffolds via `migrate_v2_to_v3_install_filesystem`
-/// and the `<install>/shared/` initializer.
 const PROTECTED_SHARED_TOP_LEVEL: &[&str] = &["skills", "skill-bundles", "knowledge"];
 
 /// Create a new directory at `<install>/shared/<raw>`. Idempotent — if the
@@ -163,17 +154,6 @@ pub fn remove_directory(config: &Config, raw: &str) -> Result<(), BrowseError> {
     std::fs::remove_dir_all(&resolved)?;
     Ok(())
 }
-
-// ── Agent-workspace operations ────────────────────────────────────────────
-//
-// All four functions are scoped to `<install>/agents/<alias>/workspace/`
-// (or the explicit per-agent override at `[agents.<alias>.workspace.path]`).
-// Containment is enforced by `resolve_under`, same as the shared/ browser.
-//
-// Protected files: the per-agent bootstrap markdown files the runtime
-// expects on disk. The dashboard refuses to delete or overwrite these via
-// READ/DELETE/MOVE; operators with a need to wipe them go through the
-// CLI / shell.
 
 /// Hard byte cap on file-read responses. Anything larger surfaces as
 /// `BrowseError::TooLarge`; the dashboard can offer a CLI hint.
@@ -484,7 +464,6 @@ mod tests {
         make_directory(&cfg, "skills/alpha/nested/deep").unwrap();
         remove_directory(&cfg, "skills/alpha").unwrap();
         assert!(!dir.path().join("shared/skills/alpha").exists());
-        // sibling not touched
         assert!(dir.path().join("shared/skills/beta").is_dir());
     }
 

@@ -1,6 +1,6 @@
 //! RPC session state.
 
-use crate::agent::agent::Agent;
+use crate::agent::agent::{Agent, TurnEvent};
 use crate::agent::dispatcher::ToolDispatcher;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -11,11 +11,6 @@ use zeroclaw_api::plan::PlanEntry;
 use zeroclaw_infra::session_queue::SessionActorQueue;
 use zeroclaw_providers::ModelProvider;
 
-/// Why a session's in-flight turn cancel token was fired. Recorded at the
-/// firing site and drained at the turn-verdict site so the durable audit row
-/// names the trigger instead of leaving a bare "cancelled" with no provenance.
-/// Each variant is a distinct, named path — there is deliberately no catch-all
-/// "unknown": a fired token must be attributable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CancelCause {
@@ -40,12 +35,6 @@ impl CancelCause {
     }
 }
 
-/// Per-session runtime overrides. All fields are optional — `None` means
-/// "use config default". Overrides are session-scoped, do not persist,
-/// and evaporate when the session ends.
-///
-/// `reasoning_effort` is deferred — it requires `ModelProvider` trait
-/// changes to support mutation after construction.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SessionOverrides {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -73,11 +62,6 @@ pub struct RpcSession {
     pub workspace_dir: String,
     pub overrides: SessionOverrides,
     pub uploads: HashMap<String, UploadEntry>,
-    /// Latest authoritative execution plan for this session (TodoWrite).
-    /// Whole-list replace; empty = no/cleared plan. In-memory only —
-    /// survives client drops / tmux detach / `session/resume` within
-    /// the daemon's lifetime, lost on daemon restart (same durability
-    /// as the rest of `RpcSession`).
     pub plan: Vec<PlanEntry>,
     pub chat_mode: crate::rpc::types::ChatMode,
     pub owner_tui_id: Option<String>,
@@ -115,11 +99,6 @@ pub struct SessionStore {
     sessions: Mutex<HashMap<String, RpcSession>>,
     cancel_tokens: std::sync::Mutex<HashMap<String, (u64, tokio_util::sync::CancellationToken)>>,
     cancel_generation: std::sync::atomic::AtomicU64,
-    /// Records WHY each session's cancel token was fired. Populated at the
-    /// firing site immediately before `token.cancel()`; drained by the
-    /// turn-verdict site. Every known firing site records before firing; a
-    /// fired token with no entry means a new path was added without wiring
-    /// the cause — treat it as a bug, not as user attribution.
     cancel_causes: std::sync::Mutex<HashMap<String, CancelCause>>,
     max_sessions: usize,
     pub session_queue: Arc<SessionActorQueue>,
@@ -156,13 +135,6 @@ impl SessionStore {
         }
     }
 
-    /// Apply overrides to the session and immediately mutate the agent.
-    /// Returns the merged overrides for confirmation.
-    ///
-    /// Note: `model_provider` is recorded here but the live provider swap is
-    /// driven by the dispatcher via [`Self::apply_model_provider`], because
-    /// rebuilding the `ModelProvider` box needs `Config` access that the
-    /// session store deliberately does not hold.
     pub async fn set_overrides(
         &self,
         id: &str,
@@ -286,8 +258,18 @@ impl SessionStore {
     }
 
     pub async fn seed_history(&self, id: &str, msgs: &[zeroclaw_api::model_provider::ChatMessage]) {
+        let _ = self.seed_history_with_event(id, msgs).await;
+    }
+
+    pub async fn seed_history_with_event(
+        &self,
+        id: &str,
+        msgs: &[zeroclaw_api::model_provider::ChatMessage],
+    ) -> Option<TurnEvent> {
         if let Some(s) = self.sessions.lock().await.get(id) {
-            s.agent.lock().await.seed_history(msgs);
+            s.agent.lock().await.seed_history_with_event(msgs)
+        } else {
+            None
         }
     }
 
@@ -310,8 +292,21 @@ impl SessionStore {
         id: &str,
         msgs: Vec<zeroclaw_api::model_provider::ConversationMessage>,
     ) {
+        let _ = self.seed_conversation_history_with_event(id, msgs).await;
+    }
+
+    pub async fn seed_conversation_history_with_event(
+        &self,
+        id: &str,
+        msgs: Vec<zeroclaw_api::model_provider::ConversationMessage>,
+    ) -> Option<TurnEvent> {
         if let Some(s) = self.sessions.lock().await.get(id) {
-            s.agent.lock().await.seed_conversation_history(msgs);
+            s.agent
+                .lock()
+                .await
+                .seed_conversation_history_with_event(msgs)
+        } else {
+            None
         }
     }
 
@@ -355,23 +350,6 @@ impl SessionStore {
         self.sessions.lock().await.remove(id).is_some()
     }
 
-    /// Drop every *idle* session owned by `tui_id` in the same `chat_mode` as a
-    /// freshly created session, except `except_id` itself. zerocode keeps one
-    /// active session per mode per TUI: creating or loading another session of
-    /// that mode abandons the prior one until it is explicitly reloaded, so the
-    /// prior agent and its history are dead weight in RSS. Chat and Code
-    /// sessions are orthogonal, so a Chat switch must never evict the live Code
-    /// session and vice versa.
-    ///
-    /// A session with a registered cancel token has a turn in flight: a spawned
-    /// `session/prompt` task still holds an `Arc<Mutex<Agent>>` clone, so
-    /// removing the map's strong ref would neither free the agent nor be safe to
-    /// trim against, and force-cancelling another TUI's mid-turn work is exactly
-    /// the freeze the reaper guards against. Such sessions are skipped; they
-    /// finish their turn and are reclaimed later. Returns the
-    /// `(session_key, agent_alias)` of each session actually dropped, so the
-    /// caller can attribute the eviction and knows the agents are freed before
-    /// it trims.
     pub async fn evict_same_mode_sibling(
         &self,
         tui_id: &str,
@@ -474,11 +452,6 @@ impl SessionStore {
             .contains_key(id)
     }
 
-    /// Force-terminate a session: if a turn is in flight, record `AdminKill`
-    /// and fire the cancel token so the verdict site can attribute the cause;
-    /// then remove the session from the store.
-    /// Returns `true` if the session existed and was removed, `false` if not found.
-    /// History on disk is NOT touched — this is an in-memory eviction only.
     pub async fn kill_session(&self, id: &str) -> bool {
         if let Some((_, token)) = self
             .cancel_tokens
@@ -1005,8 +978,6 @@ mod tests {
         assert!(after > before);
     }
 
-    /// A session must persist indefinitely after transport disconnect —
-    /// no orphan grace, no idle TTL. The reaper no longer exists.
     #[tokio::test]
     async fn session_persists_after_transport_disconnect() {
         let store = make_store(4);
@@ -1026,7 +997,6 @@ mod tests {
         );
     }
 
-    /// kill_session fires the cancel token and removes the session.
     #[tokio::test]
     async fn kill_session_cancels_inflight_and_removes() {
         let store = make_store(4);
@@ -1049,7 +1019,6 @@ mod tests {
         assert_eq!(store.count().await, 0, "session must be removed");
     }
 
-    /// kill_session on a session with no in-flight turn still removes it.
     #[tokio::test]
     async fn kill_session_idle_session_removed() {
         let store = make_store(4);
@@ -1066,15 +1035,12 @@ mod tests {
         assert_eq!(store.count().await, 0);
     }
 
-    /// kill_session returns false for a session that doesn't exist.
     #[tokio::test]
     async fn kill_session_missing_returns_false() {
         let store = make_store(4);
         assert!(!store.kill_session("ghost").await);
     }
 
-    /// kill_session must record AdminKill so the turn-verdict site can attribute
-    /// the cancel. The cause must survive until take_cancel_cause drains it.
     #[tokio::test]
     async fn kill_session_cause_is_admin_kill() {
         let store = make_store(4);

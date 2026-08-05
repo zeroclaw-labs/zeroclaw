@@ -1,8 +1,4 @@
 //! Shared JSON-RPC 2.0 types for the ACP server and runtime RPC layer.
-//!
-//! Extracted from `zeroclaw-channels::orchestrator::acp_server` so both the
-//! ACP stdio channel and the Unix socket RPC transport can share the same
-//! wire types without cross-crate dependency.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -107,6 +103,9 @@ pub mod error_codes {
     pub const AUTH_REQUIRED: i32 = -32010;
     pub const VERSION_MISMATCH: i32 = -32011;
 
+    // SOP authoring
+    pub const SOP_ALREADY_EXISTS: i32 = -32020;
+    pub const SOP_NOT_FOUND: i32 = -32021;
     // Filesystem RPC errors (internal numeric codes; wire uses string codes e.g. "fs.not_found")
     pub const FS_NOT_FOUND: i32 = 4001;
     pub const FS_PERMISSION_DENIED: i32 = 4002;
@@ -124,12 +123,6 @@ pub const ACP_PROTOCOL_VERSION: u64 = 1;
 
 type PendingResponder = oneshot::Sender<std::result::Result<Value, JsonRpcError>>;
 
-/// Writer + outbound-call tracker shared between server loops and
-/// per-session bridges (e.g. AcpChannel, RpcDispatcher).
-///
-/// All writes go through `writer_tx` so concurrent notifications and
-/// outbound requests cannot interleave bytes. Outbound requests get string
-/// ids (`zc-out-<n>`) disjoint from any client-issued id space.
 #[derive(Debug)]
 pub struct RpcOutbound {
     writer_tx: mpsc::Sender<String>,
@@ -298,7 +291,71 @@ pub struct LocalesFetchResponse {
     pub skipped: Vec<String>,
 }
 
-// ── Filesystem RPC types ─────────────────────────────────────────
+// ── SOP authoring RPC types ──────────────────────────────────────
+
+/// Request payload for SOP read/delete methods that select one SOP by name:
+/// `sops/get`, `sops/graph`, `sops/validate` (by name), `sops/delete`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SopSelectRequest {
+    pub name: String,
+}
+
+/// Request payload for `sops/run-overlay`: project a run's state onto a SOP's
+/// graph. Selects the SOP by `name` and the run by `run_id`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SopRunOverlayRequest {
+    pub name: String,
+    pub run_id: String,
+}
+
+/// Request payload for `sops/decide`: resolve a paused checkpoint. `name` and
+/// `run_id` select the run; `decision` is the raw `ApprovalDecision` wire value
+/// (`"approve"` or `{"deny": {"reason": "..."}}`), deserialized into the
+/// canonical runtime enum by the handler so no parallel decision enum exists
+/// here to drift from it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SopDecideRequest {
+    pub name: String,
+    pub run_id: String,
+    pub decision: serde_json::Value,
+}
+
+/// Request payload for `sops/run`: fire a Manual trigger for the named SOP.
+/// `payload` is an optional JSON string handed to the run as the step-1 input;
+/// omitting it starts the run with no payload. The daemon builds the Manual
+/// `SopEvent` and dispatches it on the same path as the `sop_execute` tool.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SopRunRequest {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<String>,
+}
+
+/// Response payload for `sops/run`: the id of the run that was started, which
+/// feeds straight into `sops/run-overlay` to animate the run on the canvas.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SopRunResponse {
+    pub run_id: String,
+}
+
+/// Request payload for `sops/runs`: enumerate runs the engine currently holds
+/// (active plus retained terminal), newest first. `sop` optionally scopes the
+/// listing to a single SOP by name; omitting it lists every SOP's runs.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SopRunsRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sop: Option<String>,
+}
+
+/// Request payload for `sops/save` and `sops/create`. The `sop` field is the
+/// wire form of the runtime `Sop`; the daemon deserializes and validates it.
+/// `sops/validate` also accepts this form to validate an unsaved draft.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SopSaveRequest {
+    pub sop: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_name: Option<String>,
+}
 
 /// Request payload for `fs.list_dir`.
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,17 +1,69 @@
-/// Streaming events emitted during an agent turn.
-///
-/// Used by the gateway WebSocket handler to relay real-time updates to clients.
-/// Consumers that pattern-match on [`TurnEvent::ToolCall`] or
-/// [`TurnEvent::ToolResult`] should preserve the stable `id` field for
-/// call/result correlation.
 use crate::plan::PlanEntry;
+
+/// Structured metadata for a tool that produced a file artifact (e.g.
+/// `deliver_file`). Carried on [`TurnEvent::ToolResult`] so a channel attaches
+/// the file from typed fields instead of parsing a text trailer out of the
+/// free-form `output` string. Trailer parsing let a crafted filename forge the
+/// delivered path (arbitrary-file-read / confused-deputy class).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolArtifact {
+    /// Absolute path of the delivered file on the agent host.
+    pub path: String,
+    /// Stable citation URI the client can reference (e.g. `attachment://…`).
+    pub uri: String,
+    /// Original filename.
+    pub filename: String,
+    /// Human-readable chat label; defaults to the filename.
+    pub title: String,
+    /// MIME type.
+    pub mime: String,
+    /// Size in bytes.
+    pub size: u64,
+}
+
+impl ToolArtifact {
+    /// Build from a tool's structured `output_data` when it declares a delivered
+    /// file (`delivered: true` with a non-empty `path`). Returns `None` for any
+    /// other structured output, keeping this a channel-neutral convention rather
+    /// than a hook tied to one tool name.
+    pub fn from_delivered_data(data: &serde_json::Value) -> Option<Self> {
+        if data.get("delivered").and_then(serde_json::Value::as_bool) != Some(true) {
+            return None;
+        }
+        let field = |key: &str| {
+            data.get(key)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        let path = field("path");
+        if path.is_empty() {
+            return None;
+        }
+        Some(Self {
+            uri: field("uri"),
+            filename: field("filename"),
+            title: field("title"),
+            mime: field("mimeType"),
+            size: data
+                .get("bytes")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            path,
+        })
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum TurnEvent {
     /// A text chunk from the LLM response (may arrive many times).
-    Chunk { delta: String },
+    Chunk {
+        delta: String,
+    },
     /// A reasoning/thinking chunk from a thinking model (may arrive many times).
-    Thinking { delta: String },
+    Thinking {
+        delta: String,
+    },
     /// The agent is invoking a tool.
     ToolCall {
         /// Stable correlation ID shared with the matching [`TurnEvent::ToolResult`].
@@ -25,18 +77,14 @@ pub enum TurnEvent {
         id: String,
         name: String,
         output: String,
+        /// Typed metadata for a file-producing tool (e.g. `deliver_file`), so
+        /// channels attach the file structurally instead of parsing `output`.
+        /// `None` for ordinary tools.
+        artifact: Option<ToolArtifact>,
     },
-    /// The agent published or updated its execution plan (TodoWrite).
-    ///
-    /// Whole-list replacement: `entries` is the complete authoritative
-    /// plan; an empty vec clears it. Downstream consumers replace their
-    /// held plan wholesale — no merge.
-    Plan { entries: Vec<PlanEntry> },
-    /// The agent is waiting for the operator to approve, deny, or always-allow
-    /// a tool call. The transport (e.g. gateway WebSocket) is expected to
-    /// surface this to the operator and route the response back through the
-    /// same correlation `request_id`. The runtime tool loop pauses until that
-    /// answer arrives or the channel times out.
+    Plan {
+        entries: Vec<PlanEntry>,
+    },
     ApprovalRequest {
         /// Correlation ID. The matching response frame must echo it.
         request_id: String,
@@ -48,21 +96,16 @@ pub enum TurnEvent {
         /// How long the channel will wait before auto-denying.
         timeout_secs: u64,
     },
-    /// Older whole turns were dropped from the context window to fit the token
-    /// budget. Surfaces a user-visible "context was cut here" marker so trimming
-    /// is never silent. Emitted once per turn boundary when a trim occurs.
+    /// Older whole turns were dropped to fit either the context token budget or
+    /// the configured message limit. Surfaces a user-visible "context was cut
+    /// here" marker so trimming is never silent. Emitted whenever a trim occurs.
     HistoryTrimmed {
         dropped_messages: usize,
         kept_turns: usize,
         reason: String,
     },
-    /// Per-LLM-call token usage and cost.
-    ///
-    /// Emitted once per LLM response the agent loop processes; a single turn
-    /// that hops through tools may emit several `Usage` events, one per model
-    /// call. Consumers (e.g. the gateway WS handler) accumulate these into a
-    /// turn total before reporting back to the client. Absence means "usage
-    /// unavailable for this call" rather than zero.
+    /// Per-LLM-call token usage and cost; a turn may emit several, one per
+    /// model call. `None` means "unavailable for this call", not zero.
     Usage {
         input_tokens: Option<u64>,
         /// Tokens served from the provider's prompt cache (e.g. Anthropic
@@ -97,5 +140,48 @@ mod plan_event_tests {
             }
             _ => panic!("expected TurnEvent::Plan"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tool_artifact_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn projects_delivered_data_into_typed_fields() {
+        let data = json!({
+            "delivered": true,
+            "uri": "attachment://deliver/report.pdf",
+            "path": "/ws/uploads/ab.pdf",
+            "filename": "report.pdf",
+            "title": "Quarterly report",
+            "mimeType": "application/pdf",
+            "bytes": 1234,
+        });
+        let a = ToolArtifact::from_delivered_data(&data).expect("delivered data yields artifact");
+        assert_eq!(a.path, "/ws/uploads/ab.pdf");
+        assert_eq!(a.uri, "attachment://deliver/report.pdf");
+        assert_eq!(a.filename, "report.pdf");
+        assert_eq!(a.title, "Quarterly report");
+        assert_eq!(a.mime, "application/pdf");
+        assert_eq!(a.size, 1234);
+    }
+
+    #[test]
+    fn non_delivered_data_is_ignored() {
+        // Ordinary structured tool output must not be mistaken for a file artifact.
+        assert!(ToolArtifact::from_delivered_data(&json!({"result": 42})).is_none());
+        assert!(
+            ToolArtifact::from_delivered_data(&json!({"delivered": false, "path": "/x"})).is_none()
+        );
+    }
+
+    #[test]
+    fn delivered_without_path_is_ignored() {
+        assert!(ToolArtifact::from_delivered_data(&json!({"delivered": true})).is_none());
+        assert!(
+            ToolArtifact::from_delivered_data(&json!({"delivered": true, "path": ""})).is_none()
+        );
     }
 }

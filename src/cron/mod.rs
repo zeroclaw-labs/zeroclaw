@@ -97,6 +97,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             tz,
             prompt,
             allowed_tools,
+            uses_memory,
             command,
         } => {
             require_configured_agent(config, &agent_alias)?;
@@ -120,6 +121,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                     } else {
                         Some(allowed_tools)
                     },
+                    uses_memory.unwrap_or(true),
                 )?;
                 println!(
                     "{}",
@@ -175,6 +177,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             agent_alias,
             prompt,
             allowed_tools,
+            uses_memory,
             command,
         } => {
             require_configured_agent(config, &agent_alias)?;
@@ -196,6 +199,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                     } else {
                         Some(allowed_tools)
                     },
+                    uses_memory.unwrap_or(true),
                 )?;
                 println!(
                     "{}",
@@ -246,6 +250,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             agent_alias,
             prompt,
             allowed_tools,
+            uses_memory,
             command,
         } => {
             require_configured_agent(config, &agent_alias)?;
@@ -266,6 +271,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                     } else {
                         Some(allowed_tools)
                     },
+                    uses_memory.unwrap_or(true),
                 )?;
                 println!(
                     "{}",
@@ -333,6 +339,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             agent_alias,
             prompt,
             allowed_tools,
+            uses_memory,
             command,
         } => {
             require_configured_agent(config, &agent_alias)?;
@@ -355,6 +362,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                     } else {
                         Some(allowed_tools)
                     },
+                    uses_memory.unwrap_or(true),
                 )?;
                 println!(
                     "{}",
@@ -408,6 +416,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             command,
             name,
             allowed_tools,
+            uses_memory,
         } => {
             require_configured_agent(config, &agent_alias)?;
             if expression.is_none()
@@ -415,10 +424,9 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                 && command.is_none()
                 && name.is_none()
                 && allowed_tools.is_empty()
+                && uses_memory.is_none()
             {
-                bail!(
-                    "At least one of --expression, --tz, --command, --name, or --allowed-tool must be provided"
-                );
+                bail!("{}", get_required_cli_string("cli-cron-update-no-field"));
             }
 
             let existing = if expression.is_some() || tz.is_some() || !allowed_tools.is_empty() {
@@ -467,6 +475,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                 } else {
                     Some(allowed_tools)
                 },
+                uses_memory,
                 ..CronJobPatch::default()
             };
 
@@ -566,6 +575,7 @@ mod tests {
                 agent_alias: "test-agent".into(),
                 prompt: false,
                 allowed_tools: vec![],
+                uses_memory: None,
                 command: "echo at".into(),
             },
             &config,

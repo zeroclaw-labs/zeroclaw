@@ -10,7 +10,6 @@ use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 const DEDUP_CAPACITY: usize = 10_000;
 
 /// Mochat customer service channel.
-///
 /// Integrates with the Mochat open-source customer service platform API
 /// for receiving and sending messages through its HTTP endpoints.
 pub struct MochatChannel {

@@ -1,10 +1,4 @@
 //! Transport trait — decouples hardware tools from wire protocol.
-//!
-//! Implementations:
-//! - `serial::HardwareSerialTransport` — lazy-open newline-delimited JSON over USB CDC (Phase 2)
-//! - `SWDTransport` — memory read/write via probe-rs (Phase 7)
-//! - `UF2Transport` — firmware flashing via UF2 mass storage (Phase 6)
-//! - `NativeTransport` — direct Linux GPIO/I2C/SPI via rppal/sysfs (later)
 
 use super::protocol::{ZcCommand, ZcResponse};
 use async_trait::async_trait;
@@ -35,7 +29,6 @@ pub enum TransportError {
 }
 
 /// Transport kind discriminator.
-///
 /// Used for capability matching — some tools require a specific transport
 /// (e.g. `pico_flash` requires UF2, `memory_read` prefers SWD).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -65,7 +58,6 @@ impl std::fmt::Display for TransportKind {
 }
 
 /// Transport trait — sends commands to a hardware device and receives responses.
-///
 /// All implementations MUST use explicit `tokio::time::timeout` on I/O operations.
 /// Callers should never assume success; always handle `TransportError`.
 #[async_trait]

@@ -1,10 +1,4 @@
 //! Live test for Z.AI JWT authentication.
-//!
-//! Verifies that the ZhipuJwt auth style correctly generates a JWT token
-//! and authenticates against the real Z.AI API.
-//!
-//! Requires `ZAI_API_KEY` env var set (format: `id.secret`).
-//! Run: `ZAI_API_KEY=... cargo test live_zai -- --ignored --nocapture`
 
 use zeroclaw::providers::create_model_provider;
 use zeroclaw::providers::traits::ChatMessage;
@@ -18,7 +12,6 @@ const ZAI_SANITY_TEMPERATURE: f64 = 0.1;
 /// word ("banana") appears in the reply, so determinism is required.
 const ZAI_RECALL_TEMPERATURE: f64 = 0.0;
 
-/// Sends a simple chat request to Z.AI with JWT auth and verifies a 200 response.
 #[tokio::test]
 #[ignore = "requires live ZAI_API_KEY"]
 async fn live_zai_jwt_auth_chat() {
@@ -46,7 +39,6 @@ async fn live_zai_jwt_auth_chat() {
     }
 }
 
-/// Sends a multi-turn conversation to Z.AI to verify history works with JWT auth.
 #[tokio::test]
 #[ignore = "requires live ZAI_API_KEY"]
 async fn live_zai_jwt_auth_multi_turn() {

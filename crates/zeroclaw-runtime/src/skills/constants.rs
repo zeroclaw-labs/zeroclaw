@@ -1,8 +1,4 @@
 //! Canonical filenames + scaffold subdirs for the Agent Skills spec.
-//!
-//! Every literal that names a skill-file or scaffold-subdir lives here. Any
-//! grep hit for `"SKILL.md"`, `"scripts"`, `"references"`, `"assets"` outside
-//! this module is drift.
 
 /// Canonical manifest filename per the open Agent Skills spec.
 pub const SKILL_MANIFEST_FILENAME: &str = "SKILL.md";

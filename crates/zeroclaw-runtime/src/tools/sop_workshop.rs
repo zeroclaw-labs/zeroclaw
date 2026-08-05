@@ -7,7 +7,7 @@ use crate::sop::procedural_memory::{
     ProposalDraft, apply_proposal, capture_successful_run, create_proposal, set_proposal_status,
 };
 use crate::sop::{ProposalStatus, SopEngine};
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 
 macro_rules! sop_workshop_actions {
     ($($variant:ident => $wire:literal),+ $(,)?) => {
@@ -164,12 +164,12 @@ impl Tool for SopWorkshopTool {
         match result {
             Ok(output) => Ok(ToolResult {
                 success: true,
-                output,
+                output: output.into(),
                 error: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(e.to_string()),
             }),
         }
@@ -303,7 +303,7 @@ fn required_str<'a>(args: &'a serde_json::Value, field: &str) -> anyhow::Result<
 
 fn parse_status(status: &str) -> anyhow::Result<ProposalStatus> {
     serde_json::from_value(serde_json::Value::String(status.to_string()))
-        .map_err(|_| anyhow::Error::msg(format!("invalid proposal status: {status}")))
+        .map_err(|e| anyhow::Error::msg(format!("invalid proposal status '{status}': {e}")))
 }
 
 #[cfg(test)]

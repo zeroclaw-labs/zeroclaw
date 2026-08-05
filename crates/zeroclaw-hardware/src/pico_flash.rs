@@ -1,13 +1,4 @@
 //! `pico_flash` tool — flash ZeroClaw firmware to a Pico in BOOTSEL mode.
-//!
-//! # Happy path
-//! 1. User holds BOOTSEL while plugging in Pico → RPI-RP2 drive appears.
-//! 2. User asks "flash my pico".
-//! 3. LLM calls `pico_flash(confirm=true)`.
-//! 4. Tool copies UF2 to RPI-RP2 drive; Pico reboots into the firmware.
-//! 5. Tool waits up to 20 s for `/dev/cu.usbmodem*` to appear.
-//! 6. Tool reconnects the serial transport in the DeviceRegistry.
-//! 7. Tool returns success; user restarts ZeroClaw to get `pico0`.
 
 use super::device::DeviceRegistry;
 use super::uf2;
@@ -29,12 +20,6 @@ const PORT_POLL_MS: u64 = 500;
 
 // ── PicoFlashTool ─────────────────────────────────────────────────────────────
 
-/// Tool: flash ZeroClaw firmware to a Pico in BOOTSEL mode.
-///
-/// The Pico must be connected with BOOTSEL held so it mounts as `RPI-RP2`.
-/// After flashing, the tool reconnects the serial transport in the
-/// [`DeviceRegistry`] so subsequent `gpio_write` calls work immediately
-/// without restarting ZeroClaw.
 pub struct PicoFlashTool {
     registry: Arc<RwLock<DeviceRegistry>>,
 }
@@ -81,7 +66,7 @@ impl Tool for PicoFlashTool {
         if !confirmed {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: String::new().into(),
                 error: Some(
                     "Set confirm=true to proceed with flashing. \
                      This will overwrite the firmware on the connected Pico."
@@ -96,7 +81,7 @@ impl Tool for PicoFlashTool {
             None => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: String::new().into(),
                     error: Some(
                         "No Pico in BOOTSEL mode found (RPI-RP2 drive not detected). \
                          Hold the BOOTSEL button while plugging the Pico in via USB, \
@@ -120,7 +105,7 @@ impl Tool for PicoFlashTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: String::new().into(),
                     error: Some(format!("firmware error: {e}")),
                 });
             }
@@ -130,7 +115,7 @@ impl Tool for PicoFlashTool {
         if let Err(e) = uf2::flash_uf2(&mount, &firmware_dir).await {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: String::new().into(),
                 error: Some(format!("flash failed: {e}")),
             });
         }
@@ -149,7 +134,7 @@ impl Tool for PicoFlashTool {
                 // some host systems are slower to enumerate the new port.
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: String::new().into(),
                     error: Some(format!(
                         "UF2 copied to {} but serial port did not appear within {PORT_WAIT_SECS}s. \
                          Unplug and replug the Pico, then restart ZeroClaw.",
@@ -169,7 +154,6 @@ impl Tool for PicoFlashTool {
         let final_port = Some(port);
 
         // ── 6. Reconnect serial transport in DeviceRegistry ──────────────
-        //
         // The old transport still points at a stale port handle from before
         // the flash. Reconnect so gpio_write works immediately.
         let reconnect_result = match &final_port {
@@ -244,7 +228,8 @@ impl Tool for PicoFlashTool {
                     output: format!(
                         "Pico flashed successfully. \
                          Firmware is online at {port_str}. {suffix}"
-                    ),
+                    )
+                    .into(),
                     error: None,
                 })
             }
@@ -254,7 +239,8 @@ impl Tool for PicoFlashTool {
                     "Pico flashed successfully. \
                          Serial port did not reappear within {PORT_WAIT_SECS}s — \
                          unplug and replug the Pico, then restart ZeroClaw to connect as pico0."
-                ),
+                )
+                .into(),
                 error: None,
             }),
         }

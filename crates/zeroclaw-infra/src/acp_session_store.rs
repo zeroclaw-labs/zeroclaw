@@ -1,23 +1,4 @@
 //! ACP session persistence.
-//!
-//! Storage shape:
-//!
-//! ```text
-//! acp_sessions
-//!   ├── acp_messages (FK by integer id)
-//!   │     └── acp_tool_calls (FK by integer id, two rows per call:
-//!   │                          one event_kind='in', one 'out')
-//!   └── acp_session_events
-//! ```
-//!
-//! Token tracking: `acp_sessions.token_count` holds the most recently
-//! provider-reported `input_tokens` (total prompt size). Replace-on-write
-//! after every turn. The TUI ctx bar reads this on resume.
-//!
-//! Enums (Rust-side): `ToolEventKind` is internal to this module — callers
-//! invoke `append_tool_call_in` / `append_tool_call_out` as distinct methods
-//! and never see the enum. `Action` and `EventOutcome` from `zeroclaw_log`
-//! are the canonical taxonomies for `acp_session_events`.
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -276,15 +257,6 @@ impl AcpSessionStore {
         let created_at = parse_ts(&created_at_s, "created_at", session_uuid);
         let last_activity = parse_ts(&last_activity_s, "last_activity", session_uuid);
 
-        // Reconstruct ConversationMessages by walking acp_messages in id order
-        // and, for each assistant row, joining its tool calls from acp_tool_calls
-        // (event_kind='in' for the call args).
-        //
-        // Tool results land as their own ConversationMessage::ToolResults at the
-        // position of the LAST 'out' row in the result-batch. The replay strategy
-        // is: every contiguous run of 'out' rows for a given message_id becomes
-        // one ToolResults message inserted between the assistant's
-        // AssistantToolCalls and the next message.
         let messages = Self::load_messages(&conn, session_id)?;
 
         Ok(Some(AcpSessionData {
@@ -302,19 +274,62 @@ impl AcpSessionStore {
     /// Killed rows keep their transcript for history/export but are terminal
     /// for runtime restore paths.
     pub fn load_session_for_restore(&self, session_uuid: &str) -> Result<AcpSessionRestore> {
-        if self.is_session_killed(session_uuid)? {
+        let conn = self.conn.lock();
+
+        let row = conn.query_row(
+            "SELECT id, agent_alias, workspace_dir, token_count, created_at, last_activity, killed_at
+             FROM acp_sessions WHERE session_uuid = ?1",
+            params![session_uuid],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            },
+        );
+
+        let (
+            session_id,
+            agent_alias,
+            workspace_dir,
+            token_count,
+            created_at_s,
+            last_activity_s,
+            killed_at,
+        ) = match row {
+            Ok(r) => r,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(AcpSessionRestore::Missing),
+            Err(e) => return Err(e).context("Failed to query ACP session for restore"),
+        };
+
+        if killed_at.is_some() {
             return Ok(AcpSessionRestore::Killed);
         }
 
-        match self.load_session(session_uuid)? {
-            Some(data) => Ok(AcpSessionRestore::Restorable(data)),
-            None => Ok(AcpSessionRestore::Missing),
-        }
+        let created_at = parse_ts(&created_at_s, "created_at", session_uuid);
+        let last_activity = parse_ts(&last_activity_s, "last_activity", session_uuid);
+        let messages = Self::load_messages(&conn, session_id)?;
+
+        Ok(AcpSessionRestore::Restorable(AcpSessionData {
+            session_uuid: session_uuid.to_string(),
+            agent_alias,
+            workspace_dir,
+            token_count: token_count.max(0) as u64,
+            created_at,
+            last_activity,
+            messages,
+        }))
     }
 
-    /// List all sessions as lightweight summaries, ordered by most recent
+    /// List restorable sessions as lightweight summaries, ordered by most recent
     /// activity first. This is the picker-facing read: it avoids the full
-    /// message-history hydration that `load_session` performs.
+    /// message-history hydration that `load_session` performs. Killed rows keep
+    /// history/export data but are terminal and must not be offered for restore.
     pub fn list_sessions(&self) -> Result<Vec<AcpSessionSummary>> {
         let conn = self.conn.lock();
         let mut stmt = conn
@@ -327,6 +342,7 @@ impl AcpSessionStore {
                         s.last_activity,
                         (SELECT COUNT(*) FROM acp_messages m WHERE m.session_id = s.id) AS message_count
                  FROM acp_sessions s
+                 WHERE s.killed_at IS NULL
                  ORDER BY s.last_activity DESC",
             )
             .context("Failed to prepare ACP session list query")?;
@@ -429,7 +445,7 @@ impl AcpSessionStore {
                         // Carry the producing tool name (looked up from the
                         // matching 'in' row on write) so a resumed session
                         // stays provenance-aware for media-marker
-                        // canonicalization (PR #7345).
+                        // canonicalization
                         tool_name,
                     }),
                     other => {
@@ -582,12 +598,6 @@ impl AcpSessionStore {
                         }
                     };
                     for result in results {
-                        // Look up tool_name from the matching 'in' row so the
-                        // 'out' row carries it too. Outcome is 'unknown' at
-                        // this layer — `ConversationMessage::ToolResults`
-                        // doesn't tell us whether the tool succeeded or
-                        // failed. Future wiring from the dispatcher will
-                        // call a dedicated method to record outcome.
                         let tool_name: String = tx
                             .query_row(
                                 "SELECT tool_name FROM acp_tool_calls
@@ -627,12 +637,6 @@ impl AcpSessionStore {
         Ok(())
     }
 
-    /// Overwrite the session's `token_count`. Called after every turn with
-    /// the latest provider-reported `input_tokens`.
-    ///
-    /// Returns an error if `session_uuid` does not exist — a silent zero-row
-    /// UPDATE would mask a race where the session was deleted out from
-    /// under us, which the caller almost certainly wants to log.
     pub fn set_token_count(&self, session_uuid: &str, token_count: u64) -> Result<()> {
         let conn = self.conn.lock();
         let rows = conn
@@ -732,7 +736,7 @@ impl AcpSessionStore {
         Ok(rows > 0)
     }
 
-    // ── per-agent cascade (agent deletion, #7175) ───────────────────────────
+    // ── per-agent cascade (agent deletion,───────────────────────────
 
     /// Count *live* ACP sessions for `agent_alias` — rows not yet killed
     /// (`killed_at IS NULL`). A non-zero count is a HARD blocker for deleting the
@@ -821,7 +825,7 @@ impl AcpSessionStore {
     }
 
     /// Re-point every ACP session (live or killed) from `from` to `to`,
-    /// returning the row count. The agent-rename cascade (#7468) keeps the
+    /// returning the row count. The agent-rename cascadekeeps the
     /// session and its transcript; only the owning alias moves. Unlike delete,
     /// a live session (`killed_at IS NULL`) is no obstacle to rename.
     pub fn rename_sessions_by_agent(&self, from: &str, to: &str) -> Result<usize> {
@@ -1396,6 +1400,23 @@ mod tests {
     fn list_sessions_empty_when_no_sessions() {
         let (_tmp, store) = open_store();
         assert!(store.list_sessions().unwrap().is_empty());
+    }
+
+    #[test]
+    fn list_sessions_omits_killed_sessions() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session("sess-live", "alpha", "/tmp/live")
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        store
+            .create_session("sess-killed", "alpha", "/tmp/killed")
+            .unwrap();
+        store.mark_session_killed("sess-killed").unwrap();
+
+        let list = store.list_sessions().unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].session_uuid, "sess-live");
     }
 
     #[test]
