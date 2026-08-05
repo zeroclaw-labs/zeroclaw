@@ -85,8 +85,17 @@ prometheus = { version = "0.14", default-features = false, optional = true }
 opentelemetry = { version = "0.32", default-features = false, features = ["trace", "metrics"], optional = true }
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "metrics"], optional = true }
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-blocking-client", "reqwest-rustls-webpki-roots"], optional = true }
-solana-sdk = { version = "2.1", features = ["full"], optional = true }
-solana-system-interface = { version = "1", optional = true }
+solana-address = { version = "2.7", optional = true }
+solana-hash = { version = "4.6", optional = true }
+solana-instruction = { version = "3.5", optional = true }
+solana-message = { version = "4.5", optional = true }
+solana-pubkey = { version = "4.3", optional = true }
+solana-signature = { version = "3.5", optional = true }
+solana-signer = { version = "3.0", optional = true }
+solana-system-interface = { version = "3.3", optional = true }
+solana-transaction = { version = "4.2", optional = true }
+ed25519-dalek = { version = "2", default-features = false, features = ["rand_core", "std"], optional = true }
+rand_core = { version = "0.6", features = ["getrandom"], optional = true }
 # Optional deps for specific features
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -111,8 +120,21 @@ browser-native = []
 plugins-wasm = ["dep:zeroclaw-plugins", "zeroclaw-plugins/plugins-wasmtime"]
 webauthn = []
 sandbox-bubblewrap = []
-solana-sdk = ["dep:solana-sdk", "dep:solana-system-interface"]
+solana-sdk = [
+    "dep:solana-address",
+    "dep:solana-hash",
+    "dep:solana-instruction",
+    "dep:solana-message",
+    "dep:solana-pubkey",
+    "dep:solana-signature",
+    "dep:solana-signer",
+    "dep:solana-system-interface",
+    "dep:solana-transaction",
+    "dep:ed25519-dalek",
+    "dep:rand_core",
+]
 solana-system-interface = ["dep:solana-system-interface"]
+ed25519-dalek = ["dep:ed25519-dalek"]
 
 [dev-dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
