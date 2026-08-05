@@ -37,50 +37,72 @@ impl<'a> MediaPipeline<'a> {
 
     /// Process a message's attachments and return enriched text.
     /// If the pipeline is disabled via config, returns `original_text` unchanged.
+    ///
+    /// Combined convenience form of [`Self::process_route_independent`]
+    /// followed by [`Self::process_images`] — used by callers that have
+    /// already resolved the route and want the whole pipeline in one call.
+    /// Channel message dispatch instead splits the two phases so audio
+    /// transcription participates in route selection and link enrichment
+    /// (see the phase-split comments in `process_channel_message_body`).
     pub async fn process(&self, original_text: &str, attachments: &[MediaAttachment]) -> String {
+        let text = self
+            .process_route_independent(original_text, attachments)
+            .await;
+        self.process_images(&text, attachments).await
+    }
+
+    /// Route-independent media preprocessing: transcribe audio and summarize
+    /// video attachments into annotations. Never depends on the model's
+    /// vision capability, so callers may run it BEFORE route selection and
+    /// link enrichment — a routing keyword or URL that appears only in an
+    /// audio transcript must participate in those decisions.
+    pub async fn process_route_independent(
+        &self,
+        original_text: &str,
+        attachments: &[MediaAttachment],
+    ) -> String {
         if !self.config.enabled || attachments.is_empty() {
             return original_text.to_string();
         }
 
         let mut annotations = Vec::new();
-
         for attachment in attachments {
             match attachment.kind() {
                 MediaKind::Audio if self.config.transcribe_audio => {
-                    let annotation = self.process_audio(attachment).await;
-                    annotations.push(annotation);
-                }
-                MediaKind::Image if self.config.describe_images => {
-                    let annotation = self.process_image(attachment);
-                    annotations.push(annotation);
+                    annotations.push(self.process_audio(attachment).await);
                 }
                 MediaKind::Video if self.config.summarize_video => {
-                    let annotation = self.process_video(attachment);
-                    annotations.push(annotation);
+                    annotations.push(self.process_video(attachment));
                 }
                 _ => {}
             }
         }
 
-        if annotations.is_empty() {
+        assemble_annotations(&annotations, original_text)
+    }
+
+    /// Model-aware media enrichment: image attachments become either a vision
+    /// data marker (when the effective route's model supports image input) or
+    /// a plain attached annotation. Runs AFTER the effective route is known
+    /// and warmed, so the `IMAGE:data:...` preservation decision uses the
+    /// selected provider/model rather than the startup default.
+    pub async fn process_images(
+        &self,
+        original_text: &str,
+        attachments: &[MediaAttachment],
+    ) -> String {
+        if !self.config.enabled || attachments.is_empty() {
             return original_text.to_string();
         }
 
-        let mut enriched = String::with_capacity(
-            annotations.iter().map(|a| a.len() + 1).sum::<usize>() + original_text.len() + 2,
-        );
-
-        for annotation in &annotations {
-            enriched.push_str(annotation);
-            enriched.push('\n');
+        let mut annotations = Vec::new();
+        for attachment in attachments {
+            if attachment.kind() == MediaKind::Image && self.config.describe_images {
+                annotations.push(self.process_image(attachment));
+            }
         }
 
-        if !original_text.is_empty() {
-            enriched.push('\n');
-            enriched.push_str(original_text);
-        }
-
-        enriched.trim().to_string()
+        assemble_annotations(&annotations, original_text)
     }
 
     /// Transcribe an audio attachment using the existing transcription infra.
@@ -127,6 +149,31 @@ impl<'a> MediaPipeline<'a> {
     fn process_video(&self, attachment: &MediaAttachment) -> String {
         format!("[Video: {} attached]", attachment.file_name)
     }
+}
+
+/// Prepend `annotations` (one per line) to `original_text`, trimming the
+/// combined result. Shared by the route-independent and image phases so both
+/// produce the same enrichment shape.
+fn assemble_annotations(annotations: &[String], original_text: &str) -> String {
+    if annotations.is_empty() {
+        return original_text.to_string();
+    }
+
+    let mut enriched = String::with_capacity(
+        annotations.iter().map(|a| a.len() + 1).sum::<usize>() + original_text.len() + 2,
+    );
+
+    for annotation in annotations {
+        enriched.push_str(annotation);
+        enriched.push('\n');
+    }
+
+    if !original_text.is_empty() {
+        enriched.push('\n');
+        enriched.push_str(original_text);
+    }
+
+    enriched.trim().to_string()
 }
 
 fn image_payload_for_vision(attachment: &MediaAttachment) -> (String, Cow<'_, [u8]>) {

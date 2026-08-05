@@ -1,6 +1,7 @@
 //! Unauthenticated cross-provider model catalog via models.dev.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -21,6 +22,38 @@ const CATALOG_FETCH_RETRY_BACKOFF_SECS: i64 = 60;
 /// Consulted by [`ensure_catalog_loaded`] to bound retry frequency; the
 /// `get_or_try_init` path used by explicit listings is unaffected.
 static LAST_CATALOG_FETCH_FAILURE_UNIX: AtomicI64 = AtomicI64::new(0);
+
+/// Serializes catalog fetches: at most one in-flight network attempt at any
+/// time. Concurrent [`ensure_catalog_loaded`] callers wait on this lock, so an
+/// outage cannot start multiple 10-second fetch attempts in parallel. The
+/// retry-deadline check runs both before and inside the lock, so a caller that
+/// waited for a failed fetch re-evaluates the deadline that fetch recorded
+/// before starting its own attempt.
+static CATALOG_FETCH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Injectable fetcher for tests. Production code never sets this; tests
+/// install an RAII guard so [`ensure_catalog_loaded`] can be exercised without
+/// network access. The `Fn` returns a boxed future so the override can own
+/// captured counters.
+type CatalogFetchFuture = std::pin::Pin<Box<dyn Future<Output = Result<Arc<Catalog>>> + Send>>;
+static CATALOG_FETCH_OVERRIDE: std::sync::Mutex<
+    Option<Arc<dyn Fn() -> CatalogFetchFuture + Send + Sync>>,
+> = std::sync::Mutex::new(None);
+
+/// Run the catalog fetch, honoring the test override when installed. The
+/// override lock is released before awaiting the fetch (the boxed future does
+/// not borrow it), so a fetch that internally awaits is never blocked on the
+/// override mutex.
+async fn run_catalog_fetch() -> Result<Arc<Catalog>> {
+    let override_fetch = match CATALOG_FETCH_OVERRIDE.lock() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    };
+    if let Some(fetch) = override_fetch {
+        return (fetch)().await;
+    }
+    fetch_catalog().await
+}
 
 fn now_unix_secs() -> i64 {
     SystemTime::now()
@@ -144,19 +177,46 @@ pub(crate) fn filter_models(catalog: &Catalog, provider_key: &str) -> Result<Vec
 /// through their native `/models` endpoint). No-op once loaded.
 /// Called from async agent-turn context before the capability query.
 pub(crate) async fn ensure_catalog_loaded() -> Result<()> {
-    // Bounded failure caching: after a fetch failure, skip re-fetching for
-    // `CATALOG_FETCH_RETRY_BACKOFF_SECS` so a models.dev outage does not add a
+    // 1. Already populated (possibly by the explicit-listing path) — success
+    //    regardless of any stale backoff deadline. Checking this before the
+    //    deadline means a stale failure timestamp can never reject warming
+    //    when the catalog actually loaded via another path.
+    if CACHED_CATALOG.get().is_some() {
+        return Ok(());
+    }
+
+    // Monotonic retry deadline: within `CATALOG_FETCH_RETRY_BACKOFF_SECS` of a
+    // failure, reject the fetch so a models.dev outage does not add a
     // 10-second timeout to every tool-loop iteration's warm call.
-    let last_failure = LAST_CATALOG_FETCH_FAILURE_UNIX.load(Ordering::Relaxed);
-    if last_failure != 0
-        && now_unix_secs().saturating_sub(last_failure) < CATALOG_FETCH_RETRY_BACKOFF_SECS
-    {
+    let in_retry_backoff = || {
+        let last_failure = LAST_CATALOG_FETCH_FAILURE_UNIX.load(Ordering::Acquire);
+        last_failure != 0 && now_unix_secs() < last_failure + CATALOG_FETCH_RETRY_BACKOFF_SECS
+    };
+    if in_retry_backoff() {
         anyhow::bail!("models.dev catalog fetch is in retry backoff after a recent failure");
     }
-    match CACHED_CATALOG.get_or_try_init(fetch_catalog).await {
-        Ok(_) => Ok(()),
+
+    // 2. Single-flight: serialize fetches so an outage cannot start multiple
+    //    network attempts concurrently. A caller that waited for a failed
+    //    fetch re-evaluates the deadline that fetch just recorded before
+    //    starting its own attempt (the check inside the lock).
+    let _guard = CATALOG_FETCH_LOCK.lock().await;
+    if CACHED_CATALOG.get().is_some() {
+        return Ok(());
+    }
+    if in_retry_backoff() {
+        anyhow::bail!("models.dev catalog fetch is in retry backoff after a recent failure");
+    }
+
+    // 3. Own the only in-flight slot: fetch, cache the result, and record the
+    //    failure deadline if it failed.
+    match run_catalog_fetch().await {
+        Ok(catalog) => {
+            let _ = CACHED_CATALOG.set(catalog);
+            Ok(())
+        }
         Err(err) => {
-            LAST_CATALOG_FETCH_FAILURE_UNIX.store(now_unix_secs(), Ordering::Relaxed);
+            LAST_CATALOG_FETCH_FAILURE_UNIX.store(now_unix_secs(), Ordering::Release);
             Err(err)
         }
     }
@@ -300,6 +360,7 @@ pub(crate) fn model_supports_vision(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
 
     const TINY_CATALOG: &str = r#"{
         "anthropic": {
@@ -316,6 +377,48 @@ mod tests {
         },
         "empty": { "models": {} }
     }"#;
+
+    /// RAII guard that installs a catalog-fetch override for a test and
+    /// restores the previous override (normally `None`) on drop — including on
+    /// panic, so a failing lifecycle test cannot leak its fetcher into
+    /// sibling tests.
+    struct CatalogFetchOverrideGuard(Option<Arc<dyn Fn() -> CatalogFetchFuture + Send + Sync>>);
+
+    impl CatalogFetchOverrideGuard {
+        fn install(fetch: Arc<dyn Fn() -> CatalogFetchFuture + Send + Sync>) -> Self {
+            let mut guard = CATALOG_FETCH_OVERRIDE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let previous = guard.replace(fetch);
+            drop(guard);
+            Self(previous)
+        }
+    }
+
+    impl Drop for CatalogFetchOverrideGuard {
+        fn drop(&mut self) {
+            let mut guard = CATALOG_FETCH_OVERRIDE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *guard = self.0.take();
+        }
+    }
+
+    /// RAII guard that clears the process-global failure timestamp on drop, so
+    /// a lifecycle test that records a failure cannot put sibling tests into
+    /// backoff.
+    struct CatalogFailureTimestampGuard;
+
+    impl Drop for CatalogFailureTimestampGuard {
+        fn drop(&mut self) {
+            LAST_CATALOG_FETCH_FAILURE_UNIX.store(0, Ordering::Release);
+        }
+    }
+
+    /// Serializes the catalog-lifecycle tests: they share the process-global
+    /// `CACHED_CATALOG` / `LAST_CATALOG_FETCH_FAILURE_UNIX`, so concurrent
+    /// execution would interleave their mutations.
+    static CATALOG_LIFECYCLE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[test]
     fn parses_catalog_with_typical_shape() {
@@ -531,10 +634,31 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_catalog_loaded_respects_retry_backoff() {
+        let _serial = CATALOG_LIFECYCLE_TEST_LOCK.lock().await;
+        // If another lifecycle test already populated the process-global
+        // cache, the backoff branch is unreachable (the cached path wins) —
+        // assert that and return rather than fail spuriously.
+        if CACHED_CATALOG.get().is_some() {
+            assert!(ensure_catalog_loaded().await.is_ok());
+            return;
+        }
+
+        // Install a fetch override that must never run: inside the backoff
+        // window the warm call bails before any fetch attempt.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let _fetch = CatalogFetchOverrideGuard::install(Arc::new({
+            let calls = Arc::clone(&calls);
+            move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Err(anyhow::Error::msg("fetch must not run inside backoff")) })
+                    as CatalogFetchFuture
+            }
+        }));
+        let _ts = CatalogFailureTimestampGuard;
+
         // Regression for the tool-loop retry gap: after a failed fetch, a
         // models.dev outage must not add a 10-second timeout to every
-        // iteration's warm call. Within the backoff window the call bails
-        // immediately instead of re-entering the network fetch.
+        // iteration's warm call.
         LAST_CATALOG_FETCH_FAILURE_UNIX.store(now_unix_secs() - 5, Ordering::Relaxed);
         let err = ensure_catalog_loaded()
             .await
@@ -543,24 +667,157 @@ mod tests {
             err.to_string().contains("backoff"),
             "backoff error must be descriptive, got: {err}"
         );
-        // Cleanup so other tests are not put in backoff.
-        LAST_CATALOG_FETCH_FAILURE_UNIX.store(0, Ordering::Relaxed);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "no fetch may run while the failure is inside the backoff window"
+        );
     }
 
     #[tokio::test]
     async fn ensure_catalog_loaded_does_not_backoff_without_prior_failure() {
-        // No prior failure recorded (the default state) must never trigger the
-        // backoff branch; this also keeps the explicit-listing paths free of
-        // backoff semantics.
-        LAST_CATALOG_FETCH_FAILURE_UNIX.store(0, Ordering::Relaxed);
-        // When the cache is already populated (e.g. by the catalog-injection
-        // tests elsewhere in this crate) this resolves Ok without any network.
-        if let Err(err) = ensure_catalog_loaded().await {
-            assert!(
-                !err.to_string().contains("backoff"),
-                "no prior failure must not put the call in backoff, got: {err}"
-            );
+        let _serial = CATALOG_LIFECYCLE_TEST_LOCK.lock().await;
+        if CACHED_CATALOG.get().is_some() {
+            assert!(ensure_catalog_loaded().await.is_ok());
+            return;
         }
+
+        // No prior failure recorded (the default state) must never trigger the
+        // backoff branch — the fetch runs (via the override, so no network).
+        let calls = Arc::new(AtomicUsize::new(0));
+        let _fetch = CatalogFetchOverrideGuard::install(Arc::new({
+            let calls = Arc::clone(&calls);
+            move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Err(anyhow::Error::msg("simulated outage")) })
+                    as CatalogFetchFuture
+            }
+        }));
+        let _ts = CatalogFailureTimestampGuard;
+
         LAST_CATALOG_FETCH_FAILURE_UNIX.store(0, Ordering::Relaxed);
+        let err = ensure_catalog_loaded()
+            .await
+            .expect_err("with no prior failure the fetch must run and surface its error");
+        assert!(
+            !err.to_string().contains("backoff"),
+            "no prior failure must not put the call in backoff, got: {err}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the fetch must run exactly once when there is no backoff"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_catalog_loaded_serializes_concurrent_fetches() {
+        let _serial = CATALOG_LIFECYCLE_TEST_LOCK.lock().await;
+        if CACHED_CATALOG.get().is_some() {
+            assert!(ensure_catalog_loaded().await.is_ok());
+            return;
+        }
+
+        // Two concurrent warm calls must share one in-flight fetch: the second
+        // caller waits on the fetch lock and then observes the failure deadline
+        // the first fetch recorded, so it bails in backoff instead of starting
+        // a second network attempt.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let _fetch = CatalogFetchOverrideGuard::install(Arc::new({
+            let calls = Arc::clone(&calls);
+            move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Err(anyhow::Error::msg("simulated outage")) })
+                    as CatalogFetchFuture
+            }
+        }));
+        let _ts = CatalogFailureTimestampGuard;
+
+        let (r1, r2) = tokio::join!(ensure_catalog_loaded(), ensure_catalog_loaded());
+        assert!(
+            r1.is_err() && r2.is_err(),
+            "a failing fetch must surface an error to every concurrent caller"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "concurrent warm calls must share one in-flight fetch, not start parallel attempts"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_catalog_loaded_recovers_after_backoff_window() {
+        let _serial = CATALOG_LIFECYCLE_TEST_LOCK.lock().await;
+        if CACHED_CATALOG.get().is_some() {
+            assert!(ensure_catalog_loaded().await.is_ok());
+            return;
+        }
+
+        // First fetch fails (records the deadline); the second attempt inside
+        // the window is suppressed by backoff; once the window expires the
+        // third attempt runs and succeeds. Exercises the full lifecycle
+        // without network access.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let _fetch = CatalogFetchOverrideGuard::install(Arc::new({
+            let calls = Arc::clone(&calls);
+            move || {
+                let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                if n == 1 {
+                    Box::pin(async { Err(anyhow::Error::msg("simulated outage")) })
+                        as CatalogFetchFuture
+                } else {
+                    let catalog = Arc::new(parse_catalog(TINY_CATALOG.as_bytes()).unwrap());
+                    Box::pin(async move { Ok(catalog) }) as CatalogFetchFuture
+                }
+            }
+        }));
+        let _ts = CatalogFailureTimestampGuard;
+
+        assert!(
+            ensure_catalog_loaded().await.is_err(),
+            "the first fetch must fail and record the retry deadline"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let err = ensure_catalog_loaded()
+            .await
+            .expect_err("inside the backoff window the retry must be suppressed");
+        assert!(err.to_string().contains("backoff"));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "no fetch may run inside the backoff window"
+        );
+
+        // Expire the deadline and observe recovery.
+        LAST_CATALOG_FETCH_FAILURE_UNIX.store(
+            now_unix_secs() - CATALOG_FETCH_RETRY_BACKOFF_SECS - 1,
+            Ordering::Release,
+        );
+        assert!(
+            ensure_catalog_loaded().await.is_ok(),
+            "once the backoff window expires the fetch must retry and recover"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn ensure_catalog_loaded_skips_backoff_when_cache_populated() {
+        let _serial = CATALOG_LIFECYCLE_TEST_LOCK.lock().await;
+        // Populate the cache (if a sibling test has not already), then set a
+        // fresh failure timestamp inside the backoff window. The populated
+        // cache must win over the stale deadline: warming must never be
+        // rejected when the catalog actually loaded via another path.
+        if CACHED_CATALOG.get().is_none() {
+            let catalog = Arc::new(parse_catalog(TINY_CATALOG.as_bytes()).unwrap());
+            let _ = CACHED_CATALOG.set(catalog);
+        }
+        let _ts = CatalogFailureTimestampGuard;
+        LAST_CATALOG_FETCH_FAILURE_UNIX.store(now_unix_secs(), Ordering::Release);
+
+        assert!(
+            ensure_catalog_loaded().await.is_ok(),
+            "a populated catalog must not be rejected by a stale backoff deadline"
+        );
     }
 }

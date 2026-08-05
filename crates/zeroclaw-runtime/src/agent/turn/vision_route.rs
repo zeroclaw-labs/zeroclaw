@@ -21,6 +21,17 @@ pub(crate) async fn resolve_vision_provider(
     let image_marker_count = multimodal::count_image_markers(history);
     let latest_user_image_marker_count = multimodal::count_latest_user_image_markers(history);
 
+    // Warm the PRIMARY provider's capability metadata before the synchronous
+    // per-model capability check below. This makes warm-then-query one ordered
+    // operation for EVERY caller — including the direct `Agent::turn` and
+    // streamed entry points that call this resolver before the tool-loop warm
+    // (which runs later and cannot help a capability decision made now). A
+    // credentialed compatible provider then resolves per-model vision instead
+    // of silently classifying from the family default before its catalog is
+    // loaded. No-op once warmed; the tool-loop's earlier warm on the same
+    // provider is idempotent.
+    model_provider.warm_capabilities_metadata().await;
+
     let mut degrade_strip_images = false;
     let vision_model_provider: Option<ResolvedVisionProvider> = if image_marker_count > 0
         && !model_provider.capabilities_for_model(model).vision
@@ -514,5 +525,102 @@ model = "vision-model"
             "multimodal.vision_model must override the provider alias model"
         );
         server.abort();
+    }
+
+    /// Provider whose per-model vision capability is only known after its
+    /// capability metadata is warmed — the "catalog-only image model" shape
+    /// (e.g. a credentialed compatible provider that lists per-model vision
+    /// through models.dev). Before warming, `capabilities_for_model` reports
+    /// the family default (no vision); after warming, the model is vision.
+    /// Records warm invocations.
+    struct WarmThenVisionProvider {
+        warm_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for WarmThenVisionProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
+        fn capabilities_for_model(
+            &self,
+            _model: &str,
+        ) -> zeroclaw_api::model_provider::ProviderCapabilities {
+            zeroclaw_api::model_provider::ProviderCapabilities {
+                vision: self.warm_calls.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+                ..Default::default()
+            }
+        }
+
+        async fn warm_capabilities_metadata(&self) {
+            self.warm_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    impl zeroclaw_api::attribution::Attributable for WarmThenVisionProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "WarmThenVisionProvider"
+        }
+    }
+
+    /// Regression for the 2026-08-05 review: the direct `Agent::turn` /
+    /// streamed entry points call `resolve_vision_provider` before the
+    /// tool-loop warm, so the resolver itself must warm the PRIMARY provider
+    /// before the synchronous capability decision. A provider whose vision is
+    /// only known after catalog loading must resolve as vision-capable (images
+    /// not stripped, no vision route needed) instead of being classified from
+    /// the family default. Warm-then-query is one ordered operation for every
+    /// caller.
+    #[tokio::test]
+    async fn resolve_vision_provider_warms_primary_before_capability_decision() {
+        let warm_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = WarmThenVisionProvider {
+            warm_calls: std::sync::Arc::clone(&warm_calls),
+        };
+
+        let multimodal = zeroclaw_config::schema::MultimodalConfig::default();
+        let history = vec![ChatMessage::user("look [IMAGE:/tmp/x.png]".to_string())];
+
+        let (vision_provider, degrade) = resolve_vision_provider(
+            None,
+            &provider,
+            &history,
+            &multimodal,
+            "primary",
+            "primary-model",
+        )
+        .await
+        .expect(
+            "warming must make the primary resolve as vision-capable; \
+                 a provider whose capability only appears after warm must not error",
+        );
+
+        assert_eq!(
+            warm_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "resolve_vision_provider must warm the PRIMARY provider before querying its capability"
+        );
+        assert!(
+            vision_provider.is_none(),
+            "a warmed vision-capable primary needs no secondary vision route"
+        );
+        assert!(
+            !degrade,
+            "images must NOT be stripped when the warmed primary supports vision"
+        );
     }
 }
