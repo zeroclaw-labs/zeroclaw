@@ -915,9 +915,12 @@ pub struct ModelProviderConfig {
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vision: Option<bool>,
-    /// Arbitrary key/value pairs forwarded verbatim as `chat_template_kwargs`
-    /// in the request body (llama.cpp-specific). Use this to pass model-family
-    /// template variables that control behaviour not exposed by other fields.
+    /// Arbitrary key/value pairs forwarded verbatim as a top-level
+    /// `chat_template_kwargs` object in the request body of OpenAI-compatible
+    /// providers. Consumed by chat-template-aware backends such as vLLM,
+    /// SGLang, and llama.cpp to pass model-family template variables that
+    /// control behaviour not exposed by other fields. Must be a JSON object
+    /// (TOML inline table); non-object values are ignored with a warning.
     /// Example (Qwen3 thinking suppression):
     ///   `chat_template_kwargs = { enable_thinking = false }`
     #[tab(Advanced)]

@@ -982,6 +982,12 @@ struct ApiChatRequest {
     tool_choice: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    /// Extra fields merged at the top level of the serialized JSON body.
+    /// Mirrors `NativeChatRequest::extra_body` so config-driven extras
+    /// (`provider_extra`, `chat_template_kwargs`) reach the no-tools request
+    /// paths too, not just the native-tools path.
+    #[serde(flatten)]
+    extra_body: Option<serde_json::Value>,
 }
 
 /// OpenAI-compatible `stream_options.include_usage` toggle.
@@ -2698,6 +2704,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             tools: None,
             tool_choice: None,
             max_tokens: self.max_tokens,
+            extra_body: self.extra_body.clone(),
         };
 
         let url = self.chat_completions_url();
@@ -2787,6 +2794,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             tools: None,
             tool_choice: None,
             max_tokens: self.max_tokens,
+            extra_body: self.extra_body.clone(),
         };
 
         let url = self.chat_completions_url();
@@ -3171,6 +3179,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     tools: None,
                     tool_choice: None,
                     max_tokens: provider.max_tokens,
+                    extra_body: provider.extra_body.clone(),
                 })
             };
 
@@ -3322,6 +3331,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 tools: None,
                 tool_choice: None,
                 max_tokens: provider.max_tokens,
+                extra_body: provider.extra_body.clone(),
             };
 
             let url = provider.chat_completions_url();
@@ -3440,6 +3450,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 tools: None,
                 tool_choice: None,
                 max_tokens: provider.max_tokens,
+                extra_body: provider.extra_body.clone(),
             };
 
             let url = provider.chat_completions_url();
@@ -3974,6 +3985,44 @@ mod tests {
     }
 
     #[test]
+    fn api_chat_request_flattens_extra_body_into_top_level() {
+        // Regression: the no-tools request struct (`chat_with_system`,
+        // `chat_with_history`, no-tools streaming) must also carry the
+        // config-driven `extra_body`, not just the native-tools path.
+        let req = ApiChatRequest {
+            model: "qwen".to_string(),
+            messages: vec![],
+            temperature: None,
+            stream: None,
+            stream_options: None,
+            reasoning_effort: None,
+            tool_stream: None,
+            tools: None,
+            tool_choice: None,
+            max_tokens: None,
+            extra_body: Some(serde_json::json!({
+                "top_p": 0.95,
+                "chat_template_kwargs": {"thinking": true, "reasoning_effort": "max"},
+            })),
+        };
+        let value: serde_json::Value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value.get("top_p").and_then(serde_json::Value::as_f64),
+            Some(0.95),
+            "provider_extra keys must serialize at the top level of a no-tools request"
+        );
+        assert_eq!(
+            value.pointer("/chat_template_kwargs/reasoning_effort"),
+            Some(&serde_json::json!("max")),
+            "chat_template_kwargs must be nested under its own top-level key in a no-tools request"
+        );
+        assert!(
+            value.get("extra_body").is_none(),
+            "extra_body key itself must not appear in serialized JSON"
+        );
+    }
+
+    #[test]
     fn normalize_model_ids_trims_filters_and_sorts() {
         let body = serde_json::from_value(serde_json::json!({
             "data": [
@@ -4009,6 +4058,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             max_tokens: None,
+            extra_body: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("llama-3.3-70b"));
@@ -5263,6 +5313,7 @@ mod tests {
             tools: Some(tools),
             tool_choice: Some("auto".to_string()),
             max_tokens: None,
+            extra_body: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"tools\""));
@@ -5299,6 +5350,7 @@ mod tests {
             })]),
             tool_choice: Some("auto".to_string()),
             max_tokens: None,
+            extra_body: None,
         };
 
         let json = serde_json::to_string(&req).unwrap();
@@ -5334,6 +5386,7 @@ mod tests {
             })]),
             tool_choice: Some("auto".to_string()),
             max_tokens: None,
+            extra_body: None,
         };
 
         let json = serde_json::to_string(&req).unwrap();
@@ -6858,6 +6911,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             max_tokens: None,
+            extra_body: None,
         }
     }
 

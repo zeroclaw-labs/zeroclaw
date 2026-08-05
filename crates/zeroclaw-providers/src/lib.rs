@@ -614,7 +614,10 @@ pub struct ModelProviderRuntimeOptions {
     /// model served by a vision-capable family as non-vision. Mapped from
     /// `ModelProviderConfig::vision`.
     pub vision: Option<bool>,
-    /// Passed verbatim as `chat_template_kwargs` to the llamacpp provider.
+    /// Forwarded verbatim as a top-level `chat_template_kwargs` object in the
+    /// request body for OpenAI-compatible providers (folded into `extra_body`
+    /// by `apply_compat_options`). Consumed by chat-template-aware backends
+    /// such as vLLM, SGLang, and llama.cpp.
     pub chat_template_kwargs: Option<serde_json::Value>,
     /// Path to a custom CA certificate file for TLS connections.
     pub tls_ca_cert_path: Option<String>,
