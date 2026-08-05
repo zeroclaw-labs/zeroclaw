@@ -80,6 +80,17 @@ fn resolve_image_filename(filename_arg: Option<&str>, nanos: u128) -> String {
         .unwrap_or_else(|| format!("generated_image_{nanos}"))
 }
 
+/// Strip IPv6 URL brackets for allowlist matching. `reqwest::Url::host_str()`
+/// returns a bracketed host for IPv6 URLs (`http://[::1]/...` → `[::1]`),
+/// while `domain_guard::normalize_domain` stores config entries in the bare
+/// form (`::1`). Policy comparison must use the bare form so an explicit
+/// `allowed_private_hosts = ["::1"]` entry matches `http://[::1]/...`.
+fn bare_policy_host(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host)
+}
+
 fn format_image_tool_output(
     path_display: &str,
     size_kb: usize,
@@ -263,6 +274,10 @@ impl ImageGenTool {
             .host_str()
             .ok_or_else(|| anyhow::Error::msg(Self::tool_msg("tool-image-gen-error-url-no-host")))?
             .to_string();
+        // `reqwest::Url::host_str()` returns a bracketed host for IPv6
+        // (`[::1]`), while config entries and `normalize_domain` store the
+        // bare form (`::1`). Strip the brackets for allowlist matching.
+        let policy_host = bare_policy_host(&host);
 
         // Cloud-metadata IP literals recognized by the shared
         // `domain_guard::is_cloud_metadata_ip` predicate (169.254.169.254,
@@ -281,9 +296,9 @@ impl ImageGenTool {
         // Resolve the allowlist at use time from the canonical config
         let allowed_private_hosts = (self.allowed_private_hosts_resolver)();
 
-        let host_is_private_or_local = domain_guard::is_private_or_local_host(&host);
+        let host_is_private_or_local = domain_guard::is_private_or_local_host(policy_host);
         let private_match = if host_is_private_or_local {
-            domain_guard::host_matches_allowlist(&host, &allowed_private_hosts)
+            domain_guard::host_matches_allowlist(policy_host, &allowed_private_hosts)
         } else {
             false
         };
@@ -350,6 +365,10 @@ impl ImageGenTool {
         let host = parsed.host_str().ok_or_else(|| {
             anyhow::Error::msg(Self::tool_msg("tool-image-gen-error-resolved-url-no-host"))
         })?;
+        // Same bracket normalization as `validate_image_url`: the policy
+        // comparison uses the bare IPv6 form (`::1`), while the transport
+        // host keeps the URL representation for `resolve_host`.
+        let policy_host = bare_policy_host(host);
         let port = parsed.port_or_known_default().ok_or_else(|| {
             anyhow::Error::msg(Self::tool_msg("tool-image-gen-error-resolved-url-no-port"))
         })?;
@@ -369,7 +388,7 @@ impl ImageGenTool {
         let allowed_private_hosts = (self.allowed_private_hosts_resolver)();
 
         let private_resolution_allowed =
-            domain_guard::host_matches_allowlist(host, &allowed_private_hosts);
+            domain_guard::host_matches_allowlist(policy_host, &allowed_private_hosts);
 
         for ip in &ips {
             // The metadata check is unconditional — never lifted by the
@@ -1254,10 +1273,16 @@ mod tests {
     #[tokio::test]
     async fn validate_image_url_resolved_accepts_public_host() {
         let tool = test_tool_with_private_hosts(vec![]);
-        // example.com is a well-known public test domain (RFC 2606).
-        tool.validate_image_url_resolved("https://example.com/image.png")
-            .await
-            .expect("public host must resolve to global IPs and pass");
+        // example.com is a well-known public test domain (RFC 2606). The
+        // resolver seam injects a known-global answer so the test is
+        // hermetic — it must not depend on live DNS.
+        let global: std::net::SocketAddr = "8.8.8.8:443".parse().unwrap();
+        tool.validate_image_url_resolved_with_resolver(
+            "https://example.com/image.png",
+            &|_host: String, _port: u16| async move { Ok(vec![global]) },
+        )
+        .await
+        .expect("public host must pass with a global resolved address");
     }
 
     #[tokio::test]
@@ -1266,6 +1291,34 @@ mod tests {
         tool.validate_image_url_resolved("http://localhost:8080/test.png")
             .await
             .expect("wildcard allowlist must lift the non-global check");
+    }
+
+    #[tokio::test]
+    async fn validate_image_url_allows_ipv6_loopback_with_explicit_allowlist() {
+        // `reqwest::Url::host_str()` returns a bracketed host for an IPv6 URL
+        // (`[::1]`) while config entries store the bare form (`::1`). The
+        // allowlist comparison must strip the brackets or an explicit IPv6
+        // entry never matches and the URL is rejected as a private host.
+        let tool = test_tool_with_private_hosts(vec!["::1"]);
+        let url = tool
+            .validate_image_url("http://[::1]/x.png")
+            .expect("explicit IPv6 allowlist entry must match the bracketed URL host");
+        assert_eq!(url, "http://[::1]/x.png");
+    }
+
+    #[tokio::test]
+    async fn validate_image_url_resolved_allows_ipv6_loopback_with_explicit_allowlist() {
+        let tool = test_tool_with_private_hosts(vec!["::1"]);
+        let loopback: std::net::SocketAddr = "[::1]:80".parse().unwrap();
+        let (host, addrs) = tool
+            .validate_image_url_resolved_with_resolver(
+                "http://[::1]/x.png",
+                &|_host: String, _port: u16| async move { Ok(vec![loopback]) },
+            )
+            .await
+            .expect("explicit IPv6 allowlist must lift the non-global check");
+        assert_eq!(host, "[::1]");
+        assert_eq!(addrs, vec![loopback]);
     }
 
     /// The resolved-IP validator returns the parsed hostname alongside the
