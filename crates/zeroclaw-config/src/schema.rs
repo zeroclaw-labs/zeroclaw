@@ -1421,10 +1421,17 @@ pub enum CrusoeEndpoint {
     Default,
 }
 
+impl CrusoeEndpoint {
+    /// Canonical Crusoe Managed Inference endpoint. Single source of truth —
+    /// `CompatFamilySpec::DEFAULT_URL` for `CrusoeModelProviderConfig` references
+    /// this const so the schema and factory surfaces never drift.
+    pub const DEFAULT_URI: &'static str = "https://api.inference.crusoecloud.com/v1";
+}
+
 impl ModelEndpoint for CrusoeEndpoint {
     fn uri(&self) -> &'static str {
         match self {
-            Self::Default => "https://api.inference.crusoecloud.com/v1",
+            Self::Default => Self::DEFAULT_URI,
         }
     }
 }
