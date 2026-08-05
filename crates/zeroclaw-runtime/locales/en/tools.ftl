@@ -122,7 +122,7 @@ tool-image-info = Read image file metadata (format, dimensions, size) and option
 # image_gen tool (fal.ai Flux) — description, parameters, and SSRF-gate errors
 tool-image-gen = Generate an image from a text prompt using fal.ai (Flux models). Saves the result to the workspace images directory and returns the file path.
 tool-image-gen-param-prompt = Text prompt describing the image to generate.
-tool-image-gen-param-filename = Output filename without extension (default: 'generated_image'). Saved as PNG in workspace/images/.
+tool-image-gen-param-filename = Output filename without extension (default: a unique timestamped name like 'generated_image_20260805T120000'). Saved as PNG in workspace/images/.
 tool-image-gen-param-size = Image aspect ratio / size preset (default: 'square_hd').
 tool-image-gen-param-model = fal.ai model identifier (default: 'fal-ai/flux/schnell').
 
