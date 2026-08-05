@@ -128,6 +128,14 @@ pub(crate) type Catalog = HashMap<String, ProviderEntry>;
 
 /// Process-wide cached catalog. Public so `OpenAiCompatibleModelProvider::capabilities_for_model()`
 /// can do a non-blocking lookup for per-model vision support.
+///
+/// LIFECYCLE CONTRACT: this is a process-lifetime snapshot, not a refreshable
+/// cache. Upstream models.dev modality corrections (a model gaining or losing
+/// image input, a new provider family) are invisible until the process
+/// restarts. The catalog is used as live routing authority for per-model
+/// vision capability — do not assume capabilities refresh in-process; callers
+/// that need to track upstream changes must restart or consult a provider
+/// listing that is not backed by this snapshot.
 pub(crate) static CACHED_CATALOG: OnceCell<Arc<Catalog>> = OnceCell::const_new();
 
 /// Fetch and parse the models.dev catalog fresh (no process cache). Used by the
