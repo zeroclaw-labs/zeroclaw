@@ -624,6 +624,25 @@ mod tests {
     }
 
     #[test]
+    fn prepared_estimate_charges_each_image_in_a_multi_image_round_once() {
+        // A single native-tool round can return several images in one message.
+        // Each surviving image must be charged once — its decoded bytes, not the
+        // base64 text — and not double-counted as both text and image payload.
+        let payload = "A".repeat(400); // 400 base64 chars -> 100 image tokens each
+        let message = ChatMessage::user(format!(
+            "two screenshots [IMAGE:data:image/png;base64,{payload}] [IMAGE:data:image/png;base64,{payload}]"
+        ));
+        let (text, refs) = zeroclaw_providers::multimodal::parse_image_markers(&message.content);
+        assert_eq!(refs.len(), 2, "two image markers in one round");
+        // Charged as the stripped caption text (not the base64 content length,
+        // which would double-count) plus each image once.
+        assert_eq!(
+            estimate_prepared_history_tokens(std::slice::from_ref(&message)),
+            text.len().div_ceil(4) + 4 + 100 + 100
+        );
+    }
+
+    #[test]
     fn estimate_system_floor_empty_and_no_system() {
         assert_eq!(estimate_system_floor_tokens(&[]), 0);
         let history = vec![ChatMessage::user("hi"), ChatMessage::assistant("yo")];
