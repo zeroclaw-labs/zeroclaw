@@ -428,22 +428,24 @@ impl TaskRegistry for SqliteTaskStore {
         Ok(collect_skipping_bad_rows(rows))
     }
 
-    async fn reconcile_lost(&self, id: &str, now_boot_id: &str) -> Result<bool> {
-        let conn = self.conn.lock();
-        let rec = conn
-            .query_row(
+    async fn reconcile_lost(&self, id: &str, _now_boot_id: &str) -> Result<bool> {
+        let rec = {
+            let conn = self.conn.lock();
+            conn.query_row(
                 "SELECT * FROM tasks WHERE id = ?1",
                 params![id],
                 row_to_record,
             )
             .optional()
-            .context("reconcile: load task")?;
+            .context("reconcile: load task")?
+        };
         let Some(rec) = rec else { return Ok(false) };
         // Never reclaim a terminal record, and never one a live owner still holds.
-        if rec.status.is_terminal() || !is_authoritative(&rec, now_boot_id) {
+        if rec.status.is_terminal() || !is_authoritative(&rec) {
             return Ok(false);
         }
         let now = chrono::Utc::now().to_rfc3339();
+        let conn = self.conn.lock();
         let changed = conn
             .execute(
                 "UPDATE tasks

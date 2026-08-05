@@ -2,44 +2,108 @@
 
 use super::task_registry::TaskRecord;
 
-pub fn is_authoritative(rec: &TaskRecord, current_boot_id: &str) -> bool {
-    is_authoritative_with_pid_liveness(rec, current_boot_id, pid_is_alive)
+pub fn is_authoritative(rec: &TaskRecord) -> bool {
+    is_authoritative_with_process_probe(rec, process_state)
 }
 
-fn is_authoritative_with_pid_liveness(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessState {
+    SameProcessAlive,
+    AbsentOrReused,
+    Unknown,
+}
+
+fn is_authoritative_with_process_probe(
     rec: &TaskRecord,
-    current_boot_id: &str,
-    pid_is_alive: impl Fn(u32) -> bool,
+    probe: impl Fn(u32, Option<u64>) -> ProcessState,
 ) -> bool {
-    // Fail-closed: an UNSTAMPED record (empty owner_boot_id) is never reclaimed by the
-    // boot-mismatch path — otherwise a live task mid-create (record written before the
-    // boot id is stamped) would be reaped by its own daemon. It is only reclaimable if
-    // its owner pid is provably dead (handled below).
-    if !rec.owner_boot_id.is_empty() && rec.owner_boot_id != current_boot_id {
-        // Different, non-empty boot id ⇒ prior-boot orphan ⇒ safe to reclaim.
-        return true;
-    }
-    // Same boot (or unstamped): only reclaim if the owning process is actually gone.
-    !pid_is_alive(rec.owner_pid)
-}
-
-/// Best-effort liveness check for `pid`. On Linux we consult `/proc/<pid>`; on other
-/// platforms we conservatively assume the process is alive (never reclaim a
-/// same-boot task we cannot prove is dead).
-fn pid_is_alive(pid: u32) -> bool {
-    if pid == 0 {
-        // Unset owner — treat as not-alive so an un-stamped record is reclaimable.
+    if rec.owner_pid == 0 {
         return false;
     }
-    #[cfg(target_os = "linux")]
-    {
-        std::path::Path::new(&format!("/proc/{pid}")).exists()
+
+    let expected_started_at = match parse_process_identity(&rec.owner_boot_id) {
+        ProcessIdentity::Structured {
+            pid,
+            started_at: Some(started_at),
+        } if pid == rec.owner_pid => Some(started_at),
+        ProcessIdentity::Structured { .. } => return false,
+        ProcessIdentity::Legacy => None,
+    };
+
+    matches!(
+        probe(rec.owner_pid, expected_started_at),
+        ProcessState::AbsentOrReused
+    )
+}
+
+enum ProcessIdentity {
+    Structured { pid: u32, started_at: Option<u64> },
+    Legacy,
+}
+
+fn parse_process_identity(boot_id: &str) -> ProcessIdentity {
+    let mut parts = boot_id.split(':');
+    if parts.next() != Some("zc-process-v1") {
+        return ProcessIdentity::Legacy;
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = pid;
-        true // conservative: do not reclaim what we cannot prove dead
+    let pid = parts.next().and_then(|value| value.parse().ok());
+    let started_at = parts.next().and_then(|value| value.parse().ok());
+    let nonce = parts.next();
+    if nonce.is_none() || parts.next().is_some() {
+        return ProcessIdentity::Structured {
+            pid: pid.unwrap_or_default(),
+            started_at: None,
+        };
     }
+    ProcessIdentity::Structured {
+        pid: pid.unwrap_or_default(),
+        started_at,
+    }
+}
+
+fn process_state(pid: u32, expected_started_at: Option<u64>) -> ProcessState {
+    if !sysinfo::IS_SUPPORTED_SYSTEM {
+        return ProcessState::Unknown;
+    }
+    let pid = sysinfo::Pid::from_u32(pid);
+    let mut system = sysinfo::System::new();
+    system.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::Some(&[pid]),
+        true,
+        sysinfo::ProcessRefreshKind::nothing(),
+    );
+    let Some(process) = system.process(pid) else {
+        return match pid_is_definitely_absent(pid.as_u32()) {
+            Some(true) => ProcessState::AbsentOrReused,
+            Some(false) | None => ProcessState::Unknown,
+        };
+    };
+    if process.start_time() == 0 {
+        return ProcessState::Unknown;
+    }
+    match expected_started_at {
+        Some(started_at) if process.start_time() != started_at => ProcessState::AbsentOrReused,
+        Some(_) | None => ProcessState::SameProcessAlive,
+    }
+}
+
+#[cfg(unix)]
+fn pid_is_definitely_absent(pid: u32) -> Option<bool> {
+    // SAFETY: signal 0 performs an existence/permission check without sending a signal.
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if result == 0 {
+        return Some(false);
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::ESRCH) => Some(true),
+        Some(libc::EPERM) => Some(false),
+        _ => None,
+    }
+}
+
+#[cfg(not(unix))]
+fn pid_is_definitely_absent(_pid: u32) -> Option<bool> {
+    None
 }
 
 #[cfg(test)]
@@ -68,43 +132,85 @@ mod tests {
     }
 
     #[test]
-    fn prior_boot_is_reclaimable() {
-        // Different boot id ⇒ orphan ⇒ authoritative regardless of pid.
-        assert!(is_authoritative(&rec(999_999, "boot-OLD"), "boot-NEW"));
+    fn dead_legacy_owner_is_reclaimable() {
+        assert!(is_authoritative_with_process_probe(
+            &rec(999_999, "boot-OLD"),
+            |_, _| ProcessState::AbsentOrReused,
+        ));
     }
 
     #[test]
-    fn unstamped_owner_is_reclaimable() {
-        // Same boot but pid 0 (never stamped) ⇒ reclaimable.
-        assert!(is_authoritative(&rec(0, "boot-NOW"), "boot-NOW"));
+    fn unstamped_owner_fails_closed() {
+        assert!(!is_authoritative_with_process_probe(
+            &rec(0, "boot-NOW"),
+            |_, _| ProcessState::AbsentOrReused,
+        ));
     }
 
     #[test]
     fn live_same_boot_pid_is_not_reclaimed() {
         // Our own live pid, same boot ⇒ must NOT be reclaimed.
-        let me = std::process::id();
-        assert!(!is_authoritative(&rec(me, "boot-NOW"), "boot-NOW"));
+        assert!(!is_authoritative_with_process_probe(
+            &rec(42, "boot-NOW"),
+            |_, _| ProcessState::SameProcessAlive,
+        ));
     }
 
     #[test]
     fn unstamped_boot_id_with_live_pid_is_not_reclaimed() {
         // Review finding #7: a record written before its boot_id is stamped (empty) and
         // owned by a LIVE pid must NOT be reaped via the boot-mismatch path — fail closed.
-        let me = std::process::id();
-        assert!(!is_authoritative(&rec(me, ""), "boot-NEW"));
+        assert!(!is_authoritative_with_process_probe(
+            &rec(42, ""),
+            |_, _| ProcessState::SameProcessAlive,
+        ));
     }
 
     #[test]
     fn unstamped_boot_id_reclaims_only_when_pid_liveness_says_dead() {
-        assert!(!is_authoritative_with_pid_liveness(
+        assert!(!is_authoritative_with_process_probe(
             &rec(42, ""),
-            "boot-NEW",
-            |_| true,
+            |_, _| ProcessState::SameProcessAlive,
         ));
-        assert!(is_authoritative_with_pid_liveness(
-            &rec(42, ""),
-            "boot-NEW",
-            |_| false,
+        assert!(is_authoritative_with_process_probe(&rec(42, ""), |_, _| {
+            ProcessState::AbsentOrReused
+        },));
+    }
+
+    #[test]
+    fn live_structured_owner_is_not_reclaimed_by_another_boot() {
+        let rec = rec(42, "zc-process-v1:42:123:owner");
+        assert!(!is_authoritative_with_process_probe(
+            &rec,
+            |pid, started_at| {
+                assert_eq!(pid, 42);
+                assert_eq!(started_at, Some(123));
+                ProcessState::SameProcessAlive
+            },
+        ));
+    }
+
+    #[test]
+    fn reused_pid_is_reclaimable_when_start_time_differs() {
+        let rec = rec(42, "zc-process-v1:42:123:owner");
+        assert!(is_authoritative_with_process_probe(&rec, |_, _| {
+            ProcessState::AbsentOrReused
+        },));
+    }
+
+    #[test]
+    fn malformed_structured_identity_fails_closed() {
+        let rec = rec(42, "zc-process-v1:42:not-a-time:owner");
+        assert!(!is_authoritative_with_process_probe(&rec, |_, _| {
+            ProcessState::AbsentOrReused
+        },));
+    }
+
+    #[test]
+    fn unknown_process_state_fails_closed() {
+        assert!(!is_authoritative_with_process_probe(
+            &rec(42, "boot-OLD"),
+            |_, _| ProcessState::Unknown,
         ));
     }
 }

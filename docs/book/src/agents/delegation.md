@@ -197,7 +197,7 @@ Exact, sourced from `crates/zeroclaw-runtime/src/tools/delegate.rs`.
 
 ### `delegate`: how to verify it actually fired
 
-`delegate` does not emit a dedicated tracing span today. The signal is the **target** agent's loop appearing in the log, which inherits whatever scope the parent's tool-call dispatch was inside. For background mode, use `check_result` or `await_sessions` to read the authoritative lifecycle state and output together. The workspace artifact can confirm that output was persisted, but it does not carry status.
+`delegate` does not emit a dedicated tracing span today. The signal is the **target** agent's loop appearing in the log, which inherits whatever scope the parent's tool-call dispatch was inside. For background mode, use `check_result` or `await_sessions` to read the authoritative lifecycle state and output together. Those actions, listing, and cancellation are limited to delegate rows created by the same configured caller alias. The workspace artifact can confirm that output was persisted, but it does not carry status.
 
 (Cron-launched agent jobs are a separate spawn site and use the explicit `subagent` span described above; `delegate` and cron are not the same path.)
 

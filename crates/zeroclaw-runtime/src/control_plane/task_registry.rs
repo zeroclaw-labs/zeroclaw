@@ -158,8 +158,9 @@ pub trait TaskRegistry: Send + Sync {
     async fn list_running(&self) -> anyhow::Result<Vec<TaskRecord>>;
     async fn list_by_agent(&self, agent: &str) -> anyhow::Result<Vec<TaskRecord>>;
     /// Reaper/recovery seam: mark a record terminal-loss ONLY when this process is
-    /// authoritative for it. Returns `false` (no write) when another live daemon
-    /// owns it. See [`crate::control_plane::authority::is_authoritative`].
+    /// authoritative for it. Returns `false` (no write) when another live process
+    /// owns it. `now_boot_id` remains part of the recovery seam for reaper filtering.
+    /// See [`crate::control_plane::authority::is_authoritative`].
     async fn reconcile_lost(&self, id: &str, now_boot_id: &str) -> anyhow::Result<bool>;
     /// Mark a stale-heartbeat task timed out only if the observed owner and
     /// heartbeat still match. Returns `false` when liveness changed first.

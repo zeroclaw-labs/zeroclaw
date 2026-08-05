@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use parking_lot::RwLock;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -254,6 +255,8 @@ impl DelegateTool {
     pub const NAME: &'static str = "delegate";
     const MAX_AWAIT_SESSIONS_TIMEOUT: Duration = Duration::from_secs(120);
     const MAX_AWAIT_SESSION_TASK_IDS: usize = 128;
+    const TERMINAL_TRANSITION_ATTEMPTS: usize = 3;
+    const TERMINAL_TRANSITION_RETRY_DELAY: Duration = Duration::from_millis(25);
     const OUTPUT_ARTIFACT_PREFIX: &'static str = "artifact:";
     const INDEPENDENT_ALWAYS_ASK_DOC_REF: &'static str =
         "ZeroClaw docs, \"Delegation & SubAgents\" > \"What's not supported\"";
@@ -1048,7 +1051,7 @@ impl DelegateTool {
             .entry(data_dir.clone())
             .or_insert_with(|| Arc::new(ControlPlaneCell::new()))
             .clone();
-        cell.get_or_try_init(|| crate::control_plane::ControlPlaneHandle::start(&data_dir))
+        cell.get_or_try_init(|| async { crate::control_plane::ControlPlaneHandle::open(&data_dir) })
             .await
             .cloned()
     }
@@ -1132,9 +1135,68 @@ impl DelegateTool {
                     Some(format!("failed to persist delegate output: {error:#}")),
                 ),
             };
-        store
-            .transition_terminal(&result.task_id, settled_status, output_ref, settled_error)
-            .await
+        Self::retry_terminal_transition(|| {
+            store.transition_terminal(
+                &result.task_id,
+                settled_status,
+                output_ref.clone(),
+                settled_error.clone(),
+            )
+        })
+        .await
+    }
+
+    async fn retry_terminal_transition<F, Fut>(mut transition: F) -> anyhow::Result<bool>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = anyhow::Result<bool>>,
+    {
+        let mut last_error = None;
+        for attempt in 1..=Self::TERMINAL_TRANSITION_ATTEMPTS {
+            match transition().await {
+                Ok(won) => return Ok(won),
+                Err(error) => last_error = Some(error),
+            }
+            if attempt < Self::TERMINAL_TRANSITION_ATTEMPTS {
+                tokio::time::sleep(Self::TERMINAL_TRANSITION_RETRY_DELAY * attempt as u32).await;
+            }
+        }
+        Err(last_error
+            .expect("terminal transition loop always records an error")
+            .context("terminal task transition failed after bounded retries"))
+    }
+
+    async fn settle_background_cancellation<F, Fut>(
+        task_id: &str,
+        transition: F,
+    ) -> anyhow::Result<(bool, bool)>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = anyhow::Result<bool>>,
+    {
+        let won = Self::retry_terminal_transition(transition).await?;
+        if !won {
+            return Ok((false, false));
+        }
+
+        let aborted = Self::background_task_cancels()
+            .lock()
+            .remove(task_id)
+            .inspect(CancellationToken::cancel)
+            .is_some();
+        Ok((true, aborted))
+    }
+
+    fn owns_delegate_task(&self, task: &crate::control_plane::TaskRecord) -> bool {
+        task.kind == crate::control_plane::TaskKind::Delegate
+            && self
+                .caller_identity()
+                .is_some_and(|caller| task.originator_route.as_deref() == Some(caller))
+    }
+
+    fn caller_identity(&self) -> Option<&str> {
+        let alias = self.caller_alias.trim();
+        (!alias.is_empty()).then_some(alias)
     }
 
     /// Validate that a user-provided task_id is a valid UUID to prevent
@@ -1622,6 +1684,16 @@ impl DelegateTool {
             });
         }
 
+        let Some(caller_identity) = self.caller_identity().map(str::to_owned) else {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(
+                    "Cannot start background delegation: caller identity is unavailable".into(),
+                ),
+            });
+        };
+
         let task_control_plane = match self.background_control_plane().await {
             Ok(handle) => handle,
             Err(error) => {
@@ -1672,7 +1744,7 @@ impl DelegateTool {
                 heartbeat_at: None,
                 depth: self.depth,
                 parent_id: None,
-                originator_route: None,
+                originator_route: Some(caller_identity),
                 delivered: false,
                 idem_key: None,
                 principal_id: None,
@@ -2108,6 +2180,9 @@ impl DelegateTool {
     ) -> anyhow::Result<Option<(BackgroundResultState, serde_json::Value, Option<String>)>> {
         let control_plane = self.background_control_plane().await?;
         if let Some(snapshot) = control_plane.store.get_snapshot(task_id).await? {
+            if !self.owns_delegate_task(&snapshot.task) {
+                return Ok(None);
+            }
             let state = BackgroundResultState::from_task_status(snapshot.task.status);
             let mut task_error = snapshot.error;
             let output = if state == BackgroundResultState::Completed {
@@ -2472,6 +2547,13 @@ impl DelegateTool {
 
         let control_plane = self.background_control_plane().await?;
         if let Some(snapshot) = control_plane.store.get_snapshot(task_id).await? {
+            if !self.owns_delegate_task(&snapshot.task) {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(format!("No task found for task_id '{task_id}'")),
+                });
+            }
             if snapshot.task.status != crate::control_plane::TaskStatus::Running {
                 return Ok(ToolResult {
                     success: false,
@@ -2483,20 +2565,15 @@ impl DelegateTool {
                 });
             }
 
-            let aborted = Self::background_task_cancels()
-                .lock()
-                .remove(task_id)
-                .inspect(CancellationToken::cancel)
-                .is_some();
-            let won = control_plane
-                .store
-                .transition_terminal(
+            let (won, aborted) = Self::settle_background_cancellation(task_id, || {
+                control_plane.store.transition_terminal(
                     task_id,
                     crate::control_plane::TaskStatus::Cancelled,
                     None,
                     Some("cancelled by user request".into()),
                 )
-                .await?;
+            })
+            .await?;
             if !won {
                 let status = control_plane
                     .store
@@ -3117,7 +3194,7 @@ mod tests {
             heartbeat_at: None,
             depth: 0,
             parent_id: None,
-            originator_route: None,
+            originator_route: Some("caller".into()),
             delivered: false,
             idem_key: None,
             principal_id: None,
@@ -3144,6 +3221,7 @@ mod tests {
 
         let tool = DelegateTool::new(HashMap::new(), None, Arc::new(SecurityPolicy::default()))
             .with_workspace_dir(temp.path().into())
+            .with_caller_alias("caller")
             .with_task_control_plane(task_control_plane(store));
         tokio::fs::create_dir_all(tool.results_dir()).await.unwrap();
         DelegateTool::write_result_atomic(
@@ -3217,6 +3295,7 @@ mod tests {
             .unwrap();
         let tool = DelegateTool::new(HashMap::new(), None, Arc::new(SecurityPolicy::default()))
             .with_workspace_dir(temp.path().into())
+            .with_caller_alias("caller")
             .with_task_control_plane(task_control_plane(store));
 
         let (state, view, _) = tool.read_background_view(task_id).await.unwrap().unwrap();
@@ -3286,6 +3365,7 @@ mod tests {
         .unwrap();
         let tool = DelegateTool::new(HashMap::new(), None, Arc::new(SecurityPolicy::default()))
             .with_workspace_dir(temp.path().into())
+            .with_caller_alias("caller")
             .with_task_control_plane(task_control_plane(store));
 
         for (task_id, expected_error) in [
@@ -3411,6 +3491,217 @@ mod tests {
         assert_eq!(snapshot.task.status, TaskStatus::Cancelled);
         assert!(snapshot.output.is_none());
         assert_eq!(snapshot.error.as_deref(), Some("cancelled first"));
+    }
+
+    #[tokio::test]
+    async fn terminal_transition_retries_transient_store_errors() {
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let won = DelegateTool::retry_terminal_transition(|| {
+            let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                if attempt < 2 {
+                    anyhow::bail!("transient store error");
+                }
+                Ok(true)
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(won);
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn terminal_transition_stops_after_bounded_store_errors() {
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let error = DelegateTool::retry_terminal_transition(|| {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { anyhow::bail!("persistent store error") }
+        })
+        .await
+        .unwrap_err();
+
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert!(error.to_string().contains("after bounded retries"));
+    }
+
+    #[tokio::test]
+    async fn cancellation_keeps_worker_live_when_terminal_write_fails() {
+        let task_id = "test-cancel-persistent-store-error";
+        let token = CancellationToken::new();
+        DelegateTool::background_task_cancels()
+            .lock()
+            .insert(task_id.into(), token.clone());
+
+        let error = DelegateTool::settle_background_cancellation(task_id, || async {
+            anyhow::bail!("persistent store error")
+        })
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("after bounded retries"));
+        assert!(!token.is_cancelled());
+        assert!(
+            DelegateTool::background_task_cancels()
+                .lock()
+                .remove(task_id)
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_stops_worker_only_after_terminal_write_wins() {
+        let task_id = "test-cancel-after-terminal-write";
+        let token = CancellationToken::new();
+        DelegateTool::background_task_cancels()
+            .lock()
+            .insert(task_id.into(), token.clone());
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+
+        let (won, aborted) = DelegateTool::settle_background_cancellation(task_id, || {
+            let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let token = token.clone();
+            async move {
+                assert!(!token.is_cancelled());
+                if attempt == 0 {
+                    anyhow::bail!("transient store error");
+                }
+                Ok(true)
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(won);
+        assert!(aborted);
+        assert!(token.is_cancelled());
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn cancellation_keeps_worker_live_when_terminal_write_loses() {
+        let task_id = "test-cancel-lost-terminal-race";
+        let token = CancellationToken::new();
+        DelegateTool::background_task_cancels()
+            .lock()
+            .insert(task_id.into(), token.clone());
+
+        let (won, aborted) =
+            DelegateTool::settle_background_cancellation(task_id, || async { Ok(false) })
+                .await
+                .unwrap();
+
+        assert!(!won);
+        assert!(!aborted);
+        assert!(!token.is_cancelled());
+        assert!(
+            DelegateTool::background_task_cancels()
+                .lock()
+                .remove(task_id)
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_views_reject_foreign_kinds_callers_and_missing_origins() {
+        let store: Arc<dyn TaskRegistry> = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let authorized = "10101010-1010-1010-1010-101010101010";
+        let wrong_kind = "20202020-2020-2020-2020-202020202020";
+        let wrong_caller = "30303030-3030-3030-3030-303030303030";
+        let missing_origin = "40404040-4040-4040-4040-404040404040";
+
+        store
+            .create(task_record(authorized, TaskStatus::Running))
+            .await
+            .unwrap();
+        let mut task = task_record(wrong_kind, TaskStatus::Running);
+        task.kind = TaskKind::Subagent;
+        store.create(task).await.unwrap();
+        let mut task = task_record(wrong_caller, TaskStatus::Running);
+        task.originator_route = Some("other".into());
+        store.create(task).await.unwrap();
+        let mut task = task_record(missing_origin, TaskStatus::Running);
+        task.originator_route = None;
+        store.create(task).await.unwrap();
+
+        let tool = DelegateTool::new(HashMap::new(), None, Arc::new(SecurityPolicy::default()))
+            .with_caller_alias("caller")
+            .with_task_control_plane(task_control_plane(store));
+        assert!(
+            tool.read_background_view(authorized)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        for task_id in [wrong_kind, wrong_caller, missing_origin] {
+            assert!(tool.read_background_view(task_id).await.unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn foreign_delegate_cancellation_does_not_touch_its_token() {
+        let store: Arc<dyn TaskRegistry> = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let task_id = "50505050-5050-5050-5050-505050505050";
+        let mut task = task_record(task_id, TaskStatus::Running);
+        task.originator_route = Some("other".into());
+        store.create(task).await.unwrap();
+        let token = CancellationToken::new();
+        DelegateTool::background_task_cancels()
+            .lock()
+            .insert(task_id.into(), token.clone());
+        let tool = DelegateTool::new(HashMap::new(), None, Arc::new(SecurityPolicy::default()))
+            .with_caller_alias("caller")
+            .with_task_control_plane(task_control_plane(store));
+
+        let result = tool
+            .handle_cancel_task(&json!({"task_id": task_id}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(!token.is_cancelled());
+        assert!(
+            DelegateTool::background_task_cancels()
+                .lock()
+                .remove(task_id)
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn list_results_filters_foreign_delegate_rows() {
+        let temp = TempDir::new().unwrap();
+        let store: Arc<dyn TaskRegistry> = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let authorized = "60606060-6060-6060-6060-606060606060";
+        let foreign = "70707070-7070-7070-7070-707070707070";
+        store
+            .create(task_record(authorized, TaskStatus::Running))
+            .await
+            .unwrap();
+        let mut task = task_record(foreign, TaskStatus::Running);
+        task.originator_route = Some("other".into());
+        store.create(task).await.unwrap();
+        let tool = DelegateTool::new(HashMap::new(), None, Arc::new(SecurityPolicy::default()))
+            .with_workspace_dir(temp.path().into())
+            .with_caller_alias("caller")
+            .with_task_control_plane(task_control_plane(store));
+        tokio::fs::create_dir_all(tool.results_dir()).await.unwrap();
+        for task_id in [authorized, foreign] {
+            DelegateTool::write_result_atomic(
+                &tool.results_dir().join(format!("{task_id}.json")),
+                &BackgroundDelegateOutput {
+                    task_id: task_id.into(),
+                    output: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let listed = tool.handle_list_results().await.unwrap();
+        assert!(listed.success);
+        assert!(listed.output.contains(authorized));
+        assert!(!listed.output.contains(foreign));
     }
 
     #[tokio::test]
@@ -3588,6 +3879,11 @@ mod tests {
 
     fn with_in_memory_task_store(tool: DelegateTool) -> DelegateTool {
         let store: Arc<dyn TaskRegistry> = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let tool = if tool.caller_alias.is_empty() {
+            tool.with_caller_alias("caller")
+        } else {
+            tool
+        };
         tool.with_task_control_plane(task_control_plane(store))
     }
 

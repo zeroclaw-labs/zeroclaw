@@ -1,23 +1,37 @@
-//! Process-global access to the daemon's [`ControlPlaneHandle`].
+//! Process-global access to the daemon's control plane.
 
 use std::sync::OnceLock;
 
-use super::boot::ControlPlaneHandle;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
-static CONTROL_PLANE: OnceLock<ControlPlaneHandle> = OnceLock::new();
+use super::boot::{ControlPlaneHandle, ControlPlaneRecoveryOwner};
+
+static CONTROL_PLANE: OnceLock<ControlPlaneRecoveryOwner> = OnceLock::new();
 
 /// Install the daemon's control-plane handle. Called ONCE at boot
 /// (`daemon::run`). Subsequent calls are ignored (returns `false`), so a reload
 /// iteration cannot swap the live store out from under in-flight producers.
-pub fn init_control_plane(handle: ControlPlaneHandle) -> bool {
-    CONTROL_PLANE.set(handle).is_ok()
+pub(crate) fn init_control_plane(owner: ControlPlaneRecoveryOwner) -> bool {
+    CONTROL_PLANE.set(owner).is_ok()
 }
 
 /// The daemon-owned control plane, or `None` when this process has not booted a
 /// daemon. Producers that require durable lifecycle state must either attach to
 /// the configured store explicitly or reject the operation.
 pub fn control_plane() -> Option<&'static ControlPlaneHandle> {
-    CONTROL_PLANE.get()
+    CONTROL_PLANE.get().map(ControlPlaneRecoveryOwner::handle)
+}
+
+/// Spawn the daemon-owned reaper without exposing recovery capability through
+/// producer/observer handles.
+pub(crate) fn spawn_control_plane_reaper(
+    max_runtime_secs: i64,
+    cancel: CancellationToken,
+) -> Option<JoinHandle<()>> {
+    CONTROL_PLANE
+        .get()
+        .map(|owner| owner.spawn_reaper(max_runtime_secs, cancel))
 }
 
 #[cfg(test)]
