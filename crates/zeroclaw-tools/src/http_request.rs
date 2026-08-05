@@ -390,40 +390,17 @@ impl HttpRequestTool {
         }
     }
 
-    /// Read the response body while bounding memory to the display cap. The
-    /// crate enables reqwest's gzip/brotli/deflate decoders, so a small
-    /// compressed response can decode into a much larger body; stopping the
-    /// stream once we pass the cap keeps that expansion bounded instead of
-    /// buffering the whole decoded body before `truncate_response`.
+    /// Read the response body, decoding a `Content-Encoding: gzip | deflate | br`
+    /// body, while bounding memory to the display cap. A small compressed
+    /// response can decode into a much larger body; the shared reader stops
+    /// once the decoded output passes the cap instead of buffering the whole
+    /// body before `truncate_response`. A malformed compressed body surfaces as
+    /// an error so the caller can report a failed execution.
     async fn read_capped_response_text(
         &self,
         response: reqwest::Response,
-    ) -> Result<String, reqwest::Error> {
-        use futures_util::StreamExt;
-
-        let hard_cap = if self.max_response_size == 0 {
-            usize::MAX
-        } else {
-            // One extra byte so `truncate_response` can still detect and mark an
-            // over-limit body.
-            self.max_response_size.saturating_add(1)
-        };
-
-        let mut stream = response.bytes_stream();
-        let mut bytes: Vec<u8> = Vec::new();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            if bytes.len() >= hard_cap {
-                break;
-            }
-            let remaining = hard_cap - bytes.len();
-            if chunk.len() > remaining {
-                bytes.extend_from_slice(&chunk[..remaining]);
-                break;
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    ) -> anyhow::Result<String> {
+        crate::http_decode::read_decoded_text_capped(response, self.max_response_size).await
     }
 }
 
@@ -627,11 +604,18 @@ impl Tool for HttpRequestTool {
                     .join(", ");
 
                 // Get response body with a streamed size limit so transparent
-                // decompression cannot expand past the cap in memory.
-                let response_text = match self.read_capped_response_text(response).await {
-                    Ok(text) => self.truncate_response(&text),
-                    Err(e) => format!("[Failed to read response body: {e}]"),
-                };
+                // decompression cannot expand past the cap in memory. A body /
+                // decoder failure (e.g. a 2xx advertising gzip with malformed
+                // bytes) is an operational failure, not a successful execution,
+                // so track it separately from the HTTP status.
+                let (response_text, body_error) =
+                    match self.read_capped_response_text(response).await {
+                        Ok(text) => (self.truncate_response(&text), None),
+                        Err(e) => (
+                            format!("[Failed to read response body: {e}]"),
+                            Some(e.to_string()),
+                        ),
+                    };
 
                 let output = format!(
                     "Status: {} {}\nResponse Headers: {}\n\nResponse Body:\n{}",
@@ -652,13 +636,16 @@ impl Tool for HttpRequestTool {
                     "body": body_value,
                 });
 
+                let http_error = status.is_client_error() || status.is_server_error();
                 Ok(ToolResult {
-                    success: status.is_success(),
+                    success: status.is_success() && body_error.is_none(),
                     output: ToolOutput::json_with_text(data, output),
-                    error: if status.is_client_error() || status.is_server_error() {
-                        Some(format!("HTTP {}", status_code))
-                    } else {
-                        None
+                    error: match (&body_error, http_error) {
+                        (Some(detail), _) => {
+                            Some(format!("Failed to read response body: {detail}"))
+                        }
+                        (None, true) => Some(format!("HTTP {status_code}")),
+                        (None, false) => None,
                     },
                 })
             }
@@ -1334,8 +1321,8 @@ api_token = "Bearer from-secret"
         use wiremock::matchers::method;
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        // A tiny gzip body that decodes to 10 KiB. Enabling reqwest's gzip
-        // decoder crate-wide means this must not buffer the whole decoded body
+        // A tiny gzip body that decodes to 10 KiB. `http_request` decodes gzip
+        // in `http_decode`, so this must not buffer the whole decoded body
         // before the cap applies.
         let payload = "a".repeat(10_000);
         let gz = {
@@ -1390,6 +1377,56 @@ api_token = "Bearer from-secret"
             text.len() <= 129,
             "streamed read must stop at the cap (+1), got {} bytes",
             text.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_compressed_2xx_reports_failure() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // A 200 that advertises gzip but sends bytes that are not a valid gzip
+        // stream. The body cannot be read, so the tool must report a failure —
+        // not `success: true` with an error string smuggled into the body — at
+        // the public `Tool::execute` boundary.
+        let server = MockServer::start().await;
+        let addr = server.address();
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-encoding", "gzip")
+                    .set_body_raw(b"not really gzip".to_vec(), "text/plain"),
+            )
+            .mount(&server)
+            .await;
+
+        let tool = HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["*".into()],
+            1_048_576,
+            30,
+            true,
+            Vec::new(),
+        )
+        .unwrap();
+
+        let url = format!("http://{}:{}/", addr.ip(), addr.port());
+        let result = tool
+            .execute(json!({ "url": url }))
+            .await
+            .expect("execute resolves");
+
+        assert!(
+            !result.success,
+            "a body that could not be decoded must not be a successful execution"
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("read response body")),
+            "error must explain the body-read failure, got {:?}",
+            result.error
         );
     }
 

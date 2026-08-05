@@ -1,6 +1,5 @@
 use crate::helpers::domain_guard;
 use async_trait::async_trait;
-use futures_util::StreamExt;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
@@ -82,22 +81,7 @@ impl WebFetchTool {
         &self,
         response: reqwest::Response,
     ) -> anyhow::Result<String> {
-        let mut bytes_stream = response.bytes_stream();
-        let hard_cap = if self.max_response_size == 0 {
-            usize::MAX
-        } else {
-            self.max_response_size.saturating_add(1)
-        };
-        let mut bytes = Vec::new();
-
-        while let Some(chunk_result) = bytes_stream.next().await {
-            let chunk = chunk_result?;
-            if append_chunk_with_cap(&mut bytes, &chunk, hard_cap) {
-                break;
-            }
-        }
-
-        Ok(String::from_utf8_lossy(&bytes).into_owned())
+        crate::http_decode::read_decoded_text_capped(response, self.max_response_size).await
     }
 
     /// Whether the standard fetch result should trigger a Firecrawl fallback.
@@ -563,21 +547,6 @@ fn validate_target_url_with_dns_check(
     }
 
     Ok(url.to_string())
-}
-
-fn append_chunk_with_cap(buffer: &mut Vec<u8>, chunk: &[u8], hard_cap: usize) -> bool {
-    if buffer.len() >= hard_cap {
-        return true;
-    }
-
-    let remaining = hard_cap - buffer.len();
-    if chunk.len() > remaining {
-        buffer.extend_from_slice(&chunk[..remaining]);
-        return true;
-    }
-
-    buffer.extend_from_slice(chunk);
-    buffer.len() >= hard_cap
 }
 
 fn extract_host(url: &str) -> anyhow::Result<String> {
@@ -1166,8 +1135,8 @@ mod tests {
 
         let tool = test_tool_with_limit(max_response_size);
         // Call standard_fetch directly so wiremock on 127.0.0.1 is reachable
-        // past the SSRF guard. A default client carries reqwest's transparent
-        // decoders, enabled via the crate's gzip/brotli/deflate features.
+        // past the SSRF guard. The client does no decoding; `web_fetch` decodes
+        // the body in `http_decode` from the Content-Encoding header.
         let url = format!("http://{}:{}/", addr.ip(), addr.port());
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
@@ -1193,7 +1162,7 @@ mod tests {
             );
             assert_eq!(
                 result.output, payload,
-                "Content-Encoding: {encoding} body must be transparently decompressed"
+                "Content-Encoding: {encoding} body must be decompressed"
             );
         }
     }
@@ -1299,14 +1268,6 @@ mod tests {
     fn blocklist_allows_non_blocked() {
         let tool = test_tool_with_blocklist(vec!["*"], vec!["evil.com"]);
         assert!(tool.validate_url("https://example.com").is_ok());
-    }
-
-    #[test]
-    fn append_chunk_with_cap_truncates_and_stops() {
-        let mut buffer = Vec::new();
-        assert!(!append_chunk_with_cap(&mut buffer, b"hello", 8));
-        assert!(append_chunk_with_cap(&mut buffer, b"world", 8));
-        assert_eq!(buffer, b"hellowor");
     }
 
     #[test]
