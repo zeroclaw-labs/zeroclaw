@@ -597,8 +597,7 @@ async fn handle_socket(
     if let Some(ref text) = first_msg_fallback {
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
             if parsed["type"].as_str() == Some("message") {
-                let content = parsed["content"].as_str().unwrap_or("").to_string();
-                if !content.is_empty() {
+                if let Some(content) = first_chat_message_content(text) {
                     let _session_guard = match state.session_queue.acquire(&session_key).await {
                         Ok(guard) => guard,
                         Err(e) => {
@@ -956,6 +955,13 @@ fn needs_onboarding_ws_error(
         "message": crate::needs_quickstart_channel_reply(),
         "url": "/onboard",
     }))
+}
+
+fn first_chat_message_content(text: &str) -> Option<String> {
+    let parsed = serde_json::from_str::<serde_json::Value>(text).ok()?;
+    (parsed["type"].as_str() == Some("message"))
+        .then(|| parsed["content"].as_str().unwrap_or("").to_string())
+        .filter(|content| !content.is_empty())
 }
 
 fn event_matches_session(event: &serde_json::Value, session_id: &str) -> bool {
@@ -1680,6 +1686,20 @@ mod tests {
 
         assert_eq!(response["code"], "NEEDS_ONBOARDING");
         server.abort();
+    }
+
+    #[test]
+    fn first_chat_message_content_preserves_the_message_for_dispatch() {
+        let text = serde_json::json!({
+            "type": "message",
+            "content": "hello after an idle keepalive"
+        })
+        .to_string();
+
+        assert_eq!(
+            first_chat_message_content(&text).as_deref(),
+            Some("hello after an idle keepalive")
+        );
     }
 
     #[test]

@@ -6883,6 +6883,9 @@ pub struct GatewayConfig {
     /// Send WebSocket ping frames every N seconds to keep dashboard chat
     /// connections alive. Range:
     /// `0..=GATEWAY_WEBSOCKET_PING_INTERVAL_MAX_SECS`. 0 = disabled. Default: 30.
+    /// The value is read when each WebSocket connection opens; changing it
+    /// requires reconnecting clients (or restarting the gateway) to affect
+    /// existing connections.
     #[serde(default = "default_gateway_websocket_ping_interval_secs")]
     pub websocket_ping_interval_secs: u64,
 
