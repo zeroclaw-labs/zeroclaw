@@ -1000,7 +1000,7 @@ impl RpcDispatcher {
         // updated immediately by `config/set` while `zeroclaw-log` installs its
         // writer state only at startup or daemon reload — gating on the config
         // here would advertise a stale path (or omit a live one) during the
-        // config/reload window #8650 calls out.
+        // config/reload window the Doctor diagnostics issue calls out.
         let log_path = zeroclaw_log::active_log_path().map(|p| p.to_string_lossy().to_string());
         to_result(DoctorRunResult {
             results,
@@ -7176,7 +7176,7 @@ mod tests {
         );
     }
 
-    /// #8650 config/reload window, scenario A: the daemon started with an
+    /// Config/reload window, scenario A: the daemon started with an
     /// ACTIVE writer (rolling), then `config/set` flipped
     /// `observability.log_persistence` to `none` WITHOUT a daemon reload.
     /// The writer still persists, so Doctor must still advertise the path —
@@ -7221,7 +7221,7 @@ mod tests {
         );
     }
 
-    /// #8650 config/reload window, scenario B: the daemon started with
+    /// Config/reload window, scenario B: the daemon started with
     /// persistence DISABLED, then `config/set` flipped it to `rolling`
     /// WITHOUT a daemon reload. No writer is installed, so Doctor must NOT
     /// advertise the disabled writer's stale resolved path.
