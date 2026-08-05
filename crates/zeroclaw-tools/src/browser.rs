@@ -825,17 +825,44 @@ impl BrowserTool {
             return Ok(());
         };
 
+        // One canonical target validator shared by every backend.
+        let resolved_target = self.validate_screenshot_target(path_str).await?;
+
+        // Replace the raw user path with the canonical target.
+        *path = Some(resolved_target.to_string_lossy().to_string());
+        Ok(())
+    }
+
+    /// The single canonical screenshot-destination validator. Applies the same
+    /// guards as `file_write` / `file_edit`:
+    /// 1. String-level `is_path_allowed` — rejects null bytes, `..` traversal,
+    ///    URL-encoded traversal.
+    /// 2. `resolve_tool_path` + `canonicalize` parent — resolves relative/tilde
+    ///    paths.
+    /// 3. `is_resolved_path_allowed` — canonical parent inside the workspace
+    ///    allowlist.
+    /// 4. `is_runtime_config_path` — rejects `config.toml`, `config.toml.bak`,
+    ///    `.config.toml.tmp-*`.
+    /// 5. `symlink_metadata` — rejects existing symlink targets.
+    ///
+    /// Shared by the local backends (`validate_screenshot_path`) and the
+    /// ComputerUse flow (`validate_screenshot_path_for_computer_use`) so one
+    /// policy cannot drift between them.
+    async fn validate_screenshot_target(
+        &self,
+        raw_path: &str,
+    ) -> anyhow::Result<std::path::PathBuf> {
         // String-level reject (null bytes, .. traversal, URL-encoded traversal)
-        if !self.security.is_path_allowed(path_str) {
+        if !self.security.is_path_allowed(raw_path) {
             let msg = crate::i18n::get_required_tool_string_with_args(
                 "tool-browser-screenshot-error-path-not-allowed",
-                &[("path", path_str)],
+                &[("path", raw_path)],
             );
             anyhow::bail!("{msg}");
         }
 
         // Resolve relative / tilde paths against the workspace directory.
-        let full = self.security.resolve_tool_path(path_str);
+        let full = self.security.resolve_tool_path(raw_path);
 
         // The file does not exist yet, so canonicalize the *parent* directory
         // to verify it is inside the workspace allowlist.
@@ -844,7 +871,7 @@ impl BrowserTool {
             crate::i18n::get_required_tool_string_with_args(
                 "tool-browser-screenshot-error-parent-not-exist",
                 &[
-                    ("path", path_str),
+                    ("path", raw_path),
                     ("parent", &parent.display().to_string()),
                 ],
             )
@@ -854,7 +881,7 @@ impl BrowserTool {
             let msg = crate::i18n::get_required_tool_string_with_args(
                 "tool-browser-screenshot-error-path-outside-workspace",
                 &[
-                    ("path", path_str),
+                    ("path", raw_path),
                     ("canonical", &canonical.display().to_string()),
                 ],
             );
@@ -866,7 +893,7 @@ impl BrowserTool {
         let Some(file_name) = full.file_name() else {
             let msg = crate::i18n::get_required_tool_string_with_args(
                 "tool-browser-screenshot-error-missing-filename",
-                &[("path", path_str)],
+                &[("path", raw_path)],
             );
             anyhow::bail!("{msg}");
         };
@@ -876,7 +903,7 @@ impl BrowserTool {
             let msg = crate::i18n::get_required_tool_string_with_args(
                 "tool-browser-screenshot-error-runtime-config-target",
                 &[
-                    ("path", path_str),
+                    ("path", raw_path),
                     ("target", &resolved_target.display().to_string()),
                 ],
             );
@@ -894,49 +921,7 @@ impl BrowserTool {
             anyhow::bail!("{msg}");
         }
 
-        // Replace the raw user path with the canonical target.
-        *path = Some(resolved_target.to_string_lossy().to_string());
-        Ok(())
-    }
-
-    /// Returns `true` if the ComputerUse sidecar endpoint is a remote/private-network address.
-    /// This is used to reject screenshot paths when the sidecar is on a different filesystem.
-    ///
-    /// When `allow_remote_endpoint=false`, only loopback is allowed and considered same-host.
-    /// When `allow_remote_endpoint=true`, loopback is same-host, all others are different-host.
-    ///
-    /// Loopback (127.0.0.1, ::1, localhost) are considered same-host.
-    /// All other addresses (RFC1918 private, public) are considered different-host,
-    /// meaning we cannot safely forward filesystem paths.
-    fn endpoint_is_remote_filesystem(&self) -> bool {
-        // If remote endpoints are disabled, only loopback is allowed
-        // and we consider it same-host (can forward paths)
-        if !self.computer_use.allow_remote_endpoint {
-            // Even if disabled, check if it's loopback
-            match reqwest::Url::parse(&self.computer_use.endpoint) {
-                Ok(parsed) => match parsed.host_str() {
-                    Some(host) => host != "127.0.0.1" && host != "::1" && host != "localhost",
-                    None => true, // Unparseable → different-host
-                },
-                Err(_) => true, // Unparseable → different-host
-            }
-        } else {
-            // Remote endpoints allowed - only loopback is same-host
-            match reqwest::Url::parse(&self.computer_use.endpoint) {
-                Ok(parsed) => match parsed.host_str() {
-                    Some(host) => {
-                        // Loopback addresses are same-host - safe to forward paths
-                        if host == "127.0.0.1" || host == "::1" || host == "localhost" {
-                            return false;
-                        }
-                        // All other addresses are different-host - cannot forward paths
-                        true
-                    }
-                    None => true, // Unparseable → different-host
-                },
-                Err(_) => true, // Unparseable → different-host
-            }
-        }
+        Ok(resolved_target)
     }
 
     fn validate_computer_use_action(
@@ -978,10 +963,11 @@ impl BrowserTool {
         Ok(())
     }
 
-    /// Validates screenshot path for ComputerUse backend before forwarding to sidecar.
-    /// Applies the same workspace policy / runtime-config / symlink guards as
-    /// `validate_screenshot_path`, plus rejects paths when the sidecar is on a
-    /// different filesystem (private-network endpoints).
+    /// Validates the screenshot path for the ComputerUse backend before the
+    /// sidecar round-trip. Applies the same canonical workspace policy /
+    /// runtime-config / symlink guards as the local backends (via
+    /// [`Self::validate_screenshot_target`]) and classifies the raw destination
+    /// into absent / valid string / invalid input.
     async fn validate_screenshot_path_for_computer_use(
         &self,
         action_str: &str,
@@ -1005,86 +991,14 @@ impl BrowserTool {
                 Ok(args)
             }
             Some(Value::String(_)) => {
-                // String: validate against workspace
+                // String: validate against workspace through the one canonical
+                // validator shared with the local backends.
                 let mut args = args;
                 let path_str = path.as_ref().unwrap().as_str().unwrap();
+                let resolved_target = self.validate_screenshot_target(path_str).await?;
 
-                // Reject paths when sidecar is on a remote filesystem
-                // We cannot safely forward filesystem paths to remote sidecars
-                if self.endpoint_is_remote_filesystem() {
-                    let msg = crate::i18n::get_required_tool_string_with_args(
-                        "tool-browser-screenshot-error-remote-sidecar-path",
-                        &[("endpoint", &self.computer_use.endpoint)],
-                    );
-                    anyhow::bail!("{msg}");
-                }
-
-                // String-level reject
-                if !self.security.is_path_allowed(path_str) {
-                    let msg = crate::i18n::get_required_tool_string_with_args(
-                        "tool-browser-screenshot-error-path-not-allowed",
-                        &[("path", path_str)],
-                    );
-                    anyhow::bail!("{msg}");
-                }
-
-                // Resolve and canonicalize
-                let full = self.security.resolve_tool_path(path_str);
-                let parent = full.parent().unwrap_or(&full);
-                let canonical = tokio::fs::canonicalize(parent).await.with_context(|| {
-                    crate::i18n::get_required_tool_string_with_args(
-                        "tool-browser-screenshot-error-parent-not-exist",
-                        &[
-                            ("path", path_str),
-                            ("parent", &parent.display().to_string()),
-                        ],
-                    )
-                })?;
-
-                if !self.security.is_resolved_path_allowed(&canonical) {
-                    let msg = crate::i18n::get_required_tool_string_with_args(
-                        "tool-browser-screenshot-error-path-outside-workspace",
-                        &[
-                            ("path", path_str),
-                            ("canonical", &canonical.display().to_string()),
-                        ],
-                    );
-                    anyhow::bail!("{msg}");
-                }
-
-                // Build target and apply target-level guards
-                let Some(file_name) = full.file_name() else {
-                    let msg = crate::i18n::get_required_tool_string_with_args(
-                        "tool-browser-screenshot-error-missing-filename",
-                        &[("path", path_str)],
-                    );
-                    anyhow::bail!("{msg}");
-                };
-                let resolved_target = canonical.join(file_name);
-
-                if self.security.is_runtime_config_path(&resolved_target) {
-                    let msg = crate::i18n::get_required_tool_string_with_args(
-                        "tool-browser-screenshot-error-runtime-config-target",
-                        &[
-                            ("path", path_str),
-                            ("target", &resolved_target.display().to_string()),
-                        ],
-                    );
-                    anyhow::bail!("{msg}");
-                }
-
-                if let Ok(meta) = std::fs::symlink_metadata(&resolved_target)
-                    && meta.file_type().is_symlink()
-                {
-                    let msg = crate::i18n::get_required_tool_string_with_args(
-                        "tool-browser-screenshot-error-symlink-target",
-                        &[("target", &resolved_target.display().to_string())],
-                    );
-                    anyhow::bail!("{msg}");
-                }
-
-                // Store the validated path for local write after sidecar returns PNG
-                // Do NOT forward the path to the sidecar - it returns PNG bytes
+                // Store the validated path for local write after sidecar returns PNG.
+                // Do NOT forward the path to the sidecar - it returns PNG bytes.
                 if let Some(obj) = args.as_object_mut() {
                     obj.insert(
                         "path".to_string(),
@@ -1196,13 +1110,22 @@ impl BrowserTool {
             .await
             .context("Failed to read computer-use sidecar response body")?;
 
+        // A path-bearing screenshot is the ONLY flow that transfers bytes from
+        // the sidecar to the local filesystem. For that flow the tool must fail
+        // closed: success requires a well-formed ComputerUseResponse with
+        // success != false, a non-empty PNG payload, and a completed local
+        // write. A non-JSON or structurally invalid 2xx body must NOT fall
+        // through to a generic success (which would report success without
+        // creating the requested file).
+        let is_path_bearing_screenshot =
+            action == "screenshot" && validated_path.as_deref().is_some_and(|p| !p.is_empty());
+
         if let Ok(parsed) = serde_json::from_str::<ComputerUseResponse>(&body) {
             if status.is_success() && parsed.success.unwrap_or(true) {
                 // If this was a screenshot with a validated non-empty path, write the PNG locally
-                if action == "screenshot"
-                    && let Some(path_str) = validated_path.as_deref()
-                    && !path_str.is_empty()
-                {
+                if is_path_bearing_screenshot {
+                    let path_str = validated_path.as_deref().unwrap();
+
                     // Extract PNG data from the response
                     let png_data = parsed
                         .data
@@ -1213,10 +1136,22 @@ impl BrowserTool {
                             anyhow::Error::msg("computer-use sidecar did not return PNG data")
                         })?;
 
-                    // Decode and write the screenshot
+                    // Decode and validate the PNG payload: it must decode to a
+                    // non-empty buffer with a PNG signature. Base64-decodable
+                    // arbitrary bytes are NOT a valid screenshot — writing them
+                    // to the `.png` destination would turn the sidecar boundary
+                    // into an arbitrary decoded-byte write.
                     let png_bytes = base64::engine::general_purpose::STANDARD
                         .decode(png_data)
                         .with_context(|| "Failed to decode PNG base64 data")?;
+                    if png_bytes.is_empty() {
+                        anyhow::bail!("computer-use sidecar returned an empty screenshot payload");
+                    }
+                    const PNG_SIGNATURE: &[u8] =
+                        &[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+                    if !png_bytes.starts_with(PNG_SIGNATURE) {
+                        anyhow::bail!("computer-use sidecar returned a non-PNG screenshot payload");
+                    }
 
                     tokio::fs::write(path_str, &png_bytes)
                         .await
@@ -1275,6 +1210,17 @@ impl BrowserTool {
         }
 
         if status.is_success() {
+            if is_path_bearing_screenshot {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(
+                        "computer-use sidecar returned a non-JSON success response for a \
+                         path-bearing screenshot; the requested file was not written"
+                            .into(),
+                    ),
+                });
+            }
             return Ok(ToolResult {
                 success: true,
                 output: body.into(),
@@ -2422,13 +2368,44 @@ fn parse_browser_action(action_str: &str, args: &Value) -> anyhow::Result<Browse
         }
         "get_title" => Ok(BrowserAction::GetTitle),
         "get_url" => Ok(BrowserAction::GetUrl),
-        "screenshot" => Ok(BrowserAction::Screenshot {
-            path: args.get("path").and_then(|v| v.as_str()).map(String::from),
-            full_page: args
-                .get("full_page")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false),
-        }),
+        "screenshot" => {
+            // Parse the raw optional destination once into absent / valid
+            // string / invalid input. A present non-string `path` (number,
+            // object, …) is invalid input and must be rejected up front — the
+            // same contract the ComputerUse path enforces — instead of being
+            // silently coerced to `None` (which would make the local backends
+            // take an inline screenshot while ComputerUse rejects the same
+            // input). An empty string means absent (inline screenshot), also
+            // matching ComputerUse.
+            match args.get("path") {
+                None | Some(serde_json::Value::Null) => Ok(BrowserAction::Screenshot {
+                    path: None,
+                    full_page: args
+                        .get("full_page")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                }),
+                Some(serde_json::Value::String(s)) if s.is_empty() => {
+                    Ok(BrowserAction::Screenshot {
+                        path: None,
+                        full_page: args
+                            .get("full_page")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false),
+                    })
+                }
+                Some(serde_json::Value::String(s)) => Ok(BrowserAction::Screenshot {
+                    path: Some(s.clone()),
+                    full_page: args
+                        .get("full_page")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                }),
+                Some(_) => Err(anyhow::Error::msg(
+                    "screenshot 'path' must be a string or absent",
+                )),
+            }
+        }
         "wait" => Ok(BrowserAction::Wait {
             selector: args
                 .get("selector")
@@ -3529,8 +3506,9 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("not in the workspace allowlist") || err.contains("../etc/passwd"),
-            "traversal path must be rejected at execute_action before backend dispatch, got: {err}"
+            err.contains("not in the workspace allowlist"),
+            "traversal path must be rejected by the screenshot-path validator before backend \
+             dispatch (the specific allowlist rejection, not any error echoing the path), got: {err}"
         );
 
         // The mut-borrow contract still holds for the second local backend.
@@ -3544,8 +3522,51 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("not in the workspace allowlist") || err.contains("../etc/passwd"),
+            err.contains("not in the workspace allowlist"),
             "traversal path must be rejected at execute_action for rust_native too, got: {err}"
+        );
+    }
+
+    /// `Tool::execute` raw-input boundary: a present non-string `path` must be
+    /// rejected up front — the same contract the ComputerUse path enforces —
+    /// rather than silently coerced to `None` (which would make the local
+    /// backends take an inline screenshot while ComputerUse rejects the same
+    /// input).
+    #[tokio::test]
+    async fn execute_rejects_present_non_string_screenshot_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        tokio::fs::create_dir_all(&ws).await.unwrap();
+        let tool = screenshot_tool_with_workspace(&ws);
+
+        // Local backend path (default). The non-string path must produce a
+        // rejection ToolResult, never a silent inline screenshot.
+        let result = tool
+            .execute(json!({
+                "action": "screenshot",
+                "path": 123,
+            }))
+            .await
+            .expect("execute must not panic on a non-string path");
+        assert!(
+            !result.success,
+            "a present non-string path must be rejected, not coerced to None; got: {:?}",
+            result.output
+        );
+
+        // ComputerUse path: same contract, non-string path rejected.
+        let tool = browser_tool_with_computer_use(test_computer_use_config());
+        let result = tool
+            .execute(json!({
+                "action": "screenshot",
+                "path": json!({"nested": "object"}),
+            }))
+            .await
+            .expect("execute must not panic on a non-string path");
+        assert!(
+            !result.success,
+            "computer_use must reject a present non-string path too; got: {:?}",
+            result.output
         );
     }
 
@@ -3856,73 +3877,180 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn computer_use_dispatch_rejects_remote_endpoint_with_path() {
-        use std::io::Read;
-        use std::net::TcpListener;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::time::Duration;
+    async fn computer_use_dispatch_does_not_forward_path_and_writes_local_target() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        // `127.0.0.2` is a loopback alias: `is_private_or_local_host` treats it
-        // as local (so the URL policy accepts plain http and the TCP reachability
-        // probe can connect), yet its host string is not one of the literal
-        // loopback names `endpoint_is_remote_filesystem` treats as same-host.
-        // The sidecar is therefore classified as a different filesystem and any
-        // screenshot path is rejected before dispatch.
-        let canary = TcpListener::bind("127.0.0.2:0").unwrap();
-        let port = canary.local_addr().unwrap().port();
+        // Positive remote-sidecar contract: the validated destination is NOT
+        // transmitted to the sidecar (the path is removed before the request),
+        // and the returned PNG is written only to the validated local target.
+        // A non-loopback sidecar address exercises the same flow — the old
+        // filesystem-sharing rejection (endpoint_is_remote_filesystem) is gone.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        tokio::fs::create_dir_all(&ws).await.unwrap();
 
-        // Count every inbound connection: exactly the pre-dispatch reachability
-        // probe (one) in the fixed behavior, plus any sidecar action POST in a
-        // regression where the guard was removed.
-        let connections = Arc::new(AtomicUsize::new(0));
-        let probe_connections = Arc::clone(&connections);
-        let canary_handle = std::thread::spawn(move || {
-            canary.set_nonblocking(true).unwrap();
-            let mut deadline = std::time::Instant::now() + Duration::from_secs(2);
-            loop {
-                match canary.accept() {
-                    Ok((mut stream, _)) => {
-                        probe_connections.fetch_add(1, Ordering::SeqCst);
-                        let mut buf = [0u8; 8192];
-                        let _ = stream.read(&mut buf);
-                        deadline = std::time::Instant::now() + Duration::from_secs(2);
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        if std::time::Instant::now() >= deadline {
-                            break;
-                        }
-                        std::thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
+        let server = MockServer::start().await;
+        // The sidecar must NOT receive a `path` field in the screenshot params.
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(
+                serde_json::json!({"action": "screenshot"}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "success": true,
+                    "data": { "png_base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==" }
+                })),
+            )
+            .mount(&server)
+            .await;
 
         let mut config = test_computer_use_config();
-        config.endpoint = format!("http://127.0.0.2:{port}");
+        config.endpoint = server.uri();
 
-        let tool = browser_tool_with_computer_use(config);
-        let args = json!({
-            "action": "screenshot",
-            "path": "ws/screenshot.png"
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: ws.clone(),
+            allowed_roots: vec![ws.clone()],
+            ..SecurityPolicy::default()
         });
+        let tool = BrowserTool::new_with_backend(
+            security,
+            vec!["*".into()],
+            None,
+            "computer_use".into(),
+            None,
+            true,
+            "http://127.0.0.1:9515".into(),
+            None,
+            config,
+            Vec::new(),
+        )
+        .unwrap();
 
-        // Tool errors return Ok(ToolResult{success=false}) not Err.
-        let result = tool.execute(args).await.unwrap();
-        assert!(!result.success, "Expected remote-sidecar rejection");
-        let error_msg = result.error.unwrap_or_default();
+        let result = tool
+            .execute(json!({
+                "action": "screenshot",
+                "path": "screenshot.png"
+            }))
+            .await
+            .expect("execute must succeed");
         assert!(
-            error_msg.contains("remote sidecar"),
-            "Expected remote-sidecar path rejection, got: {}",
-            error_msg
+            result.success,
+            "a valid screenshot from the sidecar must write the validated local target: {:?}",
+            result.error
         );
 
-        let _ = canary_handle.join();
-        assert_eq!(
-            connections.load(Ordering::SeqCst),
-            1,
-            "expected exactly one reachability probe and zero sidecar action requests"
+        // The local target was written with the PNG bytes.
+        let written = tokio::fs::read(ws.join("screenshot.png"))
+            .await
+            .expect("the validated local target must be written");
+        assert!(
+            written.starts_with(&[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']),
+            "the written bytes must be a PNG, not arbitrary decoded data"
         );
+
+        // The destination was not transmitted: every sidecar request body must
+        // be free of a `path` field.
+        let requests = server.received_requests().await.expect("infallible");
+        for req in &requests {
+            let body: serde_json::Value = req.body_json().expect("request body is JSON");
+            assert!(
+                body.get("params").and_then(|p| p.get("path")).is_none(),
+                "the validated destination must NOT be forwarded to the sidecar: {body}"
+            );
+        }
+    }
+
+    /// Fail-closed contract for a path-bearing screenshot: the tool must NOT
+    /// report success (or write the destination) unless the sidecar returned a
+    /// well-formed ComputerUseResponse with success != false and a valid
+    /// non-empty PNG payload. A malformed or unsuccessful 2xx body must fail
+    /// and leave the destination unwritten.
+    #[tokio::test]
+    async fn computer_use_dispatch_fails_closed_on_malformed_screenshot_response() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let not_a_png_b64 = base64::engine::general_purpose::STANDARD.encode(b"not a png");
+        let cases: Vec<(&str, serde_json::Value)> = vec![
+            ("non-json-2xx", json!("this is not json")),
+            ("success-false", json!({"success": false, "error": "boom"})),
+            (
+                "empty-base64",
+                json!({"success": true, "data": {"png_base64": ""}}),
+            ),
+            (
+                "non-png-bytes",
+                json!({"success": true, "data": {"png_base64": not_a_png_b64}}),
+            ),
+        ];
+
+        for (name, response_body) in cases {
+            let server = MockServer::start().await;
+            let tmp = tempfile::TempDir::new().unwrap();
+            let ws = tmp.path().join("ws");
+            tokio::fs::create_dir_all(&ws).await.unwrap();
+
+            Mock::given(method("GET"))
+                .and(path("/"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+                .mount(&server)
+                .await;
+
+            let security = Arc::new(SecurityPolicy {
+                autonomy: AutonomyLevel::Full,
+                workspace_dir: ws.clone(),
+                allowed_roots: vec![ws.clone()],
+                ..SecurityPolicy::default()
+            });
+            let mut config = test_computer_use_config();
+            config.endpoint = server.uri();
+            let tool = BrowserTool::new_with_backend(
+                security,
+                vec!["*".into()],
+                None,
+                "computer_use".into(),
+                None,
+                true,
+                "http://127.0.0.1:9515".into(),
+                None,
+                config,
+                Vec::new(),
+            )
+            .unwrap();
+
+            let target = ws.join("shot.png");
+            let result = tool
+                .execute(json!({
+                    "action": "screenshot",
+                    "path": "shot.png"
+                }))
+                .await;
+
+            // A malformed/unsuccessful sidecar response must fail the tool:
+            // either as an Ok(success=false) ToolResult or as an Err — never a
+            // success. And the destination must remain unwritten.
+            if let Ok(r) = result {
+                assert!(
+                    !r.success,
+                    "{name}: must fail closed, got success with output {:?}",
+                    r.output
+                );
+            }
+            assert!(
+                !tokio::fs::try_exists(&target)
+                    .await
+                    .expect("filesystem must be readable"),
+                "{name}: the destination must NOT be written on a failed screenshot"
+            );
+        }
     }
 
     #[tokio::test]
@@ -4035,34 +4163,5 @@ mod tests {
             "Expected success, got error: {:?}",
             result.error
         );
-    }
-
-    #[tokio::test]
-    async fn endpoint_is_remote_filesystem_loopback_is_false() {
-        let mut config = test_computer_use_config();
-        config.endpoint = "http://127.0.0.1:8787".to_string();
-        config.allow_remote_endpoint = true;
-        let tool = browser_tool_with_computer_use(config);
-        assert!(!tool.endpoint_is_remote_filesystem());
-    }
-
-    #[tokio::test]
-    async fn endpoint_is_remote_filesystem_private_network_is_true() {
-        let mut config = test_computer_use_config();
-        config.endpoint = "http://192.168.1.100:8787".to_string();
-        config.allow_remote_endpoint = true;
-        let tool = browser_tool_with_computer_use(config);
-        assert!(tool.endpoint_is_remote_filesystem());
-    }
-
-    #[tokio::test]
-    async fn endpoint_is_remote_filesystem_remote_endpoint_disabled_is_false() {
-        let mut config = test_computer_use_config();
-        // When allow_remote_endpoint=false, only loopback is allowed
-        // and considered same-host (can forward paths)
-        config.endpoint = "http://127.0.0.1:8787".to_string();
-        config.allow_remote_endpoint = false;
-        let tool = browser_tool_with_computer_use(config);
-        assert!(!tool.endpoint_is_remote_filesystem());
     }
 }
