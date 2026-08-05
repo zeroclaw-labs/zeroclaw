@@ -1242,6 +1242,78 @@ vision_model_provider = "grok"
     }
 
     #[test]
+    fn v2_globals_create_missing_default_alias_beside_non_default_alias() {
+        // No `default_provider`, only a non-default alias (`openai.codex` from
+        // `openai-codex`), and global `[providers]` values. The globals fold
+        // creates the missing `openai.default` alias; that fold must be
+        // registered as the slot's producer so the bare `openai` vision
+        // reference rewrites to it and keeps the folded credentials.
+        let raw = r#"
+schema_version = 2
+
+[providers]
+api_key = "global-test-key"
+default_model = "vision-model"
+
+[providers.models.openai-codex]
+
+[multimodal]
+vision_model_provider = "openai"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("openai.default"),
+            "the globals-created default alias must resolve the bare reference"
+        );
+        let alias = cfg
+            .providers
+            .models
+            .find("openai", "default")
+            .expect("globals must fold into the created openai.default alias");
+        assert_eq!(alias.api_key.as_deref(), Some("global-test-key"));
+        assert_eq!(alias.model.as_deref(), Some("vision-model"));
+    }
+
+    #[test]
+    fn v2_globals_overlay_existing_default_alias_keeps_single_producer() {
+        // `default_provider` absent, global values folded onto an existing
+        // `openai.default` alias. The overlay must not register a second
+        // producer, or the slot would look ambiguous and the bare reference
+        // would stay unrewritten.
+        let raw = r#"
+schema_version = 2
+
+[providers]
+api_key = "global-test-key"
+default_model = "vision-model"
+
+[providers.models.openai]
+api_key = "sk-openai-test"
+model = "m"
+
+[multimodal]
+vision_model_provider = "openai"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("openai.default"),
+            "overlaying globals must not make the existing default slot ambiguous"
+        );
+        let alias = cfg
+            .providers
+            .models
+            .find("openai", "default")
+            .expect("openai.default must exist");
+        assert_eq!(
+            alias.api_key.as_deref(),
+            Some("sk-openai-test"),
+            "per-provider api_key must win over the folded global value"
+        );
+    }
+
+    #[test]
     fn v2_legacy_non_default_alias_vision_reference_migrates() {
         // `openai-codex` folds into openai as the codex alias; the reference
         // must rewrite to the non-default alias.
