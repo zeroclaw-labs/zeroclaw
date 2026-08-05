@@ -52,7 +52,7 @@ returned.
 | `DELETE` | `/api/config/prop?path=...` | Reset one field to its default. Secrets respond with `{path, populated: false}`. |
 | `OPTIONS` | `/api/config/prop?path=...` | Per-field schema fragment. |
 | `GET` | `/api/config/list?prefix=...` | Enumerate every reachable path with type and category. Secret entries carry `{path, populated, is_secret: true}` and no value. |
-| `POST` | `/api/config/init?section=...` | Instantiate `None` nested sections with defaults. Mirrors `zeroclaw config init`. |
+| `POST` | `/api/config/init?section=...` | Instantiate `None` nested sections with defaults. Dynamic-map aliases are not created here; use `POST /api/config/map-key`. |
 | `POST` | `/api/config/migrate` | Apply on-disk schema migration in place. Mirrors `zeroclaw config migrate`. |
 
 ## Atomic batch writes: JSON Patch

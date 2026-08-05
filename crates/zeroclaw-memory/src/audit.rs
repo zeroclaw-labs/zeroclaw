@@ -63,6 +63,7 @@ fn ensure_owner_only_file(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn sqlite_sidecar_path(db_path: &Path, suffix: &str) -> std::path::PathBuf {
     let mut path = db_path.as_os_str().to_os_string();
     path.push(suffix);

@@ -9,6 +9,8 @@ LINKS_FILE="$(mktemp)"
 HTTP_LINKS_FILE="$(mktemp)"
 trap 'rm -f "$LINKS_FILE" "$HTTP_LINKS_FILE"' EXIT
 
+python3 ./scripts/ci/collect_changed_links_test.py
+
 python3 ./scripts/ci/collect_changed_links.py \
     --base "$BASE_SHA" \
     --docs-files "$DOCS_FILES_RAW" \

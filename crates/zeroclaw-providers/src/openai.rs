@@ -1,6 +1,6 @@
 use crate::openai_codex::{
     ResponsesStreamApiError, ResponsesStreamState, ResponsesToolSpec, append_utf8_stream_chunk,
-    build_responses_input, convert_tools, first_nonempty, process_sse_chunk,
+    build_responses_input, convert_tools, first_nonempty, parse_responses_usage, process_sse_chunk,
 };
 use crate::stream_guard::AbortOnDrop;
 use crate::traits::{
@@ -22,12 +22,7 @@ pub(crate) const BASE_URL: &str = "https://api.openai.com/v1";
 /// Default endpoint for the OpenAI Responses API.
 const RESPONSES_URL: &str = "https://api.openai.com/v1/responses";
 
-/// Max wait for the next streaming body read before the connection is treated
-/// as stalled. Streaming clients omit reqwest's overall `.timeout()` (it kills
-/// long-running responses mid-stream), so without a per-read bound a connection
-/// that goes silent after the headers park `bytes_stream().next().await` forever
-/// and the turn hangs on "working". `read_timeout` caps the gap between reads and
-/// converts a silent stall into a retryable stream error.
+/// Maximum silence between body reads for OpenAI Responses SSE streams.
 const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 pub struct OpenAiModelProvider {
@@ -759,6 +754,8 @@ struct ResponsesApiBody {
     output: Vec<serde_json::Value>,
     #[serde(default)]
     output_text: Option<String>,
+    #[serde(default)]
+    usage: Option<serde_json::Value>,
 }
 
 fn extract_responses_api_text(body: &ResponsesApiBody) -> Option<String> {
@@ -850,7 +847,7 @@ pub(crate) async fn run_responses_sse(
     let mut pending_utf8: Vec<u8> = Vec::new();
     let mut chunk_buf = String::new();
 
-    loop {
+    'stream: loop {
         match byte_stream.next().await {
             Some(Ok(bytes)) => {
                 if let Err(err) =
@@ -893,6 +890,9 @@ pub(crate) async fn run_responses_sse(
                             return;
                         }
                     }
+                    if state.saw_completion {
+                        break 'stream;
+                    }
                 }
                 Err(err) => {
                     if err.downcast_ref::<ResponsesStreamApiError>().is_some() {
@@ -906,7 +906,8 @@ pub(crate) async fn run_responses_sse(
         }
     }
 
-    if !chunk_buf.trim().is_empty()
+    if !state.saw_completion
+        && !chunk_buf.trim().is_empty()
         && let Ok(events) = process_sse_chunk(&chunk_buf, &mut state)
     {
         for event in events {
@@ -1266,7 +1267,7 @@ impl ModelProvider for OpenAiResponsesModelProvider {
         Ok(ProviderChatResponse {
             text: extract_responses_api_text(&body),
             tool_calls: extract_responses_api_tool_calls(&body),
-            usage: None,
+            usage: parse_responses_usage(body.usage.as_ref()),
             reasoning_content: None,
         })
     }
@@ -1379,6 +1380,110 @@ impl ::zeroclaw_api::attribution::Attributable for OpenAiResponsesModelProvider 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn responses_completed_ignores_trailing_events_without_eof() {
+        use axum::{Router, response::IntoResponse, routing::post};
+
+        let app = Router::new().route(
+            "/responses",
+            post(|| async {
+                let first = futures_util::stream::once(async {
+                    Ok::<_, std::convert::Infallible>(axum::body::Bytes::from_static(
+                        b"data: {\"type\":\"response.completed\",\"response\":{\"output\":[],\"output_text\":\"fallback\"}}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"after-terminal\"}\n\n",
+                    ))
+                });
+                let open = futures_util::stream::pending::<
+                    Result<axum::body::Bytes, std::convert::Infallible>,
+                >();
+                axum::body::Body::from_stream(first.chain(open)).into_response()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind Responses SSE test server");
+        let addr = listener.local_addr().expect("Responses SSE test address");
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve Responses SSE test");
+        });
+        let request = reqwest::Client::new().post(format!("http://{addr}/responses"));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(16);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            run_responses_sse(request, &tx, false),
+        )
+        .await
+        .expect("response.completed must finish without waiting for EOF");
+        drop(tx);
+        server.abort();
+
+        let mut text = None;
+        let mut saw_final = false;
+        while let Some(event) = rx.recv().await {
+            match event {
+                Ok(StreamEvent::TextDelta(chunk)) => text = Some(chunk.delta),
+                Ok(StreamEvent::Final) => saw_final = true,
+                _ => {}
+            }
+        }
+        assert_eq!(text.as_deref(), Some("fallback"));
+        assert!(saw_final, "response.completed must emit Final");
+    }
+
+    #[tokio::test]
+    async fn responses_chat_propagates_usage() {
+        use axum::{Json, Router, routing::post};
+        use tokio::net::TcpListener;
+
+        let app = Router::new().route(
+            "/responses",
+            post(|| async {
+                Json(serde_json::json!({
+                    "output_text": "ok",
+                    "output": [],
+                    "usage": {
+                        "input_tokens": 120,
+                        "input_tokens_details": {"cached_tokens": 45},
+                        "output_tokens": 30
+                    }
+                }))
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_handle = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let provider = OpenAiResponsesModelProvider::builder("test")
+            .api_url(&format!("http://{addr}"))
+            .credential(Some("test-key"))
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+
+        let response = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "gpt-4o-mini",
+                None,
+            )
+            .await
+            .expect("chat should succeed");
+
+        let usage = response
+            .usage
+            .expect("provider-reported usage should propagate");
+        assert_eq!(usage.input_tokens, Some(120));
+        assert_eq!(usage.cached_input_tokens, Some(45));
+        assert_eq!(usage.output_tokens, Some(30));
+        server_handle.abort();
+    }
 
     #[test]
     fn creates_with_key() {

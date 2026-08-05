@@ -431,6 +431,12 @@ pub struct ModelInfo {
     pub id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pricing: Option<ModelPricing>,
+    /// Maximum input window in tokens, as reported by the provider catalog.
+    /// `None` when the catalog does not publish one — callers must treat that
+    /// as "unknown" rather than substituting a default, so an operator can be
+    /// told the window is unset instead of silently getting a stub value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<usize>,
 }
 
 #[async_trait]
@@ -527,7 +533,11 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
             .list_models()
             .await?
             .into_iter()
-            .map(|id| ModelInfo { id, pricing: None })
+            .map(|id| ModelInfo {
+                id,
+                pricing: None,
+                context_window: None,
+            })
             .collect())
     }
 

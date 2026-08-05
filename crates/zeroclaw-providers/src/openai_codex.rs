@@ -6,7 +6,7 @@ use crate::stream_guard::AbortOnDrop;
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
     ModelProvider, ProviderCapabilities, StreamChunk, StreamError, StreamEvent, StreamOptions,
-    StreamResult, ToolCall as ProviderToolCall,
+    StreamResult, TokenUsage, ToolCall as ProviderToolCall,
 };
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -86,6 +86,8 @@ struct ResponsesResponse {
     output: Vec<Value>,
     #[serde(default)]
     output_text: Option<String>,
+    #[serde(default)]
+    usage: Option<Value>,
 }
 
 #[derive(Debug, Default)]
@@ -98,6 +100,7 @@ pub(crate) struct ResponsesStreamState {
     pub(crate) emitted_tool_call_ids: HashSet<String>,
     pub(crate) collected_tool_calls: Vec<ProviderToolCall>,
     pub(crate) output_items: Vec<Value>,
+    pub(crate) usage: Option<TokenUsage>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -113,6 +116,7 @@ pub(crate) struct ResponsesTurnResult {
     pub(crate) text: Option<String>,
     pub(crate) tool_calls: Vec<ProviderToolCall>,
     pub(crate) reasoning_content: Option<String>,
+    pub(crate) usage: Option<TokenUsage>,
 }
 
 impl OpenAiCodexModelProvider {
@@ -592,7 +596,29 @@ fn responses_turn_from_response(response: &ResponsesResponse) -> ResponsesTurnRe
         text: extract_responses_text(response),
         tool_calls,
         reasoning_content,
+        usage: parse_responses_usage(response.usage.as_ref()),
     }
+}
+
+/// Parses usage from a Responses response without rejecting an otherwise valid
+/// response when optional usage fields are absent or malformed.
+pub(crate) fn parse_responses_usage(usage: Option<&Value>) -> Option<TokenUsage> {
+    let usage = usage?.as_object()?;
+    let input_tokens = usage.get("input_tokens").and_then(Value::as_u64);
+    let output_tokens = usage.get("output_tokens").and_then(Value::as_u64);
+    let cached_input_tokens = usage
+        .get("input_tokens_details")
+        .and_then(Value::as_object)
+        .and_then(|details| details.get("cached_tokens"))
+        .and_then(Value::as_u64);
+
+    (input_tokens.is_some() || output_tokens.is_some() || cached_input_tokens.is_some()).then_some(
+        TokenUsage {
+            input_tokens,
+            output_tokens,
+            cached_input_tokens,
+        },
+    )
 }
 
 fn record_responses_output_item(state: &mut ResponsesStreamState, item: Value) {
@@ -829,8 +855,9 @@ pub(crate) fn process_responses_stream_event(
                 }
             }
         }
-        Some("response.completed" | "response.done") => {
+        Some(event_type @ ("response.completed" | "response.done")) => {
             state.saw_completion = true;
+            let is_completed = event_type == "response.completed";
             if let Some(response) = event
                 .get("response")
                 .and_then(|value| serde_json::from_value::<ResponsesResponse>(value.clone()).ok())
@@ -843,6 +870,11 @@ pub(crate) fn process_responses_stream_event(
                     if let Some(tool_call) = emit_tool_call(state, tool_call) {
                         emitted.push(StreamEvent::ToolCall(tool_call));
                     }
+                }
+                if is_completed && let Some(usage) = parse_responses_usage(response.usage.as_ref())
+                {
+                    state.usage = Some(usage.clone());
+                    emitted.push(StreamEvent::Usage(usage));
                 }
             }
         }
@@ -935,6 +967,7 @@ fn parse_sse_turn(body: &str) -> anyhow::Result<ResponsesTurnResult> {
             !state.collected_tool_calls.is_empty(),
         ),
         tool_calls: state.collected_tool_calls,
+        usage: state.usage,
     })
 }
 
@@ -1507,7 +1540,7 @@ impl ModelProvider for OpenAiCodexModelProvider {
         Ok(ProviderChatResponse {
             text: response.text,
             tool_calls: response.tool_calls,
-            usage: None,
+            usage: response.usage,
             reasoning_content: response.reasoning_content,
         })
     }
@@ -1722,6 +1755,7 @@ mod tests {
         let response = ResponsesResponse {
             output: vec![],
             output_text: Some("hello".into()),
+            usage: None,
         };
         assert_eq!(extract_responses_text(&response).as_deref(), Some("hello"));
     }
@@ -1740,8 +1774,135 @@ mod tests {
                 ]
             })],
             output_text: None,
+            usage: None,
         };
         assert_eq!(extract_responses_text(&response).as_deref(), Some("nested"));
+    }
+
+    #[test]
+    fn parses_responses_usage_without_synthesizing_missing_fields() {
+        let usage = parse_responses_usage(Some(&serde_json::json!({
+            "input_tokens": 120,
+            "input_tokens_details": {"cached_tokens": 45},
+            "output_tokens": 30
+        })))
+        .expect("valid usage should be reported");
+        assert_eq!(usage.input_tokens, Some(120));
+        assert_eq!(usage.cached_input_tokens, Some(45));
+        assert_eq!(usage.output_tokens, Some(30));
+
+        let partial = parse_responses_usage(Some(&serde_json::json!({
+            "input_tokens": "not-a-number",
+            "output_tokens": 7,
+            "input_tokens_details": {"cached_tokens": null}
+        })))
+        .expect("a valid optional field should survive malformed siblings");
+        assert_eq!(partial.input_tokens, None);
+        assert_eq!(partial.cached_input_tokens, None);
+        assert_eq!(partial.output_tokens, Some(7));
+        assert!(parse_responses_usage(None).is_none());
+        assert!(parse_responses_usage(Some(&serde_json::json!({}))).is_none());
+    }
+
+    #[test]
+    fn completed_stream_event_emits_authoritative_usage() {
+        let mut state = ResponsesStreamState::default();
+        let events = process_sse_chunk(
+            "data: {\"type\":\"response.completed\",\"response\":{\"output_text\":\"done\",\"usage\":{\"input_tokens\":120,\"input_tokens_details\":{\"cached_tokens\":45},\"output_tokens\":30}}}",
+            &mut state,
+        )
+        .expect("completed event should parse");
+
+        assert!(matches!(
+            events.as_slice(),
+            [StreamEvent::Usage(TokenUsage {
+                input_tokens: Some(120),
+                cached_input_tokens: Some(45),
+                output_tokens: Some(30),
+            })]
+        ));
+        assert_eq!(
+            state.usage.as_ref().and_then(|usage| usage.input_tokens),
+            Some(120)
+        );
+    }
+
+    #[test]
+    fn completed_stream_event_omits_usage_when_provider_does_not_report_it() {
+        let mut state = ResponsesStreamState::default();
+        let events = process_sse_chunk(
+            "data: {\"type\":\"response.completed\",\"response\":{\"output_text\":\"done\"}}",
+            &mut state,
+        )
+        .expect("completed event should parse");
+
+        assert!(events.is_empty());
+        assert!(state.usage.is_none());
+    }
+
+    #[test]
+    fn completed_stream_event_orders_fallback_tool_call_before_usage() {
+        let mut state = ResponsesStreamState::default();
+        let events = process_sse_chunk(
+            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"echo\",\"arguments\":\"{}\"}],\"usage\":{\"input_tokens\":2,\"output_tokens\":1}}}",
+            &mut state,
+        )
+        .expect("completed event should parse");
+
+        assert!(matches!(
+            events.as_slice(),
+            [StreamEvent::ToolCall(_), StreamEvent::Usage(_)]
+        ));
+    }
+
+    #[test]
+    fn done_alias_does_not_emit_usage() {
+        let mut state = ResponsesStreamState::default();
+        let events = process_sse_chunk(
+            "data: {\"type\":\"response.done\",\"response\":{\"output_text\":\"done\",\"usage\":{\"input_tokens\":2,\"output_tokens\":1}}}",
+            &mut state,
+        )
+        .expect("done alias should parse");
+
+        assert!(events.is_empty());
+        assert!(state.usage.is_none());
+    }
+
+    #[tokio::test]
+    async fn chat_propagates_non_streaming_responses_usage() {
+        let (provider, _captured, server_handle, _temp_dir) =
+            mock_codex_provider(vec![MockCodexReply::Json(serde_json::json!({
+                "output_text": "ok",
+                "output": [],
+                "usage": {
+                    "input_tokens": 120,
+                    "input_tokens_details": {"cached_tokens": 45},
+                    "output_tokens": 30
+                }
+            }))])
+            .await;
+        let messages = vec![ChatMessage::user("hello")];
+
+        let response = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "gpt-5-codex",
+                None,
+            )
+            .await
+            .expect("chat should succeed");
+
+        let usage = response
+            .usage
+            .expect("provider-reported usage should propagate");
+        assert_eq!(usage.input_tokens, Some(120));
+        assert_eq!(usage.cached_input_tokens, Some(45));
+        assert_eq!(usage.output_tokens, Some(30));
+        server_handle.abort();
     }
 
     #[test]

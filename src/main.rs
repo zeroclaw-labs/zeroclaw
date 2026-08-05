@@ -37,7 +37,7 @@
 
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
-use dialoguer::{Password, Select};
+use dialoguer::Select;
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 use std::io::{BufRead, ErrorKind, Read, Write};
@@ -139,6 +139,32 @@ fn ta(key: &str, args: &[(&str, &str)], fallback: &str) -> String {
     }
 }
 
+/// Interactive secret prompt with pre-submit feedback.
+///
+/// The value stays hidden, but the prompt shows a bounded mask once the input
+/// buffer becomes non-empty.
+#[cfg(feature = "agent-runtime")]
+fn secret_prompt(prompt_text: &str, allow_empty: bool) -> Result<String> {
+    use std::io::IsTerminal;
+
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        bail!(ta(
+            "cli-secret-needs-tty",
+            &[],
+            "Secret input requires a terminal on stdin and stderr."
+        ));
+    }
+
+    let value = cli_input::SecretInput::new()
+        .with_prompt(prompt_text)
+        .interact()?;
+    if allow_empty || !value.trim().is_empty() {
+        Ok(value)
+    } else {
+        bail!(ta("cli-secret-empty", &[], "Value cannot be empty."))
+    }
+}
+
 #[cfg(feature = "agent-runtime")]
 fn qta(key: &str, args: &[(&str, &str)]) -> String {
     zeroclaw_runtime::i18n::get_required_cli_string_with_args(key, args)
@@ -183,18 +209,25 @@ fn json_value_to_setprop_string(
     value: &serde_json::Value,
     config: &Config,
     path: &str,
+    op_index: usize,
+    json: bool,
 ) -> Result<String> {
     let kind = config_patch_prop_kind(config, path);
-    zeroclaw_config::typed_value::coerce_for_set_prop(value, kind).map_err(|e| {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(::serde_json::json!({"path": path, "error": e.message.clone()})),
-            "config patch coercion rejected JSON value"
-        );
-        anyhow::Error::msg(e.message)
-    })
+    match zeroclaw_config::typed_value::coerce_for_set_prop(value, kind) {
+        Ok(value_str) => Ok(value_str),
+        Err(err) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"path": path, "error": err.message.clone()})),
+                "config patch coercion rejected JSON value"
+            );
+            let err = err.with_path(path).with_op_index(op_index);
+            let human = err.message.clone();
+            config_patch_fail_json_or_human(json, err, human)
+        }
+    }
 }
 
 fn config_patch_map_prop_error(err: anyhow::Error, path: &str, op_index: usize) -> ConfigApiError {
@@ -951,6 +984,7 @@ Examples:
   zeroclaw config set channels.matrix.access-token      # secret: masked input
   zeroclaw config set channels.matrix.stream-mode       # enum: interactive select
   zeroclaw config init channels.matrix                  # init section with defaults
+  zeroclaw config init risk_profiles.strict             # create a new dynamic-map alias
   zeroclaw config schema                                # print JSON Schema to stdout
   zeroclaw config schema > schema.json
 
@@ -1235,7 +1269,7 @@ async fn run_quickstart_cli(
     api_key: Option<String>,
     agent: Option<String>,
 ) -> anyhow::Result<()> {
-    use dialoguer::{Confirm, Editor, FuzzySelect, Input, Password};
+    use dialoguer::{Confirm, Editor, FuzzySelect, Input};
     use zeroclaw_config::presets::{
         AgentIdentity, BuilderSubmission, ChannelQuickStart, MemoryChoice, ModelProviderChoice,
         RISK_PRESETS, SelectorChoice,
@@ -2456,17 +2490,68 @@ fn map_key_for_prop_path<'a>(section_path: &str, prop_path: &'a str) -> Option<&
     Some(key)
 }
 
-fn ensure_map_key_for_prop_path(config: &mut Config, prop_path: &str) -> Result<bool> {
-    let Some((section_path, key)) = Config::map_key_sections()
+/// Split `section_arg` into the map key under `section_path` with NOTHING after
+/// it, the `config init <section>.<alias>` shape.
+fn map_key_for_section_arg<'a>(section_path: &str, section_arg: &'a str) -> Option<&'a str> {
+    let tail = section_arg.strip_prefix(section_path)?.strip_prefix('.')?;
+    (!tail.is_empty() && !tail.contains('.')).then_some(tail)
+}
+
+/// Longest alias-materializable section whose path prefixes `path`, plus the
+/// alias `split` extracts. `#[resource_key]` sections are excluded: their keys
+/// are values from another domain (model id, voice, tool name) and may
+/// themselves contain dots, so a dot split would yield a bogus alias.
+fn alias_target_for_path<'a>(
+    path: &'a str,
+    split: impl Fn(&str, &'a str) -> Option<&'a str>,
+) -> Option<(&'static str, &'a str)> {
+    Config::map_key_sections()
         .into_iter()
         .filter(|section| section.kind == zeroclaw_config::traits::MapKeyKind::Map)
         .filter(|section| !section.resource_key)
-        .filter_map(|section| {
-            let key = map_key_for_prop_path(section.path, prop_path)?;
-            Some((section.path, key))
-        })
+        .filter_map(|section| split(section.path, path).map(|key| (section.path, key)))
         .max_by_key(|(section_path, _)| section_path.len())
+}
+
+/// `config init <section>.<alias>`: materialize a dynamic-map alias with schema
+/// defaults. Returns the created `"<section>.<alias>"` path, or `None` when
+/// `section_arg` is not a `<map-section>.<new-alias>` shape (the alias already
+/// exists, the section is resource-keyed or a natural-key list, or the argument
+/// is a plain nested prefix that `init_defaults` already handles). A reserved
+/// alias is an error, not a silent no-op.
+fn init_map_alias(config: &mut Config, section_arg: &str) -> Result<Option<String>> {
+    let Some((section_path, alias)) = alias_target_for_path(section_arg, map_key_for_section_arg)
     else {
+        return Ok(None);
+    };
+    match zeroclaw_config::alias_refs::create_map_key_checked(config, section_path, alias) {
+        Ok(true) => Ok(Some(format!("{section_path}.{alias}"))),
+        Ok(false) => Ok(None),
+        Err(e) => Err(anyhow::Error::msg(e.to_string())),
+    }
+}
+
+/// Dirty every generated leaf under a newly created map alias so required
+/// default-valued fields survive the incremental writer's empty-leaf pruning.
+fn mark_new_map_alias_dirty(config: &mut Config, alias_path: &str) {
+    let prefix = format!("{alias_path}.");
+    let leaf_paths: Vec<String> = config
+        .prop_fields()
+        .into_iter()
+        .filter_map(|field| field.name.starts_with(&prefix).then_some(field.name))
+        .collect();
+
+    if leaf_paths.is_empty() {
+        config.mark_dirty(alias_path);
+    } else {
+        for path in leaf_paths {
+            config.mark_dirty(&path);
+        }
+    }
+}
+
+fn ensure_map_key_for_prop_path(config: &mut Config, prop_path: &str) -> Result<bool> {
+    let Some((section_path, key)) = alias_target_for_path(prop_path, map_key_for_prop_path) else {
         return Ok(false);
     };
 
@@ -2521,29 +2606,27 @@ fn prompt_for_field(
     desc: &zeroclaw_runtime::quickstart::FieldDescriptor,
     seed: Option<&str>,
 ) -> anyhow::Result<Option<String>> {
-    use dialoguer::{FuzzySelect, Input, Password};
+    use dialoguer::{FuzzySelect, Input};
     use zeroclaw_config::traits::PropKind;
     if !desc.help.is_empty() {
         println!("  {}", desc.help);
     }
     let prompt = desc.label.clone();
     if desc.is_secret {
-        // dialoguer 0.12 has no Esc-cancellable Password — only Ctrl+C
-        // (returns `ErrorKind::Interrupted` wrapped in `dialoguer::Error::IO`).
-        // Map that to `Ok(None)` so the caller treats it as "user backed
-        // out" instead of bubbling a confusing IO-error message.
-        match Password::new()
-            .with_prompt(prompt.clone())
-            .allow_empty_password(true)
-            .interact()
-        {
-            Ok(pw) => return Ok(Some(pw)),
+        match secret_prompt(&prompt, true) {
+            Ok(pw) => {
+                if !pw.is_empty() {
+                    eprintln!("{}", ta("cli-secret-received", &[], "  ✓ Secret received"));
+                }
+                return Ok(Some(pw));
+            }
             Err(e) => {
-                let io: std::io::Error = e.into();
-                if io.kind() == std::io::ErrorKind::Interrupted {
+                if e.downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::Interrupted)
+                {
                     return Ok(None);
                 }
-                return Err(io.into());
+                return Err(e);
             }
         }
     }
@@ -2574,7 +2657,7 @@ fn prompt_for_field(
         // field's true type (e.g. a bool) and rejects.
         input = input.default(d.to_string());
     }
-    // Same Ctrl+C-as-cancel mapping as the Password branch above.
+    // Same Ctrl+C-as-cancel mapping as the secret prompt branch above.
     match input.interact_text() {
         Ok(v) => Ok(Some(v)),
         Err(e) => {
@@ -2810,7 +2893,7 @@ enum ConfigCommands {
     },
     /// Initialize unconfigured sections with defaults (enabled=false)
     Init {
-        /// Section prefix (e.g. channels.matrix). Omit to init all.
+        /// Section prefix (e.g. channels.matrix), or <section>.<alias> to create a new dynamic-map alias (e.g. risk_profiles.strict). Omit to init all.
         section: Option<String>,
         /// Emit a structured JSON envelope ({initialized: [...]}) instead of plain text.
         #[arg(long)]
@@ -4079,7 +4162,13 @@ async fn async_main(command: clap::Command) -> Result<()> {
             // config stops the warning and a freshly-degraded one starts it.
             let mut degraded_nag: Option<tokio::task::JoinHandle<()>> =
                 gate_security_posture(&current_config, allow_degraded_security)?;
+            let startup_feedback_enabled = !cli.verbose;
             loop {
+                if startup_feedback_enabled && daemon::stderr_is_interactive_foreground() {
+                    let mut stderr = std::io::stderr().lock();
+                    let _ = daemon::echo_daemon_starting_to_terminal(&mut stderr);
+                }
+
                 // Per-iteration clones so the subsystem closures (which
                 // `move`-capture) don't consume the outer bindings on the
                 // first iteration; reload would otherwise see a moved value.
@@ -4117,7 +4206,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 registry.register_gateway(Box::new({
                     let sop_e = sop_engine.clone();
                     let sop_a = sop_audit.clone();
-                    move |host, port, config, tx, reload_controls, tui_registry| {
+                    move |host, port, config, tx, reload_controls, tui_registry, ready_tx| {
                         let canvas_store = canvas_store_for_gateway.clone();
                         let sop_engine = sop_e.clone();
                         let sop_audit = sop_a.clone();
@@ -4132,6 +4221,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                                 Some(canvas_store),
                                 sop_engine,
                                 sop_audit,
+                                ready_tx,
                             ))
                             .await
                         })
@@ -4191,10 +4281,15 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     }
                 }));
 
-                registry.register_socket(Box::new(|ctx, cancel, client_count| {
+                registry.register_socket(Box::new(|ctx, cancel, client_count, ready_tx| {
                     Box::pin(async move {
-                        zeroclaw_runtime::rpc::local::run_local_listener(ctx, cancel, client_count)
-                            .await
+                        zeroclaw_runtime::rpc::local::run_local_listener(
+                            ctx,
+                            cancel,
+                            client_count,
+                            ready_tx,
+                        )
+                        .await
                     })
                 }));
 
@@ -4233,6 +4328,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     port,
                     registry,
                     ephemeral,
+                    startup_feedback_enabled,
                 ))
                 .await;
                 if let Some(handle) = sop_maintenance {
@@ -5380,10 +5476,12 @@ async fn async_main(command: clap::Command) -> Result<()> {
                             "  \u{26a0} {path} is an encrypted secret \u{2014} using masked input."
                         );
                     }
-                    let secret_value = dialoguer::Password::new()
-                        .with_prompt(format!("Enter value for {path}"))
-                        .interact()?;
-                    let secret_value = secret_value.trim().to_string();
+                    let secret_value = secret_prompt(&format!("Enter value for {path}"), false)?
+                        .trim()
+                        .to_string();
+                    if !secret_value.is_empty() {
+                        eprintln!("{}", ta("cli-secret-received", &[], "  ✓ Secret received"));
+                    }
                     if secret_value.is_empty() {
                         anyhow::bail!("Value cannot be empty.");
                     }
@@ -5509,15 +5607,24 @@ async fn async_main(command: clap::Command) -> Result<()> {
             }
             ConfigCommands::Init { section, json } => {
                 crate::config::migration::ensure_disk_at_current_version(&config.config_path)?;
-                let initialized: Vec<String> = config
+                let mut initialized: Vec<String> = config
                     .init_defaults(section.as_deref())
                     .into_iter()
                     .map(str::to_string)
                     .collect();
+                for section in &initialized {
+                    config.mark_dirty(section);
+                }
+                // `init_defaults` only instantiates nested struct sections. A
+                // `<section>.<alias>` argument names a dynamic-map entry, which
+                // has to be materialized through `create_map_key` instead.
+                if let Some(arg) = section.as_deref()
+                    && let Some(created) = init_map_alias(&mut config, arg)?
+                {
+                    mark_new_map_alias_dirty(&mut config, &created);
+                    initialized.push(created);
+                }
                 if !initialized.is_empty() {
-                    for section in &initialized {
-                        config.mark_dirty(section);
-                    }
                     Box::pin(config.save_dirty()).await?;
                 }
                 if json {
@@ -5761,28 +5868,38 @@ async fn async_main(command: clap::Command) -> Result<()> {
 
                     let result_entry: serde_json::Value = match op_name {
                         "add" | "replace" => {
-                            let value = op.get("value").ok_or_else(|| {
-                                ::zeroclaw_log::record!(
-                                    WARN,
-                                    ::zeroclaw_log::Event::new(
-                                        module_path!(),
-                                        ::zeroclaw_log::Action::Reject
-                                    )
-                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                    .with_attrs(
-                                        ::serde_json::json!({
-                                            "op": op_name,
-                                            "op_index": idx,
-                                            "path": path,
-                                        })
-                                    ),
-                                    "config patch op rejected: missing `value` field"
-                                );
-                                anyhow::Error::msg(format!(
-                                    "op[{idx}] `{op_name}` on `{path}`: missing `value` field"
-                                ))
-                            })?;
-                            let value_str = json_value_to_setprop_string(value, &config, &path)?;
+                            let value = match op.get("value") {
+                                Some(value) => value,
+                                None => {
+                                    ::zeroclaw_log::record!(
+                                        WARN,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Reject
+                                        )
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                        .with_attrs(
+                                            ::serde_json::json!({
+                                                "op": op_name,
+                                                "op_index": idx,
+                                                "path": path,
+                                            })
+                                        ),
+                                        "config patch op rejected: missing `value` field"
+                                    );
+                                    let message = format!(
+                                        "op[{idx}] `{op_name}` on `{path}`: missing `value` field"
+                                    );
+                                    let api_err = config_patch_json_value_type_error(
+                                        message.clone(),
+                                        Some(path.clone()),
+                                        Some(idx),
+                                    );
+                                    config_patch_fail_json_or_human(json, api_err, message)?
+                                }
+                            };
+                            let value_str =
+                                json_value_to_setprop_string(value, &config, &path, idx, json)?;
                             match config.set_prop_persistent(&path, &value_str) {
                                 Ok(()) => {}
                                 Err(err) => {
@@ -6300,10 +6417,10 @@ fn handle_estop_command(
                     );
                 }
                 if otp_code.is_none() {
-                    let entered = Password::new()
-                        .with_prompt("Enter OTP code")
-                        .allow_empty_password(false)
-                        .interact()?;
+                    let entered = secret_prompt("Enter OTP code", false)?;
+                    if !entered.is_empty() {
+                        eprintln!("{}", ta("cli-otp-received", &[], "  ✓ OTP received"));
+                    }
                     otp_code = Some(entered);
                 }
 
@@ -6968,7 +7085,10 @@ fn paircode_no_code_message(
 
     lines.push(String::new());
     lines.push("To inspect the running gateway:".into());
-    lines.push(format!("    open http://{host}:{port}"));
+    lines.push(format!(
+        "    open http://{}:{port}",
+        gateway_browser_host(host)
+    ));
     indent_paircode_lines(lines)
 }
 
@@ -7016,10 +7136,10 @@ fn indent_paircode_lines(lines: Vec<String>) -> String {
 
 #[cfg(feature = "agent-runtime")]
 fn read_auth_input(prompt: &str) -> Result<String> {
-    let input = Password::new()
-        .with_prompt(prompt)
-        .allow_empty_password(false)
-        .interact()?;
+    let input = secret_prompt(prompt, false)?;
+    if !input.is_empty() {
+        eprintln!("{}", ta("cli-secret-received", &[], "  ✓ Secret received"));
+    }
     Ok(input.trim().to_string())
 }
 
@@ -7866,7 +7986,7 @@ async fn run_gateway_if_enabled(
     // manually" message, None for tui_registry (no TUI socket), and None
     // for canvas_store so the gateway falls back to its own default.
     let result = Box::pin(gateway::run_gateway(
-        host, port, config, tx, None, None, None, None, None,
+        host, port, config, tx, None, None, None, None, None, None,
     ))
     .await;
     // Self-respawn after the listener is released, if an in-app upgrade
@@ -7908,6 +8028,14 @@ fn is_default_gateway_addr(host: &str, port: u16, default_host: &str, default_po
     host == default_host && port == default_port
 }
 
+fn gateway_browser_host(host: &str) -> &str {
+    match host {
+        "0.0.0.0" => "127.0.0.1",
+        "::" | "[::]" => "[::1]",
+        _ => host,
+    }
+}
+
 fn gateway_addr_in_use_message(
     host: &str,
     port: u16,
@@ -7924,7 +8052,10 @@ fn gateway_addr_in_use_message(
     ];
 
     if is_default_gateway_addr(host, port, default_host, default_port) {
-        lines.push(format!("    open http://{host}:{port}"));
+        lines.push(format!(
+            "    open http://{}:{port}",
+            gateway_browser_host(host)
+        ));
     }
 
     lines.push(gateway_paircode_recovery_command(
@@ -8624,6 +8755,31 @@ mod tests {
 
     #[test]
     #[cfg(feature = "agent-runtime")]
+    fn paircode_no_code_message_uses_loopback_browser_hint_for_wildcard_hosts() {
+        let default = config::GatewayConfig::default();
+
+        for (host, browser_host) in [("0.0.0.0", "127.0.0.1"), ("::", "[::1]"), ("[::]", "[::1]")] {
+            let msg = paircode_no_code_message(
+                host,
+                9001,
+                &default.host,
+                default.port,
+                &PaircodeAction::Show,
+                true,
+                None,
+            );
+
+            assert!(
+                msg.contains(&format!("open http://{browser_host}:9001")),
+                "{msg}"
+            );
+            assert!(msg.contains(&format!("--port 9001 --host {host}")), "{msg}");
+            assert!(!msg.contains(&format!("open http://{host}:9001")), "{msg}");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
     fn paircode_no_code_message_omits_configured_default_host_port() {
         let msg = paircode_no_code_message(
             "192.168.1.20",
@@ -8687,6 +8843,19 @@ mod tests {
         assert!(msg.contains("zeroclaw gateway get-paircode --port 9001 --host 0.0.0.0"));
         assert!(msg.contains("zeroclaw gateway start --port 9002 --host 0.0.0.0"));
         assert!(msg.contains("lsof -nP -iTCP:9001 -sTCP:LISTEN"));
+    }
+
+    #[test]
+    fn gateway_addr_in_use_message_uses_loopback_browser_hint_for_wildcard_default() {
+        for (host, browser_host) in [("0.0.0.0", "127.0.0.1"), ("::", "[::1]"), ("[::]", "[::1]")] {
+            let msg = gateway_addr_in_use_message(host, 9001, host, 9001, None);
+
+            assert!(
+                msg.contains(&format!("open http://{browser_host}:9001")),
+                "{msg}"
+            );
+            assert!(!msg.contains(&format!("open http://{host}:9001")), "{msg}");
+        }
     }
 
     #[test]
@@ -9252,6 +9421,33 @@ mod tests {
     }
 
     #[test]
+    fn config_set_materializes_agent_workspace_path() {
+        let mut config = Config::default();
+        let raw = "agents.assistant.workspace.path";
+
+        let known: Vec<String> = config.prop_fields().into_iter().map(|f| f.name).collect();
+        let mut path = zeroclaw_config::helpers::resolve_field_path(&known, raw);
+        let created = ensure_map_key_for_prop_path(&mut config, &path)
+            .expect("agent alias and workspace path should materialize");
+        assert!(created, "missing agent alias should be created");
+
+        let known: Vec<String> = config.prop_fields().into_iter().map(|f| f.name).collect();
+        path = zeroclaw_config::helpers::resolve_field_path(&known, &path);
+        config
+            .set_prop_persistent(&path, "/srv/zeroclaw/assistant")
+            .expect("agent workspace path should be writable");
+
+        assert_eq!(path, raw);
+        assert_eq!(
+            config
+                .agents
+                .get("assistant")
+                .and_then(|agent| agent.workspace.path.as_deref()),
+            Some(std::path::Path::new("/srv/zeroclaw/assistant"))
+        );
+    }
+
+    #[test]
     fn ensure_map_key_rolls_back_alias_on_unknown_tail_field() {
         let mut config = Config::default();
         let path = "risk_profiles.newprofile.not_a_real_field";
@@ -9268,6 +9464,100 @@ mod tests {
                 .unwrap_or_default()
                 .is_empty(),
             "the tentatively-created alias must be rolled back, not left dangling",
+        );
+    }
+
+    // `config init` alias tests. Every test in this module builds a bare
+    // `Config::default()`, whose `config_path` points at the developer's real
+    // `~/.zeroclaw/config.toml`, and no gate catches a write from `src/`. These
+    // stay safe only by calling `init_map_alias` and in-memory readers such as
+    // `get_map_keys` — never `save()`, `save_dirty()`, a persisting `set_prop`,
+    // `ensure_disk_at_current_version`, or the real `ConfigCommands::Init` arm.
+    // End-to-end coverage of the handler lives in `tests/component/`.
+
+    #[test]
+    fn config_init_materializes_new_map_alias() {
+        for (arg, section) in [
+            ("risk_profiles.strict", "risk_profiles"),
+            ("peer_groups.pi400_owner", "peer_groups"),
+        ] {
+            let mut config = Config::default();
+            let created = init_map_alias(&mut config, arg)
+                .expect("alias-shaped section arguments should materialize");
+            assert_eq!(created.as_deref(), Some(arg));
+            let alias = arg.rsplit('.').next().expect("alias segment");
+            assert!(
+                config
+                    .get_map_keys(section)
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|k| k == alias),
+                "{arg} should be present under {section}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_init_alias_is_idempotent() {
+        let mut config = Config::default();
+        init_map_alias(&mut config, "risk_profiles.strict").expect("first create");
+        let again = init_map_alias(&mut config, "risk_profiles.strict").expect("second create");
+        assert!(again.is_none(), "an existing alias is not re-reported");
+        assert_eq!(
+            config.get_map_keys("risk_profiles").unwrap_or_default(),
+            vec!["strict".to_string()],
+        );
+    }
+
+    #[test]
+    fn config_init_ignores_plain_section_prefixes() {
+        let mut config = Config::default();
+        for arg in ["channels.telegram", "gateway"] {
+            assert!(
+                init_map_alias(&mut config, arg)
+                    .expect("plain prefixes are not an error")
+                    .is_none(),
+                "{arg} has no trailing alias segment; init_defaults keeps ownership"
+            );
+        }
+    }
+
+    #[test]
+    fn config_init_ignores_resource_keyed_sections() {
+        let mut config = Config::default();
+        assert!(
+            init_map_alias(&mut config, "cost.rates.providers.models.openai.gpt-5")
+                .expect("resource-keyed sections are ignored, not rejected")
+                .is_none()
+        );
+        assert!(config.cost.rates.providers.models.openai.is_empty());
+    }
+
+    #[test]
+    fn config_init_refuses_reserved_default_agent() {
+        let mut config = Config::default();
+        let err = init_map_alias(&mut config, "agents.default")
+            .expect_err("the reserved agent guard must surface, not exit 0");
+        assert!(
+            err.to_string().contains("reserved"),
+            "message should name the reserved alias: {err}"
+        );
+        assert!(config.agents.is_empty());
+
+        assert_eq!(
+            init_map_alias(&mut config, "agents.researcher")
+                .expect("non-reserved agent aliases still materialize")
+                .as_deref(),
+            Some("agents.researcher"),
+        );
+    }
+
+    #[test]
+    fn config_init_rejects_invalid_alias_key() {
+        let mut config = Config::default();
+        assert!(
+            init_map_alias(&mut config, "risk_profiles.Bad-Name").is_err(),
+            "validate_alias_key's refusal must propagate"
         );
     }
 
