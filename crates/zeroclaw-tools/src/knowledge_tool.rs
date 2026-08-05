@@ -1,11 +1,10 @@
 //! Knowledge management tool for capturing, searching, and reusing expertise.
-//!
 //! Exposes the knowledge graph to the agent via the `Tool` trait.
 
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_memory::knowledge_graph::{KnowledgeGraph, NodeType, Relation};
 
 const CLIENT_NETWORK_INTERACTION_LIMIT: usize = 20;
@@ -149,7 +148,7 @@ impl Tool for KnowledgeTool {
             "interaction_log" => self.handle_interaction_log(&args),
             other => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("unknown action: {other}")),
             }),
         }
@@ -236,12 +235,12 @@ impl KnowledgeTool {
         {
             Ok(id) => Ok(ToolResult {
                 success: true,
-                output: json!({ "node_id": id }).to_string(),
+                output: json!({ "node_id": id }).to_string().into(),
                 error: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("capture failed: {e}")),
             }),
         }
@@ -321,7 +320,9 @@ impl KnowledgeTool {
 
         Ok(ToolResult {
             success: true,
-            output: json!({ "results": results, "count": results.len() }).to_string(),
+            output: json!({ "results": results, "count": results.len() })
+                .to_string()
+                .into(),
             error: None,
         })
     }
@@ -390,12 +391,12 @@ impl KnowledgeTool {
         match self.graph.add_edge(from_id, to_id, relation) {
             Ok(()) => Ok(ToolResult {
                 success: true,
-                output: "relationship created".to_string(),
+                output: "relationship created".to_string().into(),
                 error: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("relate failed: {e}")),
             }),
         }
@@ -437,7 +438,9 @@ impl KnowledgeTool {
 
         Ok(ToolResult {
             success: true,
-            output: json!({ "suggestions": suggestions, "count": suggestions.len() }).to_string(),
+            output: json!({ "suggestions": suggestions, "count": suggestions.len() })
+                .to_string()
+                .into(),
             error: None,
         })
     }
@@ -456,7 +459,7 @@ impl KnowledgeTool {
         if tags.is_empty() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("missing 'tags' for expert_find".into()),
             });
         }
@@ -476,7 +479,9 @@ impl KnowledgeTool {
 
         Ok(ToolResult {
             success: true,
-            output: json!({ "experts": output, "count": output.len() }).to_string(),
+            output: json!({ "experts": output, "count": output.len() })
+                .to_string()
+                .into(),
             error: None,
         })
     }
@@ -546,7 +551,9 @@ impl KnowledgeTool {
 
         Ok(ToolResult {
             success: true,
-            output: json!({ "lessons": lessons, "count": lessons.len() }).to_string(),
+            output: json!({ "lessons": lessons, "count": lessons.len() })
+                .to_string()
+                .into(),
             error: None,
         })
     }
@@ -555,12 +562,12 @@ impl KnowledgeTool {
         match self.graph.stats() {
             Ok(stats) => Ok(ToolResult {
                 success: true,
-                output: serde_json::to_string(&stats).unwrap_or_default(),
+                output: serde_json::to_string(&stats).unwrap_or_default().into(),
                 error: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("failed to get stats: {e}")),
             }),
         }
@@ -572,7 +579,7 @@ impl KnowledgeTool {
             None => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some("missing 'node_id' for graph_neighbors".into()),
                 });
             }
@@ -584,7 +591,7 @@ impl KnowledgeTool {
             None => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("node not found: {node_id}")),
                 });
             }
@@ -618,7 +625,8 @@ impl KnowledgeTool {
                 "outbound_count": outbound_count,
                 "inbound_count": inbound_count,
             })
-            .to_string(),
+            .to_string()
+            .into(),
             error: None,
         })
     }
@@ -629,7 +637,7 @@ impl KnowledgeTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(e.to_string()),
                 });
             }
@@ -691,7 +699,8 @@ impl KnowledgeTool {
                 "manager_count": managers.len(),
                 "interaction_count": interactions.len(),
             })
-            .to_string(),
+            .to_string()
+            .into(),
             error: None,
         })
     }
@@ -702,7 +711,7 @@ impl KnowledgeTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(e.to_string()),
                 });
             }
@@ -726,7 +735,9 @@ impl KnowledgeTool {
 
         Ok(ToolResult {
             success: true,
-            output: json!({"interactions": entries, "count": entries.len()}).to_string(),
+            output: json!({"interactions": entries, "count": entries.len()})
+                .to_string()
+                .into(),
             error: None,
         })
     }

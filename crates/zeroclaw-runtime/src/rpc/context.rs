@@ -1,9 +1,5 @@
 //! Shared context threaded from `daemon::run()` through the Unix socket
 //! listener into each per-connection [`super::dispatch::RpcDispatcher`].
-//!
-//! Every subsystem handle the RPC layer might need lives here. Fields
-//! beyond `config` and `sessions` are `Option` so the context works in
-//! tests and minimal (kernel-only) daemon configurations.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -21,11 +17,6 @@ use zeroclaw_infra::session_backend::SessionBackend;
 use super::session::SessionStore;
 use super::tui_identity::TuiRegistry;
 
-/// Registry for in-flight tool approval requests.
-///
-/// The RpcApprovalChannel inserts a (request_id, oneshot::Sender) pair
-/// before sending the approval_request notification.
-/// handle_session_approve resolves it when the client sends session/approve.
 #[derive(Default)]
 pub struct ApprovalPendingMap {
     inner: std::sync::Mutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>,
@@ -102,12 +93,34 @@ impl ApprovalPendingMap {
     }
 }
 
+/// Owned guard for [`RpcContext::config_write_lock`]. Owned (not
+/// borrowed) so a handler can release it explicitly at its commit point
+/// — letting post-commit side effects run unlocked — and pass it by
+/// value into delegated handlers without lifetime coupling.
+pub(crate) type ConfigWriteGuard = tokio::sync::OwnedMutexGuard<()>;
+
 /// Daemon-wide state shared across all RPC connections.
 pub struct RpcContext {
     /// Live config behind a read-write lock so `config/set` can mutate
     /// without a full daemon reload. Mirrors the gateway's
     /// `Arc<RwLock<Config>>` pattern.
     pub config: Arc<RwLock<Config>>,
+
+    /// Serializes the read-mutate-flush critical section of every RPC
+    /// handler that mutates `config` (config/set, config/delete, map-key
+    /// create/delete/rename, alias rename, quickstart/apply). A tokio
+    /// mutex, not `parking_lot`, because the guard must survive the
+    /// `.await` on config-save I/O.
+    ///
+    /// Invariant: every mutation of `config` must happen while holding
+    /// this mutex, acquired before the first `config` read-for-modify or
+    /// write and held through the flush that persists it. Never acquire
+    /// it while holding a `config` guard — lock order is this mutex
+    /// first, `config` second, always. A writer that bypasses this lock
+    /// and re-dirties a just-saved path while a flush is mid-save loses
+    /// disk persistence for that write (memory keeps it, but the dirty
+    /// flag is cleared by the concurrent flush).
+    pub config_write_lock: Arc<tokio::sync::Mutex<()>>,
 
     /// In-memory session store for active RPC sessions.
     pub sessions: Arc<SessionStore>,
@@ -157,11 +170,6 @@ pub struct RpcContext {
 }
 
 impl RpcContext {
-    /// Minimal context for tests — only config and sessions, everything
-    /// else `None`.
-    /// Lightweight context for external live integration tests — only config
-    /// and sessions are wired; everything else is `None`. Not `#[cfg(test)]`
-    /// because integration tests compile against the public surface.
     pub fn for_live_test(config: Config, sessions: Arc<SessionStore>) -> Arc<Self> {
         let tui_dir = config
             .config_path
@@ -171,6 +179,7 @@ impl RpcContext {
         let data_dir = config.data_dir.clone();
         Arc::new(Self {
             config: Arc::new(RwLock::new(config)),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             sessions,
             session_backend: None,
             memory: None,
@@ -191,6 +200,7 @@ impl RpcContext {
     pub fn minimal(config: Config, sessions: Arc<SessionStore>) -> Arc<Self> {
         Arc::new(Self {
             config: Arc::new(RwLock::new(config)),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             sessions,
             session_backend: None,
             memory: None,
@@ -208,6 +218,56 @@ impl RpcContext {
     }
 
     #[cfg(test)]
+    pub fn minimal_with_event_tx(
+        config: Config,
+        sessions: Arc<SessionStore>,
+        event_tx: tokio::sync::broadcast::Sender<Value>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            config: Arc::new(RwLock::new(config)),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            sessions,
+            session_backend: None,
+            memory: None,
+            cost_tracker: None,
+            event_tx: Some(event_tx),
+            reload_tx: None,
+            gateway_shutdown_tx: None,
+            approval_pending: Arc::new(ApprovalPendingMap::default()),
+            tui_registry: Arc::new(TuiRegistry::new_unsigned()),
+            acp_session_store: None,
+            sop_engine: None,
+            sop_audit: None,
+            hooks: None,
+        })
+    }
+
+    #[cfg(test)]
+    pub fn minimal_with_sop_engine(
+        config: Config,
+        sessions: Arc<SessionStore>,
+        sop_engine: Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            config: Arc::new(RwLock::new(config)),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            sessions,
+            session_backend: None,
+            memory: None,
+            cost_tracker: None,
+            event_tx: None,
+            reload_tx: None,
+            gateway_shutdown_tx: None,
+            approval_pending: Arc::new(ApprovalPendingMap::default()),
+            tui_registry: Arc::new(TuiRegistry::new_unsigned()),
+            acp_session_store: None,
+            sop_engine: Some(sop_engine),
+            sop_audit: None,
+            hooks: None,
+        })
+    }
+
+    #[cfg(test)]
     pub fn minimal_with_memory(
         config: Config,
         sessions: Arc<SessionStore>,
@@ -215,6 +275,7 @@ impl RpcContext {
     ) -> Arc<Self> {
         Arc::new(Self {
             config: Arc::new(RwLock::new(config)),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             sessions,
             session_backend: None,
             memory: Some(memory),
@@ -239,6 +300,7 @@ impl RpcContext {
     ) -> Arc<Self> {
         Arc::new(Self {
             config: Arc::new(RwLock::new(config)),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             sessions,
             session_backend: None,
             memory: None,
@@ -264,6 +326,7 @@ impl RpcContext {
     ) -> Arc<Self> {
         Arc::new(Self {
             config: Arc::new(RwLock::new(config)),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             sessions,
             session_backend,
             memory: None,
@@ -289,6 +352,7 @@ impl RpcContext {
     ) -> Arc<Self> {
         Arc::new(Self {
             config: Arc::new(RwLock::new(config)),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             sessions,
             session_backend: None,
             memory: None,

@@ -1,5 +1,4 @@
 //! Flash ZeroClaw Arduino firmware via arduino-cli.
-//!
 //! Ensures arduino-cli is available (installs via brew on macOS if missing),
 //! installs the AVR core, compiles and uploads the base firmware.
 

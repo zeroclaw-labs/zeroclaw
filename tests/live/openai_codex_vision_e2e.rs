@@ -1,15 +1,4 @@
 //! E2E test for vision support in model_providers.
-//!
-//! This test validates that:
-//! 1. ModelProvider reports vision capability
-//! 2. ModelProvider correctly processes messages with [IMAGE:...] markers
-//! 3. Request is sent to API with proper image_url format
-//!
-//! Requires:
-//! - Live model_provider OAuth credentials (OpenAI Codex or Gemini)
-//! - Test image at /tmp/test_vision.png
-//!
-//! Run manually: `cargo test provider_vision -- --ignored --nocapture`
 
 use anyhow::Result;
 use zeroclaw::providers::{ChatMessage, ChatRequest, ModelProviderRuntimeOptions};
@@ -19,13 +8,6 @@ use zeroclaw::providers::{ChatMessage, ChatRequest, ModelProviderRuntimeOptions}
 /// codebase default) keeps behavior matching earlier runs.
 const VISION_PROBE_TEMPERATURE: f64 = 0.7;
 
-/// Tests that model_provider supports vision input.
-///
-/// This test:
-/// 1. Creates model_provider via factory (tries OpenAI Codex, falls back to Gemini)
-/// 2. Verifies vision capability is reported
-/// 3. Sends a message with [IMAGE:...] marker
-/// 4. Verifies request succeeds without capability error
 #[tokio::test]
 #[ignore = "requires live model_provider OAuth credentials"]
 async fn provider_vision_support() -> Result<()> {
@@ -140,23 +122,11 @@ async fn provider_vision_support() -> Result<()> {
     }
 }
 
-/// Tests that OpenAI Codex second profile supports vision input.
-///
-/// This test:
-/// 1. Creates OpenAI Codex model_provider with "second" profile override
-/// 2. Verifies vision capability is reported
-/// 3. Sends a message with [IMAGE:...] marker
-/// 4. Verifies request succeeds without capability error
 #[tokio::test]
 #[ignore = "requires live OpenAI Codex OAuth credentials (second profile)"]
 async fn openai_codex_second_vision_support() -> Result<()> {
     println!("Creating OpenAI Codex model_provider with second profile...");
 
-    // Create model_provider with profile override. Codex routing now
-    // happens via the legacy "openai-codex" family-name escape hatch
-    // (the typed-alias `requires_openai_auth` flag flows through
-    // `OpenAIModelProviderConfig::create_provider` when called with
-    // full Config + alias context, which this live test does not use).
     let opts = ModelProviderRuntimeOptions {
         auth_profile_override: Some("second".to_string()),
         secrets_encrypt: false,

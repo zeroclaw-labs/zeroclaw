@@ -1,24 +1,6 @@
 //! ESP32 simulator — speaks the same JSON-over-serial protocol as
 //! `firmware/esp32/src/main.rs`, so a host ZeroClaw daemon can drive virtual
 //! GPIO pins without any real hardware.
-//!
-//! Architecture: this binary spawns `socat` to create a pty pair with named
-//! symlinks (`/tmp/zc-sim-esp32` ↔ `/tmp/zc-sim-firmware`). ZeroClaw connects
-//! to the first; this simulator opens the second. The simulator also runs a
-//! small axum server that serves a static frontend on :8080 and broadcasts
-//! virtual pin state over a WebSocket on the same port at `/ws`.
-//!
-//! Run:
-//!     cargo run --example esp32_sim --features "hardware dev-sim"
-//!
-//! Then point ZeroClaw at the pty:
-//!     [[peripherals.boards]]
-//!     board = "esp32"
-//!     transport = "serial"
-//!     path = "/tmp/zc-sim-esp32"
-//!     baud = 115200
-//!
-//! Requires `socat` on PATH (`brew install socat` or `apt install socat`).
 
 use anyhow::{Context, Result};
 use axum::{
@@ -438,11 +420,6 @@ async fn run_http_server(state: AppState, bind_addr: String) -> Result<()> {
     let app = Router::new()
         .route("/", get(index))
         .route("/state", get(get_state))
-        // Demo-only manual control surface for the browser visualizer's buttons.
-        // Accepts unauthenticated POST /manual JSON {pin, value} and only mutates
-        // the in-memory simulated GPIO state (never the pty/firmware command stream
-        // and never real hardware). See the Security & Privacy Impact section of the
-        // PR body for the full network surface description.
         .route("/manual", post(manual_flip))
         .route("/ws", get(ws_handler))
         .with_state(state);

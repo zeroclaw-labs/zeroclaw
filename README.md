@@ -33,19 +33,22 @@ Read the [Philosophy](docs/book/src/philosophy/index.md) for the four opinions t
 
 ## Install
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash
+### Unix (recommended)
+
+<!-- >>> generated:readme-unix-fast by `cargo generate installers` - do not edit <<< -->
+```sh
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | sh
+"${CARGO_HOME:-$HOME/.cargo}/bin/zeroclaw" quickstart
 ```
+<!-- >>> end generated:readme-unix-fast <<< -->
 
-Or clone and run:
+### Windows (recommended)
 
-```bash
-git clone https://github.com/zeroclaw-labs/zeroclaw.git
-cd zeroclaw
-./install.sh
-```
+Use the Rust-free [prebuilt PowerShell path](docs/book/src/setup/windows.md#option-1-prebuilt-binary-recommended) in the Windows setup guide. It installs the current release, updates PATH, and runs Quickstart.
 
-The installer asks whether you want a prebuilt binary (fast, ~seconds) or a source build (slower, customisable). Both end the same way: `zeroclaw quickstart` kicks off automatically.
+For the guided Unix installer, source builds, app and feature selection, and PATH behavior, compare the [installation paths](docs/book/src/getting-started/quickstart.md#install).
+
+Run `./install.sh --help` for the complete Unix installer flag reference.
 
 > **Working on the docs?** The translated documentation catalogues live in a
 > git submodule (`docs/book/po`). The Rust build does not need it, but building
@@ -55,25 +58,6 @@ The installer asks whether you want a prebuilt binary (fast, ~seconds) or a sour
 > git clone --recurse-submodules https://github.com/zeroclaw-labs/zeroclaw.git
 > git submodule update --init docs/book/po   # existing clone
 > ```
-
-Flags:
-
-```
-./install.sh --prebuilt              # always prebuilt; don't ask
-./install.sh --source                # always build from source
-./install.sh --preset minimal        # kernel-only source preset (~6.6 MB)
-./install.sh --minimal               # alias for --preset minimal
-./install.sh --source --features agent-runtime,channel-discord  # custom feature set
-./install.sh --apps zerocode         # select apps to install; use "none" to skip all
-./install.sh --without-tui           # skip building zerocode
-./install.sh --with-gateway          # force gateway support on
-./install.sh --without-gateway       # force gateway support off
-./install.sh --prefix /tmp/zc-test   # install under a custom prefix
-./install.sh --dry-run --prebuilt    # preview without installing
-./install.sh --skip-quickstart       # install only, run `zeroclaw quickstart` later
-./install.sh --list-features         # print available feature flags
-./install.sh --uninstall             # remove ZeroClaw
-```
 
 Platform-specific notes: [Linux](docs/book/src/setup/linux.md) · [macOS](docs/book/src/setup/macos.md) · [Windows](docs/book/src/setup/windows.md) · [FreeBSD](docs/book/src/setup/freebsd.md) · [NixOS](docs/book/src/setup/nixos.md) · [Docker](docs/book/src/setup/container.md)
 
@@ -109,20 +93,30 @@ One TOML file at `~/.zeroclaw/config.toml`. Pointers:
 
 A V3 config has at minimum four section headers (`<type>.<alias>` shaped) — a provider entry, an agent that references it, and a risk profile the agent gates against. See [Provider Configuration → Minimal working example](docs/book/src/providers/configuration.md#minimal-working-example) for the canonical four-section form with inline type/alias commentary.
 
-For standard OpenAI Codex subscription auth, swap the provider entry to:
+For standard OpenAI Codex subscription auth, Quickstart can write the provider
+entry for you:
+
+```bash
+zeroclaw auth login --model-provider openai-codex --import ~/.codex/auth.json  # if already signed in with Codex CLI
+zeroclaw quickstart --model-provider openai-codex --model gpt-5.4
+```
+
+The provider entry uses the canonical OpenAI shape; the alias below is an
+example:
 
 ```toml
 [providers.models.openai.coding]   # type = openai; alias = coding (you choose)
-model = "gpt-5-codex"
+model = "gpt-5.4"
 wire_api = "responses"
 requires_openai_auth = true
 ```
 
-…and point your agent at it with `model_provider = "openai.coding"`.
+…and point your agent at it with `model_provider = "openai.<alias>"`.
 
 Notes:
 
 - Normal OpenAI Codex subscription auth uses stored auth profiles, not an `api_key` on the provider entry.
+- Claude Max setup-token auth stays on the canonical Anthropic slot: run `claude setup-token`, choose `setup_token` in Quickstart, and paste the generated token into the API key/token prompt.
 - Only set `api_key` / `uri` on `[providers.models.openai.<alias>]` when intentionally targeting a custom OpenAI-compatible gateway or endpoint.
 - If you see `provider streaming failed, falling back to non-streaming chat`, ZeroClaw retries the same request in non-streaming mode. Check `zeroclaw auth status` before changing provider config.
 

@@ -11,8 +11,9 @@ use ratatui::{
 use std::sync::Arc;
 
 use crate::client::{
-    AgentStatusEntry, CostSummaryResult, CronJobEntry, CronSchedule, MemoryEntryResult,
-    MessageEntry, OrgCost, RpcClient, SessionEntry, StatusResult, TuiListEntry,
+    AgentStatusEntry, CostSummaryResult, CronJobEntry, CronRunEntry, CronSchedule,
+    CronTriggerResult, MemoryEntryResult, MessageEntry, OrgCost, RpcClient, SessionEntry,
+    StatusResult, TuiListEntry,
 };
 use crate::mouse;
 use crate::theme;
@@ -26,8 +27,28 @@ const POLL_INTERVAL_SECS: u64 = 5;
 /// of the conversation. Long sessions never load the full history.
 const SESSION_MESSAGES_PAGE_SIZE: usize = 100;
 
-pub(crate) enum DashboardMouseAction {
-    OpenAgentConfig(String),
+struct CronTriggerUpdate {
+    job_id: String,
+    result: Result<CronTriggerResult, String>,
+    jobs: Option<Vec<CronJobEntry>>,
+    runs: Option<Result<Vec<CronRunEntry>, String>>,
+}
+
+struct AgentRenameState {
+    from: String,
+    buf: String,
+}
+
+#[derive(Clone, Copy)]
+enum DashboardMessageLevel {
+    Info,
+    Warn,
+    Error,
+}
+
+struct DashboardMessage {
+    text: String,
+    level: DashboardMessageLevel,
 }
 
 // ── Tab enum ─────────────────────────────────────────────────────
@@ -76,8 +97,6 @@ pub(crate) struct Dashboard {
     tab: Tab,
     last_poll: Option<Instant>,
     // Data
-    status: Option<StatusResult>,
-    health: Option<serde_json::Value>,
     sessions: Vec<SessionEntry>,
     agents: Vec<AgentStatusEntry>,
     cost: Option<CostSummaryResult>,
@@ -89,24 +108,19 @@ pub(crate) struct Dashboard {
     /// daemon has an `org_cost.json` (an integrator's external sync); `None`
     /// otherwise, so the organization row is simply omitted.
     cost_org: Option<OrgCost>,
-    /// Set when the `cost/org` RPC returns an error (a present-but-broken
-    /// `org_cost.json` — unreadable or invalid). Distinct from an absent
-    /// snapshot (`cost_org == None` with no error): an absent snapshot hides
-    /// the org row, but a broken one is surfaced on the Cost tab so the
-    /// operator fixes the billing cache instead of seeing org billing
-    /// silently vanish as if unconfigured.
     cost_org_error: Option<String>,
     cron_jobs: Vec<CronJobEntry>,
+    cron_runs: Vec<CronRunEntry>,
+    cron_runs_job_id: Option<String>,
+    cron_runs_error: Option<String>,
+    cron_trigger_job_id: Option<String>,
+    cron_trigger_message: Option<String>,
+    cron_trigger_inflight_job_id: Option<String>,
+    cron_trigger_rx: Option<tokio::sync::mpsc::UnboundedReceiver<CronTriggerUpdate>>,
     memories: Vec<MemoryEntryResult>,
     memory_error: Option<String>,
     cost_error: Option<String>,
     sessions_loaded: bool,
-    /// Lazy-loaded full payload for the currently-open Memory detail
-    /// row. Fetched via `memory/get` on selection (the list rows store
-    /// only previews, with `content` truncated to ~200 bytes by the
-    /// daemon). `None` whenever the Memory tab isn't focused or no
-    /// row is selected — long browsing sessions never accumulate
-    /// full-content bodies for entries the user has scrolled past.
     memory_detail: Option<MemoryEntryResult>,
     /// Key of the entry whose detail is currently being fetched or
     /// shown. Used to drop stale `memory/get` responses when the
@@ -139,10 +153,13 @@ pub(crate) struct Dashboard {
     search_buf: String,
     search_query: String,
     search_query_saved: String, // saved on search entry for Esc restore
+    agent_rename: Option<AgentRenameState>,
+    agent_rename_message: Option<DashboardMessage>,
     // Layout tracking for mouse
     tab_area: Rect,
     list_area: Rect,
     overview_agents_area: Rect,
+    agent_alias_rename_area: Option<Rect>,
     detail_area: Option<Rect>,
     double_click: mouse::DoubleClickTracker,
 }
@@ -155,8 +172,6 @@ impl Dashboard {
             insecure_tls,
             tab: Tab::Overview,
             last_poll: None,
-            status: None,
-            health: None,
             sessions: Vec::new(),
             agents: Vec::new(),
             cost: None,
@@ -164,6 +179,13 @@ impl Dashboard {
             cost_org: None,
             cost_org_error: None,
             cron_jobs: Vec::new(),
+            cron_runs: Vec::new(),
+            cron_runs_job_id: None,
+            cron_runs_error: None,
+            cron_trigger_job_id: None,
+            cron_trigger_message: None,
+            cron_trigger_inflight_job_id: None,
+            cron_trigger_rx: None,
             memories: Vec::new(),
             memory_error: None,
             cost_error: None,
@@ -188,9 +210,12 @@ impl Dashboard {
             search_buf: String::new(),
             search_query: String::new(),
             search_query_saved: String::new(),
+            agent_rename: None,
+            agent_rename_message: None,
             tab_area: Rect::default(),
             list_area: Rect::default(),
             overview_agents_area: Rect::default(),
+            agent_alias_rename_area: None,
             detail_area: None,
             double_click: mouse::DoubleClickTracker::new(),
         }
@@ -212,17 +237,14 @@ impl Dashboard {
         }
     }
 
+    pub(crate) fn on_pane_blur(&mut self) {
+        self.agent_rename = None;
+        self.agent_rename_message = None;
+        self.agent_alias_rename_area = None;
+    }
+
     async fn poll_data(&mut self) {
         self.last_poll = Some(Instant::now());
-
-        // Always fetch status and health (health feeds the status line
-        // on every tab — RAM/CPU display).
-        if let Ok(s) = self.rpc.status().await {
-            self.status = Some(s);
-        }
-        if let Ok(h) = self.rpc.health().await {
-            self.health = Some(h);
-        }
 
         // Fetch tab-specific data
         match self.tab {
@@ -320,11 +342,6 @@ impl Dashboard {
                     }
                 }
                 self.cost_periods = periods;
-                // Org-level billed snapshot. An absent snapshot (`Ok(None)`,
-                // the daemon returns JSON null for a missing org_cost.json) is
-                // normal and just hides the org row; a present-but-broken
-                // snapshot returns an RPC error, which we surface rather than
-                // collapse to absent (preserves the cost/org #8482 contract).
                 match self.rpc.cost_org().await {
                     Ok(org) => {
                         self.cost_org = org;
@@ -339,6 +356,9 @@ impl Dashboard {
             Tab::Cron => {
                 if let Ok(c) = self.rpc.cron_list().await {
                     self.cron_jobs = c.jobs;
+                    if self.detail_open {
+                        self.load_cron_runs().await;
+                    }
                 }
             }
         }
@@ -372,7 +392,17 @@ impl Dashboard {
 
     // ── Drawing ──────────────────────────────────────────────────
 
-    pub(crate) fn draw(&mut self, frame: &mut ratatui::Frame, area: Rect) {
+    pub(crate) fn draw(
+        &mut self,
+        frame: &mut ratatui::Frame,
+        area: Rect,
+        status: Option<&StatusResult>,
+        health: Option<&serde_json::Value>,
+        code_cwd: Option<&str>,
+        chat_cwd: Option<&str>,
+    ) {
+        self.drain_cron_trigger_updates();
+
         // Clear stale data when disconnected so panels don't show
         // ghost entries from a previous daemon lifetime.
         if matches!(
@@ -397,11 +427,13 @@ impl Dashboard {
         self.draw_status_line(frame, chunks[1]);
 
         match self.tab {
-            Tab::Overview => self.draw_overview(frame, chunks[2]),
+            Tab::Overview => {
+                self.draw_overview(frame, chunks[2], status, health, code_cwd, chat_cwd)
+            }
             Tab::Sessions => self.draw_sessions(frame, chunks[2]),
             Tab::Agents => self.draw_agents(frame, chunks[2]),
             Tab::Memories => self.draw_memories(frame, chunks[2]),
-            Tab::Health => self.draw_health(frame, chunks[2]),
+            Tab::Health => self.draw_health(frame, chunks[2], health),
             Tab::Cost => self.draw_cost(frame, chunks[2]),
             Tab::Cron => self.draw_cron(frame, chunks[2]),
         }
@@ -430,46 +462,81 @@ impl Dashboard {
     }
 
     fn draw_status_line(&self, frame: &mut ratatui::Frame, area: Rect) {
-        let version = self
-            .status
-            .as_ref()
-            .map(|s| s.server_version.as_str())
-            .unwrap_or("?");
-        let active = self.status.as_ref().map(|s| s.active_sessions).unwrap_or(0);
-        let help: String = if self.search_active {
+        let help: String = if self.search_active || self.agent_rename.is_some() {
             format!(
                 "Enter:{apply}  Esc:{cancel}",
-                apply = crate::i18n::t("zc-dashboard-search-action-apply"),
-                cancel = crate::i18n::t("zc-dashboard-search-action-cancel"),
+                apply = if self.agent_rename.is_some() {
+                    crate::i18n::t("zc-dashboard-agent-rename-action-apply")
+                } else {
+                    crate::i18n::t("zc-dashboard-search-action-apply")
+                },
+                cancel = if self.agent_rename.is_some() {
+                    crate::i18n::t("zc-dashboard-agent-rename-action-cancel")
+                } else {
+                    crate::i18n::t("zc-dashboard-search-action-cancel")
+                },
             )
+        } else if self.tab == Tab::Agents {
+            let key =
+                crate::keymap::action_key_labels(crate::keymap::DashboardTabAction::RenameAgent)
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "e".to_string());
+            format!("{key}:{}", crate::i18n::t("zc-dashboard-agent-rename-hint"))
         } else {
             String::new()
         };
 
-        // Process stats from health
-        let process_info = self.process_stats_line();
-
-        let line = if self.search_active {
-            Line::from(vec![
+        let line = if let Some(rename) = &self.agent_rename {
+            let mut spans = vec![
                 Span::styled(
-                    format!(" v{version} sessions:{active}{process_info} "),
-                    theme::dim_style(),
+                    crate::i18n::t("zc-dashboard-agent-rename-prefix"),
+                    theme::accent_style(),
                 ),
+                Span::styled(" ", theme::dim_style()),
+                Span::styled(&rename.from, theme::body_style()),
+                Span::styled(" -> ", theme::dim_style()),
+                Span::styled(&rename.buf, theme::input_style()),
+                Span::styled("\u{2588} ", theme::accent_style()),
+                Span::styled(help, theme::dim_style()),
+            ];
+            if let Some(message) = &self.agent_rename_message {
+                let style = match message.level {
+                    DashboardMessageLevel::Info => theme::dim_style(),
+                    DashboardMessageLevel::Warn | DashboardMessageLevel::Error => {
+                        theme::warn_style()
+                    }
+                };
+                spans.push(Span::styled("  ", theme::dim_style()));
+                spans.push(Span::styled(&message.text, style));
+            }
+            Line::from(spans)
+        } else if self.search_active {
+            Line::from(vec![
                 Span::styled(" /", theme::accent_style()),
                 Span::styled(&self.search_buf, theme::input_style()),
                 Span::styled("\u{2588}", theme::accent_style()),
             ])
         } else {
-            let mut spans = vec![Span::styled(
-                format!(" v{version} sessions:{active}{process_info} "),
-                theme::dim_style(),
-            )];
+            let mut spans = Vec::new();
             if !self.search_query.is_empty() {
                 spans.push(Span::styled(
                     crate::i18n::t("zc-dashboard-search-prefix"),
                     theme::dim_style(),
                 ));
                 spans.push(Span::styled(&self.search_query, theme::accent_style()));
+                spans.push(Span::styled(" ", theme::dim_style()));
+            }
+            if self.tab == Tab::Agents
+                && let Some(message) = &self.agent_rename_message
+            {
+                let style = match message.level {
+                    DashboardMessageLevel::Info => theme::dim_style(),
+                    DashboardMessageLevel::Warn | DashboardMessageLevel::Error => {
+                        theme::warn_style()
+                    }
+                };
+                spans.push(Span::styled(&message.text, style));
                 spans.push(Span::styled(" ", theme::dim_style()));
             }
             spans.push(Span::styled(help, theme::dim_style()));
@@ -479,43 +546,23 @@ impl Dashboard {
         frame.render_widget(Paragraph::new(line), area);
     }
 
-    /// Build a compact process stats string from the health data.
-    fn process_stats_line(&self) -> String {
-        let Some(ref h) = self.health else {
-            return String::new();
-        };
-        let Some(process) = h.get("process") else {
-            return String::new();
-        };
-        let mut parts = Vec::new();
-        if let Some(rss) = process.get("rss_bytes").and_then(|v| v.as_u64())
-            && rss > 0
-        {
-            let total = process
-                .get("system_ram_total_bytes")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            let rss_str = format_bytes(rss);
-            if total > 0 {
-                let pct = (rss as f64 / total as f64) * 100.0;
-                parts.push(format!(" ram:{rss_str}({pct:.0}%)"));
-            } else {
-                parts.push(format!(" ram:{rss_str}"));
-            }
-        }
-        if let Some(cpu) = process.get("cpu_percent").and_then(|v| v.as_f64()) {
-            parts.push(format!(" cpu:{cpu:.1}%"));
-        }
-        parts.join("")
-    }
-
     // ── Overview tab ─────────────────────────────────────────────
 
-    fn draw_overview(&mut self, frame: &mut ratatui::Frame, area: Rect) {
+    fn draw_overview(
+        &mut self,
+        frame: &mut ratatui::Frame,
+        area: Rect,
+        status: Option<&StatusResult>,
+        health: Option<&serde_json::Value>,
+        code_cwd: Option<&str>,
+        chat_cwd: Option<&str>,
+    ) {
+        let workspace_lines = workspace_lines(code_cwd, chat_cwd);
+        let status_height = 12 + workspace_lines.len() as u16;
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(8),                            // status box
+                Constraint::Length(status_height),                // status box
                 Constraint::Length(4 + self.agents.len() as u16), // agents
                 Constraint::Min(0),                               // connected TUIs
             ])
@@ -529,93 +576,24 @@ impl Dashboard {
         let inner = status_block.inner(chunks[0]);
         frame.render_widget(status_block, chunks[0]);
 
-        if let Some(ref s) = self.status {
-            let mut lines = vec![Line::from(vec![
-                Span::styled(
-                    format!("{:<11}", crate::i18n::t("zc-dashboard-label-connected")),
-                    theme::dim_style(),
-                ),
-                Span::styled(&self.connect_label, theme::accent_style()),
-            ])];
-
-            if self.insecure_tls {
-                lines.push(Line::from(Span::styled(
-                    crate::i18n::t("zc-dashboard-label-insecure-tls"),
-                    theme::warn_style(),
-                )));
-            }
-
-            lines.extend([
-                Line::from(vec![
-                    Span::styled(
-                        format!("{:<11}", crate::i18n::t("zc-dashboard-label-server")),
-                        theme::dim_style(),
-                    ),
-                    Span::styled(format!("v{}", s.server_version), theme::body_style()),
-                ]),
-                Line::from(vec![
-                    Span::styled(
-                        format!("{:<11}", crate::i18n::t("zc-dashboard-label-protocol")),
-                        theme::dim_style(),
-                    ),
-                    Span::styled(format!("{}", s.protocol_version), theme::body_style()),
-                ]),
-                Line::from(vec![
-                    Span::styled(
-                        format!("{:<11}", crate::i18n::t("zc-dashboard-label-sessions")),
-                        theme::dim_style(),
-                    ),
-                    Span::styled(format!("{}", s.active_sessions), theme::accent_style()),
-                ]),
-            ]);
-
-            // Process stats from health
-            if let Some(ref h) = self.health
-                && let Some(process) = h.get("process")
-            {
-                if let Some(rss) = process.get("rss_bytes").and_then(|v| v.as_u64())
-                    && rss > 0
-                {
-                    let total = process
-                        .get("system_ram_total_bytes")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
-                    let rss_str = format_bytes(rss);
-                    let val = if total > 0 {
-                        let pct = (rss as f64 / total as f64) * 100.0;
-                        format!("{rss_str} / {} ({pct:.1}%)", format_bytes(total))
-                    } else {
-                        rss_str
-                    };
-                    lines.push(Line::from(vec![
-                        Span::styled(
-                            format!("{:<11}", crate::i18n::t("zc-dashboard-label-memory")),
-                            theme::dim_style(),
-                        ),
-                        Span::styled(val, theme::body_style()),
-                    ]));
-                }
-                if let Some(cpu) = process.get("cpu_percent").and_then(|v| v.as_f64()) {
-                    let ncpu = process
-                        .get("num_cpus")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
-                    let val = if ncpu > 0 {
-                        format!("{cpu:.1}% ({ncpu} cores)")
-                    } else {
-                        format!("{cpu:.1}%")
-                    };
-                    lines.push(Line::from(vec![
-                        Span::styled(
-                            format!("{:<11}", crate::i18n::t("zc-dashboard-label-cpu")),
-                            theme::dim_style(),
-                        ),
-                        Span::styled(val, theme::body_style()),
-                    ]));
-                }
-            }
-
+        if let Some(s) = status {
+            let lines = overview_status_lines(
+                &self.connect_label,
+                self.insecure_tls,
+                s,
+                health,
+                code_cwd,
+                chat_cwd,
+            );
             frame.render_widget(Paragraph::new(lines), inner);
+        } else {
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    crate::i18n::t("zc-dashboard-loading"),
+                    theme::dim_style(),
+                )),
+                inner,
+            );
         }
 
         // Agents
@@ -905,6 +883,7 @@ impl Dashboard {
             self.detail_area = Some(hsplit[1]);
         } else {
             self.detail_area = None;
+            self.agent_alias_rename_area = None;
             self.draw_agent_list(frame, area, &filtered);
         }
     }
@@ -958,7 +937,8 @@ impl Dashboard {
         frame.render_stateful_widget(list, area, &mut self.agent_state);
     }
 
-    fn draw_agent_detail(&self, frame: &mut ratatui::Frame, area: Rect) {
+    fn draw_agent_detail(&mut self, frame: &mut ratatui::Frame, area: Rect) {
+        self.agent_alias_rename_area = None;
         let block = Block::default()
             .title(Span::styled(" Agent Detail ", theme::title_style()))
             .borders(Borders::ALL)
@@ -978,8 +958,15 @@ impl Dashboard {
         };
 
         let a = &self.agents[idx];
+        if self.detail_scroll == 0 && inner.height > 0 {
+            self.agent_alias_rename_area = Some(Rect::new(inner.x, inner.y, inner.width, 1));
+        }
         let mut lines = vec![
-            detail_line(&crate::i18n::t("zc-dashboard-detail-alias"), &a.alias),
+            detail_action_line(
+                &crate::i18n::t("zc-dashboard-detail-alias"),
+                &a.alias,
+                &crate::i18n::t("zc-dashboard-agent-rename-hint"),
+            ),
             detail_line(
                 &crate::i18n::t("zc-dashboard-detail-enabled"),
                 &if a.enabled {
@@ -1130,11 +1117,6 @@ impl Dashboard {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        // Prefer the lazy-loaded full body when present (populated by
-        // `memory/get` on detail-open via `load_memory_detail`). When
-        // it's still loading, render the truncated preview from
-        // `memories[idx]` so the pane isn't blank for the first frame
-        // before the daemon round-trip lands.
         let m: &MemoryEntryResult = match (&self.memory_detail, self.selected_memory_index()) {
             (Some(detail), _) => detail,
             (None, Some(idx)) => &self.memories[idx],
@@ -1217,7 +1199,12 @@ impl Dashboard {
 
     // ── Health tab ───────────────────────────────────────────────
 
-    fn draw_health(&self, frame: &mut ratatui::Frame, area: Rect) {
+    fn draw_health(
+        &self,
+        frame: &mut ratatui::Frame,
+        area: Rect,
+        health: Option<&serde_json::Value>,
+    ) {
         let block = Block::default()
             .title(Span::styled(" Health ", theme::title_style()))
             .borders(Borders::ALL)
@@ -1225,7 +1212,7 @@ impl Dashboard {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        let Some(ref h) = self.health else {
+        let Some(h) = health else {
             frame.render_widget(
                 Paragraph::new(Span::styled(
                     crate::i18n::t("zc-dashboard-loading"),
@@ -1290,7 +1277,10 @@ impl Dashboard {
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0);
                     let val = if ncpu > 0 {
-                        format!("{cpu:.1}% ({ncpu} cores)")
+                        crate::i18n::t_args(
+                            "zc-dashboard-cpu-with-cores",
+                            &[("cpu", &format!("{cpu:.1}%")), ("cores", &ncpu.to_string())],
+                        )
                     } else {
                         format!("{cpu:.1}%")
                     };
@@ -1692,6 +1682,10 @@ impl Dashboard {
                 &crate::i18n::t("zc-dashboard-detail-last-status"),
                 j.last_status.as_deref().unwrap_or("\u{2014}"),
             ),
+            detail_line(
+                &crate::i18n::t("zc-dashboard-actions"),
+                &self.cron_action_hint(),
+            ),
         ];
 
         if !j.command.is_empty() {
@@ -1722,6 +1716,94 @@ impl Dashboard {
             )));
             for l in output.lines() {
                 lines.push(Line::from(Span::styled(l.to_string(), theme::body_style())));
+            }
+        }
+
+        if self.cron_trigger_job_id.as_deref() == Some(j.id.as_str())
+            && let Some(message) = &self.cron_trigger_message
+        {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                crate::i18n::t("zc-dashboard-section-manual-run"),
+                theme::heading_style(),
+            )));
+            for l in message.lines() {
+                lines.push(Line::from(Span::styled(l.to_string(), theme::body_style())));
+            }
+        }
+
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            crate::i18n::t("zc-dashboard-section-recent-runs"),
+            theme::heading_style(),
+        )));
+        if self.cron_runs_job_id.as_deref() != Some(j.id.as_str()) {
+            lines.push(Line::from(Span::styled(
+                crate::i18n::t("zc-dashboard-loading-runs"),
+                theme::dim_style(),
+            )));
+        } else if let Some(error) = &self.cron_runs_error {
+            lines.push(Line::from(Span::styled(
+                format!("{}: {error}", crate::i18n::t("zc-dashboard-runs-error")),
+                theme::error_style(),
+            )));
+        } else if self.cron_runs.is_empty()
+            && self.cron_trigger_inflight_job_id.as_deref() != Some(j.id.as_str())
+        {
+            lines.push(Line::from(Span::styled(
+                crate::i18n::t("zc-dashboard-no-runs"),
+                theme::dim_style(),
+            )));
+        } else {
+            if self.cron_trigger_inflight_job_id.as_deref() == Some(j.id.as_str()) {
+                lines.push(Line::from(vec![
+                    Span::styled("#... ", theme::dim_style()),
+                    Span::styled(format!("{} ", truncate(&j.id, 24)), theme::dim_style()),
+                    Span::styled(
+                        format!("{:<10}", crate::i18n::t("zc-dashboard-run-pending-status")),
+                        theme::warn_style(),
+                    ),
+                    Span::styled(
+                        format!(
+                            "{}  {}",
+                            crate::i18n::t("zc-dashboard-run-pending-window"),
+                            format_duration_ms(None)
+                        ),
+                        theme::dim_style(),
+                    ),
+                ]));
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", crate::i18n::t("zc-dashboard-run-pending-output")),
+                    theme::dim_style(),
+                )));
+            }
+            for run in &self.cron_runs {
+                let status_style = cron_run_status_style(&run.status);
+                let run_window = if run.finished_at.trim().is_empty() {
+                    run.started_at.clone()
+                } else {
+                    format!("{} -> {}", run.started_at, run.finished_at)
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("#{} ", run.id), theme::dim_style()),
+                    Span::styled(
+                        format!("{} ", truncate(&run.job_id, 24)),
+                        theme::dim_style(),
+                    ),
+                    Span::styled(format!("{:<10}", run.status), status_style),
+                    Span::styled(
+                        format!("{}  {}", run_window, format_duration_ms(run.duration_ms)),
+                        theme::dim_style(),
+                    ),
+                ]));
+                if let Some(output) = run.output.as_deref().filter(|s| !s.trim().is_empty()) {
+                    for l in output.lines().take(3) {
+                        lines.push(Line::from(Span::styled(
+                            format!("  {}", truncate(l, 96)),
+                            theme::body_style(),
+                        )));
+                    }
+                }
             }
         }
 
@@ -1758,6 +1840,9 @@ impl Dashboard {
     // ── Key handling ─────────────────────────────────────────────
 
     pub(crate) async fn handle_key(&mut self, key: KeyEvent) -> bool {
+        if self.agent_rename.is_some() {
+            return self.handle_agent_rename_key(key).await;
+        }
         if self.search_active {
             return self.handle_search_key(key);
         }
@@ -1814,6 +1899,11 @@ impl Dashboard {
                 self.memory_detail_key = None;
                 self.session_messages.clear();
                 self.session_messages_id = None;
+                self.cron_runs.clear();
+                self.cron_runs_job_id = None;
+                self.cron_runs_error = None;
+                self.cron_trigger_job_id = None;
+                self.cron_trigger_message = None;
             }
             // Shift+J / Shift+K scroll the detail pane
             Some(DashboardTabAction::DetailScrollDown) => {
@@ -1849,6 +1939,9 @@ impl Dashboard {
                 self.search_active = true;
                 self.search_buf = self.search_query.clone();
             }
+            Some(DashboardTabAction::RenameAgent) if self.tab == Tab::Agents => {
+                self.begin_agent_rename();
+            }
             Some(DashboardTabAction::CopyDetail) => {
                 self.search_query.clear();
                 self.search_buf.clear();
@@ -1867,6 +1960,9 @@ impl Dashboard {
                     self.last_poll = None;
                 }
             }
+            Some(DashboardTabAction::TriggerCron) if self.tab == Tab::Cron => {
+                self.trigger_selected_cron();
+            }
             _ => {}
         }
         false
@@ -1880,13 +1976,13 @@ impl Dashboard {
         match DashboardTabAction::from_chord(&key) {
             Some(DashboardTabAction::NextTab) => self.next_tab(),
             Some(DashboardTabAction::PrevTab) => self.prev_tab(),
-            Some(DashboardTabAction::Tab1) => self.tab = Tab::Overview,
-            Some(DashboardTabAction::Tab2) => self.tab = Tab::Sessions,
-            Some(DashboardTabAction::Tab3) => self.tab = Tab::Agents,
-            Some(DashboardTabAction::Tab4) => self.tab = Tab::Memories,
-            Some(DashboardTabAction::Tab5) => self.tab = Tab::Health,
-            Some(DashboardTabAction::Tab6) => self.tab = Tab::Cost,
-            Some(DashboardTabAction::Tab7) => self.tab = Tab::Cron,
+            Some(DashboardTabAction::Tab1) => self.set_tab(Tab::Overview),
+            Some(DashboardTabAction::Tab2) => self.set_tab(Tab::Sessions),
+            Some(DashboardTabAction::Tab3) => self.set_tab(Tab::Agents),
+            Some(DashboardTabAction::Tab4) => self.set_tab(Tab::Memories),
+            Some(DashboardTabAction::Tab5) => self.set_tab(Tab::Health),
+            Some(DashboardTabAction::Tab6) => self.set_tab(Tab::Cost),
+            Some(DashboardTabAction::Tab7) => self.set_tab(Tab::Cron),
             Some(DashboardTabAction::Down) => self.move_list_down(),
             Some(DashboardTabAction::Up) => self.move_list_up(),
             Some(DashboardTabAction::OpenDetail) if self.has_detail_pane() => {
@@ -1900,6 +1996,9 @@ impl Dashboard {
                 self.search_active = true;
                 self.search_buf = self.search_query.clone();
             }
+            Some(DashboardTabAction::RenameAgent) if self.tab == Tab::Agents => {
+                self.begin_agent_rename();
+            }
             Some(DashboardTabAction::CopyDetail) => {
                 self.search_query.clear();
                 self.search_buf.clear();
@@ -1907,6 +2006,9 @@ impl Dashboard {
             }
             Some(DashboardTabAction::Refresh) => {
                 self.poll_data().await;
+            }
+            Some(DashboardTabAction::TriggerCron) if self.tab == Tab::Cron => {
+                self.trigger_selected_cron();
             }
             Some(DashboardTabAction::JumpEnd) => self.jump_to_end(),
             Some(DashboardTabAction::JumpStart) => self.jump_to_start(),
@@ -1942,6 +2044,135 @@ impl Dashboard {
         false
     }
 
+    fn begin_agent_rename(&mut self) {
+        let Some(idx) = self.selected_agent_index() else {
+            self.agent_rename_message = Some(DashboardMessage {
+                text: crate::i18n::t("zc-dashboard-no-agent"),
+                level: DashboardMessageLevel::Warn,
+            });
+            return;
+        };
+        let from = self.agents[idx].alias.clone();
+        self.agent_rename = Some(AgentRenameState {
+            from: from.clone(),
+            buf: from,
+        });
+        self.agent_rename_message = None;
+    }
+
+    async fn handle_agent_rename_key(&mut self, key: KeyEvent) -> bool {
+        use crate::keymap::ConfigEditorAction;
+        let action = ConfigEditorAction::from_chord(&key);
+        match action {
+            Some(ConfigEditorAction::Cancel) => {
+                self.agent_rename = None;
+                self.agent_rename_message = None;
+            }
+            Some(ConfigEditorAction::Confirm) => {
+                self.apply_agent_rename().await;
+            }
+            Some(ConfigEditorAction::Backspace) => {
+                if let Some(rename) = self.agent_rename.as_mut() {
+                    rename.buf.pop();
+                }
+            }
+            _ => {
+                if let KeyCode::Char(c) = key.code
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && let Some(rename) = self.agent_rename.as_mut()
+                {
+                    rename.buf.push(c);
+                }
+            }
+        }
+        false
+    }
+
+    async fn apply_agent_rename(&mut self) {
+        let Some(rename) = &self.agent_rename else {
+            return;
+        };
+        let from = rename.from.clone();
+        let to = rename.buf.trim().to_string();
+        if to.is_empty() {
+            self.agent_rename_message = Some(DashboardMessage {
+                text: crate::i18n::t("zc-dashboard-agent-rename-empty"),
+                level: DashboardMessageLevel::Error,
+            });
+            return;
+        }
+        if from == to {
+            self.agent_rename = None;
+            self.agent_rename_message = Some(DashboardMessage {
+                text: crate::i18n::t("zc-dashboard-agent-rename-unchanged"),
+                level: DashboardMessageLevel::Info,
+            });
+            return;
+        }
+
+        match self.rpc.config_map_key_rename("agents", &from, &to).await {
+            Ok(result) => {
+                self.agent_rename = None;
+                if let Ok(a) = self.rpc.agents_status().await {
+                    self.agents = a.agents;
+                    if !self.select_agent_alias(&to) {
+                        self.search_query.clear();
+                        self.search_buf.clear();
+                        self.select_agent_alias(&to);
+                    }
+                }
+                self.last_poll = None;
+                if result.renamed {
+                    if result.warnings.is_empty() {
+                        self.agent_rename_message = Some(DashboardMessage {
+                            text: crate::i18n::t_args(
+                                "zc-dashboard-agent-rename-success",
+                                &[("from", &from), ("to", &to)],
+                            ),
+                            level: DashboardMessageLevel::Info,
+                        });
+                    } else {
+                        let warnings = result.warnings.join("; ");
+                        self.agent_rename_message = Some(DashboardMessage {
+                            text: crate::i18n::t_args(
+                                "zc-dashboard-agent-rename-success-warnings",
+                                &[("from", &from), ("to", &to), ("warnings", &warnings)],
+                            ),
+                            level: DashboardMessageLevel::Warn,
+                        });
+                    }
+                } else {
+                    self.agent_rename_message = Some(DashboardMessage {
+                        text: crate::i18n::t("zc-dashboard-agent-rename-unchanged"),
+                        level: DashboardMessageLevel::Info,
+                    });
+                }
+            }
+            Err(e) => {
+                self.agent_rename_message = Some(DashboardMessage {
+                    text: crate::i18n::t_args(
+                        "zc-dashboard-agent-rename-failed",
+                        &[("error", &e.to_string())],
+                    ),
+                    level: DashboardMessageLevel::Error,
+                });
+            }
+        }
+    }
+
+    fn select_agent_alias(&mut self, alias: &str) -> bool {
+        let Some(pos) = self
+            .filtered_agent_indices()
+            .iter()
+            .position(|&idx| self.agents[idx].alias == alias)
+        else {
+            return false;
+        };
+        self.agent_state.select(Some(pos));
+        self.detail_scroll = 0;
+        true
+    }
+
     /// Called when the list selection changes while the detail pane is open.
     async fn on_selection_change(&mut self) {
         if self.tab == Tab::Sessions && self.detail_open {
@@ -1949,6 +2180,136 @@ impl Dashboard {
         }
         if self.tab == Tab::Memories && self.detail_open {
             self.load_memory_detail().await;
+        }
+        if self.tab == Tab::Cron && self.detail_open {
+            self.load_cron_runs().await;
+        }
+    }
+
+    async fn load_cron_runs(&mut self) {
+        let Some(idx) = self.selected_cron_index() else {
+            self.cron_runs.clear();
+            self.cron_runs_job_id = None;
+            self.cron_runs_error = None;
+            return;
+        };
+        let job_id = self.cron_jobs[idx].id.clone();
+        self.cron_runs_job_id = Some(job_id.clone());
+        match self.rpc.cron_runs(&job_id, Some(20)).await {
+            Ok(res) => {
+                if self.cron_runs_job_id.as_deref() == Some(job_id.as_str()) {
+                    self.cron_runs = res.runs;
+                    self.cron_runs_error = None;
+                }
+            }
+            Err(e) => {
+                if self.cron_runs_job_id.as_deref() == Some(job_id.as_str()) {
+                    self.cron_runs.clear();
+                    self.cron_runs_error = Some(e.to_string());
+                }
+            }
+        }
+    }
+
+    fn trigger_selected_cron(&mut self) {
+        let Some(idx) = self.selected_cron_index() else {
+            self.cron_trigger_job_id = None;
+            self.cron_trigger_message = Some(crate::i18n::t("zc-dashboard-no-job"));
+            return;
+        };
+        let job_id = self.cron_jobs[idx].id.clone();
+        if let Some(inflight_id) = self.cron_trigger_inflight_job_id.as_deref() {
+            self.cron_trigger_message = Some(crate::i18n::t_args(
+                "zc-dashboard-run-already-running",
+                &[("id", inflight_id)],
+            ));
+            return;
+        }
+
+        self.cron_trigger_job_id = Some(job_id.clone());
+        self.cron_trigger_message = Some(crate::i18n::t_args(
+            "zc-dashboard-run-running",
+            &[("id", &job_id)],
+        ));
+        self.cron_trigger_inflight_job_id = Some(job_id.clone());
+
+        let rpc = Arc::clone(&self.rpc);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.cron_trigger_rx = Some(rx);
+        tokio::spawn(async move {
+            let result = rpc.cron_trigger(&job_id).await.map_err(|e| e.to_string());
+            let jobs = rpc.cron_list().await.ok().map(|c| c.jobs);
+            let runs = Some(
+                rpc.cron_runs(&job_id, Some(20))
+                    .await
+                    .map(|r| r.runs)
+                    .map_err(|e| e.to_string()),
+            );
+            let _ = tx.send(CronTriggerUpdate {
+                job_id,
+                result,
+                jobs,
+                runs,
+            });
+        });
+        self.last_poll = None;
+    }
+
+    fn drain_cron_trigger_updates(&mut self) {
+        let Some(mut rx) = self.cron_trigger_rx.take() else {
+            return;
+        };
+        while let Ok(update) = rx.try_recv() {
+            if self.cron_trigger_inflight_job_id.as_deref() == Some(update.job_id.as_str()) {
+                self.cron_trigger_inflight_job_id = None;
+            }
+            self.cron_trigger_job_id = Some(update.job_id.clone());
+            match update.result {
+                Ok(result) => {
+                    let status = if result.success {
+                        crate::i18n::t("zc-dashboard-run-succeeded")
+                    } else {
+                        crate::i18n::t("zc-dashboard-run-failed")
+                    };
+                    let output = result.output.trim();
+                    self.cron_trigger_message = Some(if output.is_empty() {
+                        format!("{status}: {}", result.id)
+                    } else {
+                        format!("{status}: {}\n{}", result.id, output)
+                    });
+                }
+                Err(e) => {
+                    self.cron_trigger_message = Some(format!(
+                        "{}: {e}",
+                        crate::i18n::t("zc-dashboard-run-failed")
+                    ));
+                }
+            }
+            if let Some(jobs) = update.jobs {
+                self.cron_jobs = jobs;
+            }
+            let selected_matches = self
+                .selected_cron_index()
+                .and_then(|idx| self.cron_jobs.get(idx))
+                .is_some_and(|job| job.id == update.job_id);
+            if selected_matches || self.cron_runs_job_id.as_deref() == Some(update.job_id.as_str())
+            {
+                self.cron_runs_job_id = Some(update.job_id.clone());
+                match update.runs {
+                    Some(Ok(runs)) => {
+                        self.cron_runs = runs;
+                        self.cron_runs_error = None;
+                    }
+                    Some(Err(e)) => {
+                        self.cron_runs_error = Some(e);
+                    }
+                    None => {}
+                }
+            }
+            self.last_poll = None;
+        }
+        if self.cron_trigger_inflight_job_id.is_some() {
+            self.cron_trigger_rx = Some(rx);
         }
     }
 
@@ -1982,11 +2343,7 @@ impl Dashboard {
 
     // ── Mouse handling ───────────────────────────────────────────
 
-    pub(crate) fn handle_mouse(
-        &mut self,
-        evt: MouseEvent,
-        _content_area: Rect,
-    ) -> Option<DashboardMouseAction> {
+    pub(crate) fn handle_mouse(&mut self, evt: MouseEvent, _content_area: Rect) {
         use crossterm::event::MouseButton;
 
         let col = evt.column;
@@ -1994,6 +2351,15 @@ impl Dashboard {
 
         match evt.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                if self.tab == Tab::Agents
+                    && self.agent_rename.is_none()
+                    && let Some(area) = self.agent_alias_rename_area
+                    && mouse::in_rect(col, row, area)
+                {
+                    self.begin_agent_rename();
+                    return;
+                }
+
                 if self.tab == Tab::Overview
                     && mouse::in_rect(col, row, self.overview_agents_area)
                     && let Some(idx) = mouse::list_click_index(
@@ -2004,7 +2370,9 @@ impl Dashboard {
                     )
                     && let Some(agent) = self.agents.get(idx)
                 {
-                    return Some(DashboardMouseAction::OpenAgentConfig(agent.alias.clone()));
+                    let alias = agent.alias.clone();
+                    self.focus_agent(&alias);
+                    return;
                 }
 
                 // Tab bar clicks
@@ -2014,8 +2382,8 @@ impl Dashboard {
                     .collect();
                 let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
                 if let Some(idx) = mouse::tab_click_index(col, row, self.tab_area, &label_refs, 3) {
-                    self.tab = TABS[idx];
-                    return None;
+                    self.set_tab(TABS[idx]);
+                    return;
                 }
 
                 // List clicks
@@ -2058,20 +2426,25 @@ impl Dashboard {
             }
             _ => {}
         }
-        None
     }
 
     // ── Navigation helpers ───────────────────────────────────────
 
     fn next_tab(&mut self) {
         let idx = TABS.iter().position(|t| *t == self.tab).unwrap_or(0);
-        self.tab = TABS[(idx + 1) % TABS.len()];
-        self.on_tab_change();
+        self.set_tab(TABS[(idx + 1) % TABS.len()]);
     }
 
     fn prev_tab(&mut self) {
         let idx = TABS.iter().position(|t| *t == self.tab).unwrap_or(0);
-        self.tab = TABS[(idx + TABS.len() - 1) % TABS.len()];
+        self.set_tab(TABS[(idx + TABS.len() - 1) % TABS.len()]);
+    }
+
+    fn set_tab(&mut self, tab: Tab) {
+        if self.tab == tab {
+            return;
+        }
+        self.tab = tab;
         self.on_tab_change();
     }
 
@@ -2080,14 +2453,51 @@ impl Dashboard {
         self.detail_scroll = 0;
         self.health_scroll = 0;
         self.cost_scroll = 0;
+        self.cron_runs.clear();
+        self.cron_runs_job_id = None;
+        self.cron_runs_error = None;
+        self.cron_trigger_job_id = None;
+        self.cron_trigger_message = None;
+        self.agent_rename = None;
+        self.agent_rename_message = None;
+        self.agent_alias_rename_area = None;
         // Force immediate data fetch for new tab
         self.last_poll = None;
+    }
+
+    fn focus_agent(&mut self, alias: &str) {
+        self.set_tab(Tab::Agents);
+        self.search_query.clear();
+        self.search_buf.clear();
+        self.search_query_saved.clear();
+
+        let filtered = self.filtered_agent_indices();
+        if let Some(pos) = filtered
+            .iter()
+            .position(|&idx| self.agents[idx].alias == alias)
+        {
+            self.agent_state.select(Some(pos));
+        }
+        self.detail_open = true;
+        self.detail_scroll = 0;
+        self.detail_pct = 50;
     }
 
     fn has_detail_pane(&self) -> bool {
         matches!(
             self.tab,
             Tab::Sessions | Tab::Agents | Tab::Memories | Tab::Cron
+        )
+    }
+
+    fn cron_action_hint(&self) -> String {
+        use crate::keymap::{DashboardTabAction as D, action_key_labels};
+
+        let run = action_key_labels(D::TriggerCron).join("/");
+        let refresh = action_key_labels(D::Refresh).join("/");
+        crate::i18n::t_args(
+            "zc-dashboard-cron-action-hint",
+            &[("run", &run), ("refresh", &refresh)],
         )
     }
 
@@ -2151,17 +2561,16 @@ impl Dashboard {
         }
     }
 
-    /// Whether the pane is in a text-input mode (search bar active).
+    /// Whether the pane is in a text-input mode (search bar or rename prompt active).
     pub(crate) fn wants_text_input(&self) -> bool {
-        self.search_active
+        self.search_active || self.agent_rename.is_some()
     }
 
-    /// Route a bracketed-paste payload into the search buffer when the
-    /// search bar is open. Mirrors the char-insertion path in
-    /// `handle_search_key`, including the live-filter refresh for
-    /// client-side tabs; server-side tabs (sessions, memories) still
-    /// wait for Enter. Ignored when search isn't active.
     pub(crate) fn handle_paste(&mut self, text: &str) {
+        if let Some(rename) = self.agent_rename.as_mut() {
+            rename.buf.push_str(text);
+            return;
+        }
         if !self.search_active {
             return;
         }
@@ -2185,6 +2594,13 @@ impl crate::widgets::HelpContext for Dashboard {
             ]));
         }
 
+        if self.agent_rename.is_some() {
+            return HelpNode::entries(entries_for([
+                crate::keymap::SearchBoxAction::Accept,
+                crate::keymap::SearchBoxAction::Cancel,
+            ]));
+        }
+
         // Global tab-switching always available.
         let tab_nav = entries_for([D::NextTab, D::PrevTab, D::Tab1, D::Refresh]);
 
@@ -2202,6 +2618,10 @@ impl crate::widgets::HelpContext for Dashboard {
             ];
             if self.tab == Tab::Sessions {
                 detail.push(D::KillSession);
+            } else if self.tab == Tab::Cron {
+                detail.push(D::TriggerCron);
+            } else if self.tab == Tab::Agents {
+                detail.push(D::RenameAgent);
             }
             return HelpNode::entries(entries_for(detail));
         }
@@ -2214,14 +2634,21 @@ impl crate::widgets::HelpContext for Dashboard {
             }
             Tab::Sessions | Tab::Agents | Tab::Memories | Tab::Cron => {
                 entries.push(E::spacer());
-                entries.extend(entries_for([
+                let mut tab_actions = vec![
                     D::Up,
                     D::Down,
                     D::JumpEnd,
                     D::JumpStart,
                     D::OpenDetail,
                     D::BeginSearch,
-                ]));
+                ];
+                if self.tab == Tab::Cron {
+                    tab_actions.push(D::TriggerCron);
+                }
+                if self.tab == Tab::Agents {
+                    tab_actions.push(D::RenameAgent);
+                }
+                entries.extend(entries_for(tab_actions));
             }
         }
         HelpNode::entries(entries)
@@ -2235,6 +2662,41 @@ fn detail_line(label: &str, value: &str) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!("{label}{}", " ".repeat(pad)), theme::dim_style()),
         Span::styled(value.to_string(), theme::body_style()),
+    ])
+}
+
+fn cron_run_status_style(status: &str) -> Style {
+    if status.eq_ignore_ascii_case("ok") || status.eq_ignore_ascii_case("success") {
+        Style::default().fg(Color::Green)
+    } else if status.eq_ignore_ascii_case("error") || status.eq_ignore_ascii_case("failed") {
+        theme::error_style()
+    } else if status.eq_ignore_ascii_case("degraded") || status.eq_ignore_ascii_case("warning") {
+        theme::warn_style()
+    } else {
+        theme::body_style()
+    }
+}
+
+fn format_duration_ms(duration_ms: Option<i64>) -> String {
+    let Some(ms) = duration_ms else {
+        return "-".to_string();
+    };
+    if ms < 1_000 {
+        format!("{ms}ms")
+    } else if ms < 60_000 {
+        format!("{:.1}s", ms as f64 / 1_000.0)
+    } else {
+        format!("{:.1}m", ms as f64 / 60_000.0)
+    }
+}
+
+fn detail_action_line(label: &str, value: &str, action: &str) -> Line<'static> {
+    let pad = 12usize.saturating_sub(label.len());
+    Line::from(vec![
+        Span::styled(format!("{label}{}", " ".repeat(pad)), theme::dim_style()),
+        Span::styled(value.to_string(), theme::body_style()),
+        Span::styled("  ", theme::dim_style()),
+        Span::styled(format!("[{action}]"), theme::dim_style()),
     ])
 }
 
@@ -2327,21 +2789,6 @@ fn cost_period_windows() -> Vec<(String, String, String)> {
     ]
 }
 
-/// One organization/personal billed-scope row:
-/// `label  YTD $X (N tok)  proj/yr $Y`.
-///
-/// The projection prefers a run-rate (last FULL calendar month × 12, which
-/// captures acceleration); it falls back to linearly scaling YTD by the
-/// fraction of the year elapsed when fewer than two months are present. This
-/// mirrors the CLI report's projection.
-/// Build the organization-billing section for the Cost tab, appended after
-/// the local engine usage. The three states are deliberately distinct so a
-/// broken snapshot never renders identically to an absent one (the cost/org
-/// #8482 contract):
-/// - present (`org = Some`): billed org/personal rows + the FY note;
-/// - broken (`org = None`, `err = Some`): a warning line so the operator
-///   repairs `org_cost.json` instead of seeing the section silently vanish;
-/// - absent (`org = None`, `err = None`): no lines (the org row is omitted).
 fn org_section_lines(
     org: Option<&crate::client::OrgCost>,
     err: Option<&str>,
@@ -2463,6 +2910,269 @@ fn format_uptime(secs: u64) -> String {
     }
 }
 
+fn overview_status_lines(
+    connect_label: &str,
+    insecure_tls: bool,
+    status: &StatusResult,
+    health: Option<&serde_json::Value>,
+    code_cwd: Option<&str>,
+    chat_cwd: Option<&str>,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            format!("{:<11}", crate::i18n::t("zc-dashboard-label-daemon")),
+            theme::dim_style(),
+        ),
+        Span::styled(
+            daemon_label(connect_label).to_string(),
+            theme::accent_style(),
+        ),
+    ])];
+
+    if is_local_connection(connect_label) {
+        if let Some(socket) = status
+            .local_ipc_endpoint
+            .as_deref()
+            .or_else(|| local_socket_label(connect_label))
+        {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{:<11}", crate::i18n::t("zc-dashboard-label-socket")),
+                    theme::dim_style(),
+                ),
+                Span::styled(socket.to_string(), theme::body_style()),
+            ]));
+        }
+    } else if is_remote_connection(connect_label) {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{:<11}", crate::i18n::t("zc-dashboard-label-endpoint")),
+                theme::dim_style(),
+            ),
+            Span::styled(remote_endpoint_label(connect_label), theme::body_style()),
+        ]));
+    }
+
+    if insecure_tls {
+        lines.push(Line::from(Span::styled(
+            crate::i18n::t("zc-dashboard-label-insecure-tls"),
+            theme::warn_style(),
+        )));
+    }
+
+    lines.extend([
+        Line::from(vec![
+            Span::styled(
+                format!("{:<11}", crate::i18n::t("zc-dashboard-label-server")),
+                theme::dim_style(),
+            ),
+            Span::styled(format!("v{}", status.server_version), theme::body_style()),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                format!("{:<11}", crate::i18n::t("zc-dashboard-label-protocol")),
+                theme::dim_style(),
+            ),
+            Span::styled(format!("{}", status.protocol_version), theme::body_style()),
+        ]),
+    ]);
+
+    if let Some(config_path) = status
+        .config_file
+        .as_deref()
+        .or(status.config_dir.as_deref())
+    {
+        let mut spans = vec![
+            Span::styled(
+                format!("{:<11}", crate::i18n::t("zc-dashboard-label-config")),
+                theme::dim_style(),
+            ),
+            Span::styled(config_path.to_string(), theme::body_style()),
+        ];
+        if let Some(config_kind) = status.config_kind.as_ref() {
+            spans.extend([
+                Span::styled(" (", theme::body_style()),
+                Span::styled(
+                    config_kind_label(config_kind),
+                    config_kind_style(config_kind),
+                ),
+                Span::styled(")", theme::body_style()),
+            ]);
+        }
+        lines.push(Line::from(spans));
+    }
+
+    lines.extend(workspace_lines(code_cwd, chat_cwd));
+
+    if let Some(h) = health
+        && let Some(process) = h.get("process")
+    {
+        if let Some(rss) = process.get("rss_bytes").and_then(|v| v.as_u64())
+            && rss > 0
+        {
+            let total = process
+                .get("system_ram_total_bytes")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let rss_str = format_bytes(rss);
+            let val = if total > 0 {
+                let pct = (rss as f64 / total as f64) * 100.0;
+                format!("{rss_str} / {} ({pct:.1}%)", format_bytes(total))
+            } else {
+                rss_str
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{:<11}", crate::i18n::t("zc-dashboard-label-memory")),
+                    theme::dim_style(),
+                ),
+                Span::styled(val, theme::body_style()),
+            ]));
+        }
+        if let Some(cpu) = process.get("cpu_percent").and_then(|v| v.as_f64()) {
+            let ncpu = process
+                .get("num_cpus")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let val = if ncpu > 0 {
+                crate::i18n::t_args(
+                    "zc-dashboard-cpu-with-cores",
+                    &[("cpu", &format!("{cpu:.1}%")), ("cores", &ncpu.to_string())],
+                )
+            } else {
+                format!("{cpu:.1}%")
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{:<11}", crate::i18n::t("zc-dashboard-label-cpu")),
+                    theme::dim_style(),
+                ),
+                Span::styled(val, theme::body_style()),
+            ]));
+        } else {
+            let ncpu = process
+                .get("num_cpus")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let val = if ncpu > 0 {
+                crate::i18n::t_args(
+                    "zc-dashboard-cpu-with-cores",
+                    &[
+                        ("cpu", &crate::i18n::t("zc-dashboard-loading")),
+                        ("cores", &ncpu.to_string()),
+                    ],
+                )
+            } else {
+                crate::i18n::t("zc-dashboard-loading")
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{:<11}", crate::i18n::t("zc-dashboard-label-cpu")),
+                    theme::dim_style(),
+                ),
+                Span::styled(val, theme::dim_style()),
+            ]));
+        }
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{:<11}", crate::i18n::t("zc-dashboard-label-cpu")),
+                theme::dim_style(),
+            ),
+            Span::styled(crate::i18n::t("zc-dashboard-loading"), theme::dim_style()),
+        ]));
+    }
+
+    lines
+}
+
+fn config_kind_label(kind: &str) -> String {
+    match kind {
+        "default" => crate::i18n::t("zc-dashboard-config-kind-default"),
+        "custom" => crate::i18n::t("zc-dashboard-config-kind-custom"),
+        "temporary" => crate::i18n::t("zc-dashboard-config-kind-temporary"),
+        other => other.to_string(),
+    }
+}
+
+fn config_kind_style(kind: &str) -> Style {
+    match kind {
+        "default" => theme::body_style(),
+        "custom" => theme::accent_style(),
+        "temporary" => theme::warn_style(),
+        _ => theme::body_style(),
+    }
+}
+
+fn daemon_label(connect_label: &str) -> String {
+    if is_local_connection(connect_label) {
+        crate::i18n::t("zc-dashboard-daemon-local")
+    } else if is_remote_connection(connect_label) {
+        crate::i18n::t("zc-dashboard-daemon-remote")
+    } else {
+        connect_label.to_string()
+    }
+}
+
+fn is_local_connection(connect_label: &str) -> bool {
+    connect_label.starts_with("local:")
+}
+
+fn is_remote_connection(connect_label: &str) -> bool {
+    connect_label.starts_with("ws://") || connect_label.starts_with("wss://")
+}
+
+fn local_socket_label(connect_label: &str) -> Option<&str> {
+    connect_label.strip_prefix("local:")
+}
+
+fn remote_endpoint_label(connect_label: &str) -> String {
+    let Ok(url) = url::Url::parse(connect_label) else {
+        return connect_label.to_string();
+    };
+    if !matches!(url.scheme(), "ws" | "wss") {
+        return connect_label.to_string();
+    }
+
+    let mut safe = String::from(url.scheme());
+    safe.push_str("://");
+    if let Some(host) = url.host() {
+        safe.push_str(&host.to_string());
+    }
+    if let Some(port) = url.port() {
+        safe.push(':');
+        safe.push_str(&port.to_string());
+    }
+    safe
+}
+
+fn workspace_lines(code_cwd: Option<&str>, chat_cwd: Option<&str>) -> Vec<Line<'static>> {
+    match (code_cwd, chat_cwd) {
+        (Some(code), Some(chat)) if code != chat => vec![
+            status_row("zc-dashboard-label-code-cwd", code, theme::body_style()),
+            status_row("zc-dashboard-label-chat-cwd", chat, theme::body_style()),
+        ],
+        (Some(cwd), _) | (_, Some(cwd)) => {
+            vec![status_row(
+                "zc-dashboard-label-workspace",
+                cwd,
+                theme::body_style(),
+            )]
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn status_row(label_key: &str, value: &str, style: Style) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("{:<11}", crate::i18n::t(label_key)),
+            theme::dim_style(),
+        ),
+        Span::styled(value.to_string(), style),
+    ])
+}
+
 fn format_bytes(bytes: u64) -> String {
     if bytes >= 1_073_741_824 {
         format!("{:.1}G", bytes as f64 / 1_073_741_824.0)
@@ -2486,6 +3196,205 @@ mod tests {
             .map(|s| s.content.as_ref())
             .collect::<Vec<_>>()
             .join("|")
+    }
+
+    fn status_fixture() -> StatusResult {
+        StatusResult {
+            server_version: "0.8.2".into(),
+            protocol_version: 1,
+            active_sessions: 2,
+            config_dir: Some("/tmp/zc-profile".into()),
+            config_file: Some("/tmp/zc-profile/config.toml".into()),
+            config_kind: Some("temporary".into()),
+            local_ipc_endpoint: Some("/tmp/zc-profile/data/daemon.sock".into()),
+        }
+    }
+
+    #[test]
+    fn overview_status_lines_render_local_socket_not_endpoint() {
+        let status = status_fixture();
+        let text = lines_text(&overview_status_lines(
+            "local:/fallback.sock",
+            false,
+            &status,
+            None,
+            None,
+            None,
+        ));
+
+        assert!(
+            text.contains(&crate::i18n::t("zc-dashboard-daemon-local")),
+            "daemon label: {text}"
+        );
+        assert!(
+            text.contains("/tmp/zc-profile/data/daemon.sock"),
+            "local socket: {text}"
+        );
+        assert!(
+            !text.contains("/fallback.sock"),
+            "daemon socket wins: {text}"
+        );
+        assert!(
+            !text.contains("wss://"),
+            "must not render remote endpoint: {text}"
+        );
+    }
+
+    #[test]
+    fn overview_status_lines_render_remote_endpoint_and_insecure_tls() {
+        let status = status_fixture();
+        let text = lines_text(&overview_status_lines(
+            "wss://zero.example.test:9781",
+            true,
+            &status,
+            None,
+            None,
+            None,
+        ));
+
+        assert!(
+            text.contains(&crate::i18n::t("zc-dashboard-daemon-remote")),
+            "daemon label: {text}"
+        );
+        assert!(
+            text.contains("wss://zero.example.test:9781"),
+            "remote endpoint: {text}"
+        );
+        assert!(
+            text.contains(&crate::i18n::t("zc-dashboard-label-insecure-tls")),
+            "insecure TLS warning: {text}"
+        );
+        assert!(
+            !text.contains("/tmp/zc-profile/data/daemon.sock"),
+            "remote view must not label socket as endpoint: {text}"
+        );
+    }
+
+    #[test]
+    fn overview_status_lines_redacts_remote_endpoint_credentials() {
+        let status = status_fixture();
+        let text = lines_text(&overview_status_lines(
+            "wss://user:secret@zero.example.test:9781/rpc?token=abc#frag",
+            false,
+            &status,
+            None,
+            None,
+            None,
+        ));
+
+        assert!(
+            text.contains("wss://zero.example.test:9781"),
+            "safe endpoint: {text}"
+        );
+        assert!(!text.contains("/rpc"), "must redact path: {text}");
+        assert!(!text.contains("user"), "must redact userinfo: {text}");
+        assert!(!text.contains("secret"), "must redact password: {text}");
+        assert!(!text.contains("token"), "must redact query: {text}");
+        assert!(!text.contains("frag"), "must redact fragment: {text}");
+    }
+
+    #[test]
+    fn overview_status_lines_collapse_shared_workspace() {
+        let status = status_fixture();
+        let text = lines_text(&overview_status_lines(
+            "local:/daemon.sock",
+            false,
+            &status,
+            None,
+            Some("/work/shared"),
+            Some("/work/shared"),
+        ));
+
+        assert!(
+            text.contains(&crate::i18n::t("zc-dashboard-label-workspace")),
+            "shared workspace row: {text}"
+        );
+        assert!(!text.contains(&crate::i18n::t("zc-dashboard-label-code-cwd")));
+        assert!(!text.contains(&crate::i18n::t("zc-dashboard-label-chat-cwd")));
+        assert!(text.contains("/work/shared"), "workspace value: {text}");
+    }
+
+    #[test]
+    fn overview_status_lines_split_different_workspaces() {
+        let status = status_fixture();
+        let text = lines_text(&overview_status_lines(
+            "local:/daemon.sock",
+            false,
+            &status,
+            None,
+            Some("/work/code"),
+            Some("/work/chat"),
+        ));
+
+        assert!(
+            text.contains(&crate::i18n::t("zc-dashboard-label-code-cwd")),
+            "code cwd row: {text}"
+        );
+        assert!(
+            text.contains(&crate::i18n::t("zc-dashboard-label-chat-cwd")),
+            "chat cwd row: {text}"
+        );
+        assert!(text.contains("/work/code"), "code cwd value: {text}");
+        assert!(text.contains("/work/chat"), "chat cwd value: {text}");
+    }
+
+    #[test]
+    fn overview_status_lines_render_cpu_loading_before_sample() {
+        let status = status_fixture();
+        let health = serde_json::json!({
+            "process": {
+                "rss_bytes": 1_048_576_u64,
+                "system_ram_total_bytes": 4_194_304_u64,
+                "num_cpus": 8_u64
+            }
+        });
+        let text = lines_text(&overview_status_lines(
+            "local:/daemon.sock",
+            false,
+            &status,
+            Some(&health),
+            None,
+            None,
+        ));
+
+        assert!(text.contains("1.0M / 4.0M (25.0%)"), "memory: {text}");
+        assert!(
+            text.contains(&crate::i18n::t_args(
+                "zc-dashboard-cpu-with-cores",
+                &[
+                    ("cpu", &crate::i18n::t("zc-dashboard-loading")),
+                    ("cores", "8"),
+                ],
+            )),
+            "cpu loading: {text}"
+        );
+    }
+
+    #[test]
+    fn overview_status_lines_render_cpu_value_with_core_count() {
+        let status = status_fixture();
+        let health = serde_json::json!({
+            "process": {
+                "cpu_percent": 12.345_f64,
+                "num_cpus": 8_u64
+            }
+        });
+        let text = lines_text(&overview_status_lines(
+            "local:/daemon.sock",
+            false,
+            &status,
+            Some(&health),
+            None,
+            None,
+        ));
+
+        assert!(
+            text.contains(&crate::i18n::t_args(
+                "zc-dashboard-cpu-with-cores",
+                &[("cpu", "12.3%"), ("cores", "8")],
+            )),
+            "cpu value: {text}"
+        );
     }
 
     #[test]
@@ -2568,5 +3477,13 @@ mod tests {
     #[test]
     fn truncate_uses_first_line_only() {
         assert_eq!(truncate("first\nsecond", 40), "first");
+    }
+
+    #[test]
+    fn format_duration_ms_scales_units() {
+        assert_eq!(format_duration_ms(None), "-");
+        assert_eq!(format_duration_ms(Some(42)), "42ms");
+        assert_eq!(format_duration_ms(Some(1_500)), "1.5s");
+        assert_eq!(format_duration_ms(Some(90_000)), "1.5m");
     }
 }

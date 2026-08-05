@@ -1,8 +1,4 @@
 //! Parse and serialize canonical `SKILL.md` files.
-//!
-//! A [`SkillDocument`] is the on-disk pair of frontmatter and body. The
-//! splitter [`split_frontmatter`] is shared with the legacy `parse_skill_markdown`
-//! path in `super` so both readers see the same delimiter rules.
 
 use std::fmt::Write as _;
 
@@ -47,6 +43,7 @@ impl SkillDocument {
         write_optional(&mut out, "version", self.frontmatter.version.as_deref());
         write_optional(&mut out, "category", self.frontmatter.category.as_deref());
         write_tags(&mut out, &self.frontmatter.tags);
+        write_bool(&mut out, "always", self.frontmatter.always);
         write_slash_options(&mut out, &self.frontmatter.slash_options);
         out.push_str("---\n");
         if !self.body.is_empty() {
@@ -117,7 +114,7 @@ fn parse_frontmatter(src: &str) -> Result<SkillFrontmatter, DocumentParseError> 
         }
         // YAML block list under `tags:` — consume `- item` continuation lines
         // until a non-list line. Mirrors the loader's parser so both readers
-        // agree on tag shape (zeroclaw-labs/zeroclaw#7490 reads the same tags).
+        // agree on tag shapereads the same tags).
         if collecting_tags {
             let trimmed = line.trim();
             if let Some(item) = trimmed.strip_prefix("- ") {
@@ -181,6 +178,7 @@ fn assign(fm: &mut SkillFrontmatter, key: &str, value: &str) {
         "author" => fm.author = Some(value.to_string()),
         "version" => fm.version = Some(value.to_string()),
         "category" => fm.category = Some(value.to_string()),
+        "always" => fm.always = value.eq_ignore_ascii_case("true"),
         _ => {}
     }
 }
@@ -222,21 +220,18 @@ fn write_tags(out: &mut String, tags: &[String]) {
     let _ = writeln!(out, "tags: [{}]", tags.join(", "));
 }
 
-// ─── Nested `slash_options:` (the one non-flat field) ──────────────────────
-//
-// Parsed/serialized here and shared with the loader's `parse_simple_frontmatter`
-// so both readers agree on the shape. A scoped, dependency-free parser for the
-// exact YAML subset the serializer below emits — see `parse_slash_options`.
+/// Serialize a bool flag, omitted when `false` (the default) so an
+/// `always`-less skill round-trips byte-identical.
+fn write_bool(out: &mut String, key: &str, value: bool) {
+    if value {
+        let _ = writeln!(out, "{key}: true");
+    }
+}
 
 fn indent_of(line: &str) -> usize {
     line.len() - line.trim_start().len()
 }
 
-/// Locate a top-level `slash_options:` block as a `[start, end)` line range
-/// (header line included). The block is the header plus every following indented
-/// (or blank) line, ending at the next top-level non-blank line or EOF. Only the
-/// block form (`slash_options:` with an empty inline value) is recognized; an
-/// inline `slash_options: [...]` is intentionally ignored.
 fn locate_slash_options_block(src: &str) -> Option<(usize, usize)> {
     let lines: Vec<&str> = src.lines().collect();
     let start = lines.iter().position(|line| {
@@ -260,27 +255,6 @@ fn locate_slash_options_block(src: &str) -> Option<(usize, usize)> {
     Some((start, end))
 }
 
-/// Parse the nested `slash_options:` block from a SKILL.md frontmatter source.
-/// Absent block → empty. Lenient by design (matching the flat parser): an option
-/// missing `name` or `type` is dropped rather than failing the whole parse.
-///
-/// Supported subset (exactly what `write_slash_options` emits — keeps the
-/// hand-rolled parser tractable, no YAML dependency):
-/// ```text
-/// slash_options:
-///   - name: format
-///     description: Output format.
-///     type: string
-///     required: true
-///     choices: [{name: Email, value: email}, {name: Tweet, value: tweet}]
-///   - name: words
-///     type: integer
-///     min: 10
-///     max: 2000
-/// ```
-/// `choices` accepts an inline flow list (above) or a block list of single-line
-/// flow maps (`    - {name: X, value: Y}`). Option descriptions are single-line
-/// (no block scalars inside an option).
 pub(crate) fn parse_slash_options(src: &str) -> Vec<SkillSlashOption> {
     let Some((start, end)) = locate_slash_options_block(src) else {
         return Vec::new();
@@ -584,11 +558,36 @@ mod tests {
                 version: Some("0.2.0".into()),
                 category: Some("coding".into()),
                 tags: vec!["slash".into(), "ops".into()],
+                always: false,
                 slash_options: Vec::new(),
             },
             body: "# Code Review\n\nReviews diffs.\n".into(),
         };
         let parsed = SkillDocument::parse(&original.serialize()).unwrap();
+        assert_eq!(parsed.frontmatter, original.frontmatter);
+    }
+
+    #[test]
+    fn round_trips_always_true_flag() {
+        let original = SkillDocument {
+            frontmatter: SkillFrontmatter {
+                name: "security-policy".into(),
+                description: "Critical safety rules the agent must never skip.".into(),
+                always: true,
+                ..Default::default()
+            },
+            body: "# Security Policy\n\nNever skip the safety review.\n".into(),
+        };
+        let serialized = original.serialize();
+        assert!(
+            serialized.contains("always: true"),
+            "serialize() must emit the always flag when true:\n{serialized}"
+        );
+        let parsed = SkillDocument::parse(&serialized).unwrap();
+        assert!(
+            parsed.frontmatter.always,
+            "always: true must survive the serialize -> parse round-trip"
+        );
         assert_eq!(parsed.frontmatter, original.frontmatter);
     }
 
