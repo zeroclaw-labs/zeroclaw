@@ -1,9 +1,4 @@
 //! Fluent helpers for tool-facing strings.
-//!
-//! `zeroclaw-runtime` also reads `tools.ftl`, but this crate cannot depend on
-//! runtime because runtime depends on tool implementations. Keep this helper
-//! local and narrow so tools can route their own schemas and results through
-//! the same catalogue without reversing the crate graph.
 
 use fluent::{FluentArgs, FluentBundle, FluentResource};
 use std::collections::HashMap;

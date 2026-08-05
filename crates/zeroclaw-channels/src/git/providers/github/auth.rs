@@ -26,18 +26,33 @@ struct Claims {
 
 pub struct AppAuth {
     app_id: u64,
-    private_key_path: String,
+    /// Inline RS256 private key PEM.
+    private_key_pem: Option<String>,
     /// Parsed encoding key, loaded lazily on first use.
     key: parking_lot::Mutex<Option<EncodingKey>>,
     /// Cached installation token (one installation per channel alias).
     token: parking_lot::Mutex<Option<CachedToken>>,
 }
 
+impl std::fmt::Debug for AppAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppAuth")
+            .field("app_id", &self.app_id)
+            .field(
+                "private_key_pem",
+                &self.private_key_pem.as_ref().map(|_| "***"),
+            )
+            .field("key", &"<redacted>")
+            .field("token", &"<redacted>")
+            .finish()
+    }
+}
+
 impl AppAuth {
-    pub fn new(app_id: u64, private_key_path: String) -> Self {
+    pub fn new(app_id: u64, private_key_pem: Option<String>) -> Self {
         Self {
             app_id,
-            private_key_path,
+            private_key_pem: private_key_pem.filter(|p| !p.trim().is_empty()),
             key: parking_lot::Mutex::new(None),
             token: parking_lot::Mutex::new(None),
         }
@@ -87,37 +102,13 @@ impl AppAuth {
     }
 
     fn load_key(&self) -> Result<EncodingKey, GitChannelError> {
-        let path = shellexpand::tilde(&self.private_key_path).into_owned();
-        let pem = std::fs::read(&path).map_err(|source| GitChannelError::KeyRead {
-            path: path.clone(),
-            source,
-        })?;
-        warn_on_loose_permissions(&path);
-        Ok(EncodingKey::from_rsa_pem(&pem)?)
+        let pem = self
+            .private_key_pem
+            .as_ref()
+            .ok_or(GitChannelError::MissingPrivateKey)?;
+        Ok(EncodingKey::from_rsa_pem(pem.as_bytes())?)
     }
 }
-
-/// The private key is a long-lived credential: group/other access on the
-/// key file is operator error worth surfacing, but not worth refusing to
-/// start over.
-#[cfg(unix)]
-fn warn_on_loose_permissions(path: &str) {
-    use std::os::unix::fs::MetadataExt;
-    let Ok(meta) = std::fs::metadata(path) else {
-        return;
-    };
-    if meta.mode() & 0o077 != 0 {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_attrs(::serde_json::json!({"path": path})),
-            "GitHub App private key is readable by group/other; chmod 600 recommended"
-        );
-    }
-}
-
-#[cfg(not(unix))]
-fn warn_on_loose_permissions(_path: &str) {}
 
 /// Throwaway 2048-bit RSA key generated for unit tests only, never
 /// registered with any real GitHub App. Shared with the channel-level
@@ -161,13 +152,9 @@ fjoU4xl9y5oLMVZZ+YPF2qw=
 mod tests {
     use super::*;
     use base64::Engine;
-    use std::io::Write;
 
-    fn auth_with_test_key() -> (AppAuth, tempfile::NamedTempFile) {
-        let mut file = tempfile::NamedTempFile::new().unwrap();
-        file.write_all(TEST_KEY_PEM.as_bytes()).unwrap();
-        let auth = AppAuth::new(12345, file.path().to_string_lossy().into_owned());
-        (auth, file)
+    fn auth_with_test_key() -> AppAuth {
+        AppAuth::new(12345, Some(TEST_KEY_PEM.to_string()))
     }
 
     fn decode_payload(jwt: &str) -> serde_json::Value {
@@ -180,7 +167,7 @@ mod tests {
 
     #[test]
     fn mint_jwt_signs_rs256_with_app_id_issuer() {
-        let (auth, _file) = auth_with_test_key();
+        let auth = auth_with_test_key();
         let jwt = auth.mint_jwt_at(1_000_000).unwrap();
 
         let header = jsonwebtoken::decode_header(&jwt).unwrap();
@@ -193,24 +180,46 @@ mod tests {
     }
 
     #[test]
-    fn mint_jwt_fails_when_key_file_missing() {
-        let auth = AppAuth::new(1, "/nonexistent/github-app.pem".into());
+    fn mint_jwt_fails_when_key_unset() {
+        let auth = AppAuth::new(1, None);
         let err = auth.mint_jwt().unwrap_err();
-        assert!(matches!(err, GitChannelError::KeyRead { .. }));
+        assert!(matches!(err, GitChannelError::MissingPrivateKey));
+    }
+
+    #[test]
+    fn blank_inline_pem_is_treated_as_unset() {
+        let auth = AppAuth::new(9, Some("   ".into()));
+        let err = auth.mint_jwt().unwrap_err();
+        assert!(matches!(err, GitChannelError::MissingPrivateKey));
     }
 
     #[test]
     fn mint_jwt_fails_on_garbage_key() {
-        let mut file = tempfile::NamedTempFile::new().unwrap();
-        file.write_all(b"not a pem").unwrap();
-        let auth = AppAuth::new(1, file.path().to_string_lossy().into_owned());
+        let auth = AppAuth::new(1, Some("not a pem".into()));
         let err = auth.mint_jwt().unwrap_err();
         assert!(matches!(err, GitChannelError::Jwt(_)));
     }
 
     #[test]
+    fn debug_redacts_inline_private_key() {
+        let auth = AppAuth::new(
+            7,
+            Some(
+                "-----BEGIN RSA PRIVATE KEY-----\nSUPERSECRETPEM\n-----END RSA PRIVATE KEY-----"
+                    .into(),
+            ),
+        );
+        let out = format!("{auth:?}");
+        assert!(
+            !out.contains("SUPERSECRETPEM"),
+            "Debug must not print the raw private key PEM"
+        );
+        assert!(out.contains("***"), "Debug must mask the private key");
+    }
+
+    #[test]
     fn token_cache_returns_only_fresh_tokens() {
-        let (auth, _file) = auth_with_test_key();
+        let auth = auth_with_test_key();
         assert!(auth.cached_token().is_none());
 
         auth.store_token(CachedToken {

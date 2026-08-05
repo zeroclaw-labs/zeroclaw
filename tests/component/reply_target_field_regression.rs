@@ -1,5 +1,4 @@
 //! Regression guard for ChannelMessage field naming consistency.
-//!
 //! This test prevents accidental reintroduction of the removed `reply_to` field
 //! in Rust source code where `reply_target` must be used.
 

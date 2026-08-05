@@ -1,11 +1,4 @@
 //! Outbound media markers and the egress trust boundary.
-//!
-//! The agent emits `[IMAGE:…]` / `[DOCUMENT:…]` / `[VIDEO:…]` / `[AUDIO:…]` /
-//! `[VOICE:…]` markers in its reply text. This module parses them out, validates
-//! each target against the workspace sandbox (only `http(s)` URLs and absolute
-//! paths inside `workspace_dir` may be exposed to chatters), and renders the
-//! count-only delivery-failure note and the 🚫/⚠️ reactions when a target is
-//! dropped.
 
 use anyhow::Context as _;
 use serde::Deserialize;
@@ -96,19 +89,6 @@ pub(crate) fn parse_attachment_markers(message: &str) -> (String, Vec<DiscordAtt
 
     (cleaned.trim().to_string(), attachments)
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Embed author surface: the `[EMBED:{json}]` marker
-//
-// An agent emits `[EMBED:{ …discord embed json… }]` to attach a rich embed.
-// Unlike the media markers (whose payload is a single path/URL), the embed
-// payload is a JSON object that may itself contain `]`, so it is extracted with
-// a brace-aware scan rather than the first-`]` rule. Every URL the author puts
-// in an embed (image/thumbnail/url/author.url/author.icon_url/footer.icon_url)
-// is fetched or linked by Discord, so each routes through the same
-// `validate_marker_target` egress trust boundary as a media marker — only
-// `http(s)` URLs survive; local paths and other schemes are dropped.
-// ─────────────────────────────────────────────────────────────────────────────
 
 const EMBED_TAG: &str = "[EMBED:";
 
@@ -224,12 +204,6 @@ pub(crate) fn parse_embed_markers(message: &str) -> (String, Vec<EmbedSpec>) {
     (cleaned.trim().to_string(), specs)
 }
 
-/// Scan a single `[EMBED:{json}]` whose `[` is at `tag_start`. Locates the
-/// structural span first (so a serde rejection can still be skipped over as a
-/// unit), then attempts to deserialize. Returns:
-/// * `None` — not a structural marker (no `{`, unbalanced braces, no `]`),
-/// * `Some((end, Some(spec)))` — a valid marker ending just past `]` at `end`,
-/// * `Some((end, None))` — a structural span whose JSON was invalid.
 fn scan_one_embed(message: &str, tag_start: usize) -> Option<(usize, Option<EmbedSpec>)> {
     let after_tag = tag_start + EMBED_TAG.len();
     let brace = next_non_ws(message, after_tag)?;
@@ -299,11 +273,6 @@ fn find_ci(haystack: &str, needle: &str) -> Option<usize> {
     (0..=h.len() - n.len()).find(|&i| h[i..i + n.len()].eq_ignore_ascii_case(n))
 }
 
-/// Convert an author [`EmbedSpec`] into a wire [`DiscordEmbed`], routing every
-/// URL through [`validate_marker_target`]: only `http(s)` URLs survive (Discord
-/// fetches/links them server-side), so a local path or disallowed scheme drops
-/// that field and records a [`DiscordMarkerFailure`]. Returns `None` when the
-/// embed has no content left to render.
 pub(crate) fn spec_to_embed(
     spec: EmbedSpec,
     workspace_dir: Option<&Path>,
@@ -381,22 +350,6 @@ fn vet_embed_url(url: &str, workspace_dir: Option<&Path>) -> Result<String, Disc
         Err(e) => Err(e.kind()),
     }
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Interactive components marker — `[COMPONENTS:{json}]`
-//
-// The agent emits a single `[COMPONENTS:{…}]` marker carrying one JSON object
-// `{"rows": [ [ <component>, … ], … ]}`. Each action button / select option may
-// carry a server-side `prompt` that is enqueued as a new agent turn when the
-// component is clicked. The marker is parsed out on the outgoing path (`send`),
-// its prompts are registered in the channel's single-use `PendingComponents`
-// registry, and the rendered action rows ride along on the first message chunk.
-//
-// Trust note: the `prompt` is the *agent's own* text (same trust as any other
-// model output). It is registered server-side at emit time and bound to a
-// freshly-minted `custom_id`; a click resolves only that registered prompt and
-// never anything reconstructed from the click payload (see `pending.rs`).
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// One component declared inside a `[COMPONENTS:{…}]` row.
 #[derive(Debug, Clone, PartialEq)]
@@ -655,23 +608,6 @@ fn parse_components_body(json: &str) -> Option<Vec<Vec<ComponentSpec>>> {
 /// The marker tag, including the trailing colon — `[COMPONENTS:`.
 const COMPONENTS_TAG: &str = "[COMPONENTS:";
 
-/// Strip *every* `[COMPONENTS:{json}]` marker from `message`, returning the
-/// fully-stripped text and the merged row specs from all markers (empty when
-/// none were present). JSON-aware: a marker body is a JSON object that itself
-/// contains `[`/`]`, so the close bracket is found by tracking brace depth and
-/// string state rather than the first `]`.
-///
-/// All recognised markers are consumed and their rows concatenated in emission
-/// order — an agent that emits several `[COMPONENTS:…]` markers (e.g. one per
-/// row while composing a "kitchen sink" reply) gets them merged onto the one
-/// message. The downstream builder caps the merged rows to Discord's 5
-/// action-row limit.
-///
-/// Extent + repair are delegated to [`find_marker_extent`], which is
-/// **prose-safe**: it never consumes user text outside a marker. A `[COMPONENTS:`
-/// that isn't a recognisable marker is left verbatim (its raw tag may show, but
-/// no surrounding words are ever deleted) and scanning resumes *after* the tag,
-/// so one garbled marker neither eats prose nor suppresses a later valid one.
 pub(crate) fn parse_component_markers(message: &str) -> (String, Vec<Vec<ComponentSpec>>) {
     let mut cleaned = String::with_capacity(message.len());
     let mut rows: Vec<Vec<ComponentSpec>> = Vec::new();
@@ -692,11 +628,6 @@ pub(crate) fn parse_component_markers(message: &str) -> (String, Vec<Vec<Compone
                 rest = &rest[body_start + consumed..];
             }
             None => {
-                // Not a marker I can safely strip (under-closed with prose after,
-                // or a body that doesn't parse). Keep the tag verbatim and resume
-                // scanning AFTER it: never delete surrounding words, never let one
-                // bad `[COMPONENTS:` suppress a later valid marker. `body_start`
-                // is past the ASCII tag, so this also guarantees forward progress.
                 cleaned.push_str(&rest[..body_start]);
                 rest = &rest[body_start..];
             }
@@ -706,11 +637,6 @@ pub(crate) fn parse_component_markers(message: &str) -> (String, Vec<Vec<Compone
     (cleaned.trim().to_string(), rows)
 }
 
-/// Byte offset of the closing `]` of a `[COMPONENTS:{json}]` marker whose body is
-/// bracket-balanced (relative to `after_tag`), or `None` when the body never
-/// returns to depth 0 at a `]` (it is under-closed). String/escape-aware so a
-/// `]` inside a JSON string is ignored. The first depth-0 `]` is the structural
-/// end of a balanced body, so this never crosses into trailing prose.
 fn strict_marker_close(after_tag: &str) -> Option<usize> {
     let mut depth: i64 = 0;
     let mut in_string = false;
@@ -741,12 +667,6 @@ fn strict_marker_close(after_tag: &str) -> Option<usize> {
     None
 }
 
-/// Balance the brackets of a JSON body: insert the closer the model dropped (or
-/// mis-ordered) and append closers for anything still open at the end; an extra
-/// closer with nothing open is dropped. String/escape-aware. Only brackets are
-/// touched — a value-level JSON error still fails the later parse (and is
-/// tolerated). Operates ONLY on the supplied body slice, so it can never consume
-/// text outside the marker.
 fn repair_brackets(body: &str) -> String {
     let mut out = String::with_capacity(body.len() + 4);
     let mut stack: Vec<char> = Vec::new();
@@ -800,33 +720,7 @@ fn repair_brackets(body: &str) -> String {
     out
 }
 
-/// Locate a `[COMPONENTS:]` marker's extent + parsed rows, given the text right
-/// after `[COMPONENTS:`. Returns `(consumed, rows)` where `consumed` is the byte
-/// length through the marker's closing `]`. `None` means "not a marker I can
-/// safely strip" — the caller keeps the tag verbatim and keeps scanning.
-///
-/// Prose-safety invariant: a `[COMPONENTS:` is stripped only when the slice up
-/// to its close is one valid JSON value. `serde_json::from_str` requires the
-/// *whole* slice to validate, so a slice contaminated with user prose can never
-/// qualify — prose is never deleted.
-///
-/// A balanced body is closed by [`strict_marker_close`] (the first depth-0 `]`)
-/// and accepted when that slice validates; for an over-/under-opened body strict
-/// can land on a `]` sitting in trailing prose, but the contaminated slice fails
-/// to validate so we fall through. An under-closed body (the model dropped a
-/// closer — observed live: `…}]}]}]` for `…}]}]]}]`) is bracket-repaired ONLY
-/// when the marker is trailing (whitespace only after the last `]`, so there is
-/// no prose to eat), holds no second `[COMPONENTS:`, and the repaired body parses
-/// into rows. Anything else is left verbatim — its raw JSON may show (a
-/// recoverable leak), but no surrounding words are ever lost.
 fn find_marker_extent(after_tag: &str) -> Option<(usize, Vec<Vec<ComponentSpec>>)> {
-    // Case 1 — strip only when the whole slice up to the strict close is one
-    // valid JSON value. serde's `from_str` requires exactly that, so a slice
-    // carrying trailing/embedded prose (an over-/under-opened body whose strict
-    // close landed on a `]` sitting in user text) can never qualify — prose is
-    // never deleted. A valid body that renders no rows (e.g. a modal button
-    // missing its fields, or an empty select) is still a marker: strip it so its
-    // raw JSON doesn't leak, with empty rows.
     if let Some(close) = strict_marker_close(after_tag) {
         let body = &after_tag[..close];
         if serde_json::from_str::<serde_json::Value>(body.trim()).is_ok() {
@@ -854,11 +748,6 @@ pub(crate) enum DiscordMarkerTarget {
     Http(String),
 }
 
-/// Why a marker target was rejected. Drives the user-facing emoji reaction
-/// on the bot's outgoing message: `Refused` (trust-boundary rejection) maps
-/// to 🚫, `NotFound` (path didn't resolve on disk) maps to ⚠️. The
-/// distinction matters because a chatter should see at a glance that the
-/// bot deliberately declined a target rather than tried and failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DiscordMarkerFailure {
     /// Trust-boundary refusal: disallowed scheme, relative path, missing
@@ -892,22 +781,6 @@ impl std::fmt::Display for DiscordMarkerError {
     }
 }
 
-/// Validate an outbound marker target against Discord's trust-boundary policy.
-///
-/// The orchestrator system prompt mandates absolute paths for media markers,
-/// and the workspace is the only directory the agent is authorised to
-/// expose to chatters:
-///
-/// * `http`/`https` URLs are accepted and inlined as links.
-/// * Any other URL scheme (`file:`, `data:`, custom `://`) is refused.
-/// * Local paths must be absolute. Relative paths are agent
-///   misconfiguration and dropped, not silently resolved against cwd.
-/// * Absolute paths are canonicalised and must resolve inside
-///   `workspace_dir`. Anything outside or any traversal escape is
-///   refused; a path that simply doesn't exist on disk returns
-///   `NotFound`, which the caller renders differently from a refusal.
-/// * When `workspace_dir` is not configured, no local path can be safely
-///   bounded, so all local targets are refused.
 pub(crate) fn validate_marker_target(
     target: &str,
     workspace_dir: Option<&Path>,
@@ -1310,12 +1183,6 @@ mod component_marker_tests {
 
     #[test]
     fn repairs_dropped_rows_closing_bracket() {
-        // Regression (live capture): the model dropped the `]` that closes the
-        // "rows" array — it emitted `…}]}]}]` where a balanced body needs
-        // `…}]}]]}]`. Previously the marker had no findable close, leaked raw,
-        // and rendered nothing. The tolerant scanner repairs the single missing
-        // closer and recovers all rows. Note the `}]` (missing rows `]`) after
-        // row 2 instead of `]]`.
         let msg = concat!(
             "[COMPONENTS:{\"rows\":[",
             "[{\"label\":\"A\",\"style\":\"primary\",\"prompt\":\"pa\"}],",
@@ -1346,11 +1213,6 @@ mod component_marker_tests {
 
     #[test]
     fn mid_message_under_closed_marker_preserves_prose() {
-        // The model dropped a body closer, leaving the marker under-closed, and a
-        // later bare `]` sits in trailing prose. The scanner MUST NOT walk forward
-        // eating the user's words to reach that `]`. All prose is preserved (the
-        // raw tag may show, but no text is deleted) and nothing renders. This is
-        // the data-loss regression the bracket-repair scanner must never cause.
         let msg = "Status update: [COMPONENTS:{\"rows\":[[{\"label\":\"Ack\",\"prompt\":\"ack\"}]] all good, deploy finished] thanks everyone";
         let (cleaned, rows) = parse_component_markers(msg);
         assert!(

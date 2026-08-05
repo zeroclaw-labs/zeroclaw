@@ -1,18 +1,5 @@
 //! `ProviderDispatch` — single source of truth for `attribution_span!`
 //! on the [`ModelProvider`] surface.
-//!
-//! Every direct call to a `ModelProvider` method in the workspace goes
-//! through this helper so the resulting `LogEvent` carries the inner
-//! provider's alias-bound attribution without the call site naming any
-//! of it. Each wrapping method opens
-//! `attribution_span!(&*self.inner)` (and, for the methods that take a
-//! model string, an additional `scope!(model: …)`) around the
-//! underlying call.
-//!
-//! Adding a new `ModelProvider` method: add the wrapping method here
-//! and extend the `scripts/ci/rust_quality_gate.sh` grep gate's
-//! protected method list. The dispatch module is the only place in the
-//! workspace that opens `attribution_span!` for a `ModelProvider`.
 
 use std::sync::Arc;
 
@@ -29,16 +16,6 @@ pub struct ProviderDispatch {
     inner: Arc<dyn ModelProvider>,
 }
 
-/// Borrowed-reference twin of [`ProviderDispatch`]. Use this at call
-/// sites that already hold a `&dyn ModelProvider` and shouldn't be
-/// forced to plumb `Arc<dyn ModelProvider>` through their signatures
-/// just to gain attribution. Same surface, same on-disk shape; the
-/// only difference is the storage discipline.
-///
-/// `stream_chat` is supported because the inner provider's
-/// `stream_chat` already returns a `BoxStream<'static, …>`; the
-/// returned stream owns its span guards (not borrowed from `self`),
-/// so the dispatcher's lifetime does not bound the stream.
 pub struct ProviderDispatchRef<'a> {
     inner: &'a dyn ModelProvider,
 }
@@ -69,12 +46,6 @@ impl ProviderDispatch {
     ) -> anyhow::Result<ChatResponse> {
         use zeroclaw_log::Instrument;
         let span = zeroclaw_log::attribution_span!(&*self.inner);
-        // Enter the attribution span first so the scope! macro's
-        // info_span! constructs with the attribution span as its parent.
-        // Without this nesting, the attribution span and the scope
-        // span would be siblings (both children of the caller's span),
-        // and the layer's leaf→root walk from the scope span would
-        // skip the attribution contribution entirely.
         async move {
             zeroclaw_log::scope!(
                 model: model,
@@ -86,13 +57,6 @@ impl ProviderDispatch {
         .await
     }
 
-    /// Wrap the inner provider's `stream_chat` with
-    /// `attribution_span!` and a `scope!(model: …)`. Each `poll_next`
-    /// of the returned stream re-enters the `model_scope` span; the
-    /// attribution span is `model_scope`'s parent (set at construction
-    /// time while the attribution span was entered), so the layer's
-    /// leaf→root walk reaches the attribution contribution on every
-    /// per-chunk `record!` from inside the provider's stream body.
     pub fn stream_chat(
         &self,
         request: ChatRequest<'_>,
@@ -113,12 +77,6 @@ impl ProviderDispatch {
         );
         let inner_stream = self.inner.stream_chat(request, model, temperature, options);
         drop(_attribution_enter);
-        // Manually re-enter `model_scope` on every poll. `tracing`
-        // does not impl `Stream` for `Instrumented<S>` (only for
-        // `Future`s), so we use the `poll_fn` adapter to drive the
-        // inner stream while holding the scope guard for the duration
-        // of each poll. The guard never crosses an await — it is
-        // dropped before `poll_next` returns — so this stays `Send`.
         let mut inner_stream = inner_stream;
         stream::poll_fn(move |cx| {
             let _enter = model_scope.enter();
@@ -127,12 +85,6 @@ impl ProviderDispatch {
         .boxed()
     }
 
-    /// Wrap the inner provider's `simple_chat`. We dispatch through
-    /// `&*self.inner` because the `Arc<dyn ModelProvider>` blanket
-    /// impl does not forward `simple_chat`; routing via the blanket
-    /// would fall back to the trait default (which itself calls
-    /// `chat_with_system`), bypassing any concrete `simple_chat`
-    /// override on the inner provider.
     pub async fn simple_chat(
         &self,
         message: &str,
@@ -214,11 +166,6 @@ impl ProviderDispatch {
         .await
     }
 
-    /// Wrap the inner provider's `list_models`. No `model` parameter,
-    /// so attribution only — no `scope!(model: …)`. We dispatch
-    /// through `&*self.inner` (instead of via the `Arc<dyn …>` blanket)
-    /// because the blanket impl does not forward `list_models` and
-    /// the trait default bails with "not supported".
     pub async fn list_models(&self) -> anyhow::Result<Vec<String>> {
         use zeroclaw_log::Instrument;
         let span = zeroclaw_log::attribution_span!(&*self.inner);
@@ -267,12 +214,6 @@ impl<'a> ProviderDispatchRef<'a> {
         .await
     }
 
-    /// Wrap the inner provider's `stream_chat`. Same span-parenting
-    /// trick as [`ProviderDispatch::stream_chat`]; the returned
-    /// `BoxStream<'static, …>` is independent of `self`'s lifetime
-    /// because the inner provider's `stream_chat` already returns
-    /// `'static` (the spans are owned by the closure, not borrowed
-    /// from `self`).
     pub fn stream_chat(
         &self,
         request: ChatRequest<'_>,
@@ -405,11 +346,6 @@ impl<'a> ProviderDispatchRef<'a> {
         self.inner.warmup().instrument(span).await
     }
 
-    /// Hand back the underlying borrowed provider reference. Useful
-    /// at call sites that need to forward the provider to a non-call
-    /// API (e.g. a helper that holds a `&dyn ModelProvider` for
-    /// non-attribution reasons such as a manual
-    /// `attribution_span!(provider).entered()` on a sibling event).
     #[must_use]
     pub fn inner(&self) -> &'a dyn ModelProvider {
         self.inner
@@ -566,12 +502,6 @@ mod tests {
             _temperature: Option<f64>,
             _options: StreamOptions,
         ) -> futures_util::stream::BoxStream<'static, StreamResult<StreamEvent>> {
-            // Emit a record! from inside the stream body on each poll
-            // so the test can verify the span survives stream re-entry.
-            // We use `stream::iter` with eagerly-evaluated items;
-            // alternatively a manual stream could fire from inside
-            // `poll_next`. Either way the layer's scope walk must see
-            // the dispatcher-installed spans on the resulting event.
             futures_util::stream::unfold(0u8, |state| async move {
                 match state {
                     0 => {

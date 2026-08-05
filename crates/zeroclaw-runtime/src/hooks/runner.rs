@@ -10,11 +10,6 @@ use zeroclaw_api::tool::ToolResult;
 
 use super::traits::{HookHandler, HookResult};
 
-/// Dispatcher that manages registered hook handlers.
-///
-/// Void hooks are dispatched in parallel via `join_all`.
-/// Modifying hooks run sequentially by priority (higher first), piping output
-/// and short-circuiting on `Cancel`.
 pub struct HookRunner {
     handlers: Vec<Box<dyn HookHandler>>,
 }
@@ -496,22 +491,6 @@ mod tests {
         }
     }
 
-    // ── Panic recovery + cancellation propagation (#7688) ────────────────────
-    //
-    // Pinned regression: a hook that panics must not abort the runner or
-    // prevent subsequent handlers in the same `run_*` call from running, and
-    // a hook that returns `HookResult::Cancel(_)` must short-circuit the
-    // remaining handlers in the same call. These contracts are spelled out
-    // at lines 144–156 (cancel) and 148–156 (panic recovery) for
-    // `run_before_model_resolve`, and duplicated in every other `run_*`
-    // method on `HookRunner`. Without focused tests, a future refactor that
-    // drops the catch_unwind arm as "seems redundant because hook code
-    // shouldn't panic" would silently regress runtime control flow.
-    //
-    // We deliberately cover a small representative set of hook families
-    // rather than all six, matching the issue acceptance criteria ("tests
-    // document any intentional asymmetry between hook families").
-
     /// A hook that panics on a configurable method. Records nothing; its
     /// only role is to exercise the `catch_unwind` branch in the runner.
     struct PanickingHook {
@@ -604,12 +583,6 @@ mod tests {
             priority: 0,
         }));
 
-        // `before_model_resolve` returns the (provider, model) tuple; the
-        // panicker yields no value so the runner falls back to the prior
-        // (input) values and the subsequent UppercasePromptHook ... wait,
-        // UppercasePromptHook only overrides before_prompt_build. Use a
-        // hook that does override before_model_resolve so the "subsequent
-        // handler ran" assertion is meaningful.
         struct ModelConstHook {
             name: String,
             priority: i32,

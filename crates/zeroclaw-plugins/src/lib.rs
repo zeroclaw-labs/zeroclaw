@@ -1,5 +1,4 @@
 //! WASM plugin system for ZeroClaw.
-//!
 //! Plugins are WebAssembly components loaded via wasmtime that can extend
 //! ZeroClaw with custom tools and channels. Enable with a `plugins-wasm*` feature.
 
@@ -7,8 +6,10 @@
 pub mod component;
 #[cfg(feature = "plugins-wasmtime")]
 mod component_logging;
+pub mod endpoint;
 pub mod error;
 pub mod host;
+pub mod instance;
 pub mod registry;
 #[cfg(feature = "plugins-wasmtime")]
 pub mod runtime;
@@ -54,7 +55,7 @@ pub struct PluginManifest {
 }
 
 /// What a plugin can do.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Hash, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginCapability {
     /// Provides one or more tools
@@ -70,7 +71,7 @@ pub enum PluginCapability {
 }
 
 /// Permissions a plugin may request.
-#[derive(Debug, Clone, Hash, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Hash, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginPermission {
     /// Can make HTTP requests

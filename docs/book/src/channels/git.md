@@ -2,11 +2,17 @@
 
 Converse with the agent through a git forge's issue and pull-request comments, and surface repository events, including PR lifecycle, review comments, CI outcomes, and releases, through a per-event routing table. The channel is built around a **provider seam**: a `provider` field selects the forge. GitHub, Gitea, and Forgejo are wired providers; additional forges drop in as sibling providers without changing the generic channel.
 
+> **New to ZeroClaw?** Start with the [Quickstart](../getting-started/quickstart.md) to get a running agent, then skim [Concepts](../getting-started/concepts.md) for the terms (agent, peer group, autonomy, SOP) this page assumes.
+
 With the GitHub provider, ZeroClaw authenticates as a **GitHub App** and replies as the app's own bot identity (`your-app[bot]`), so it works on any repository the app is installed on. There is no personal access token and no shared user account.
 
 With the Gitea/Forgejo provider, ZeroClaw authenticates with a personal access token against the instance's Gitea-compatible API and replies as the token owner.
 
-> **Build note:** the git channel is **not included** in the lean default build. Build with `--features channel-git` (or `channels-full`). `channel-git` bundles both providers (it enables `provider-github` and `provider-gitea` for Gitea/Forgejo together), so a single build serves every supported forge; there is no smaller per-provider subset to select.
+> **Build note:** the git channel is **not included** in the lean default build. Build with `--features channel-git` (or `channels-full`). The `channel-git` feature pulls in every wired forge provider in one build, so a single binary serves all supported forges; there is no smaller per-provider build subset to select.
+
+## Who can talk to the agent
+
+{{#peer-group git}}
 
 ## How it works
 
@@ -17,51 +23,33 @@ With the Gitea/Forgejo provider, ZeroClaw authenticates with a personal access t
 - **Cold start.** Events created before the daemon started are never processed, so restarting can't replay history. The flip side: comments posted while the daemon was down are missed, so mention the app again.
 - **Comment edits are ignored.** Only newly created comments and issue/PR opening posts trigger the agent.
 
-## Create credentials
+## Credentials
 
-For GitHub:
+Each provider authenticates differently, and each has a full step-by-step walkthrough:
 
-1. GitHub → **Settings → Developer settings → GitHub Apps → New GitHub App**.
-2. **Webhook:** uncheck *Active*; this channel doesn't use one.
-3. **Repository permissions:** Issues *Read & write*, Pull requests *Read & write*, Metadata *Read-only*. Nothing else.
-4. After creating, note the **App ID** and **generate a private key**. GitHub downloads a `.pem` file. Move it somewhere stable and `chmod 600` it (looser permissions log a startup warning).
-5. **Install the app** on your account or organization, selecting the repositories the agent should see.
-
-For Gitea or Forgejo, create a personal access token for the bot/operator account with `read:user` (the channel resolves its own bot identity from `/user` at startup), plus repository read access and issue/PR comment write access. Give the token to a dedicated bot account, not the operator's own account: the channel ignores its own activity, so if the token owner is also the person mentioning the app, those messages are skipped.
+- **GitHub** authenticates as a GitHub App (App ID plus a generated private key). See [Creating a GitHub App](./git-github-app.md).
+- **Gitea / Forgejo** authenticate with a personal access token against the instance's Gitea-compatible API. See [Creating a Gitea / Forgejo token (Codeberg)](./git-gitea-forgejo.md).
 
 ## Configure
 
-GitHub:
+Set the channel fields on whichever surface you prefer:
 
-```bash
-zeroclaw config set channels.git.default.provider github
-zeroclaw config set channels.git.default.app-id 12345
-zeroclaw config set channels.git.default.private-key-path ~/.zeroclaw/github-app.pem
-zeroclaw config set channels.git.default.repos '["your-org/your-repo"]'
-zeroclaw config set channels.git.default.poll-interval-secs 30
-zeroclaw config set channels.git.default.mention-only true
-zeroclaw config set channels.git.default.enabled true
-```
+{{#config-where channels git}}
 
-Gitea or Forgejo:
+The full field reference, straight from the schema:
 
-```bash
-zeroclaw config set channels.git.default.provider forgejo
-zeroclaw config set channels.git.default.api-base-url https://git.example.org/api/v1
-zeroclaw config set channels.git.default.access-token "$FORGEJO_TOKEN"
-zeroclaw config set channels.git.default.repos '["your-org/your-repo"]'
-zeroclaw config set channels.git.default.poll-interval-secs 30
-zeroclaw config set channels.git.default.mention-only true
-zeroclaw config set channels.git.default.enabled true
-```
+{{#config-fields channels.git}}
 
-Use `provider gitea` for Gitea instances and `provider forgejo` for Forgejo instances; both use the same Gitea-compatible provider internally. The `default` alias is the common first instance. Leave `repos` empty to poll every repository visible to the credential, or set it to an explicit repository list for lower rate usage. Set GitHub `installation-id` only when the app has several installations, and `listen-to-bots` only if comments from other bot accounts should be processed. An unknown `provider` value is a clear startup error rather than a silent fallback.
+The `default` alias is the common first instance. Leave `repos` empty to poll every repository visible to the credential, or set it to an explicit repository list for lower rate usage. Set `listen_to_bots` only if comments from other bot accounts should be processed. An unknown `provider` value is a clear startup error rather than a silent fallback.
 
-{{#peer-group git}}
+Credential setup differs per provider and each has its own encrypted secret; both walkthroughs cover it end to end:
+
+- **GitHub:** App ID plus a private key. See [Creating a GitHub App](./git-github-app.md).
+- **Gitea / Forgejo:** an access token and API base URL. See [Creating a Gitea / Forgejo token (Codeberg)](./git-gitea-forgejo.md).
 
 ## Events & routing
 
-Beyond conversation, the channel normalizes repository activity into typed events and routes each event type per config:
+Beyond conversation, the channel normalizes repository activity into typed events and routes each event type per config. Routing an event to a `sop` dispatches it to a [Standard Operating Procedure](../sop/index.md), a deterministic, auditable procedure with trigger matching and approval gates. The [Git SOP fan-in](../sop/fan-in/git.md) page details exactly how a forge event becomes a SOP run.
 
 | Event type | Example route | Result |
 | --- | --- | --- |
@@ -84,8 +72,15 @@ Known event types: `issue_comment.created`, `issues.opened`, `pull_request.opene
 
 - **Rate budget:** on GitHub, each installation gets 5,000 requests/hour; the conversational default spends 2 requests per repository per poll tick (5 repos at a 30 s interval ≈ 1,200/hour). Each additionally routed endpoint family (review comments, releases, Actions runs) adds 1 per repo per tick, and the Events API backbone adds 1 conditional request (304s on idle repos are effectively free). Gitea/Forgejo rate limits depend on the instance. On a rate-limit response the channel backs off until the limit window resets.
 - **Many repositories:** when `repos` is empty and the credential can see more than 100 repositories, only the first page is polled (a warning is logged for GitHub). List `repos` explicitly in that case.
-- **Multiple installations:** one channel alias serves one installation. If the app is installed on several accounts, set `installation_id` (and add more aliases for the others).
 
 ## Safety
 
-Issues and PR comments on public repositories are adversarial input. Keep `mention_only = true`, gate senders with a peer group (an empty peer set denies everyone, `["*"]` accepts anyone), and keep autonomy at `Supervised` or lower for public-facing repositories. This is the same guidance as [social channels](./social.md#operating-social-channels-safely).
+Issues and PR comments on public repositories are adversarial input. Keep `mention_only = true`, gate senders with a [peer group](./peer-groups.md) (an empty peer set denies everyone, `["*"]` accepts anyone), and keep [autonomy](../security/autonomy.md) at `Supervised` or lower for public-facing repositories. This is the same guidance as [social channels](./social.md#operating-social-channels-safely).
+
+## Related docs
+
+- **Set up credentials:** [Creating a GitHub App](./git-github-app.md) · [Creating a Gitea / Forgejo token (Codeberg)](./git-gitea-forgejo.md)
+- **Who can reach the agent:** [Peer Groups](./peer-groups.md)
+- **What the agent may do:** [Security & Autonomy](../security/overview.md) · [Autonomy levels](../security/autonomy.md)
+- **Event-driven automation:** [Standard Operating Procedures](../sop/index.md) · [Git SOP fan-in](../sop/fan-in/git.md)
+- **The bigger picture:** [Agents](../agents/overview.md) · [Channels overview](./overview.md)

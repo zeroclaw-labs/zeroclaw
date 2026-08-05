@@ -1,11 +1,4 @@
 //! End-to-end integration tests for agent orchestration.
-//!
-//! These tests exercise the full agent turn cycle through the public API,
-//! using mock model_providers and tools to validate orchestration behavior without
-//! external service dependencies. They complement the unit tests in
-//! `src/agent/tests.rs` by running at the integration test boundary.
-//!
-//! Ref: <https://github.com/zeroclaw-labs/zeroclaw/issues/618> (item 6)
 
 use crate::support::helpers::{
     StaticRecallMemory, build_agent, build_agent_xml, build_recording_agent, text_response,
@@ -20,7 +13,6 @@ use zeroclaw::providers::{ChatResponse, ConversationMessage, ToolCall};
 // E2E smoke tests — full agent turn cycle
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Validates the simplest happy path: user message → LLM text response.
 #[tokio::test]
 async fn e2e_simple_text_response() {
     let model_provider = Box::new(MockModelProvider::new(vec![text_response(
@@ -32,7 +24,6 @@ async fn e2e_simple_text_response() {
     assert!(!response.is_empty(), "Expected non-empty text response");
 }
 
-/// Validates single tool call → tool execution → final LLM response.
 #[tokio::test]
 async fn e2e_single_tool_call_cycle() {
     let model_provider = Box::new(MockModelProvider::new(vec![
@@ -53,7 +44,6 @@ async fn e2e_single_tool_call_cycle() {
     );
 }
 
-/// Validates multi-step tool chain: tool A → tool B → tool C → final response.
 #[tokio::test]
 async fn e2e_multi_step_tool_chain() {
     let (counting_tool, count) = CountingTool::new();
@@ -83,7 +73,6 @@ async fn e2e_multi_step_tool_chain() {
     assert_eq!(*count.lock().unwrap(), 2);
 }
 
-/// Validates that the XML dispatcher path also works end-to-end.
 #[tokio::test]
 async fn e2e_xml_dispatcher_tool_call() {
     let model_provider = Box::new(MockModelProvider::new(vec![
@@ -109,7 +98,6 @@ async fn e2e_xml_dispatcher_tool_call() {
     );
 }
 
-/// Validates that multiple sequential turns maintain conversation coherence.
 #[tokio::test]
 async fn e2e_multi_turn_conversation() {
     let model_provider = Box::new(MockModelProvider::new(vec![
@@ -132,7 +120,6 @@ async fn e2e_multi_turn_conversation() {
     assert_ne!(r2, r3, "Sequential turn responses should be distinct");
 }
 
-/// Validates that the agent handles unknown tool names gracefully.
 #[tokio::test]
 async fn e2e_unknown_tool_recovery() {
     let model_provider = Box::new(MockModelProvider::new(vec![
@@ -153,7 +140,6 @@ async fn e2e_unknown_tool_recovery() {
     );
 }
 
-/// Validates parallel tool dispatch in a single response.
 #[tokio::test]
 async fn e2e_parallel_tool_dispatch() {
     let (counting_tool, count) = CountingTool::new();
@@ -189,8 +175,6 @@ async fn e2e_parallel_tool_dispatch() {
 // Multi-turn history fidelity & memory enrichment tests
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Validates that multi-turn conversation correctly accumulates history
-/// and passes growing message sequences to the model_provider on each turn.
 #[tokio::test]
 async fn e2e_multi_turn_history_fidelity() {
     let (model_provider, recorded) = RecordingModelProvider::new(vec![
@@ -261,8 +245,6 @@ async fn e2e_multi_turn_history_fidelity() {
     );
 }
 
-/// Validates that the engine's unified memory-context injection enriches
-/// the outgoing user message before it reaches the model_provider.
 #[tokio::test]
 async fn e2e_memory_enrichment_injects_context() {
     let (model_provider, recorded) =
@@ -308,9 +290,6 @@ async fn e2e_memory_enrichment_injects_context() {
     }
 }
 
-/// Validates multi-turn conversation with memory enrichment: each turn's
-/// outgoing user message is enriched fresh; prior turns stay clean in
-/// history (memory blocks are per-request state, not persisted history).
 #[tokio::test]
 async fn e2e_multi_turn_with_memory_enrichment() {
     let (model_provider, recorded) =
@@ -359,8 +338,6 @@ async fn e2e_multi_turn_with_memory_enrichment() {
     assert_eq!(agent.history().len(), 5);
 }
 
-/// Validates that empty memory context does not prepend memory text.
-/// A per-turn datetime prefix may still be present.
 #[tokio::test]
 async fn e2e_empty_memory_context_passthrough() {
     let (model_provider, recorded) =

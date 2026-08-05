@@ -2,7 +2,7 @@ use crate::helpers::domain_guard;
 use async_trait::async_trait;
 use serde_json::json;
 use std::{process::Stdio, sync::Arc, time::Duration};
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 
 const BROWSER_OPEN_LAUNCH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -120,7 +120,7 @@ impl Tool for BrowserOpenTool {
         if !self.security.can_act() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Action blocked: autonomy is read-only".into()),
             });
         }
@@ -128,7 +128,7 @@ impl Tool for BrowserOpenTool {
         if !self.security.record_action() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Action blocked: rate limit exceeded".into()),
             });
         }
@@ -138,7 +138,7 @@ impl Tool for BrowserOpenTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(e.to_string()),
                 });
             }
@@ -147,12 +147,12 @@ impl Tool for BrowserOpenTool {
         match open_in_system_browser(&url).await {
             Ok(()) => Ok(ToolResult {
                 success: true,
-                output: format!("Opened in system browser: {url}"),
+                output: format!("Opened in system browser: {url}").into(),
                 error: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Failed to open system browser: {e}")),
             }),
         }
@@ -408,12 +408,6 @@ mod tests {
 
     #[test]
     fn validate_accepts_http_for_wildcard_allowlist() {
-        // Explicit pin of the default posture: with the shipped default
-        // `browser.allowed_domains = ["*"]`, browser_open accepts plain http://
-        // to any public host. This is the same default that web_fetch,
-        // http_request, and the `browser` tool already ship (all default to
-        // `["*"]` and already accept http://); this test makes the
-        // default-posture change for browser_open conscious and reviewable.
         let tool = test_tool(vec!["*"]);
         let got = tool.validate_url("http://example.com/page").unwrap();
         assert_eq!(got, "http://example.com/page");
@@ -606,12 +600,6 @@ mod tests {
 
     #[test]
     fn listed_private_host_permits_http_scheme() {
-        // `browser_open` accepts `http://` (since it was relaxed to accept
-        // both schemes upstream), so a listed private host can be reached
-        // over plain HTTP — internal services frequently lack a public TLS
-        // cert. The unlisted-host SSRF guard still applies; this test just
-        // pins that the scheme guard does not pre-empt the allowlist for
-        // listed hosts.
         let tool = test_tool_with_private(vec![], vec!["10.0.0.1"]);
         assert!(tool.validate_url("http://10.0.0.1").is_ok());
     }

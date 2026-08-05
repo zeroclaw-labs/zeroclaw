@@ -2,18 +2,6 @@
 //! canonical code registries: the channel inventory, the model-provider slots,
 //! and the default tool set. The registries are the single source of truth; the
 //! docs render whatever they carry so a channel/provider/tool add reflows the
-//! rendered tables on the next build with no hand edit.
-//!
-//! The ZeroClaw column is walked from source. The OpenClaw and Hermes columns
-//! come from `docs/book/feature-matrix-parity.toml`, the single reviewable
-//! source for parity facts the binary has no knowledge of. A walked row with no
-//! parity entry renders `Unknown`; a parity key the walk no longer produces is a
-//! hard error.
-//!
-//! Outputs (gitignored, derived and included with `{{#include}}` at build time):
-//!   docs/book/src/_snippets/feature-matrix-channels.md
-//!   docs/book/src/_snippets/feature-matrix-providers.md
-//!   docs/book/src/_snippets/feature-matrix-tools.md
 
 use anyhow::Result;
 use std::collections::BTreeMap;

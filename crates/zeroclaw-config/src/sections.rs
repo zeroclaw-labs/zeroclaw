@@ -1,16 +1,6 @@
 //! Curated sections surface — a flat ordered set of [`Section`]s the
 //! operator walks (new install) or scans (returning user) to configure
 //! a working ZeroClaw deployment.
-//!
-//! Every fact about a section (its enum variant, its on-the-wire key,
-//! its UI shape, its display group, its help blurb, its canonical
-//! position) lives in ONE table — the `sections!` invocation below. The
-//! macro expands that table into the [`Section`] enum, every per-variant
-//! `match` helper, and the [`QUICKSTART_SECTIONS`] const, so adding a
-//! section is exactly one row, no hand-listed variant set anywhere else.
-//!
-//! Consumers (CLI runtime, gateway, dashboard) dispatch off this enum;
-//! drift is a compile error.
 
 use serde::{Deserialize, Serialize};
 
@@ -35,15 +25,7 @@ pub enum SectionShape {
     BackendPicker,
 }
 
-/// Display group for the Config menu. Every curated [`Section`] row
-/// names one in its `group:` cell; the long tail of schema-derived
-/// top-level roots (`gateway`, `observability`, …) that surface in the
-/// section explorer without a curated row resolves through
-/// [`section_group_for_key`]. [`SECTION_GROUPS`] fixes the display
-/// order across every surface.
-///
-/// `Other` is the catch-all: unknown keys land there so new schema
-/// additions still surface in the menu until someone curates them.
+/// Display group for a curated or schema-derived configuration section.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
@@ -89,11 +71,6 @@ impl SectionGroup {
         }
     }
 
-    /// Inverse of [`label`](Self::label): parse a group label string
-    /// back into the enum, or `None` for an unrecognized label. The
-    /// bridge for `#[group = "..."]` attributes resolved through the
-    /// schema — the derive emits the label as a string the macro can't
-    /// type-check, so this validates it on the way back in.
     #[must_use]
     pub fn from_label(label: &str) -> Option<Self> {
         SECTION_GROUPS.iter().copied().find(|g| g.label() == label)
@@ -122,44 +99,17 @@ pub const SECTION_GROUPS: &[SectionGroup] = &[
     SectionGroup::Other,
 ];
 
-/// Display group for any section key. Two declarative sources, no
-/// hand-maintained table:
-///
-/// 1. Curated [`Section`]s read the `group:` cell of their `sections!`
-///    row.
-/// 2. The long tail of top-level `Config` roots the section explorer
-///    surfaces without a curated row declares its group inline via
-///    `#[group = "..."]`, harvested by the `Configurable` derive into
-///    [`crate::schema::Config::nested_section_group`]. This mirrors how
-///    [`section_help`] falls through to `Config::nested_section_help`.
-///
-/// Unknown keys — and roots whose `#[group]` label fails to parse — fall
-/// into [`SectionGroup::Other`] so new schema additions still surface;
-/// they just land in the catch-all bucket until someone annotates them.
-/// The `every_surfaced_root_has_a_group` test guards against a real root
-/// silently landing there.
 #[must_use]
 pub fn section_group_for_key(key: &str) -> SectionGroup {
     if let Some(s) = Section::from_key(key) {
         return s.group();
     }
-    // `nested_section_group` arms are keyed by the Rust field ident,
-    // i.e. snake_case (the derive's `snake_to_kebab` is currently an
-    // identity passthrough). Section keys reaching here are snake too
-    // (the RPC/gateway pass `prop_fields()` first segments), so the
-    // direct lookup hits; tolerate a kebab-spelled caller by normalizing
-    // back to snake, matching `Section::from_key`'s leniency.
     crate::schema::Config::nested_section_group(key)
         .or_else(|| crate::schema::Config::nested_section_group(&key.replace('-', "_")))
         .and_then(SectionGroup::from_label)
         .unwrap_or(SectionGroup::Other)
 }
 
-/// Humanize a section wire key for display (`risk_profiles` → `Risk profiles`,
-/// `providers.models` → `Model providers`). Single source of truth for section
-/// labels across the gateway dashboard, zerocode Config pane, and docs. Specific
-/// wording overrides are listed explicitly; everything else is mechanically
-/// title-cased from the key.
 #[must_use]
 pub fn humanize_section_key(key: &str) -> String {
     match key {
@@ -175,19 +125,6 @@ pub fn humanize_section_key(key: &str) -> String {
     s
 }
 
-/// Single source of truth for every pickable config section. Each row
-/// maps 1:1 to a dashboard `/config/<key>` page, a CLI
-/// `zeroclaw quickstart` flow and the gateway section picker handler.
-/// Adding/removing a section is one row here and every consumer's
-/// `match` either compiles cleanly or fails with an exhaustiveness
-/// error pointing at exactly what needs an arm.
-///
-/// Row order is the canonical order operators see in the dashboard
-/// and walk through in the CLI. It is dependency-correct: every
-/// downstream alias reference an Agent carries (model_provider,
-/// risk_profile, runtime_profile, channels, *_bundles) appears earlier
-/// in the list than [`Section::Agents`], so walking top-to-bottom
-/// never produces a dangling reference.
 macro_rules! sections {
     (
         $(
@@ -199,12 +136,7 @@ macro_rules! sections {
             }
         ),+ $(,)?
     ) => {
-        /// One pickable section. The variant ordering follows the
-        /// `sections!` macro invocation.
-        ///
-        /// With the `clap` feature on, this enum doubles as the
-        /// `zeroclaw quickstart` and curated-section endpoints — no separate
-        /// mirror enum in the binary crate.
+        /// One configuration section exposed by the curated section registry.
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
         #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
         #[cfg_attr(feature = "clap", derive(clap::Subcommand))]
@@ -242,11 +174,6 @@ macro_rules! sections {
                 }
             }
 
-            /// Display group for the Config menu — the bucket this
-            /// section renders under in the dashboard sidebar and the
-            /// zerocode Config pane. Read the `group:` cell of the
-            /// `sections!` row; the long tail of non-curated section
-            /// keys resolves through [`section_group_for_key`] instead.
             #[must_use]
             pub const fn group(self) -> SectionGroup {
                 match self {
@@ -282,17 +209,6 @@ macro_rules! sections {
                 }
             }
 
-            /// Parse a stable wire key, tolerating both the snake and
-            /// kebab spellings of any section. The schema mixes the two:
-            /// `model_providers` (snake) and `peer-groups` (kebab) are
-            /// both valid wire forms produced elsewhere in the codebase.
-            /// Callers (dashboard URL routing, gateway picker dispatch,
-            /// CLI clap subcommands) can pass either form; `from_key`
-            /// resolves to the same variant. Returns `None` for keys
-            /// outside the known section table. Named `from_key` rather
-            /// than `from_str` so clippy doesn't flag it as confusable
-            /// with `std::str::FromStr` (parse failure is `None`, not
-            /// `Err(_)`).
             #[must_use]
             pub fn from_key(s: &str) -> Option<Self> {
                 let try_match = |s: &str| -> Option<Self> {
@@ -482,11 +398,6 @@ sections! {
                 Skip if you don't need them.",
     },
 
-    // Tier 7 — Bind. Pulls tiers 1–6 together. Every alias ref an
-    // Agent carries exists by this point.
-    // Personality is intentionally NOT a top-level section —
-    // markdown personality files live per-agent and surface inside the
-    // agent edit form.
     Agents => {
         key:   "agents",
         shape: OneTierAliasMap,
@@ -524,12 +435,6 @@ sections! {
                 or ngrok. Pick `none` to keep it localhost-only.",
     },
 
-    // Tier 10 — Lifecycle state. Not part of any agent dependency
-    // chain. Tracks whether the Quickstart has completed on this
-    // install; surfaces dispatch on it to decide whether to auto-open
-    // the Quickstart on launch. The on-disk TOML key stays
-    // `onboard_state` for backwards compatibility with installs that
-    // already wrote against it; only the in-code symbol is renamed.
     QuickstartState => {
         key:   "onboard_state",
         shape: DirectForm,
@@ -571,24 +476,6 @@ pub fn is_known_section(key: &str) -> bool {
     Section::from_key(key).is_some()
 }
 
-/// Help blurb for a section key, covering both `Section` variants and
-/// the long tail of top-level `Config` fields the dashboard / TUI config
-/// editor surface (gateway, scheduler, observability, …). Single source
-/// of truth shared by every surface — the gateway sidebar, the CLI
-/// Quickstart flow, and the future TUI config editor all call this rather
-/// than maintaining parallel tables.
-///
-/// Resolution order:
-/// 1. `Section` variants (curated `help` text next to the variant
-///    declaration in the `sections!` macro).
-/// 2. The `Config` struct's `#[nested]` field-level `///` docstring,
-///    harvested by the `Configurable` derive into
-///    `Config::nested_section_help`. This is what makes adding a new
-///    top-level section a one-line schema change with no parallel
-///    help table to update.
-///
-/// Returns `""` for keys without a docstring so callers can decide
-/// whether to omit the help row or show a fallback.
 #[must_use]
 pub fn section_help(key: &str) -> &'static str {
     if let Some(s) = Section::from_key(key) {
@@ -605,41 +492,19 @@ pub fn section_for_path(path: &str) -> Option<Section> {
     Section::from_key(path.split('.').next()?)
 }
 
-/// Does this section show any signal of having been touched on this
-/// install? Used by callers (RPC config-list filtering, lifecycle
-/// dispatch) to decide whether to surface a section as "untouched".
-///
-/// Each variant decides what counts as a real signal vs a default
-/// value that round-trips identically across a fresh install.
 pub fn section_has_signal(cfg: &crate::schema::Config, section: Section) -> bool {
     match section {
         Section::ModelProviders => !cfg.providers.models.is_empty(),
-        // `channels.cli: bool` is a default-true scalar that lives directly
-        // under `channels.*`, so a bare `starts_with("channels.")` check
-        // fires on every fresh install. Require a nested channel config
-        // (e.g. `channels.telegram.bot-token`) — anything with a second dot
-        // segment — to count as user-driven signal.
         Section::Channels => cfg.prop_fields().iter().any(|f| {
             f.name
                 .strip_prefix("channels.")
                 .is_some_and(|rest| rest.contains('.'))
         }),
         Section::Hardware => cfg.hardware.enabled,
-        // Servers' existence in the Vec is the signal — a fresh install
-        // has an empty `mcp.servers`, so any element at all (even one
-        // with no command set) counts as user intent to use MCP. The
-        // parent `Mcp` section stays marker-only because its top-level
-        // booleans (`enabled`, `deferred_loading`) have meaningful
-        // defaults that are indistinguishable from user choice.
         Section::McpServers => !cfg.mcp.servers.is_empty(),
         // Routes' existence in the Vec is the signal, same as McpServers.
         Section::ModelRoutes => !cfg.model_routes.is_empty(),
         Section::EmbeddingRoutes => !cfg.embedding_routes.is_empty(),
-        // Memory's default backend is "sqlite" and Tunnel's is "none" —
-        // both are valid user choices indistinguishable from untouched
-        // defaults. TTS / transcription providers and agents start
-        // empty; their existence in the typed family map IS the signal,
-        // not a derivable default-divergence. Marker-only for these.
         Section::TtsProviders
         | Section::TranscriptionProviders
         | Section::Memory
@@ -675,11 +540,6 @@ mod tests {
         assert_eq!(Section::McpBundles.label(), "Mcp bundles");
     }
 
-    /// Round-trip every entry in the canonical list. `from_key`,
-    /// `as_str`, `section_index`, and `QUICKSTART_SECTIONS` are all
-    /// generated from the same `sections!` row, so this test exercises
-    /// the table — adding a row that breaks any of them fails here
-    /// without listing variants by hand.
     #[test]
     fn sections_round_trip() {
         for s in QUICKSTART_SECTIONS {
@@ -693,10 +553,6 @@ mod tests {
         assert_eq!(Section::from_key("not_a_section"), None);
     }
 
-    /// Every section the dashboard URL surface points at must resolve
-    /// through `Section::from_key`. The dashboard URL form is kebab-case
-    /// (`peer-groups`), the canonical wire form may be snake_case
-    /// (`peer_groups`); both must parse to the same variant.
     #[test]
     fn dashboard_url_sections_round_trip_kebab_and_snake() {
         let kebab_then_snake: &[(&str, &str, Section)] = &[
@@ -736,10 +592,6 @@ mod tests {
         }
     }
 
-    /// Every OneTierAliasMap section's wire key must appear verbatim
-    /// in `Config::map_key_sections()`. That table is what
-    /// `Config::create_map_key` dispatches off, so a mismatch silently
-    /// breaks the dashboard's `+ Add` affordance.
     #[test]
     fn alias_map_section_wire_keys_match_map_key_sections() {
         use crate::schema::Config;
@@ -765,13 +617,6 @@ mod tests {
         }
     }
 
-    /// `Section::McpServers` is the per-server editor page. It must
-    /// be the `OneTierAliasMap` shape so the dashboard / TUI dispatch
-    /// it to the alias-list renderer (matching `risk_profiles` etc.).
-    /// `Section::Mcp` keeps its `DirectForm` shape so the parent's
-    /// `enabled` / `deferred_loading` toggles render as a normal
-    /// field list. Both must coexist; the parent must not collapse
-    /// into the child when both appear in the curated section list.
     #[test]
     fn mcp_servers_section_has_alias_map_shape_and_parent_keeps_direct_form() {
         assert_eq!(Section::Mcp.shape(), SectionShape::DirectForm);
@@ -793,11 +638,6 @@ mod tests {
         assert!(idx(Section::McpServers) < idx(Section::McpBundles));
     }
 
-    /// Canonical order is dependency-correct: every Section that
-    /// `AliasedAgentConfig` references through an alias field appears
-    /// earlier in the list than `Section::Agents`. Walking
-    /// `QUICKSTART_SECTIONS` top-to-bottom never asks the operator to
-    /// configure an Agent before the things it has to bind to exist.
     #[test]
     fn ordering_respects_agent_dependency_tiers() {
         let idx = |s: Section| {
@@ -838,9 +678,6 @@ mod tests {
         }
     }
 
-    /// Every variant of `SectionGroup` appears in `SECTION_GROUPS`
-    /// exactly once, and `Other` is last so the catch-all bucket
-    /// renders at the bottom of every grouped surface.
     #[test]
     fn section_groups_const_is_exhaustive_unique_and_other_last() {
         // Exhaustiveness guard: adding a SectionGroup variant without
@@ -885,10 +722,6 @@ mod tests {
         );
     }
 
-    /// Group labels are a wire contract: the dashboard's `GROUP_ORDER`
-    /// (web/src/pages/Config.tsx) and the zerocode Config pane match
-    /// these exact strings from `ConfigSectionEntry.group`. Renaming a
-    /// label means updating those consumers in the same change.
     #[test]
     fn group_labels_are_pinned_for_ui_compat() {
         let expected = [
@@ -908,9 +741,6 @@ mod tests {
         }
     }
 
-    /// Every curated section resolves to a real bucket — `Other` exists
-    /// only for the uncurated long tail, so a curated row landing there
-    /// means someone forgot to pick a group for a new section.
     #[test]
     fn curated_sections_never_fall_into_other() {
         for s in QUICKSTART_SECTIONS {
@@ -922,12 +752,6 @@ mod tests {
         }
     }
 
-    /// `section_group_for_key` resolves curated rows through the table
-    /// (both snake and kebab spellings), hand-mapped long-tail roots
-    /// through the match, and unknown keys into `Other`. Pins the gap
-    /// fixes that motivated moving grouping into this crate: the MCP
-    /// and provider sub-sections used to fall into `Other` in the
-    /// gateway's hand-list.
     #[test]
     fn section_group_for_key_resolves_curated_tail_and_unknown() {
         // Curated rows, including former gap sections.
@@ -974,18 +798,6 @@ mod tests {
         assert_eq!(section_group_for_key("not_a_section"), SectionGroup::Other);
     }
 
-    /// Drift guard for the schema-attribute grouping: every top-level
-    /// config root the section explorer can surface must resolve to a
-    /// real [`SectionGroup`], not the `Other` catch-all — either through
-    /// the `sections!` table (curated rows) or a `#[group = "..."]`
-    /// annotation harvested into `Config::nested_section_group`.
-    ///
-    /// This is what makes grouping declarative-by-construction: add a
-    /// new top-level `#[nested]` section without a group and this test
-    /// fails, naming the root, rather than the section silently landing
-    /// in `Other`. A root that genuinely has no curated group yet goes
-    /// in `UNGROUPED` with intent; `HIDDEN` covers system roots the
-    /// explorer never shows.
     #[test]
     fn every_surfaced_root_has_a_group() {
         use crate::schema::Config;
@@ -1000,12 +812,6 @@ mod tests {
         // runtime, never user-edited, so intentionally ungrouped.
         const HIDDEN: &[&str] = &["schema_version"];
 
-        // Roots with no curated group yet: they render in the `Other`
-        // bucket. Pre-existing — ungrouped before grouping moved into
-        // the schema. Annotating one with `#[group]` (e.g. `microsoft365`
-        // and the `file_*` tool sections are obvious candidates) means
-        // removing it from this list. The assertions below keep the list
-        // honest: every entry must still be a real, still-ungrouped root.
         const UNGROUPED: &[&str] = &[
             "escalation",
             "locale",
@@ -1043,10 +849,6 @@ mod tests {
         }
     }
 
-    /// The regression roots that the pre-migration gateway hand-list
-    /// grouped must still resolve the same way through the schema
-    /// attributes — pins that the move from hand-list to `#[group]`
-    /// didn't silently drop any of them back into `Other`.
     #[test]
     fn migrated_hand_list_roots_keep_their_groups() {
         let expected = [
@@ -1071,11 +873,6 @@ mod tests {
         }
     }
 
-    /// Storage help must steer first-time operators toward SQLite as the
-    /// safe default. Pins the contract: SQLite is named, flagged as a
-    /// default/safe/recommended choice, and positioned before the
-    /// alternatives so the recommendation lands first instead of being
-    /// buried in a closing list.
     #[test]
     fn storage_help_steers_to_sqlite_default() {
         let help = section_help("storage").to_lowercase();

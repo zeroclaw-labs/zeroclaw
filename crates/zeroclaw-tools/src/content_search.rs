@@ -6,18 +6,13 @@ use std::path::Path;
 use std::process::Stdio;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 
 const MAX_RESULTS: usize = 1000;
 const MAX_OUTPUT_BYTES: usize = 1_048_576; // 1 MB
 const TIMEOUT_SECS: u64 = 30;
 
-/// Search file contents by regex pattern within the workspace.
-///
-/// Uses ripgrep (`rg`) when available, falling back to `grep -rn -E` or an
-/// internal scanner when external search tools are unavailable.
-/// All searches are confined to the workspace directory by security policy.
 pub struct ContentSearchTool {
     security: Arc<SecurityPolicy>,
     backend: SearchBackend,
@@ -140,7 +135,7 @@ impl Tool for ContentSearchTool {
         if pattern.is_empty() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Empty pattern is not allowed.".into()),
             });
         }
@@ -155,7 +150,7 @@ impl Tool for ContentSearchTool {
         if !matches!(output_mode, "content" | "files_with_matches" | "count") {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Invalid output_mode '{output_mode}'. Allowed values: content, files_with_matches, count."
                 )),
@@ -204,7 +199,7 @@ impl Tool for ContentSearchTool {
         if search_path.contains("../") || search_path.contains("..\\") || search_path == ".." {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Path traversal ('..') is not allowed.".into()),
             });
         }
@@ -217,7 +212,7 @@ impl Tool for ContentSearchTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Cannot resolve path '{search_path}': {e}")),
                 });
             }
@@ -226,18 +221,23 @@ impl Tool for ContentSearchTool {
         if !self.security.is_resolved_path_readable(&resolved_canon) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Resolved path for '{search_path}' is outside the allowed workspace."
                 )),
             });
         }
 
+        // A de-verbatimized Windows path is safe to hand to legacy grep only
+        // when it still identifies the exact path that passed authorization.
+        // Otherwise use the internal backend, which opens the canonical path.
+        let backend = effective_search_backend(self.backend, &resolved_canon);
+
         // --- Multiline check for non-ripgrep fallbacks ---
-        if multiline && self.backend != SearchBackend::Ripgrep {
+        if multiline && backend != SearchBackend::Ripgrep {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(
                     "Multiline matching requires ripgrep (rg), which is not available.".into(),
                 ),
@@ -249,10 +249,11 @@ impl Tool for ContentSearchTool {
         let workspace_canon =
             std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.clone());
 
-        let formatted = match self.backend {
+        let formatted = match backend {
             SearchBackend::Ripgrep | SearchBackend::Grep => {
                 let raw_stdout = match self
                     .execute_external_search(
+                        backend,
                         pattern,
                         &resolved_canon,
                         output_mode,
@@ -268,12 +269,15 @@ impl Tool for ContentSearchTool {
                     Err(result) => return Ok(result),
                 };
 
-                match self.backend {
+                match backend {
                     SearchBackend::Ripgrep => {
                         format_rg_output(&raw_stdout, &workspace_canon, output_mode, max_results)
                     }
                     SearchBackend::Grep => {
-                        format_grep_output(&raw_stdout, &workspace_canon, output_mode, max_results)
+                        // grep receives a de-verbatimized search path (see build_grep_command), so its
+                        // output paths are de-verbatimized too — relativize against a matching prefix.
+                        let ws = strip_verbatim_prefix(&workspace_canon);
+                        format_grep_output(&raw_stdout, ws.as_ref(), output_mode, max_results)
                     }
                     SearchBackend::Internal => unreachable!(),
                 }
@@ -308,21 +312,21 @@ impl Tool for ContentSearchTool {
                     Ok(Ok(Err(e))) => {
                         return Ok(ToolResult {
                             success: false,
-                            output: String::new(),
+                            output: ToolOutput::default(),
                             error: Some(format!("Search error: {e}")),
                         });
                     }
                     Ok(Err(e)) => {
                         return Ok(ToolResult {
                             success: false,
-                            output: String::new(),
+                            output: ToolOutput::default(),
                             error: Some(format!("Search task failed: {e}")),
                         });
                     }
                     Err(_) => {
                         return Ok(ToolResult {
                             success: false,
-                            output: String::new(),
+                            output: ToolOutput::default(),
                             error: Some(format!("Search timed out after {TIMEOUT_SECS} seconds.")),
                         });
                     }
@@ -341,7 +345,7 @@ impl Tool for ContentSearchTool {
 
         Ok(ToolResult {
             success: true,
-            output: final_output,
+            output: final_output.into(),
             error: None,
         })
     }
@@ -350,6 +354,7 @@ impl Tool for ContentSearchTool {
 impl ContentSearchTool {
     async fn execute_external_search(
         &self,
+        backend: SearchBackend,
         pattern: &str,
         resolved_canon: &Path,
         output_mode: &str,
@@ -359,7 +364,7 @@ impl ContentSearchTool {
         context_after: usize,
         multiline: bool,
     ) -> Result<String, ToolResult> {
-        let mut cmd = match self.backend {
+        let mut cmd = match backend {
             SearchBackend::Ripgrep => build_rg_command(
                 pattern,
                 resolved_canon,
@@ -403,14 +408,14 @@ impl ContentSearchTool {
             Ok(Err(e)) => {
                 return Err(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Failed to execute search command: {e}")),
                 });
             }
             Err(_) => {
                 return Err(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Search timed out after {TIMEOUT_SECS} seconds.")),
                 });
             }
@@ -422,7 +427,7 @@ impl ContentSearchTool {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Search error: {}", stderr.trim())),
             });
         }
@@ -828,7 +833,7 @@ fn build_grep_command(
 
     cmd.arg("--");
     cmd.arg(pattern);
-    cmd.arg(search_path);
+    cmd.arg(strip_verbatim_prefix(search_path).as_ref());
 
     cmd
 }
@@ -851,12 +856,6 @@ fn format_grep_output(
     format_line_output(raw, workspace_canon, output_mode, max_results)
 }
 
-/// Shared formatting for both rg and grep line-based outputs.
-///
-/// Both tools produce similar line-based output in our configuration:
-/// - content mode: `path:line:content` or `path-line-content` (context lines)
-/// - files_with_matches mode: `path`
-/// - count mode: `path:count`
 fn format_line_output(
     raw: &str,
     workspace_canon: &std::path::Path,
@@ -1001,11 +1000,54 @@ fn relativize_path(line: &str, workspace_prefix: &str) -> String {
     line.to_string()
 }
 
-/// Parse content output line and determine whether it is a real match line.
-///
-/// Supported formats:
-/// - Match line: `path:line:content`
-/// - Context line: `path-line-content`
+/// Strip a Windows extended-length (`\\?\`) verbatim prefix so external tools
+/// such as `grep` receive a plain path they can parse. No-op for non-verbatim
+/// paths (and thus on non-Windows). Handles both the disk form `\\?\C:\..`
+/// (→ `C:\..`) and the UNC form `\\?\UNC\server\share` (→ `\\server\share`).
+fn strip_verbatim_prefix(path: &Path) -> std::borrow::Cow<'_, Path> {
+    match path.to_str() {
+        Some(s) => {
+            if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+                std::borrow::Cow::Owned(std::path::PathBuf::from(format!(r"\\{rest}")))
+            } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+                std::borrow::Cow::Owned(std::path::PathBuf::from(rest))
+            } else {
+                std::borrow::Cow::Borrowed(path)
+            }
+        }
+        None => std::borrow::Cow::Borrowed(path),
+    }
+}
+
+fn effective_search_backend(configured: SearchBackend, authorized_path: &Path) -> SearchBackend {
+    if configured == SearchBackend::Grep && !grep_plain_path_preserves_identity(authorized_path) {
+        SearchBackend::Internal
+    } else {
+        configured
+    }
+}
+
+fn grep_plain_path_preserves_identity(authorized_path: &Path) -> bool {
+    let plain_path = strip_verbatim_prefix(authorized_path);
+    if matches!(plain_path, std::borrow::Cow::Borrowed(_)) {
+        return true;
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+
+        // grep.exe is not guaranteed to be long-path aware. Keep paths that
+        // need extended-length handling on the internal backend even when
+        // Rust itself can reopen the plain spelling.
+        if plain_path.as_os_str().encode_wide().count() >= 260 {
+            return false;
+        }
+    }
+
+    std::fs::canonicalize(plain_path.as_ref()).is_ok_and(|round_trip| round_trip == authorized_path)
+}
+
 fn parse_content_line(line: &str) -> Option<(&str, bool)> {
     static MATCH_RE: OnceLock<regex::Regex> = OnceLock::new();
     static CONTEXT_RE: OnceLock<regex::Regex> = OnceLock::new();
@@ -1525,6 +1567,97 @@ mod tests {
         // Byte index 4 splits the first Chinese character.
         let truncated = truncate_utf8(text, 4);
         assert_eq!(truncated, "abc");
+    }
+
+    #[test]
+    fn strip_verbatim_prefix_strips_disk_form() {
+        let result = strip_verbatim_prefix(Path::new(r"\\?\C:\Users\me\ws"));
+        assert_eq!(result.as_ref(), Path::new(r"C:\Users\me\ws"));
+    }
+
+    #[test]
+    fn strip_verbatim_prefix_strips_unc_form() {
+        let result = strip_verbatim_prefix(Path::new(r"\\?\UNC\server\share\dir"));
+        assert_eq!(result.as_ref(), Path::new(r"\\server\share\dir"));
+    }
+
+    #[test]
+    fn strip_verbatim_prefix_noop_on_plain_paths() {
+        let unix_path = Path::new("/tmp/ws/sub");
+        assert_eq!(strip_verbatim_prefix(unix_path).as_ref(), unix_path);
+
+        let windows_path = Path::new(r"C:\ws\sub");
+        let result = strip_verbatim_prefix(windows_path);
+        assert_eq!(result.as_ref(), windows_path);
+        assert!(
+            matches!(result, std::borrow::Cow::Borrowed(_)),
+            "plain paths must not be reallocated"
+        );
+    }
+
+    #[test]
+    fn build_grep_command_de_verbatimizes_search_path() {
+        let cmd = build_grep_command("pat", Path::new(r"\\?\C:\ws"), "content", None, true, 0, 0);
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(args.last().copied(), Some(std::ffi::OsStr::new(r"C:\ws")));
+
+        let plain_cmd = build_grep_command("pat", Path::new(r"C:\ws"), "content", None, true, 0, 0);
+        let plain_args: Vec<&std::ffi::OsStr> = plain_cmd.get_args().collect();
+        assert_eq!(
+            plain_args.last().copied(),
+            Some(std::ffi::OsStr::new(r"C:\ws"))
+        );
+    }
+
+    #[test]
+    fn grep_backend_accepts_plain_canonical_path() {
+        let dir = TempDir::new().unwrap();
+        let authorized = std::fs::canonicalize(dir.path()).unwrap();
+
+        assert_eq!(
+            effective_search_backend(SearchBackend::Grep, &authorized),
+            SearchBackend::Grep
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn grep_backend_rejects_normalization_changing_component() {
+        let dir = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let tricky = root.join(".. ");
+        std::fs::create_dir(&tricky).unwrap();
+        let authorized = std::fs::canonicalize(&tricky).unwrap();
+
+        let backend = effective_search_backend(SearchBackend::Grep, &authorized);
+        std::fs::remove_dir(&tricky).unwrap();
+
+        assert_eq!(backend, SearchBackend::Internal);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn grep_backend_rejects_path_that_needs_extended_length_handling() {
+        use std::os::windows::ffi::OsStrExt;
+
+        let dir = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let mut long_path = root.clone();
+        while strip_verbatim_prefix(&long_path)
+            .as_os_str()
+            .encode_wide()
+            .count()
+            < 270
+        {
+            long_path.push("extended_length_component_0123456789");
+            std::fs::create_dir(&long_path).unwrap();
+        }
+        let authorized = std::fs::canonicalize(&long_path).unwrap();
+
+        let backend = effective_search_backend(SearchBackend::Grep, &authorized);
+        std::fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(backend, SearchBackend::Internal);
     }
 
     #[tokio::test]
