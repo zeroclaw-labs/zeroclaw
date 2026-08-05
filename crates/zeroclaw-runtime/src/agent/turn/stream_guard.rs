@@ -11,7 +11,7 @@ use zeroclaw_tool_call_parser::{
     TERMINAL_MARKERS, ToolProtocolEnvelopeKind, classify_tool_protocol_envelope,
     contains_tool_protocol_tag_call, looks_like_malformed_tool_protocol_envelope_for_known_tools,
     looks_like_tool_protocol_envelope, looks_like_tool_protocol_example,
-    tool_protocol_envelope_mentions_known_tool,
+    strip_trailing_terminal_markers, tool_protocol_envelope_mentions_known_tool,
 };
 
 #[derive(Debug, Default)]
@@ -390,6 +390,29 @@ mod terminal_marker_stripper_tests {
         );
     }
 
+    /// Regression for the incomplete-marker-prefix data loss: `push` holds a
+    /// possible split marker (`<eom`) plus the ordinary trailing space that
+    /// follows it, and `finish` must preserve that whitespace verbatim because
+    /// no complete terminal marker was produced. The non-streaming helper keeps
+    /// the same input, so the two paths must agree.
+    #[test]
+    fn finish_preserves_whitespace_after_incomplete_marker_prefix() {
+        let mut stripper = StreamTerminalMarkerStripper::new();
+        // `<eom` is held as a possible split marker; the trailing space is
+        // ordinary text, not part of a completed marker suffix.
+        assert_eq!(stripper.push("Answer<eom "), "Answer");
+        assert_eq!(
+            stripper.finish(),
+            "<eom ",
+            "no complete marker was stripped, so the trailing space is kept"
+        );
+        assert_eq!(
+            strip_trailing_terminal_markers("Answer<eom "),
+            "Answer<eom ",
+            "the non-streaming helper must preserve the same input"
+        );
+    }
+
     /// The streaming stripper and the non-streaming
     /// `strip_trailing_terminal_markers` helper must agree on the same inputs.
     /// This guards the shared-marker-vocabulary invariant: a change to
@@ -406,6 +429,7 @@ mod terminal_marker_stripper_tests {
             ("Text with <eom> inline", "Text with <eom> inline"),
             ("<eom>", ""),
             ("<eom>\n<|eom|>", ""),
+            ("Answer<eom ", "Answer<eom "),
             ("", ""),
         ];
         for (input, expected) in cases {
@@ -561,33 +585,11 @@ impl StreamTerminalMarkerStripper {
             return String::new();
         }
 
-        // Strip trailing terminal markers (possibly with whitespace between them)
-        let mut result = self.pending.trim_end().to_string();
-
-        loop {
-            let original_len = result.len();
-            let trimmed = result.trim_end().to_string();
-
-            let mut found_marker = false;
-            for marker in TERMINAL_MARKERS {
-                if let Some(prefix) = trimmed.strip_suffix(marker) {
-                    result = prefix.to_string();
-                    found_marker = true;
-                    break;
-                }
-            }
-
-            // If no marker found but there was trailing whitespace, remove it
-            if !found_marker && trimmed.len() < original_len {
-                result = trimmed.clone();
-            }
-
-            // If nothing changed, we're done
-            if result.len() == trimmed.len() && !found_marker {
-                break;
-            }
-        }
-
-        result
+        // Delegate to the shared non-streaming helper so both paths apply the
+        // same policy: only whitespace that follows a *complete* recognized
+        // marker is trimmed. An incomplete marker prefix plus ordinary trailing
+        // whitespace (e.g. `<eom␠` with no closing `>`) is preserved verbatim —
+        // it is user-visible prose, not a terminal marker suffix.
+        strip_trailing_terminal_markers(&self.pending)
     }
 }
