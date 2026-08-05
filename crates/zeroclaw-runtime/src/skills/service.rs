@@ -27,6 +27,8 @@ pub struct SkillSummary {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkillOrigin {
+    /// A skill embedded in the running ZeroClaw binary.
+    BuiltIn,
     /// `<install>/agents/<alias>/workspace/skills/`.
     Workspace,
     /// The open-skills repo (tagged `open-skills`).
@@ -216,9 +218,13 @@ impl<'a> SkillsService<'a> {
 
     /// Attribute a resolved skill to its [`SkillOrigin`], mirroring the
     /// resolver's own discriminators so dashboard provenance can't drift: the
-    /// `open-skills` tag, the `plugin:` name/tag prefix, then a `location`
-    /// match against a configured bundle directory; otherwise the workspace.
+    /// built-in registry, `open-skills` tag, the `plugin:` name/tag prefix,
+    /// then a `location` match against a configured bundle directory;
+    /// otherwise the workspace.
     fn derive_origin(skill: &super::Skill, bundles: &[BundleSummary]) -> SkillOrigin {
+        if super::is_builtin_skill(skill) {
+            return SkillOrigin::BuiltIn;
+        }
         if skill.tags.iter().any(|t| t == "open-skills") {
             return SkillOrigin::OpenSkills;
         }
@@ -423,6 +429,10 @@ mod tests {
             location: loc.map(PathBuf::from),
             description_localizations: Default::default(),
         };
+        assert_eq!(
+            SkillsService::derive_origin(&mk("zeroclaw-docs", &[], None), &bundles),
+            SkillOrigin::BuiltIn
+        );
         assert_eq!(
             SkillsService::derive_origin(&mk("s", &["open-skills"], None), &bundles),
             SkillOrigin::OpenSkills
@@ -644,7 +654,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_effective_skills_empty_vs_all_dropped() {
+    fn resolve_effective_skills_builtin_only_vs_all_user_skills_dropped() {
         let (dir, mut cfg) = fixture(&["core"]);
         cfg.config_path = dir.path().join("config.toml");
         cfg.agents.insert(
@@ -656,12 +666,17 @@ mod tests {
         );
         let svc = SkillsService::new(&cfg, dir.path());
 
-        // (a) nothing configured → both empty.
+        // (a) nothing configured → only the built-in skill, no dropped
+        // operator-provided candidates.
         super::super::cache::invalidate();
         let empty = svc.resolve_effective_skills("default").unwrap();
-        assert!(empty.skills.is_empty() && empty.dropped.is_empty());
+        assert_eq!(empty.skills.len(), 1);
+        assert_eq!(empty.skills[0].name, "zeroclaw-docs");
+        assert_eq!(empty.skills[0].origin, SkillOrigin::BuiltIn);
+        assert!(empty.dropped.is_empty());
 
-        // (b) one audit-failing skill → skills empty, dropped non-empty.
+        // (b) one audit-failing user skill → built-in remains, dropped is
+        // non-empty.
         let ws = cfg
             .agent_workspace_dir("default")
             .join("skills")
@@ -674,7 +689,8 @@ mod tests {
         .unwrap();
         super::super::cache::invalidate();
         let all_dropped = svc.resolve_effective_skills("default").unwrap();
-        assert!(all_dropped.skills.is_empty());
+        assert_eq!(all_dropped.skills.len(), 1);
+        assert_eq!(all_dropped.skills[0].name, "zeroclaw-docs");
         assert_eq!(all_dropped.dropped.len(), 1);
     }
 

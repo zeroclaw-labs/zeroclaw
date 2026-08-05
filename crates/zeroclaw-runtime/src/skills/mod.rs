@@ -50,7 +50,24 @@ const SKILLS_REGISTRY_SYNC_INTERVAL_SECS: u64 = 60 * 60 * 24;
 /// clone/pull/sync machinery as the default skills registry.
 const EXTRA_REGISTRY_DIR_PREFIX: &str = "extra-registry-";
 
-/// A skill is a user-defined or community-built capability.
+/// Canonical definitions for skills shipped with the runtime. They stay
+/// embedded in the binary instead of being copied into workspaces, so
+/// upgrading ZeroClaw cannot leave stale generated skill files behind.
+///
+/// `load_on_demand` creates the prompt-loading policy for a built-in skill. It
+/// deliberately lives beside the embedded source instead of in [`Skill`],
+/// where it could be mistaken for operator-authored skill state.
+struct BuiltinSkillDefinition {
+    source: &'static str,
+    load_on_demand: bool,
+}
+
+const BUILTIN_SKILLS: &[BuiltinSkillDefinition] = &[BuiltinSkillDefinition {
+    source: include_str!("assets/zeroclaw-docs/SKILL.md"),
+    load_on_demand: true,
+}];
+
+/// A skill is a bundled, user-defined, or community-built capability.
 /// Skills live in `~/.zeroclaw/workspace/skills/<name>/SKILL.md`
 /// and can include tool definitions, prompts, and automation scripts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -611,9 +628,11 @@ pub fn load_skills_for_agent_audited(
     let (mut skills, mut dropped) = load_skills_with_config_audited(workspace_dir, config);
     let mut shadows: Vec<ShadowedSkill> = Vec::new();
     let Some(agent) = config.agent(agent_alias) else {
+        append_missing_builtin_skills(&mut skills);
         return (skills, dropped, shadows);
     };
     if agent.skill_bundles.is_empty() {
+        append_missing_builtin_skills(&mut skills);
         return (skills, dropped, shadows);
     }
     let install_root = config.install_root_dir();
@@ -669,6 +688,10 @@ pub fn load_skills_for_agent_audited(
             }
         }
     }
+
+    // Built-ins have the lowest precedence: an operator-provided skill with
+    // the same name remains an intentional override.
+    append_missing_builtin_skills(&mut skills);
     (skills, dropped, shadows)
 }
 
@@ -1328,15 +1351,28 @@ fn load_skill_toml(path: &Path) -> Result<Skill> {
 /// Load a skill from a SKILL.md file (simpler format)
 fn load_skill_md(path: &Path, dir: &Path) -> Result<Skill> {
     let content = std::fs::read_to_string(path)?;
-    let parsed = parse_skill_markdown(&content);
-    let name = dir
+    let mut parsed = parse_skill_markdown(&content);
+    let fallback_name = dir
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("unknown")
         .to_string();
+    let name = parsed.meta.name.take().unwrap_or(fallback_name);
 
-    Ok(Skill {
-        name: parsed.meta.name.unwrap_or(name),
+    Ok(skill_from_parsed_markdown(
+        parsed,
+        name,
+        Some(path.to_path_buf()),
+    ))
+}
+
+fn skill_from_parsed_markdown(
+    parsed: ParsedSkillMarkdown,
+    name: String,
+    location: Option<PathBuf>,
+) -> Skill {
+    Skill {
+        name,
         description: parsed
             .meta
             .description
@@ -1350,8 +1386,79 @@ fn load_skill_md(path: &Path, dir: &Path) -> Result<Skill> {
         tools: Vec::new(),
         prompts: vec![parsed.body],
         slash_options: parsed.meta.slash_options,
-        location: Some(path.to_path_buf()),
+        location,
+    }
+}
+
+fn load_builtin_skill(source: &'static str) -> Option<Skill> {
+    let mut parsed = parse_skill_markdown(source);
+    let name = parsed
+        .meta
+        .name
+        .take()
+        .filter(|value| !value.trim().is_empty())?;
+
+    // The source is embedded in the binary and read through
+    // `builtin_skill_source`; it has no filesystem location.
+    Some(skill_from_parsed_markdown(parsed, name, None))
+}
+
+fn append_missing_builtin_skills(skills: &mut Vec<Skill>) {
+    for definition in BUILTIN_SKILLS {
+        let Some(skill) = load_builtin_skill(definition.source) else {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "built-in skill source is missing a non-empty name"
+            );
+            continue;
+        };
+        if !skills.iter().any(|loaded| loaded.name == skill.name) {
+            skills.push(skill);
+        }
+    }
+}
+
+fn builtin_skill_definition(skill: &Skill) -> Option<&'static BuiltinSkillDefinition> {
+    if skill.location.is_some() {
+        return None;
+    }
+
+    BUILTIN_SKILLS.iter().find(|definition| {
+        parse_skill_markdown(definition.source)
+            .meta
+            .name
+            .is_some_and(|name| name == skill.name)
     })
+}
+
+pub(crate) fn builtin_skill_source(skill: &Skill) -> Option<&'static str> {
+    builtin_skill_definition(skill).map(|definition| definition.source)
+}
+
+pub(crate) fn is_builtin_skill(skill: &Skill) -> bool {
+    builtin_skill_definition(skill).is_some()
+}
+
+fn skill_loads_on_demand(skill: &Skill) -> bool {
+    builtin_skill_definition(skill).is_some_and(|definition| definition.load_on_demand)
+}
+
+/// Whether an agent's effective skill set needs the `read_skill` tool.
+///
+/// Compact mode loads every skill on demand. Full mode normally keeps its
+/// existing inline behavior, except for built-ins whose canonical definition
+/// opts into progressive disclosure.
+#[must_use]
+pub fn skills_require_read_tool(
+    skills: &[Skill],
+    mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
+) -> bool {
+    matches!(
+        mode,
+        zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
+    ) || skills.iter().any(skill_loads_on_demand)
 }
 
 fn load_open_skill_md(path: &Path) -> Result<Skill> {
@@ -1564,6 +1671,9 @@ fn resolve_skill_location(skill: &Skill, workspace_dir: &Path) -> PathBuf {
 }
 
 fn render_skill_location(skill: &Skill, workspace_dir: &Path, prefer_relative: bool) -> String {
+    if is_builtin_skill(skill) {
+        return format!("builtin://{}/SKILL.md", skill.name);
+    }
     let location = resolve_skill_location(skill, workspace_dir);
     if prefer_relative && let Ok(relative) = location.strip_prefix(workspace_dir) {
         return display_skill_location(relative);
@@ -1618,14 +1728,21 @@ pub fn skills_to_prompt_with_mode(
         return String::new();
     }
 
-    let mut prompt = match mode {
-        zeroclaw_config::schema::SkillsPromptInjectionMode::Full => String::from(
+    let has_on_demand_skill = skills.iter().any(skill_loads_on_demand);
+    let mut prompt = match (mode, has_on_demand_skill) {
+        (zeroclaw_config::schema::SkillsPromptInjectionMode::Full, false) => String::from(
             "## Available Skills\n\n\
              Skill instructions and tool metadata are preloaded below.\n\
              Follow these instructions directly; do not read skill files at runtime unless the user asks.\n\n\
              <available_skills>\n",
         ),
-        zeroclaw_config::schema::SkillsPromptInjectionMode::Compact => String::from(
+        (zeroclaw_config::schema::SkillsPromptInjectionMode::Full, true) => String::from(
+            "## Available Skills\n\n\
+             Most skill instructions and all tool metadata are preloaded below.\n\
+             For a skill marked `<loading>on-demand</loading>`, call `read_skill(name)` with its `<name>` before following its instructions.\n\n\
+             <available_skills>\n",
+        ),
+        (zeroclaw_config::schema::SkillsPromptInjectionMode::Compact, _) => String::from(
             "## Available Skills\n\n\
              Skill summaries are preloaded below to keep context compact.\n\
              Skill instructions are loaded on demand: call `read_skill(name)` with the skill's `<name>` when you need the full skill file.\n\
@@ -1635,27 +1752,22 @@ pub fn skills_to_prompt_with_mode(
     };
 
     for skill in skills {
+        let loads_on_demand = matches!(
+            mode,
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
+        ) || skill_loads_on_demand(skill);
         let _ = writeln!(prompt, "  <skill>");
         write_xml_text_element(&mut prompt, 4, "name", &skill.name);
         write_xml_text_element(&mut prompt, 4, "description", &skill.description);
-        let location = render_skill_location(
-            skill,
-            workspace_dir,
-            matches!(
-                mode,
-                zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
-            ),
-        );
+        let location = render_skill_location(skill, workspace_dir, loads_on_demand);
         write_xml_text_element(&mut prompt, 4, "location", &location);
+        if loads_on_demand {
+            write_xml_text_element(&mut prompt, 4, "loading", "on-demand");
+        }
 
-        // In Full mode, inline both instructions and tools.
-        // In Compact mode, skip instructions (loaded on demand) but keep tools
-        // so the LLM knows which skill tools are available.
-        if matches!(
-            mode,
-            zeroclaw_config::schema::SkillsPromptInjectionMode::Full
-        ) && !skill.prompts.is_empty()
-        {
+        // Keep tools visible in every mode. Instructions stay inline unless
+        // compact mode or the built-in's canonical definition opts out.
+        if !loads_on_demand && !skill.prompts.is_empty() {
             let _ = writeln!(prompt, "    <instructions>");
             for instruction in &skill.prompts {
                 write_xml_text_element(&mut prompt, 6, "instruction", instruction);
@@ -4398,5 +4510,145 @@ version = "0.1.0"
             names.contains(&skill_name),
             "with empty skill_bundles, workspace skills must still load; got: {names:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod builtin_skill_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn config_for(workspace: &Path) -> zeroclaw_config::schema::Config {
+        zeroclaw_config::schema::Config {
+            config_path: workspace.join("config.toml"),
+            data_dir: workspace.join("data"),
+            skills: zeroclaw_config::schema::SkillsConfig {
+                open_skills_enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn zeroclaw_docs_is_loaded_from_the_embedded_source() {
+        let workspace = TempDir::new().unwrap();
+        let config = config_for(workspace.path());
+
+        let skills = load_skills_for_agent(workspace.path(), &config, "default");
+        let skill = skills
+            .iter()
+            .find(|skill| skill.name == "zeroclaw-docs")
+            .expect("built-in zeroclaw-docs skill must load");
+
+        assert!(is_builtin_skill(skill));
+        assert!(skill.location.is_none());
+        assert!(skill.description.contains("current ZeroClaw installation"));
+        assert!(skill.prompts[0].contains("## Source priority"));
+        assert!(
+            builtin_skill_source(skill)
+                .expect("built-in source must be readable")
+                .starts_with("---\nname: zeroclaw-docs")
+        );
+    }
+
+    #[test]
+    fn operator_skill_with_the_same_name_overrides_the_builtin() {
+        let workspace = TempDir::new().unwrap();
+        let skill_dir = workspace.path().join("skills/zeroclaw-docs");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: zeroclaw-docs\ndescription: Operator override\n---\n\n# Override\n",
+        )
+        .unwrap();
+        let config = config_for(workspace.path());
+
+        let matches: Vec<_> = load_skills_for_agent(workspace.path(), &config, "default")
+            .into_iter()
+            .filter(|skill| skill.name == "zeroclaw-docs")
+            .collect();
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].description, "Operator override");
+        assert!(!is_builtin_skill(&matches[0]));
+        assert!(matches[0].location.is_some());
+    }
+
+    #[test]
+    fn compact_prompt_advertises_a_virtual_builtin_location() {
+        let skill = load_builtin_skill(BUILTIN_SKILLS[0].source)
+            .expect("bundled skill source must have a name");
+        let prompt = skills_to_prompt_with_mode(
+            &[skill],
+            Path::new("/tmp/workspace"),
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Compact,
+        );
+
+        assert!(prompt.contains("<name>zeroclaw-docs</name>"));
+        assert!(prompt.contains("<location>builtin://zeroclaw-docs/SKILL.md</location>"));
+        assert!(prompt.contains("<loading>on-demand</loading>"));
+        assert!(!prompt.contains("<instructions>"));
+    }
+
+    #[test]
+    fn full_prompt_loads_builtin_docs_on_demand_without_changing_other_skills() {
+        let builtin = load_builtin_skill(BUILTIN_SKILLS[0].source)
+            .expect("bundled skill source must have a name");
+        let operator_skill = Skill {
+            name: "operator-runbook".to_string(),
+            description: "Operator instructions".to_string(),
+            description_localizations: Default::default(),
+            version: "0.1.0".to_string(),
+            author: None,
+            tags: Vec::new(),
+            tools: Vec::new(),
+            prompts: vec!["Keep this instruction inline.".to_string()],
+            slash_options: Vec::new(),
+            location: Some(PathBuf::from(
+                "/tmp/workspace/skills/operator-runbook/SKILL.md",
+            )),
+        };
+
+        let prompt = skills_to_prompt_with_mode(
+            &[builtin, operator_skill],
+            Path::new("/tmp/workspace"),
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+        );
+
+        assert!(prompt.contains("<loading>on-demand</loading>"));
+        assert!(!prompt.contains("# ZeroClaw self-knowledge and operation"));
+        assert!(prompt.contains("Keep this instruction inline."));
+    }
+
+    #[test]
+    fn full_prompt_inlines_an_operator_override_of_builtin_docs() {
+        let operator_skill = Skill {
+            name: "zeroclaw-docs".to_string(),
+            description: "Operator override".to_string(),
+            description_localizations: Default::default(),
+            version: "0.1.0".to_string(),
+            author: None,
+            tags: Vec::new(),
+            tools: Vec::new(),
+            prompts: vec!["Use the operator's instructions.".to_string()],
+            slash_options: Vec::new(),
+            location: Some(PathBuf::from(
+                "/tmp/workspace/skills/zeroclaw-docs/SKILL.md",
+            )),
+        };
+
+        assert!(!skills_require_read_tool(
+            std::slice::from_ref(&operator_skill),
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+        ));
+        let prompt = skills_to_prompt_with_mode(
+            &[operator_skill],
+            Path::new("/tmp/workspace"),
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+        );
+
+        assert!(!prompt.contains("<loading>"));
+        assert!(prompt.contains("Use the operator&apos;s instructions."));
     }
 }

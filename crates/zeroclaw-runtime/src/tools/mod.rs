@@ -753,12 +753,15 @@ pub fn all_tools_with_runtime(
         )));
     }
 
-    if matches!(
+    let effective_skills =
+        crate::skills::load_skills_for_agent_from_config(root_config, agent_alias);
+    if crate::skills::skills_require_read_tool(
+        &effective_skills,
         root_config.effective_skills_prompt_mode(agent_alias),
-        zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
     ) {
-        // ReadSkillTool now holds full config to support all skill sources:
-        // workspace skills, open-skills, agent-bound bundles, and plugin skills.
+        // ReadSkillTool holds full config to resolve the effective set again at
+        // call time: workspace skills, open-skills, agent-bound bundles,
+        // plugin skills, and embedded built-ins.
         tool_arcs.push(Arc::new(ReadSkillTool::new(
             config.clone(),
             agent_alias.to_string(),
@@ -2789,7 +2792,7 @@ mod tests {
     }
 
     #[test]
-    fn all_tools_excludes_read_skill_in_full_mode() {
+    fn all_tools_includes_read_skill_for_on_demand_builtin_in_full_mode() {
         let tmp = TempDir::new().unwrap();
         let security = Arc::new(SecurityPolicy::default());
         let mem_cfg = MemoryConfig {
@@ -2803,6 +2806,55 @@ mod tests {
         let http = zeroclaw_config::schema::HttpRequestConfig::default();
         let mut cfg = test_config(&tmp);
         cfg.skills.prompt_injection_mode = zeroclaw_config::schema::SkillsPromptInjectionMode::Full;
+
+        let tools = all_tools(
+            Arc::new(cfg.clone()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+            false,
+            None,
+        )
+        .tools;
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"read_skill"));
+    }
+
+    #[test]
+    fn all_tools_excludes_read_skill_for_operator_override_in_full_mode() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let browser = BrowserConfig::default();
+        let http = zeroclaw_config::schema::HttpRequestConfig::default();
+        let mut cfg = test_config(&tmp);
+        cfg.skills.prompt_injection_mode = zeroclaw_config::schema::SkillsPromptInjectionMode::Full;
+        let override_dir = cfg
+            .agent_workspace_dir("test-agent")
+            .join("skills/zeroclaw-docs");
+        std::fs::create_dir_all(&override_dir).unwrap();
+        std::fs::write(
+            override_dir.join("SKILL.md"),
+            "---\nname: zeroclaw-docs\ndescription: Operator override\n---\n\n# Override\n",
+        )
+        .unwrap();
 
         let tools = all_tools(
             Arc::new(cfg.clone()),
@@ -2940,7 +2992,7 @@ mod tests {
     }
 
     #[test]
-    fn all_tools_omits_read_skill_for_full_agent_override_over_global_compact() {
+    fn all_tools_keeps_read_skill_for_on_demand_builtin_with_full_agent_override() {
         let tmp = TempDir::new().unwrap();
         let security = Arc::new(SecurityPolicy::default());
         let mem_cfg = MemoryConfig {
@@ -2996,8 +3048,8 @@ mod tests {
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(
-            !names.contains(&"read_skill"),
-            "full runtime-profile override should omit read_skill even when global is compact"
+            names.contains(&"read_skill"),
+            "the on-demand built-in should register read_skill even when the effective mode is full"
         );
     }
 }

@@ -818,7 +818,12 @@ export interface SkillDocument {
 }
 
 /** Where a skill in an agent's effective set was loaded from. */
-export type AgentSkillOrigin = "workspace" | "open-skills" | "plugin" | "bundle";
+export type AgentSkillOrigin =
+  | "built-in"
+  | "workspace"
+  | "open-skills"
+  | "plugin"
+  | "bundle";
 
 /**
  * A lower-precedence same-name skill that a winning skill shadowed (it did
@@ -904,7 +909,8 @@ export function listSkillsInBundle(
 
 /**
  * The agent's EFFECTIVE skill set — every skill the runtime actually loads
- * for `alias`, across workspace / open-skills / plugin / bundle origins.
+ * for `alias`, across built-in / workspace / open-skills / plugin / bundle
+ * origins.
  * Unlike {@link listSkillsInBundle} (which only sees configured bundles),
  * this reflects what the agent can really use.
  */

@@ -831,7 +831,8 @@ rpc_type! {
     pub struct AgentSkillEntry {
         pub name: String,
         pub description: String,
-        /// `"workspace"` | `"open-skills"` | `"plugin"` | `"bundle"`.
+        /// `"built-in"` | `"workspace"` | `"open-skills"` | `"plugin"` |
+        /// `"bundle"`.
         pub origin: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub plugin: Option<String>,

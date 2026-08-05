@@ -10802,13 +10802,13 @@ pub async fn start_channels(
             ),
         ];
 
-        if matches!(
+        if zeroclaw_runtime::skills::skills_require_read_tool(
+            &skills,
             config.effective_skills_prompt_mode(agent_alias),
-            zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
         ) {
             tool_descs.push((
                 "read_skill",
-                "Load the full source for an available skill by name. Use when: compact mode only shows a summary and you need the complete skill instructions.",
+                "Load the full source for an available skill by name. Use when: its prompt entry marks the instructions as on-demand.",
             ));
         }
         if config.browser.enabled {
@@ -23645,6 +23645,28 @@ BTC is currently around $65,000 based on latest tool output."#
         provider_impl: Arc<HistoryCaptureModelProvider>,
         memory: Arc<dyn Memory>,
     ) -> Arc<ChannelRuntimeContext> {
+        let agent_alias = "test-agent";
+        let workspace_dir = std::env::temp_dir().join(format!(
+            "zeroclaw-cache-stability-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let prompt_config = Arc::new(zeroclaw_config::schema::Config::default());
+        let skills_prompt = zeroclaw_runtime::skills::skills_to_prompt_with_mode(
+            &zeroclaw_runtime::skills::load_skills_for_agent(
+                &workspace_dir,
+                prompt_config.as_ref(),
+                agent_alias,
+            ),
+            &workspace_dir,
+            prompt_config.effective_skills_prompt_mode(agent_alias),
+        );
+        // Production contexts already contain the effective skills section.
+        // Keep this fixture faithful so a new-session refresh remains byte
+        // identical to subsequent turns.
+        let system_prompt = replace_available_skills_section(
+            "test-system-prompt\n\n## Workspace\n\nTest workspace.",
+            &skills_prompt,
+        );
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
         let mut channels_by_name = HashMap::new();
@@ -23654,7 +23676,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channels_by_name: Arc::new(channels_by_name),
             model_provider: provider_impl,
             model_provider_ref: Arc::new("test-provider".to_string()),
-            agent_alias: Arc::new("test-agent".to_string()),
+            agent_alias: Arc::new(agent_alias.to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: memory.clone(),
             memory_strategy: Arc::new(
@@ -23666,7 +23688,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ),
             tools_registry: Arc::new(Vec::new()),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(system_prompt),
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -23682,8 +23704,8 @@ BTC is currently around $65,000 based on latest tool output."#
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
-            workspace_dir: Arc::new(std::env::temp_dir()),
-            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            workspace_dir: Arc::new(workspace_dir),
+            prompt_config,
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
