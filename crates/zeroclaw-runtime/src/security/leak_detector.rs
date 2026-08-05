@@ -1496,7 +1496,7 @@ MIIEowIBAAKCAQEA0ZPr5JeyVDonXsKhfq...
         // still be redacted. This is the case that length/alphabet matching
         // alone would get wrong.
         let detector = LeakDetector::new();
-        let secret = "F3mQ7nR9sT2vW5xY8aB1cD4eG6hJ8kL0mN2pQ4rS6tU8vWxY";
+        let secret = "8MZZix7yFzfgcTsdcvorrYqreVG1g68Ku7V1uzkYkMES";
         assert_eq!(secret.len(), 44);
         assert!(is_base58(secret), "test secret must be all-base58");
         let content = format!("my signing key is {secret}");
