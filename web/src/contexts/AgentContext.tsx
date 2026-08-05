@@ -13,6 +13,7 @@ import {
   type TurnStreamFrame,
   type TurnStreamState,
 } from '@/contexts/turnStream.logic';
+import { buildHistoryTrimmedNotice } from '@/contexts/historyTrimNotices.logic';
 import {
   loadChatHistory,
   mapServerMessagesToPersisted,
@@ -409,42 +410,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
       }
 
       case 'history_trimmed': {
-        const reason = msg.reason || t('agent.history_trimmed_unknown_reason');
-        const dropped = String(msg.dropped_messages ?? 0);
-        const kept = String(msg.kept_turns ?? 0);
-        const hasTokens =
-          msg.token_budget != null && msg.tokens_before != null && msg.tokens_after != null;
-        let content: string;
-        if (hasTokens) {
-          content = t('agent.history_trimmed_tokens')
-            .replace('{budget}', String(msg.token_budget))
-            .replace('{before}', String(msg.tokens_before))
-            .replace('{after}', String(msg.tokens_after))
-            .replace('{dropped}', dropped)
-            .replace('{kept}', kept);
-          const sourceLabel = (source?: string) =>
-            source === 'provider'
-              ? t('agent.history_trimmed_tokens_source_provider')
-              : source === 'estimate'
-                ? t('agent.history_trimmed_tokens_source_estimate')
-                : source === 'calibrated'
-                  ? t('agent.history_trimmed_tokens_source_calibrated')
-                  : undefined;
-          const beforeLabel = sourceLabel(msg.tokens_before_source);
-          const afterLabel = sourceLabel(msg.tokens_after_source);
-          if (beforeLabel && afterLabel) {
-            content +=
-              ' ' +
-              t('agent.history_trimmed_tokens_sources')
-                .replace('{before}', beforeLabel)
-                .replace('{after}', afterLabel);
-          }
-        } else {
-          content = t('agent.history_trimmed')
-            .replace('{reason}', reason)
-            .replace('{dropped}', dropped)
-            .replace('{kept}', kept);
-        }
+        const content = buildHistoryTrimmedNotice(msg, t);
         localMessageMutationVersionRef.current += 1;
         setMessages((prev) => [
           ...prev,

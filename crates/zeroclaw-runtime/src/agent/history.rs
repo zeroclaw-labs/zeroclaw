@@ -246,6 +246,22 @@ pub fn estimate_history_tokens(history: &[ChatMessage]) -> usize {
     history.iter().map(estimate_message_tokens).sum()
 }
 
+/// Estimate the token cost of native tool definitions serialized into the
+/// provider request, using the same ~4 chars/token heuristic as messages.
+/// The OpenAI and compatible adapters serialize these schemas into the chat
+/// request, so providers that include them in `input_tokens` report a
+/// population of messages plus tool schemas, not messages alone.
+pub fn estimate_tool_schema_tokens(specs: &[crate::tools::ToolSpec]) -> usize {
+    specs
+        .iter()
+        .map(|spec| {
+            let parameters_len =
+                serde_json::to_string(&*spec.parameters).map_or(0, |serialized| serialized.len());
+            (spec.name.len() + spec.description.len() + parameters_len).div_ceil(4) + 4
+        })
+        .sum()
+}
+
 pub fn estimate_system_floor_tokens(history: &[ChatMessage]) -> usize {
     history
         .iter()
@@ -453,6 +469,21 @@ mod tests {
         assert_eq!(estimate_system_floor_tokens(&[]), 0);
         let history = vec![ChatMessage::user("hi"), ChatMessage::assistant("yo")];
         assert_eq!(estimate_system_floor_tokens(&history), 0);
+    }
+
+    #[test]
+    fn estimate_tool_schema_tokens_counts_name_description_and_parameters() {
+        let spec = crate::tools::ToolSpec::new(
+            "search",
+            "search the corpus",
+            serde_json::json!({"type": "object", "properties": {"q": {"type": "string"}}}),
+        );
+        let tokens = estimate_tool_schema_tokens(&[spec]);
+        assert!(tokens > 0, "a tool schema must contribute tokens");
+        assert!(
+            estimate_tool_schema_tokens(&[]) == 0,
+            "no tools means no schema tokens"
+        );
     }
 
     #[test]
