@@ -1,34 +1,16 @@
 //! ZeroClaw ESP32 firmware — JSON-over-serial peripheral.
-//!
-//! Listens for newline-delimited JSON commands on UART0, executes gpio_read/gpio_write,
-//! responds with JSON. Compatible with host ZeroClaw SerialPeripheral protocol.
-//!
-//! Protocol: same as STM32 — see docs/hardware-peripherals-design.md
 
 use esp_idf_svc::hal::gpio::PinDriver;
 use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::hal::uart::{UartConfig, UartDriver};
 use esp_idf_svc::hal::units::Hertz;
+use heapless::{String, Vec};
 use log::info;
-use serde::{Deserialize, Serialize};
+use zeroclaw_fw_protocol::{Command, copy_id, write_err, write_ok};
 
-/// Incoming command from host.
-#[derive(Debug, Deserialize)]
-struct Request {
-    id: String,
-    cmd: String,
-    args: serde_json::Value,
-}
-
-/// Outgoing response to host.
-#[derive(Debug, Serialize)]
-struct Response {
-    id: String,
-    ok: bool,
-    result: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-}
+// Pre-escaped because `write_ok` embeds this value as a JSON string without escaping.
+const CAPABILITIES_RESULT: &str =
+    r#"{\"gpio\":[0,1,2,3,4,5,12,13,14,15,16,17,18,19],\"led_pin\":2}"#;
 
 fn main() -> anyhow::Result<()> {
     esp_idf_svc::sys::link_patches();
@@ -55,7 +37,8 @@ fn main() -> anyhow::Result<()> {
     info!("ZeroClaw ESP32 firmware ready on UART0 (115200)");
 
     let mut buf = [0u8; 512];
-    let mut line = Vec::new();
+    let mut line: Vec<u8, 400> = Vec::new();
+    let mut resp_buf: String<256> = String::new();
 
     loop {
         match uart.read(&mut buf, 100) {
@@ -64,20 +47,13 @@ fn main() -> anyhow::Result<()> {
                 for &b in &buf[..n] {
                     if b == b'\n' {
                         if !line.is_empty() {
-                            if let Ok(line_str) = std::str::from_utf8(&line) {
-                                if let Ok(resp) = handle_request(line_str, &mut gpio2, &mut gpio13)
-                                {
-                                    let out = serde_json::to_string(&resp).unwrap_or_default();
-                                    let _ = uart.write(format!("{}\n", out).as_bytes());
-                                }
-                            }
+                            handle_request(&line, &mut gpio2, &mut gpio13, &mut resp_buf);
+                            let _ = uart.write(resp_buf.as_bytes());
+                            let _ = uart.write(b"\n");
                             line.clear();
                         }
-                    } else {
-                        line.push(b);
-                        if line.len() > 400 {
-                            line.clear();
-                        }
+                    } else if line.push(b).is_err() {
+                        line.clear();
                     }
                 }
             }
@@ -87,53 +63,40 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn handle_request<G2, G13>(
-    line: &str,
+    line: &[u8],
     gpio2: &mut PinDriver<'_, G2>,
     gpio13: &mut PinDriver<'_, G13>,
-) -> anyhow::Result<Response>
-where
+    resp_buf: &mut String<256>,
+) where
     G2: esp_idf_svc::hal::gpio::OutputMode,
     G13: esp_idf_svc::hal::gpio::OutputMode,
 {
-    let req: Request = serde_json::from_str(line.trim())?;
-    let id = req.id.clone();
+    let mut id_buf = [0u8; 32];
+    let id_len = copy_id(line, &mut id_buf);
+    let id_str = core::str::from_utf8(&id_buf[..id_len]).unwrap_or("0");
 
-    let result = match req.cmd.as_str() {
-        "capabilities" => {
-            // Phase C: report GPIO pins and LED pin (matches Arduino protocol)
-            let caps = serde_json::json!({
-                "gpio": [0, 1, 2, 3, 4, 5, 12, 13, 14, 15, 16, 17, 18, 19],
-                "led_pin": 2
-            });
-            Ok(caps.to_string())
+    match Command::from_line(line) {
+        Some(Command::Capabilities) => {
+            write_ok(resp_buf, id_str, CAPABILITIES_RESULT);
         }
-        "gpio_read" => {
-            let pin_num = req.args.get("pin").and_then(|v| v.as_u64()).unwrap_or(0) as i32;
-            let value = gpio_read(pin_num)?;
-            Ok(value.to_string())
+        Some(Command::GpioRead { pin }) => match gpio_read(pin) {
+            Ok(value) => {
+                let mut value_buf: String<8> = String::new();
+                let _ = core::fmt::Write::write_fmt(&mut value_buf, format_args!("{value}"));
+                write_ok(resp_buf, id_str, &value_buf);
+            }
+            Err(e) => write_err(resp_buf, id_str, &e.to_string()),
+        },
+        Some(Command::GpioWrite { pin, value }) => match gpio_write(gpio2, gpio13, pin, value) {
+            Ok(()) => write_ok(resp_buf, id_str, "done"),
+            Err(e) => write_err(resp_buf, id_str, &e.to_string()),
+        },
+        Some(Command::Ping) => {
+            write_ok(resp_buf, id_str, "pong");
         }
-        "gpio_write" => {
-            let pin_num = req.args.get("pin").and_then(|v| v.as_u64()).unwrap_or(0) as i32;
-            let value = req.args.get("value").and_then(|v| v.as_u64()).unwrap_or(0);
-            gpio_write(gpio2, gpio13, pin_num, value)?;
-            Ok("done".into())
+        None => {
+            write_err(resp_buf, id_str, "Unknown command");
         }
-        _ => Err(anyhow::Error::msg(format!("Unknown command: {}", req.cmd))),
-    };
-
-    match result {
-        Ok(r) => Ok(Response {
-            id,
-            ok: true,
-            result: r,
-            error: None,
-        }),
-        Err(e) => Ok(Response {
-            id,
-            ok: false,
-            result: String::new(),
-            error: Some(e.to_string()),
-        }),
     }
 }
 
@@ -146,7 +109,7 @@ fn gpio_write<G2, G13>(
     gpio2: &mut PinDriver<'_, G2>,
     gpio13: &mut PinDriver<'_, G13>,
     pin: i32,
-    value: u64,
+    value: i32,
 ) -> anyhow::Result<()>
 where
     G2: esp_idf_svc::hal::gpio::OutputMode,

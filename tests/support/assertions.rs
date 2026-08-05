@@ -2,12 +2,6 @@
 
 use super::trace::TraceExpects;
 
-/// Verify trace expectations against actual test results.
-///
-/// - `expects`: declarative expectations from the trace fixture
-/// - `final_response`: the final text response from the agent
-/// - `tools_called`: names of tools that were actually called
-/// - `label`: test label for error messages
 pub fn verify_expects(
     expects: &TraceExpects,
     final_response: &str,

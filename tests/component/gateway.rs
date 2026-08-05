@@ -1,10 +1,4 @@
 //! Gateway component tests.
-//!
-//! Tests public gateway infrastructure (rate limiter, idempotency, signature
-//! verification) in isolation. The gateway module (`zeroclaw::gateway`) exposes
-//! `verify_whatsapp_signature` and the server function `run_gateway`, but the
-//! internal rate limiter and idempotency store constructors are crate-private.
-//! Tests here verify behavior through the public API surface.
 
 use zeroclaw::gateway::verify_whatsapp_signature;
 
@@ -12,7 +6,6 @@ use zeroclaw::gateway::verify_whatsapp_signature;
 // WhatsApp webhook signature verification (public API)
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Valid HMAC-SHA256 signature is accepted.
 #[test]
 fn gateway_whatsapp_valid_signature_accepted() {
     let secret = "test_app_secret";
@@ -35,7 +28,6 @@ fn gateway_whatsapp_valid_signature_accepted() {
     );
 }
 
-/// Wrong signature is rejected.
 #[test]
 fn gateway_whatsapp_wrong_signature_rejected() {
     let secret = "test_app_secret";
@@ -48,7 +40,6 @@ fn gateway_whatsapp_wrong_signature_rejected() {
     );
 }
 
-/// Missing sha256= prefix is rejected.
 #[test]
 fn gateway_whatsapp_missing_prefix_rejected() {
     let secret = "test_app_secret";
@@ -61,7 +52,6 @@ fn gateway_whatsapp_missing_prefix_rejected() {
     );
 }
 
-/// Empty signature is rejected.
 #[test]
 fn gateway_whatsapp_empty_signature_rejected() {
     let secret = "test_app_secret";
@@ -73,7 +63,6 @@ fn gateway_whatsapp_empty_signature_rejected() {
     );
 }
 
-/// Tampered body is rejected (signature computed for different body).
 #[test]
 fn gateway_whatsapp_tampered_body_rejected() {
     let secret = "test_app_secret";
@@ -96,7 +85,6 @@ fn gateway_whatsapp_tampered_body_rejected() {
     );
 }
 
-/// Different secrets produce different signatures.
 #[test]
 fn gateway_whatsapp_different_secrets_differ() {
     let body = b"same body";
@@ -127,7 +115,6 @@ fn gateway_whatsapp_different_secrets_differ() {
 // Gateway constants and configuration validation
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Gateway body limit constant is reasonable.
 #[test]
 fn gateway_body_limit_is_reasonable() {
     assert_eq!(
@@ -137,7 +124,6 @@ fn gateway_body_limit_is_reasonable() {
     );
 }
 
-/// Gateway timeout constant is reasonable.
 #[test]
 fn gateway_timeout_is_reasonable() {
     assert_eq!(
@@ -147,7 +133,6 @@ fn gateway_timeout_is_reasonable() {
     );
 }
 
-/// Gateway rate limit window is 60 seconds.
 #[test]
 fn gateway_rate_limit_window_is_60s() {
     assert_eq!(

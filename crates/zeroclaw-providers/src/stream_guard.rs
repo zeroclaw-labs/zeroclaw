@@ -30,14 +30,6 @@ impl Drop for AbortOnDrop {
     }
 }
 
-/// Close out an SSE parser at EOF: `Final` only when the provider's own
-/// completion signal was observed, otherwise a truncation `StreamError`.
-///
-/// Socket EOF alone proves nothing — a connection dropped mid-response reads
-/// exactly like a finished one. Treating bare EOF as success made the agent
-/// loop end turns as empty "final responses" with no explanation (live repro:
-/// trace aaf558a6). The truncation error is retryable downstream:
-/// `call_provider` falls back to non-streaming chat on stream errors.
 pub(crate) async fn finish_sse_stream(
     tx: &tokio::sync::mpsc::Sender<
         ::zeroclaw_api::model_provider::StreamResult<::zeroclaw_api::model_provider::StreamEvent>,

@@ -1,10 +1,6 @@
 //! Multi-agent runtime types: alias newtypes, access-mode enum, peer
 //! external entries, and the nested config structs that wire into
 //! [`crate::schema::AliasedAgentConfig`] and [`crate::schema::Config`].
-//!
-//! Cross-agent semantics, peer-group resolution, and SubAgent permission
-//! inheritance live in the runtime crate; this module only carries the
-//! data shapes.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -15,11 +11,7 @@ crate::define_provider_ref!(AgentAlias, "agents");
 crate::define_provider_ref!(PeerGroupName, "peer_groups");
 crate::define_provider_ref!(PeerUsername, "channels.peers");
 
-/// Cross-agent filesystem grant.
-///
-/// Used as the value type in `[agents.<alias>.workspace.access]` maps.
-/// A missing entry means no cross-agent access at all (jailed). The enum
-/// only encodes the granted modes; absence is the safe default.
+/// A cross-agent filesystem grant from a workspace allowlist entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
@@ -33,15 +25,7 @@ pub enum AccessMode {
     ReadWrite,
 }
 
-/// Per-agent memory backend selector.
-///
-/// Closed set; the schema is law. The enum mirrors the storage-instance
-/// outer keys under `Config.storage.<kind>.<alias>`: `sqlite`, `postgres`,
-/// `qdrant`, `markdown`, `lucid`, plus `none` for the no-storage case.
-///
-/// An agent's backend is locked at agent creation and immutable on
-/// subsequent loads. `Config::validate()` enforces immutability against
-/// the persisted on-disk state.
+/// Selects the memory backend used by an agent.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
@@ -66,21 +50,7 @@ pub enum MemoryBackendKind {
     Lucid,
 }
 
-/// Per-agent filesystem and cross-agent access settings, nested under
-/// `[agents.<alias>.workspace]`.
-///
-/// `path = None` means derive the working directory from the install
-/// root and agent alias (`<install>/agents/<alias>/workspace/`); set
-/// `Some(path)` to put a specific agent's workspace on a different disk
-/// or filesystem. The `access` map is the inbound cross-agent filesystem
-/// allowlist (key = sibling agent alias, value = read/write/read+write
-/// grant); empty means jailed. `unrestricted_filesystem` is the escape
-/// hatch for agents that genuinely need to read or write outside any
-/// per-agent scope; off by default and audited.
-///
-/// `read_memory_from` is the cross-agent memory allowlist (parallel to
-/// `access` but for the memory layer). The schema validates entries
-/// for cross-reference and same-backend invariants at config load.
+/// Per-agent workspace and cross-agent access configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "agent_workspace"]
@@ -90,28 +60,17 @@ pub struct AgentWorkspaceConfig {
     /// `<install>/agents/<alias>/workspace/`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
-    /// Cross-agent filesystem allowlist (inbound declaration). Key is
-    /// the target sibling agent alias; value is the granted mode. Empty
-    /// map = jailed (own workspace only).
+    /// Cross-agent workspace allowlist. An empty map grants no sibling access.
     pub access: BTreeMap<AgentAlias, AccessMode>,
     /// Escape hatch: when `true`, the agent can read or write anywhere
     /// the host filesystem permits. Off by default; flipping this on is
     /// auditable.
     pub unrestricted_filesystem: bool,
-    /// Cross-agent memory allowlist (inbound declaration). Each alias
-    /// listed here is a sibling agent this agent may recall memory
-    /// rows from. Empty = own only.
+    /// Cross-agent memory allowlist. An empty list grants access only to local memory.
     pub read_memory_from: Vec<AgentAlias>,
 }
 
-/// Per-agent memory backend selection, nested under
-/// `[agents.<alias>.memory]`.
-///
-/// The `backend` field is locked at agent creation and immutable on
-/// subsequent loads (`Config::validate()` enforces this against the
-/// persisted on-disk state). Cross-backend memory sharing across the
-/// per-agent `read_memory_from` allowlist is rejected at validation:
-/// allowlist entries must point at same-backend siblings.
+/// Per-agent memory backend selection and its persistence contract.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "agent_memory"]
@@ -123,10 +82,6 @@ pub struct AgentMemoryConfig {
 }
 
 /// Preferred output modality for a peer group.
-///
-/// Controls how the agent delivers replies to peers in this group when no
-/// stronger per-turn signal is present. `Mirror` (default) preserves the
-/// existing input-driven behaviour: voice in → voice out, text in → text out.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
@@ -162,13 +117,17 @@ pub struct PeerGroupConfig {
     /// agent always reply and deliver proactive messages (cron, announces)
     /// as TTS voice notes on channels that support audio output.
     pub output_modality: OutputModality,
+    /// When `true`, members of this peer group are authorized to issue
+    /// `/model --agent <model>` on the agent this group is bound to.
+    /// Default `false` (deny-by-default). The runtime resolves this live
+    /// from `Config::peer_groups` at command-dispatch time via
+    /// `Config::channel_agent_scope_admins`; no cache, no per-channel
+    /// duplicate sender list.
+    #[serde(default)]
+    pub admin_for_agent_scope: bool,
 }
 
-/// `[a2a.server]` — inbound A2A discovery server.
-///
-/// Wrapped under `[a2a.server]` (two-level) via [`A2aServerSection`] so the
-/// `a2a` table can grow sibling sub-tables later (e.g. client config) without
-/// a breaking move.
+/// Inbound A2A discovery server configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "a2a_server"]
@@ -187,24 +146,11 @@ pub struct A2aServerConfig {
     /// derives from the gateway port. Advertise-only: nothing binds here.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
-    /// Externally reachable base URL advertised in card endpoint fields
-    /// (e.g. `https://agents.example.com`). Highest precedence. When empty,
-    /// endpoints fall back to the `bind`/`port` override, then to the
-    /// gateway's own host and port. Set this behind a reverse proxy so
-    /// advertised URLs match the public origin.
+    /// Operator-supplied base URL advertised in agent card endpoints.
     pub public_base_url: String,
 }
 
-/// `[a2a]` section wrapper. Kept as a
-/// dedicated wrapper so the `a2a` table can host sibling sub-tables (outbound
-/// client config, signing) in later slices without moving `server`.
-///
-/// Server-level exposure gate for A2A agent discovery. Default-closed: the
-/// server serves nothing until `[a2a.server] enabled = true`, and even then
-/// only aliases that opt in via `[agents.<alias>.a2a] published = true`
-/// appear. The discovery routes serve on the gateway's own listener; public
-/// exposure follows the gateway's bind posture. See
-/// `crates/zeroclaw-gateway/src/a2a.rs`.
+/// A2A section wrapper that leaves room for future sibling configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "a2a"]
@@ -215,14 +161,7 @@ pub struct A2aServerSection {
     pub server: A2aServerConfig,
 }
 
-/// Per-alias A2A publication block (`[agents.<alias>.a2a]`).
-///
-/// Default-closed second gate: even with the server enabled, an alias is
-/// absent from discovery until `published = true`. `exposed_skills` is a
-/// filter over the alias's resolved skill set (from `skill_bundles` /
-/// `mcp_bundles`), never a parallel registry: empty means expose no skills
-/// on the card; a non-empty list selects which resolved skill ids appear.
-/// The bundles remain the single source of truth for what the agent can do.
+/// Per-agent A2A publication and exposed-skill configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "agent_a2a"]

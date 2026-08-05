@@ -3,11 +3,6 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Voice event types for the WebSocket duplex protocol.
-///
-/// These are serialized as JSON text frames. Using base64-encoded audio
-/// in the `tts_chunk` variant means the existing `Message::Text` path
-/// handles everything — no binary frame changes needed yet.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum VoiceEvent {
@@ -40,18 +35,12 @@ pub enum VoiceEvent {
 }
 
 /// Attempt to parse a text frame as a voice event.
-///
 /// Returns `Some(VoiceEvent)` if the JSON parses as a known voice event type,
 /// or `None` if it's not a voice event (let it fall through to normal handling).
 pub fn try_parse_voice_event(text: &str) -> Option<VoiceEvent> {
     serde_json::from_str::<VoiceEvent>(text).ok()
 }
 
-/// Handle a parsed voice event.
-///
-/// Returns `None` for successfully handled client→server events.
-/// Returns `Some(json)` with an error frame when the client sends
-/// a server→client-only event, so the caller can relay it back.
 pub fn handle_voice_event(event: VoiceEvent) -> Option<serde_json::Value> {
     match event {
         VoiceEvent::SpeechStart => {
@@ -77,7 +66,7 @@ pub fn handle_voice_event(event: VoiceEvent) -> Option<serde_json::Value> {
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
                 "voice duplex: barge_in received"
             );
-            // TODO: wire into session abort mechanism (ref upstream PR #5705)
+            // TODO: wire into session abort mechanism (ref upstream
             None
         }
         VoiceEvent::TtsCancel | VoiceEvent::TtsChunk { .. } => {

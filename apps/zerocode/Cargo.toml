@@ -6,6 +6,14 @@ license.workspace = true
 description = "Interactive TUI config manager for ZeroClaw."
 publish = false
 
+[features]
+# Reserved for future SOP-authoring exposure work. The SOP pane is currently
+# unreachable from navigation in every build (`Mode::Sop` is absent from the
+# mode bar); the web dashboard ships as the first experimental release. This
+# flag gates no exposure today and is kept as the seam for re-enabling later.
+default = []
+sop-authoring = []
+
 [[bin]]
 name = "zerocode"
 path = "src/main.rs"
@@ -46,6 +54,7 @@ directories = { workspace = true }
 fluent = "0.16"
 unic-langid = "0.9"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+url = "2.5"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

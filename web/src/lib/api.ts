@@ -356,6 +356,63 @@ export function getHealth(): Promise<HealthSnapshot> {
   ).then((data) => unwrapField(data, "health"));
 }
 
+// ── Version check / self-upgrade (version.rs) ────────────────────────
+// Types are derived from the generated OpenAPI client (`components`) so the
+// dashboard contract stays in lock-step with `openapi::build_spec()`. Editing
+// a request/response shape in Rust and running `cargo web check` will fail the
+// typecheck here on drift, instead of silently disagreeing at runtime.
+
+export type VersionCheckResponse = components["schemas"]["VersionCheckResponse"];
+
+/**
+ * GET /api/version/check — is a newer release available?
+ *
+ * Backed by `zeroclaw update --check --json`, cached server-side for 1h.
+ * Pass `force` to bypass the cache, or `version` to check a specific tag.
+ */
+export function checkVersion(opts?: {
+  force?: boolean;
+  version?: string;
+}): Promise<VersionCheckResponse> {
+  const params = new URLSearchParams();
+  if (opts?.force) params.set("force", "true");
+  if (opts?.version) params.set("version", opts.version);
+  const qs = params.toString();
+  return apiFetch<VersionCheckResponse>(
+    `/api/version/check${qs ? `?${qs}` : ""}`,
+  );
+}
+
+export type UpgradeState = components["schemas"]["UpgradeStatusState"];
+export type UpgradeStatusResponse =
+  components["schemas"]["UpgradeStatusResponse"];
+export type UpgradeRequest = components["schemas"]["UpgradeRequest"];
+export type UpgradeAcceptedResponse =
+  components["schemas"]["UpgradeAcceptedResponse"];
+
+/**
+ * POST /api/version/upgrade — apply an upgrade via `zeroclaw update`.
+ *
+ * Returns a `handoff_id`; poll {@link getUpgradeStatus} for progress. Requires
+ * `gateway.allow_self_upgrade`. `auto_restart` is only honoured under a
+ * supervisor (systemd/launchd).
+ */
+export function startUpgrade(
+  opts?: UpgradeRequest,
+): Promise<UpgradeAcceptedResponse> {
+  return apiFetch<UpgradeAcceptedResponse>("/api/version/upgrade", {
+    method: "POST",
+    body: JSON.stringify(opts ?? {}),
+  });
+}
+
+export function getUpgradeStatus(
+  handoffId?: string,
+): Promise<UpgradeStatusResponse> {
+  const qs = handoffId ? `?handoff_id=${encodeURIComponent(handoffId)}` : "";
+  return apiFetch<UpgradeStatusResponse>(`/api/version/upgrade/status${qs}`);
+}
+
 // ---------------------------------------------------------------------------
 // TUIs
 // ---------------------------------------------------------------------------
@@ -375,17 +432,16 @@ export function getTuis(): Promise<TuiEntry[]> {
 // ---------------------------------------------------------------------------
 
 /**
- * One non-fatal validation warning surfaced after a successful save —
- * config that loads and validates structurally but will fail at agent
- * runtime because of a logical inconsistency (e.g. `providers.fallback`
- * referencing a key not present in `providers.models`). Matches the
+ * One non-fatal validation warning surfaced after a successful save.
+ * Warnings may identify a runtime inconsistency, an inert setting, or a
+ * supported configuration that is being deprecated. Matches the
  * `tracing::warn!` signal the CLI shows on stderr; surfaced structured so
  * the dashboard can render it next to the offending field.
  */
 export interface ValidationWarning {
   /** Stable machine-readable identifier (e.g. `'dangling_provider_fallback'`). */
   code: string;
-  /** Human-readable description suitable for direct display. */
+  /** English fallback for unknown warning codes; localize known codes before display. */
   message: string;
   /** Dotted property path the warning concerns (e.g. `'providers.fallback'`). */
   path: string;
@@ -428,6 +484,12 @@ export interface ListResponseEntry {
   section?: string;
   /** Tab grouping from `ConfigTab` enum. Absent when `ConfigTab::None`. */
   tab?: string;
+  /**
+   * Surface hint from the schema's `#[multiline]` attribute: render a
+   * multi-line text area (e.g. a PEM key body) instead of a single-line
+   * input. Absent/false on single-line fields.
+   */
+  multiline?: boolean;
 }
 
 export interface DriftEntry {
@@ -1512,6 +1574,8 @@ export interface QuickstartTypeOption {
   display_name: string;
   /** True for local providers that need no credential; always false for channels. */
   local: boolean;
+  /** Daemon-derived runtime preset to auto-select for this provider. */
+  default_runtime_profile?: string | null;
 }
 
 export interface QuickstartState {
@@ -1519,6 +1583,8 @@ export interface QuickstartState {
   agents: string[];
   risk_profiles: string[];
   runtime_profiles: string[];
+  /** Canonical fallback when a provider has no runtime recommendation. */
+  default_runtime_profile?: string | null;
   model_providers: string[];
   channels: string[];
   /**
@@ -1819,6 +1885,7 @@ export function addCronJob(body: {
   allowed_tools?: string[];
   enabled?: boolean;
   delivery?: CronDelivery;
+  uses_memory?: boolean;
 }): Promise<CronJob> {
   return apiFetch<CronJob | { status: string; job: CronJob }>("/api/cron", {
     method: "POST",
@@ -1873,6 +1940,7 @@ export function patchCronJob(
     command?: string;
     prompt?: string;
     enabled?: boolean;
+    uses_memory?: boolean;
   },
 ): Promise<CronJob> {
   return apiFetch<CronJob | { status: string; job: CronJob }>(
@@ -2069,6 +2137,33 @@ export function getChannels(): Promise<ChannelDetail[]> {
   ).then((data) => {
     const result = unwrapField(data, "channels");
     return Array.isArray(result) ? result : [];
+  });
+}
+
+export interface BindChannelRequest {
+  channel_type: string;
+  alias: string;
+  identity: string;
+}
+
+export interface BindChannelResponse {
+  saved: boolean;
+  already_bound?: boolean;
+  group?: string;
+  channel?: string;
+}
+
+/**
+ * Authorize an inbound identity on a pairing channel (telegram/wechat/line)
+ * — the GUI equivalent of `zeroclaw channel bind-<type> <id> --alias <alias>`.
+ * The bound user can message the bot immediately, with no `/bind` round trip.
+ */
+export function bindChannelIdentity(
+  body: BindChannelRequest,
+): Promise<BindChannelResponse> {
+  return apiFetch<BindChannelResponse>("/api/channels/bind", {
+    method: "POST",
+    body: JSON.stringify(body),
   });
 }
 

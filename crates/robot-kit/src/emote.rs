@@ -1,5 +1,4 @@
 //! Emote Tool - LED expressions and sound effects
-//!
 //! Control LED matrix/strips for robot "expressions" and play sounds.
 //! Makes the robot more engaging for kids!
 

@@ -4,9 +4,12 @@
 
 - SOP definitions are loaded from `<workspace>/sops/<sop_name>/SOP.toml` plus optional `SOP.md`.
 - CLI `zeroclaw sop` currently manages definitions only: `list`, `validate`, `show`.
-- SOP runs are started by a live event fan-in (MQTT, filesystem, or AMQP) or by the in-agent tool `sop_execute`. Other trigger types are defined and matched but not yet wired to a live event source (see [SOP Fan-In](./fan-in/overview.md)).
+- SOP runs are started by a live event fan-in (MQTT, filesystem, or AMQP), by the daemon's periodic SOP maintenance tick for `cron` triggers, or by the in-agent tool `sop_execute`. The remaining trigger types (webhook, peripheral, calendar) are defined and matched but not yet wired to a live event source (see [SOP Fan-In](./fan-in/overview.md)).
 - Run progression uses tools: `sop_status`, `sop_approve`, `sop_advance`.
+- Run state is process-local by default. With `sop.persist_runs = true`, successful initialization of the default SQLite backend stores it under `<data_dir>/sop/runs.db` and restores active runs after restart. Initialization failure logs a warning and falls back to process-local memory.
 - SOP audit records are persisted in the configured Memory backend under category `sop`.
+
+Run state and audit history are separate surfaces. See [Background work lifecycle](../architecture/background-work-lifecycle.md) for lifecycle ownership, cancellation, and restart semantics.
 
 ## Event flow
 
@@ -15,7 +18,7 @@ graph LR
     MQTT[MQTT listener] -->|topic match| Dispatch
     TOOL[sop_execute tool] -->|manual| Dispatch
     WH[Webhook trigger] -.->|defined, unwired| Dispatch
-    CRON[Cron trigger] -.->|defined, unwired| Dispatch
+    CRON[Cron trigger] -->|daemon maintenance tick| Dispatch
     GPIO[Peripheral trigger] -.->|defined, unwired| Dispatch
 
     Dispatch --> Engine[SOP Engine]

@@ -45,7 +45,7 @@ Filed RFCs go through a discussion window (default 7 days, longer for larger pro
 
 Per RFC #5577, RFCs are ratified by a two-thirds maintainer majority. The outcomes:
 
-- **Accepted**: issue closed with the `status:accepted` label and a maintainer comment summarising the final shape. Implementation PRs can then proceed.
+- **Accepted**: issue carries `status:accepted`, and a maintainer comment records the final shape and links its durable disposition. Implementation PRs can proceed once that governance handoff is visible.
 - **Rejected**: issue closed with a maintainer comment giving the rationale. The record lives; re-proposing requires a materially different take.
 - **Deferred**: issue stays open with a maintainer comment noting it's parked; revisit later. Add `status:blocked` when it's waiting on a specific prerequisite.
 - **Withdrawn**: the author pulls it. Closed without prejudice.
@@ -54,6 +54,7 @@ Per RFC #5577, RFCs are ratified by a two-thirds maintainer majority. The outcom
 
 Implementation PRs should:
 
+- Confirm the RFC issue records its final accepted shape and durable disposition before implementation begins
 - Reference the RFC issue number (`Implements #5574 phase 1`)
 - Fit within the accepted design, if a detail changes during implementation, update the RFC body or file a follow-up clarification issue
 - Ship behind a feature flag if the RFC calls for gradual rollout
@@ -98,7 +99,7 @@ These shape everything else. Read them before proposing cross-cutting changes:
 
 RFC authorship by AI assistants (with a human sponsor) is explicitly permitted per RFC #5615. If an RFC was drafted with AI help:
 
-- Mark it clearly in the body ("drafted with Claude, reviewed by @singlerider")
+- Mark it clearly in the body ("drafted with Claude, reviewed by @maintainer")
 - The sponsoring human is responsible for accuracy and for responding to review
 - The human takes the ratification vote, not the AI
 

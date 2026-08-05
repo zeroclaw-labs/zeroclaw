@@ -1,20 +1,4 @@
 //! Safety System - Collision avoidance, watchdogs, and emergency stops
-//!
-//! This module runs INDEPENDENTLY of the AI brain to ensure safety
-//! even if the LLM makes bad decisions or hangs.
-//!
-//! ## Safety Layers
-//!
-//! 1. **Pre-move checks** - Verify path clear before any movement
-//! 2. **Active monitoring** - Continuous sensor polling during movement
-//! 3. **Reactive stops** - Instant halt on obstacle detection
-//! 4. **Watchdog timer** - Auto-stop if no commands for N seconds
-//! 5. **Hardware E-stop** - Physical button overrides everything
-//!
-//! ## Design Philosophy
-//!
-//! The AI can REQUEST movement, but the safety system ALLOWS it.
-//! Safety always wins.
 
 // robot-kit is an independent hardware crate that does not depend on
 // `zeroclaw-spawn` (or any orchestrator crate), so it cannot use
