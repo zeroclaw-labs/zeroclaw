@@ -247,6 +247,7 @@ fn test_manifest(
         permissions,
         signature: None,
         publisher_key: None,
+        egress: crate::PluginEgressDeclaration::default(),
     }
 }
 

@@ -715,6 +715,16 @@ cli-plugin-installed-name-version = 已安装插件 {$name} v{$version}
 cli-plugin-config-entry-seeded = 已为 '{$name}' 创建 [[plugins.entries]]。使用 `zeroclaw config set plugins.entries.{$name}.config.<key>` 设置插件配置值。
 cli-plugin-config-entry-seed-skipped = 警告：已跳过为 '{$name}' 创建配置条目：磁盘上的 [plugins] 部分格式不正确。请修复它，添加带有 `name = "{$name}"` 的 [[plugins.entries]] 块，然后使用 `zeroclaw config set plugins.entries.{$name}.config.<key>` 设置值。
 cli-plugin-config-entry-seed-unaddressable = 警告：已跳过为 '{$name}' 创建配置条目：包含 '.' 的插件名称无法通过点分配置路径寻址（`config set` 会按 '.' 分割）。请手动向配置文件添加带有 `name = "{$name}"` 的 [[plugins.entries]] 块。
+cli-plugin-egress-seeded = 已根据清单声明为“{$name}”授予出站目标（{$count} 个）：
+cli-plugin-egress-destination = → {$host}
+cli-plugin-egress-edit-command = 之后可用以下命令修改该授权：{$command}
+cli-plugin-egress-declared-not-granted = 插件“{$name}”声明了 {$count} 个其现有配置条目未授予的目标：
+cli-plugin-egress-added = + {$host}
+cli-plugin-egress-apply-command = 如需明确授予，请运行：{$command}
+cli-plugin-egress-granted-not-declared = 插件“{$name}”的配置条目授予了 {$count} 个清单不再声明的目标（保持不变）：
+cli-plugin-egress-removed = - {$host}
+cli-plugin-egress-never-extended = “{$name}”的现有出站授权未被修改：安装软件包绝不会扩展条目的允许列表。
+cli-plugin-egress-gap = {$name}：声明了 {$hosts}，但其配置条目未授予 — 发往这些目标的请求会被拒绝。授予命令：{$command}
 cli-config-section-degraded = 警告：{$path} 中的配置部分 `{$section}` 格式不正确，本次运行已重置为默认值。该部分中的值不会生效。请运行 `zeroclaw config migrate` 查看解析错误，然后修复文件。
 cli-plugin-removed = 已移除插件“{$name}”。
 cli-plugin-not-found = 未找到插件“{$name}”。

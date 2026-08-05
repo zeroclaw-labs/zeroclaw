@@ -804,6 +804,16 @@ cli-plugin-installed-name-version = Installed plugin {$name} v{$version}
 cli-plugin-config-entry-seeded = Seeded [[plugins.entries]] for '{$name}'. Set plugin config values with `zeroclaw config set plugins.entries.{$name}.config.<key>`.
 cli-plugin-config-entry-seed-skipped = warning: skipped seeding the config entry for '{$name}': the [plugins] section on disk is malformed. Repair it, add a [[plugins.entries]] block with `name = "{$name}"`, then set values with `zeroclaw config set plugins.entries.{$name}.config.<key>`.
 cli-plugin-config-entry-seed-unaddressable = warning: skipped seeding the config entry for '{$name}': plugin names containing '.' cannot be addressed by dotted config paths (`config set` splits on '.'). Add a [[plugins.entries]] block with `name = "{$name}"` to the config file by hand.
+cli-plugin-egress-seeded = Granted egress for '{$name}' from its manifest declaration ({$count} destination(s)):
+cli-plugin-egress-destination = → {$host}
+cli-plugin-egress-edit-command = Edit this grant later with: {$command}
+cli-plugin-egress-declared-not-granted = Plugin '{$name}' declares {$count} destination(s) its existing config entry does not grant:
+cli-plugin-egress-added = + {$host}
+cli-plugin-egress-apply-command = Grant them deliberately with: {$command}
+cli-plugin-egress-granted-not-declared = Plugin '{$name}' grants {$count} destination(s) its manifest no longer declares (left in place):
+cli-plugin-egress-removed = - {$host}
+cli-plugin-egress-never-extended = The existing egress grant for '{$name}' was NOT modified: installing a package never extends an entry's allowlist.
+cli-plugin-egress-gap = {$name}: declares {$hosts}, which its config entry does not grant — requests there are denied. Grant with: {$command}
 cli-config-section-degraded = warning: config section `{$section}` in {$path} is malformed and was reset to defaults for this run. Values in that section are NOT in effect. Run `zeroclaw config migrate` to see the parse error, then repair the file.
 cli-plugin-removed = Plugin '{$name}' removed.
 cli-plugin-not-found = Plugin '{$name}' not found.

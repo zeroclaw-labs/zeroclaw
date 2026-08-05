@@ -719,6 +719,16 @@ cli-plugin-installed-name-version = Plugin {$name} v{$version} installé
 cli-plugin-config-entry-seeded = [[plugins.entries]] initialisé pour '{$name}'. Définissez les valeurs de configuration du plugin avec `zeroclaw config set plugins.entries.{$name}.config.<key>`.
 cli-plugin-config-entry-seed-skipped = avertissement : initialisation de l'entrée de configuration ignorée pour '{$name}' : la section [plugins] sur disque est mal formée. Réparez-la, ajoutez un bloc [[plugins.entries]] avec `name = "{$name}"`, puis définissez les valeurs avec `zeroclaw config set plugins.entries.{$name}.config.<key>`.
 cli-plugin-config-entry-seed-unaddressable = avertissement : initialisation de l'entrée de configuration ignorée pour '{$name}' : les noms de plugin contenant '.' ne peuvent pas être adressés par des chemins de configuration pointés (`config set` découpe sur '.'). Ajoutez manuellement un bloc [[plugins.entries]] avec `name = "{$name}"` au fichier de configuration.
+cli-plugin-egress-seeded = Sortie réseau accordée à « {$name} » d'après la déclaration de son manifeste ({$count} destination(s)) :
+cli-plugin-egress-destination = → {$host}
+cli-plugin-egress-edit-command = Modifiez cette autorisation plus tard avec : {$command}
+cli-plugin-egress-declared-not-granted = Le plugin « {$name} » déclare {$count} destination(s) que son entrée de configuration existante n'accorde pas :
+cli-plugin-egress-added = + {$host}
+cli-plugin-egress-apply-command = Accordez-les délibérément avec : {$command}
+cli-plugin-egress-granted-not-declared = Le plugin « {$name} » accorde {$count} destination(s) que son manifeste ne déclare plus (conservées) :
+cli-plugin-egress-removed = - {$host}
+cli-plugin-egress-never-extended = L'autorisation de sortie existante pour « {$name} » n'a PAS été modifiée : installer un paquet n'étend jamais la liste d'autorisation d'une entrée.
+cli-plugin-egress-gap = {$name} : déclare {$hosts}, que son entrée de configuration n'accorde pas — les requêtes vers ces destinations sont refusées. Accordez avec : {$command}
 cli-config-section-degraded = avertissement : la section de configuration `{$section}` dans {$path} est mal formée et a été réinitialisée aux valeurs par défaut pour cette exécution. Les valeurs de cette section NE sont PAS appliquées. Exécutez `zeroclaw config migrate` pour voir l'erreur d'analyse, puis réparez le fichier.
 cli-plugin-removed = Plugin « {$name} » supprimé.
 cli-plugin-not-found = Plugin « {$name} » introuvable.

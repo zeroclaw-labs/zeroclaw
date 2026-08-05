@@ -442,6 +442,7 @@ capabilities = ["tool"]
             permissions: Vec::new(),
             signature: None,
             publisher_key: None,
+            egress: zeroclaw::plugins::PluginEgressDeclaration::default(),
         };
 
         assert!(verify_manifest_matches_registry(&entry, &manifest).is_err());

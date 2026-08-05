@@ -34,6 +34,7 @@ fn scope(grants: impl IntoIterator<Item = PluginPermission>) -> PluginInstanceSc
         permissions: permissions.clone(),
         signature: None,
         publisher_key: None,
+        egress: Default::default(),
     };
     PluginInstanceScope::from_manifest(&manifest, PluginCapability::Tool, "main", permissions)
         .expect("reference manifest admits its requested grants")
