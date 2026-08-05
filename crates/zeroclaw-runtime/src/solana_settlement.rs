@@ -32,6 +32,9 @@ use solana_signer::{Signer, SignerError};
 use solana_system_interface::instruction as system_instruction;
 use solana_transaction::Transaction;
 
+// Brings SigningKey::sign into scope (the ed25519-dalek Signer trait).
+use ed25519_dalek::Signer as _;
+
 /// An Ed25519 signer backed by `ed25519-dalek 2.x` (patched line).
 ///
 /// Provides the same `Signer` interface `solana-keypair` would, without
