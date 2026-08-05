@@ -6,16 +6,18 @@
 // `<nav>` or the `<aside>` as a horizontal-overflow mask.
 export const railNavClassName = "flex-1 overflow-y-auto py-3 px-1.5";
 
-// The desktop rail's link sizing contract. Links are `w-full max-w-10` — never
-// a bare fixed `w-10` — so they shrink to the available width when a classic
-// vertical scrollbar gutter consumes part of the 56px rail (`w-14`). With an
-// overlay scrollbar the nav keeps 44px of content width and links render at
-// their 40px `max-w-10`; with a classic gutter the content width drops to
-// ~34px and the `w-full` links shrink instead of overflowing horizontally and
-// reintroducing the scrollbar that #8791 eliminates. The 22px icon stays
-// centered in either case.
+// The desktop rail's link sizing contract. Links are `w-full max-w-10 mx-auto` —
+// never a bare fixed `w-10` — so they shrink to the available width when a
+// classic vertical scrollbar gutter consumes part of the 56px rail (`w-14`).
+// With an overlay scrollbar the nav keeps 44px of content width and links cap
+// at their 40px `max-w-10`; `mx-auto` keeps the 2px of spare horizontal space
+// evenly split so the icon, hover background, and active bar stay centered in
+// the rail, matching the original `w-10 mx-auto` on `master`. With a classic
+// gutter the content width drops to ~34px and the `w-full` links shrink instead
+// of overflowing horizontally and reintroducing the scrollbar that #8791
+// eliminates. The 22px icon stays centered in either case.
 export const railLinkClassName =
-  "group relative flex h-10 w-full max-w-10 items-center justify-center";
+  "group relative flex h-10 w-full max-w-10 mx-auto items-center justify-center";
 
 export const railAsideStyle = {
   background: "var(--pc-bg-sidebar)",

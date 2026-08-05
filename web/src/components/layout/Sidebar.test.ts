@@ -101,6 +101,10 @@ test('rail links shrink to the available width instead of a fixed w-10', () => {
     'link must not be pinned to a fixed w-10 that overflows a classic gutter',
   );
   assert.ok(
+    railLinkClassName.includes('mx-auto'),
+    'link must keep mx-auto so the spare rail width stays evenly split and the icon stays centered',
+  );
+  assert.ok(
     !railLinkClassName.includes('overflow-x'),
     'link must not mask horizontal overflow',
   );
