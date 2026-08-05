@@ -10,7 +10,7 @@ pub(crate) fn preflight_history_maintenance(history: &mut Vec<ChatMessage>) {
     // Remove orphaned tool-role messages whose assistant (tool_calls)
     // counterpart was dropped by turn-boundary trimming or session history
     // reloading. Without this, model_providers like MiniMax reject the
-    // request with "tool result's tool id not found" (bug #7727).
+    // request with "tool result's tool id not found".
     //
     // Only the orphaned tool-role half is removed here. Repairing the other
     // half — an assistant tool_call whose result is missing — is deliberately
