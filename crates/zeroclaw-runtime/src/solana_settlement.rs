@@ -9,7 +9,7 @@
 //!
 //! Devnet only. No mainnet paths exist in this module.
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
