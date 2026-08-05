@@ -7145,10 +7145,22 @@ mod tests {
 
     #[tokio::test]
     async fn doctor_run_omits_log_path_when_persistence_is_disabled() {
+        // Serialize against the other tests that mutate the process-global
+        // writer state (the two transition tests below) and install an
+        // explicit disabled writer so the assertion cannot observe a writer
+        // another parallel test installed.
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
         let tmp = tempfile::TempDir::new().unwrap();
+        zeroclaw_log::init_from_config(
+            &zeroclaw_log::LogConfig {
+                log_persistence: "none".into(),
+                log_persistence_path: "state/runtime-trace.jsonl".into(),
+                ..Default::default()
+            },
+            tmp.path(),
+        );
         let mut config = make_acp_test_config(&tmp);
-        // No writer is installed in this test: Doctor must not advertise any
-        // path regardless of the config snapshot.
+        // Doctor must not advertise any path regardless of the config snapshot.
         config.observability.log_persistence = zeroclaw_config::schema::LogPersistence::None;
         let (dispatcher, _sessions) = make_acp_test_dispatcher(config);
 

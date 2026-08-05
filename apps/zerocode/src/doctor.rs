@@ -659,16 +659,22 @@ mod tests {
     #[test]
     fn doctor_timeout_error_is_generic_not_model_probing_specific() {
         // A whole-RPC timeout (no response) must not suggest model probing —
-        // the daemon may have timed out for any reason.
+        // the daemon may have timed out for any reason. The assertions compare
+        // against the localized catalogue values so the suite passes under any
+        // shipped locale.
+        let daemon_busy = crate::i18n::t("zc-doctor-error-daemon-timeout");
+        let partial_banner = crate::i18n::t("zc-doctor-partial-banner");
+        let partial_hint = crate::i18n::t("zc-doctor-partial-hint");
+
         let message = format_doctor_error("RPC doctor/run: request timed out");
 
         assert!(message.contains("request timed out"));
         assert!(
-            message.contains("daemon may be busy"),
+            message.contains(&daemon_busy),
             "whole-RPC timeout must be generic, got: {message}"
         );
         assert!(
-            !message.contains("Model probing") && !message.contains("provider API"),
+            !message.contains(&partial_banner) && !message.contains(&partial_hint),
             "whole-RPC timeout must NOT name model probing, got: {message}"
         );
     }
@@ -679,50 +685,44 @@ mod tests {
     /// banner path, never on the error path. A future refactor that swaps
     /// the discriminator (e.g. on freeform substring matching) will be caught
     /// here even though `format_doctor_error`'s own test would still pass
-    /// in isolation.
+    /// in isolation. All comparisons use the localized catalogue values so the
+    /// suite passes under any shipped locale.
     #[test]
     fn doctor_timeout_discriminator_pins_each_path_to_its_own_text() {
         // Error path — generic daemon-side timeout text only.
+        let daemon_busy = crate::i18n::t("zc-doctor-error-daemon-timeout");
+        let partial_banner = crate::i18n::t("zc-doctor-partial-banner");
+        let partial_hint = crate::i18n::t("zc-doctor-partial-hint");
         let error_msg = format_doctor_error("RPC doctor/run: request timed out");
         assert!(
-            error_msg.contains("daemon may be busy"),
+            error_msg.contains(&daemon_busy),
             "error path must surface generic daemon-busy hint; got: {error_msg}"
         );
         assert!(
-            !error_msg.contains("model probing"),
-            "error path must NEVER mention model probing; got: {error_msg}"
-        );
-        assert!(
-            !error_msg.contains("Partial results"),
+            !error_msg.contains(&partial_banner),
             "error path must NEVER render partial-results chrome; got: {error_msg}"
         );
 
         // Structured-partial path — only the partial-banner string is allowed
         // to surface probe-specific copy; the error path's generic text must
-        // not appear.
-        let partial_banner = crate::i18n::t("zc-doctor-partial-banner");
-        let partial_hint = crate::i18n::t("zc-doctor-partial-hint");
-        let daemon_busy = crate::i18n::t("zc-doctor-error-daemon-timeout");
-
+        // not appear. The three catalogue entries must stay semantically
+        // distinct (probe banner vs. probe hint vs. generic daemon timeout) so
+        // the discriminator cannot collapse onto one copy block.
         assert!(
-            partial_banner.contains("model probing"),
-            "partial-banner FTL must carry the probe-specific substring; got: {partial_banner}"
+            partial_banner != daemon_busy,
+            "partial-banner copy must differ from the generic daemon-timeout copy; got: {partial_banner}"
         );
         assert!(
-            partial_hint.contains("provider catalog"),
-            "partial-hint FTL must explain which phase was lost; got: {partial_hint}"
+            partial_hint != daemon_busy,
+            "partial-hint copy must differ from the generic daemon-timeout copy; got: {partial_hint}"
         );
         assert!(
-            daemon_busy.contains("daemon"),
-            "daemon-timeout FTL must remain the generic copy; got: {daemon_busy}"
+            partial_banner != partial_hint,
+            "partial-banner and partial-hint copy must differ; got: {partial_banner} / {partial_hint}"
         );
         assert!(
-            !daemon_busy.contains("model probing"),
-            "daemon-timeout FTL must NOT leak the probe-specific copy; got: {daemon_busy}"
-        );
-        assert!(
-            !partial_banner.contains("daemon may be busy"),
-            "partial-banner FTL must NOT collide with error-path copy; got: {partial_banner}"
+            !daemon_busy.is_empty() && !partial_banner.is_empty() && !partial_hint.is_empty(),
+            "all three timeout copy entries must be populated"
         );
     }
 
@@ -889,7 +889,7 @@ mod tests {
         // operator sees the discoverability affordance is part of the
         // empty-selection fallback rather than a hidden field.
         assert!(
-            rendered.contains("No diagnostic selected"),
+            rendered.contains(&crate::i18n::t("zc-doctor-no-selection")),
             "fallback hint must render alongside log_path; got:\n{rendered}"
         );
 
@@ -937,9 +937,9 @@ mod tests {
             !rendered.contains("trace-2026-07-13"),
             "log_path must be absent when persistence is disabled; got:\n{rendered}"
         );
-        // The fallback "No diagnostic selected" line should still render.
+        // The fallback no-selection line should still render.
         assert!(
-            rendered.contains("No diagnostic selected"),
+            rendered.contains(&crate::i18n::t("zc-doctor-no-selection")),
             "fallback hint must still render when persistence is disabled; got:\n{rendered}"
         );
 
@@ -971,7 +971,7 @@ mod tests {
 
         let rendered = render_buffer_to_string(terminal.backend().buffer(), area);
         assert!(
-            rendered.contains("No diagnostic selected"),
+            rendered.contains(&crate::i18n::t("zc-doctor-no-selection")),
             "the disconnected empty state must render the no-selection hint; got:\n{rendered}"
         );
     }
@@ -1012,12 +1012,21 @@ mod tests {
 
         // The partial-results banner must be discoverable in the detail panel,
         // above the selected entry's `detail_lines` content.
+        let partial_banner = crate::i18n::t("zc-doctor-partial-banner");
+        let partial_hint = crate::i18n::t("zc-doctor-partial-hint");
         assert!(
-            rendered.contains("⚠ Partial results"),
+            rendered.contains(&partial_banner),
             "partial-results banner must render in detail panel; got:\n{rendered}"
         );
+        // The hint wraps across lines in the 120-wide panel; assert its first
+        // phrase (visible before the wrap) rather than the full string.
+        let hint_first = partial_hint
+            .split_whitespace()
+            .take(6)
+            .collect::<Vec<_>>()
+            .join(" ");
         assert!(
-            rendered.contains("model probing timed out"),
+            rendered.contains(&hint_first),
             "banner subtitle must render in detail panel; got:\n{rendered}"
         );
         // The Diagnostics list still surfaces surviving entries (the probe
