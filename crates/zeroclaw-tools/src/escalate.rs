@@ -1,16 +1,11 @@
 //! Human escalation tool with urgency-aware routing.
-//!
-//! Exposes `escalate_to_human` as an agent-callable tool that sends a structured
-//! escalation message to a messaging channel. High/critical urgency escalations
-//! additionally notify any channels listed in `[escalation] alert_channels`.
-//! Supports optional blocking mode to wait for a human response.
 
 use crate::ask_user::ChannelMapHandle;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
 
@@ -63,17 +58,22 @@ impl EscalateToHumanTool {
         lines.join("\n")
     }
 
-    /// Send best-effort alerts to configured alert channels for high/critical urgency.
-    async fn send_alerts(&self, text: &str) {
+    /// Send best-effort alerts to configured alert channels for high/critical
+    /// urgency.
+    ///
+    /// Returns the names of channels that actually accepted the message, so
+    /// callers can distinguish "notified a human somewhere" from "notified
+    /// nobody". Channels whose `send` is a no-op (`supports_outbound_send()`
+    /// is false) are skipped rather than counted as delivered — otherwise an
+    /// alert-channel list made solely of back-channels would look successful.
+    async fn send_alerts(&self, text: &str) -> Vec<String> {
         // Collect Arc clones while holding the lock, then drop the guard before awaiting.
         let targets: Vec<(String, Arc<dyn Channel>)> = {
             let channels = self.channel_map.read();
             self.alert_channels
                 .iter()
                 .filter_map(|name| {
-                    if let Some(ch) = channels.get(name) {
-                        Some((name.clone(), Arc::clone(ch)))
-                    } else {
+                    let Some(ch) = channels.get(name) else {
                         ::zeroclaw_log::record!(
                             WARN,
                             ::zeroclaw_log::Event::new(
@@ -82,13 +82,28 @@ impl EscalateToHumanTool {
                             )
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                             .with_attrs(::serde_json::json!({"name": name})),
-                            "escalate_to_human: alert channel '' not found in channel map"
+                            "escalate_to_human: alert channel not found in channel map"
                         );
-                        None
+                        return None;
+                    };
+                    if !ch.supports_outbound_send() {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"name": name})),
+                            "escalate_to_human: alert channel cannot deliver outbound messages"
+                        );
+                        return None;
                     }
+                    Some((name.clone(), Arc::clone(ch)))
                 })
                 .collect()
         };
+        let mut delivered = Vec::new();
         for (name, ch) in targets {
             let msg = SendMessage::new(text, "");
             if let Err(e) = ch.send(&msg).await {
@@ -97,10 +112,13 @@ impl EscalateToHumanTool {
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                         .with_attrs(::serde_json::json!({"error": format!("{}", e), "name": name})),
-                    "escalate_to_human: alert to channel '' failed"
+                    "escalate_to_human: alert to channel failed"
                 );
+            } else {
+                delivered.push(name);
             }
         }
+        delivered
     }
 }
 
@@ -113,7 +131,8 @@ impl Tool for EscalateToHumanTool {
     fn description(&self) -> &str {
         "Escalate a situation to a human operator with urgency routing. \
          Sends a structured message to the active channel. High/critical urgency \
-         also notifies any channels listed in `[escalation] alert_channels`. \
+         also notifies any channels listed in `[escalation] alert_channels`, which \
+         additionally serve as a fallback when the active channel cannot deliver. \
          Optionally blocks to wait for a human response."
     }
 
@@ -141,6 +160,10 @@ impl Tool for EscalateToHumanTool {
                 "timeout_secs": {
                     "type": "integer",
                     "description": "Seconds to wait for a response when wait_for_response is true (default: 600)"
+                },
+                "channel": {
+                    "type": "string",
+                    "description": "Channel to escalate on. Defaults to the channel this conversation is happening on."
                 }
             },
             "required": ["summary"]
@@ -155,7 +178,7 @@ impl Tool for EscalateToHumanTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Action blocked: {e}")),
             });
         }
@@ -192,7 +215,7 @@ impl Tool for EscalateToHumanTool {
         if !VALID_URGENCY_LEVELS.contains(&urgency) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Invalid urgency '{}'. Must be one of: {}",
                     urgency,
@@ -214,40 +237,130 @@ impl Tool for EscalateToHumanTool {
         // Format the message
         let text = Self::format_message(urgency, &summary, context.as_deref());
 
+        let requested_channel = args
+            .get("channel")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
         // Resolve channel — block-scoped to drop the RwLock guard before any .await
         let (channel_name, channel): (String, Arc<dyn Channel>) = {
             let channels = self.channel_map.read();
             if channels.is_empty() {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some("No channels available yet (channels not initialized)".to_string()),
                 });
             }
-            let (name, ch) = channels.iter().next().ok_or_else(|| {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"missing": "channels"})),
-                    "escalate: no channels configured"
-                );
-                anyhow::Error::msg("No channels available. Configure at least one channel.")
-            })?;
-            (name.clone(), ch.clone())
+            if let Some(ref name) = requested_channel {
+                // Explicit or origin-injected channel: honour it exactly rather
+                // than silently escalating somewhere the operator isn't looking.
+                let ch = channels.get(name.as_str()).cloned().ok_or_else(|| {
+                    let available = channels.keys().cloned().collect::<Vec<_>>().join(", ");
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "channel_requested": name,
+                                "available": &available,
+                            })),
+                        "escalate: requested channel not found"
+                    );
+                    anyhow::Error::msg(format!(
+                        "Channel '{name}' not found. Available: {available}"
+                    ))
+                })?;
+                (name.clone(), ch)
+            } else {
+                let (name, ch) = channels.iter().next().ok_or_else(|| {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"missing": "channels"})),
+                        "escalate: no channels configured"
+                    );
+                    anyhow::Error::msg("No channels available. Configure at least one channel.")
+                })?;
+                (name.clone(), ch.clone())
+            }
         };
 
-        // Channels without free-form `listen` support (e.g. ACP in Phase 1
-        // of the elicitation rollout) can't deliver the human's reply. Fail
-        // fast so the agent can route the escalation differently or proceed
-        // without blocking — the alternative is silently timing out for
-        // `timeout_secs` seconds. Phase 2 of the elicitation rollout will
-        // flip ACP's `supports_free_form_ask` to true.
-        // ACP elicitation RFD: https://agentclientprotocol.com/rfds/elicitation
+        // An escalation that nobody receives is worse than a failed one: the
+        // agent believes a human was notified. RPC/WS back-channels return
+        // `Ok(())` from `send` without rendering anything.
+        //
+        // Rather than fail outright, try the configured alert channels as a
+        // genuine fallback — that is the one remedy available at this point in
+        // the call, and for high/critical urgency they would have been notified
+        // anyway. Only report success if a channel actually accepted the
+        // message; otherwise fail honestly and suggest only remedies that work.
+        if !channel.supports_outbound_send() {
+            let delivered = if self.alert_channels.is_empty() {
+                Vec::new()
+            } else {
+                self.send_alerts(&text).await
+            };
+
+            if delivered.is_empty() {
+                let remedy = if self.alert_channels.is_empty() {
+                    "Re-run `escalate_to_human` with an explicit `channel` that can deliver, \
+                     or configure `[escalation] alert_channels` as a fallback."
+                } else {
+                    "Re-run `escalate_to_human` with an explicit `channel` that can deliver; \
+                     the configured `[escalation] alert_channels` could not deliver either."
+                };
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(format!(
+                        "Channel '{channel_name}' cannot deliver an escalation message \
+                         (no outbound send support), so the human would never see it. \
+                         {remedy}"
+                    )),
+                });
+            }
+
+            // A human was reached, but not on the requested channel, and this
+            // path cannot host a free-form reply.
+            if wait_for_response {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(format!(
+                        "Channel '{channel_name}' cannot deliver an escalation message, so the \
+                         alert was routed to `[escalation] alert_channels` ({}) instead. Those \
+                         channels cannot return a reply to this turn, so `wait_for_response` is \
+                         unsupported here. Retry with `wait_for_response: false`.",
+                        delivered.join(", ")
+                    )),
+                });
+            }
+
+            return Ok(ToolResult {
+                success: true,
+                output: json!({
+                    "status": "escalated_via_alert_channels",
+                    "urgency": urgency,
+                    "channel": channel_name,
+                    "delivered_to": delivered,
+                    "note": format!(
+                        "Channel '{channel_name}' cannot deliver outbound messages; \
+                         escalation was routed to the configured alert channels instead."
+                    ),
+                })
+                .to_string()
+                .into(),
+                error: None,
+            });
+        }
+
         if wait_for_response && !channel.supports_free_form_ask() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Channel '{channel_name}' cannot receive a free-form reply, \
                      so `wait_for_response` is unsupported (awaits ACP elicitation Phase 2). \
@@ -261,16 +374,17 @@ impl Tool for EscalateToHumanTool {
         if let Err(e) = channel.send(&msg).await {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Failed to send escalation to channel '{channel_name}': {e}"
                 )),
             });
         }
 
-        // Notify alert channels for high/critical urgency (non-blocking, best-effort)
+        // Notify alert channels for high/critical urgency (non-blocking, best-effort).
+        // The undeliverable-origin path above returns early, so this cannot double-send.
         if (urgency == "high" || urgency == "critical") && !self.alert_channels.is_empty() {
-            self.send_alerts(&text).await;
+            let _ = self.send_alerts(&text).await;
         }
 
         if wait_for_response {
@@ -288,17 +402,17 @@ impl Tool for EscalateToHumanTool {
             match response {
                 Ok(Some(msg)) => Ok(ToolResult {
                     success: true,
-                    output: msg.content,
+                    output: msg.content.into(),
                     error: None,
                 }),
                 Ok(None) => Ok(ToolResult {
                     success: false,
-                    output: "TIMEOUT".to_string(),
+                    output: "TIMEOUT".to_string().into(),
                     error: Some("Channel closed before receiving a response".to_string()),
                 }),
                 Err(_) => Ok(ToolResult {
                     success: false,
-                    output: "TIMEOUT".to_string(),
+                    output: "TIMEOUT".to_string().into(),
                     error: Some(format!(
                         "No response received within {timeout_secs} seconds"
                     )),
@@ -313,7 +427,8 @@ impl Tool for EscalateToHumanTool {
                     "urgency": urgency,
                     "channel": channel_name,
                 })
-                .to_string(),
+                .to_string()
+                .into(),
                 error: None,
             })
         }
@@ -437,9 +552,16 @@ mod tests {
     }
 
     fn make_tool_with_channels(channels: Vec<(&str, Arc<dyn Channel>)>) -> EscalateToHumanTool {
+        make_tool_with_channels_and_alerts(channels, vec![])
+    }
+
+    fn make_tool_with_channels_and_alerts(
+        channels: Vec<(&str, Arc<dyn Channel>)>,
+        alert_channels: Vec<&str>,
+    ) -> EscalateToHumanTool {
         let tool = EscalateToHumanTool::new(
             Arc::new(SecurityPolicy::default()),
-            vec![],
+            alert_channels.into_iter().map(String::from).collect(),
             Arc::new(RwLock::new(HashMap::new())),
         );
         let map: HashMap<String, Arc<dyn Channel>> = channels
@@ -725,6 +847,277 @@ mod tests {
 
         assert!(result.success, "error: {:?}", result.error);
         assert_eq!(stub.sent.read().len(), 1);
+    }
+
+    /// Stub whose `send` silently no-ops, mirroring `RpcApprovalChannel` /
+    /// `WsApprovalChannel`: returns `Ok(())` but renders nothing.
+    struct NoDeliveryChannel {
+        channel_name: String,
+        sent: Arc<RwLock<Vec<String>>>,
+    }
+
+    impl NoDeliveryChannel {
+        fn new(name: &str) -> Self {
+            Self {
+                channel_name: name.to_string(),
+                sent: Arc::new(RwLock::new(Vec::new())),
+            }
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for NoDeliveryChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+        fn alias(&self) -> &str {
+            "test"
+        }
+    }
+
+    #[async_trait]
+    impl Channel for NoDeliveryChannel {
+        fn name(&self) -> &str {
+            &self.channel_name
+        }
+
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            self.sent.write().push(message.content.clone());
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("listen not supported")
+        }
+
+        fn supports_outbound_send(&self) -> bool {
+            false
+        }
+
+        fn supports_free_form_ask(&self) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn escalate_uses_requested_channel_not_arbitrary_map_entry() {
+        // Regression: escalate_to_human had no `channel` parameter and always
+        // used channels.iter().next() (HashMap order), so an escalation could
+        // land on an arbitrary configured channel while the operator watched
+        // the channel that actually issued the turn.
+        let origin = Arc::new(SilentChannel::new("telegram"));
+        let other_a = Arc::new(SilentChannel::new("discord"));
+        let other_b = Arc::new(SilentChannel::new("slack"));
+        let tool = make_tool_with_channels(vec![
+            ("discord", Arc::clone(&other_a) as Arc<dyn Channel>),
+            ("telegram", Arc::clone(&origin) as Arc<dyn Channel>),
+            ("slack", Arc::clone(&other_b) as Arc<dyn Channel>),
+        ]);
+
+        let result = tool
+            .execute(json!({
+                "summary": "Need a human",
+                "channel": "telegram",
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "error: {:?}", result.error);
+        let parsed: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(parsed["channel"], "telegram");
+        assert_eq!(
+            origin.sent.read().len(),
+            1,
+            "escalation must go to the requested channel"
+        );
+        assert!(
+            other_a.sent.read().is_empty() && other_b.sent.read().is_empty(),
+            "no other channel may receive the escalation"
+        );
+    }
+
+    #[tokio::test]
+    async fn escalate_reports_unknown_requested_channel() {
+        let tool = make_tool_with_channels(vec![(
+            "telegram",
+            Arc::new(SilentChannel::new("telegram")) as Arc<dyn Channel>,
+        )]);
+
+        let result = tool
+            .execute(json!({ "summary": "Help", "channel": "nope" }))
+            .await;
+
+        // Unknown channel surfaces as an error rather than silently escalating
+        // somewhere the caller did not ask for.
+        let err = match result {
+            Err(e) => e.to_string(),
+            Ok(r) => r.error.unwrap_or_default(),
+        };
+        assert!(
+            err.contains("nope"),
+            "error should name the missing channel: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn escalate_fails_honestly_when_channel_cannot_deliver() {
+        // Regression: routing escalations to the originating channel means RPC
+        // and WS back-channels are now reachable. Their `send` returns Ok(())
+        // without rendering anything, so reporting "escalated" would tell the
+        // agent a human was notified when nobody was.
+        let ch = Arc::new(NoDeliveryChannel::new("rpc"));
+        let tool = make_tool_with_channels(vec![("rpc", Arc::clone(&ch) as Arc<dyn Channel>)]);
+
+        let result = tool
+            .execute(json!({ "summary": "Production down", "channel": "rpc" }))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "must not claim escalation succeeded on a non-delivering channel"
+        );
+        let err = result.error.unwrap_or_default();
+        assert!(
+            err.contains("rpc") && err.contains("deliver"),
+            "error should explain the delivery gap: {err}"
+        );
+        assert!(
+            err.contains("alert_channels"),
+            "with no alert channels configured, suggesting them is a valid remedy: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn undeliverable_origin_falls_back_to_alert_channels() {
+        // Review follow-up: the error text suggested configuring
+        // `[escalation] alert_channels`, but the guard returned before alerts
+        // were ever sent, so that remedy could not change this path. Configured
+        // alert channels are now a real fallback.
+        let origin = Arc::new(NoDeliveryChannel::new("rpc"));
+        let alert = Arc::new(SilentChannel::new("slack"));
+        let tool = make_tool_with_channels_and_alerts(
+            vec![
+                ("rpc", Arc::clone(&origin) as Arc<dyn Channel>),
+                ("slack", Arc::clone(&alert) as Arc<dyn Channel>),
+            ],
+            vec!["slack"],
+        );
+
+        let result = tool
+            .execute(json!({ "summary": "Production down", "channel": "rpc" }))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "a delivered alert-channel fallback is a real escalation: {:?}",
+            result.error
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(parsed["status"], "escalated_via_alert_channels");
+        assert_eq!(parsed["delivered_to"][0], "slack");
+        assert_eq!(
+            alert.sent.read().len(),
+            1,
+            "the alert channel must actually receive the escalation"
+        );
+        assert!(
+            origin.sent.read().is_empty(),
+            "must not pretend to send on the undeliverable origin channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn undeliverable_origin_fails_when_alert_channels_also_cannot_deliver() {
+        // The fallback must not become a new false-success path: an
+        // alert_channels list made only of no-op channels delivers nothing.
+        let origin = Arc::new(NoDeliveryChannel::new("rpc"));
+        let dud = Arc::new(NoDeliveryChannel::new("ws"));
+        let tool = make_tool_with_channels_and_alerts(
+            vec![
+                ("rpc", Arc::clone(&origin) as Arc<dyn Channel>),
+                ("ws", Arc::clone(&dud) as Arc<dyn Channel>),
+            ],
+            vec!["ws"],
+        );
+
+        let result = tool
+            .execute(json!({ "summary": "Production down", "channel": "rpc" }))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "no channel delivered, so this is not an escalation"
+        );
+        let err = result.error.unwrap_or_default();
+        assert!(
+            err.contains("could not deliver either"),
+            "error must not re-suggest alert_channels that already failed: {err}"
+        );
+        assert!(
+            dud.sent.read().is_empty(),
+            "a no-op alert channel must be skipped, not counted as delivered"
+        );
+    }
+
+    #[tokio::test]
+    async fn undeliverable_origin_fallback_rejects_wait_for_response() {
+        // Alert channels cannot return a reply into this turn, so a fallback
+        // delivery must not be reported as satisfying wait_for_response.
+        let origin = Arc::new(NoDeliveryChannel::new("rpc"));
+        let alert = Arc::new(SilentChannel::new("slack"));
+        let tool = make_tool_with_channels_and_alerts(
+            vec![
+                ("rpc", Arc::clone(&origin) as Arc<dyn Channel>),
+                ("slack", Arc::clone(&alert) as Arc<dyn Channel>),
+            ],
+            vec!["slack"],
+        );
+
+        let started = std::time::Instant::now();
+        let result = tool
+            .execute(json!({
+                "summary": "Need a decision",
+                "channel": "rpc",
+                "wait_for_response": true,
+                "timeout_secs": 30,
+            }))
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(!result.success);
+        let err = result.error.unwrap_or_default();
+        assert!(
+            err.contains("wait_for_response"),
+            "error should name the unsupported option: {err}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "must fail fast rather than wait for a reply that cannot arrive; took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn escalate_without_channel_still_uses_map_fallback() {
+        // Back-compat: callers that omit `channel` (and turns with no
+        // originating channel to inject) keep the previous behaviour.
+        let tool = make_tool_with_channels(vec![(
+            "telegram",
+            Arc::new(SilentChannel::new("telegram")) as Arc<dyn Channel>,
+        )]);
+
+        let result = tool.execute(json!({ "summary": "Help" })).await.unwrap();
+
+        assert!(result.success, "error: {:?}", result.error);
+        let parsed: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(parsed["channel"], "telegram");
     }
 
     // ── 10. test_high_urgency_succeeds_without_alert_channels ──

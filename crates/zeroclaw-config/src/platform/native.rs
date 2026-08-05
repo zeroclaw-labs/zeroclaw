@@ -3,12 +3,6 @@ use std::path::{Path, PathBuf};
 use zeroclaw_api::platform::is_android;
 use zeroclaw_api::runtime_traits::RuntimeAdapter;
 
-/// Command-line argument passed after `cmd.exe /C`.
-///
-/// The outer quotes make `cmd.exe` receive the whole configured command as one
-/// command string, while internal quotes remain verbatim for paths and args
-/// with spaces. This preserves the #7083 quoting contract for all Windows
-/// platform-shell call sites.
 pub fn windows_cmd_shell_raw_arg(command: &str) -> String {
     format!("\"{command}\"")
 }
@@ -62,7 +56,6 @@ impl NativeRuntime {
     }
 
     /// Create a native runtime that uses a specific shell binary.
-    ///
     /// `shell` should be a path or name resolvable via `PATH`,
     /// e.g. `"bash"`, `"/bin/zsh"`, `"/usr/bin/fish"`.
     pub fn with_shell(shell: String) -> Self {
@@ -178,11 +171,6 @@ mod tests {
         assert!(debug.contains("echo hello"));
     }
 
-    /// On Windows, `std::process::Command` applies `CommandLineToArgvW`
-    /// escaping to each `.arg()`, which mangles embedded double quotes
-    /// with backslash escapes that `cmd.exe` does not understand.
-    /// `raw_arg` must pass the command verbatim so that quoted paths
-    /// and arguments survive intact (see #7083).
     #[test]
     fn shell_command_preserves_double_quotes() {
         let cwd = std::env::temp_dir();
@@ -202,7 +190,7 @@ mod tests {
         );
 
         // On Windows, raw_arg must NOT produce backslash-escaped quotes
-        // (the core issue in #7083).
+        // (the core issue in
         #[cfg(target_os = "windows")]
         {
             assert!(
@@ -234,8 +222,6 @@ mod tests {
         );
     }
 
-    /// A command with mixed quoted and unquoted segments must pass
-    /// through without mangling any part of the command line.
     #[test]
     fn shell_command_preserves_mixed_quoted_unquoted() {
         let cwd = std::env::temp_dir();
@@ -280,9 +266,6 @@ mod tests {
         }
     }
 
-    /// On Windows, actually invoke `cmd /C` with a quoted `echo`
-    /// argument to confirm the fix works end-to-end. Skipped on
-    /// non-Windows hosts since there's no `cmd.exe`.
     #[tokio::test]
     #[cfg(target_os = "windows")]
     async fn windows_echo_quoted_argument_succeeds() {
@@ -302,9 +285,6 @@ mod tests {
         );
     }
 
-    /// On Windows, verify `dir` with a quoted path works (previous
-    /// behavior: "The filename, directory name, or volume label
-    /// syntax is incorrect").
     #[tokio::test]
     #[cfg(target_os = "windows")]
     async fn windows_dir_quoted_path_succeeds() {
@@ -324,8 +304,6 @@ mod tests {
         );
     }
 
-    /// Verify a command with entirely unquoted arguments still works
-    /// (regression check for the raw_arg conversion).
     #[test]
     fn shell_command_no_quotes_still_works() {
         let cwd = std::env::temp_dir();
@@ -336,8 +314,6 @@ mod tests {
         assert!(debug.contains("echo hello_world"));
     }
 
-    /// Verify `echo %VAR%` expansion syntax is preserved verbatim
-    /// and not mangled by escaping.
     #[tokio::test]
     #[cfg(target_os = "windows")]
     async fn windows_echo_percent_expansion_preserved() {

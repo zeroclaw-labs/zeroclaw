@@ -104,17 +104,27 @@ jobs:
 
       - name: Determine version tag
         id: version
+        # Pass workflow context through env, never interpolated into the script
+        # body. `${{ github.event.inputs.tag }}` is an untrusted workflow_dispatch
+        # input; expanding it directly into `run:` would let a crafted value inject
+        # shell before the validation regex below ever runs. As env vars the shell
+        # reads them as data.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          TAG_INPUT: ${{ github.event.inputs.tag }}
+          GIT_REF: ${{ github.ref }}
+          GIT_REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TAG="${{ github.event.inputs.tag }}"
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            TAG="$TAG_INPUT"
             # Validate: must be 'master' or a semver tag like v0.7.5 / v0.8.0-beta-1.
             if ! [[ "$TAG" =~ ^(master|v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9._-]+)?)$ ]]; then
               echo "::error::Invalid tag input '${TAG}'. Must be 'master' or match v<major>.<minor>.<patch>[-<pre>]."
               exit 1
             fi
-          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            TAG="${{ github.ref_name }}"
+          elif [[ "$GIT_REF" == refs/tags/* ]]; then
+            TAG="$GIT_REF_NAME"
           else
             # Master push: always deploy master. A pointer flip in the same push is
             # already validated above; the master deploy refreshes the pointer file

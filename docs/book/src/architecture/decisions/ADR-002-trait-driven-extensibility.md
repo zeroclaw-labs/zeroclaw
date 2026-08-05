@@ -23,7 +23,7 @@ record; the date above is the date this ADR was added to the
 architecture docs.
 
 This record was drafted from
-[FND-002 §6.3](../../foundations/fnd-002-documentation-standards.md#63-retroactive-adrs),
+[FND-002 §6.3](../../foundations/fnd-002-documentation-standards.md#63-foundational-adr-backlog),
 the current `zeroclaw-api` trait surfaces, and the crate and
 tool-boundary docs. It was not recovered from an older ADR file.
 
@@ -99,11 +99,9 @@ Negative consequences:
 
 Follow-up decisions:
 
-- [ADR-003](./ADR-003-wasm-plugin-model.md) governs independently
-  distributed WASM plugin capabilities, not only first-party Rust
-  implementations.
-- The memory-backend, built-in-channel, and gateway-extraction decisions
-  still need their own retroactive ADRs.
+- [ADR-003](./ADR-003-wasm-plugin-model.md) governs independently distributed WASM plugin capabilities, not only first-party Rust implementations.
+- [ADR-005](./ADR-005-pluggable-memory-backends.md) records the backend-neutral memory storage contract and SQLite default.
+- ADR-006 and ADR-007 remain reserved for the implementation-gated channel-plugin and gateway-extraction decisions.
 
 ## References
 

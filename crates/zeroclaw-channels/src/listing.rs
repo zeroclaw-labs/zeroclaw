@@ -1,9 +1,4 @@
 //! Enumerate the channel types compiled into this binary.
-//!
-//! Use [`compiled_channels`] in display commands that should only mention
-//! channels that can actually be started. Use
-//! [`configured_uncompiled_channels`] when an operator-facing surface must show
-//! configured channels that this binary cannot run.
 
 use zeroclaw_config::schema::ChannelsConfig;
 use zeroclaw_config::traits::ChannelInfo;
@@ -217,12 +212,6 @@ fn compiled_channel_names() -> impl Iterator<Item = &'static str> {
         .filter_map(|spec| spec.schema_name)
 }
 
-/// Returns one entry per channel type compiled into this binary.
-///
-/// Filters the canonical channel list from [`zeroclaw_config::schema::ChannelsConfig::channels`] down to
-/// only those enabled at compile time via `channel-*` / `voice-wake` feature
-/// flags. Name, desc, and configured status come from the config crate's single
-/// source of truth; this function contributes only the compile-time filter.
 pub fn compiled_channels(cfg: &ChannelsConfig) -> Vec<ChannelInfo> {
     cfg.channels()
         .into_iter()
@@ -230,11 +219,6 @@ pub fn compiled_channels(cfg: &ChannelsConfig) -> Vec<ChannelInfo> {
         .collect()
 }
 
-/// Returns configured channel types that exist in config but are not compiled.
-///
-/// This is an on-demand view over the config crate's canonical channel
-/// inventory plus this module's compile-spec table. It does not introduce a
-/// second channel list.
 pub fn configured_uncompiled_channels(cfg: &ChannelsConfig) -> Vec<ChannelInfo> {
     cfg.channels()
         .into_iter()
@@ -243,7 +227,6 @@ pub fn configured_uncompiled_channels(cfg: &ChannelsConfig) -> Vec<ChannelInfo> 
 }
 
 /// Returns whether a schema channel type key is compiled into this binary.
-///
 /// Accepts both kebab-case keys emitted by the config schema and legacy
 /// underscore spellings used in channel references.
 pub fn is_channel_type_compiled(channel_type: &str) -> bool {
@@ -253,6 +236,46 @@ pub fn is_channel_type_compiled(channel_type: &str) -> bool {
         }
     }
     false
+}
+
+/// Typed key over the QR-pairing channels that own persisted login/session
+/// state on disk.
+///
+/// This is the single dispatch value for channel-owned login-state
+/// operations (`crate::login_probe::persisted_login`, and any future hooks
+/// over the same state). Callers resolve a channel type key to this enum
+/// once via [`qr_pairing_channel`] and dispatch on the typed value; the raw
+/// string key never travels past the resolution point.
+///
+/// Variants are feature-gated so a binary without the channel feature
+/// cannot name (or dispatch on) a channel it cannot run — dispatch sites
+/// stay exhaustive without a dead fallback arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QrPairingChannel {
+    #[cfg(feature = "channel-wechat")]
+    WeChat,
+    #[cfg(feature = "whatsapp-web")]
+    WhatsAppWeb,
+}
+
+/// Resolve a channel type key to its typed QR-pairing channel.
+///
+/// This is the one place a QR-login key is parsed from a string; everything
+/// downstream dispatches on [`QrPairingChannel`]. Uses the same key space
+/// as [`is_channel_type_compiled`] (kebab-case schema keys plus legacy
+/// underscore spellings, per `type_keys` in the compile-spec registry
+/// above — `qr_pairing_keys_stay_registered_in_compile_specs` pins the
+/// agreement). Returns `None` for channel types that have no channel-owned
+/// QR login state and for channels not compiled into this binary — the two
+/// cases callers treat identically as "unsupported".
+pub fn qr_pairing_channel(channel_type: &str) -> Option<QrPairingChannel> {
+    match channel_type {
+        #[cfg(feature = "channel-wechat")]
+        "wechat" => Some(QrPairingChannel::WeChat),
+        #[cfg(feature = "whatsapp-web")]
+        "whatsapp-web" | "whatsapp_web" => Some(QrPairingChannel::WhatsAppWeb),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -362,6 +385,35 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn qr_pairing_keys_stay_registered_in_compile_specs() {
+        // Every key the QR-pairing resolver accepts must exist in the
+        // compile-spec registry with a matching compiled flag, so the typed
+        // key space cannot drift from the canonical channel inventory.
+        for (key, feature_compiled) in [
+            ("wechat", cfg!(feature = "channel-wechat")),
+            ("whatsapp-web", cfg!(feature = "whatsapp-web")),
+            ("whatsapp_web", cfg!(feature = "whatsapp-web")),
+        ] {
+            assert!(
+                CHANNEL_COMPILE_SPECS
+                    .iter()
+                    .any(|spec| spec.type_keys.contains(&key)),
+                "QR-pairing key `{key}` is missing from CHANNEL_COMPILE_SPECS"
+            );
+            assert_eq!(
+                super::qr_pairing_channel(key).is_some(),
+                feature_compiled,
+                "QR-pairing resolution for `{key}` drifted from its compile feature"
+            );
+        }
+
+        // Channel types without channel-owned QR login state never resolve.
+        assert_eq!(super::qr_pairing_channel("telegram"), None);
+        assert_eq!(super::qr_pairing_channel("whatsapp"), None);
+        assert_eq!(super::qr_pairing_channel("not-a-channel"), None);
     }
 
     #[test]

@@ -1,8 +1,4 @@
 //! Shared wasmtime component-model plumbing for all plugin worlds.
-//!
-//! One async-enabled engine, one store state carrying the host imports, and the
-//! per-world linker wiring. Tool plugins use a fresh store per call; channel and
-//! memory plugins hold a warm store guarded by an async mutex.
 
 use anyhow::Result;
 use std::collections::VecDeque;
@@ -15,13 +11,8 @@ use wasmtime_wasi_http::WasiHttpCtx;
 use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
 
 use crate::PluginPermission;
+use crate::instance::PluginInstanceScope;
 
-/// A host-owned queue of inbound messages destined for a channel plugin.
-///
-/// The host runs the listener (webhook server, vendor tunnel, polling client)
-/// and pushes each received message in; the plugin drains it from the imported
-/// `inbound` interface. Cloning shares the same underlying queue, so a listener
-/// task can hold one handle while the plugin's store holds another.
 #[derive(Clone, Default)]
 pub struct InboundQueue {
     inner: Arc<Mutex<VecDeque<HostInboundMessage>>>,
@@ -80,6 +71,59 @@ pub struct PluginLimits {
     pub max_instances: usize,
 }
 
+#[cfg(test)]
+pub(crate) fn test_limits(call_fuel: u64) -> PluginLimits {
+    PluginLimits {
+        call_fuel,
+        max_memory_bytes: 1024 * 1024,
+        max_table_elements: 100,
+        max_instances: 10,
+    }
+}
+
+/// Complete host-side inputs for constructing one scoped plugin store.
+///
+/// The immutable instance scope supplies identity and effective grants. Limits
+/// remain a per-store materialized view of canonical host configuration, while
+/// the inbound queue is a process-local resource owned by this store.
+pub(crate) struct PluginStoreSpec {
+    scope: PluginInstanceScope,
+    limits: PluginLimits,
+    inbound: InboundQueue,
+    http: bool,
+}
+
+impl PluginStoreSpec {
+    /// Create a store specification with no host-fed inbound messages.
+    #[must_use]
+    pub(crate) fn new(scope: PluginInstanceScope, limits: PluginLimits) -> Self {
+        Self {
+            scope,
+            limits,
+            inbound: InboundQueue::default(),
+            http: false,
+        }
+    }
+
+    /// Attach HTTP only when this scope was granted `HttpClient`.
+    ///
+    /// Adapters opt into the surface explicitly. This prevents adding a grant
+    /// to a scope from silently widening an adapter that has not implemented
+    /// and tested the corresponding component boundary.
+    #[must_use]
+    pub(crate) fn with_granted_http(mut self) -> Self {
+        self.http = self.scope.grants().allows(PluginPermission::HttpClient);
+        self
+    }
+
+    /// Attach the queue shared with a host-owned inbound listener.
+    #[must_use]
+    pub(crate) fn with_inbound(mut self, inbound: InboundQueue) -> Self {
+        self.inbound = inbound;
+        self
+    }
+}
+
 pub mod bindings {
     pub mod tool {
         wasmtime::component::bindgen!({
@@ -107,12 +151,8 @@ pub mod bindings {
     }
 }
 
-/// Per-store host state. Carries a sandboxed WASI context (no preopens, no
-/// network) so Rust-compiled wasip2 components instantiate, plus the resource
-/// table WASI requires. Outbound HTTP is present only when the plugin's manifest
-/// grants `HttpClient`; otherwise `http` is `None` and `wasi:http` is never
-/// linked, so the component cannot reach the network at all.
 pub struct PluginState {
+    scope: PluginInstanceScope,
     wasi: WasiCtx,
     table: ResourceTable,
     http: Option<WasiHttpCtx>,
@@ -122,48 +162,42 @@ pub struct PluginState {
 }
 
 impl PluginState {
-    /// Build store state for a plugin holding `permissions` under `limits`.
-    /// `HttpClient` is the only permission that widens the host surface here: it
-    /// attaches a `WasiHttpCtx` so the gated `wasi:http` import can be linked.
-    /// Every other permission resolves elsewhere (config jail, memory bridge)
-    /// and leaves the WASI sandbox closed. `limits` sets the per-call fuel and
-    /// the memory/table/instance ceilings the store limiter enforces.
-    pub fn new(permissions: &[PluginPermission], limits: PluginLimits) -> Self {
-        Self::with_inbound(permissions, InboundQueue::default(), limits)
-    }
-
-    /// Build store state with a caller-supplied inbound queue. A channel plugin
-    /// whose host listener feeds it inbound traffic shares the listener's queue
-    /// handle here, so `inbound-poll` drains what the listener enqueued.
-    pub fn with_inbound(
-        permissions: &[PluginPermission],
-        inbound: InboundQueue,
-        limits: PluginLimits,
-    ) -> Self {
-        let http = permissions
-            .contains(&PluginPermission::HttpClient)
-            .then(WasiHttpCtx::new);
+    /// Build store state from one typed, host-issued specification.
+    /// `HttpClient` is the only grant that can widen the host surface here, and
+    /// only after the adapter calls [`PluginStoreSpec::with_granted_http`]. That
+    /// opt-in attaches a `WasiHttpCtx` so the gated `wasi:http` import can be
+    /// linked. Other grants are consumed by adapters or host services where
+    /// implemented and do not widen ambient WASI.
+    pub(crate) fn new(spec: PluginStoreSpec) -> Self {
+        let http = spec.http.then(WasiHttpCtx::new);
         Self {
+            scope: spec.scope,
             wasi: WasiCtx::builder().build(),
             table: ResourceTable::new(),
             http,
-            inbound,
+            inbound: spec.inbound,
             limits: StoreLimitsBuilder::new()
-                .memory_size(limits.max_memory_bytes)
-                .table_elements(limits.max_table_elements)
-                .instances(limits.max_instances)
+                .memory_size(spec.limits.max_memory_bytes)
+                .table_elements(spec.limits.max_table_elements)
+                .instances(spec.limits.max_instances)
                 .build(),
-            fuel_per_call: limits.call_fuel,
+            fuel_per_call: spec.limits.call_fuel,
         }
     }
 
+    /// Immutable host-owned identity and authority for this store.
+    #[must_use]
+    pub(crate) fn scope(&self) -> &PluginInstanceScope {
+        &self.scope
+    }
+
     /// Whether this state was built with outbound HTTP attached.
-    pub fn http_enabled(&self) -> bool {
+    pub(crate) fn http_enabled(&self) -> bool {
         self.http.is_some()
     }
 
     /// The inbound queue this plugin drains. Host code holds a clone to enqueue.
-    pub fn inbound(&self) -> &InboundQueue {
+    pub(crate) fn inbound(&self) -> &InboundQueue {
         &self.inbound
     }
 }
@@ -210,14 +244,6 @@ pub fn add_wasi_http(linker: &mut wasmtime::component::Linker<PluginState>) -> R
     )
 }
 
-/// Assert that a store and the linker chosen for it agree on the `wasi:http`
-/// surface before instantiation. The store carries a `WasiHttpCtx` only when
-/// its manifest granted `HttpClient`; `linker_has_http` is whether the linker
-/// picked for it wired `wasi:http`. A registration path that pairs an
-/// http-linked linker with a store lacking the context (or the reverse) gets a
-/// named startup error here instead of a `WasiHttpView::http` panic at the
-/// first outbound call, so a misconfigured wiring cannot crash a live task and
-/// cannot silently link a surface the store cannot back.
 pub fn ensure_http_coherent(store: &Store<PluginState>, linker_has_http: bool) -> Result<()> {
     let store_has_http = store.data().http_enabled();
     if store_has_http != linker_has_http {
@@ -238,22 +264,13 @@ pub fn engine() -> &'static Engine {
     })
 }
 
-pub fn new_store(permissions: &[PluginPermission], limits: PluginLimits) -> Store<PluginState> {
-    new_store_with_inbound(permissions, InboundQueue::default(), limits)
-}
-
-/// Like [`new_store`], but the resulting state shares `inbound` so a host
-/// listener can enqueue traffic the plugin drains. The limiter and per-call
-/// fuel are wired identically to [`new_store`].
-pub fn new_store_with_inbound(
-    permissions: &[PluginPermission],
-    inbound: InboundQueue,
-    limits: PluginLimits,
-) -> Store<PluginState> {
-    let state = PluginState::with_inbound(permissions, inbound, limits);
+/// Build a Wasmtime store whose imports are derived from one admitted scope.
+pub(crate) fn new_store(spec: PluginStoreSpec) -> Store<PluginState> {
+    let call_fuel = spec.limits.call_fuel;
+    let state = PluginState::new(spec);
     let mut store = Store::new(engine(), state);
     store.limiter(|state| &mut state.limits);
-    set_call_fuel(&mut store, limits.call_fuel);
+    set_call_fuel(&mut store, call_fuel);
     store
 }
 
@@ -272,6 +289,25 @@ pub fn refuel(store: &mut Store<PluginState>) {
 
 pub fn wt<T>(r: wasmtime::Result<T>, ctx: &'static str) -> Result<T> {
     r.map_err(|e| anyhow::Error::msg(format!("{ctx}: {e}")))
+}
+
+/// Hint appended to instantiation failures, pointing plugin authors at the
+/// most common cause: a vendored `wit/v0` copy that has drifted from the
+/// host's current WIT. Phrased conditionally ("if this is a WIT ... mismatch")
+/// because it is appended to *every* instantiation failure, including non-WIT
+/// causes such as a too-small memory limit — so it must read as a lead to
+/// check, not an assertion of the cause. Kept as a `const` so it has one
+/// source of truth and tests can assert against it instead of a literal.
+const WIT_DRIFT_HINT: &str = "if this is a WIT interface/type mismatch, your plugin's vendored wit/v0 may have drifted — rebuild it against the WIT shipped with this host version";
+
+/// Like [`wt`], but for component instantiation specifically. Instantiation
+/// failures are where a stale vendored `wit/v0` copy surfaces, and wasmtime's
+/// error there is a chain (e.g. "while linking ... caused by: type mismatch
+/// for ..."). Unlike `wt`, this preserves the full chain via the alternate
+/// `{:#}` Display instead of flattening it to the top-level message, and
+/// appends [`WIT_DRIFT_HINT`] so the failure is actionable.
+pub fn wt_instantiate<T>(r: wasmtime::Result<T>, ctx: &'static str) -> Result<T> {
+    r.map_err(|e| anyhow::Error::msg(format!("{ctx}: {e:#} (hint: {WIT_DRIFT_HINT})")))
 }
 
 /// Compile a component from a WASM file. With a JIT backend present a `.wasm`
@@ -293,7 +329,7 @@ fn load_inner(wasm_path: &Path) -> wasmtime::Result<Component> {
     unsafe { Component::deserialize_file(engine(), wasm_path) }
 }
 
-/// Run an async call against a warm `Arc<Mutex<(Store, bindings)>>` plugin,
+/// Run an async call against a warm mutex-protected `(Store, bindings)` pair,
 /// holding the store lock for the duration of the single component call.
 macro_rules! call_plugin {
     ($self:expr, $body:expr) => {{
@@ -309,19 +345,22 @@ pub(crate) use call_plugin;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::PluginCapability;
 
-    fn limits(call_fuel: u64) -> PluginLimits {
-        PluginLimits {
-            call_fuel,
-            max_memory_bytes: 256 * 1024 * 1024,
-            max_table_elements: 100_000,
-            max_instances: 64,
-        }
+    fn scope(
+        binding: &str,
+        grants: impl IntoIterator<Item = PluginPermission>,
+    ) -> PluginInstanceScope {
+        crate::instance::test_scope(PluginCapability::Tool, binding, grants)
+    }
+
+    fn spec(grants: impl IntoIterator<Item = PluginPermission>, call_fuel: u64) -> PluginStoreSpec {
+        PluginStoreSpec::new(scope("main", grants), test_limits(call_fuel)).with_granted_http()
     }
 
     #[test]
     fn http_absent_without_permission() {
-        let state = PluginState::new(&[], limits(0));
+        let state = PluginState::new(spec([], 0));
         assert!(
             !state.http_enabled(),
             "no HttpClient permission means no outbound HTTP context"
@@ -330,14 +369,14 @@ mod tests {
 
     #[test]
     fn http_absent_for_unrelated_permissions() {
-        let state = PluginState::new(
-            &[
+        let state = PluginState::new(spec(
+            [
                 PluginPermission::ConfigRead,
                 PluginPermission::MemoryRead,
                 PluginPermission::FileRead,
             ],
-            limits(0),
-        );
+            0,
+        ));
         assert!(
             !state.http_enabled(),
             "only HttpClient attaches the HTTP context"
@@ -346,7 +385,7 @@ mod tests {
 
     #[test]
     fn http_present_with_permission() {
-        let state = PluginState::new(&[PluginPermission::HttpClient], limits(0));
+        let state = PluginState::new(spec([PluginPermission::HttpClient], 0));
         assert!(
             state.http_enabled(),
             "HttpClient attaches the outbound HTTP context"
@@ -354,13 +393,24 @@ mod tests {
     }
 
     #[test]
+    fn grant_does_not_enable_http_without_adapter_opt_in() {
+        let granted_scope = scope("main", [PluginPermission::HttpClient]);
+        let state = PluginState::new(PluginStoreSpec::new(granted_scope, test_limits(0)));
+
+        assert!(
+            !state.http_enabled(),
+            "an adapter must explicitly opt into its tested HTTP boundary"
+        );
+    }
+
+    #[test]
     fn http_coherence_accepts_matching_store_and_linker() {
-        let granted = new_store(&[PluginPermission::HttpClient], limits(0));
+        let granted = new_store(spec([PluginPermission::HttpClient], 0));
         assert!(
             ensure_http_coherent(&granted, true).is_ok(),
             "granted store paired with an http linker is coherent"
         );
-        let plain = new_store(&[], limits(0));
+        let plain = new_store(spec([], 0));
         assert!(
             ensure_http_coherent(&plain, false).is_ok(),
             "ungranted store paired with a plain linker is coherent"
@@ -372,12 +422,12 @@ mod tests {
         // A registration path that links wasi:http against a store with no
         // HttpClient context (or the reverse) is refused at instantiate time
         // with a named error, not a WasiHttpView::http panic on first call.
-        let granted = new_store(&[PluginPermission::HttpClient], limits(0));
+        let granted = new_store(spec([PluginPermission::HttpClient], 0));
         assert!(
             ensure_http_coherent(&granted, false).is_err(),
             "granted store with a plain linker cannot back its own permission"
         );
-        let plain = new_store(&[], limits(0));
+        let plain = new_store(spec([], 0));
         assert!(
             ensure_http_coherent(&plain, true).is_err(),
             "plain store with an http linker would panic on first outbound call"
@@ -469,7 +519,7 @@ mod tests {
     #[test]
     fn plugin_state_exposes_its_inbound_queue() {
         let q = InboundQueue::default();
-        let state = PluginState::with_inbound(&[], q.clone(), limits(0));
+        let state = PluginState::new(spec([], 0).with_inbound(q.clone()));
         q.enqueue(sample_inbound("y"));
         assert_eq!(
             state.inbound().pending(),
@@ -480,7 +530,7 @@ mod tests {
 
     #[test]
     fn engine_enables_fuel_metering() {
-        let mut store = Store::new(engine(), PluginState::new(&[], limits(0)));
+        let mut store = Store::new(engine(), PluginState::new(spec([], 0)));
         store
             .set_fuel(123)
             .expect("fuel must be enabled on the shared plugin engine");
@@ -489,13 +539,13 @@ mod tests {
 
     #[test]
     fn new_store_seeds_configured_budget() {
-        let store = new_store(&[], limits(777));
+        let store = new_store(spec([], 777));
         assert_eq!(store.get_fuel().expect("get_fuel"), 777);
     }
 
     #[test]
     fn zero_budget_traps_before_any_work() {
-        let store = new_store(&[], limits(0));
+        let store = new_store(spec([], 0));
         assert_eq!(
             store.get_fuel().expect("get_fuel"),
             0,
@@ -505,7 +555,7 @@ mod tests {
 
     #[test]
     fn refuel_restores_per_call_budget_on_a_warm_store() {
-        let mut store = new_store(&[], limits(500));
+        let mut store = new_store(spec([], 500));
         store.set_fuel(3).expect("set_fuel");
         assert_eq!(store.get_fuel().expect("get_fuel"), 3);
         refuel(&mut store);
@@ -513,6 +563,66 @@ mod tests {
             store.get_fuel().expect("get_fuel"),
             500,
             "refuel must reset a drained warm store to the configured per-call budget"
+        );
+    }
+
+    #[test]
+    fn stores_share_only_their_issued_instance_scope() {
+        let primary = scope("primary", []);
+        let primary_store = new_store(PluginStoreSpec::new(primary.clone(), test_limits(0)));
+        let second_primary_store = new_store(PluginStoreSpec::new(primary, test_limits(0)));
+        let backup_store = new_store(PluginStoreSpec::new(scope("backup", []), test_limits(0)));
+
+        assert!(std::ptr::eq(
+            primary_store.data().scope().id(),
+            second_primary_store.data().scope().id()
+        ));
+        assert_ne!(
+            primary_store.data().scope().id(),
+            backup_store.data().scope().id(),
+            "separate bindings must not share a host-service namespace"
+        );
+    }
+
+    #[test]
+    fn wt_instantiate_passes_through_on_success() {
+        let value = wt_instantiate(Ok(42), "failed to instantiate tool plugin")
+            .expect("Ok is passed through unchanged");
+        assert_eq!(value, 42);
+    }
+
+    #[test]
+    fn wt_instantiate_preserves_the_chain_and_appends_the_drift_hint() {
+        // Shaped like a real wasmtime component-model mismatch: a root cause
+        // (the WIT type mismatch) wrapped with an intermediate linking
+        // context, the way `instantiate_async` failures actually chain. This
+        // is `wasmtime::Error` (what `instantiate_async` actually returns),
+        // not `anyhow::Error` — the two are distinct types in this wasmtime
+        // version, though `Error::context` chains the same way.
+        let err =
+            wasmtime::Error::msg("type mismatch for `plugin-action`: expected 5 cases, found 4")
+                .context("while linking zeroclaw:plugin/logging");
+
+        let decorated = wt_instantiate::<()>(Err(err), "failed to instantiate tool plugin")
+            .expect_err("Err must stay an error");
+        let rendered = format!("{decorated}");
+
+        assert!(
+            rendered.contains("failed to instantiate tool plugin"),
+            "must keep the caller-supplied context: {rendered}"
+        );
+        assert!(
+            rendered.contains("type mismatch for"),
+            "must preserve the root cause via the alternate {{:#}} Display, \
+             not just the top-level message: {rendered}"
+        );
+        assert!(
+            rendered.contains("while linking zeroclaw:plugin/logging"),
+            "must preserve the intermediate chain link too: {rendered}"
+        );
+        assert!(
+            rendered.contains(WIT_DRIFT_HINT),
+            "must append the wit/v0 drift hint: {rendered}"
         );
     }
 }

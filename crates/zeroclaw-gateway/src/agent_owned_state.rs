@@ -1,17 +1,5 @@
-//! Agent-deletion **owned-state** cascade (#7175) — the non-config half of
+//! Agent-deletion **owned-state** cascade— the non-config half of
 //! deleting an agent.
-//!
-//! Config references are scrubbed by
-//! `zeroclaw_config::alias_refs::delete_with_cascade`. This module handles the
-//! persisted state the *surface* owns (the infra stores `zeroclaw-config` can't
-//! depend on): memory rows, cron jobs, ACP sessions, and session-metadata
-//! attribution. Each store is opened from `config.data_dir` on demand.
-//!
-//! **Export-then-delete** (recoverable, per the agreed cascade policy): rows are
-//! written into the same `agents/_deleted/<alias>-<ts>/` archive as the
-//! workspace (under `cascade/`), then removed. Best-effort + reported — a single
-//! store failing does not abort the others (mirrors the existing
-//! archive+purge behaviour); the surface persists the config last.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -22,12 +10,6 @@ use zeroclaw_config::schema::Config;
 use zeroclaw_infra::acp_session_store::AcpSessionStore;
 use zeroclaw_infra::session_backend::SessionBackend;
 
-/// Count of *live* (un-killed) ACP sessions owned by `alias`. Non-zero is a HARD
-/// blocker for deleting the agent. Returns `Err` if the ACP store exists but
-/// can't be opened/queried — the caller must **fail closed** (refuse the delete)
-/// rather than assume zero, since live sessions might exist undetected.
-/// (`AcpSessionStore::new` creates a missing DB empty, so a fresh system with no
-/// ACP usage returns `Ok(0)` and deletes proceed normally.)
 pub fn live_acp_session_count(config: &Config, alias: &str) -> anyhow::Result<usize> {
     let store = AcpSessionStore::new(&config.data_dir)
         .context("open ACP session store to verify live sessions")?;
@@ -62,12 +44,6 @@ async fn write_json(path: &Path, bytes: Vec<u8>) {
     }
 }
 
-/// Export-then-delete the agent's owned non-config state into `archive_dir`
-/// (the `agents/_deleted/<alias>-<ts>/` the workspace was moved to), then return
-/// a report. Best-effort: each store is independent.
-///
-/// Precondition: the caller already refused if [`live_acp_session_count`] was
-/// non-zero, so only killed ACP sessions remain to delete here.
 pub async fn cascade_owned_state(
     config: &Config,
     mem: &Arc<dyn Memory>,
@@ -197,7 +173,7 @@ pub async fn cascade_owned_state(
     report
 }
 
-/// What the agent-rename owned-state cascade re-pointed (#7468).
+/// What the agent-rename owned-state cascade re-pointed
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct RenameStateReport {
     pub memory_rows: usize,
@@ -209,15 +185,6 @@ pub struct RenameStateReport {
     pub warnings: Vec<String>,
 }
 
-/// Re-point the agent's owned non-config **DB** state from `from` to `to`:
-/// memory rows (`agents.alias`), cron jobs, ACP sessions, and session-metadata
-/// attribution. The workspace directory is moved by the caller (mirroring how
-/// the delete handler archives the workspace, not `cascade_owned_state`).
-///
-/// Unlike delete this is **in-place** — no export/archive — and there is **no
-/// live-session refusal**: a live ACP session simply follows the rename.
-/// Best-effort + reported: a single store failing does not abort the others; the
-/// surface persists the renamed config last.
 pub async fn cascade_rename_agent(
     config: &Config,
     mem: &Arc<dyn Memory>,

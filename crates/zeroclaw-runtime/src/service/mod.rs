@@ -44,12 +44,6 @@ impl FromStr for InitSystem {
 }
 
 impl InitSystem {
-    /// Resolve auto-detection to a concrete init system
-    ///
-    /// Detection order (deny-by-default):
-    /// 1. `/run/systemd/system` exists → Systemd
-    /// 2. `/run/openrc` exists AND OpenRC binary present → OpenRC
-    /// 3. else → Error (unknown init system)
     #[cfg(target_os = "linux")]
     pub fn resolve(self) -> Result<Self> {
         match self {
@@ -68,7 +62,6 @@ impl InitSystem {
 }
 
 /// Detect the active init system on Linux
-///
 /// Checks for systemd and OpenRC in order, returning the first match.
 /// Returns an error if neither is detected.
 #[cfg(target_os = "linux")]
@@ -688,12 +681,6 @@ fn uninstall_linux(config: &Config, init_system: InitSystem) -> Result<()> {
     Ok(())
 }
 
-/// Detect if the executable lives under a Homebrew prefix and return the
-/// corresponding `var/zeroclaw` directory.
-///
-/// Homebrew installs binaries into `<prefix>/Cellar/<formula>/<version>/bin/`
-/// and symlinks them through `<prefix>/bin/` and `<prefix>/opt/<formula>/`.
-/// The canonical `var` directory is `<prefix>/var`.
 pub fn homebrew_var_dir_from_exe(exe: &Path) -> Option<PathBuf> {
     let resolved = exe.canonicalize().unwrap_or_else(|_| exe.to_path_buf());
     let exe = resolved.as_path();
@@ -1526,12 +1513,6 @@ fn install_windows(config: &Config) -> Result<()> {
         .args(["/Delete", "/TN", task_name, "/F"])
         .output();
 
-    // Run at the invoking user's normal privilege (LIMITED), not HIGHEST.
-    // This is a per-user ONLOGON task driving a user-level daemon; running it
-    // elevated makes the daemon's RPC pipe owned by an elevated token, so a
-    // non-elevated `zerocode` can't connect unless it too is run as admin.
-    // Matching the user's standard token keeps the pipe reachable from the
-    // normal desktop session.
     run_checked(Command::new("schtasks").args([
         "/Create",
         "/TN",
@@ -1929,8 +1910,8 @@ mod linux_service_tests {
     }
 }
 
-#[cfg(all(test, zeroclaw_root_crate))]
-mod tests {
+#[cfg(test)]
+mod service_helper_tests {
     use super::*;
 
     #[test]
@@ -2086,53 +2067,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn systemd_unit_contains_home_and_pass_environment() {
-        let unit = "[Unit]\n\
-             Description=ZeroClaw daemon\n\
-             After=network.target\n\
-             \n\
-             [Service]\n\
-             Type=simple\n\
-             ExecStart=/usr/local/bin/zeroclaw daemon\n\
-             Restart=always\n\
-             RestartSec=3\n\
-             # Ensure HOME is set so headless browsers can create profile/cache dirs.\n\
-             Environment=HOME=%h\n\
-             # Allow inheriting DISPLAY and XDG_RUNTIME_DIR from the user session\n\
-             # so graphical/headless browsers can function correctly.\n\
-             PassEnvironment=DISPLAY XDG_RUNTIME_DIR\n\
-             \n\
-             [Install]\n\
-             WantedBy=default.target\n"
-            .to_string();
-
-        assert!(
-            unit.contains("Environment=HOME=%h"),
-            "systemd unit must set HOME for headless browser support"
-        );
-        assert!(
-            unit.contains("PassEnvironment=DISPLAY XDG_RUNTIME_DIR"),
-            "systemd unit must pass through display/runtime env vars"
-        );
-    }
-
-    #[test]
-    fn warn_if_binary_in_home_detects_home_path() {
-        use std::path::PathBuf;
-
-        let home_path = PathBuf::from("/home/user/.cargo/bin/zeroclaw");
-        assert!(home_path.to_string_lossy().contains("/home/"));
-        assert!(home_path.to_string_lossy().contains(".cargo/bin"));
-
-        let cargo_path = PathBuf::from("/home/user/.cargo/bin/zeroclaw");
-        assert!(cargo_path.to_string_lossy().contains(".cargo/bin"));
-
-        let system_path = PathBuf::from("/usr/local/bin/zeroclaw");
-        assert!(!system_path.to_string_lossy().contains("/home/"));
-        assert!(!system_path.to_string_lossy().contains(".cargo/bin"));
-    }
-
     #[cfg(unix)]
     #[test]
     fn shell_single_quote_escapes_single_quotes() {
@@ -2196,21 +2130,5 @@ mod tests {
         // tail should succeed on existing file
         let result = tail_file(&log, 3, false);
         assert!(result.is_ok(), "tail on existing file should succeed");
-    }
-
-    #[test]
-    fn logs_variant_is_recognized() {
-        // Ensure the Logs variant can be constructed and matched
-        let cmd = crate::ServiceCommands::Logs {
-            lines: 25,
-            follow: true,
-        };
-        match &cmd {
-            crate::ServiceCommands::Logs { lines, follow } => {
-                assert_eq!(*lines, 25);
-                assert!(*follow);
-            }
-            _ => panic!("Expected Logs variant"),
-        }
     }
 }

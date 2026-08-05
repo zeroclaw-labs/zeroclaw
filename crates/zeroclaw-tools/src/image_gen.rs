@@ -3,16 +3,10 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult, with_ephemeral_workspace_warning};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, with_ephemeral_workspace_warning};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
 
-/// Resolve the output filename stem (no extension) for a generated image.
-///
-/// A caller-supplied `filename` is used verbatim with path components stripped
-/// (traversal-safe). When none is given, a unique timestamped default
-/// (`generated_image_<nanos>`) is returned so successive default generations
-/// never clobber each other. `nanos` is injected so the selection is testable.
 fn resolve_image_filename(filename_arg: Option<&str>, nanos: u128) -> String {
     filename_arg
         .filter(|s| !s.trim().is_empty())
@@ -25,12 +19,6 @@ fn resolve_image_filename(filename_arg: Option<&str>, nanos: u128) -> String {
         .unwrap_or_else(|| format!("generated_image_{nanos}"))
 }
 
-/// Format the tool output for a saved image.
-///
-/// Emits the saved path in BOTH a durable `File:` line (survives marker
-/// stripping in older turns) and an explicit `[IMAGE:<path>]` marker the
-/// multimodal pipeline inlines. Both carry the same path so the runtime
-/// canonicalizer dedups them.
 fn format_image_tool_output(
     path_display: &str,
     size_kb: usize,
@@ -47,22 +35,11 @@ fn format_image_tool_output(
     )
 }
 
-/// Standalone image generation tool using fal.ai (Flux / Nano Banana models).
-///
-/// Reads the API key from an environment variable (default: `FAL_API_KEY`),
-/// calls the fal.ai synchronous endpoint, downloads the resulting image,
-/// and saves it to `{workspace}/images/{filename}.png`.
 pub struct ImageGenTool {
     security: Arc<SecurityPolicy>,
     workspace_dir: PathBuf,
     default_model: String,
     api_key_env: String,
-    /// Whether the saved image persists on the host filesystem. `false` on an
-    /// ephemeral runtime (Docker tmpfs / no volume mount), where the PNG is
-    /// written inside the container but invisible on the host and discarded at
-    /// session end. When `false`, a successful generation carries a loud
-    /// ephemeral-workspace warning. Mirrors
-    /// [`super::file_write::FileWriteTool`]. See issue #4627.
     persistent_writes: bool,
 }
 
@@ -126,7 +103,7 @@ impl ImageGenTool {
             _ => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some("Missing required parameter: 'prompt'".into()),
                 });
             }
@@ -158,7 +135,7 @@ impl ImageGenTool {
         if !VALID_SIZES.contains(&size) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Invalid size '{size}'. Valid values: {}",
                     VALID_SIZES.join(", ")
@@ -183,7 +160,7 @@ impl ImageGenTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Invalid model identifier '{model}'. \
                      Must be a fal.ai model path (e.g. 'fal-ai/flux/schnell')."
@@ -197,7 +174,7 @@ impl ImageGenTool {
             Err(msg) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(msg),
                 });
             }
@@ -227,7 +204,7 @@ impl ImageGenTool {
             let body_text = resp.text().await.unwrap_or_default();
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("fal.ai API error ({status}): {body_text}")),
             });
         }
@@ -260,7 +237,7 @@ impl ImageGenTool {
         if !img_resp.status().is_success() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Failed to download image from {image_url} ({})",
                     img_resp.status()
@@ -286,17 +263,12 @@ impl ImageGenTool {
 
         let size_kb = bytes.len() / 1024;
 
-        // Emit a durable `File:` line (survives marker-stripping in older turns)
-        // plus an explicit `[IMAGE:…]` marker the multimodal pipeline inlines.
-        // Both carry the same path string so the promoter
-        // (`canonicalize_tool_result_media_markers`) dedups the bare path
-        // against the already-wrapped marker and does not double-count.
         let path_display = output_path.display().to_string();
         let output = format_image_tool_output(&path_display, size_kb, model, &prompt);
 
         Ok(ToolResult {
             success: true,
-            output,
+            output: output.into(),
             error: None,
         })
     }
@@ -347,16 +319,16 @@ impl Tool for ImageGenTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(error),
             });
         }
 
         let mut result = self.generate(args).await?;
         // A generated image saved to an ephemeral workspace never reaches the
-        // host and is lost at session end; warn loudly on success (issue #4627).
+        // host and is lost at session end; warn loudly on success
         if !self.persistent_writes && result.success {
-            result.output = with_ephemeral_workspace_warning(&result.output);
+            result.output = with_ephemeral_workspace_warning(&result.output).into();
         }
         Ok(result)
     }
@@ -575,7 +547,7 @@ mod tests {
 
     #[test]
     fn resolve_image_filename_default_is_non_clobbering_and_unique() {
-        // Exercises the PRODUCTION filename-selection helper (#7874): an omitted
+        // Exercises the PRODUCTION filename-selection helper an omitted
         // filename must yield a unique timestamped name, never the bare
         // `generated_image` that would clobber prior generations, and two
         // default calls must differ. Fails if the code reverts to a fixed name.
@@ -602,11 +574,6 @@ mod tests {
 
     #[test]
     fn image_output_emits_matching_file_line_and_image_marker() {
-        // Exercises the PRODUCTION output formatter (#7874): the saved path must
-        // appear in BOTH the durable `File:` line and the `[IMAGE:<path>]`
-        // marker, with the same concrete path, so the multimodal pipeline can
-        // inline the attachment and the canonicalizer dedups them. Fails if the
-        // marker (or the matching path) is dropped.
         let path = "/ws/images/generated_image_42.png";
         let out = format_image_tool_output(path, 12, "fal-ai/flux", "a cat");
         assert!(

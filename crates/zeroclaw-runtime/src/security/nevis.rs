@@ -1,8 +1,4 @@
 //! Nevis IAM authentication model_provider for ZeroClaw.
-//!
-//! Integrates with Nevis Security Suite (Adnovum) for OAuth2/OIDC token
-//! validation, FIDO2/passkey verification, and session management. Maps Nevis
-//! roles to ZeroClaw tool permissions via [`super::iam_policy::IamPolicy`].
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -43,7 +39,6 @@ impl TokenValidationMode {
 }
 
 /// Authentication model_provider backed by a Nevis instance.
-///
 /// Validates tokens, manages sessions, and resolves identities. The model_provider
 /// is designed to be shared across concurrent requests (`Send + Sync`).
 pub struct NevisAuthProvider {
@@ -97,7 +92,6 @@ const _: () = {
 
 impl NevisAuthProvider {
     /// Create a new Nevis auth model_provider from config values.
-    ///
     /// `client_secret` should already be decrypted by the config loader.
     pub fn new(
         instance_url: String,
@@ -137,7 +131,6 @@ impl NevisAuthProvider {
     }
 
     /// Validate a bearer token and resolve the caller's identity.
-    ///
     /// Returns `NevisIdentity` on success, or an error if the token is invalid,
     /// expired, or MFA requirements are not met.
     pub async fn validate_token(&self, token: &str) -> Result<NevisIdentity> {
@@ -237,12 +230,6 @@ impl NevisAuthProvider {
         })
     }
 
-    /// Validate token locally using JWKS.
-    ///
-    /// Local JWT/JWKS validation is not yet implemented. Rather than silently
-    /// falling back to the remote introspection endpoint (which would hide a
-    /// misconfiguration), this returns an explicit error directing the operator
-    /// to use `token_validation = "remote"` until local JWKS support is added.
     #[allow(clippy::unused_async)] // Will use async when JWKS validation is implemented
     async fn validate_token_local(&self, token: &str) -> Result<NevisIdentity> {
         // JWT structure check: header.payload.signature

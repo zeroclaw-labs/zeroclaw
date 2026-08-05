@@ -1,23 +1,5 @@
-//! Integration test for #8695: a cron job with `uses_memory = false` must be
+//! Integration test a cron job with `uses_memory = false` must be
 //! memory-free end to end, not merely opted out of the context preamble.
-//!
-//! The scheduler maps `uses_memory = false` to
-//! `AgentRunOverrides { memory_free: true, suppress_memory_inject: true, .. }`
-//! (`crates/zeroclaw-runtime/src/cron/scheduler.rs`). `memory_free` makes the
-//! agent loop bind a `NoneMemory` backend and drop the persistent memory tools
-//! from the registry, so the model can neither read a real store (recall/inject)
-//! nor reach one through advertised memory tools. `suppress_memory_inject`
-//! alone would still hand the model a live backend and working `memory_*` tools.
-//!
-//! This test drives `agent::run` on the cron origin twice against a mock
-//! OpenAI-compatible provider that records every request body, and audits those
-//! bodies:
-//!   * memory-free run (`uses_memory = false`): the request advertises NONE of
-//!     the `memory_*` tools, and a planted, highly-relevant memory entry never
-//!     reaches the provider (recall is inert on `NoneMemory`).
-//!   * live run (`uses_memory = true`): the same setup DOES advertise the
-//!     memory tools — the control that proves the exclusion is meaningful and
-//!     that `memory_free` is what removes them.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -56,11 +38,6 @@ async fn spawn_mock_provider() -> (SocketAddr, CapturedBodies) {
     (addr, captured)
 }
 
-/// Build a config whose `default` agent points at the mock provider and plant a
-/// highly-relevant Core memory entry carrying `SECRET_SENTINEL`. Core (not
-/// Conversation) is deliberately chosen: the cron origin excludes only
-/// Conversation, so under a live backend this entry is eligible for recall and
-/// injection — which is exactly what the memory-free run must prevent.
 async fn config_with_planted_memory(provider_uri: &str, workspace_dir: &std::path::Path) -> Config {
     let provider_type = "custom";
     {

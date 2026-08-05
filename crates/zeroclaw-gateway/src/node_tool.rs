@@ -1,6 +1,5 @@
 //! Wraps a node capability as a zeroclaw [`Tool`] so it can be dispatched
 //! through the existing tool registry and agent loop.
-//!
 //! Tool names are prefixed with the node ID: `node:<node_id>:<capability_name>`.
 
 use std::sync::Arc;
@@ -10,7 +9,7 @@ use tokio::time::Duration;
 
 use crate::nodes::{NodeInvocation, NodeRegistry};
 use zeroclaw_api::attribution::ToolKind;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_api::tool_attribution;
 use zeroclaw_tools::node_capabilities::requires_approval;
 
@@ -20,7 +19,6 @@ tool_attribution!(NodeTool, ToolKind::Plugin);
 const NODE_INVOKE_TIMEOUT_SECS: u64 = 30;
 
 /// A zeroclaw [`Tool`] backed by a node capability.
-///
 /// The `prefixed_name` (e.g. `node:phone-1:camera.snap`) is what the agent
 /// loop sees. Invocations are routed to the connected node via WebSocket.
 pub struct NodeTool {
@@ -88,7 +86,7 @@ impl Tool for NodeTool {
             if !approved {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!(
                         "Capability '{}' requires approval. Set approved=true to proceed.",
                         self.capability_name
@@ -112,7 +110,7 @@ impl Tool for NodeTool {
                 None => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!("Node '{}' is not connected", self.node_id)),
                     });
                 }
@@ -131,7 +129,7 @@ impl Tool for NodeTool {
         if invoke_tx.send(invocation).await.is_err() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Failed to send invocation to node '{}'",
                     self.node_id
@@ -144,12 +142,12 @@ impl Tool for NodeTool {
         {
             Ok(Ok(result)) => Ok(ToolResult {
                 success: result.success,
-                output: result.output,
+                output: result.output.into(),
                 error: result.error,
             }),
             Ok(Err(_)) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Node '{}' dropped the invocation channel",
                     self.node_id
@@ -157,7 +155,7 @@ impl Tool for NodeTool {
             }),
             Err(_) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Node '{}' invocation timed out after {NODE_INVOKE_TIMEOUT_SECS}s",
                     self.node_id

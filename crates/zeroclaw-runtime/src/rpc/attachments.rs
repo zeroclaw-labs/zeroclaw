@@ -1,9 +1,4 @@
 //! File attachment processing for the RPC transport.
-//!
-//! Handles base64-encoded uploads and local-path reads, SHA-256
-//! content-addressed deduplication, workspace storage, and marker
-//! generation. Used by both `file/attach` and `session/prompt`
-//! (inline attachments).
 
 use super::session::SessionStore;
 // FileSource is only referenced from the `#[cfg(test)] mod tests` below,
@@ -28,13 +23,6 @@ fn rpc_err(code: i32, msg: impl Into<String>) -> JsonRpcError {
     }
 }
 
-/// Process a single [`FileEntry`] — resolve bytes, dedup, write to the
-/// upload root, and return a [`FileEntryResult`].
-///
-/// `upload_root` is the directory under which a `uploads/` subdir is
-/// created and bytes are written. Callers should pass the per-agent
-/// workspace dir, NOT the session cwd — uploads belong to the agent,
-/// not to whatever directory the user happened to launch the TUI from.
 pub async fn process_file_entry(
     entry: &FileEntry,
     session_id: &str,
@@ -122,59 +110,26 @@ pub async fn process_file_entry(
         });
     }
 
-    // 4. Sanitize filename.
+    // 4. Sanitize filename (display only; the on-disk name is the content hash).
     let sanitized = sanitize_filename(&filename);
 
-    // 5. Determine extension + write to workspace.
+    // 5. Persist through the shared hardened content-addressed writer: full-digest
+    // storage name and a directory-handle-bound, no-follow atomic write. This makes
+    // the RPC attachment path and the ACP/MCP blob path share one filesystem owner
+    // instead of duplicating decode/hash/naming/persistence with a plain,
+    // symlink-following `fs::write`. Marker and session dedup stay RPC-specific.
     let ext = std::path::Path::new(&sanitized)
         .extension()
         .map(|e| e.to_string_lossy().to_string())
         .unwrap_or_default();
-    let storage_name = if ext.is_empty() {
-        hex[..16].to_string()
-    } else {
-        format!("{}.{ext}", &hex[..16])
-    };
-    let upload_dir = std::path::Path::new(upload_root).join("uploads");
-    tokio::fs::create_dir_all(&upload_dir)
-        .await
-        .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cannot create upload dir: {e}")))?;
-    let dest = upload_dir.join(&storage_name);
-    tokio::fs::write(&dest, &bytes)
-        .await
-        .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cannot write upload: {e}")))?;
+    let dest = zeroclaw_tools::embedded_resource::persist_content_addressed(
+        std::path::Path::new(upload_root),
+        &bytes,
+        &ext,
+    )
+    .map_err(|e| rpc_err(INTERNAL_ERROR, e.to_string()))?;
+    let workspace_path = strip_windows_verbatim_prefix(&dest.to_string_lossy()).into_owned();
 
-    // Canonicalize so the marker always contains an absolute path —
-    // upload_root may be relative (e.g. ".") when no path was provided.
-    let canonical = tokio::fs::canonicalize(&dest)
-        .await
-        .unwrap_or_else(|_| dest.clone());
-    let canonical_display = canonical.to_string_lossy();
-    let workspace_path = strip_windows_verbatim_prefix(&canonical_display).into_owned();
-
-    // 6. Build marker.
-    //
-    // Images use `[IMAGE:path]` so the multimodal processor can inline them
-    // as data URIs for vision models. Non-image files use a prose format
-    // matching the channel attachment style (`[Document: name] path`) so the
-    // LLM sees a readable path it can access with file-reading tools.
-    //
-    // Regardless of source (file pick vs clipboard paste) and regardless of
-    // transport (Unix path vs WSS base64), the canonical workspace path is
-    // ALWAYS a valid local file that the multimodal pipeline can load — the
-    // bytes were just written above. Emitting `[IMAGE:<workspace_path>]` for
-    // every source ensures vision models receive the actual image data.
-    //
-    // (A previous implementation emitted `[IMAGE from clipboard]` for the
-    // Clipboard source. That marker had no path, so the multimodal loader
-    // silently produced no inline image part and the model received text
-    // only — observed as the agent hallucinating about prior screenshots.)
-    //
-    // The `display_path` preference is the user's original path only for
-    // stable file picks (Unix transport, non-clipboard). Clipboard pastes
-    // use a /tmp path that the TUI deletes after the turn completes, so
-    // on the next turn the multimodal pipeline would find the file gone
-    // and emit a WARN. Always use the workspace /uploads/ copy for clipboard.
     let kind = attachment_kind(&mime_type);
     let is_clipboard = matches!(entry.source, FileSource::Clipboard);
     let marker = if kind == "IMAGE" {
@@ -263,6 +218,14 @@ fn attachment_kind(mime: &str) -> &'static str {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::ffi::OsStr;
+    use std::path::{Component, Path};
+
+    fn path_contains_uploads_component(path: &str) -> bool {
+        Path::new(path)
+            .components()
+            .any(|component| matches!(component, Component::Normal(name) if name == OsStr::new("uploads")))
+    }
 
     #[test]
     fn mime_from_filename_common_types() {
@@ -493,13 +456,14 @@ mod tests {
             r.marker
         );
         assert!(
-            r.marker.contains("/uploads/"),
+            path_contains_uploads_component(&r.workspace_path),
             "clipboard image marker should reference workspace uploads path: {}",
             r.marker
         );
+        assert!(r.marker.contains(&r.workspace_path));
         assert!(!r.deduplicated);
         assert_eq!(r.size_bytes, png_bytes.len() as u64);
-        assert!(std::path::Path::new(&r.workspace_path).exists());
+        assert!(Path::new(&r.workspace_path).exists());
     }
 
     #[tokio::test]
@@ -529,11 +493,57 @@ mod tests {
             r.marker
         );
         assert!(
-            r.marker.contains("/uploads/"),
+            path_contains_uploads_component(&r.workspace_path),
             "marker should include workspace uploads path: {}",
             r.marker
         );
+        assert!(r.marker.contains(&r.workspace_path));
         assert!(!r.deduplicated);
+    }
+
+    // Consolidation: the RPC attachment writer now persists through the shared
+    // hardened content-addressed writer, so the on-disk name is the FULL SHA-256
+    // digest, not a 64-bit prefix. Proves the single-filesystem-owner delegation
+    // and that RPC no longer uses a collision-feasible truncated identity. The
+    // no-follow/handle-bound write property is covered by the shared writer's own
+    // regressions in `zeroclaw-tools`.
+    #[tokio::test]
+    async fn rpc_attachment_stores_under_full_digest_name() {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        use sha2::{Digest, Sha256};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().to_string_lossy().to_string();
+        let store = setup_store(&ws).await;
+
+        let bytes = b"rpc-consolidation-bytes";
+        let entry = FileEntry {
+            path: None,
+            data_b64: Some(STANDARD.encode(bytes)),
+            filename: Some("doc.pdf".into()),
+            mime_type: Some("application/pdf".into()),
+            source: FileSource::File,
+        };
+        let r = process_file_entry(&entry, "s1", &ws, false, &store)
+            .await
+            .unwrap();
+
+        let full_hex = format!("{:x}", Sha256::digest(bytes));
+        let name = Path::new(&r.workspace_path)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(
+            name,
+            format!("{full_hex}.pdf"),
+            "RPC storage name must be the full digest"
+        );
+        assert_ne!(
+            name,
+            format!("{}.pdf", &full_hex[..16]),
+            "must not use the old 64-bit prefix identity"
+        );
     }
 
     #[tokio::test]
@@ -666,11 +676,12 @@ mod tests {
             r.marker
         );
         assert!(
-            r.marker.contains("/uploads/"),
+            path_contains_uploads_component(&r.workspace_path),
             "marker should include workspace path: {}",
             r.marker
         );
+        assert!(r.marker.contains(&r.workspace_path));
         assert!(!r.deduplicated);
-        assert!(std::path::Path::new(&r.workspace_path).exists());
+        assert!(Path::new(&r.workspace_path).exists());
     }
 }
