@@ -80,12 +80,22 @@ Configure outbound leak detection in its own TOML section:
 enabled = true
 sensitivity = 0.7
 high_entropy_tokens = true
+# solana_identifiers defaults to false — opt in only for Solana-capable agents
+solana_identifiers = false
 ```
 
 `enabled = false` disables the entire outbound leak detector.
 `high_entropy_tokens = false` disables only the standalone entropy heuristic;
 deterministic credential patterns still run. `sensitivity` accepts `0.0`
 through `1.0`; higher values are more aggressive.
+
+`solana_identifiers` is **opt-in**: when true, base58 tokens of Solana
+identifier length (43/44/87/88 chars) pass through high-entropy redaction so
+Solana-capable agents can state wallet addresses, transaction signatures, and
+program IDs. It defaults to `false` because length + alphabet alone cannot
+distinguish a Solana address from a randomly generated base58 secret of the
+same length — a default-on exemption would let such secrets bypass redaction
+(see issue #9486 and the #9762 review).
 
 The complete field table and defaults are in the
 [Config reference](../reference/config.md#securityleak_detection).

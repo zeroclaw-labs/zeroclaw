@@ -5052,6 +5052,14 @@ pub struct VerifiableIntentConfig {
     /// Default: "strict".
     #[serde(default = "default_vi_strictness")]
     pub strictness: String,
+
+    /// The runtime-owned issuer trust anchor: the public JWK (JSON object
+    /// with kty/crv/x/y) of the credential provider that signs L1. The chain
+    /// verifier recovers every downstream key from the chain itself, but the
+    /// issuer key is the ONE piece of trust context that must come from the
+    /// operator, never from model-supplied tool arguments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer_jwk: Option<serde_json::Value>,
 }
 
 fn default_vi_strictness() -> String {
