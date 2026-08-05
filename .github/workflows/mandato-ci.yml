@@ -50,4 +50,4 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy on changed surface
-        run: cargo clippy -p zeroclaw-runtime --features solana-sdk -- -D warnings
+        run: cargo clippy -p zeroclaw-runtime --locked --all-targets --features solana-sdk -- -D warnings

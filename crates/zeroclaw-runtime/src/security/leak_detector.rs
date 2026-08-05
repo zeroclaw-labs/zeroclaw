@@ -1431,7 +1431,7 @@ MIIEowIBAAKCAQEA0ZPr5JeyVDonXsKhfq...
         "h82pJGF9p7kpzb6eU326EFZf2cDnimbTFVeJtx1qtBmUNJAEqN76R7PwPfHt3oWb8R6cKvhgyxQdDn53jFrK6wFx";
 
     #[test]
-    fn solana_address_is_not_redacted_by_default() {
+    fn solana_address_is_redacted_by_default() {
         let detector = LeakDetector::new();
         // Sanity: the address alone would trip the entropy heuristic.
         assert!(
@@ -1440,34 +1440,84 @@ MIIEowIBAAKCAQEA0ZPr5JeyVDonXsKhfq...
         );
         let content = format!("Send the payment to {} on Solana", SOLANA_ADDRESS);
         match detector.scan(&content) {
-            LeakResult::Clean => {}
+            LeakResult::Clean => panic!("address must be redacted with default config"),
             LeakResult::Detected { redacted, .. } => {
                 assert!(
-                    redacted.contains(SOLANA_ADDRESS),
-                    "Solana address was redacted: {redacted}"
+                    !redacted.contains(SOLANA_ADDRESS),
+                    "Solana address survived default redaction: {redacted}"
                 );
             }
         }
     }
 
     #[test]
-    fn solana_tx_signature_is_not_redacted_by_default() {
-        let detector = LeakDetector::new();
+    fn solana_address_not_redacted_when_allowed() {
+        let config = LeakDetectionConfig {
+            solana_identifiers: true,
+            ..LeakDetectionConfig::default()
+        };
+        let detector = LeakDetector::with_config(&config);
+        let content = format!("Send the payment to {} on Solana", SOLANA_ADDRESS);
+        match detector.scan(&content) {
+            LeakResult::Clean => {}
+            LeakResult::Detected { redacted, .. } => {
+                assert!(
+                    redacted.contains(SOLANA_ADDRESS),
+                    "Solana address was redacted despite allowlist: {redacted}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn solana_tx_signature_not_redacted_when_allowed() {
+        let config = LeakDetectionConfig {
+            solana_identifiers: true,
+            ..LeakDetectionConfig::default()
+        };
+        let detector = LeakDetector::with_config(&config);
         let content = format!("Settled: https://solscan.io/tx/{}", SOLANA_TX_SIG);
         match detector.scan(&content) {
             LeakResult::Clean => {}
             LeakResult::Detected { redacted, .. } => {
                 assert!(
                     redacted.contains(SOLANA_TX_SIG),
-                    "Solana tx signature was redacted: {redacted}"
+                    "Solana tx signature was redacted despite allowlist: {redacted}"
                 );
             }
         }
     }
 
     #[test]
-    fn high_entropy_secret_still_redacted_when_solana_allowed() {
+    fn adversarial_base58_secret_is_redacted_by_default() {
+        // A randomly generated 44-char all-base58 token is indistinguishable
+        // from a Solana address by length + alphabet alone. The exemption is
+        // opt-in for a reason: with the default config, such a secret MUST
+        // still be redacted. This is the case that length/alphabet matching
+        // alone would get wrong.
         let detector = LeakDetector::new();
+        let secret = "F3mQ7nR9sT2vW5xY8aB1cD4eG6hJ8kL0mN2pQ4rS6tU8vWxY";
+        assert_eq!(secret.len(), 44);
+        assert!(is_base58(secret), "test secret must be all-base58");
+        let content = format!("my signing key is {secret}");
+        match detector.scan(&content) {
+            LeakResult::Detected { redacted, .. } => {
+                assert!(
+                    !redacted.contains(secret),
+                    "adversarial base58 secret survived default redaction: {redacted}"
+                );
+            }
+            LeakResult::Clean => panic!("adversarial base58 secret must be detected by default"),
+        }
+    }
+
+    #[test]
+    fn high_entropy_secret_still_redacted_when_solana_allowed() {
+        let config = LeakDetectionConfig {
+            solana_identifiers: true,
+            ..LeakDetectionConfig::default()
+        };
+        let detector = LeakDetector::with_config(&config);
         // A 44-char token that is NOT base58 (contains `0`) must still be
         // redacted: the allowlist is character-set strict. The string is a
         // neutral high-entropy value with no known-secret prefix, so the
@@ -1487,20 +1537,21 @@ MIIEowIBAAKCAQEA0ZPr5JeyVDonXsKhfq...
     }
 
     #[test]
-    fn solana_exemption_can_be_disabled() {
-        let mut config = LeakDetectionConfig::default();
-        config.solana_identifiers = false;
-        let detector = LeakDetector::with_config(&config);
+    fn solana_exemption_is_opt_in() {
+        // Default config must NOT exempt Solana identifiers (they are
+        // indistinguishable from random base58 secrets offline).
+        let default_config = LeakDetectionConfig::default();
+        assert!(
+            !default_config.solana_identifiers,
+            "solana_identifiers must default to false (opt-in)"
+        );
+        // And the default-constructed detector (used by new()) must match.
+        let detector = LeakDetector::new();
         let content = format!("Send the payment to {} on Solana", SOLANA_ADDRESS);
-        match detector.scan(&content) {
-            LeakResult::Detected { redacted, .. } => {
-                assert!(
-                    !redacted.contains(SOLANA_ADDRESS),
-                    "address must be redacted when allowlist disabled"
-                );
-            }
-            LeakResult::Clean => panic!("address must be flagged when allowlist disabled"),
-        }
+        assert!(
+            !matches!(detector.scan(&content), LeakResult::Clean),
+            "default detector must redact Solana-shaped tokens"
+        );
     }
 
     #[test]
