@@ -595,6 +595,7 @@ cli-quickstart-error-channel-bound = 通道 `{$reference}` 已绑定到 agent `{
 cli-quickstart-error-channel-required = 必须填写通道类型和别名
 cli-quickstart-error-channel-field-not-advertised = Quickstart 中不支持通道字段 `{$field}`
 cli-quickstart-error-channel-token-required = 必须填写 Telegram Bot 令牌
+cli-quickstart-error-webhook-secret-required = 必须填写 Webhook 共享密钥
 cli-quickstart-error-peer-group-name-required = 必须填写对等组名称
 cli-quickstart-error-peer-group-channel-required = 必须填写对等组通道引用
 cli-quickstart-error-peer-group-unknown-channel = 对等组 `{$name}` 引用了未知通道 `{$channel}`
@@ -925,6 +926,13 @@ cli-gateway-restart-hint-process = 重启 `zeroclaw daemon` 进程
 
 cli-daemon-gateway-already-running = ZeroClaw gateway 已在 {$host}:{$port} 运行。daemon 会管理自己的 gateway，不会在同一地址启动第二个 gateway。请停止该 gateway（或使用 `zeroclaw config set gateway.port <port>` 将 daemon 指向空闲端口），然后重新运行 daemon。
 cli-daemon-gateway-port-occupied = Gateway 地址 {$host}:{$port} 已被另一个进程占用。请释放该端口或将 daemon 指向空闲端口（`zeroclaw config set gateway.port <port>`），然后重新运行 daemon。
+cli-daemon-starting-title = 🧠 ZeroClaw daemon 正在启动…
+cli-daemon-starting-detail = 正在准备已配置的 daemon endpoint
+cli-daemon-started-title = 🧠 ZeroClaw daemon 已就绪
+cli-daemon-started-gateway = Gateway:  {$url}
+cli-daemon-started-socket = Socket:   {$path}
+cli-daemon-started-pairing = 配对：已启用（当前状态请查看上方 gateway 输出）
+cli-daemon-started-stop = 按 Ctrl+C 或发送 SIGTERM 停止
 cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%
 cli-agent-context-bar-unknown = ctx: 未知 / {$max}
 cli-doctor-ctxwin-already-set = {$provider_ref}: 已有 context_window = {$ctx}
@@ -941,6 +949,7 @@ cli-doctor-ctxwin-write-failed = {$provider_ref}: 写入 context_window 失败: 
 # ── Degraded config sections (doctor diagnose, #8835) ──
 cli-doctor-degraded-security = 安全关键配置节 `{$path}` 无效，已重置为默认值以便守护进程启动；当前运行的安全态势可能弱于预期。运行 `zeroclaw config migrate` 查看解析错误，然后修复该文件。
 cli-doctor-degraded-section = 配置节 `{$path}` 格式错误，已重置为默认值；该节中的值当前不生效。运行 `zeroclaw config migrate` 查看解析错误，然后修复该文件。
+cli-doctor-skills-prompt-injection-mode-full-deprecated = 技能提示注入模式 "full" 已弃用。弃用过渡期内仍支持显式 full 模式，但 compact 现已成为默认值；请在 Schema V4 移除 full 模式前完成迁移。
 sop-approval-deferred-at-capacity = 执行槽位已满，无法恢复运行 {$run_id}。审批仍处于等待状态；请在槽位释放后重试。
 sop-approval-policy-unavailable = 无法使用暂停的 SOP 步骤，审批失败：{$reason}。运行仍处于等待状态。
 sop-rpc-decision-invalid-state = 运行 {$run_id} 无法在当前状态下完成决策。

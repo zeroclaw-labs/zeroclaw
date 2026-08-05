@@ -678,6 +678,7 @@ cli-quickstart-error-channel-bound = channel `{$reference}` is already bound to 
 cli-quickstart-error-channel-required = channel type and alias are required
 cli-quickstart-error-channel-field-not-advertised = channel field `{$field}` is not available in Quickstart
 cli-quickstart-error-channel-token-required = Telegram bot token is required
+cli-quickstart-error-webhook-secret-required = Webhook shared secret is required
 cli-quickstart-error-peer-group-name-required = peer-group name is required
 cli-quickstart-error-peer-group-channel-required = peer-group channel ref is required
 cli-quickstart-error-peer-group-unknown-channel = peer-group `{$name}` references unknown channel `{$channel}`
@@ -1064,6 +1065,13 @@ cli-gateway-restart-hint-process = restart the `zeroclaw daemon` process
 # a supervisor retry loop. The two variants differ only by who holds the port.
 cli-daemon-gateway-already-running = A ZeroClaw gateway is already running on {$host}:{$port}. The daemon supervises its own gateway and will not start a second one on the same address. Stop that gateway (or point the daemon at a free port with `zeroclaw config set gateway.port <port>`), then run the daemon again.
 cli-daemon-gateway-port-occupied = Gateway address {$host}:{$port} is already in use by another process. Free the port or point the daemon at a free port (`zeroclaw config set gateway.port <port>`), then run the daemon again.
+cli-daemon-starting-title = 🧠 ZeroClaw daemon starting…
+cli-daemon-starting-detail = Preparing configured daemon endpoints
+cli-daemon-started-title = 🧠 ZeroClaw daemon ready
+cli-daemon-started-gateway = Gateway:  {$url}
+cli-daemon-started-socket = Socket:   {$path}
+cli-daemon-started-pairing = Pairing:    enabled (see gateway output above for current status)
+cli-daemon-started-stop = Ctrl+C or SIGTERM to stop
 
 # ── Context window (doctor update-context-windows, agent interactive) ──
 cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%
@@ -1083,12 +1091,18 @@ cli-doctor-cache-write-failed = Failed to persist model cache: {$error}
 # ── Degraded config sections (doctor diagnose, #8835) ──
 cli-doctor-degraded-security = SECURITY-CRITICAL config section `{$path}` is invalid and was reset to its default so the daemon can boot; the running posture may be WEAKER than intended. Run `zeroclaw config migrate` to see the parse error, then repair the file.
 cli-doctor-degraded-section = config section `{$path}` is malformed and was reset to defaults; values in that section are NOT in effect. Run `zeroclaw config migrate` to see the parse error, then repair the file.
+cli-doctor-skills-prompt-injection-mode-full-deprecated = Skill prompt injection mode "full" is deprecated. Explicit full mode remains supported during the deprecation window, but compact is now the default; migrate before Schema V4 removes full mode.
 sop-approval-deferred-at-capacity = Approval could not resume run {$run_id}: execution slots are full. The gate remains waiting; retry after a slot frees.
 sop-approval-policy-unavailable = Approval failed because the parked SOP step is unavailable: {$reason}. The run remains waiting.
 sop-rpc-decision-invalid-state = Run {$run_id} cannot be resolved in its current state.
 sop-rpc-decision-unauthorized = The RPC principal is not authorized to resolve this SOP step.
 sop-rpc-policy-missing = SOP approval policy '{$name}' is not configured.
 sop-rpc-policy-unavailable = The parked SOP policy is unavailable: {$reason}.
+
+# ── Runtime command construction — shell and skill shell tools ──
+tool-runtime-command-build-failed = Failed to build runtime command: {$error}
+tool-runtime-command-docker-workspace-path = Failed to build runtime command: Failed to canonicalize Docker workspace path {$path}: {$cause}
+tool-runtime-command-docker-allowed-root = Failed to build runtime command: Failed to canonicalize Docker workspace root {$path}: {$cause}
 
 # ── Tool approval (channels, #9409) ──
 # Human-visible copy for the operator-facing tool-approval prompt, shared

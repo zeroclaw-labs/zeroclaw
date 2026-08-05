@@ -602,7 +602,10 @@ pub struct Config {
     #[serde(default)]
     pub locale: Option<String>,
 
-    /// Verifiable Intent (VI) credential verification and issuance (`[verifiable_intent]`).
+    /// Verifiable Intent (VI) credential issuance and constraint checking
+    /// (`[verifiable_intent]`). No credential chain verifier exists yet, so the
+    /// `vi_verify` tool is not registered for the model and this section does not
+    /// currently enable verification of anything.
     #[serde(default)]
     #[nested]
     #[group = "Agent"]
@@ -912,9 +915,12 @@ pub struct ModelProviderConfig {
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vision: Option<bool>,
-    /// Arbitrary key/value pairs forwarded verbatim as `chat_template_kwargs`
-    /// in the request body (llama.cpp-specific). Use this to pass model-family
-    /// template variables that control behaviour not exposed by other fields.
+    /// Arbitrary key/value pairs forwarded verbatim as a top-level
+    /// `chat_template_kwargs` object in the request body of OpenAI-compatible
+    /// providers. Consumed by chat-template-aware backends such as vLLM,
+    /// SGLang, and llama.cpp to pass model-family template variables that
+    /// control behaviour not exposed by other fields. Must be a JSON object
+    /// (TOML inline table); non-object values are ignored with a warning.
     /// Example (Qwen3 thinking suppression):
     ///   `chat_template_kwargs = { enable_thinking = false }`
     #[tab(Advanced)]
@@ -4157,10 +4163,9 @@ impl Config {
         Some(out)
     }
 
-    /// Resolve the effective skills prompt-injection mode for an agent: the
-    /// agent's resolved runtime profile's `prompt_injection_mode` override when
-    /// set, otherwise the global `[skills] prompt_injection_mode`. Agents with
-    /// no runtime profile (or an unknown alias) fall back to the global value.
+    /// Resolve the effective skills prompt-injection mode for an agent: use an
+    /// explicit runtime-profile override when set, otherwise inherit the global
+    /// `[skills] prompt_injection_mode` value.
     ///
     /// Keyed on the resolved runtime profile — the sanctioned surface for
     /// per-agent runtime tunables — so agent-inline knobs stay inert.
@@ -5038,18 +5043,30 @@ impl Default for McpConfig {
     }
 }
 
-/// Verifiable Intent (VI) credential verification and issuance (`[verifiable_intent]` section).
+/// Verifiable Intent (VI) credential issuance and constraint checking
+/// (`[verifiable_intent]` section).
+///
+/// ZeroClaw implements issuance, crypto, types and constraint checking, but not
+/// a credential chain verifier. Until one exists the `vi_verify` tool is
+/// withheld from the model-visible registry, so neither key below enables
+/// verification of a credential. The library paths are unaffected.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "verifiable_intent"]
 pub struct VerifiableIntentConfig {
-    /// Enable VI credential verification on commerce tool calls (default: false).
+    /// Opt in to the VI section (default: false).
+    ///
+    /// While the tool is withheld this does not enable credential verification
+    /// on commerce tool calls. It currently causes a warning naming that gap,
+    /// emitted once per config application: at process startup, and again when
+    /// a daemon reload re-reads config from disk.
     #[serde(default)]
     pub enabled: bool,
 
-    /// Strictness mode for constraint evaluation: "strict" (fail-closed on unknown
-    /// constraint types) or "permissive" (skip unknown types with a warning).
-    /// Default: "strict".
+    /// Intended strictness mode for constraint evaluation.
+    ///
+    /// Accepts `"strict"` or `"permissive"`, and defaults to `"strict"`. No
+    /// production code reads it while the tool is withheld.
     #[serde(default = "default_vi_strictness")]
     pub strictness: String,
 }
@@ -5960,10 +5977,13 @@ impl Default for PacingConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum SkillsPromptInjectionMode {
-    /// Inline full skill instructions and tool metadata into the system prompt.
-    #[default]
+    /// Inline full skill instructions. This legacy behavior remains supported
+    /// when explicitly configured during the deprecation window.
     Full,
-    /// Inline only compact skill metadata (name/description/location) and load details on demand.
+    /// Default behavior: inline compact skill metadata
+    /// (name/description/location + callable tool specs) and load instructions
+    /// on demand via `read_skill`.
+    #[default]
     Compact,
 }
 
@@ -6084,8 +6104,9 @@ pub struct SkillsConfig {
     /// is cloned to its own `extra-registry-<name>/` workspace directory.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_registries: Vec<ExternalRegistry>,
-    /// Controls how skills are injected into the system prompt.
-    /// `full` preserves legacy behavior. `compact` keeps context small and loads skills on demand.
+    /// Controls how skills are injected into the system prompt. Omission now
+    /// defaults to `compact`; explicit `full` remains supported during the
+    /// deprecation window and emits a validation warning before Schema V4.
     #[serde(default)]
     pub prompt_injection_mode: SkillsPromptInjectionMode,
     /// Autonomous skill creation from successful multi-step task executions.
@@ -11943,7 +11964,7 @@ pub struct RuntimeProfileConfig {
     /// How skills are injected into the system prompt for agents on this
     /// profile. `None` inherits the global `[skills] prompt_injection_mode`;
     /// `compact` inlines only compact skill metadata and registers the
-    /// `read_skill` tool, `full` inlines full skill instructions. Resolved
+    /// `read_skill` tool, while `full` inlines full skill instructions. Resolved
     /// through [`Config::effective_skills_prompt_mode`], the single point both
     /// the system-prompt builder and the `read_skill` tool-registration gate
     /// consult so they always agree on the effective mode.
@@ -12169,10 +12190,13 @@ pub struct DockerRuntimeConfig {
     pub read_only_rootfs: bool,
 
     /// Mount configured workspace into `/workspace`.
+    ///
+    /// When enabled, the workspace must exist and canonicalize before Docker
+    /// command construction.
     #[serde(default = "default_true")]
     pub mount_workspace: bool,
 
-    /// Optional workspace root allowlist for Docker mount validation.
+    /// Optional workspace root allowlist for fail-closed Docker mount validation: when `mount_workspace` is enabled, the workspace must exist and canonicalize even when this list is empty; every configured root must also exist and canonicalize; one invalid entry rejects the command before Docker starts; an empty list permits any canonical workspace.
     #[serde(default)]
     pub allowed_workspace_roots: Vec<String>,
 }
@@ -14444,8 +14468,10 @@ pub struct WebhookConfig {
     pub retry_max_delay_ms: Option<u64>,
 }
 
+pub const DEFAULT_WEBHOOK_CHANNEL_PORT: u16 = 8090;
+
 fn default_webhook_channel_port() -> u16 {
-    8090
+    DEFAULT_WEBHOOK_CHANNEL_PORT
 }
 
 impl ChannelConfig for WebhookConfig {
@@ -19117,6 +19143,31 @@ impl Config {
     /// and document the code in `validation_warnings.rs`.
     pub fn collect_warnings(&self) -> Vec<crate::validation_warnings::ValidationWarning> {
         let mut warnings = Vec::new();
+        if matches!(
+            self.skills.prompt_injection_mode,
+            SkillsPromptInjectionMode::Full
+        ) {
+            warnings.push(crate::validation_warnings::ValidationWarning::new(
+                "skills_prompt_injection_mode_full_deprecated",
+                "skills.prompt_injection_mode = \"full\" is deprecated. Explicit full mode remains supported during the deprecation window, but compact is now the default; migrate before Schema V4 removes full mode.",
+                "skills.prompt_injection_mode",
+            ));
+        }
+        for (profile_alias, profile) in &self.runtime_profiles {
+            if matches!(
+                profile.prompt_injection_mode,
+                Some(SkillsPromptInjectionMode::Full)
+            ) {
+                let path = format!("runtime_profiles.{profile_alias}.prompt_injection_mode");
+                warnings.push(crate::validation_warnings::ValidationWarning::new(
+                    "skills_prompt_injection_mode_full_deprecated",
+                    format!(
+                        "{path} = \"full\" is deprecated. Explicit full mode remains supported during the deprecation window, but compact is now the default; migrate before Schema V4 removes full mode."
+                    ),
+                    path,
+                ));
+            }
+        }
         self.collect_fallback_warnings(&mut warnings);
         self.collect_cross_provider_summary_model_warnings(&mut warnings);
         self.collect_a2a_exposed_skills_warnings(&mut warnings);
@@ -24150,7 +24201,7 @@ api_token = "Bearer test-token"
         assert!(!c.skills.install_suggestions.enabled);
         assert_eq!(
             c.skills.prompt_injection_mode,
-            SkillsPromptInjectionMode::Full
+            SkillsPromptInjectionMode::Compact
         );
         assert!(c.data_dir.to_string_lossy().contains("data"));
         assert!(c.config_path.to_string_lossy().contains("config.toml"));
@@ -24191,29 +24242,48 @@ api_token = "Bearer test-token"
             .agents
             .insert("inherit".to_string(), AliasedAgentConfig::default());
 
-        // Profile override beats the global value.
+        // Profile override to Compact beats the (deprecated) global value.
         assert_eq!(
             config.effective_skills_prompt_mode("override"),
             SkillsPromptInjectionMode::Compact
         );
-        // Profile present but mode unset → inherit the global value.
+        // An unset profile, an agent with no profile, and an unknown alias all
+        // inherit the explicit global Full value during the deprecation window.
         assert_eq!(
             config.effective_skills_prompt_mode("unset"),
             SkillsPromptInjectionMode::Full
         );
-        // No runtime profile → inherit the global value.
         assert_eq!(
             config.effective_skills_prompt_mode("inherit"),
             SkillsPromptInjectionMode::Full
         );
-        // Unknown alias also falls back to the global value.
         assert_eq!(
             config.effective_skills_prompt_mode("missing"),
             SkillsPromptInjectionMode::Full
         );
 
-        // Flipping the global moves only the inheriting/unset/unknown agents;
-        // the profile override is unaffected.
+        // A runtime profile that explicitly pins Full is also honored.
+        config.runtime_profiles.insert(
+            "full_profile".to_string(),
+            RuntimeProfileConfig {
+                prompt_injection_mode: Some(SkillsPromptInjectionMode::Full),
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "pinned_full".to_string(),
+            AliasedAgentConfig {
+                runtime_profile: "full_profile".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        assert_eq!(
+            config.effective_skills_prompt_mode("pinned_full"),
+            SkillsPromptInjectionMode::Full
+        );
+
+        // Flipping the global to Compact updates inheriting agents while both
+        // explicit profile overrides remain authoritative.
         config.skills.prompt_injection_mode = SkillsPromptInjectionMode::Compact;
         assert_eq!(
             config.effective_skills_prompt_mode("unset"),
@@ -24230,6 +24300,10 @@ api_token = "Bearer test-token"
         assert_eq!(
             config.effective_skills_prompt_mode("override"),
             SkillsPromptInjectionMode::Compact
+        );
+        assert_eq!(
+            config.effective_skills_prompt_mode("pinned_full"),
+            SkillsPromptInjectionMode::Full
         );
     }
 
@@ -24287,7 +24361,8 @@ runtime_profile = "fast"
             SkillsPromptInjectionMode::Compact
         );
 
-        // Profile-less agent: resolved value falls back to the global default.
+        // Profile-less agent: explicit global `full` remains effective during
+        // the deprecation window.
         let plain = parsed
             .resolved_agent_config("plain")
             .expect("agent plain resolves");
@@ -24295,6 +24370,50 @@ runtime_profile = "fast"
             plain.resolved.prompt_injection_mode,
             SkillsPromptInjectionMode::Full
         );
+        assert_eq!(
+            parsed.effective_skills_prompt_mode("plain"),
+            SkillsPromptInjectionMode::Full
+        );
+    }
+
+    #[test]
+    async fn explicit_global_full_emits_structured_deprecation_warning() {
+        let mut config = Config::default();
+        config.skills.prompt_injection_mode = SkillsPromptInjectionMode::Full;
+
+        let warning = config
+            .collect_warnings()
+            .into_iter()
+            .find(|warning| warning.code == "skills_prompt_injection_mode_full_deprecated")
+            .expect("explicit global full should emit a deprecation warning");
+
+        assert_eq!(warning.path, "skills.prompt_injection_mode");
+        assert!(warning.message.contains("remains supported"));
+        assert!(!warning.message.contains("ignored"));
+    }
+
+    #[test]
+    async fn runtime_profile_full_emits_structured_deprecation_warning() {
+        let mut config = Config::default();
+        config.runtime_profiles.insert(
+            "legacy".to_string(),
+            RuntimeProfileConfig {
+                prompt_injection_mode: Some(SkillsPromptInjectionMode::Full),
+                ..RuntimeProfileConfig::default()
+            },
+        );
+
+        let warning = config
+            .collect_warnings()
+            .into_iter()
+            .find(|warning| {
+                warning.code == "skills_prompt_injection_mode_full_deprecated"
+                    && warning.path == "runtime_profiles.legacy.prompt_injection_mode"
+            })
+            .expect("runtime-profile full should emit a deprecation warning");
+
+        assert!(warning.message.contains("remains supported"));
+        assert!(!warning.message.contains("ignored"));
     }
 
     #[test]

@@ -1,5 +1,10 @@
-//! Verifiable Intent tool — exposes VI verification and constraint evaluation
-//! to the agent orchestration loop.
+//! Verifiable Intent primitives exposed as a tool.
+//!
+//! These operations check individual values the caller supplies. They do not
+//! authenticate a credential chain: nothing here establishes that a constraint
+//! or a fulfillment came from a signed credential. This type is currently not
+//! registered for the model for that reason, and an embedder constructing it
+//! directly gets the same limitation.
 
 use async_trait::async_trait;
 use serde_json::json;
@@ -15,8 +20,11 @@ use crate::verifiable_intent::verification::{
 };
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 
-/// Tool for verifying Verifiable Intent credential chains and evaluating
-/// constraints against fulfillment data.
+/// Evaluates Verifiable Intent constraints and checks binding and timestamp
+/// primitives against values the caller provides.
+///
+/// It does not verify a credential chain, so a satisfied result is not evidence
+/// that the inputs were signed or authorized.
 pub struct VerifiableIntentTool {
     security: Arc<SecurityPolicy>,
     strictness: StrictnessMode,
@@ -38,9 +46,12 @@ impl Tool for VerifiableIntentTool {
     }
 
     fn description(&self) -> &str {
-        "Verify a Verifiable Intent credential chain. Supports two operations: \
-         'verify_binding' checks sd_hash binding between credential layers; \
-         'evaluate_constraints' validates constraints against fulfillment data."
+        "Check Verifiable Intent primitives against values you supply. This does \
+         NOT verify a credential chain, so a passing result does not show the \
+         inputs were signed or authorized. Operations: 'verify_binding' checks an \
+         sd_hash against a serialized parent; 'evaluate_constraints' evaluates \
+         constraints against fulfillment data; 'verify_timestamps' checks an \
+         iat/exp pair."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

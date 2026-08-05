@@ -210,6 +210,11 @@ fn sender_session_id(channel: &str, msg: &zeroclaw_api::channel::ChannelMessage)
     }
 }
 
+#[cfg(feature = "channel-linq")]
+fn linq_channel_ref(alias: &str) -> String {
+    format!("linq.{alias}")
+}
+
 fn webhook_session_id(headers: &HeaderMap) -> Option<String> {
     const MAX_SESSION_ID_LEN: usize = 128;
     headers
@@ -591,6 +596,7 @@ pub async fn run_gateway(
     // Shared SOP engine from the daemon. `None` when standalone — sessions build their own.
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
 ) -> Result<()> {
     // ── Security: warn on public bind without tunnel or explicit opt-in ──
     if is_public_bind(host)
@@ -2060,6 +2066,10 @@ pub async fn run_gateway(
         _ => None,
     };
 
+    if let Some(readiness) = readiness {
+        readiness.report_ready(actual_addr);
+    }
+
     if let Some(tls_acceptor) = tls_acceptor {
         // Manual TLS accept loop — serves each connection via hyper.
         let app = app.into_make_service_with_connect_info::<SocketAddr>();
@@ -2499,6 +2509,59 @@ fn needs_quickstart_channel_reply() -> String {
     i18n::get_required_cli_string("channel-needs-quickstart-reply")
 }
 
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GatewayChatDispatchCapture {
+    message: String,
+    session_id: Option<String>,
+    agent_override: Option<String>,
+}
+
+#[cfg(test)]
+static GATEWAY_CHAT_DISPATCH_CAPTURES: std::sync::Mutex<Vec<GatewayChatDispatchCapture>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+static GATEWAY_CHAT_DISPATCH_CAPTURE_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
+#[cfg(test)]
+async fn lock_gateway_chat_dispatch_capture_for_test() -> tokio::sync::MutexGuard<'static, ()> {
+    GATEWAY_CHAT_DISPATCH_CAPTURE_TEST_LOCK.lock().await
+}
+
+#[cfg(test)]
+fn clear_gateway_chat_dispatch_captures_for_test() {
+    GATEWAY_CHAT_DISPATCH_CAPTURES
+        .lock()
+        .expect("gateway chat dispatch capture mutex poisoned")
+        .clear();
+}
+
+#[cfg(test)]
+fn gateway_chat_dispatch_captures_for_test() -> Vec<GatewayChatDispatchCapture> {
+    GATEWAY_CHAT_DISPATCH_CAPTURES
+        .lock()
+        .expect("gateway chat dispatch capture mutex poisoned")
+        .clone()
+}
+
+#[cfg(test)]
+fn record_gateway_chat_dispatch_for_test(
+    message: &str,
+    session_id: Option<&str>,
+    agent_override: Option<&str>,
+) {
+    GATEWAY_CHAT_DISPATCH_CAPTURES
+        .lock()
+        .expect("gateway chat dispatch capture mutex poisoned")
+        .push(GatewayChatDispatchCapture {
+            message: message.to_string(),
+            session_id: session_id.map(ToString::to_string),
+            agent_override: agent_override.map(ToString::to_string),
+        });
+}
+
 pub(crate) async fn run_gateway_chat_with_tools(
     state: &AppState,
     message: &str,
@@ -2515,7 +2578,7 @@ pub(crate) async fn run_gateway_chat_with_tools(
     // doesn't go through the cost-tracking scope.
     #[cfg(test)]
     {
-        let _ = (session_id, agent_override);
+        record_gateway_chat_dispatch_for_test(message, session_id, agent_override);
         let response = state
             .model_provider
             .chat_with_system(None, message, &state.model, state.temperature)
@@ -3292,10 +3355,36 @@ async fn process_linq_webhook(
         return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
     }
 
+    let channel_ref = linq_channel_ref(alias);
+    let (agent_override, has_channel_bindings) = {
+        let config = state.config.read();
+        (
+            config.agent_for_channel(&channel_ref).map(str::to_owned),
+            config
+                .agents
+                .values()
+                .any(|agent| !agent.channels.is_empty()),
+        )
+    };
+    if agent_override.is_none() && has_channel_bindings {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"channel": "linq", "alias": alias})),
+            "Linq webhook ignored because no enabled agent owns the channel alias"
+        );
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "ignored", "reason": "no_agent_for_channel"})),
+        );
+    }
+
     // Process each message
     for msg in &messages {
         ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"channel": "linq", "alias": alias, "sender": msg.sender, "content": msg.content})), "inbound webhook message");
-        let session_id = sender_session_id("linq", msg);
+        let session_id =
+            zeroclaw_api::session_keys::sanitize_session_key(&sender_session_id(&channel_ref, msg));
 
         // Auto-save to memory
         if state.auto_save && !zeroclaw_memory::should_skip_autosave_content(&msg.content) {
@@ -3316,12 +3405,18 @@ async fn process_linq_webhook(
             state,
             &msg.content,
             Some(&session_id),
-            None,
+            agent_override.as_deref(),
         ))
         .await
         {
             Ok(GatewayChatOutcome { response, .. }) => {
+                #[cfg(test)]
+                {
+                    let _ = response;
+                }
+
                 // Send reply via Linq
+                #[cfg(not(test))]
                 if let Err(e) = linq
                     .send(&SendMessage::new(response, &msg.reply_target))
                     .await
@@ -4927,7 +5022,19 @@ mod tests {
         );
 
         let handle = zeroclaw_spawn::spawn!(async move {
-            run_gateway("127.0.0.1", 0, config, None, None, None, None, None, None).await
+            run_gateway(
+                "127.0.0.1",
+                0,
+                config,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
         });
 
         match tokio::time::timeout(
@@ -4983,7 +5090,19 @@ mod tests {
         config.agents.insert("fake123".to_string(), agent);
 
         let handle = zeroclaw_spawn::spawn!(async move {
-            run_gateway("127.0.0.1", 0, config, None, None, None, None, None, None).await
+            run_gateway(
+                "127.0.0.1",
+                0,
+                config,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
         });
 
         match tokio::time::timeout(
@@ -5024,7 +5143,19 @@ mod tests {
         );
 
         let handle = zeroclaw_spawn::spawn!(async move {
-            run_gateway("127.0.0.1", 0, config, None, None, None, None, None, None).await
+            run_gateway(
+                "127.0.0.1",
+                0,
+                config,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
         });
 
         match tokio::time::timeout(
@@ -5052,7 +5183,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_gateway_uses_external_shutdown_sender() {
+    async fn daemon_startup_gateway_reports_ready_and_uses_external_shutdown_sender() {
         let port_probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = port_probe.local_addr().unwrap().port();
         drop(port_probe);
@@ -5071,6 +5202,10 @@ mod tests {
             shutdown_tx: shutdown_tx.clone(),
             reload_tx,
         };
+        let (ready_tx, mut ready_rx) = tokio::sync::watch::channel(None);
+        let readiness = zeroclaw_runtime::daemon::GatewayReadinessReporter::new(move |addr| {
+            let _ = ready_tx.send(Some(addr));
+        });
 
         let handle = zeroclaw_spawn::spawn!(async move {
             run_gateway(
@@ -5083,9 +5218,18 @@ mod tests {
                 None,
                 None,
                 None,
+                Some(readiness),
             )
             .await
         });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            ready_rx.wait_for(Option::is_some).await.unwrap();
+        })
+        .await
+        .expect("gateway should report its successful bind");
+        let ready_addr = *ready_rx.borrow();
+        assert_eq!(ready_addr.unwrap().port(), port);
 
         let addr = format!("127.0.0.1:{port}");
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -5111,6 +5255,50 @@ mod tests {
 
         std::net::TcpListener::bind(("127.0.0.1", port))
             .expect("gateway should release the listener after external shutdown");
+    }
+
+    #[tokio::test]
+    async fn daemon_startup_gateway_does_not_report_ready_when_tls_setup_fails() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        config.gateway.tls = Some(zeroclaw_config::schema::GatewayTlsConfig {
+            enabled: true,
+            cert_path: tmp.path().join("missing-cert.pem").display().to_string(),
+            key_path: tmp.path().join("missing-key.pem").display().to_string(),
+            client_auth: None,
+        });
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+
+        let (ready_tx, ready_rx) = tokio::sync::watch::channel(None);
+        let readiness = zeroclaw_runtime::daemon::GatewayReadinessReporter::new(move |addr| {
+            let _ = ready_tx.send(Some(addr));
+        });
+        let result = run_gateway(
+            "127.0.0.1",
+            0,
+            config,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(readiness),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "invalid TLS files should fail gateway setup"
+        );
+        assert!(
+            ready_rx.borrow().is_none(),
+            "failed post-bind setup must not report gateway readiness"
+        );
     }
 
     #[tokio::test]
@@ -7671,7 +7859,9 @@ mod tests {
         serde_json::json!({
             "event_type": "message.received",
             "data": {
-                "sender": { "phone": sender },
+                "chat_id": "chat-789",
+                "from": sender,
+                "is_from_me": false,
                 "message": {
                     "parts": [{ "type": "text", "value": text }]
                 }
@@ -7685,6 +7875,15 @@ mod tests {
     /// secret.
     #[cfg(feature = "channel-linq")]
     fn linq_test_state(alias: &str, signing_secret: Option<&str>) -> AppState {
+        linq_test_state_with_config(alias, signing_secret, Config::default())
+    }
+
+    #[cfg(feature = "channel-linq")]
+    fn linq_test_state_with_config(
+        alias: &str,
+        signing_secret: Option<&str>,
+        config: Config,
+    ) -> AppState {
         let model_provider: Arc<dyn ModelProvider> = Arc::new(MockModelProvider::default());
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
 
@@ -7705,7 +7904,7 @@ mod tests {
         }
 
         AppState {
-            config: Arc::new(RwLock::new(Config::default())),
+            config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
             model: "test-model".into(),
@@ -7980,6 +8179,131 @@ mod tests {
         .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[cfg(feature = "channel-linq")]
+    #[tokio::test]
+    async fn linq_webhook_alias_dispatches_to_configured_channel_agent() {
+        use zeroclaw_config::providers::ChannelRef;
+        use zeroclaw_config::schema::AliasedAgentConfig;
+
+        let _capture_guard = lock_gateway_chat_dispatch_capture_for_test().await;
+        clear_gateway_chat_dispatch_captures_for_test();
+
+        let mut config = Config::default();
+        config.agents.insert(
+            "alpha".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "beta".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                channels: vec![ChannelRef::new("linq.work")],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let secret = generate_test_secret();
+        let state = linq_test_state_with_config("work", Some(&secret), config);
+
+        let message = "hello from linq work alias";
+        let body = linq_webhook_body("+15551234567", message);
+        let timestamp = chrono::Utc::now().timestamp().to_string();
+        let sig = compute_linq_signature_hex(&secret, &timestamp, &body);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Webhook-Signature",
+            HeaderValue::from_str(&format!("sha256={sig}")).unwrap(),
+        );
+        headers.insert(
+            "X-Webhook-Timestamp",
+            HeaderValue::from_str(&timestamp).unwrap(),
+        );
+
+        let response = Box::pin(handle_linq_webhook_alias(
+            State(state),
+            Path("work".to_string()),
+            headers,
+            Bytes::from(body),
+        ))
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let captures = gateway_chat_dispatch_captures_for_test();
+        let capture = captures
+            .iter()
+            .find(|capture| capture.message == message)
+            .expect("Linq webhook should dispatch the inbound message");
+        assert_eq!(capture.agent_override.as_deref(), Some("beta"));
+        let session_id = capture
+            .session_id
+            .as_deref()
+            .expect("Linq dispatch should pass a session id");
+        assert_eq!(session_id, "linq_work__15551234567");
+    }
+
+    #[cfg(feature = "channel-linq")]
+    #[tokio::test]
+    async fn linq_webhook_alias_without_enabled_owner_does_not_use_default_agent() {
+        use zeroclaw_config::providers::ChannelRef;
+        use zeroclaw_config::schema::AliasedAgentConfig;
+
+        let _capture_guard = lock_gateway_chat_dispatch_capture_for_test().await;
+        clear_gateway_chat_dispatch_captures_for_test();
+
+        let mut config = Config::default();
+        config.agents.insert(
+            "alpha".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "beta".to_string(),
+            AliasedAgentConfig {
+                enabled: false,
+                channels: vec![ChannelRef::new("linq.work")],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let secret = generate_test_secret();
+        let state = linq_test_state_with_config("work", Some(&secret), config);
+
+        let message = "do not route me to alpha";
+        let body = linq_webhook_body("+15551234567", message);
+        let timestamp = chrono::Utc::now().timestamp().to_string();
+        let sig = compute_linq_signature_hex(&secret, &timestamp, &body);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Webhook-Signature",
+            HeaderValue::from_str(&format!("sha256={sig}")).unwrap(),
+        );
+        headers.insert(
+            "X-Webhook-Timestamp",
+            HeaderValue::from_str(&timestamp).unwrap(),
+        );
+
+        let response = Box::pin(handle_linq_webhook_alias(
+            State(state),
+            Path("work".to_string()),
+            headers,
+            Bytes::from(body),
+        ))
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let captures = gateway_chat_dispatch_captures_for_test();
+        assert!(
+            captures.iter().all(|capture| capture.message != message),
+            "unowned Linq alias must not dispatch through the default agent: {captures:?}"
+        );
     }
 
     // ── Per-alias webhook routing───────────────────────────────────

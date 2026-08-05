@@ -142,10 +142,39 @@ fn has_non_empty_value(value: Option<&str>) -> bool {
     value.map(str::trim).is_some_and(|value| !value.is_empty())
 }
 
+/// Merge the config-driven request-body extras into a single object that the
+/// compat builder flattens onto the top level of every request.
+///
+/// - `provider_extra` supplies arbitrary top-level keys. Only object-shaped
+///   JSON is threaded through; other shapes are dropped here (and warned about
+///   by the caller).
+/// - `chat_template_kwargs` is nested under its own `chat_template_kwargs` key,
+///   matching what chat-template-aware backends (vLLM, SGLang, llama.cpp)
+///   expect. Only object-shaped JSON is threaded through, mirroring
+///   `provider_extra`; other shapes are dropped here (and warned about by the
+///   caller).
+///
+/// Returns `None` when neither source contributes anything, so the caller can
+/// skip setting `extra_body` entirely.
+fn merge_extra_body(
+    provider_extra: Option<&serde_json::Value>,
+    chat_template_kwargs: Option<&serde_json::Value>,
+) -> Option<serde_json::Value> {
+    let mut merged = serde_json::Map::new();
+    if let Some(obj) = provider_extra.and_then(serde_json::Value::as_object) {
+        merged.extend(obj.clone());
+    }
+    if let Some(kwargs) = chat_template_kwargs.filter(|v| v.is_object()) {
+        merged.insert("chat_template_kwargs".to_string(), kwargs.clone());
+    }
+    (!merged.is_empty()).then_some(serde_json::Value::Object(merged))
+}
+
 /// Apply cross-cutting compat overrides (timeout, headers, api_path,
-/// max_tokens, reasoning effort, TLS CA, `provider_extra`) to a compat
-/// builder before calling `.build()` and boxing the trait object. Single
-/// source of the override chain — every compat impl funnels through here.
+/// max_tokens, reasoning effort, TLS CA, `provider_extra`,
+/// `chat_template_kwargs`) to a compat builder before calling `.build()` and
+/// boxing the trait object. Single source of the override chain — every compat
+/// impl funnels through here.
 pub fn apply_compat_options(
     mut b: crate::compatible::OpenAiCompatibleBuilder,
     opts: &ModelProviderRuntimeOptions,
@@ -175,14 +204,15 @@ pub fn apply_compat_options(
     // path below reads it for logging. Only object-shaped JSON is threaded
     // through; other shapes produce a WARN and are ignored (matching the
     // pre-refactor behaviour).
-    let extra_body_for_build = opts.provider_extra.as_ref().and_then(|extra| {
-        if extra.is_object() {
-            Some(extra.clone())
-        } else {
-            None
-        }
-    });
-    if let Some(extra) = extra_body_for_build.clone() {
+    //
+    // `chat_template_kwargs` is folded into the same `extra_body` object under
+    // its own top-level key, so a chat-template payload rides the request body
+    // even when `provider_extra` is unset. The builder exposes a single
+    // `extra_body` slot, hence the merge here rather than two setter calls.
+    if let Some(extra) = merge_extra_body(
+        opts.provider_extra.as_ref(),
+        opts.chat_template_kwargs.as_ref(),
+    ) {
         b = b.extra_body(extra);
     }
     let p = b.build();
@@ -200,6 +230,22 @@ pub fn apply_compat_options(
                 })),
             "provider_extra must be a JSON object (use TOML inline \
              table syntax, not a JSON string). Got: {extra}. Config path: {config_path}",
+        );
+    }
+    if let Some(kwargs) = &opts.chat_template_kwargs
+        && !kwargs.is_object()
+    {
+        let config_path = format!("[providers.models.{}].chat_template_kwargs", p.alias);
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "alias": p.alias,
+                    "config_path": &config_path,
+                })),
+            "chat_template_kwargs must be a JSON object (use TOML inline \
+             table syntax). Got: {kwargs}. Config path: {config_path}",
         );
     }
     Box::new(p)
@@ -1617,6 +1663,70 @@ mod tests {
         assert_eq!(
             KiloEndpoint::default().uri(),
             "https://api.kilo.ai/api/gateway"
+        );
+    }
+
+    #[test]
+    fn merge_extra_body_nests_chat_template_kwargs_under_own_key() {
+        let kwargs = serde_json::json!({"thinking": true, "reasoning_effort": "max"});
+        let merged = merge_extra_body(None, Some(&kwargs))
+            .expect("chat_template_kwargs alone must produce an extra_body object");
+        assert_eq!(
+            merged.get("chat_template_kwargs"),
+            Some(&kwargs),
+            "chat_template_kwargs must be nested under its own top-level key"
+        );
+    }
+
+    #[test]
+    fn merge_extra_body_combines_provider_extra_and_chat_template_kwargs() {
+        let provider_extra = serde_json::json!({"top_p": 0.95});
+        let kwargs = serde_json::json!({"thinking": true});
+        let merged = merge_extra_body(Some(&provider_extra), Some(&kwargs))
+            .expect("both sources present must produce an extra_body object");
+        assert_eq!(
+            merged.get("top_p").and_then(serde_json::Value::as_f64),
+            Some(0.95),
+            "provider_extra keys must remain at the top level"
+        );
+        assert_eq!(
+            merged.get("chat_template_kwargs"),
+            Some(&kwargs),
+            "chat_template_kwargs must coexist with provider_extra keys"
+        );
+    }
+
+    #[test]
+    fn merge_extra_body_ignores_non_object_provider_extra() {
+        let provider_extra = serde_json::json!("not-an-object");
+        assert!(
+            merge_extra_body(Some(&provider_extra), None).is_none(),
+            "a non-object provider_extra with no chat_template_kwargs must yield None"
+        );
+    }
+
+    #[test]
+    fn merge_extra_body_ignores_non_object_chat_template_kwargs() {
+        // Scalars, arrays, and null are not valid chat-template payloads; drop
+        // them the same way provider_extra drops non-object shapes.
+        for shape in [
+            serde_json::json!("max"),
+            serde_json::json!(true),
+            serde_json::json!(["a", "b"]),
+            serde_json::Value::Null,
+        ] {
+            assert!(
+                merge_extra_body(None, Some(&shape)).is_none(),
+                "a non-object chat_template_kwargs ({shape}) must be dropped, yielding None"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_extra_body_is_none_when_both_absent() {
+        assert!(
+            merge_extra_body(None, None).is_none(),
+            "no extras must yield None so the caller skips extra_body"
         );
     }
 

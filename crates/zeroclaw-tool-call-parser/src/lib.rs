@@ -1742,6 +1742,14 @@ fn parse_glm_shortened_body(body: &str) -> Option<ParsedToolCall> {
     None
 }
 
+fn malformed_tool_block_event(payload_len: usize) -> ::zeroclaw_log::Event {
+    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+        .with_attrs(::serde_json::json!({
+            "payload_len": payload_len,
+        }))
+}
+
 pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     // Strip `<think>...</think>` blocks before parsing.  Qwen and other
     // reasoning models embed chain-of-thought inline in the response text;
@@ -2007,7 +2015,11 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
                     });
                 } else {
                     // Log a warning if we found a tool block but couldn't parse arguments
-                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"tool_name": tool_name, "inner": inner.chars().take(100).collect::<String>()})), "Found ```tool <name> block but could not parse JSON arguments");
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        malformed_tool_block_event(inner.len()),
+                        "Found ```tool <name> block but could not parse JSON arguments"
+                    );
                 }
             } else {
                 for value in json_values {
@@ -2745,6 +2757,54 @@ Done."#;
         );
         assert!(text.contains("I'll write a test file."));
         assert!(text.contains("Done."));
+    }
+
+    #[test]
+    fn malformed_tool_block_log_omits_model_controlled_content() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let secret_name = "sk_live_SECRET_IDENTIFIER";
+        let secret_body = "api_key=sk_live_SECRET_BODY";
+        let malformed_payload = format!("{secret_body}\n");
+        let expected_payload_len = malformed_payload.len() as u64;
+        let response = format!("```tool {secret_name}\n{malformed_payload}```");
+
+        let (_, calls) = parse_tool_calls(&response);
+        assert!(calls.is_empty());
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let event = 'search: loop {
+            while let Ok(event) = rx.try_recv() {
+                let matches_message = event.get("message").and_then(|value| value.as_str())
+                    == Some("Found ```tool <name> block but could not parse JSON arguments");
+                let matches_source = event
+                    .get("attributes")
+                    .and_then(|attributes| attributes.get("_file"))
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|file| file.ends_with("zeroclaw-tool-call-parser/src/lib.rs"));
+                if matches_message && matches_source {
+                    break 'search event;
+                }
+            }
+
+            assert!(
+                std::time::Instant::now() < deadline,
+                "malformed tool block should emit the expected canonical log event"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        let serialized = event.to_string();
+        assert!(!serialized.contains(secret_name));
+        assert!(!serialized.contains(secret_body));
+        assert!(event["attributes"].get("tool_name").is_none());
+        assert_eq!(
+            event["attributes"]["payload_len"].as_u64(),
+            Some(expected_payload_len)
+        );
     }
 
     #[test]
