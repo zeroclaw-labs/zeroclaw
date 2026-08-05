@@ -1,7 +1,7 @@
 import { useLocation } from 'react-router-dom';
 import { basePath } from '../../lib/basePath';
 import { findActiveNavPath } from './sidebarNav';
-import { railAsideStyle, railNavClassName } from './sidebarRail';
+import { railAsideStyle, railLinkClassName, railNavClassName } from './sidebarRail';
 import { SidebarNavLink } from './SidebarNavLink';
 import {
   Activity,
@@ -127,50 +127,47 @@ function RailNavItem({
   // when the popover should not render. Deriving both from the rect means
   // the rail's `w-14` width is no longer hard-coded into the popover's
   // horizontal position.
+  // Hover and keyboard focus are tracked independently so a mouseleave does
+  // not hide a tooltip that should remain visible while the link is still
+  // `document.activeElement` (the "hover or keyboard focus" visibility
+  // contract). `tooltipVisible` is their union; the position state is only
+  // meaningful while it is true.
+  const [hovered, setHovered] = useState(false);
+  const [focused, setFocused] = useState(false);
+  const tooltipVisible = hovered || focused;
   const [tooltipTop, setTooltipTop] = useState<number | null>(null);
   const [tooltipLeft, setTooltipLeft] = useState<number | null>(null);
 
-  const showTooltip = () => {
-    const linkRect = linkRef.current?.getBoundingClientRect();
-    // Anchor the popover to the rail's right edge (the closest `<aside>`),
-    // not the link's right edge. The rail is `w-14` (56 px) and the desired
-    // gap is 8 px; deriving from the rail's actual rect keeps the visual gap
-    // stable regardless of how the link is positioned within the rail
-    // (centered icon, full-width item, future layout changes, etc.) — i.e.
-    // the rail's `w-14` is no longer duplicated into the popover's
-    // horizontal position.
-    const railRect = linkRef.current?.closest('aside')?.getBoundingClientRect();
-    if (linkRect && railRect) {
-      setTooltipTop(linkRect.top + linkRect.height / 2);
-      setTooltipLeft(railRect.right + 8); // 8 px gap from the rail's right edge
-    }
-  };
-  const hideTooltip = () => {
-    setTooltipTop(null);
-    setTooltipLeft(null);
-  };
-
-  // Re-anchor while the popover is visible so it tracks the NavLink across
-  // viewport scrolls and resize events. Cleanup on unmount.
+  // Re-anchor the popover while it is visible so it tracks the NavLink across
+  // viewport scrolls and resize events, and compute the initial position when
+  // visibility flips to true (hover or focus). Cleanup on unmount / hide.
   useEffect(() => {
-    if (tooltipTop === null) return;
+    if (!tooltipVisible) return;
     const update = () => {
       const linkRect = linkRef.current?.getBoundingClientRect();
+      // Anchor the popover to the rail's right edge (the closest `<aside>`),
+      // not the link's right edge. The rail is `w-14` (56 px) and the desired
+      // gap is 8 px; deriving from the rail's actual rect keeps the visual gap
+      // stable regardless of how the link is positioned within the rail
+      // (centered icon, full-width item, future layout changes, etc.) — i.e.
+      // the rail's `w-14` is no longer duplicated into the popover's
+      // horizontal position.
       const railRect = linkRef.current
         ?.closest('aside')
         ?.getBoundingClientRect();
       if (linkRect && railRect) {
         setTooltipTop(linkRect.top + linkRect.height / 2);
-        setTooltipLeft(railRect.right + 8);
+        setTooltipLeft(railRect.right + 8); // 8 px gap from the rail's right edge
       }
     };
+    update();
     window.addEventListener('scroll', update, true);
     window.addEventListener('resize', update);
     return () => {
       window.removeEventListener('scroll', update, true);
       window.removeEventListener('resize', update);
     };
-  }, [tooltipTop !== null]);
+  }, [tooltipVisible]);
 
   return (
     <>
@@ -179,15 +176,15 @@ function RailNavItem({
         activePath={activePath}
         ref={linkRef}
         onClick={onClick}
-        onMouseEnter={showTooltip}
-        onMouseLeave={hideTooltip}
-        onFocus={showTooltip}
-        onBlur={hideTooltip}
+        onMouseEnter={() => setHovered(true)}
+        onMouseLeave={() => setHovered(false)}
+        onFocus={() => setFocused(true)}
+        onBlur={() => setFocused(false)}
         title={text}
         aria-label={text}
         className={({ isActive }) =>
           [
-            'group relative flex h-10 w-10 mx-auto items-center justify-center',
+            railLinkClassName,
             'rounded-[var(--radius-md)] transition-colors duration-150',
             'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]',
             isActive
@@ -215,7 +212,8 @@ function RailNavItem({
           </>
         )}
       </SidebarNavLink>
-      {tooltipTop !== null &&
+      {tooltipVisible &&
+        tooltipTop !== null &&
         createPortal(
           <span
             role="tooltip"
