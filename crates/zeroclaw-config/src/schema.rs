@@ -5071,6 +5071,7 @@ impl Default for VerifiableIntentConfig {
         Self {
             enabled: false,
             strictness: default_vi_strictness(),
+            issuer_jwk: None,
         }
     }
 }
