@@ -93,7 +93,7 @@ solana-pubkey = { version = "4.3", optional = true }
 solana-signature = { version = "3.5", optional = true }
 solana-signer = { version = "3.0", optional = true }
 solana-system-interface = { version = "3.3", features = ["bincode"], optional = true }
-solana-transaction = { version = "4.2", features = ["wincode"], optional = true }
+solana-transaction = { version = "4.2", features = ["wincode", "verify"], optional = true }
 ed25519-dalek = { version = "2", default-features = false, features = ["rand_core", "std"], optional = true }
 rand_core = { version = "0.6", features = ["getrandom"], optional = true }
 # Optional deps for specific features

@@ -1062,6 +1062,7 @@ dependencies = [
  "cfg-if",
  "constant_time_eq",
  "cpufeatures 0.3.0",
+ "digest 0.11.3",
 ]
 
 [[package]]
@@ -4121,6 +4122,8 @@ version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
+ "allocator-api2",
+ "equivalent",
  "foldhash 0.1.5",
 ]
 
@@ -9585,6 +9588,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf8209ece2bd9f1450e672858ffc0e5c8c786ff6916d2a862b126dd0128f380f"
 
 [[package]]
+name = "solana-ed25519"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9eb363f7bce265f568551029efdff3f33752376fe8289cb628fe084503a925f"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.3.0",
+ "curve25519-dalek-derive",
+ "digest 0.11.3",
+ "ed25519",
+ "hashbrown 0.15.5",
+ "rand 0.10.2",
+ "rand_core 0.10.1",
+ "rustc_version",
+ "sha2 0.11.0",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
 name = "solana-hash"
 version = "4.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9624,6 +9647,7 @@ version = "4.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "188f4df6f4f4d5bd8b9d82aee0f053b6c37826dcd96933f7b59f684b406a7b3c"
 dependencies = [
+ "blake3",
  "solana-address",
  "solana-hash",
  "solana-instruction",
@@ -9690,6 +9714,7 @@ checksum = "40256f54e42a6f606722a4a6cad22c9be97d97e524004990d057e394d546f8f0"
 dependencies = [
  "five8",
  "serde",
+ "solana-ed25519",
  "solana-sanitize",
  "wincode",
 ]
