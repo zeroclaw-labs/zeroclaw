@@ -133,6 +133,190 @@ pub(crate) fn starts_suspicious_tag_or_fence_prefix(text: &str) -> bool {
         || lower.starts_with("[tool_call]")
 }
 
+pub(crate) fn contains_close_tag_marker(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "</tool_call",
+        "</toolcall",
+        "</tool-call",
+        "</invoke",
+        "</function",
+        "</|dsml|",
+        "</|tool_call|",
+        "</｜dsml｜",
+        "</｜dsml",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+/// Lowercase close-marker prefixes for tool-protocol envelopes. Shared by the
+/// envelope-boundary and continuation-fragment helpers below.
+const SUPPRESSED_CLOSE_MARKERS: [&str; 11] = [
+    "</|dsml|>",
+    "</｜dsml｜",
+    "</|tool_call|>",
+    "</tool_call>",
+    "</tool_calls>",
+    "</toolcall>",
+    "</tool-call>",
+    "</invoke>",
+    "</function",
+    "</minimax:tool_call>",
+    "</minimax:toolcall>",
+];
+
+fn is_plain_tag_name(seg: &str) -> bool {
+    !seg.is_empty()
+        && seg
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | ':'))
+}
+
+fn first_json_value_end(input: &str) -> Option<usize> {
+    for (byte_idx, ch) in input.char_indices() {
+        if ch != '{' && ch != '[' {
+            continue;
+        }
+        let slice = &input[byte_idx..];
+        let mut stream = serde_json::Deserializer::from_str(slice).into_iter::<serde_json::Value>();
+        if let Some(Ok(_)) = stream.next() {
+            let consumed = stream.byte_offset();
+            if consumed > 0 {
+                return Some(byte_idx + consumed);
+            }
+        }
+    }
+    None
+}
+
+pub(crate) fn protocol_envelope_end(text: &str, start: usize) -> Option<usize> {
+    let rest = text.get(start..)?;
+    let lower = rest.to_ascii_lowercase();
+
+    if let Some(body) = rest.strip_prefix("```") {
+        if let Some(close) = body.find("```") {
+            return Some(start + 3 + close + 3);
+        }
+        return None;
+    }
+
+    let mut best: Option<usize> = None;
+    for marker in SUPPRESSED_CLOSE_MARKERS {
+        let Some(rel) = lower.rfind(marker) else {
+            continue;
+        };
+        let tail = &rest[rel + marker.len()..];
+        let end = match tail.find('>') {
+            Some(idx)
+                if tail[..idx].trim_start().is_empty()
+                    || is_plain_tag_name(tail[..idx].trim_start()) =>
+            {
+                rel + marker.len() + idx + 1
+            }
+            _ => rel + marker.len(),
+        };
+        best = Some(best.map_or(end, |current: usize| current.max(end)));
+    }
+    if let Some(end) = best {
+        return Some(start + end);
+    }
+
+    if rest.starts_with('{') || rest.starts_with('[') {
+        return first_json_value_end(rest).map(|end| start + end);
+    }
+    for open in ["<|dsml|>", "<｜dsml｜", "<|tool_call|>"] {
+        if !lower.starts_with(open) {
+            continue;
+        }
+        let mut body = &rest[open.len()..];
+        let mut body_offset = open.len();
+        if let Some(idx) = body.find('>')
+            && is_plain_tag_name(body[..idx].trim_start())
+        {
+            body = &body[idx + 1..];
+            body_offset += idx + 1;
+        }
+        if let Some(end) = first_json_value_end(body) {
+            return Some(start + body_offset + end);
+        }
+        break;
+    }
+
+    None
+}
+
+pub(crate) fn suppressed_continuation_trailing(chunk: &str) -> Option<&str> {
+    let lead = chunk.len() - chunk.trim_start().len();
+    let body = &chunk[lead..];
+    let lower = body.to_ascii_lowercase();
+
+    let mut first: Option<usize> = None;
+    for marker in SUPPRESSED_CLOSE_MARKERS {
+        if let Some(rel) = lower.find(marker)
+            && first.is_none_or(|current| rel < current)
+        {
+            first = Some(rel);
+        }
+    }
+    let Some(first_idx) = first else {
+        return close_run_trailing(chunk, lead, body);
+    };
+    if !body[..first_idx].trim().is_empty() {
+        return None;
+    }
+
+    let mut best: Option<usize> = None;
+    for marker in SUPPRESSED_CLOSE_MARKERS {
+        let Some(rel) = lower.rfind(marker) else {
+            continue;
+        };
+        let tail = &body[rel + marker.len()..];
+        let end = match tail.find('>') {
+            Some(idx)
+                if tail[..idx].trim_start().is_empty()
+                    || is_plain_tag_name(tail[..idx].trim_start()) =>
+            {
+                rel + marker.len() + idx + 1
+            }
+            _ => rel + marker.len(),
+        };
+        best = Some(best.map_or(end, |current: usize| current.max(end)));
+    }
+    if let Some(end) = best {
+        return trailing_after_fragment(chunk, lead + end);
+    }
+
+    close_run_trailing(chunk, lead, body)
+}
+
+fn close_run_trailing<'a>(chunk: &'a str, lead: usize, body: &str) -> Option<&'a str> {
+    let mut end = lead;
+    for ch in body.chars() {
+        if matches!(ch, '}' | ']' | '`') {
+            end += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if end > lead {
+        return trailing_after_fragment(chunk, end);
+    }
+    None
+}
+
+fn trailing_after_fragment(chunk: &str, end: usize) -> Option<&str> {
+    let trailing = chunk[end..].trim_start();
+    if trailing.is_empty() {
+        return None;
+    }
+    let lower = trailing.to_ascii_lowercase();
+    if starts_suspicious_protocol_prefix(trailing) || lower.starts_with("</") {
+        return None;
+    }
+    Some(trailing)
+}
+
 pub(crate) fn complete_non_protocol_json(text: &str, known_tool_names: &HashSet<String>) -> bool {
     let trimmed = text.trim();
     (trimmed.starts_with('{') || trimmed.starts_with('['))

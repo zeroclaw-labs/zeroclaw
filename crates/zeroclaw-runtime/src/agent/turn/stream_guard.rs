@@ -1,10 +1,10 @@
 //! Streaming-text guards: protocol-fragment buffering and `<think>` tag stripping.
 
 use super::protocol_detect::{
-    complete_json_fence_protocol_state, complete_non_protocol_json,
+    complete_json_fence_protocol_state, complete_non_protocol_json, contains_close_tag_marker,
     find_embedded_protocol_candidate_start, find_incomplete_protocol_candidate_start,
-    longest_suffix_matching_prefix, starts_suspicious_protocol_prefix,
-    starts_suspicious_tag_or_fence_prefix,
+    longest_suffix_matching_prefix, protocol_envelope_end, starts_suspicious_protocol_prefix,
+    starts_suspicious_tag_or_fence_prefix, suppressed_continuation_trailing,
 };
 use std::collections::HashSet;
 use zeroclaw_tool_call_parser::{
@@ -40,18 +40,25 @@ impl StreamTextGuard {
     }
 
     pub(crate) fn push(&mut self, chunk: &str) -> Option<String> {
-        if self.suppress_forwarding || chunk.is_empty() {
+        if self.suppress_forwarding {
+            if self.pending.is_empty() && self.continuation_of_suppressed_protocol(chunk) {
+                return suppressed_continuation_trailing(chunk).map(str::to_string);
+            }
+            self.suppress_forwarding = false;
+        }
+        if chunk.is_empty() {
             return None;
         }
 
         if self.pending.is_empty() && !starts_suspicious_protocol_prefix(chunk) {
             if let Some(start) = find_embedded_protocol_candidate_start(chunk) {
-                self.pending_candidate_start = Some(start);
+                self.pending_candidate_start = Some(0);
                 self.pending.push_str(&chunk[start..]);
                 return if self.should_suppress_protocol_candidate(&self.pending) {
                     self.suppress_protocol(&chunk[..start])
                 } else {
                     self.pending.insert_str(0, &chunk[..start]);
+                    self.pending_candidate_start = Some(start);
                     self.evaluate_pending(false)
                 };
             }
@@ -68,7 +75,8 @@ impl StreamTextGuard {
     }
 
     pub(crate) fn finish(&mut self) -> Option<String> {
-        if self.suppress_forwarding || self.pending.is_empty() {
+        self.suppress_forwarding = false;
+        if self.pending.is_empty() {
             return None;
         }
         if let Some(release) = self.evaluate_pending(true) {
@@ -127,13 +135,49 @@ impl StreamTextGuard {
     }
 
     fn suppress_protocol(&mut self, narration: &str) -> Option<String> {
+        let mut parts = Vec::new();
         let narration = narration.trim();
-        let narration = (!narration.is_empty()).then(|| narration.to_string());
+        if !narration.is_empty() {
+            parts.push(narration.to_string());
+        }
+        if let Some(trailing) = self.trailing_after_envelope() {
+            let trailing = trailing.trim();
+            if !trailing.is_empty() {
+                parts.push(trailing.to_string());
+            }
+        }
         self.pending.clear();
         self.pending_candidate_start = None;
-        self.suppress_forwarding = true;
         self.suppressed_protocol = true;
-        narration
+        self.suppress_forwarding = true;
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(" "))
+        }
+    }
+
+    fn trailing_after_envelope(&self) -> Option<String> {
+        let start = self
+            .pending_candidate_start
+            .unwrap_or(0)
+            .min(self.pending.len());
+        let candidate = self.pending.get(start..)?;
+        let envelope_end = protocol_envelope_end(candidate, 0)?;
+        let trailing = candidate.get(envelope_end..)?;
+        (!trailing.trim().is_empty()).then(|| trailing.to_string())
+    }
+
+    fn continuation_of_suppressed_protocol(&self, chunk: &str) -> bool {
+        if suppressed_continuation_trailing(chunk).is_some() {
+            return true;
+        }
+        let lower = chunk.trim_start().to_ascii_lowercase();
+        let closed = lower.starts_with("</")
+            || lower.starts_with("}")
+            || lower.starts_with("]")
+            || lower.starts_with("```");
+        closed && (starts_suspicious_protocol_prefix(chunk) || contains_close_tag_marker(chunk))
     }
 
     fn narration_before_candidate(&self) -> String {
@@ -315,7 +359,94 @@ mod tests {
             guard.suppressed_protocol,
             "DSML envelope must be suppressed"
         );
-        assert!(guard.suppress_forwarding);
+    }
+
+    #[test]
+    fn suppresses_dsml_envelope_and_forwards_clean_text_afterwards() {
+        let mut guard = shell_guard();
+
+        assert_eq!(
+            guard.push(
+                "narration <|DSML|>invoke name=\"shell\"><|DSML|>parameter name=\"command\" string=\"true\">ls</|DSML|>parameter></|DSML|>invoke></|DSML|>tool_calls> Done!"
+            ),
+            Some("narration Done!".to_string()),
+            "trailing text after the envelope must survive suppression"
+        );
+        assert!(guard.suppressed_protocol);
+
+        assert_eq!(guard.push("More text."), Some("More text.".to_string()));
+        assert_eq!(guard.finish(), None);
+    }
+
+    #[test]
+    fn suppression_scoped_to_envelope_not_stream() {
+        let mut guard = shell_guard();
+
+        assert_eq!(
+            guard.push(
+                "<|DSML|>invoke name=\"shell\"><|DSML|>parameter name=\"command\" string=\"true\">ls</|DSML|>parameter></|DSML|>invoke></|DSML|>tool_calls>"
+            ),
+            None,
+            "standalone envelope must be buffered"
+        );
+        assert_eq!(guard.finish(), None);
+        assert!(guard.suppressed_protocol);
+
+        assert_eq!(guard.push("After."), Some("After.".to_string()));
+    }
+
+    #[test]
+    fn split_envelope_trailing_close_tag_still_suppressed() {
+        let mut guard = shell_guard();
+
+        assert_eq!(guard.push("<|DSML|>"), None);
+        assert_eq!(guard.push("\n{\"name\":\"shell\""), None);
+        assert_eq!(guard.push(",\"arguments\":{\"cmd\":\"ls\"}}"), None);
+        assert_eq!(guard.push("\n</|DSML|>"), None);
+
+        assert_eq!(guard.finish(), None);
+        assert!(guard.suppressed_protocol);
+
+        assert_eq!(guard.push("Next."), Some("Next.".to_string()));
+    }
+
+    #[test]
+    fn envelope_without_narration_keeps_trailing_text() {
+        let mut guard = shell_guard();
+
+        assert_eq!(
+            guard.push(
+                "<|DSML|>invoke name=\"shell\"><|DSML|>parameter name=\"command\" string=\"true\">ls</|DSML|>parameter></|DSML|>invoke></|DSML|>tool_calls> Done!"
+            ),
+            Some("Done!".to_string()),
+            "trailing text must survive even without leading narration"
+        );
+        assert!(guard.suppressed_protocol);
+        assert_eq!(guard.finish(), None);
+    }
+
+    #[test]
+    fn close_fragment_with_trailing_text_forwards_trailing_only() {
+        let mut guard = shell_guard();
+
+        assert_eq!(
+            guard.push("Do it. <|DSML|>invoke name=\"shell\"><|DSML|>parameter name=\"command\" string=\"true\">ls"),
+            Some("Do it.".to_string()),
+            "narration before the envelope must be preserved"
+        );
+        assert_eq!(
+            guard.push("</|DSML|>parameter></|DSML|>invoke></|DSML|>tool_calls> Done!"),
+            Some("Done!".to_string())
+        );
+        assert!(guard.suppressed_protocol);
+
+        assert_eq!(
+            guard.push("</|DSML|> Done!"),
+            Some("Done!".to_string()),
+            "trailing text after a close fragment must be forwarded"
+        );
+        assert_eq!(guard.push("More."), Some("More.".to_string()));
+        assert_eq!(guard.finish(), None);
     }
 
     #[test]
@@ -346,7 +477,6 @@ mod tests {
             guard.suppressed_protocol,
             "fullwidth DSML envelope must be suppressed"
         );
-        assert!(guard.suppress_forwarding);
     }
 
     #[test]
@@ -373,7 +503,6 @@ mod tests {
             guard.suppressed_protocol,
             "narration forwarded but DSML envelope suppressed"
         );
-        assert!(guard.suppress_forwarding);
     }
 
     #[test]
