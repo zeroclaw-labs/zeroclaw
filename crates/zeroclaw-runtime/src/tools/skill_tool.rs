@@ -221,7 +221,9 @@ impl Tool for SkillShellTool {
                 return Ok(ToolResult {
                     success: false,
                     output: ToolOutput::default(),
-                    error: Some(format!("Failed to build runtime command: {e}")),
+                    error: Some(super::runtime_command_error::format_runtime_command_error(
+                        &e,
+                    )),
                 });
             }
         };
@@ -404,8 +406,10 @@ impl Tool for SkillBuiltinTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::DockerRuntime;
     use crate::security::{AutonomyLevel, SecurityPolicy};
     use crate::skills::SkillTool;
+    use zeroclaw_config::schema::DockerRuntimeConfig;
 
     fn test_security() -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy {
@@ -612,6 +616,36 @@ mod tests {
         let result = tool.execute(serde_json::json!({})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("hello-skill"));
+    }
+
+    #[tokio::test]
+    async fn skill_shell_tool_reports_invalid_docker_workspace_root() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir should be created");
+        let missing_root = workspace.path().join("missing-root");
+        let missing_root_text = missing_root.to_string_lossy().into_owned();
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: workspace.path().to_path_buf(),
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        });
+        let runtime = Arc::new(DockerRuntime::new(DockerRuntimeConfig {
+            allowed_workspace_roots: vec![missing_root_text.clone()],
+            ..DockerRuntimeConfig::default()
+        }));
+        let tool =
+            SkillShellTool::new_with_runtime("test", &sample_skill_tool(), security, runtime);
+
+        let result = tool
+            .execute(serde_json::json!({"file": "src/main.rs", "format": "text"}))
+            .await
+            .expect("invalid Docker root should return a tool result");
+
+        assert!(!result.success);
+        let error = result.error.as_deref().unwrap_or("");
+        assert!(error.contains("Failed to canonicalize Docker workspace root"));
+        assert!(error.contains(missing_root_text.as_str()));
     }
 
     #[test]
@@ -1096,6 +1130,7 @@ mod tests {
             }],
             prompts: vec![],
             slash_options: Vec::new(),
+            always: false,
             location: None,
         };
         crate::tools::register_skill_tools_with_context(

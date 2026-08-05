@@ -768,6 +768,8 @@ fn handle_add(
         tags: Vec::new(),
         // Slash options are authored in the dashboard editor, not at scaffold time.
         slash_options: Vec::new(),
+        // Scaffolded skills load on demand; always-inject is opt-in via the editor.
+        always: false,
     };
 
     let skill_dir = service.scaffold_skill(

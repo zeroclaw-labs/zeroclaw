@@ -27,6 +27,31 @@ fn top_level_job<'a>(workflow: &'a str, name: &str) -> &'a str {
     &rest[..end]
 }
 
+fn mount_option<'a>(mount: &'a str, names: &[&str]) -> Option<&'a str> {
+    mount
+        .split(',')
+        .filter_map(|option| option.split_once('='))
+        .find_map(|(name, value)| names.contains(&name).then_some(value))
+}
+
+fn cargo_cache_mounts(containerfile: &str) -> Vec<(&str, Option<&str>)> {
+    containerfile
+        .lines()
+        .flat_map(|line| {
+            line.split_whitespace().filter_map(move |token| {
+                let mount = token.strip_prefix("--mount=")?;
+                if mount_option(mount, &["type"]) != Some("cache") {
+                    return None;
+                }
+
+                let target = mount_option(mount, &["target", "dst", "destination"])?;
+                matches!(target, "/root/.cargo/registry" | "/root/.cargo/git")
+                    .then(|| (line.trim(), mount_option(mount, &["sharing"])))
+            })
+        })
+        .collect()
+}
+
 #[test]
 fn manual_stable_release_calls_container_matrix_at_release_tag() {
     let release = workflow("release-stable-manual.yml");
@@ -120,5 +145,47 @@ fn scheduled_trivy_verifies_published_tag_before_scan() {
     assert!(
         !scheduled.contains("\n  upload-sarif:\n"),
         "each scan matrix leg must upload its own SARIF result independently"
+    );
+}
+
+#[test]
+fn containerfile_serializes_shared_cargo_caches() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let containerfile =
+        fs::read_to_string(root.join("Containerfile")).expect("failed to read Containerfile");
+    let cargo_cache_mounts = cargo_cache_mounts(&containerfile);
+
+    assert!(
+        !cargo_cache_mounts.is_empty(),
+        "Containerfile must contain Cargo cache mounts"
+    );
+    for (mount, sharing) in cargo_cache_mounts {
+        assert_eq!(
+            sharing,
+            Some("locked"),
+            "parallel Containerfile stages must serialize shared Cargo caches: {mount}"
+        );
+    }
+}
+
+#[test]
+fn cargo_cache_guard_parses_option_order_and_exact_values() {
+    let mounts = cargo_cache_mounts(
+        "RUN --mount=type=cache,id=registry,target=/root/.cargo/registry cargo fetch\n\
+         RUN --mount=destination=/root/.cargo/git,sharing=lockedx,type=cache cargo fetch\n\
+         RUN --mount=dst=/root/.cargo/git,type=cache,sharing=locked cargo fetch",
+    );
+
+    assert_eq!(mounts.len(), 3);
+    assert_eq!(mounts[0].1, None, "reordered unlocked mount must be found");
+    assert_eq!(
+        mounts[1].1,
+        Some("lockedx"),
+        "malformed sharing value must not be normalized"
+    );
+    assert_eq!(
+        mounts[2].1,
+        Some("locked"),
+        "dst alias and reordered locked mount must be found"
     );
 }

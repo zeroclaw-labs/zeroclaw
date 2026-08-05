@@ -109,6 +109,7 @@ macro_rules! impl_prop_kind {
 
 impl_prop_kind!(PropKind::Bool, bool);
 impl_prop_kind!(PropKind::String, String);
+impl_prop_kind!(PropKind::String, std::path::PathBuf);
 impl_prop_kind!(PropKind::Float, f64, f32);
 impl_prop_kind!(
     PropKind::Integer,
