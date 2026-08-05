@@ -3027,8 +3027,19 @@ async fn process_whatsapp_message(
     headers: HeaderMap,
     body: Bytes,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    // ── Security: Verify X-Hub-Signature-256 if app_secret is configured ──
-    if let Some(app_secret) = app_secret {
+    // ── Security: WhatsApp Cloud webhooks MUST be signature-verified ──
+    // Fail closed: with no configured app secret we cannot verify the signature, so the
+    // request is rejected. Previously an absent secret skipped verification entirely,
+    // which let any caller who knew the webhook URL inject messages into the agent.
+    let Some(app_secret) = app_secret else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": "whatsapp: no app_secret configured; refusing to accept an unverified webhook"
+            })),
+        );
+    };
+    {
         let signature = headers
             .get("X-Hub-Signature-256")
             .and_then(|v| v.to_str().ok())
@@ -3214,8 +3225,20 @@ async fn process_linq_webhook(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let body_str = String::from_utf8_lossy(&body);
 
-    // ── Security: Verify X-Webhook-Signature if signing_secret is configured ──
-    if let Some(signing_secret) = signing_secret {
+    // ── Security: Linq webhooks MUST be signature-verified ──
+    // Fail closed: with no configured signing secret we cannot verify the signature, so
+    // the request is rejected. Previously an absent secret skipped verification
+    // entirely, which let any caller who knew the webhook URL inject messages into the
+    // agent.
+    let Some(signing_secret) = signing_secret else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": "linq: no signing_secret configured; refusing to accept an unverified webhook"
+            })),
+        );
+    };
+    {
         let timestamp = headers
             .get("X-Webhook-Timestamp")
             .and_then(|v| v.to_str().ok())
@@ -7847,6 +7870,42 @@ mod tests {
     #[cfg(feature = "channel-linq")]
     #[tokio::test]
     async fn linq_webhook_accepts_valid_message_for_known_alias() {
+        // This test proves alias routing, not signature handling, but inbound
+        // verification is mandatory, so it has to carry a real secret and a valid
+        // signature to reach the routing it is asserting on.
+        let secret = generate_test_secret();
+        let state = linq_test_state("default", Some(&secret));
+        let body = linq_webhook_body("+15551234567", "hello from test");
+        let timestamp = chrono::Utc::now().timestamp().to_string();
+        let sig = compute_linq_signature_hex(&secret, &timestamp, &body);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Webhook-Signature",
+            HeaderValue::from_str(&format!("sha256={sig}")).unwrap(),
+        );
+        headers.insert(
+            "X-Webhook-Timestamp",
+            HeaderValue::from_str(&timestamp).unwrap(),
+        );
+
+        let response = Box::pin(handle_linq_webhook_alias(
+            State(state),
+            Path("default".to_string()),
+            headers,
+            Bytes::from(body),
+        ))
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[cfg(feature = "channel-linq")]
+    #[tokio::test]
+    async fn linq_webhook_rejects_when_no_signing_secret_is_configured() {
+        // Fail closed. An alias with no resolved signing secret cannot verify
+        // anything, so the webhook is refused rather than processed unverified.
         let state = linq_test_state("default", None);
         let body = linq_webhook_body("+15551234567", "hello from test");
 
@@ -7859,7 +7918,7 @@ mod tests {
         .await
         .into_response();
 
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[cfg(feature = "channel-linq")]
@@ -8147,6 +8206,27 @@ mod tests {
         ))
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    #[tokio::test]
+    async fn whatsapp_webhook_rejects_when_no_app_secret_is_configured() {
+        // Fail closed. A configured alias with no app secret cannot verify
+        // X-Hub-Signature-256, so the webhook is refused rather than dispatched
+        // to the agent unverified.
+        let mut state = webhook_baseline_state();
+        state.whatsapp = HashMap::from([("work".to_string(), whatsapp_instance("work", "tok"))]);
+        state.whatsapp_app_secret = HashMap::new();
+
+        let body = br#"{"object":"whatsapp_business_account","entry":[]}"#;
+        let resp = Box::pin(handle_whatsapp_message_alias(
+            State(state),
+            Path("work".to_string()),
+            HeaderMap::new(),
+            Bytes::from_static(body),
+        ))
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     /// Build an `AppState` whose device registry points at a non-existent
