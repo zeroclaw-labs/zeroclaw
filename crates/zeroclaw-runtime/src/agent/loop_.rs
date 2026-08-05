@@ -5347,14 +5347,124 @@ mod tests {
             .lock()
             .expect("recorded requests lock should be valid");
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].len(), 1);
+        assert_eq!(requests[0].len(), 2);
+        let system_message = requests[0]
+            .iter()
+            .find(|message| message.role == "system")
+            .expect("iteration budget warning should be present");
         assert!(
-            requests[0][0]
+            system_message
+                .content
+                .contains("Only 3 tool-call rounds remain")
+        );
+        let user_message = requests[0]
+            .iter()
+            .find(|message| message.role == "user")
+            .expect("degraded user message should be present");
+        assert!(
+            user_message
                 .content
                 .contains("1 attached image(s) could not be loaded")
         );
-        assert!(!requests[0][0].content.contains("[IMAGE:"));
-        assert!(!requests[0][0].content.contains(&oversized_payload));
+        assert!(!user_message.content.contains("[IMAGE:"));
+        assert!(!user_message.content.contains(&oversized_payload));
+    }
+
+    #[tokio::test]
+    async fn iteration_budget_warning_request_stays_within_context_budget() {
+        let model_provider = RecordingModelProvider::new();
+        let recorded_requests = Arc::clone(&model_provider.requests);
+        let old_payload = "old-context-".repeat(24);
+        let current_payload = "current-context-".repeat(24);
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user(format!("old request {old_payload}").as_str()),
+            ChatMessage::assistant(format!("old response {old_payload}").as_str()),
+            ChatMessage::user(format!("current request {current_payload}").as_str()),
+        ];
+        let context_token_budget = crate::agent::history::estimate_history_tokens(&history);
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let observer = NoopObserver;
+        let turn_id = uuid::Uuid::new_v4().to_string();
+
+        let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &model_provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 3,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_token_budget,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            channel_name: "cli",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: None,
+            turn_id: &turn_id,
+        })
+        .await
+        .expect("warning-bearing request should reach the provider");
+
+        assert_eq!(result, "done");
+        let requests = recorded_requests
+            .lock()
+            .expect("recorded requests lock should be valid");
+        assert_eq!(requests.len(), 1, "provider should receive one request");
+        let request = &requests[0];
+        assert!(
+            request
+                .iter()
+                .any(|message| message.content.contains("<tool-iteration-budget>")),
+            "near-limit request should retain the iteration warning"
+        );
+        assert!(
+            crate::agent::history::estimate_history_tokens(request) <= context_token_budget,
+            "warning-bearing provider request must stay within the configured context budget"
+        );
+        assert!(
+            request
+                .iter()
+                .all(|message| !message.content.contains(&old_payload)),
+            "oldest turn should be trimmed to reserve warning capacity"
+        );
+        assert!(
+            request
+                .iter()
+                .any(|message| message.content.contains(&current_payload)),
+            "current turn must remain in the provider request"
+        );
     }
 
     #[tokio::test]
