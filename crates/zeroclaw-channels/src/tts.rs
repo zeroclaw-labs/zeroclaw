@@ -409,19 +409,38 @@ pub struct EdgeTtsProvider {
     timeout: std::time::Duration,
 }
 
-/// How long the reaper waits for the child to exit after a kill before
-/// escalating to a hard kill, and before the temp file is removed.
+/// How long the reaper waits for the child to exit after a graceful kill
+/// before escalating to a hard kill, and before the temp file is removed.
 const EDGE_TTS_REAP_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Send a graceful termination request to the child. On Unix this is
+/// `SIGTERM`, which a cooperative child (or a test fixture) can handle or
+/// ignore; Windows has no signal model, so fall back to the hard kill.
+#[cfg(unix)]
+fn graceful_kill(child: &tokio::process::Child) {
+    if let Some(pid) = child.id() {
+        let _ = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+    }
+}
+
+#[cfg(not(unix))]
+fn graceful_kill(child: &tokio::process::Child) {
+    let _ = child.start_kill();
+}
 
 /// RAII cleanup for the temporary Edge TTS output file, the spawned child, and
 /// its stderr drain. On every path out of [`EdgeTtsProvider::synthesize`] —
 /// success, subprocess failure, timeout, output-read failure, and cancellation
 /// (future drop) — the child is killed and reaped and the stderr reader aborted
 /// before the artifact is removed, so deletion cannot race a still-terminating
-/// process. Reaping never blocks an executor worker: `Drop` only starts the
-/// kill and, if the child has not exited yet, hands it to a detached async
-/// reaper that parks (bounded) off any worker thread. Cleanup failure is
-/// swallowed so it never masks the primary synthesis error.
+/// process. The child reap and stderr drain never block an executor worker:
+/// `Drop` only requests a graceful `SIGTERM`, checks the child once without
+/// blocking, and if it has not exited hands it to a detached async reaper that
+/// parks (bounded) off any worker thread, escalating to a hard kill after
+/// [`EDGE_TTS_REAP_GRACE`]. Cleanup failure is swallowed so it never masks the
+/// primary synthesis error. The already-exited and no-child branches delete the
+/// temp file with a single synchronous `remove_file` (fast local-unlink); the
+/// pending-reap branch removes it inside the detached reaper.
 struct EdgeTtsTempArtifact {
     path: PathBuf,
     child: Option<tokio::process::Child>,
@@ -445,7 +464,10 @@ impl Drop for EdgeTtsTempArtifact {
                 let _ = std::fs::remove_file(&self.path);
             }
             Some(mut child) => {
-                let _ = child.start_kill();
+                // Graceful first: SIGTERM on Unix. A cooperative child exits
+                // promptly; an uncooperative one keeps running and stays
+                // pending so the reaper below genuinely owns the bounded wait.
+                graceful_kill(&child);
                 // Already reaped (e.g. the success path): remove the file
                 // inline — no reaper needed.
                 if let Ok(Some(_)) = child.try_wait() {
@@ -454,13 +476,12 @@ impl Drop for EdgeTtsTempArtifact {
                 }
                 // Child still terminating: hand it to a detached async reaper
                 // that parks on the executor rather than blocking a worker.
-                // It bounds the wait, escalates to a hard kill, and only then
-                // removes the temp file, preserving the reap-before-delete
-                // ordering.
+                // It bounds the wait for the graceful exit, escalates to a
+                // hard kill if the grace window expires, and only then removes
+                // the temp file, preserving the reap-before-delete ordering.
                 let path = self.path.clone();
                 zeroclaw_spawn::spawn!(async move {
                     let mut child = child;
-                    let _ = child.start_kill();
                     if tokio::time::timeout(EDGE_TTS_REAP_GRACE, child.wait())
                         .await
                         .is_err()
@@ -544,6 +565,7 @@ impl TtsProvider for EdgeTtsProvider {
             .arg(voice)
             .arg("--write-media")
             .arg(output_path)
+            .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn()
