@@ -342,6 +342,20 @@ pub trait Tool: Send + Sync + crate::attribution::Attributable {
         Vec::new()
     }
 
+    /// Lowercase phrases that suggest an inbound message wants this tool —
+    /// e.g. routing wording or configured destination names for a delivery
+    /// tool. A pre-turn prefilter may scan the message against these and
+    /// nudge the model to consider the tool; the tool itself is never called
+    /// by the prefilter. Baseline matching contract: case-insensitive
+    /// substring search, so entries should be phrases distinctive enough not
+    /// to fire on ordinary prose. Entries derived from runtime config
+    /// (aliases, group names) must be computed live per call, never cached
+    /// across reloads. Default: no triggers; the tool does not participate
+    /// in prefilter hints.
+    fn invocation_triggers(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Execute the tool with given arguments
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult>;
 
@@ -393,6 +407,35 @@ mod tests {
         let back: ToolSpec = serde_json::from_str(&arc_json).expect("spec deserializes");
         assert_eq!(back.name, spec.name);
         assert_eq!(*back.parameters, *spec.parameters);
+    }
+
+    #[test]
+    fn invocation_triggers_default_to_empty() {
+        struct Plain;
+        impl crate::attribution::Attributable for Plain {
+            fn role(&self) -> crate::attribution::Role {
+                crate::attribution::Role::Tool(crate::attribution::ToolKind::Plugin)
+            }
+            fn alias(&self) -> &str {
+                "plain"
+            }
+        }
+        #[async_trait]
+        impl Tool for Plain {
+            fn name(&self) -> &str {
+                "plain"
+            }
+            fn description(&self) -> &str {
+                "no triggers"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+                Ok(ToolResult::ok("ok"))
+            }
+        }
+        assert!(Plain.invocation_triggers().is_empty());
     }
 
     #[test]

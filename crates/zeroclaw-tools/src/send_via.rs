@@ -43,6 +43,41 @@ pub struct TurnRoutingEntry {
 /// duration of the loop, and reads it back after the loop completes.
 pub type TurnRoutingHandle = Arc<Mutex<Vec<TurnRoutingEntry>>>;
 
+/// Static routing/modality wording that suggests a `send_via` call. Multiword
+/// phrases keep case-insensitive substring matching from firing on ordinary
+/// prose; live channel and peer-group names are added per call on top.
+const STATIC_INVOCATION_TRIGGERS: &[&str] = &[
+    "send this to",
+    "send it to",
+    "send that to",
+    "send to my",
+    "forward this to",
+    "forward it to",
+    "redirect to",
+    "deliver to",
+    "reply by",
+    "reply as",
+    "reply in",
+    "respond by",
+    "by voice",
+    "via voice",
+    "as voice",
+    "voice message",
+    "voice note",
+    "by text",
+    "as text",
+    "text only",
+    "by email",
+    "via email",
+    "email this",
+    "email it",
+    "email me",
+];
+
+/// Dynamic trigger entries shorter than this are dropped: single short
+/// tokens ("a", "io") match everywhere and poison substring scanning.
+const MIN_DYNAMIC_TRIGGER_LEN: usize = 3;
+
 /// Agent-callable tool for per-turn output routing and channel fanout.
 pub struct SendViaTool {
     security: Arc<SecurityPolicy>,
@@ -190,6 +225,39 @@ impl Tool for SendViaTool {
          \n\
          `target` must be a channel alias (e.g. `telegram.default`) or a peer group name \
          the active agent belongs to. `modality` defaults to the peer group's output_modality."
+    }
+
+    fn invocation_triggers(&self) -> Vec<String> {
+        let mut triggers: std::collections::BTreeSet<String> = STATIC_INVOCATION_TRIGGERS
+            .iter()
+            .map(|t| (*t).to_string())
+            .collect();
+
+        // Live views, mirroring resolve_target: recomputed per call so config
+        // reloads (channels, peer groups) take effect without a registry rebuild.
+        for key in self.channel_map.read().keys() {
+            let lower = key.to_lowercase();
+            if let Some((channel_type, alias)) = lower.split_once('.') {
+                if channel_type.len() >= MIN_DYNAMIC_TRIGGER_LEN {
+                    triggers.insert(channel_type.to_string());
+                }
+                // "default" is an implementation alias, not user wording.
+                if alias != "default" && alias.len() >= MIN_DYNAMIC_TRIGGER_LEN {
+                    triggers.insert(alias.to_string());
+                }
+            }
+            if lower.len() >= MIN_DYNAMIC_TRIGGER_LEN {
+                triggers.insert(lower);
+            }
+        }
+        for group in (self.agent_peer_groups)().keys() {
+            let lower = group.to_lowercase();
+            if lower.len() >= MIN_DYNAMIC_TRIGGER_LEN {
+                triggers.insert(lower);
+            }
+        }
+
+        triggers.into_iter().collect()
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -530,6 +598,69 @@ mod tests {
             output_modality: OutputModality::Text,
             ..PeerGroupConfig::default()
         }
+    }
+
+    #[test]
+    fn invocation_triggers_combine_static_and_live_names() {
+        let (tool, _routing) = make_tool(
+            vec![
+                ("telegram.default", Arc::new(StubChannel::new("telegram"))),
+                ("email.work", Arc::new(StubChannel::new("email"))),
+            ],
+            HashMap::from([("Family".to_string(), pg("telegram", &["ana"]))]),
+        );
+        let triggers = tool.inner.invocation_triggers();
+        let has = |t: &str| triggers.iter().any(|x| x == t);
+
+        // Static routing/modality wording.
+        assert!(has("send it to"));
+        assert!(has("via voice"));
+        // Channel types, full keys, and non-default aliases.
+        assert!(has("telegram"));
+        assert!(has("telegram.default"));
+        assert!(has("email"));
+        assert!(has("email.work"));
+        assert!(has("work"));
+        // Peer-group names, lowercased.
+        assert!(has("family"));
+        // The implementation alias never becomes a bare trigger word.
+        assert!(!has("default"));
+        // Everything is lowercase: the scan contract is case-insensitive
+        // matching against a lowercased message.
+        assert!(triggers.iter().all(|t| t == &t.to_lowercase()));
+    }
+
+    #[test]
+    fn invocation_triggers_follow_live_config_changes() {
+        let map: PerToolChannelHandle = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        let groups: Arc<parking_lot::RwLock<HashMap<String, PeerGroupConfig>>> =
+            Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        let resolver: AgentPeerGroupResolver = {
+            let groups = Arc::clone(&groups);
+            Arc::new(move || groups.read().clone())
+        };
+        let tool = SendViaTool::new(
+            Arc::new(SecurityPolicy::default()),
+            Arc::clone(&map),
+            resolver,
+        );
+
+        let before = tool.invocation_triggers();
+        assert!(!before.iter().any(|t| t == "family"));
+        assert!(!before.iter().any(|t| t == "discord"));
+
+        map.write().insert(
+            "discord.main".to_string(),
+            Arc::new(StubChannel::new("discord")) as Arc<dyn Channel>,
+        );
+        groups
+            .write()
+            .insert("family".to_string(), pg("discord", &["ana"]));
+
+        let after = tool.invocation_triggers();
+        assert!(after.iter().any(|t| t == "discord"));
+        assert!(after.iter().any(|t| t == "main"));
+        assert!(after.iter().any(|t| t == "family"));
     }
 
     fn pg_with_peers(channel: &str, agents: &[&str], peers: &[&str]) -> PeerGroupConfig {
