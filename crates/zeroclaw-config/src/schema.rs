@@ -10576,6 +10576,19 @@ pub struct MemoryConfig {
     /// backend globally and on every agent (validated at config load).
     #[serde(default)]
     pub consolidation_extract_facts: bool,
+    /// Record memories in a persona's own voice instead of clinical
+    /// third-person prose.
+    ///
+    /// Consolidation output is injected back into the agent's context, and the
+    /// model treats it as an authorised description of itself. For a task agent
+    /// that is harmless. For a persona it is not: a memory reading "Dislikes
+    /// taking posed selfies" — inferred by the consolidator from a single
+    /// refusal — made a persona agent keep declining photos it was fully
+    /// configured to send. Leave unset for task agents; the prompt is then
+    /// unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[nested]
+    pub persona: Option<MemoryPersonaConfig>,
     /// Move daily/session files to the archive directory after this many days. Keeps the hot working set small without deleting history.
     #[serde(default = "default_archive_after_days")]
     pub archive_after_days: u32,
@@ -10759,6 +10772,27 @@ pub struct MemoryConfig {
     // postgres.*) live on `[storage.<backend>.<alias>]`. The `backend` field
     // carries a dotted alias reference and the runtime looks up the typed
     // config via `Config::resolve_active_storage`.
+}
+
+/// Persona identity for memory consolidation (`[memory.persona]` section).
+///
+/// Both fields are required for the persona block to be emitted: a persona with
+/// a name but no language (or the reverse) falls back to the plain prompt
+/// rather than rendering a half-filled instruction at the model.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "memory.persona"]
+pub struct MemoryPersonaConfig {
+    /// What the persona calls itself, e.g. "Nova". Used in the first-person
+    /// instruction so stored memories read as the persona's own recollection
+    /// rather than an observer's report about it.
+    #[serde(default)]
+    pub name: String,
+    /// Language for stored memories, written the way a model recognises it:
+    /// "français", "English", "日本語". A memory written in a language
+    /// the persona does not speak reads back as somebody else's note.
+    #[serde(default)]
+    pub language: String,
 }
 
 /// Typed memory configuration (`[memory.types]` section).
@@ -11159,6 +11193,8 @@ impl Default for MemoryConfig {
             auto_save: true,
             hygiene_enabled: default_hygiene_enabled(),
             consolidation_extract_facts: false,
+            // Off by default: task agents keep the pre-change prompt exactly.
+            persona: None,
             archive_after_days: default_archive_after_days(),
             purge_after_days: default_purge_after_days(),
             conversation_retention_days: default_conversation_retention_days(),
