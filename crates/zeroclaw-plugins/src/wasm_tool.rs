@@ -20,6 +20,12 @@ pub struct WasmTool {
     scope: PluginInstanceScope,
     config: HashMap<String, String>,
     limits: PluginLimits,
+    /// Host-owned egress authority for this instance (ADR-013). `None` is
+    /// deny-by-default: the store still links `wasi:http` when the scope grants
+    /// `HttpClient`, but every outbound request is refused. Held as a resolver
+    /// rather than a resolved allowlist so an operator's config edit applies on
+    /// the next request without rebuilding the tool.
+    egress: Option<crate::egress::EgressPolicy>,
 }
 
 impl Attributable for WasmTool {
@@ -55,7 +61,18 @@ impl WasmTool {
             scope,
             config,
             limits,
+            egress: None,
         })
+    }
+
+    /// Attach the host's egress policy for this instance.
+    ///
+    /// Omitting this is safe by construction — the tool then has no network
+    /// reach — which is why it is a builder rather than a required argument.
+    #[must_use]
+    pub fn with_egress_policy(mut self, egress: Option<crate::egress::EgressPolicy>) -> Self {
+        self.egress = egress;
+        self
     }
 
     /// Create a `WasmTool` by loading its required metadata exports.
@@ -67,13 +84,19 @@ impl WasmTool {
         scope: PluginInstanceScope,
         config: HashMap<String, String>,
         limits: PluginLimits,
+        egress: Option<crate::egress::EgressPolicy>,
     ) -> anyhow::Result<Self> {
         scope.require_capability(PluginCapability::Tool)?;
         let probe = {
             let wasm_path = wasm_path.clone();
             let scope = scope.clone();
+            // The metadata probe instantiates the guest, so it runs under the
+            // same policy the tool will execute under — a component cannot use
+            // its `name()` export as an unpoliced egress window.
+            let egress = egress.clone();
             block_probe(async move {
-                let mut plugin = runtime::create_plugin(&wasm_path, &scope, limits).await?;
+                let mut plugin =
+                    runtime::create_plugin_with_egress(&wasm_path, &scope, limits, egress).await?;
                 runtime::call_tool_metadata(&mut plugin).await
             })
         };
@@ -87,6 +110,7 @@ impl WasmTool {
             scope,
             config,
             limits,
+            egress,
         })
     }
 }
@@ -128,7 +152,15 @@ impl Tool for WasmTool {
 
     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
         let args_json = serde_json::to_vec(&args)?;
-        let mut plugin = runtime::create_plugin(&self.wasm_path, &self.scope, self.limits).await?;
+        // The policy handle travels to the fresh store; the *decision* is not
+        // read here. It is read inside the hooks, per request.
+        let mut plugin = runtime::create_plugin_with_egress(
+            &self.wasm_path,
+            &self.scope,
+            self.limits,
+            self.egress.clone(),
+        )
+        .await?;
         runtime::call_execute(&mut plugin, &args_json, &self.config).await
     }
 }
@@ -186,6 +218,7 @@ mod tests {
             tool_scope(),
             HashMap::new(),
             crate::component::test_limits(0),
+            None,
         );
 
         assert!(result.is_err());

@@ -1492,12 +1492,42 @@ pub fn all_tools_with_runtime(
                         max_table_elements: config.plugins.limits.max_table_elements,
                         max_instances: config.plugins.limits.max_instances,
                     };
+                    // ADR-013: one host-owned egress authority for every plugin
+                    // instance in this registry. It is a *resolver*, not a
+                    // snapshot: the allowlist is read out of canonical config
+                    // at the moment each request is made, so an operator edit
+                    // takes effect without re-instantiating the guest. The live
+                    // handle is preferred; one-shot callers that have none fall
+                    // back to the documented `root_config` snapshot.
+                    let egress_policy = {
+                        let live = live_config.clone();
+                        let snapshot = config.clone();
+                        zeroclaw_plugins::egress::EgressPolicy::from_resolver(Arc::new(
+                            move |id: &zeroclaw_plugins::instance::PluginInstanceId| {
+                                // For tool plugins the binding *is* the entry
+                                // name key `plugins.entries[].name`, the same
+                                // key `entry_config` above resolves against.
+                                let (hosts, allow_private) = match live.as_ref() {
+                                    Some(handle) => {
+                                        handle.read().plugins.entry_egress(id.binding())
+                                    }
+                                    None => snapshot.plugins.entry_egress(id.binding()),
+                                };
+                                zeroclaw_plugins::egress::EgressDecisionInput {
+                                    hosts,
+                                    allow_private,
+                                }
+                            },
+                        ))
+                    };
+
                     for (manifest, wasm_path) in details {
                         let plugin_config = config
                             .plugins
                             .entry_config(&manifest.name)
                             .cloned()
                             .unwrap_or_default();
+                        let egress_policy = egress_policy.clone();
                         let tool = (|| -> anyhow::Result<_> {
                             let scope =
                                 zeroclaw_plugins::instance::PluginInstanceScope::from_manifest(
@@ -1511,6 +1541,7 @@ pub fn all_tools_with_runtime(
                                 scope,
                                 plugin_config,
                                 plugin_limits,
+                                Some(egress_policy),
                             )
                         })();
                         match tool {

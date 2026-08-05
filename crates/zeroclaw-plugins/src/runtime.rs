@@ -75,10 +75,26 @@ pub async fn create_plugin(
     scope: &PluginInstanceScope,
     limits: crate::component::PluginLimits,
 ) -> Result<Plugin> {
+    create_plugin_with_egress(wasm_path, scope, limits, None).await
+}
+
+/// [`create_plugin`], plus the host-owned egress policy for this instance.
+///
+/// `egress: None` is deny-by-default: the store still links `wasi:http` when
+/// the scope grants `HttpClient`, but every outbound request is refused. The
+/// policy is a resolver, not a snapshot, so it is re-read per request.
+pub async fn create_plugin_with_egress(
+    wasm_path: &Path,
+    scope: &PluginInstanceScope,
+    limits: crate::component::PluginLimits,
+    egress: Option<crate::egress::EgressPolicy>,
+) -> Result<Plugin> {
     scope.require_capability(PluginCapability::Tool)?;
     let component = load_component(wasm_path)?;
     let mut store = crate::component::new_store(
-        PluginStoreSpec::new(scope.clone(), limits).with_granted_http(),
+        PluginStoreSpec::new(scope.clone(), limits)
+            .with_granted_http()
+            .with_egress_policy(egress),
     );
     let http = store.data().http_enabled();
     let linker = if http {

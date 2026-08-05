@@ -11,6 +11,7 @@ use wasmtime_wasi_http::WasiHttpCtx;
 use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
 
 use crate::PluginPermission;
+use crate::egress::{EgressPolicy, PluginEgressHooks};
 use crate::instance::PluginInstanceScope;
 
 #[derive(Clone, Default)]
@@ -91,6 +92,7 @@ pub(crate) struct PluginStoreSpec {
     limits: PluginLimits,
     inbound: InboundQueue,
     http: bool,
+    egress: Option<EgressPolicy>,
 }
 
 impl PluginStoreSpec {
@@ -102,6 +104,7 @@ impl PluginStoreSpec {
             limits,
             inbound: InboundQueue::default(),
             http: false,
+            egress: None,
         }
     }
 
@@ -110,9 +113,26 @@ impl PluginStoreSpec {
     /// Adapters opt into the surface explicitly. This prevents adding a grant
     /// to a scope from silently widening an adapter that has not implemented
     /// and tested the corresponding component boundary.
+    ///
+    /// This grants the *surface*, never the *reach*. Without a policy from
+    /// [`Self::with_egress_policy`] the store still links `wasi:http` and still
+    /// answers `http_enabled()`, but every request the guest issues is denied
+    /// (ADR-013). Keeping the linker attached rather than dropping it is what
+    /// keeps store construction and the store/linker coherence check stable
+    /// while the answer to "may this instance reach the network" moves to the
+    /// policy.
     #[must_use]
     pub(crate) fn with_granted_http(mut self) -> Self {
         self.http = self.scope.grants().allows(PluginPermission::HttpClient);
+        self
+    }
+
+    /// Attach the host-owned egress policy for this instance.
+    ///
+    /// `None` (the default) means deny-by-default: no destination is reachable.
+    #[must_use]
+    pub(crate) fn with_egress_policy(mut self, egress: Option<EgressPolicy>) -> Self {
+        self.egress = egress;
         self
     }
 
@@ -155,10 +175,19 @@ pub struct PluginState {
     scope: PluginInstanceScope,
     wasi: WasiCtx,
     table: ResourceTable,
-    http: Option<WasiHttpCtx>,
+    http: Option<HttpSurface>,
     inbound: InboundQueue,
     limits: StoreLimits,
     fuel_per_call: u64,
+}
+
+/// The outbound-HTTP half of a store: wasmtime's per-store context paired with
+/// ZeroClaw's policy hooks. They are one field because `WasiHttpCtxView` needs
+/// both, and because a context without hooks would be the unmediated
+/// `wasi:http` this ADR exists to remove.
+struct HttpSurface {
+    ctx: WasiHttpCtx,
+    hooks: PluginEgressHooks,
 }
 
 impl PluginState {
@@ -169,7 +198,10 @@ impl PluginState {
     /// linked. Other grants are consumed by adapters or host services where
     /// implemented and do not widen ambient WASI.
     pub(crate) fn new(spec: PluginStoreSpec) -> Self {
-        let http = spec.http.then(WasiHttpCtx::new);
+        let http = spec.http.then(|| HttpSurface {
+            ctx: WasiHttpCtx::new(),
+            hooks: PluginEgressHooks::new(spec.scope.id().clone(), spec.egress.clone()),
+        });
         Self {
             scope: spec.scope,
             wasi: WasiCtx::builder().build(),
@@ -212,15 +244,19 @@ impl WasiView for PluginState {
 }
 
 impl WasiHttpView for PluginState {
+    /// Hand `wasi:http` ZeroClaw's policy hooks instead of
+    /// `wasmtime_wasi_http::p2::default_hooks()`. The default hooks send every
+    /// request the guest asks for; these evaluate the host-owned egress policy
+    /// first and own the connect (see [`crate::egress`]).
     fn http(&mut self) -> WasiHttpCtxView<'_> {
-        let ctx = self
+        let surface = self
             .http
             .as_mut()
             .expect("wasi:http called on a plugin without the HttpClient permission");
         WasiHttpCtxView {
-            ctx,
+            ctx: &mut surface.ctx,
             table: &mut self.table,
-            hooks: wasmtime_wasi_http::p2::default_hooks(),
+            hooks: &mut surface.hooks,
         }
     }
 }

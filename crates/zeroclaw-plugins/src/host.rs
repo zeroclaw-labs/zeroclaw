@@ -424,6 +424,16 @@ fn validate_manifest_shape(
         )));
     }
 
+    // The `[egress]` declaration is signature-covered content, so a malformed
+    // pattern is a malformed package: reject it at discovery and at install
+    // rather than silently dropping the entry. This is validation of the
+    // *declaration* only — it still grants nothing (ADR-013).
+    zeroclaw_infra::net_guard::normalize_egress_patterns(
+        &manifest.egress.hosts,
+        &format!("plugin '{}' egress.hosts", manifest.name),
+    )
+    .map_err(|e| PluginError::InvalidManifest(e.to_string()))?;
+
     if manifest.capabilities.contains(&PluginCapability::Skill) {
         validate_skill_bundle(&manifest.name, plugin_dir)?;
     }
@@ -896,6 +906,118 @@ capabilities = ["tool"]
         let host = PluginHost::new(dir.path()).unwrap();
         // Discovery skips invalid manifests rather than failing.
         assert!(host.list_plugins().is_empty());
+    }
+
+    /// A manifest with an unparseable `[egress]` grammar is rejected outright
+    /// rather than having the bad entry dropped: silently discarding a
+    /// destination the publisher believed they declared is how a declaration
+    /// and the operator's seeded grant drift apart.
+    #[test]
+    fn invalid_egress_grammar_rejects_the_manifest_at_discovery() {
+        for bad in [
+            "\"*\"",
+            "\"*.com\"",
+            "\"https://api.example.com\"",
+            "\"api.example.com:8443\"",
+        ] {
+            let dir = tempdir().unwrap();
+            let plugin_dir = dir.path().join("plugins").join("bad-egress");
+            std::fs::create_dir_all(&plugin_dir).unwrap();
+            std::fs::write(
+                plugin_dir.join("manifest.toml"),
+                format!(
+                    "name = \"bad-egress\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\ncapabilities = [\"tool\"]\n\n[egress]\nhosts = [{bad}]\n"
+                ),
+            )
+            .unwrap();
+
+            let host = PluginHost::new(dir.path()).unwrap();
+            assert!(
+                host.list_plugins().is_empty(),
+                "egress entry {bad} must reject the manifest"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_egress_grammar_rejects_the_manifest_at_install() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("plugin.wasm"), b"\0asm").unwrap();
+        std::fs::write(
+            source.join("manifest.toml"),
+            "name = \"bad-egress\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\ncapabilities = [\"tool\"]\n\n[egress]\nhosts = [\"*\"]\n",
+        )
+        .unwrap();
+
+        let mut host = PluginHost::new(&dir.path().join("home")).unwrap();
+        let err = host
+            .install(source.to_str().unwrap())
+            .expect_err("install must refuse an invalid egress declaration");
+        assert!(
+            format!("{err}").contains("allow-all"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A valid declaration parses, survives discovery, and — critically — still
+    /// grants nothing. Reach comes only from the operator's config entry.
+    #[test]
+    fn valid_egress_declaration_is_admitted_but_confers_no_reach() {
+        let dir = tempdir().unwrap();
+        let plugin_dir = dir.path().join("plugins").join("declares");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.toml"),
+            "name = \"declares\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\ncapabilities = [\"tool\"]\npermissions = [\"http_client\"]\n\n[egress]\nhosts = [\"api.example.com\", \"*.cdn.example.com\"]\n",
+        )
+        .unwrap();
+
+        let host = PluginHost::new(dir.path()).unwrap();
+        let plugins = host.list_plugins();
+        assert_eq!(plugins.len(), 1);
+        let manifest = &host.loaded.get("declares").unwrap().manifest;
+        assert_eq!(
+            manifest.egress.hosts,
+            vec![
+                "api.example.com".to_string(),
+                "*.cdn.example.com".to_string()
+            ]
+        );
+        // `PluginInfo` is the surface the CLI and registry render. The
+        // declaration is deliberately absent from it as a grant-shaped value.
+        assert!(
+            plugins[0]
+                .permissions
+                .contains(&crate::PluginPermission::HttpClient)
+        );
+    }
+
+    /// A manifest written before this field parses unchanged and declares
+    /// nothing — absent and empty are the same state.
+    #[test]
+    fn manifest_without_an_egress_table_declares_nothing() {
+        let dir = tempdir().unwrap();
+        let plugin_dir = dir.path().join("plugins").join("legacy");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.toml"),
+            "name = \"legacy\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\ncapabilities = [\"tool\"]\npermissions = [\"http_client\"]\n",
+        )
+        .unwrap();
+
+        let host = PluginHost::new(dir.path()).unwrap();
+        assert_eq!(host.list_plugins().len(), 1);
+        assert!(
+            host.loaded
+                .get("legacy")
+                .unwrap()
+                .manifest
+                .egress
+                .hosts
+                .is_empty()
+        );
     }
 
     #[test]
