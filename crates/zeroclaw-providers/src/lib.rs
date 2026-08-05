@@ -3116,6 +3116,22 @@ mod tests {
     }
 
     #[test]
+    fn crusoe_default_url_matches_endpoint_enum() {
+        use crate::factory::CompatFamilySpec;
+        use zeroclaw_config::schema::CrusoeModelProviderConfig;
+        // Cross-surface drift guard: the factory default URL must equal the
+        // config-owned `CrusoeEndpoint` URI. Both reference
+        // `CrusoeEndpoint::DEFAULT_URI`, so this asserts the single-source-of-
+        // truth wiring stays intact if either surface is edited independently.
+        assert_eq!(
+            <CrusoeModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
+            <zeroclaw_config::schema::CrusoeEndpoint as zeroclaw_config::schema::ModelEndpoint>::uri(
+                &zeroclaw_config::schema::CrusoeEndpoint::Default,
+            ),
+        );
+    }
+
+    #[test]
     fn factory_custom_with_resolved_uri() {
         let options = ModelProviderRuntimeOptions {
             provider_api_url: Some("https://my-llm.example.com".to_string()),

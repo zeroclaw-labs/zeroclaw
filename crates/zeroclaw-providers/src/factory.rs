@@ -477,7 +477,7 @@ impl CompatFamilySpec for TogetherModelProviderConfig {
 }
 impl CompatFamilySpec for CrusoeModelProviderConfig {
     const DISPLAY: &'static str = "Crusoe Managed Inference";
-    const DEFAULT_URL: &'static str = "https://api.inference.crusoecloud.com/v1";
+    const DEFAULT_URL: &'static str = zeroclaw_config::schema::CrusoeEndpoint::DEFAULT_URI;
     const AUTH: AuthStyle = AuthStyle::Bearer;
     const MODELS_DEV_KEY: Option<&'static str> = None;
 }
