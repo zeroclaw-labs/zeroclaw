@@ -728,6 +728,10 @@ impl<T: ModelProvider + ?Sized> ModelProvider for Arc<T> {
         self.as_ref().capabilities_for_model(model)
     }
 
+    async fn warm_capabilities_metadata(&self) {
+        self.as_ref().warm_capabilities_metadata().await
+    }
+
     fn default_max_tokens(&self) -> u32 {
         self.as_ref().default_max_tokens()
     }
@@ -938,5 +942,58 @@ mod turn_order_tests {
         let mut msgs: Vec<ChatMessage> = vec![];
         ChatMessage::sanitize_leading_turn_order(&mut msgs);
         assert!(msgs.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod arc_delegation_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct WarmRecordingMock {
+        warm_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for WarmRecordingMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
+        async fn warm_capabilities_metadata(&self) {
+            self.warm_calls.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    impl crate::attribution::Attributable for WarmRecordingMock {
+        fn role(&self) -> crate::attribution::Role {
+            crate::attribution::Role::Provider(crate::attribution::ProviderKind::Model(
+                crate::attribution::ModelProviderKind::Custom,
+            ))
+        }
+        fn alias(&self) -> &str {
+            "WarmRecordingMock"
+        }
+    }
+
+    #[tokio::test]
+    async fn arc_blanket_delegates_warm_capabilities_metadata() {
+        let warm_calls = Arc::new(AtomicUsize::new(0));
+        let wrapped: Arc<dyn ModelProvider> = Arc::new(WarmRecordingMock {
+            warm_calls: Arc::clone(&warm_calls),
+        });
+
+        wrapped.warm_capabilities_metadata().await;
+
+        assert_eq!(
+            warm_calls.load(Ordering::SeqCst),
+            1,
+            "the Arc<T> blanket must delegate warm_capabilities_metadata to the inner provider"
+        );
     }
 }
