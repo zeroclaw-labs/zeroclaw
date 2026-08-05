@@ -1008,13 +1008,30 @@ impl AcpServer {
             }
         };
 
-        let stored_messages: Vec<_> = data
+        let mut stored_messages: Vec<_> = data
             .messages
             .into_iter()
             .filter(|message| {
                 !matches!(message, ConversationMessage::Chat(chat) if chat.role == "system")
             })
             .collect();
+        // Repair an interrupted native-tool exchange left by a failed/cancelled
+        // turn before it is seeded into provider history or replayed to the
+        // client, while the transcript is still typed `ConversationMessage`.
+        let repaired_tool_calls = Self::repair_incomplete_tool_calls(&mut stored_messages);
+        if repaired_tool_calls > 0 {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Delete)
+                    .with_category(::zeroclaw_log::EventCategory::Channel)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "session_id": session_id,
+                        "assistant_messages_repaired": repaired_tool_calls,
+                    })),
+                "ACP session/load repaired interrupted tool calls in restored transcript"
+            );
+        }
         let restore_trim_event =
             agent.seed_conversation_history_with_event(stored_messages.clone());
         let dropped_messages = match &restore_trim_event {
@@ -1748,6 +1765,70 @@ impl AcpServer {
             zeroclaw_runtime::i18n::get_required_cli_string("turn-failed"),
         )));
         messages
+    }
+
+    /// Repair an interrupted native-tool exchange in a restored ACP transcript
+    /// while it is still typed `ConversationMessage` data. A turn that failed or
+    /// was cancelled after the model emitted a tool call but before its result
+    /// existed leaves an `AssistantToolCalls` whose call id no `ToolResults`
+    /// ever answered; seeding it into provider history (and replaying it to the
+    /// client) would carry an unmatched tool call into the next request.
+    ///
+    /// The repair runs here, on typed data, precisely because the shared flat
+    /// preflight cannot: a genuine native call is the `AssistantToolCalls`
+    /// variant, so an ordinary assistant `Chat` message whose text merely
+    /// contains a `tool_calls` array is never mistaken for one. Only unpaired
+    /// calls are dropped, preserving any accompanying assistant text as a plain
+    /// assistant message. Orphaned `ToolResults` (a result whose call was
+    /// dropped) are intentionally left to the provider adapters and
+    /// `remove_orphaned_tool_messages`, which keep their id-recovery contracts.
+    fn repair_incomplete_tool_calls(messages: &mut Vec<ConversationMessage>) -> usize {
+        let resolved: std::collections::HashSet<String> = messages
+            .iter()
+            .filter_map(|message| match message {
+                ConversationMessage::ToolResults(results) => Some(results),
+                _ => None,
+            })
+            .flat_map(|results| results.iter().map(|result| result.tool_call_id.clone()))
+            .collect();
+
+        let mut repaired = 0usize;
+        let mut i = 0;
+        while i < messages.len() {
+            let ConversationMessage::AssistantToolCalls { text, tool_calls, .. } = &mut messages[i]
+            else {
+                i += 1;
+                continue;
+            };
+            let before = tool_calls.len();
+            tool_calls.retain(|call| resolved.contains(&call.id));
+            if tool_calls.len() == before {
+                i += 1;
+                continue;
+            }
+            repaired += 1;
+            if !tool_calls.is_empty() {
+                i += 1;
+                continue;
+            }
+            // Every call was unpaired. Keep any salvageable assistant text as a
+            // plain message; otherwise drop the now-empty tool-call turn.
+            let salvaged = text
+                .as_deref()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(ToString::to_string);
+            match salvaged {
+                Some(text) => {
+                    messages[i] = ConversationMessage::Chat(ChatMessage::assistant(text));
+                    i += 1;
+                }
+                None => {
+                    messages.remove(i);
+                }
+            }
+        }
+        repaired
     }
 
     /// Durably append a turn's new messages to the ACP session store.
@@ -4479,6 +4560,86 @@ mod tests {
             }
             other => panic!("expected trailing failure marker, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn repair_incomplete_tool_calls_strips_unpaired_native_calls_only() {
+        use zeroclaw_api::model_provider::{ConversationMessage, ToolCall, ToolResultMessage};
+
+        fn call(id: &str) -> ToolCall {
+            ToolCall {
+                id: id.to_string(),
+                name: "shell".to_string(),
+                arguments: "{}".to_string(),
+                extra_content: None,
+            }
+        }
+
+        // Paired call + its result: left untouched.
+        let mut paired = vec![
+            ConversationMessage::AssistantToolCalls {
+                text: None,
+                tool_calls: vec![call("toolu_ok")],
+                reasoning_content: None,
+            },
+            ConversationMessage::ToolResults(vec![ToolResultMessage {
+                tool_call_id: "toolu_ok".to_string(),
+                content: "done".to_string(),
+                tool_name: "shell".to_string(),
+            }]),
+        ];
+        assert_eq!(AcpServer::repair_incomplete_tool_calls(&mut paired), 0);
+        assert_eq!(paired.len(), 2);
+
+        // Partial: keep the paired call, drop the unpaired one.
+        let mut partial = vec![
+            ConversationMessage::AssistantToolCalls {
+                text: Some("working".to_string()),
+                tool_calls: vec![call("toolu_ok"), call("toolu_orphan")],
+                reasoning_content: None,
+            },
+            ConversationMessage::ToolResults(vec![ToolResultMessage {
+                tool_call_id: "toolu_ok".to_string(),
+                content: "done".to_string(),
+                tool_name: "shell".to_string(),
+            }]),
+        ];
+        assert_eq!(AcpServer::repair_incomplete_tool_calls(&mut partial), 1);
+        match &partial[0] {
+            ConversationMessage::AssistantToolCalls { tool_calls, .. } => {
+                assert_eq!(tool_calls.len(), 1);
+                assert_eq!(tool_calls[0].id, "toolu_ok");
+            }
+            other => panic!("expected surviving paired call, got {other:?}"),
+        }
+
+        // Fully unpaired with salvageable text: becomes a plain assistant message.
+        let mut salvage = vec![ConversationMessage::AssistantToolCalls {
+            text: Some("let me check".to_string()),
+            tool_calls: vec![call("toolu_orphan")],
+            reasoning_content: None,
+        }];
+        assert_eq!(AcpServer::repair_incomplete_tool_calls(&mut salvage), 1);
+        match &salvage[0] {
+            ConversationMessage::Chat(chat) => {
+                assert_eq!(chat.role, "assistant");
+                assert_eq!(chat.content, "let me check");
+            }
+            other => panic!("expected salvaged assistant text, got {other:?}"),
+        }
+
+        // Fully unpaired with no text: message dropped entirely.
+        let mut dropped = vec![
+            ConversationMessage::Chat(ChatMessage::user("q")),
+            ConversationMessage::AssistantToolCalls {
+                text: None,
+                tool_calls: vec![call("toolu_orphan")],
+                reasoning_content: None,
+            },
+        ];
+        assert_eq!(AcpServer::repair_incomplete_tool_calls(&mut dropped), 1);
+        assert_eq!(dropped.len(), 1);
+        assert!(matches!(&dropped[0], ConversationMessage::Chat(c) if c.role == "user"));
     }
 
     #[tokio::test]
