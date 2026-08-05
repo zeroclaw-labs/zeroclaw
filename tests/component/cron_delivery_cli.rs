@@ -277,6 +277,155 @@ fn cron_update_patches_delivery_without_dropping_unspecified_fields() {
     assert_eq!(untouched.delivery.to.as_deref(), Some("222"));
 }
 
+/// A config that declares a `[cron.<id>]` job and an agent that claims it, so
+/// the daemon materializes it with `source = "declarative"`. `agent_for_cron_job`
+/// resolves the owner from `[agents.<x>].cron_jobs`; without that membership the
+/// sync skips the entry as an orphan and nothing is materialized.
+const DECLARATIVE_CONFIG_TOML: &str = r#"schema_version = 3
+locale = "en"
+
+[risk_profiles.default]
+allowed_commands = ["echo"]
+
+[agents.default]
+enabled = true
+risk_profile = "default"
+cron_jobs = ["decl_job"]
+
+[cron.decl_job]
+job_type = "shell"
+command = "echo declarative"
+enabled = true
+
+[cron.decl_job.schedule]
+kind = "cron"
+expr = "0 2 * * *"
+
+[cron.decl_job.delivery]
+mode = "announce"
+channel = "telegram"
+to = "111"
+"#;
+
+/// Regression: a `[cron.<id>]` job is owned by config.toml. Before the guard,
+/// `cron update --channel …` against one reported success and wrote the row,
+/// and `sync_declarative_jobs` then rewrote every declarative column from the
+/// config on the next daemon start, so the change silently disappeared.
+///
+/// The store-level unit test (`update_job_rejects_delivery_for_declarative_job`)
+/// proves the guard and demonstrates the revert it prevents. This asserts what
+/// the operator actually sees: a non-zero exit, an error naming the config key,
+/// and a stored row that did not move.
+/// Materialize `[cron.decl_job]` into the store exactly as a daemon start would,
+/// mirroring `DECLARATIVE_CONFIG_TOML` above. The declaration and the claiming
+/// agent are both required: `sync_declarative_jobs` skips any entry no
+/// `[agents.<x>].cron_jobs` list claims, treating it as an orphan.
+fn seed_declarative_job(config_dir: &Path) {
+    let mut config = Config {
+        data_dir: config_dir.join("data"),
+        config_path: config_dir.join("config.toml"),
+        ..Config::default()
+    };
+    std::fs::create_dir_all(&config.data_dir).expect("create data dir");
+
+    config.agents.insert(
+        "default".to_string(),
+        zeroclaw_config::schema::AliasedAgentConfig {
+            enabled: true,
+            cron_jobs: vec!["decl_job".to_string()],
+            ..Default::default()
+        },
+    );
+
+    let decl = zeroclaw_config::schema::CronJobDecl {
+        name: Some("decl_job".to_string()),
+        job_type: "shell".to_string(),
+        schedule: zeroclaw_config::schema::CronScheduleDecl::Cron {
+            expr: "0 2 * * *".to_string(),
+            tz: None,
+        },
+        command: Some("echo declarative".to_string()),
+        prompt: None,
+        enabled: true,
+        model: None,
+        allowed_tools: None,
+        uses_memory: true,
+        session_target: None,
+        delivery: Some(zeroclaw_config::schema::DeliveryConfigDecl {
+            mode: "announce".to_string(),
+            channel: Some("telegram".to_string()),
+            to: Some("111".to_string()),
+            thread_id: None,
+            best_effort: true,
+        }),
+        shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Wrapped,
+    };
+
+    let mut decls = std::collections::HashMap::new();
+    decls.insert("decl_job".to_string(), decl.clone());
+    config.cron.insert("decl_job".to_string(), decl);
+
+    cron::sync_declarative_jobs(&config, &decls).expect("materialize declarative job");
+}
+
+#[test]
+fn cron_update_rejects_delivery_on_a_declarative_job() {
+    let dir = tempfile::tempdir().expect("temp config dir");
+    let config_dir = dir.path();
+    std::fs::write(config_dir.join("config.toml"), DECLARATIVE_CONFIG_TOML).expect("write config");
+
+    // Materialize the declarative row before invoking the CLI. No CLI command
+    // runs `sync_declarative_jobs`; the only production caller is the scheduler's
+    // daemon-startup path (`cron/scheduler.rs`). Seeding through the library is
+    // how `zeroclaw-gateway`'s own declarative test sets this up, and it keeps the
+    // assertions on what the binary does rather than on how the row got there.
+    seed_declarative_job(config_dir);
+
+    let before = stored_job(config_dir, "decl_job");
+    assert_eq!(
+        before.source, "declarative",
+        "the job must be materialized as declarative for this test to mean anything"
+    );
+    assert_eq!(before.delivery.to.as_deref(), Some("111"));
+
+    let rejected = run(
+        config_dir,
+        &[
+            "cron",
+            "update",
+            "decl_job",
+            "--agent",
+            "default",
+            "--channel",
+            "discord",
+            "--to",
+            "222",
+        ],
+    );
+    assert!(
+        !rejected.status.success(),
+        "a delivery update on a config-owned job must fail\nstdout:\n{}",
+        stdout_of(&rejected)
+    );
+    let stderr = stderr_of(&rejected);
+    assert!(
+        stderr.contains("config.toml"),
+        "the error must point at the canonical source:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("[cron.decl_job].delivery"),
+        "the error must name the exact key to edit:\n{stderr}"
+    );
+
+    let after = stored_job(config_dir, "decl_job");
+    assert_eq!(
+        after.delivery.channel.as_deref(),
+        Some("telegram"),
+        "the rejected update must leave the stored row untouched"
+    );
+    assert_eq!(after.delivery.to.as_deref(), Some("111"));
+}
+
 /// Regression: Telegram group and channel ids are negative (`-100…`), and clap
 /// treats a hyphen-prefixed token as a flag unless the argument opts out. Before
 /// `allow_negative_numbers`, `--to -100123456` exited 2 with
