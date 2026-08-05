@@ -94,12 +94,20 @@ pub fn tool_dispatcher_for_provider(
     }
 }
 
+// Debug so a failing routing assertion can print which variant and which
+// source it actually got; without it the test just says "assertion failed".
+#[derive(Debug)]
 pub(crate) enum RoutedApproval {
     /// Use this response. `decider` names the channel that answered, for audit
     /// attribution; `None` for a bridge-synthesized fail-closed deny.
+    ///
+    /// `source` says whether a human actually decided. `decider` cannot answer
+    /// that on its own: it is also `None` when a single non-fan-out channel
+    /// relays a real operator answer.
     Decided {
         response: zeroclaw_api::channel::ChannelApprovalResponse,
         decider: Option<String>,
+        source: zeroclaw_api::channel::ApprovalSource,
     },
     /// Explicit `InheritOriginator` — defer to the originating-channel fan-out.
     Fallthrough,
@@ -117,22 +125,45 @@ pub(crate) async fn resolve_routed_approval(
         .find(|(name, _)| name.as_str() == route.approver_channel)
         .map(|(name, channel)| (name.clone(), Arc::clone(channel)));
 
-    let reason: &str = if let Some((channel_name, channel)) = approver {
-        let dur = std::time::Duration::from_secs(route.timeout_secs.max(1));
-        match tokio::time::timeout(dur, channel.request_approval(recipient, request)).await {
-            Ok(Ok(Some(response))) => {
-                return RoutedApproval::Decided {
-                    response,
-                    decider: Some(channel_name),
-                };
+    // `source` is tracked alongside `reason` so the fail-closed deny below can
+    // say WHY no operator decided, rather than leaving the caller to guess from
+    // a missing decider.
+    let (reason, source): (&str, zeroclaw_api::channel::ApprovalSource) =
+        if let Some((channel_name, channel)) = approver {
+            let dur = std::time::Duration::from_secs(route.timeout_secs.max(1));
+            // Attributed, not legacy: if the approver channel synthesizes its own
+            // `Some(Deny)` (its inner timeout firing before this outer one), that
+            // is a runtime denial and must not be relabelled as the approver's
+            // decision just because a response came back.
+            match tokio::time::timeout(dur, channel.request_approval_attributed(recipient, request))
+                .await
+            {
+                Ok(Ok(Some(attributed))) => {
+                    return RoutedApproval::Decided {
+                        response: attributed.response,
+                        decider: Some(channel_name),
+                        source: attributed.source,
+                    };
+                }
+                Ok(Ok(None)) => (
+                    "approver returned no decision",
+                    zeroclaw_api::channel::ApprovalSource::Unreachable,
+                ),
+                Ok(Err(_)) => (
+                    "approver channel unreachable",
+                    zeroclaw_api::channel::ApprovalSource::Unreachable,
+                ),
+                Err(_) => (
+                    "approver timed out",
+                    zeroclaw_api::channel::ApprovalSource::TimedOut,
+                ),
             }
-            Ok(Ok(None)) => "approver returned no decision",
-            Ok(Err(_)) => "approver channel unreachable",
-            Err(_) => "approver timed out",
-        }
-    } else {
-        "approver channel not registered"
-    };
+        } else {
+            (
+                "approver channel not registered",
+                zeroclaw_api::channel::ApprovalSource::Unavailable,
+            )
+        };
 
     match route.on_no_approver {
         zeroclaw_config::autonomy::OnNoApprover::Deny => {
@@ -151,6 +182,10 @@ pub(crate) async fn resolve_routed_approval(
             RoutedApproval::Decided {
                 response: zeroclaw_api::channel::ChannelApprovalResponse::Deny,
                 decider: None,
+                // The runtime denied this, not a person. Carrying the specific
+                // reason lets the tool result say so instead of reporting a
+                // user denial that never happened.
+                source,
             }
         }
         zeroclaw_config::autonomy::OnNoApprover::InheritOriginator => {
@@ -233,12 +268,18 @@ impl zeroclaw_api::channel::Channel for RoutedApprovalChannel {
         match resolve_routed_approval(&self.handles, &self.route, recipient, request).await {
             // The deciding approver's name travels on the response itself;
             // `None` for a bridge-synthesized fail-closed deny.
-            RoutedApproval::Decided { response, decider } => {
-                Ok(Some(zeroclaw_api::channel::AttributedApprovalResponse {
-                    response,
-                    decided_by: decider,
-                }))
-            }
+            //
+            // Cross-crate construction: `AttributedApprovalResponse` is
+            // `#[non_exhaustive]`, so struct-literal syntax is forbidden from
+            // here. Build via the dedicated constructors.
+            RoutedApproval::Decided {
+                response,
+                decider,
+                source,
+            } => Ok(Some(
+                zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(response, source)
+                    .with_decider_opt(decider),
+            )),
             // No originating channel to inherit on this path; let the gate apply
             // the non-interactive default (auto-deny).
             RoutedApproval::Fallthrough => Ok(None),
@@ -1928,6 +1969,26 @@ impl Agent {
         Ok(())
     }
 
+    fn rebuild_streamed_system_prompt_for_active_provider(
+        &mut self,
+        loop_history: &mut [ChatMessage],
+    ) -> Result<()> {
+        let dispatcher = tool_dispatcher_for_provider(&self.config, self.model_provider.as_ref());
+        self.rebuild_system_prompt_for_dispatcher(dispatcher.as_ref())?;
+
+        let Some(ConversationMessage::Chat(persisted)) = self.history.first() else {
+            return Ok(());
+        };
+        let Some(active) = loop_history
+            .first_mut()
+            .filter(|message| message.role == "system")
+        else {
+            return Ok(());
+        };
+        active.content.clone_from(&persisted.content);
+        Ok(())
+    }
+
     fn try_apply_model_switch(
         &mut self,
         current_effective_model: &str,
@@ -2920,6 +2981,17 @@ impl Agent {
                             new_model,
                         )
                     {
+                        if let Err(error) = self
+                            .rebuild_streamed_system_prompt_for_active_provider(&mut loop_history)
+                        {
+                            let notice = self.trim_history(Some(&turn_id));
+                            forward_history_trim_notice(&event_tx, notice).await;
+                            return Err(StreamedTurnError {
+                                error,
+                                committed_response,
+                                new_messages: new_msgs,
+                            });
+                        }
                         let notice = self.trim_history(Some(&turn_id));
                         forward_history_trim_notice(&event_tx, notice).await;
                         effective_model = new_effective_model;
@@ -4534,6 +4606,69 @@ mod tests {
                 !prompt.contains(XML_TOOLS_MARKER),
                 "prompt must be rebuilt without XML tool listing"
             );
+        }
+
+        #[test]
+        fn streamed_provider_switch_refreshes_active_loop_skills_prompt() {
+            let workspace = tempfile::TempDir::new().expect("temp dir");
+            let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+                backend: "none".into(),
+                ..zeroclaw_config::schema::MemoryConfig::default()
+            };
+            let mem: Arc<dyn Memory> = Arc::from(
+                zeroclaw_memory::create_memory(&memory_cfg, workspace.path(), None)
+                    .expect("memory creation should succeed"),
+            );
+            let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+            let (provider, _) = capturing_provider(false);
+            let config = zeroclaw_config::schema::AliasedAgentConfig {
+                resolved: zeroclaw_config::schema::ResolvedRuntime {
+                    strict_tool_parsing: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let skills = vec![crate::skills::Skill {
+                name: "deploy".into(),
+                description: "Release safely".into(),
+                description_localizations: Default::default(),
+                version: "1.0.0".into(),
+                author: None,
+                tags: vec![],
+                tools: vec![],
+                prompts: vec!["Run smoke tests before deploy.".into()],
+                slash_options: Vec::new(),
+                always: false,
+                location: None,
+            }];
+            let mut agent = Agent::builder()
+                .model_provider(provider)
+                .tools(vec![Box::new(MockTool)])
+                .memory(mem)
+                .observer(observer)
+                .tool_dispatcher(Box::new(NativeToolDispatcher))
+                .config(config)
+                .skills(skills)
+                .skills_prompt_mode(zeroclaw_config::schema::SkillsPromptInjectionMode::Compact)
+                .workspace_dir(workspace.path().to_path_buf())
+                .build()
+                .expect("agent builder should succeed");
+            agent.history = vec![ConversationMessage::Chat(ChatMessage::system(
+                "stale compact prompt",
+            ))];
+            let mut loop_history = vec![ChatMessage::system("stale compact prompt")];
+
+            agent
+                .rebuild_streamed_system_prompt_for_active_provider(&mut loop_history)
+                .expect("streamed prompt rebuild should succeed");
+
+            assert!(
+                loop_history[0]
+                    .content
+                    .contains("Run smoke tests before deploy."),
+                "active loop history must receive the loader-safe inlined instructions"
+            );
+            assert!(!loop_history[0].content.contains("read_skill(name)"));
         }
 
         #[tokio::test]
@@ -8074,6 +8209,7 @@ mod tests {
                 .collect(),
             prompts: vec![],
             slash_options: Vec::new(),
+            always: false,
             location: None,
         }
     }
@@ -8202,6 +8338,7 @@ mod tests {
             }],
             prompts: vec![],
             slash_options: Vec::new(),
+            always: false,
             location: None,
         };
         tools::register_skill_tools_with_context(
@@ -9381,6 +9518,26 @@ mod tests {
                 ..zeroclaw_config::schema::Config::default()
             })),
         };
+        let agent_config = zeroclaw_config::schema::AliasedAgentConfig {
+            resolved: zeroclaw_config::schema::ResolvedRuntime {
+                strict_tool_parsing: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let skills = vec![crate::skills::Skill {
+            name: "deploy".into(),
+            description: "Release safely".into(),
+            description_localizations: Default::default(),
+            version: "1.0.0".into(),
+            author: None,
+            tags: vec![],
+            tools: vec![],
+            prompts: vec!["Run smoke tests before deploy.".into()],
+            slash_options: Vec::new(),
+            always: false,
+            location: None,
+        }];
 
         let mut agent = Agent::builder()
             .model_provider(provider)
@@ -9391,6 +9548,9 @@ mod tests {
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .config(agent_config)
+            .skills(skills)
+            .skills_prompt_mode(zeroclaw_config::schema::SkillsPromptInjectionMode::Compact)
             .workspace_dir(std::path::PathBuf::from("/tmp"))
             .model_provider_name("openai".to_string())
             .model_name("gpt-4o-mini".to_string())
@@ -9422,6 +9582,16 @@ mod tests {
         assert_eq!(
             agent.model_name, "llama3",
             "turn_streamed must commit the switched model after the tool result"
+        );
+        let prompt = match agent.history.first() {
+            Some(ConversationMessage::Chat(message)) if message.role == "system" => {
+                &message.content
+            }
+            _ => panic!("history must retain the rebuilt system prompt"),
+        };
+        assert!(
+            prompt.contains("Model: llama3"),
+            "turn_streamed must rebuild the system prompt against the switched model"
         );
 
         // The original provider is used for exactly the first call; the next
@@ -9544,12 +9714,21 @@ mod approval_route_tests {
             behavior: StubBehavior::Answer(ChannelApprovalResponse::Approve),
         }]);
         match resolve_routed_approval(&h, &route("ops", OnNoApprover::Deny), "r", &req()).await {
-            RoutedApproval::Decided { response, decider } => {
+            RoutedApproval::Decided {
+                response,
+                decider,
+                source,
+            } => {
                 assert_eq!(response, ChannelApprovalResponse::Approve);
                 assert_eq!(
                     decider.as_deref(),
                     Some("ops"),
                     "decider names the approver"
+                );
+                assert_eq!(
+                    source,
+                    zeroclaw_api::channel::ApprovalSource::Operator,
+                    "an approver's answer is an operator decision"
                 );
             }
             RoutedApproval::Fallthrough => panic!("expected a routed decision"),
@@ -9560,9 +9739,22 @@ mod approval_route_tests {
     async fn unregistered_approver_fails_closed_by_default() {
         let h = registry(vec![]);
         match resolve_routed_approval(&h, &route("ops", OnNoApprover::Deny), "r", &req()).await {
-            RoutedApproval::Decided { response, decider } => {
+            RoutedApproval::Decided {
+                response,
+                decider,
+                source,
+            } => {
                 assert_eq!(response, ChannelApprovalResponse::Deny, "fail-closed deny");
                 assert!(decider.is_none(), "synthetic deny has no decider");
+                // The regression this guards: a fail-closed deny is Some(Deny)
+                // with no decider, so anything inferring "a user decided" from
+                // the presence of a response reports a denial nobody made.
+                assert_eq!(
+                    source,
+                    zeroclaw_api::channel::ApprovalSource::Unavailable,
+                    "an unregistered approver is a runtime denial, not a user's"
+                );
+                assert!(source.is_runtime_fail_closed());
             }
             RoutedApproval::Fallthrough => panic!("default policy must NOT fall through"),
         }
@@ -9591,13 +9783,17 @@ mod approval_route_tests {
             behavior: StubBehavior::NoDecision,
         }]);
         let out = resolve_routed_approval(&h, &route("ops", OnNoApprover::Deny), "r", &req()).await;
-        assert!(matches!(
-            out,
-            RoutedApproval::Decided {
-                response: ChannelApprovalResponse::Deny,
-                ..
-            }
-        ));
+        assert!(
+            matches!(
+                out,
+                RoutedApproval::Decided {
+                    response: ChannelApprovalResponse::Deny,
+                    source: zeroclaw_api::channel::ApprovalSource::Unreachable,
+                    ..
+                }
+            ),
+            "an approver that returns no decision is a runtime denial: {out:?}"
+        );
     }
 
     // The route timeout (1s) fires and cancels the stub's long sleep, so this
@@ -9609,13 +9805,19 @@ mod approval_route_tests {
             behavior: StubBehavior::Slow,
         }]);
         let out = resolve_routed_approval(&h, &route("ops", OnNoApprover::Deny), "r", &req()).await;
-        assert!(matches!(
-            out,
-            RoutedApproval::Decided {
-                response: ChannelApprovalResponse::Deny,
-                ..
-            }
-        ));
+        // A timeout is the case most easily mistaken for a user's "no": the
+        // route returns Some(Deny) exactly as an operator denial would.
+        assert!(
+            matches!(
+                out,
+                RoutedApproval::Decided {
+                    response: ChannelApprovalResponse::Deny,
+                    source: zeroclaw_api::channel::ApprovalSource::TimedOut,
+                    ..
+                }
+            ),
+            "a timed-out approver is a runtime denial, not a user's: {out:?}"
+        );
     }
 
     use zeroclaw_api::channel::Channel as _;

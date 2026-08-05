@@ -4084,11 +4084,24 @@ Ensure only one `zeroclaw` process is using this bot token."
         Ok(())
     }
 
+    /// Delegates to [`Self::request_approval_attributed`] and drops the
+    /// provenance, so the prompt/timeout logic lives in exactly one place.
     async fn request_approval(
         &self,
         recipient: &str,
         request: &zeroclaw_api::channel::ChannelApprovalRequest,
     ) -> anyhow::Result<Option<zeroclaw_api::channel::ChannelApprovalResponse>> {
+        Ok(self
+            .request_approval_attributed(recipient, request)
+            .await?
+            .map(|attributed| attributed.response))
+    }
+
+    async fn request_approval_attributed(
+        &self,
+        recipient: &str,
+        request: &zeroclaw_api::channel::ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
         use zeroclaw_api::channel::ChannelApprovalResponse;
 
         // Parse recipient for chat_id + optional thread_id ("chat_id:thread_id" format).
@@ -4213,11 +4226,29 @@ Ensure only one `zeroclaw` process is using this bot token."
         // `channels.telegram.approval_timeout_secs` (default 120s).
         let result =
             match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), rx).await {
-                Ok(Ok(response)) => Some(response),
-                _ => {
-                    // Timeout or sender dropped — clean up and deny.
+                Ok(Ok(response)) => Some(
+                    zeroclaw_api::channel::AttributedApprovalResponse::operator(response),
+                ),
+                Ok(Err(_)) => {
+                    // Sender dropped — clean up and deny. Nobody tapped.
                     self.pending_approvals.lock().await.remove(&approval_id);
-                    Some(ChannelApprovalResponse::Deny)
+                    Some(
+                        zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                            ChannelApprovalResponse::Deny,
+                            zeroclaw_api::channel::ApprovalSource::Unreachable,
+                        ),
+                    )
+                }
+                Err(_) => {
+                    // Timeout — clean up and deny. This is the runtime's deny,
+                    // not the operator's.
+                    self.pending_approvals.lock().await.remove(&approval_id);
+                    Some(
+                        zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                            ChannelApprovalResponse::Deny,
+                            zeroclaw_api::channel::ApprovalSource::TimedOut,
+                        ),
+                    )
                 }
             };
 
