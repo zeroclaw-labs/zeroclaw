@@ -9115,6 +9115,7 @@ fn build_channel_by_id(
                 .with_transcription(config.transcription.clone())
                 .with_tts(&config)
                 .with_workspace_dir(workspace_dir)
+                .with_per_user_session(tg.per_user_session)
                 .with_approval_timeout_secs(tg.approval_timeout_secs),
             ))
         }
@@ -10404,6 +10405,7 @@ fn collect_configured_channels(
                     .with_workspace_dir(config.channel_workspace_dir(&format!("telegram.{alias}")))
                     .with_proxy_url(tg.proxy_url.clone())
                     .with_tool_command_specs(tool_specs.to_vec())
+                    .with_per_user_session(tg.per_user_session)
                     .with_approval_timeout_secs(tg.approval_timeout_secs),
                 ),
                 tg,
@@ -33401,6 +33403,7 @@ This is an example JSON object for profile settings."#;
                 draft_update_interval_ms: 1000,
                 interrupt_on_new_message: false,
                 mention_only: false,
+                per_user_session: true,
                 ack_reactions: None,
                 proxy_url: None,
                 approval_timeout_secs: 120,
@@ -33430,6 +33433,7 @@ This is an example JSON object for profile settings."#;
                 draft_update_interval_ms: 1000,
                 interrupt_on_new_message: false,
                 mention_only: false,
+                per_user_session: true,
                 ack_reactions: None,
                 proxy_url: None,
                 approval_timeout_secs: 120,
