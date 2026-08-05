@@ -86,6 +86,7 @@ opentelemetry = { version = "0.32", default-features = false, features = ["trace
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "metrics"], optional = true }
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-blocking-client", "reqwest-rustls-webpki-roots"], optional = true }
 solana-sdk = { version = "2.1", features = ["full"], optional = true }
+solana-system-interface = { version = "2", optional = true }
 # Optional deps for specific features
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -110,7 +111,8 @@ browser-native = []
 plugins-wasm = ["dep:zeroclaw-plugins", "zeroclaw-plugins/plugins-wasmtime"]
 webauthn = []
 sandbox-bubblewrap = []
-solana-sdk = ["dep:solana-sdk"]
+solana-sdk = ["dep:solana-sdk", "dep:solana-system-interface"]
+solana-system-interface = ["dep:solana-system-interface"]
 
 [dev-dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }

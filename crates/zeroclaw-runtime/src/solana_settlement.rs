@@ -16,8 +16,8 @@ use std::str::FromStr;
 use solana_sdk::message::Message;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signer};
-use solana_sdk::system_instruction;
 use solana_sdk::transaction::Transaction;
+use solana_system_interface::instruction as system_instruction;
 
 /// A settlement that passed chain verification and is ready to broadcast.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -199,7 +199,11 @@ mod tests {
         assert_eq!(tx.signatures.len(), 1);
         // The canonical check: every signature in the transaction verifies
         // against the message.
-        assert!(tx.verify(), "transaction signatures must verify");
+        assert!(
+            tx.verify().is_ok(),
+            "transaction signatures must verify: {:?}",
+            tx.verify().err()
+        );
     }
 
     #[test]
