@@ -3630,7 +3630,138 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn computer_use_dispatch_sends_canonicalized_path_to_sidecar() {
+    async fn computer_use_dispatch_rejects_runtime_config_target_before_sidecar() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        let config_dir = tmp.path().join("config");
+        tokio::fs::create_dir_all(&ws).await.unwrap();
+        tokio::fs::create_dir_all(&config_dir).await.unwrap();
+        let config_path = config_dir.join("config.toml");
+        tokio::fs::write(&config_path, b"").await.unwrap();
+
+        // POST must never be reached: the ComputerUse runtime-config guard
+        // rejects before any sidecar action request.
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: ws.clone(),
+            allowed_roots: vec![ws.clone(), config_dir.clone()],
+            config_path: Some(config_path.clone()),
+            ..SecurityPolicy::default()
+        });
+
+        let mut config = test_computer_use_config();
+        config.endpoint = server.uri();
+        let tool = BrowserTool::new_with_backend(
+            security,
+            vec!["*".into()],
+            None,
+            "computer_use".into(),
+            None,
+            true,
+            "http://127.0.0.1:9515".into(),
+            None,
+            config,
+            Vec::new(),
+        )
+        .unwrap();
+
+        let args = json!({
+            "action": "screenshot",
+            "path": config_path.to_string_lossy().to_string()
+        });
+
+        // Validation happens in execute_computer_use_action, returns ToolResult with error.
+        let result = tool.execute(args).await.unwrap();
+        assert!(!result.success, "Expected runtime-config rejection");
+        let error = result.error.expect("Expected error in result");
+        assert!(
+            error.contains("runtime config") || error.contains("Refusing"),
+            "Expected runtime-config rejection, got: {}",
+            error
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn computer_use_dispatch_rejects_symlink_target_before_sidecar() {
+        use std::os::unix::fs::symlink;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        let outside = tmp.path().join("outside");
+        tokio::fs::create_dir_all(&ws).await.unwrap();
+        tokio::fs::create_dir_all(&outside).await.unwrap();
+
+        // Create a symlink inside the workspace pointing outside.
+        let link_path = ws.join("page.png");
+        let target_path = outside.join("real.txt");
+        tokio::fs::write(&target_path, b"real").await.unwrap();
+        symlink(&target_path, &link_path).unwrap();
+
+        // POST must never be reached: the ComputerUse symlink-target guard
+        // rejects before any sidecar action request.
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: ws.clone(),
+            allowed_roots: vec![ws.clone()],
+            ..SecurityPolicy::default()
+        });
+
+        let mut config = test_computer_use_config();
+        config.endpoint = server.uri();
+        let tool = BrowserTool::new_with_backend(
+            security,
+            vec!["*".into()],
+            None,
+            "computer_use".into(),
+            None,
+            true,
+            "http://127.0.0.1:9515".into(),
+            None,
+            config,
+            Vec::new(),
+        )
+        .unwrap();
+
+        let args = json!({
+            "action": "screenshot",
+            "path": "page.png"
+        });
+
+        // Validation happens in execute_computer_use_action, returns ToolResult with error.
+        let result = tool.execute(args).await.unwrap();
+        assert!(!result.success, "Expected symlink-target rejection");
+        let error = result.error.expect("Expected error in result");
+        assert!(
+            error.contains("symlink"),
+            "Expected symlink-target rejection, got: {}",
+            error
+        );
+    }
+
+    #[tokio::test]
+    async fn computer_use_dispatch_writes_validated_png_locally_without_forwarding_path() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -3691,8 +3822,9 @@ mod tests {
             "path": page_path.to_string_lossy().to_string()
         });
 
-        // Should succeed - path is validated but NOT forwarded to sidecar
-        // Sidecar returns PNG, we write it locally
+        // Should succeed - path is validated locally but NOT forwarded to the
+        // sidecar. The sidecar returns PNG bytes and ZeroClaw performs the
+        // validated local write.
         let result = tool.execute(args).await.unwrap();
         assert!(
             result.success,
@@ -3700,47 +3832,74 @@ mod tests {
             result.error
         );
 
-        // Verify sidecar was called (without path in params)
+        // The fail-closed contract: exactly one sidecar action request, and the
+        // destination path is absent from its params.
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1);
         let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
         let params = body.get("params").unwrap().as_object().unwrap();
-        // Path should NOT be in params anymore
         assert!(
             !params.contains_key("path"),
             "Path should not be forwarded to sidecar"
+        );
+
+        // ZeroClaw performed the validated local write: the pre-existing file
+        // was overwritten with the decoded PNG bytes from the sidecar.
+        let expected_png = base64::engine::general_purpose::STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")
+            .unwrap();
+        let written = tokio::fs::read(&page_path).await.unwrap();
+        assert_eq!(
+            written, expected_png,
+            "local screenshot write must match the sidecar PNG"
         );
     }
 
     #[tokio::test]
     async fn computer_use_dispatch_rejects_remote_endpoint_with_path() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use std::io::Read;
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
 
-        // Start a mock server on a loopback address to pass reachability check
-        let server = MockServer::start().await;
+        // `127.0.0.2` is a loopback alias: `is_private_or_local_host` treats it
+        // as local (so the URL policy accepts plain http and the TCP reachability
+        // probe can connect), yet its host string is not one of the literal
+        // loopback names `endpoint_is_remote_filesystem` treats as same-host.
+        // The sidecar is therefore classified as a different filesystem and any
+        // screenshot path is rejected before dispatch.
+        let canary = TcpListener::bind("127.0.0.2:0").unwrap();
+        let port = canary.local_addr().unwrap().port();
 
-        // Mock the reachability check (GET request)
-        Mock::given(method("GET"))
-            .and(path("/"))
-            .respond_with(ResponseTemplate::new(200))
-            .mount(&server)
-            .await;
+        // Count every inbound connection: exactly the pre-dispatch reachability
+        // probe (one) in the fixed behavior, plus any sidecar action POST in a
+        // regression where the guard was removed.
+        let connections = Arc::new(AtomicUsize::new(0));
+        let probe_connections = Arc::clone(&connections);
+        let canary_handle = std::thread::spawn(move || {
+            canary.set_nonblocking(true).unwrap();
+            let mut deadline = std::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                match canary.accept() {
+                    Ok((mut stream, _)) => {
+                        probe_connections.fetch_add(1, Ordering::SeqCst);
+                        let mut buf = [0u8; 8192];
+                        let _ = stream.read(&mut buf);
+                        deadline = std::time::Instant::now() + Duration::from_secs(2);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= deadline {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
 
-        // Mock the POST endpoint - should NOT be called because endpoint_is_remote_filesystem rejects
-        Mock::given(method("POST"))
-            .and(path("/"))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(0..)
-            .mount(&server)
-            .await;
-
-        // Setup: use the mock server URI but pretend it's a remote endpoint
         let mut config = test_computer_use_config();
-        // Replace 127.0.0.1 with a public-looking hostname to trigger endpoint_is_remote_filesystem
-        let server_uri = server.uri();
-        config.endpoint = server_uri.replace("127.0.0.1", "example.com");
-        config.allow_remote_endpoint = true;
+        config.endpoint = format!("http://127.0.0.2:{port}");
 
         let tool = browser_tool_with_computer_use(config);
         let args = json!({
@@ -3748,17 +3907,21 @@ mod tests {
             "path": "ws/screenshot.png"
         });
 
-        // Must fail through Tool::execute with endpoint validation rejection
-        // Note: Tool errors return Ok(ToolResult{success=false}) not Err
+        // Tool errors return Ok(ToolResult{success=false}) not Err.
         let result = tool.execute(args).await.unwrap();
-        assert!(!result.success, "Expected endpoint validation to fail");
+        assert!(!result.success, "Expected remote-sidecar rejection");
         let error_msg = result.error.unwrap_or_default();
         assert!(
-            error_msg.contains("https")
-                || error_msg.contains("remote")
-                || error_msg.contains("public"),
-            "Expected remote endpoint rejection, got: {}",
+            error_msg.contains("remote sidecar"),
+            "Expected remote-sidecar path rejection, got: {}",
             error_msg
+        );
+
+        let _ = canary_handle.join();
+        assert_eq!(
+            connections.load(Ordering::SeqCst),
+            1,
+            "expected exactly one reachability probe and zero sidecar action requests"
         );
     }
 
@@ -3778,14 +3941,15 @@ mod tests {
             .await;
 
         // Mock the screenshot action (POST request) - should NOT be called because
-        // path validation happens before the sidecar request
+        // path validation happens before the sidecar request. Exact zero is
+        // asserted so a regression that forwards a non-string path fails here.
         Mock::given(method("POST"))
             .and(path("/"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "success": true,
                 "data": {"ok": true}
             })))
-            .expect(0..) // 0 or more times - we don't care, just don't fail
+            .expect(0)
             .mount(&server)
             .await;
 
