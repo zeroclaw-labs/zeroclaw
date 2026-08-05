@@ -757,8 +757,8 @@ pub fn all_tools_with_runtime(
         root_config.effective_skills_prompt_mode(agent_alias),
         zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
     ) {
-        // ReadSkillTool now holds full config to support all skill sources:
-        // workspace skills, open-skills, agent-bound bundles, and plugin skills.
+        // ReadSkillTool holds full config to support workspace skills,
+        // open-skills, agent-bound bundles, and plugin skills.
         tool_arcs.push(Arc::new(ReadSkillTool::new(
             config.clone(),
             agent_alias.to_string(),
@@ -2789,7 +2789,7 @@ mod tests {
     }
 
     #[test]
-    fn all_tools_excludes_read_skill_in_full_mode() {
+    fn all_tools_excludes_read_skill_for_explicit_global_full() {
         let tmp = TempDir::new().unwrap();
         let security = Arc::new(SecurityPolicy::default());
         let mem_cfg = MemoryConfig {
@@ -2954,7 +2954,8 @@ mod tests {
         let http = zeroclaw_config::schema::HttpRequestConfig::default();
         let mut cfg = test_config(&tmp);
         // Global is Compact; a runtime profile pins this agent to Full and the
-        // agent selects it via `runtime_profile`.
+        // agent selects it via `runtime_profile`. The Full pin inlines skills
+        // eagerly, so read_skill must be omitted.
         cfg.skills.prompt_injection_mode =
             zeroclaw_config::schema::SkillsPromptInjectionMode::Compact;
         cfg.runtime_profiles.insert(

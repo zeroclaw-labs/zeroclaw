@@ -67,7 +67,9 @@ Triggered on tag push (and `workflow_dispatch`); builds and publishes versioned 
 
 ### Docker Image PR Check (`docker-image-pr.yml`)
 
-Runs only when Docker image or release-Docker context files change. It prepares a smoke `docker-ctx` with the same helper used by the stable release workflow, then builds the default prebuilt image and the Debian compatibility prebuilt image from `Dockerfile.ci` without pushing either image. This catches image dependency and `COPY` path breakage before release without giving PR runs registry write permission or running on every PR.
+Runs only when Docker image, Compose, or release-Docker context files change. It validates the merged default-plus-Alpine Compose configuration and, for changes beyond Compose-only edits, builds the default and Debian prebuilt smoke images plus the source Dockerfiles without pushing them. The default and Alpine source images build for `linux/amd64` and `linux/arm64`; the Debian source image builds for `linux/amd64`.
+
+The Alpine amd64 lane runs both binaries, starts the built image through the merged Compose configuration, and checks the gateway health and dashboard surfaces. The Alpine arm64 lane is compile- and image-assembly coverage only. Compose-only changes use a reduced Alpine amd64 matrix so they still exercise the runtime contract without rebuilding unrelated images. All jobs have read-only repository permissions and no registry write permission.
 
 ### Docker Publish (`docker-publish.yml`)
 

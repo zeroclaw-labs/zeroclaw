@@ -1,7 +1,7 @@
-//! Non-fatal validation warnings — config that loads and validates
-//! successfully (i.e. `Config::validate()` returns `Ok(())`) but will fail
-//! at agent runtime because of a logical inconsistency the schema can't
-//! enforce structurally.
+//! Non-fatal validation warnings for config that loads and validates
+//! successfully (i.e. `Config::validate()` returns `Ok(())`) but needs user
+//! attention. Warnings may identify a runtime inconsistency, an inert setting,
+//! or a supported configuration that is being deprecated.
 
 use serde::{Deserialize, Serialize};
 
@@ -23,6 +23,8 @@ use serde::{Deserialize, Serialize};
 /// - `memory_config_knob_inert`: a `[memory]` knob is set to a non-default
 ///   value but has no runtime consumer yet, so it currently has no effect
 ///   (see `validate_memory_semantics` in `schema.rs` for the current list).
+/// - `skills_prompt_injection_mode_full_deprecated`: explicit global full skill
+///   injection remains supported but is deprecated before Schema V4.
 /// - `peer_group_channel_dangling`: a `peer_groups.<name>.channel` dotted
 ///   alias (`<type>.<alias>`) does not resolve to any configured
 ///   `[channels.<type>.<alias>]` block — typically a typo that silently
@@ -41,7 +43,8 @@ use serde::{Deserialize, Serialize};
 pub struct ValidationWarning {
     /// Stable machine-readable identifier for the warning class.
     pub code: String,
-    /// Human-readable description suitable for direct display.
+    /// Stable English fallback for logs and consumers without a localization catalog.
+    /// User-facing surfaces should localize from `code` and use this only for unknown codes.
     pub message: String,
     /// Dotted property path the warning concerns
     /// (e.g. `"agents.researcher.model_provider"`).

@@ -2326,6 +2326,10 @@ impl DelegateTool {
         sends_native_tool_specs: bool,
         skills_override: Option<&[crate::skills::Skill]>,
     ) -> Option<String> {
+        let mut resolved_agent_config = agent_config.clone();
+        resolved_agent_config.resolved = self.resolve_loop_runtime(agent_alias, agent_config);
+        let agent_config = &resolved_agent_config;
+
         let resolved_skills: Vec<crate::skills::Skill>;
         let skills: &[crate::skills::Skill] = match skills_override {
             Some(s) => s,
@@ -2379,7 +2383,7 @@ impl DelegateTool {
             model_name,
             tools: prompt_tools,
             skills,
-            skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+            skills_prompt_mode: agent_config.resolved.prompt_injection_mode,
             identity_config: None,
             dispatcher_instructions: "",
             sends_native_tool_specs: sends_native_tool_specs && !prompt_tools.is_empty(),
@@ -2576,8 +2580,6 @@ impl DelegateTool {
         };
 
         let loop_runtime = self.resolve_loop_runtime(agent_name, agent_config);
-        let mut prompt_agent_config = agent_config.clone();
-        prompt_agent_config.resolved = loop_runtime.clone();
 
         // Build enriched system prompt with tools, skills, workspace, datetime context.
         // Independent delegation builds it from the TARGET's workspace (`sub_workspace`), so
@@ -2586,7 +2588,7 @@ impl DelegateTool {
         let prompt_workspace = sub_workspace.as_deref().unwrap_or(&self.workspace_dir);
         let enriched_system_prompt = self.build_enriched_system_prompt(
             agent_name,
-            &prompt_agent_config,
+            agent_config,
             model,
             &sub_tools,
             prompt_workspace,
@@ -5501,6 +5503,60 @@ mod tests {
         assert!(!prompt.contains("ISO 8601:"));
 
         let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn enriched_prompt_resolves_explicit_global_full_skill_mode() {
+        let mut root_config = Config::default();
+        root_config.skills.prompt_injection_mode =
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full;
+        root_config
+            .agents
+            .insert("alpha".into(), AliasedAgentConfig::default());
+        let root_config = Arc::new(root_config);
+        let config = root_config.agents.get("alpha").unwrap().clone();
+        let workspace = std::env::temp_dir();
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let skills = vec![crate::skills::Skill {
+            name: "deploy".into(),
+            description: "Release safely".into(),
+            description_localizations: Default::default(),
+            version: "1.0.0".into(),
+            author: None,
+            tags: vec![],
+            tools: vec![],
+            prompts: vec!["Run <smoke> & release checks.".into()],
+            slash_options: Vec::new(),
+            always: false,
+            location: None,
+        }];
+
+        let tool = DelegateTool::new(root_config.agents.clone(), None, test_security())
+            .with_root_config(root_config)
+            .with_workspace_dir(workspace.to_path_buf());
+        assert_eq!(
+            tool.resolve_loop_runtime("alpha", &config)
+                .prompt_injection_mode,
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full
+        );
+        let prompt = tool
+            .build_enriched_system_prompt(
+                "alpha",
+                &config,
+                "test-model",
+                &tools,
+                &workspace,
+                false,
+                Some(&skills),
+            )
+            .unwrap();
+
+        assert!(prompt.contains("<instructions>"));
+        assert!(
+            prompt.contains("<instruction>Run &lt;smoke&gt; &amp; release checks.</instruction>")
+        );
+        assert!(!prompt.contains("read_skill"));
+        assert!(!prompt.contains("loaded on demand"));
     }
 
     #[test]
