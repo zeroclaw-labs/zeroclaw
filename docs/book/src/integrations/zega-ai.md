@@ -1,7 +1,7 @@
 ---
-type: integration
-status: prototype
-last-reviewed: 2026-08-04
+type: reference
+status: proposed
+last-reviewed: 2026-08-05
 relates-to:
   - FND-002
   - FND-003
@@ -71,7 +71,10 @@ X-Pairing-Code: <6-digit code>
 ```
 
 The bridge falls back to this route when the enhanced endpoint is
-unavailable or returns a non-success status.
+unavailable or returns a non-rate-limit non-success status. If the
+enhanced endpoint returns a rate-limit failure (`RateLimitError`), the
+bridge re-throws the error immediately without attempting the legacy
+fallback.
 
 Upstream handler: `handle_pair`
 (`crates/zeroclaw-gateway/src/lib.rs`).
@@ -101,4 +104,5 @@ code, or call any gateway endpoint over HTTP.
 ## External reference
 
 For source code and monorepo details, visit the
-[ZEGA AI repository](https://github.com/siabang35/zega.ai).
+[ZEGA AI repository](https://github.com/siabang35/zega.ai) or inspect the bridge package at reviewed commit
+[`f99104367a6b06815cf478120b247d042fa7b1a5`](https://github.com/siabang35/zega.ai/tree/f99104367a6b06815cf478120b247d042fa7b1a5/packages/zeroclaw-bridge).
