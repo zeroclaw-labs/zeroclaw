@@ -166,6 +166,9 @@ pub struct SecurityPolicy {
     pub workspace_only: bool,
     pub allowed_commands: Vec<String>,
     pub forbidden_paths: Vec<String>,
+    /// Lazily-built categorized workspace-relative patterns derived from
+    /// `forbidden_paths`. Initialized on first access.
+    pub forbidden_patterns: std::sync::OnceLock<crate::forbidden_patterns::ForbiddenPatternSet>,
     /// Directories the agent can read AND write under. Includes
     /// `RiskProfileConfig.allowed_roots` plus any cross-agent
     /// `AccessMode::ReadWrite` grants resolved from
@@ -489,6 +492,7 @@ impl Default for SecurityPolicy {
             workspace_only: true,
             allowed_commands: default_allowed_commands(),
             forbidden_paths: default_forbidden_paths(),
+            forbidden_patterns: std::sync::OnceLock::new(),
             allowed_roots: Vec::new(),
             allowed_roots_read_only: Vec::new(),
             allowed_roots_write_only: Vec::new(),
@@ -1553,6 +1557,17 @@ impl SecurityPolicy {
         }
     }
 
+    /// Return the categorized workspace-relative pattern set, lazily built
+    /// from `self.forbidden_paths` on first access and cached for the
+    /// lifetime of this policy.
+    fn workspace_relative_patterns(&self) -> &crate::forbidden_patterns::ForbiddenPatternSet {
+        self.forbidden_patterns.get_or_init(|| {
+            crate::forbidden_patterns::ForbiddenPatternSet::from_config_entries(
+                &self.forbidden_paths,
+            )
+        })
+    }
+
     /// Return the first path-like argument blocked by path policy.
     /// This is best-effort token parsing for shell commands and is intended
     /// as a safety gate before command execution.
@@ -1726,7 +1741,29 @@ impl SecurityPolicy {
                 .iter()
                 .any(|root| expanded_path.starts_with(root));
 
-            if in_workspace || in_allowed_root || in_read_only_root || in_write_only_root {
+            if in_workspace {
+                // Workspace path: check workspace-relative patterns
+                // (globs, basename, directory) before allowing.
+                //
+                // NOTE: this pre-check only fires for absolute paths.
+                // Relative shell arguments (e.g. `cat .env`) never reach
+                // this branch. Non-glob relative patterns (e.g. `secrets/`)
+                // are partially caught by the legacy prefix loop below,
+                // but workspace-relative glob patterns (e.g. `*.toml`) are
+                // NOT caught there — the authoritative enforcement for
+                // globs is the resolved-path check in
+                // `is_resolved_path_readable` / `is_resolved_path_allowed`.
+                if let Ok(relative) = expanded_path.strip_prefix(&self.workspace_dir)
+                    && self.workspace_relative_patterns().is_forbidden(relative)
+                {
+                    return false;
+                }
+                return true;
+            }
+
+            if in_allowed_root || in_read_only_root || in_write_only_root {
+                // allowed_roots bypasses forbidden_patterns — intentional;
+                // these are admin/operator-granted cross-agent access paths.
                 return true;
             }
 
@@ -1770,6 +1807,11 @@ impl SecurityPolicy {
             .canonicalize()
             .unwrap_or_else(|_| self.workspace_dir.clone());
         if resolved.starts_with(&workspace_root) {
+            if let Ok(relative) = resolved.strip_prefix(&workspace_root)
+                && self.workspace_relative_patterns().is_forbidden(relative)
+            {
+                return false;
+            }
             return true;
         }
         for root in &self.allowed_roots {
@@ -1848,6 +1890,11 @@ impl SecurityPolicy {
             .canonicalize()
             .unwrap_or_else(|_| self.workspace_dir.clone());
         if resolved.starts_with(&workspace_root) {
+            if let Ok(relative) = resolved.strip_prefix(&workspace_root)
+                && self.workspace_relative_patterns().is_forbidden(relative)
+            {
+                return false;
+            }
             return true;
         }
 
@@ -2188,6 +2235,7 @@ impl SecurityPolicy {
             workspace_only: effective_workspace_only,
             allowed_commands: risk_profile.allowed_commands.clone(),
             forbidden_paths: risk_profile.forbidden_paths.clone(),
+            forbidden_patterns: std::sync::OnceLock::new(),
             allowed_roots: risk_profile
                 .allowed_roots
                 .iter()
@@ -5651,5 +5699,122 @@ mod tests {
         );
         assert_eq!(attached_short_option_value("-f"), None);
         assert_eq!(attached_short_option_value("--long"), None);
+    }
+
+    // ── Conformance matrix: workspace-relative glob patterns ─────────────
+
+    /// After path resolution, a symlink pointing to a workspace file whose
+    /// basename matches a forbidden pattern is blocked.
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn symlink_resolved_to_forbidden_basename_is_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("workspace");
+        std::fs::create_dir_all(&ws).unwrap();
+        // Create a real file with a forbidden basename.
+        std::fs::write(ws.join("secrets.json"), b"{}").unwrap();
+        // Create a symlink pointing to it from a subdirectory.
+        let sub = ws.join("link_dir");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("secrets.json"), b"{}").unwrap();
+
+        let policy = SecurityPolicy {
+            workspace_dir: ws.clone(),
+            forbidden_paths: vec!["secrets.json".into()],
+            ..SecurityPolicy::default()
+        };
+
+        // The resolved (canonical) path of the file matches the basename pattern.
+        let resolved = ws.join("secrets.json").canonicalize().unwrap();
+        assert!(
+            !policy.is_resolved_path_readable(&resolved),
+            "resolved path matching forbidden basename must be blocked"
+        );
+
+        // A symlink-resolved path also matches.
+        let symlink_resolved = sub.join("secrets.json").canonicalize().unwrap();
+        assert!(
+            !policy.is_resolved_path_readable(&symlink_resolved),
+            "symlink-resolved path matching forbidden basename must be blocked"
+        );
+    }
+
+    /// Relative shell arguments (no leading `/`) bypass the workspace
+    /// forbidden-pattern check — this is the expected best-effort behavior
+    /// documented in the RFC.
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn relative_shell_arg_bypasses_workspace_forbidden_pattern() {
+        let policy = SecurityPolicy {
+            workspace_dir: PathBuf::from("/home/user/workspace"),
+            forbidden_paths: vec!["*.toml".into()],
+            ..SecurityPolicy::default()
+        };
+        // Relative path: not absolute, so is_path_allowed never reaches
+        // the workspace branch. This is the documented best-effort limit.
+        assert!(
+            policy.is_path_allowed("Cargo.toml"),
+            "relative shell args bypass workspace forbidden patterns (best-effort)"
+        );
+        assert!(
+            policy.is_path_allowed("./Cargo.toml"),
+            "relative shell args bypass workspace forbidden patterns (best-effort)"
+        );
+    }
+
+    /// A child SubAgent must not drop a parent's workspace-relative
+    /// forbidden_paths entry (e.g. "*.toml").
+    #[test]
+    fn subagent_cannot_drop_parent_workspace_glob_pattern() {
+        let parent = SecurityPolicy {
+            forbidden_paths: vec![
+                "/etc".into(),
+                "~/.ssh".into(),
+                "*.toml".into(),
+                "secrets/".into(),
+            ],
+            ..SecurityPolicy::default()
+        };
+
+        // Child tries to drop the workspace-relative entries.
+        let child_dropped_glob = SecurityPolicy {
+            forbidden_paths: vec!["/etc".into(), "~/.ssh".into()],
+            ..parent.clone()
+        };
+        let err = child_dropped_glob
+            .ensure_no_escalation_beyond(&parent)
+            .expect_err("child must not drop parent's *.toml pattern");
+        assert!(
+            matches!(
+                err,
+                EscalationViolation::ForbiddenPathDroppedByChild { ref path }
+                if path == "*.toml"
+            ),
+            "violation must name the dropped pattern"
+        );
+
+        // Child tries to drop the directory pattern.
+        let child_dropped_dir = SecurityPolicy {
+            forbidden_paths: vec!["/etc".into(), "~/.ssh".into(), "*.toml".into()],
+            ..parent.clone()
+        };
+        let err = child_dropped_dir
+            .ensure_no_escalation_beyond(&parent)
+            .expect_err("child must not drop parent's secrets/ pattern");
+        assert!(
+            matches!(
+                err,
+                EscalationViolation::ForbiddenPathDroppedByChild { ref path }
+                if path == "secrets/"
+            ),
+            "violation must name the dropped directory pattern"
+        );
+
+        // Child with all parent entries intact is accepted.
+        let child_complete = parent.clone();
+        assert!(
+            child_complete.ensure_no_escalation_beyond(&parent).is_ok(),
+            "child preserving all parent entries must be accepted"
+        );
     }
 }

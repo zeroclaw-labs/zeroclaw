@@ -14,6 +14,7 @@ pub mod cost;
 pub mod domain_matcher;
 pub mod env_overrides;
 pub mod field_visibility;
+pub mod forbidden_patterns;
 pub mod helpers;
 pub mod migration;
 pub mod multi_agent;
