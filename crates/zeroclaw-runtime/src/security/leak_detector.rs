@@ -613,7 +613,7 @@ const BASE58_ALPHABET: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmno
 
 /// Whether `s` consists entirely of base58 characters.
 fn is_base58(s: &str) -> bool {
-    !s.is_empty() && s.bytes().all(|b| BASE58_ALPHABET.iter().any(|&a| a == b))
+    !s.is_empty() && s.bytes().all(|b| BASE58_ALPHABET.contains(&b))
 }
 
 /// Whether `s` is a Solana public identifier:

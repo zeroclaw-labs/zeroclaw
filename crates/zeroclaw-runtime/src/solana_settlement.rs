@@ -46,20 +46,21 @@ pub fn build_durable_nonce_transfer(
     nonce: &str,
 ) -> Result<Transaction> {
     let payee_pubkey = Pubkey::from_str(&settlement.payee)
-        .map_err(|e| anyhow!("payee is not a valid Solana address: {e}"))?;
-    let nonce_account = Pubkey::from_str(&settlement.nonce_account)
-        .map_err(|e| anyhow!("nonce account is not a valid Solana address: {e}"))?;
+        .map_err(|e| anyhow::Error::msg(format!("payee is not a valid Solana address: {e}")))?;
+    let nonce_account = Pubkey::from_str(&settlement.nonce_account).map_err(|e| {
+        anyhow::Error::msg(format!("nonce account is not a valid Solana address: {e}"))
+    })?;
     let authority_pubkey = Pubkey::from_str(&settlement.authority)
-        .map_err(|e| anyhow!("authority is not a valid Solana address: {e}"))?;
+        .map_err(|e| anyhow::Error::msg(format!("authority is not a valid Solana address: {e}")))?;
     if authority_pubkey != authority.pubkey() {
-        return Err(anyhow!(
+        return Err(anyhow::Error::msg(format!(
             "settlement authority {} does not match signing keypair {}",
             authority_pubkey,
             authority.pubkey()
-        ));
+        )));
     }
     if settlement.lamports == 0 {
-        return Err(anyhow!("refusing zero-lamport settlement"));
+        return Err(anyhow::Error::msg("refusing zero-lamport settlement"));
     }
     let _ = nonce;
 
