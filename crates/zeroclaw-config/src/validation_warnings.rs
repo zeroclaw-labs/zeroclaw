@@ -23,6 +23,9 @@ use serde::{Deserialize, Serialize};
 /// - `memory_config_knob_inert`: a `[memory]` knob is set to a non-default
 ///   value but has no runtime consumer yet, so it currently has no effect
 ///   (see `validate_memory_semantics` in `schema.rs` for the current list).
+/// - `security_audit_enabled_has_no_effect`: `security.audit.enabled` is set
+///   to `true`, but command audit logging has no production writer yet, so
+///   the setting currently has no effect.
 /// - `peer_group_channel_dangling`: a `peer_groups.<name>.channel` dotted
 ///   alias (`<type>.<alias>`) does not resolve to any configured
 ///   `[channels.<type>.<alias>]` block — typically a typo that silently

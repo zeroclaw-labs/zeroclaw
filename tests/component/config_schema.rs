@@ -324,7 +324,11 @@ fn gateway_path_prefix_accepts_none() {
 #[test]
 fn security_config_defaults() {
     let sec = SecurityConfig::default();
-    assert!(sec.audit.enabled, "audit should be enabled by default");
+    assert!(
+        !sec.audit.enabled,
+        "audit should default to disabled: there is no production writer yet, \
+         so a default of true would give operators a false sense of protection"
+    );
     // V3: sandbox/resource limits live on risk_profiles entries, not SecurityConfig.
     let profile = RiskProfileConfig::default();
     assert!(
