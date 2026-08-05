@@ -24,7 +24,7 @@ table = true
 [[var]]
 path = "providers.models.crusoe.default.api_key"
 comment = "Inject a Crusoe Managed Inference alias credential"
-value = "crsk-..."
+value = "cr_..."
 group = "example"
 table = true
 
