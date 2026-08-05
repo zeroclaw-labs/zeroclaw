@@ -86,7 +86,7 @@ opentelemetry = { version = "0.32", default-features = false, features = ["trace
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "metrics"], optional = true }
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-blocking-client", "reqwest-rustls-webpki-roots"], optional = true }
 solana-address = { version = "2.7", optional = true }
-solana-hash = { version = "4.6", optional = true }
+solana-hash = { version = "4.6", features = ["copy"], optional = true }
 solana-instruction = { version = "3.5", optional = true }
 solana-message = { version = "4.5", optional = true }
 solana-pubkey = { version = "4.3", optional = true }
