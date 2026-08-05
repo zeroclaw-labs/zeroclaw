@@ -461,6 +461,32 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         std::collections::HashMap::new();
 
     for iteration in 0..max_iterations {
+        // Re-resolved every iteration, against the tools callable *right now*.
+        //
+        // A step's scope is resolved by name, so it can only narrow tools that
+        // exist when it runs: `tool_search` activates deferred MCP tools in the
+        // middle of a turn, and a scoped step must narrow those on the next
+        // iteration rather than the next turn — otherwise a step that may call
+        // `tool_search` can reach a tool its scope excludes. Reading the scope
+        // from the task (rather than a parameter) also covers the loops this
+        // one drives on behalf of another agent: a delegated target assembles
+        // its own registry, and inherits the boundary all the same.
+        //
+        // `None` for every ordinary turn, which keeps its own slice and pays
+        // nothing.
+        let step_scoped_excluded: Option<Vec<String>> =
+            crate::sop::active_scope::active_headless_step_scope().map(|scope| {
+                let mut merged = excluded_tools.to_vec();
+                crate::agent::loop_::merge_sop_step_exclusions(
+                    &mut merged,
+                    tools_registry,
+                    activated_tools,
+                    Some(&scope),
+                );
+                merged
+            });
+        let excluded_tools: &[String] = step_scoped_excluded.as_deref().unwrap_or(excluded_tools);
+
         for steering_message in drain_steering_messages(&mut steering) {
             match ingress_policy(&steering_message, &ingress, &ingress_policy_cfg) {
                 // DEFAULT — append the injection to history exactly as today.
@@ -1227,7 +1253,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
     .await
 }
 
-fn collect_callable_tool_names(
+pub(crate) fn collect_callable_tool_names(
     tools_registry: &[Box<dyn crate::tools::Tool>],
     activated_tools: Option<&Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
 ) -> Vec<String> {
@@ -1275,7 +1301,7 @@ fn sop_step_excluded_tools(
     excluded_tools: &[String],
 ) -> Vec<String> {
     let mut scoped = excluded_tools.to_vec();
-    for tool in ["sop_execute", "sop_advance", "sop_approve"] {
+    for tool in crate::sop::active_scope::SOP_CONTROL_TOOLS {
         push_excluded_tool(&mut scoped, tool);
     }
 
