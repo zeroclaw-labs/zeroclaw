@@ -6847,18 +6847,28 @@ impl ChatState {
             } => {
                 let dropped = dropped_messages.to_string();
                 let kept = kept_turns.to_string();
-                let notice = match (token_budget, tokens_before, tokens_after) {
-                    (Some(budget), Some(before), Some(after)) => {
+                let notice = match (tokens_before, tokens_after) {
+                    (Some(before), Some(after)) => {
                         let mut notice = crate::i18n::t_args(
                             "zc-chat-history-trimmed-tokens",
                             &[
-                                ("budget", &budget.to_string()),
+                                ("reason", &reason),
                                 ("before", &before.to_string()),
                                 ("after", &after.to_string()),
                                 ("dropped", &dropped),
                                 ("kept", &kept),
                             ],
                         );
+                        // The configured budget is context, never the trim
+                        // target: recovery trims toward a provider-overflow
+                        // target, so the notice must not present the
+                        // configured limit as governing the trim.
+                        if let Some(budget) = token_budget {
+                            notice.push_str(&crate::i18n::t_args(
+                                "zc-chat-history-trimmed-token-budget-clause",
+                                &[("budget", &budget.to_string())],
+                            ));
+                        }
                         let before_label = tokens_before_source.as_deref().and_then(|source| {
                             crate::i18n::try_t(&token_source_fluent_key(source))
                         });
@@ -10686,13 +10696,66 @@ mod tests {
             Some(ChatEntry::SystemMessage(text))
                 if text.contains("612000")
                     && text.contains("117000")
-                    && text.contains("500000")
+                    && text.contains("configured token budget: 500000")
+                    && text.contains("context token budget exceeded")
                     && text.contains("12")
                     && text.contains("33")
                     && text.contains("provider")
                     && text.contains("estimate")
                     && text.contains("before")
                     && text.contains("after")
+                    && !text.contains("against a")
+        ));
+    }
+
+    #[test]
+    fn history_trimmed_recovery_below_configured_budget_does_not_claim_budget_governed() {
+        let mut s = state();
+        s.apply_update(SessionUpdate::HistoryTrimmed {
+            session_id: "sess-1".to_string(),
+            dropped_messages: 4,
+            kept_turns: 2,
+            reason: "context window overflow recovery".to_string(),
+            token_budget: Some(500_000),
+            tokens_before: Some(612_000),
+            tokens_after: Some(117_000),
+            tokens_before_source: Some("provider".to_string()),
+            tokens_after_source: Some("calibrated".to_string()),
+        });
+
+        assert!(matches!(
+            s.entries().last(),
+            Some(ChatEntry::SystemMessage(text))
+                if text.contains("612000")
+                    && text.contains("117000")
+                    && text.contains("context window overflow recovery")
+                    && text.contains("configured token budget: 500000")
+                    && !text.contains("against a")
+        ));
+    }
+
+    #[test]
+    fn history_trimmed_recovery_with_enforcement_disabled_renders_valid_counts() {
+        let mut s = state();
+        s.apply_update(SessionUpdate::HistoryTrimmed {
+            session_id: "sess-1".to_string(),
+            dropped_messages: 4,
+            kept_turns: 2,
+            reason: "context window overflow recovery".to_string(),
+            token_budget: None,
+            tokens_before: Some(612_000),
+            tokens_after: Some(117_000),
+            tokens_before_source: Some("provider".to_string()),
+            tokens_after_source: Some("calibrated".to_string()),
+        });
+
+        assert!(matches!(
+            s.entries().last(),
+            Some(ChatEntry::SystemMessage(text))
+                if text.contains("612000")
+                    && text.contains("117000")
+                    && text.contains("context window overflow recovery")
+                    && !text.contains("budget")
         ));
     }
 

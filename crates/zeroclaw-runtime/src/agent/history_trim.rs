@@ -210,8 +210,9 @@ pub fn trim_to_reported_budget(
     history: Vec<ChatMessage>,
     budget_tokens: usize,
     reported_input_tokens: usize,
+    tool_schema_tokens: usize,
 ) -> TrimResult {
-    let estimated = estimate_history_tokens(&history);
+    let estimated = estimate_history_tokens(&history) + tool_schema_tokens;
     if budget_tokens == 0 || reported_input_tokens <= budget_tokens || estimated == 0 {
         let total_turns = count_turns(&history);
         return TrimResult {
@@ -224,13 +225,18 @@ pub fn trim_to_reported_budget(
             trimmed: false,
         };
     }
-    let scaled =
+    // Native tool schemas are constant across a trim, so reserve them inside
+    // the scaled total and trim the history portion to what remains: the
+    // retained history plus tools then fits the budget when the reported
+    // count is faithful.
+    let target_total =
         (budget_tokens as u128 * estimated as u128 / reported_input_tokens as u128).max(1) as usize;
+    let scaled = target_total.saturating_sub(tool_schema_tokens).max(1);
     let result = trim_to_recent_turns(history, scaled);
     let ratio = reported_input_tokens as f64 / estimated as f64;
     TrimResult {
         tokens_before: reported_input_tokens,
-        tokens_after: (result.tokens_after as f64 * ratio).round() as usize,
+        tokens_after: ((result.tokens_after + tool_schema_tokens) as f64 * ratio).round() as usize,
         ..result
     }
 }
@@ -914,7 +920,7 @@ mod tests {
         let estimated = estimate_history_tokens(&h);
         let reported = estimated * 4;
         let budget = reported / 2;
-        let r = trim_to_reported_budget(h, budget, reported);
+        let r = trim_to_reported_budget(h, budget, reported, 0);
         assert!(
             r.trimmed,
             "must trim when provider-reported tokens exceed budget"
@@ -927,7 +933,7 @@ mod tests {
     fn reported_budget_no_trim_when_real_tokens_fit() {
         let h = vec![sys("system"), user("hi"), asst("hello")];
         let estimated = estimate_history_tokens(&h);
-        let r = trim_to_reported_budget(h, estimated * 4, estimated);
+        let r = trim_to_reported_budget(h, estimated * 4, estimated, 0);
         assert!(!r.trimmed);
     }
 
@@ -944,9 +950,65 @@ mod tests {
         let estimated = estimate_history_tokens(&h);
         let reported = estimated * 5000;
         let budget = reported / 100;
-        let r = trim_to_reported_budget(h, budget, reported);
+        let r = trim_to_reported_budget(h, budget, reported, 0);
         assert!(r.trimmed, "extreme ratio must still enforce, not no-op");
         assert!(r.history.iter().any(|m| m.content.contains("recent short")));
+    }
+
+    #[test]
+    fn reported_budget_reserves_room_for_large_native_tool_schema() {
+        let big = "x".repeat(2000);
+        let h = vec![
+            sys("system"),
+            user(&format!("turn1 {big}")),
+            asst("a1"),
+            user(&format!("turn2 {big}")),
+            asst("a2"),
+            user("turn3 short"),
+            asst("a3"),
+        ];
+        // A large native tool schema that a provider would serialize into the
+        // request and count in `input_tokens` alongside the messages.
+        let spec = crate::tools::ToolSpec::new(
+            "large_schema_tool",
+            "a tool with a very large parameter schema",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "payload": {
+                        "type": "string",
+                        "description": "big".repeat(300),
+                    }
+                }
+            }),
+        );
+        let tool_tokens = crate::agent::history::estimate_tool_schema_tokens(&[spec]);
+        assert!(
+            tool_tokens > 0,
+            "a large tool schema must contribute a nonzero token estimate"
+        );
+
+        // Faithful provider: reported == messages + tool schemas.
+        let estimated = estimate_history_tokens(&h) + tool_tokens;
+        let reported = estimated;
+        let budget = reported / 2;
+        assert!(budget > tool_tokens, "budget must leave headroom for tools");
+
+        let r = trim_to_reported_budget(h, budget, reported, tool_tokens);
+        assert!(
+            r.trimmed,
+            "must trim when reported population exceeds budget"
+        );
+        let kept_total = estimate_history_tokens(&r.history) + tool_tokens;
+        assert!(
+            kept_total <= budget,
+            "retained history plus constant tool schemas must fit the budget (kept {kept_total}, budget {budget})"
+        );
+        assert_eq!(
+            r.tokens_after, kept_total,
+            "tokens_after must cover the full provider population, tool schemas included"
+        );
+        assert!(r.history.iter().any(|m| m.content.contains("turn3 short")));
     }
 
     #[test]

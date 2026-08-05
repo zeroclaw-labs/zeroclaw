@@ -246,6 +246,12 @@ async fn enforce_reported_budget(
     // would mix a later, larger transcript into the calibration ratio's
     // denominator and understate the calibrated post-trim count.
     reported_population_estimated: usize,
+    // Estimated token count of the native tool definitions serialized into
+    // the same provider request (constant across the trim). Providers that
+    // include native schemas in `input_tokens` report a population of
+    // messages plus tool schemas; both the pre-trim estimate and the
+    // post-trim recount must cover the same population.
+    tool_schema_tokens: usize,
     context_token_budget: usize,
     event_tx: Option<&tokio::sync::mpsc::Sender<TurnEvent>>,
     observer: &dyn crate::observability::Observer,
@@ -259,6 +265,7 @@ async fn enforce_reported_budget(
         taken,
         context_token_budget,
         reported_input_tokens,
+        tool_schema_tokens,
     );
     if result.trimmed {
         let mut trimmed = result.history;
@@ -267,7 +274,8 @@ async fn enforce_reported_budget(
         // history (breadcrumb included) so `tokens_after` describes exactly
         // what is sent, not the pre-breadcrumb kept set.
         let ratio = reported_input_tokens as f64 / pre_trim_estimated.max(1) as f64;
-        result.tokens_after = (crate::agent::history::estimate_history_tokens(&trimmed) as f64
+        result.tokens_after = ((crate::agent::history::estimate_history_tokens(&trimmed)
+            + tool_schema_tokens) as f64
             * ratio)
             .round() as usize;
         *history = trimmed;
@@ -857,8 +865,17 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // before any assistant/tool-result output is appended to `history`.
         // `enforce_reported_budget` below needs this as the calibration
         // denominator, not a later, larger `history` estimate.
+        // Native tool definitions are serialized into the same provider
+        // request, so providers that count them in `input_tokens` report a
+        // population of messages plus tool schemas.
+        let tool_schema_tokens = if use_native_tools {
+            crate::agent::history::estimate_tool_schema_tokens(tool_specs)
+        } else {
+            0
+        };
         let reported_population_estimated =
-            crate::agent::history::estimate_history_tokens(&provider_request_messages);
+            crate::agent::history::estimate_history_tokens(&provider_request_messages)
+                + tool_schema_tokens;
 
         // Fail closed on the local budget BEFORE announcing the request.
         // `announce_llm_request` emits the user-visible `WaitingOnModel`
@@ -1236,6 +1253,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     turn_state.history,
                     reported as usize,
                     reported_population_estimated,
+                    tool_schema_tokens,
                     context_token_budget,
                     event_tx.as_ref(),
                     observer,
@@ -1514,6 +1532,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 turn_state.history,
                 reported as usize,
                 reported_population_estimated,
+                tool_schema_tokens,
                 context_token_budget,
                 event_tx.as_ref(),
                 observer,
@@ -2593,6 +2612,7 @@ mod reported_budget_tests {
             &mut history,
             reported,
             estimated,
+            0,
             budget,
             None,
             &NoopObserver,
@@ -2622,6 +2642,7 @@ mod reported_budget_tests {
             &mut history,
             estimated,
             estimated,
+            0,
             estimated * 4,
             None,
             &NoopObserver,
@@ -2652,7 +2673,16 @@ mod reported_budget_tests {
     async fn enforce_noop_when_budget_disabled() {
         let mut history = big_history();
         let before: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
-        enforce_reported_budget(&mut history, usize::MAX, usize::MAX, 0, None, &NoopObserver).await;
+        enforce_reported_budget(
+            &mut history,
+            usize::MAX,
+            usize::MAX,
+            0,
+            0,
+            None,
+            &NoopObserver,
+        )
+        .await;
         let after: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
         assert_eq!(after, before, "zero budget disables enforcement");
     }
@@ -2668,6 +2698,7 @@ mod reported_budget_tests {
             &mut history,
             reported,
             estimated,
+            0,
             budget,
             Some(&tx),
             &NoopObserver,
@@ -2724,6 +2755,7 @@ mod reported_budget_tests {
             &mut history,
             reported,
             estimated,
+            0,
             budget,
             Some(&tx),
             &NoopObserver,
