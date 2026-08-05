@@ -1573,10 +1573,16 @@ async fn timed_out_hailo_request_quarantines_provider_without_overlap() {
     )
     .expect("valid timeout canary URL");
 
-    provider
+    let first_error = provider
         .simple_chat("first", "qwen3:1.7b", Some(0.2))
         .await
         .expect_err("first Hailo request must hit its HTTP timeout");
+    assert!(
+        first_error
+            .downcast_ref::<NonRetryableProviderError>()
+            .is_some(),
+        "ambiguous timeout must retain its non-retryable classification: {first_error:?}"
+    );
     assert_eq!(
         state.active.load(Ordering::SeqCst),
         1,

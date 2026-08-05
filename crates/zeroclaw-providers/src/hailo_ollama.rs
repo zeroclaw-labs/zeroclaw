@@ -300,6 +300,7 @@ impl HailoOllamaModelProvider {
     }
 
     fn redact_transport_error(&self, error: anyhow::Error) -> anyhow::Error {
+        let quarantine = Self::quarantine_reason(&error).is_some();
         let Some(request_error) = error
             .chain()
             .find_map(|source| source.downcast_ref::<reqwest::Error>())
@@ -348,7 +349,11 @@ impl HailoOllamaModelProvider {
             "Hailo-Ollama transport request failed"
         );
 
-        anyhow::Error::msg(message)
+        if quarantine {
+            anyhow::Error::new(NonRetryableProviderError::new(message))
+        } else {
+            anyhow::Error::msg(message)
+        }
     }
 }
 
