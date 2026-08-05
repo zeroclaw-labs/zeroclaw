@@ -3901,14 +3901,14 @@ fn render_transcript_selection(f: &mut Frame, state: &ChatState) {
     else {
         return;
     };
-    if !selection.dragged {
+    let Some((start, end)) = snapshot.selection_bounds(selection) else {
         return;
-    }
+    };
 
     let buffer = f.buffer_mut();
     for row in 0..snapshot.area.height {
         for column in 0..snapshot.area.width {
-            if snapshot.selection_contains(selection, CellPoint { column, row }) {
+            if TranscriptSnapshot::bounds_contain(start, end, CellPoint { column, row }) {
                 buffer[(snapshot.area.x + column, snapshot.area.y + row)]
                     .set_style(theme::selected_bg_style());
             }
@@ -5014,11 +5014,29 @@ impl TranscriptSnapshot {
         .is_some_and(|origin| !origin.symbol.chars().all(char::is_whitespace))
     }
 
+    fn row_text_bounds(&self, row: u16) -> Option<(u16, u16)> {
+        let first =
+            (0..self.area.width).find(|&column| self.has_text_at(CellPoint { column, row }))?;
+        let last = (0..self.area.width)
+            .rev()
+            .find(|&column| self.has_text_at(CellPoint { column, row }))?;
+        Some((first, last))
+    }
+
+    fn clamp_outer_whitespace(&self, mut point: CellPoint) -> CellPoint {
+        if let Some((first, last)) = self.row_text_bounds(point.row) {
+            point.column = point.column.clamp(first, last);
+        }
+        point
+    }
+
     fn selection_bounds(&self, selection: TranscriptSelection) -> Option<(CellPoint, CellPoint)> {
         if !selection.dragged {
             return None;
         }
         let (mut start, mut end) = selection.normalized();
+        start = self.clamp_outer_whitespace(start);
+        end = self.clamp_outer_whitespace(end);
         start.column = self.cell(start)?.span_start;
         let end_cell = self.cell(end)?;
         let origin = self.cell(CellPoint {
@@ -5036,10 +5054,7 @@ impl TranscriptSnapshot {
         Some((start, end))
     }
 
-    fn selection_contains(&self, selection: TranscriptSelection, point: CellPoint) -> bool {
-        let Some((start, end)) = self.selection_bounds(selection) else {
-            return false;
-        };
+    fn bounds_contain(start: CellPoint, end: CellPoint, point: CellPoint) -> bool {
         (point.row, point.column) >= (start.row, start.column)
             && (point.row, point.column) <= (end.row, end.column)
     }
@@ -5355,7 +5370,7 @@ impl ChatState {
             self.clear_transcript_selection();
             return false;
         };
-        if !snapshot.has_text_at(point) {
+        if snapshot.row_text_bounds(point.row).is_none() {
             self.clear_transcript_selection();
             return false;
         }
@@ -6869,7 +6884,13 @@ mod tests {
         };
 
         assert!(snapshot.has_text_at(CellPoint { column: 2, row: 0 }));
-        assert!(snapshot.selection_contains(selection, CellPoint { column: 1, row: 0 }));
+        assert_eq!(
+            snapshot.selection_bounds(selection),
+            Some((
+                CellPoint { column: 1, row: 0 },
+                CellPoint { column: 3, row: 0 }
+            ))
+        );
         assert_eq!(snapshot.selected_text(selection).as_deref(), Some("界B"));
     }
 
@@ -6890,6 +6911,51 @@ mod tests {
         assert_eq!(state.transcript_selected_text().as_deref(), Some("be\nta"));
         assert_eq!(state.copy_feedback, None);
         assert!(state.info_message.is_none());
+    }
+
+    #[test]
+    fn transcript_selection_drag_can_start_in_side_whitespace() {
+        let mut state = state();
+        state.transcript_snapshot = Some(transcript_snapshot(Rect::new(10, 5, 8, 1), &["alpha"]));
+
+        assert!(state.begin_transcript_drag(17, 5));
+        assert!(state.update_transcript_drag(16, 5));
+        let snapshot = state.transcript_snapshot.as_ref().unwrap();
+        let selection = state.transcript_selection.unwrap();
+        assert_eq!(snapshot.selected_text(selection).as_deref(), Some("a"));
+        assert_eq!(
+            snapshot.selection_bounds(selection),
+            Some((
+                CellPoint { column: 4, row: 0 },
+                CellPoint { column: 4, row: 0 }
+            ))
+        );
+
+        assert!(state.update_transcript_drag(10, 5));
+        state.finish_transcript_drag();
+
+        assert_eq!(state.transcript_selected_text().as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn transcript_selection_side_whitespace_click_still_dismisses() {
+        let mut state = state();
+        state.transcript_snapshot = Some(transcript_snapshot(Rect::new(10, 5, 8, 1), &["alpha"]));
+
+        assert!(state.begin_transcript_drag(17, 5));
+        state.finish_transcript_drag();
+
+        assert_eq!(state.transcript_selection, None);
+    }
+
+    #[test]
+    fn transcript_selection_empty_row_cannot_start_drag() {
+        let mut state = state();
+        state.transcript_snapshot =
+            Some(transcript_snapshot(Rect::new(10, 5, 8, 2), &["alpha", ""]));
+
+        assert!(!state.begin_transcript_drag(17, 6));
+        assert_eq!(state.transcript_selection, None);
     }
 
     #[test]
@@ -8451,13 +8517,20 @@ mod tests {
         state.dirty = LinesDirty::Clean;
         chat.phase = ChatPhase::Active(Box::new(state));
 
-        let click = MouseEvent {
+        let mouse_down = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: blank_col,
             row: blank_row,
             modifiers: KeyModifiers::NONE,
         };
-        chat.handle_mouse(click, area).await;
+        chat.handle_mouse(mouse_down, area).await;
+        let mouse_up = MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: blank_col,
+            row: blank_row,
+            modifiers: KeyModifiers::NONE,
+        };
+        chat.handle_mouse(mouse_up, area).await;
 
         let ChatPhase::Active(state) = &chat.phase else {
             panic!("expected active chat");
