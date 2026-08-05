@@ -551,6 +551,9 @@ pub struct TelegramChannel {
     draft_update_interval_ms: u64,
     last_draft_edit: Mutex<std::collections::HashMap<String, std::time::Instant>>,
     mention_only: bool,
+    /// When `false`, group-chat sessions are shared per chat/topic instead of
+    /// per sender. See `with_per_user_session`.
+    per_user_session: bool,
     bot_username: Mutex<Option<String>>,
     bot_id: Mutex<Option<i64>>,
     /// Base URL for the Telegram Bot API. Defaults to `https://api.telegram.org`.
@@ -649,6 +652,7 @@ impl TelegramChannel {
             last_draft_edit: Mutex::new(std::collections::HashMap::new()),
             typing_handle: Mutex::new(None),
             mention_only,
+            per_user_session: true,
             bot_username: Mutex::new(None),
             bot_id: Mutex::new(None),
             api_base: TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
@@ -687,6 +691,31 @@ impl TelegramChannel {
     pub fn with_ack_reactions(mut self, enabled: bool) -> Self {
         self.ack_reactions = enabled;
         self
+    }
+
+    /// Set by the orchestrator from `[channels.telegram.<alias>].per_user_session`.
+    /// When `false`, group-chat messages carry `ReplyTarget` conversation scope,
+    /// so every member of a group (or forum topic) shares one session keyed on
+    /// the chat/topic. When `true` (default), group sessions stay sender-scoped.
+    /// Direct messages are always sender-scoped either way.
+    pub fn with_per_user_session(mut self, enabled: bool) -> Self {
+        self.per_user_session = enabled;
+        self
+    }
+
+    /// Conversation scope for an inbound Telegram message: room-scoped for
+    /// group/supergroup chats when `per_user_session = false`, sender-scoped
+    /// otherwise. `reply_target` already carries `chat_id:message_thread_id`
+    /// for forum topics, so room scope still isolates topics from each other.
+    fn conversation_scope_for(
+        &self,
+        message: &serde_json::Value,
+    ) -> zeroclaw_api::channel::ChannelConversationScope {
+        if !self.per_user_session && Self::is_group_message(message) {
+            zeroclaw_api::channel::ChannelConversationScope::ReplyTarget
+        } else {
+            zeroclaw_api::channel::ChannelConversationScope::Sender
+        }
     }
 
     /// Returns `true` if `recipient` is in a peer group configured with
@@ -1966,6 +1995,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+            conversation_scope: self.conversation_scope_for(message),
 
             ..Default::default()
         })
@@ -2129,6 +2159,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+            conversation_scope: self.conversation_scope_for(message),
 
             ..Default::default()
         })
@@ -2400,6 +2431,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+            conversation_scope: self.conversation_scope_for(message),
 
             ..Default::default()
         })
@@ -6256,6 +6288,64 @@ mod tests {
             "chat": { "type": "private" }
         });
         assert!(!TelegramChannel::is_group_message(&private_msg));
+    }
+
+    #[test]
+    fn telegram_with_per_user_session_propagates_value() {
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "default",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        );
+        assert!(ch.per_user_session, "default must preserve legacy behavior");
+        let ch_off = TelegramChannel::new(
+            "fake-token".into(),
+            "default",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_per_user_session(false);
+        assert!(!ch_off.per_user_session);
+    }
+
+    #[test]
+    fn telegram_conversation_scope_respects_per_user_session_flag() {
+        use zeroclaw_api::channel::ChannelConversationScope;
+        let group_msg = serde_json::json!({ "chat": { "type": "supergroup" } });
+        let private_msg = serde_json::json!({ "chat": { "type": "private" } });
+
+        let per_user = TelegramChannel::new(
+            "fake-token".into(),
+            "default",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        );
+        assert_eq!(
+            per_user.conversation_scope_for(&group_msg),
+            ChannelConversationScope::Sender
+        );
+        assert_eq!(
+            per_user.conversation_scope_for(&private_msg),
+            ChannelConversationScope::Sender
+        );
+
+        let shared = TelegramChannel::new(
+            "fake-token".into(),
+            "default",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_per_user_session(false);
+        assert_eq!(
+            shared.conversation_scope_for(&group_msg),
+            ChannelConversationScope::ReplyTarget
+        );
+        // DMs stay sender-scoped even with shared group sessions.
+        assert_eq!(
+            shared.conversation_scope_for(&private_msg),
+            ChannelConversationScope::Sender
+        );
     }
 
     #[test]
