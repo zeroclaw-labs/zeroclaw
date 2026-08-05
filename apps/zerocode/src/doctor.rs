@@ -948,6 +948,34 @@ mod tests {
         );
     }
 
+    /// Regression for the disconnected empty-state suggestion: when the pane
+    /// has no result and is not loading or erroring (e.g. the connection is
+    /// disconnected), the detail panel must render the no-selection hint
+    /// instead of a blank panel.
+    #[tokio::test]
+    async fn render_screenshot_disconnected_empty_state_shows_no_selection() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut doctor = Doctor::new(test_client());
+        // No error, no refresh task, no result — the disconnected empty state.
+        doctor.filter = DoctorFilter::Problems;
+
+        let area = Rect::new(0, 0, 120, 24);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                doctor.draw(frame, area);
+            })
+            .expect("draw doctor");
+
+        let rendered = render_buffer_to_string(terminal.backend().buffer(), area);
+        assert!(
+            rendered.contains("No diagnostic selected"),
+            "the disconnected empty state must render the no-selection hint; got:\n{rendered}"
+        );
+    }
+
     // ─────────────────────────────────────────────────────────
     // Test for partial-results banner feature.
     // ─────────────────────────────────────────────────────────

@@ -995,13 +995,13 @@ impl RpcDispatcher {
         let (results, timed_out_phase) =
             crate::doctor::run_structured_with_probe(&config, PROBE_MODEL_TIMEOUT, probe).await;
         let summary = doctor_summary(&results);
-        let log_path = if config.observability.log_persistence
-            != zeroclaw_config::schema::LogPersistence::None
-        {
-            zeroclaw_log::current_log_path().map(|p| p.to_string_lossy().to_string())
-        } else {
-            None
-        };
+        // Read enabled + path from the one canonical active-writer accessor.
+        // The runtime `ctx.config.observability.log_persistence` snapshot is
+        // updated immediately by `config/set` while `zeroclaw-log` installs its
+        // writer state only at startup or daemon reload — gating on the config
+        // here would advertise a stale path (or omit a live one) during the
+        // config/reload window #8650 calls out.
+        let log_path = zeroclaw_log::active_log_path().map(|p| p.to_string_lossy().to_string());
         to_result(DoctorRunResult {
             results,
             summary,
@@ -7147,8 +7147,8 @@ mod tests {
     async fn doctor_run_omits_log_path_when_persistence_is_disabled() {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut config = make_acp_test_config(&tmp);
-        // Set persistence to None — writer state may still resolve a path,
-        // but the RPC must not advertise it as active.
+        // No writer is installed in this test: Doctor must not advertise any
+        // path regardless of the config snapshot.
         config.observability.log_persistence = zeroclaw_config::schema::LogPersistence::None;
         let (dispatcher, _sessions) = make_acp_test_dispatcher(config);
 
@@ -7159,7 +7159,86 @@ mod tests {
         let obj = result.as_object().expect("result must be an object");
         assert!(
             obj.get("log_path").map(|v| v.is_null()).unwrap_or(true),
-            "log_path must be null when persistence is disabled; got: {:?}",
+            "log_path must be null when no writer is active; got: {:?}",
+            obj.get("log_path")
+        );
+    }
+
+    /// #8650 config/reload window, scenario A: the daemon started with an
+    /// ACTIVE writer (rolling), then `config/set` flipped
+    /// `observability.log_persistence` to `none` WITHOUT a daemon reload.
+    /// The writer still persists, so Doctor must still advertise the path —
+    /// gating on the `ctx.config` snapshot would hide a live log.
+    #[tokio::test]
+    async fn doctor_reports_active_writer_path_after_config_set_to_none_without_reload() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        zeroclaw_log::init_from_config(
+            &zeroclaw_log::LogConfig {
+                log_persistence: "rolling".into(),
+                log_persistence_path: "state/runtime-trace.jsonl".into(),
+                ..Default::default()
+            },
+            tmp.path(),
+        );
+
+        let mut config = make_acp_test_config(&tmp);
+        config.observability.log_persistence = zeroclaw_config::schema::LogPersistence::None;
+        let (dispatcher, _sessions) = make_acp_test_dispatcher(config);
+
+        let result = dispatcher
+            .handle_doctor_run()
+            .await
+            .expect("doctor/run must succeed");
+        let obj = result.as_object().expect("result must be an object");
+        let log_path = obj.get("log_path").and_then(|v| v.as_str());
+        assert!(
+            matches!(log_path, Some(p) if p.ends_with("runtime-trace.jsonl")),
+            "an active writer must be advertised even when the config snapshot says none; got: {:?}",
+            obj.get("log_path")
+        );
+
+        // Restore a disabled writer so later tests start from a clean state.
+        zeroclaw_log::init_from_config(
+            &zeroclaw_log::LogConfig {
+                log_persistence: "none".into(),
+                log_persistence_path: "state/runtime-trace.jsonl".into(),
+                ..Default::default()
+            },
+            tmp.path(),
+        );
+    }
+
+    /// #8650 config/reload window, scenario B: the daemon started with
+    /// persistence DISABLED, then `config/set` flipped it to `rolling`
+    /// WITHOUT a daemon reload. No writer is installed, so Doctor must NOT
+    /// advertise the disabled writer's stale resolved path.
+    #[tokio::test]
+    async fn doctor_omits_log_path_after_config_set_to_rolling_without_reload_when_writer_disabled()
+    {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        zeroclaw_log::init_from_config(
+            &zeroclaw_log::LogConfig {
+                log_persistence: "none".into(),
+                log_persistence_path: "state/runtime-trace.jsonl".into(),
+                ..Default::default()
+            },
+            tmp.path(),
+        );
+
+        let mut config = make_acp_test_config(&tmp);
+        config.observability.log_persistence = zeroclaw_config::schema::LogPersistence::Rolling;
+        let (dispatcher, _sessions) = make_acp_test_dispatcher(config);
+
+        let result = dispatcher
+            .handle_doctor_run()
+            .await
+            .expect("doctor/run must succeed");
+        let obj = result.as_object().expect("result must be an object");
+        assert!(
+            obj.get("log_path").map(|v| v.is_null()).unwrap_or(true),
+            "log_path must stay null when no writer is installed, even if the config says rolling; got: {:?}",
             obj.get("log_path")
         );
     }
