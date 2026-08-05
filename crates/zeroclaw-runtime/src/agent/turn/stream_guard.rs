@@ -8,9 +8,10 @@ use super::protocol_detect::{
 };
 use std::collections::HashSet;
 use zeroclaw_tool_call_parser::{
-    ToolProtocolEnvelopeKind, classify_tool_protocol_envelope, contains_tool_protocol_tag_call,
-    looks_like_malformed_tool_protocol_envelope_for_known_tools, looks_like_tool_protocol_envelope,
-    looks_like_tool_protocol_example, tool_protocol_envelope_mentions_known_tool,
+    TERMINAL_MARKERS, ToolProtocolEnvelopeKind, classify_tool_protocol_envelope,
+    contains_tool_protocol_tag_call, looks_like_malformed_tool_protocol_envelope_for_known_tools,
+    looks_like_tool_protocol_envelope, looks_like_tool_protocol_example,
+    tool_protocol_envelope_mentions_known_tool,
 };
 
 #[derive(Debug, Default)]
@@ -274,26 +275,29 @@ impl StreamThinkTagStripper {
 #[cfg(test)]
 mod terminal_marker_stripper_tests {
     use super::StreamTerminalMarkerStripper;
+    use zeroclaw_tool_call_parser::{TERMINAL_MARKERS, strip_trailing_terminal_markers};
 
     #[test]
     fn strips_single_marker_at_end() {
         let mut stripper = StreamTerminalMarkerStripper::new();
-        assert_eq!(stripper.push("Summary<eom>"), "");
-        assert_eq!(stripper.finish(), "Summary");
+        // The safe prefix streams live; only the marker is held and discarded
+        // on finish.
+        assert_eq!(stripper.push("Summary<eom>"), "Summary");
+        assert_eq!(stripper.finish(), "");
     }
 
     #[test]
     fn strips_pipe_eom_marker_at_end() {
         let mut stripper = StreamTerminalMarkerStripper::new();
-        assert_eq!(stripper.push("Summary<|eom|>"), "");
-        assert_eq!(stripper.finish(), "Summary");
+        assert_eq!(stripper.push("Summary<|eom|>"), "Summary");
+        assert_eq!(stripper.finish(), "");
     }
 
     #[test]
     fn strips_stacked_markers_at_end() {
         let mut stripper = StreamTerminalMarkerStripper::new();
-        assert_eq!(stripper.push("Summary<eom><|eom|>"), "");
-        assert_eq!(stripper.finish(), "Summary");
+        assert_eq!(stripper.push("Summary<eom><|eom|>"), "Summary");
+        assert_eq!(stripper.finish(), "");
     }
 
     #[test]
@@ -309,26 +313,26 @@ mod terminal_marker_stripper_tests {
     #[test]
     fn handles_marker_split_across_chunks() {
         let mut stripper = StreamTerminalMarkerStripper::new();
-        assert_eq!(stripper.push("Summary<"), "");
+        assert_eq!(stripper.push("Summary<"), "Summary");
         assert_eq!(stripper.push("eom>"), "");
-        assert_eq!(stripper.finish(), "Summary");
+        assert_eq!(stripper.finish(), "");
     }
 
     #[test]
     fn handles_pipe_marker_split_across_chunks() {
         let mut stripper = StreamTerminalMarkerStripper::new();
-        assert_eq!(stripper.push("Summary<|"), "");
+        assert_eq!(stripper.push("Summary<|"), "Summary");
         assert_eq!(stripper.push("eom|>"), "");
-        assert_eq!(stripper.finish(), "Summary");
+        assert_eq!(stripper.finish(), "");
     }
 
     #[test]
     fn handles_stacked_markers_split_across_chunks() {
         let mut stripper = StreamTerminalMarkerStripper::new();
-        assert_eq!(stripper.push("Summary<eom>"), "");
+        assert_eq!(stripper.push("Summary<eom>"), "Summary");
         assert_eq!(stripper.push("<|"), "");
         assert_eq!(stripper.push("eom|>"), "");
-        assert_eq!(stripper.finish(), "Summary");
+        assert_eq!(stripper.finish(), "");
     }
 
     #[test]
@@ -341,15 +345,15 @@ mod terminal_marker_stripper_tests {
     #[test]
     fn handles_whitespace_after_marker() {
         let mut stripper = StreamTerminalMarkerStripper::new();
-        assert_eq!(stripper.push("Summary<eom>\n"), "");
-        assert_eq!(stripper.finish(), "Summary");
+        assert_eq!(stripper.push("Summary<eom>\n"), "Summary");
+        assert_eq!(stripper.finish(), "");
     }
 
     #[test]
     fn handles_long_whitespace_after_stacked_markers() {
         let mut stripper = StreamTerminalMarkerStripper::new();
-        assert_eq!(stripper.push("Summary<eom>           <|eom|>"), "");
-        assert_eq!(stripper.finish(), "Summary");
+        assert_eq!(stripper.push("Summary<eom>           <|eom|>"), "Summary");
+        assert_eq!(stripper.finish(), "");
     }
 
     #[test]
@@ -365,23 +369,119 @@ mod terminal_marker_stripper_tests {
         assert_eq!(stripper.push("Normal text"), "Normal text");
         assert_eq!(stripper.finish(), "");
     }
+
+    /// Regression for the live-streaming timing bug: a provider that sends the
+    /// whole answer plus a terminal marker in ONE delta must still forward the
+    /// answer immediately. The old implementation held the entire chunk in
+    /// `pending` and only released it on `finish()`, so nothing streamed until
+    /// the provider's `Final` event.
+    #[test]
+    fn push_releases_safe_prefix_and_holds_marker_suffix() {
+        let mut stripper = StreamTerminalMarkerStripper::new();
+        assert_eq!(
+            stripper.push("A large answer<eom>"),
+            "A large answer",
+            "the safe prefix must stream immediately; only the marker is held"
+        );
+        assert_eq!(
+            stripper.finish(),
+            "",
+            "the held marker is terminal and must be discarded on finish"
+        );
+    }
+
+    /// The streaming stripper and the non-streaming
+    /// `strip_trailing_terminal_markers` helper must agree on the same inputs.
+    /// This guards the shared-marker-vocabulary invariant: a change to
+    /// [`TERMINAL_MARKERS`] or to one path that is not mirrored in the other
+    /// fails here.
+    #[test]
+    fn streaming_matches_non_streaming_on_complete_input() {
+        let cases = [
+            ("Summary<eom>", "Summary"),
+            ("Summary<|eom|>", "Summary"),
+            ("Summary<eom><|eom|>", "Summary"),
+            ("Summary<eom>  \n", "Summary"),
+            ("Summary<eom>           <|eom|>", "Summary"),
+            ("Text with <eom> inline", "Text with <eom> inline"),
+            ("<eom>", ""),
+            ("<eom>\n<|eom|>", ""),
+            ("", ""),
+        ];
+        for (input, expected) in cases {
+            let non_streaming = strip_trailing_terminal_markers(input);
+            assert_eq!(
+                non_streaming, expected,
+                "non-streaming helper diverged for {input:?}"
+            );
+            let mut stripper = StreamTerminalMarkerStripper::new();
+            let live = stripper.push(input);
+            let flushed = stripper.finish();
+            let streamed = format!("{live}{flushed}");
+            assert_eq!(
+                streamed, expected,
+                "streaming stripper diverged from the non-streaming helper for {input:?}"
+            );
+        }
+    }
+
+    /// The canonical marker vocabulary must stay aligned between the streaming
+    /// state machine and the non-streaming helper. If the table is duplicated
+    /// again or a marker is added to only one path, this pin fails.
+    #[test]
+    fn marker_vocabulary_is_shared_with_non_streaming_path() {
+        assert_eq!(
+            TERMINAL_MARKERS,
+            ["<|eom|>", "<eom>"],
+            "the canonical marker table must match the documented spellings"
+        );
+        for marker in TERMINAL_MARKERS {
+            assert_eq!(
+                strip_trailing_terminal_markers(&format!("Summary{marker}")),
+                "Summary",
+                "non-streaming helper must strip the shared marker {marker:?}"
+            );
+            let mut stripper = StreamTerminalMarkerStripper::new();
+            assert_eq!(
+                stripper.push(&format!("Summary{marker}")),
+                "Summary",
+                "streaming stripper must recognize the shared marker {marker:?}"
+            );
+            assert_eq!(stripper.finish(), "");
+        }
+    }
 }
 
 /// Streaming-safe terminal marker stripper.
 ///
-/// Strips trailing terminal markers (`<eom>`, `<|eom|>`) from streaming text chunks.
-/// Handles markers split across multiple chunks, stacked markers, and markers with
-/// arbitrary whitespace between them.
+/// Strips trailing terminal markers ([`TERMINAL_MARKERS`]) from streaming text
+/// chunks. Handles markers split across multiple chunks, stacked markers, and
+/// markers with arbitrary whitespace between them.
 ///
 /// # State machine
 ///
-/// The stripper maintains a `pending` buffer that accumulates text. When a complete
-/// marker is found at the end, it is held in `pending` until the next chunk arrives.
-/// If the next chunk is non-empty, the marker is released as inline text. If
-/// `finish()` is called, the marker is discarded as terminal.
+/// The stripper maintains a `pending` buffer that accumulates text. When a
+/// complete marker is found at the end, only the possible marker/whitespace
+/// suffix is held in `pending`; the safe prefix is emitted immediately so a
+/// single delta that ends in a terminal marker still streams live instead of
+/// buffering the whole chunk until `finish()`. If the next chunk is non-empty
+/// and turns the held suffix into inline text, the suffix is released as inline
+/// text. If `finish()` is called, the marker is discarded as terminal.
 #[derive(Debug, Default)]
 pub(crate) struct StreamTerminalMarkerStripper {
     pending: String,
+}
+
+/// Length of the longest [`TERMINAL_MARKERS`] prefix that `text` ends with, if
+/// any. Used to hold a marker that is split across chunk boundaries (e.g. a
+/// chunk ending in `<` or `<|`) until the rest of the marker arrives.
+fn longest_terminal_marker_prefix(text: &str) -> Option<usize> {
+    TERMINAL_MARKERS
+        .iter()
+        .flat_map(|marker| (1..marker.len()).map(move |len| &marker[..len]))
+        .filter(|prefix| text.ends_with(prefix))
+        .map(str::len)
+        .max()
 }
 
 impl StreamTerminalMarkerStripper {
@@ -392,6 +492,14 @@ impl StreamTerminalMarkerStripper {
     }
 
     /// Push a chunk of text and return the visible text with terminal markers stripped.
+    ///
+    /// The safe prefix is emitted immediately and only the possible
+    /// marker/whitespace suffix (including a marker split across chunk
+    /// boundaries) is held, so a provider that sends a full answer plus a
+    /// terminal marker in one delta still streams the answer live instead of
+    /// buffering the whole chunk until [`Self::finish`]. A complete marker
+    /// followed by a partial marker is held as one unit: it may resolve into
+    /// stacked terminal markers.
     pub(crate) fn push(&mut self, chunk: &str) -> String {
         if chunk.is_empty() {
             return String::new();
@@ -400,94 +508,49 @@ impl StreamTerminalMarkerStripper {
         // Append the new chunk
         self.pending.push_str(chunk);
 
-        // Check if pending ends with a complete marker (possibly with trailing whitespace)
-        let trimmed = self.pending.trim_end();
+        // From the end, strip the trailing run of whitespace / complete
+        // markers / partial marker prefixes. What remains is the safe prefix.
+        let mut hold_start = self.pending.len();
+        loop {
+            let before = hold_start;
+            let ws_trimmed = self.pending[..hold_start].trim_end().len();
 
-        for marker in ["<|eom|>", "<eom>"] {
-            if trimmed.ends_with(marker) {
-                // Found a complete marker at the end
-                // Check if there's meaningful text after the last marker
-                // If the marker is at position 0 in trimmed, it's terminal
-                // If there's text before it, we need to check if that text ends with another marker
-
-                // Find the position of the last marker in trimmed
-                if let Some(marker_pos) = trimmed.rfind(marker) {
-                    // Check what's before this marker
-                    let before_marker = &trimmed[..marker_pos];
-
-                    // If before_marker is empty or only whitespace, this is a terminal marker
-                    if before_marker.trim().is_empty() {
-                        // Terminal marker - hold everything
-                        return String::new();
-                    }
-
-                    // There's text before the marker - check if it ends with another marker
-                    // If so, this is stacked terminal markers
-                    let before_trimmed = before_marker.trim_end();
-                    let is_stacked = ["<|eom|>", "<eom>"]
-                        .iter()
-                        .any(|m| before_trimmed.ends_with(m));
-
-                    if is_stacked {
-                        // Stacked terminal markers - hold everything
-                        return String::new();
-                    }
-
-                    // There's real text before the marker - this is an inline marker
-                    // But we still need to check if there's text AFTER the marker
-                    let after_marker_start = marker_pos + marker.len();
-                    let after_marker = &trimmed[after_marker_start..];
-
-                    if after_marker.trim().is_empty() {
-                        // Marker is at the end (possibly with whitespace) - terminal marker
-                        // Check if the text before contains an inline marker
-                        // If so, release the text up to (but not including) that inline marker
-                        // Otherwise, hold everything pending
-
-                        // Look for any marker in before_marker
-                        let has_inline_marker = ["<|eom|>", "<eom>"]
-                            .iter()
-                            .any(|m| before_marker.contains(m));
-
-                        if has_inline_marker {
-                            // There's an inline marker before this terminal marker
-                            // Release everything before the terminal marker
-                            let result = before_marker.to_string();
-                            // Hold the terminal marker and any trailing whitespace
-                            let hold_end =
-                                marker_pos + marker.len() + (self.pending.len() - trimmed.len());
-                            self.pending = self.pending[marker_pos..hold_end].to_string();
-                            return result;
-                        } else {
-                            // No inline marker - hold everything pending
-                            return String::new();
-                        }
-                    } else {
-                        // There's text after the marker - inline marker
-                        // Release everything (the marker is part of the inline text)
-                        let result = self.pending.clone();
-                        self.pending.clear();
-                        return result;
-                    }
+            let mut stripped = false;
+            for marker in TERMINAL_MARKERS {
+                if self.pending[..ws_trimmed].ends_with(marker) {
+                    hold_start = ws_trimmed - marker.len();
+                    stripped = true;
+                    break;
                 }
+            }
+            if !stripped
+                && let Some(prefix_len) =
+                    longest_terminal_marker_prefix(&self.pending[..ws_trimmed])
+            {
+                hold_start = ws_trimmed - prefix_len;
+                stripped = true;
+            }
+            if !stripped {
+                // No marker or partial prefix in the tail: the trailing
+                // whitespace (if any) belongs to normal text — emit it.
+                hold_start = before;
+                break;
+            }
+            if hold_start == 0 {
+                // Everything is a possible terminal marker — hold it all until
+                // the next chunk decides inline vs terminal.
+                return String::new();
             }
         }
 
-        // Check if pending ends with a partial marker prefix
-        // This handles cases like "Summary<" or "Summary<|" where the marker is split
-        for marker in ["<|eom|>", "<eom>"] {
-            for prefix_len in 1..marker.len() {
-                let prefix = &marker[..prefix_len];
-                if self.pending.ends_with(prefix) {
-                    // Found a partial marker - hold everything pending
-                    return String::new();
-                }
-            }
+        if hold_start == self.pending.len() {
+            // No marker at all — release everything.
+            let result = std::mem::take(&mut self.pending);
+            return result;
         }
 
-        // No marker at all - release everything
-        let result = self.pending.clone();
-        self.pending.clear();
+        let result = self.pending[..hold_start].to_string();
+        self.pending.drain(..hold_start);
         result
     }
 
@@ -506,7 +569,7 @@ impl StreamTerminalMarkerStripper {
             let trimmed = result.trim_end().to_string();
 
             let mut found_marker = false;
-            for marker in ["<|eom|>", "<eom>"] {
+            for marker in TERMINAL_MARKERS {
                 if let Some(prefix) = trimmed.strip_suffix(marker) {
                     result = prefix.to_string();
                     found_marker = true;

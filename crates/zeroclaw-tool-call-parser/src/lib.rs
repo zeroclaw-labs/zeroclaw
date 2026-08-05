@@ -33,6 +33,17 @@ fn parse_arguments_value(raw: Option<&serde_json::Value>) -> serde_json::Value {
     unwrap_nested_json_strings(initial)
 }
 
+/// Canonical vocabulary of terminal markers emitted by providers that must be
+/// stripped from final response text. This is the single source of truth for
+/// the marker vocabulary, shared by the non-streaming
+/// [`strip_trailing_terminal_markers`] helper and the streaming state machine
+/// (`zeroclaw-runtime`'s `StreamTerminalMarkerStripper`) so a vocabulary or
+/// matching-rule change cannot drift one path.
+///
+/// Order matters: longer spellings must precede shorter ones so a suffix check
+/// matches the most specific marker first.
+pub const TERMINAL_MARKERS: [&str; 2] = ["<|eom|>", "<eom>"];
+
 /// Strip trailing terminal markers (`<eom>`, `<|eom|>`) from a response string.
 /// Handles stacked markers with arbitrary whitespace between them.
 ///
@@ -61,7 +72,7 @@ pub fn strip_trailing_terminal_markers(text: &str) -> String {
         // Try to strip each known terminal marker
         let mut new_result: Option<String> = None;
 
-        for marker in ["<|eom|>", "<eom>"] {
+        for marker in TERMINAL_MARKERS {
             if let Some(suffix) = trimmed.strip_suffix(marker) {
                 new_result = Some(suffix.to_string());
                 break;

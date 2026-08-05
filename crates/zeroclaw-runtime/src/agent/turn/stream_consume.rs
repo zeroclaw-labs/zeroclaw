@@ -592,4 +592,134 @@ mod tests {
             "inline marker should be preserved but terminal marker stripped"
         );
     }
+
+    /// Provider that emits one text delta ending in a terminal marker, then
+    /// delays before `Final` so the test can observe whether the answer
+    /// streamed live or was buffered until completion.
+    struct LiveMarkerTimingProvider;
+
+    impl ::zeroclaw_api::attribution::Attributable for LiveMarkerTimingProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "LiveMarkerTimingProvider"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for LiveMarkerTimingProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                native_tool_calling: true,
+                vision: false,
+                prompt_caching: false,
+                extended_thinking: false,
+            }
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            anyhow::bail!("unused")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn supports_streaming_tool_events(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            // Emit the delta immediately, then pause before Final so the
+            // consumer's forwarding timing is observable: if the stripper
+            // buffers the whole chunk, no Chunk event is sent until the
+            // (delayed) finish path and the test times out.
+            Box::pin(futures_util::stream::unfold(0u8, |state| async move {
+                match state {
+                    0 => Some((
+                        Ok(StreamEvent::TextDelta(StreamChunk::delta(
+                            "A large answer<eom>",
+                        ))),
+                        1,
+                    )),
+                    _ => {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        Some((Ok(StreamEvent::Final), 2))
+                    }
+                }
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn streams_single_marker_chunk_live_before_final() {
+        let provider = LiveMarkerTimingProvider;
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(16);
+
+        let handle = zeroclaw_spawn::spawn!(async move {
+            consume_provider_streaming_response(
+                &provider,
+                &[ChatMessage::user("go")],
+                None,
+                "mock-model",
+                Some(0.0),
+                None,
+                None,
+                Some(&event_tx),
+                false,
+            )
+            .await
+        });
+
+        // The answer must be forwarded as a live Chunk before the provider's
+        // Final (which is delayed 500ms). The old stripper held the whole
+        // chunk until `finish()` after Final, so nothing arrived in time.
+        let chunk = tokio::time::timeout(std::time::Duration::from_millis(200), event_rx.recv())
+            .await
+            .expect("the answer must stream live before the provider's Final event")
+            .expect("event channel remains open");
+
+        match chunk {
+            TurnEvent::Chunk { delta } => assert_eq!(
+                delta, "A large answer",
+                "the live chunk must be the stripped answer, without the terminal marker"
+            ),
+            other => panic!("expected the stripped answer as a live Chunk, got {other:?}"),
+        }
+
+        let outcome = handle
+            .await
+            .expect("consume task completes")
+            .expect("stream consume should succeed");
+        assert_eq!(
+            outcome.response_text, "A large answer",
+            "the final accumulated response strips the terminal marker"
+        );
+    }
 }
