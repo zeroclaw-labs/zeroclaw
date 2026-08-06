@@ -1756,9 +1756,9 @@ pub fn default_model_provider_url(name: &str) -> Option<&'static str> {
         Ai21ModelProviderConfig, AihubmixModelProviderConfig, AnyscaleModelProviderConfig,
         ArceeModelProviderConfig, AstraiModelProviderConfig, BaichuanModelProviderConfig,
         BasetenModelProviderConfig, CerebrasModelProviderConfig, CloudflareModelProviderConfig,
-        CohereModelProviderConfig, DeepinfraModelProviderConfig, DeepseekModelProviderConfig,
-        DoubaoModelProviderConfig, FeatherlessModelProviderConfig, FireworksModelProviderConfig,
-        FriendliModelProviderConfig, GithubModelsModelProviderConfig,
+        CohereModelProviderConfig, CrusoeModelProviderConfig, DeepinfraModelProviderConfig,
+        DeepseekModelProviderConfig, DoubaoModelProviderConfig, FeatherlessModelProviderConfig,
+        FireworksModelProviderConfig, FriendliModelProviderConfig, GithubModelsModelProviderConfig,
         HuggingfaceModelProviderConfig, HyperbolicModelProviderConfig,
         InceptionModelProviderConfig, LambdaAiModelProviderConfig, LeptonModelProviderConfig,
         LitellmModelProviderConfig, MistralModelProviderConfig, MorphModelProviderConfig,
@@ -1816,6 +1816,7 @@ pub fn default_model_provider_url(name: &str) -> Option<&'static str> {
         "lambda_ai" => Some(<LambdaAiModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
         "inception" => Some(<InceptionModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
         "nearai" => Some(<NearaiModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
+        "crusoe" => Some(<CrusoeModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
         "baichuan" => Some(<BaichuanModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
         "yi" => Some(<YiModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
         _ => None,
@@ -1902,6 +1903,7 @@ pub fn list_model_providers() -> Vec<ModelProviderInfo> {
             ("groq", "Groq", false),
             ("mistral", "Mistral", false),
             ("xai", "xAI (Grok)", false),
+            ("crusoe", "Crusoe Managed Inference", false),
             ("deepseek", "DeepSeek", false),
             ("together", "Together AI", false),
             ("fireworks", "Fireworks AI", false),
@@ -3109,6 +3111,26 @@ mod tests {
         assert_eq!(
             default_model_provider_url("inception"),
             Some("https://api.inceptionlabs.ai/v1")
+        );
+        assert_eq!(
+            default_model_provider_url("crusoe"),
+            Some("https://api.inference.crusoecloud.com/v1")
+        );
+    }
+
+    #[test]
+    fn crusoe_default_url_matches_endpoint_enum() {
+        use crate::factory::CompatFamilySpec;
+        use zeroclaw_config::schema::CrusoeModelProviderConfig;
+        // Cross-surface drift guard: the factory default URL must equal the
+        // config-owned `CrusoeEndpoint` URI. Both reference
+        // `CrusoeEndpoint::DEFAULT_URI`, so this asserts the single-source-of-
+        // truth wiring stays intact if either surface is edited independently.
+        assert_eq!(
+            <CrusoeModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
+            <zeroclaw_config::schema::CrusoeEndpoint as zeroclaw_config::schema::ModelEndpoint>::uri(
+                &zeroclaw_config::schema::CrusoeEndpoint::Default,
+            ),
         );
     }
 
