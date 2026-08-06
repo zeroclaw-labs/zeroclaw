@@ -4281,6 +4281,16 @@ fn strip_isolated_tool_json_artifacts(message: &str, known_tool_names: &HashSet<
     result.trim().to_string()
 }
 
+/// After a clean listener return (no error), decide whether the supervisor
+/// should restart. Cancellation means the operator asked for shutdown — the
+/// exit is expected and must not restart. Any other clean return is
+/// unexpected and must restart.
+fn should_restart_listener_after_clean_return(
+    cancel: &tokio_util::sync::CancellationToken,
+) -> bool {
+    !cancel.is_cancelled()
+}
+
 fn spawn_supervised_listener(
     ch: Arc<dyn Channel>,
     alias: Option<String>,
@@ -4335,18 +4345,35 @@ fn spawn_supervised_listener_with_health_interval(
                     tokio::pin!(listen_future);
 
                     loop {
+                        let mut shutdown = false;
                         tokio::select! {
-                            () = cancel.cancelled() => return,
+                            () = cancel.cancelled() => {
+                                shutdown = true;
+                            }
                             _ = health.tick() => {
                                 zeroclaw_runtime::health::mark_component_ok(&component);
                             }
                             result = &mut listen_future => break result,
                         }
+                        if shutdown {
+                            // Wait for the listener to finish cleanup so
+                            // session teardown runs before supervisor exit.
+                            let _ = tokio::time::timeout(
+                                Duration::from_secs(5),
+                                listen_future,
+                            )
+                            .await;
+                            return;
+                        }
+                        // Health tick fired; loop back.
                     }
                 };
 
                 match result {
                     Ok(()) => {
+                        if !should_restart_listener_after_clean_return(&cancel) {
+                            return;
+                        }
                         ::zeroclaw_log::record!(
                             WARN,
                             ::zeroclaw_log::Event::new(
@@ -11196,6 +11223,12 @@ pub async fn start_channels(
                 .max(DEFAULT_CHANNEL_MAX_BACKOFF_SECS);
 
             let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(100);
+
+            // Inject the lifecycle token so channels that internally wait
+            // for shutdown subscribe to the single SIGINT consumer.
+            for cc in &configured_channels {
+                cc.channel.set_cancel_token(cancel.clone());
+            }
 
             for cc in &configured_channels {
                 listener_handles.push(spawn_supervised_listener(
@@ -25908,6 +25941,80 @@ This is an example JSON object for profile settings."#;
                 .contains("listen boom")
         );
         assert!(calls.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[test]
+    fn should_restart_listener_after_clean_return_respects_cancellation() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        assert!(
+            should_restart_listener_after_clean_return(&cancel),
+            "must restart when cancellation has not been triggered"
+        );
+        cancel.cancel();
+        assert!(
+            !should_restart_listener_after_clean_return(&cancel),
+            "must not restart after cancellation was triggered"
+        );
+    }
+
+    /// Cancellation must wait for the listener to finish cleanup, not
+    /// drop the future immediately. Cancelling the token while the
+    /// listener is blocked (simulating cleanup) must keep the supervisor
+    /// alive until cleanup completes, then exit without restart or error.
+    #[tokio::test]
+    async fn supervised_listener_waits_for_listener_on_cancellation() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let channel_name = format!("test-cancel-waits-{}", uuid::Uuid::new_v4());
+        let component = format!("channel:{channel_name}");
+        let channel: Arc<dyn Channel> = Arc::new(BlockUntilClosedChannel {
+            name: channel_name,
+            calls: Arc::clone(&calls),
+        });
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle = spawn_supervised_listener(channel, None, tx, 1, 1, cancel.clone());
+
+        // Cancel the token while the listener is blocked.
+        cancel.cancel();
+
+        // Supervisor must not exit yet — it should be waiting for
+        // listen() to return. Give the supervisor time to observe the
+        // cancelled token and enter the grace-period wait.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(
+            !handle.is_finished(),
+            "supervisor must wait for listener cleanup, not exit immediately"
+        );
+
+        // Unblock the listener so it returns Ok(()).
+        drop(rx);
+
+        // Now the supervisor should complete cleanly.
+        let result = tokio::time::timeout(Duration::from_millis(500), handle).await;
+        assert!(
+            result.is_ok(),
+            "supervisor must exit cleanly after listener cleanup completes"
+        );
+
+        // One listen call, no restart, no error.
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "listener ran more than once"
+        );
+
+        let snapshot = zeroclaw_runtime::health::snapshot_json();
+        let c = &snapshot["components"][&component];
+        assert!(
+            c["status"].is_null() || c["status"].as_str() != Some("error"),
+            "must not record error on intentional shutdown"
+        );
+        assert_eq!(
+            c["restart_count"].as_u64().unwrap_or(0),
+            0,
+            "must not restart on intentional shutdown"
+        );
     }
 
     #[tokio::test]
