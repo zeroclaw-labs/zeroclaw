@@ -186,7 +186,8 @@ pub fn refresh_source(root: &Path) -> anyhow::Result<()> {
 }
 
 const SOURCE_HEADER: &str = "# Canonical container base-image pins for the generated container surfaces\n\
-# (Dockerfile, Dockerfile.debian). Edit registry/repo/image_ref/tag here; `tag`\n\
+# (Dockerfile, Dockerfile.debian, Dockerfile.alpine). Edit\n\
+# registry/repo/image_ref/tag here; `tag`\n\
 # records the intended policy and `digest` is rewritten live by `cargo generate\n\
 # installers`. A row with discover=true refreshes the digest for its declared\n\
 # tag from the registry; Node discover rows must use a plain\n\
@@ -333,6 +334,9 @@ digest = "sha256:{}"
             .unwrap();
         assert!(node.discover, "node tag must be discovered live");
         assert!(src.image.iter().any(|i| i.zone == "base-arg-rust-slim"));
+        assert!(src.image.iter().any(|i| i.zone == "base-arg-node-alpine"));
+        assert!(src.image.iter().any(|i| i.zone == "base-arg-rust-alpine"));
+        assert!(src.image.iter().any(|i| i.zone == "base-arg-alpine"));
     }
 
     #[test]

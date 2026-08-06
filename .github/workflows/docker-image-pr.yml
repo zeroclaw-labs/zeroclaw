@@ -6,7 +6,10 @@ on:
     paths:
       - Dockerfile
       - Dockerfile.debian
+      - Dockerfile.alpine
       - Dockerfile.ci
+      - docker-compose.yml
+      - docker-compose.alpine.yml
       - .dockerignore
       - dev/config.template.toml
       - .github/workflows/docker-image-pr.yml
@@ -21,8 +24,45 @@ permissions:
   contents: read
 
 jobs:
+  changes:
+    name: Select Docker build scope
+    runs-on: ubuntu-latest
+    outputs:
+      prebuilt_images: ${{ steps.detect.outputs.prebuilt_images }}
+      source_matrix: ${{ steps.detect.outputs.source_matrix }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 2
+
+      - name: Detect source-build inputs
+        id: detect
+        run: |
+          changed_files=$(git diff --name-only HEAD^1 HEAD^2)
+          if [ -n "$changed_files" ] && \
+             ! printf '%s\n' "$changed_files" | grep -Eqv '^(docker-compose\.yml|docker-compose\.alpine\.yml)$'; then
+            prebuilt_images=false
+            source_matrix='{"include":[{"dockerfile":"Dockerfile.alpine","platform":"linux/amd64","tag":"zeroclaw-pr-source-alpine:build","cache-scope":"docker-source-alpine-amd64"}]}'
+          else
+            prebuilt_images=true
+            source_matrix='{"include":[{"dockerfile":"Dockerfile","platform":"linux/amd64","tag":"zeroclaw-pr-source-default:build","cache-scope":"docker-source-default-amd64"},{"dockerfile":"Dockerfile","platform":"linux/arm64","tag":"zeroclaw-pr-source-default:build","cache-scope":"docker-source-default-arm64"},{"dockerfile":"Dockerfile.debian","platform":"linux/amd64","tag":"zeroclaw-pr-source-debian:build","cache-scope":"docker-source-debian"},{"dockerfile":"Dockerfile.alpine","platform":"linux/amd64","tag":"zeroclaw-pr-source-alpine:build","cache-scope":"docker-source-alpine-amd64"},{"dockerfile":"Dockerfile.alpine","platform":"linux/arm64","tag":"zeroclaw-pr-source-alpine:build","cache-scope":"docker-source-alpine-arm64"}]}'
+          fi
+          echo "prebuilt_images=$prebuilt_images" >> "$GITHUB_OUTPUT"
+          echo "source_matrix=$source_matrix" >> "$GITHUB_OUTPUT"
+
+  compose:
+    name: Validate Alpine Compose merge
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Validate merged Compose configuration
+        run: docker compose -f docker-compose.yml -f docker-compose.alpine.yml config --quiet
+
   images:
     name: Docker Images Build (no push)
+    needs: changes
+    if: needs.changes.outputs.prebuilt_images == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -67,32 +107,20 @@ jobs:
           severity: HIGH,CRITICAL
 
   # Compiles the real source Dockerfiles (not the pre-built-binary `*.ci`
-  # variants above). The default `Dockerfile` is built for both published
-  # platforms, proving the arm64 cross-compilation path before a tag triggers
-  # docker-publish.yml; `Dockerfile.debian` stays amd64-only until the same
-  # cross-build support lands there. `push: false` and `contents: read` only —
-  # this never publishes. Split per matrix entry so the slow arm64 cross-build
-  # does not serialize behind the others.
+  # variants above). The default and Alpine Dockerfiles are built for both
+  # supported platforms, proving the arm64 cross-compilation paths before a tag
+  # triggers docker-publish.yml; `Dockerfile.debian` stays amd64-only until the
+  # same cross-build support lands there. `push: false` and `contents: read`
+  # only — this never publishes. Split per matrix entry so the slow arm64
+  # cross-builds do not serialize behind the others.
   source-images:
     name: Dockerfile Source Build (no push)
+    needs: changes
     runs-on: ubuntu-latest
     timeout-minutes: 90
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - dockerfile: Dockerfile
-            platform: linux/amd64
-            tag: zeroclaw-pr-source-default:build
-            cache-scope: docker-source-default-amd64
-          - dockerfile: Dockerfile
-            platform: linux/arm64
-            tag: zeroclaw-pr-source-default:build
-            cache-scope: docker-source-default-arm64
-          - dockerfile: Dockerfile.debian
-            platform: linux/amd64
-            tag: zeroclaw-pr-source-debian:build
-            cache-scope: docker-source-debian
+      matrix: ${{ fromJSON(needs.changes.outputs.source_matrix) }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -105,8 +133,44 @@ jobs:
           context: .
           file: ${{ matrix.dockerfile }}
           push: false
-          load: false
+          load: ${{ matrix.dockerfile == 'Dockerfile.alpine' && matrix.platform == 'linux/amd64' }}
           platforms: ${{ matrix.platform }}
           tags: ${{ matrix.tag }}
           cache-from: type=gha,scope=${{ matrix.cache-scope }}
           cache-to: type=gha,scope=${{ matrix.cache-scope }},mode=max
+
+      - name: Smoke Alpine binaries
+        if: matrix.dockerfile == 'Dockerfile.alpine' && matrix.platform == 'linux/amd64'
+        run: |
+          docker run --rm --entrypoint zeroclaw "${{ matrix.tag }}" --version
+          docker run --rm --entrypoint zerocode "${{ matrix.tag }}" --version
+
+      - name: Smoke Alpine Compose runtime
+        if: matrix.dockerfile == 'Dockerfile.alpine' && matrix.platform == 'linux/amd64'
+        run: |
+          docker tag "${{ matrix.tag }}" zeroclaw:alpine
+          compose=(docker compose -f docker-compose.yml -f docker-compose.alpine.yml)
+          cleanup() {
+            status=$?
+            if [ "$status" -ne 0 ]; then
+              "${compose[@]}" logs || true
+            fi
+            "${compose[@]}" down -v --remove-orphans || true
+            docker image rm zeroclaw:alpine || true
+            exit "$status"
+          }
+          trap cleanup EXIT
+
+          "${compose[@]}" up -d --no-build
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:42617/health >/dev/null; then
+              break
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              "${compose[@]}" logs
+              exit 1
+            fi
+            sleep 2
+          done
+          dashboard=$(curl -fsS http://127.0.0.1:42617/)
+          printf '%s\n' "$dashboard" | grep -Eqi '<html'
