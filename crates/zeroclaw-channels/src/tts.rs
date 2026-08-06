@@ -417,14 +417,14 @@ const EDGE_TTS_REAP_GRACE: std::time::Duration = std::time::Duration::from_secs(
 /// `SIGTERM`, which a cooperative child (or a test fixture) can handle or
 /// ignore; Windows has no signal model, so fall back to the hard kill.
 #[cfg(unix)]
-fn graceful_kill(child: &tokio::process::Child) {
+fn graceful_kill(child: &mut tokio::process::Child) {
     if let Some(pid) = child.id() {
         let _ = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
     }
 }
 
 #[cfg(not(unix))]
-fn graceful_kill(child: &tokio::process::Child) {
+fn graceful_kill(child: &mut tokio::process::Child) {
     let _ = child.start_kill();
 }
 
@@ -467,7 +467,7 @@ impl Drop for EdgeTtsTempArtifact {
                 // Graceful first: SIGTERM on Unix. A cooperative child exits
                 // promptly; an uncooperative one keeps running and stays
                 // pending so the reaper below genuinely owns the bounded wait.
-                graceful_kill(&child);
+                graceful_kill(&mut child);
                 // Already reaped (e.g. the success path): remove the file
                 // inline — no reaper needed.
                 if let Ok(Some(_)) = child.try_wait() {
