@@ -328,6 +328,17 @@ fn collapse_wrapped_marker(raw: &str) -> String {
     out.trim().to_string()
 }
 
+/// True when `content` holds an image marker, terminated or not.
+///
+/// This is how a provider adapter tells *residue of this crate's own marker
+/// normalization* from a data URI the author wrote deliberately. An
+/// unterminated marker is copied through by [`parse_image_markers`] verbatim,
+/// prefix included, so the prefix is present in both the input and the cleaned
+/// output whenever residue is possible.
+pub(crate) fn carries_image_marker(content: &str) -> bool {
+    content.contains(IMAGE_MARKER_PREFIX)
+}
+
 pub fn parse_image_markers(content: &str) -> (String, Vec<String>) {
     let mut refs = Vec::new();
     let mut cleaned = String::with_capacity(content.len());
