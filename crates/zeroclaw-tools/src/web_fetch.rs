@@ -389,11 +389,20 @@ impl Tool for WebFetchTool {
             attempt.follow()
         });
 
+        // Negotiate the encodings `http_decode` can decode. reqwest's own
+        // compression features are intentionally disabled (they'd unify across
+        // the whole workspace), so this header is set explicitly here.
+        let mut default_headers = reqwest::header::HeaderMap::new();
+        default_headers.insert(
+            reqwest::header::ACCEPT_ENCODING,
+            reqwest::header::HeaderValue::from_static("gzip, deflate, br"),
+        );
         let builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(timeout_secs))
             .connect_timeout(Duration::from_secs(10))
             .redirect(redirect_policy)
-            .user_agent("ZeroClaw/0.1 (web_fetch)");
+            .user_agent("ZeroClaw/0.1 (web_fetch)")
+            .default_headers(default_headers);
         let builder =
             zeroclaw_config::schema::apply_runtime_proxy_to_builder(builder, "tool.web_fetch");
         let client = match builder.build() {

@@ -59,21 +59,27 @@ enum BodyDecoder {
 }
 
 impl BodyDecoder {
-    fn for_encoding(encoding: Option<&str>, cap: usize) -> Self {
+    /// Pick a decoder for a single `Content-Encoding` token. Returns `None` for an
+    /// unsupported or **compound** coding (e.g. `gzip, br`) so the caller rejects
+    /// it instead of returning the still-encoded bytes as garbage — a chained
+    /// encoding would otherwise fall through to identity.
+    fn for_encoding(encoding: Option<&str>, cap: usize) -> Option<Self> {
         let sink = CappedWriter::new(cap);
         match encoding
             .map(str::trim)
             .map(str::to_ascii_lowercase)
             .as_deref()
         {
+            None | Some("") | Some("identity") => Some(Self::Identity(sink)),
             Some("gzip") | Some("x-gzip") => {
-                Self::Gzip(Box::new(flate2::write::GzDecoder::new(sink)))
+                Some(Self::Gzip(Box::new(flate2::write::GzDecoder::new(sink))))
             }
             // HTTP `deflate` is zlib-wrapped in practice (and reqwest decoded it
             // that way); the tests encode with `flate2`'s ZlibEncoder.
-            Some("deflate") => Self::Zlib(Box::new(flate2::write::ZlibDecoder::new(sink))),
-            Some("br") => Self::Brotli(Box::new(brotli::DecompressorWriter::new(sink, 4096))),
-            _ => Self::Identity(sink),
+            Some("deflate") => Some(Self::Zlib(Box::new(flate2::write::ZlibDecoder::new(sink)))),
+            Some("br") => Some(Self::Brotli(Box::new(brotli::DecompressorWriter::new(sink, 4096)))),
+            // Unsupported or compound (comma-separated) coding.
+            Some(_) => None,
         }
     }
 
@@ -146,7 +152,12 @@ pub(crate) async fn read_decoded_text_capped(
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
 
-    let mut decoder = BodyDecoder::for_encoding(encoding.as_deref(), hard_cap);
+    let mut decoder = BodyDecoder::for_encoding(encoding.as_deref(), hard_cap).ok_or_else(|| {
+        anyhow::Error::msg(format!(
+            "unsupported Content-Encoding: {}",
+            encoding.as_deref().unwrap_or_default()
+        ))
+    })?;
     let mut stream = response.bytes_stream();
     let mut truncated = false;
     while let Some(chunk) = stream.next().await {

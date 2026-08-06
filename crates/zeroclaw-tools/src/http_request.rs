@@ -351,10 +351,20 @@ impl HttpRequestTool {
         } else {
             self.timeout_secs
         };
+        // Negotiate the encodings `http_decode` can decode. reqwest's own
+        // compression features are intentionally disabled workspace-wide, so
+        // this header is set explicitly. A caller-supplied `Accept-Encoding` in
+        // `headers` overrides it (per-request headers win over defaults).
+        let mut default_headers = reqwest::header::HeaderMap::new();
+        default_headers.insert(
+            reqwest::header::ACCEPT_ENCODING,
+            reqwest::header::HeaderValue::from_static("gzip, deflate, br"),
+        );
         let builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(timeout_secs))
             .connect_timeout(Duration::from_secs(10))
-            .redirect(reqwest::redirect::Policy::none());
+            .redirect(reqwest::redirect::Policy::none())
+            .default_headers(default_headers);
         let builder =
             zeroclaw_config::schema::apply_runtime_proxy_to_builder(builder, "tool.http_request");
         let builder = if target.host.parse::<IpAddr>().is_ok() {
@@ -1420,6 +1430,89 @@ api_token = "Bearer from-secret"
             !result.success,
             "a body that could not be decoded must not be a successful execution"
         );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("read response body")),
+            "error must explain the body-read failure, got {:?}",
+            result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn request_advertises_accept_encoding() {
+        use wiremock::matchers::{header_exists, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // The mock only matches when the request carries an Accept-Encoding
+        // header; a request without it falls through to a 404, so a 200 result
+        // proves the tool negotiates encodings.
+        let server = MockServer::start().await;
+        let addr = server.address();
+        Mock::given(method("GET"))
+            .and(header_exists("accept-encoding"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .mount(&server)
+            .await;
+
+        let tool = HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["*".into()],
+            1_048_576,
+            30,
+            true,
+            Vec::new(),
+        )
+        .unwrap();
+        let url = format!("http://{}:{}/", addr.ip(), addr.port());
+        let result = tool
+            .execute(json!({ "url": url }))
+            .await
+            .expect("execute resolves");
+
+        assert!(
+            result.success,
+            "request must advertise Accept-Encoding (else the mock 404s): {:?}",
+            result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn compound_content_encoding_reports_failure() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // A compound coding (`gzip, br`) is not a single supported token; the
+        // decoder must reject it rather than return the still-encoded bytes as
+        // model-visible garbage.
+        let server = MockServer::start().await;
+        let addr = server.address();
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-encoding", "gzip, br")
+                    .set_body_raw(b"still-encoded bytes".to_vec(), "text/plain"),
+            )
+            .mount(&server)
+            .await;
+
+        let tool = HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["*".into()],
+            1_048_576,
+            30,
+            true,
+            Vec::new(),
+        )
+        .unwrap();
+        let url = format!("http://{}:{}/", addr.ip(), addr.port());
+        let result = tool
+            .execute(json!({ "url": url }))
+            .await
+            .expect("execute resolves");
+
+        assert!(!result.success, "a compound encoding must not succeed");
         assert!(
             result
                 .error
