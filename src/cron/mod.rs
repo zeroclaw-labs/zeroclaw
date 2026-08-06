@@ -39,6 +39,78 @@ fn parse_explicit_rfc3339_utc(raw: &str) -> Result<chrono::DateTime<chrono::Utc>
         })
 }
 
+/// Build a `DeliveryConfig` for a newly created job from the shared CLI flags.
+///
+/// Returns `None` (leaving the job's delivery mode `"none"`) when no delivery
+/// flag is set, so omitting the flags keeps the pre-existing behaviour. Any flag
+/// present builds an `"announce"` config, which `validate_delivery_config` (called
+/// by the create paths) then checks for a channel and recipient. That includes
+/// `--no-best-effort` on its own: it is a delivery request with no destination,
+/// so it is rejected rather than silently dropped.
+fn build_delivery(args: &crate::CronDeliveryArgs) -> Option<DeliveryConfig> {
+    if !args.any_set() {
+        return None;
+    }
+    Some(DeliveryConfig {
+        mode: "announce".to_string(),
+        channel: args.delivery_channel.clone(),
+        to: args.delivery_to.clone(),
+        thread_id: args.delivery_thread.clone(),
+        best_effort: args.best_effort_override().unwrap_or(true),
+    })
+}
+
+/// Apply the delivery flags as a patch over a job's stored delivery config.
+///
+/// `cron update` documents that only the fields you name change, so the delivery
+/// flags follow that contract: an omitted field keeps its stored value. Changing
+/// a channel therefore no longer clears an existing thread id or resets the
+/// best-effort policy, and `--to` or `--thread` alone can amend a destination
+/// without restating it.
+///
+/// Only a job already in `"announce"` mode has fields worth preserving. When
+/// delivery was off, a stale channel or recipient left in the stored row must not
+/// be resurrected by an unrelated flag, so the merge starts from an empty config
+/// and the caller has to name a destination.
+fn merge_delivery(
+    existing: &DeliveryConfig,
+    args: &crate::CronDeliveryArgs,
+) -> Option<DeliveryConfig> {
+    if !args.any_set() {
+        return None;
+    }
+    let base = if existing.mode.eq_ignore_ascii_case("announce") {
+        existing.clone()
+    } else {
+        DeliveryConfig::default()
+    };
+    Some(DeliveryConfig {
+        mode: "announce".to_string(),
+        channel: args.delivery_channel.clone().or(base.channel),
+        to: args.delivery_to.clone().or(base.to),
+        thread_id: args.delivery_thread.clone().or(base.thread_id),
+        best_effort: args.best_effort_override().unwrap_or(base.best_effort),
+    })
+}
+
+/// Print where a created/updated job's output will go, so an `ok` job status is
+/// never mistaken for a successful delivery.
+fn print_delivery_line(job: &CronJob) {
+    let value = if job.delivery.mode.eq_ignore_ascii_case("announce") {
+        match (job.delivery.channel.as_deref(), job.delivery.to.as_deref()) {
+            (Some(channel), Some(to)) => format!("{channel} \u{2192} {to}"),
+            (Some(channel), None) => channel.to_string(),
+            _ => "announce".to_string(),
+        }
+    } else {
+        get_required_cli_string("cli-cron-delivery-disabled")
+    };
+    println!(
+        "{}",
+        get_required_cli_string_with_args("cli-cron-delivery", &[("v", &value)])
+    );
+}
+
 pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<()> {
     match command {
         crate::CronCommands::List => {
@@ -98,6 +170,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             prompt,
             allowed_tools,
             uses_memory,
+            delivery,
             command,
         } => {
             require_configured_agent(config, &agent_alias)?;
@@ -105,6 +178,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                 expr: expression,
                 tz,
             };
+            let delivery = build_delivery(&delivery);
             if prompt {
                 let job = add_agent_job(
                     config,
@@ -114,7 +188,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                     &command,
                     SessionTarget::Isolated,
                     None,
-                    None,
+                    delivery,
                     false,
                     if allowed_tools.is_empty() {
                         None
@@ -145,11 +219,20 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                         &[("v", job.prompt.as_deref().unwrap_or_default())]
                     )
                 );
+                print_delivery_line(&job);
             } else {
                 if !allowed_tools.is_empty() {
                     bail!("--allowed-tool is only supported with --prompt cron jobs");
                 }
-                let job = add_shell_job(config, &agent_alias, None, schedule, &command)?;
+                let job = add_shell_job_with_approval(
+                    config,
+                    &agent_alias,
+                    None,
+                    schedule,
+                    &command,
+                    delivery,
+                    false,
+                )?;
                 println!(
                     "{}",
                     get_required_cli_string_with_args("cli-cron-added", &[("id", &job.id)])
@@ -169,6 +252,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                     "{}",
                     get_required_cli_string_with_args("cli-cron-cmd", &[("v", &job.command)])
                 );
+                print_delivery_line(&job);
             }
             Ok(())
         }
@@ -178,11 +262,13 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             prompt,
             allowed_tools,
             uses_memory,
+            delivery,
             command,
         } => {
             require_configured_agent(config, &agent_alias)?;
             let at = parse_explicit_rfc3339_utc(&at)?;
             let schedule = Schedule::At { at };
+            let delivery = build_delivery(&delivery);
             if prompt {
                 let job = add_agent_job(
                     config,
@@ -192,7 +278,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                     &command,
                     SessionTarget::Isolated,
                     None,
-                    None,
+                    delivery,
                     true,
                     if allowed_tools.is_empty() {
                         None
@@ -222,11 +308,20 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                         &[("v", job.prompt.as_deref().unwrap_or_default())]
                     )
                 );
+                print_delivery_line(&job);
             } else {
                 if !allowed_tools.is_empty() {
                     bail!("--allowed-tool is only supported with --prompt cron jobs");
                 }
-                let job = add_shell_job(config, &agent_alias, None, schedule, &command)?;
+                let job = add_shell_job_with_approval(
+                    config,
+                    &agent_alias,
+                    None,
+                    schedule,
+                    &command,
+                    delivery,
+                    false,
+                )?;
                 println!(
                     "{}",
                     get_required_cli_string_with_args("cli-cron-added-oneshot", &[("id", &job.id)])
@@ -242,6 +337,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                     "{}",
                     get_required_cli_string_with_args("cli-cron-cmd", &[("v", &job.command)])
                 );
+                print_delivery_line(&job);
             }
             Ok(())
         }
@@ -251,10 +347,12 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             prompt,
             allowed_tools,
             uses_memory,
+            delivery,
             command,
         } => {
             require_configured_agent(config, &agent_alias)?;
             let schedule = Schedule::Every { every_ms };
+            let delivery = build_delivery(&delivery);
             if prompt {
                 let job = add_agent_job(
                     config,
@@ -264,7 +362,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                     &command,
                     SessionTarget::Isolated,
                     None,
-                    None,
+                    delivery,
                     false,
                     if allowed_tools.is_empty() {
                         None
@@ -301,11 +399,20 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                         &[("v", job.prompt.as_deref().unwrap_or_default())]
                     )
                 );
+                print_delivery_line(&job);
             } else {
                 if !allowed_tools.is_empty() {
                     bail!("--allowed-tool is only supported with --prompt cron jobs");
                 }
-                let job = add_shell_job(config, &agent_alias, None, schedule, &command)?;
+                let job = add_shell_job_with_approval(
+                    config,
+                    &agent_alias,
+                    None,
+                    schedule,
+                    &command,
+                    delivery,
+                    false,
+                )?;
                 println!(
                     "{}",
                     get_required_cli_string_with_args(
@@ -331,6 +438,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                     "{}",
                     get_required_cli_string_with_args("cli-cron-cmd3", &[("v", &job.command)])
                 );
+                print_delivery_line(&job);
             }
             Ok(())
         }
@@ -340,9 +448,11 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             prompt,
             allowed_tools,
             uses_memory,
+            delivery,
             command,
         } => {
             require_configured_agent(config, &agent_alias)?;
+            let delivery = build_delivery(&delivery);
             if prompt {
                 let duration = parse_delay(&delay)?;
                 let at = chrono::Utc::now() + duration;
@@ -355,7 +465,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                     &command,
                     SessionTarget::Isolated,
                     None,
-                    None,
+                    delivery,
                     true,
                     if allowed_tools.is_empty() {
                         None
@@ -385,11 +495,12 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                         &[("v", job.prompt.as_deref().unwrap_or_default())]
                     )
                 );
+                print_delivery_line(&job);
             } else {
                 if !allowed_tools.is_empty() {
                     bail!("--allowed-tool is only supported with --prompt cron jobs");
                 }
-                let job = add_once(config, &agent_alias, &delay, &command)?;
+                let job = add_once(config, &agent_alias, &delay, &command, delivery)?;
                 println!(
                     "{}",
                     get_required_cli_string_with_args("cli-cron-added-oneshot", &[("id", &job.id)])
@@ -405,6 +516,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                     "{}",
                     get_required_cli_string_with_args("cli-cron-cmd", &[("v", &job.command)])
                 );
+                print_delivery_line(&job);
             }
             Ok(())
         }
@@ -417,20 +529,42 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             name,
             allowed_tools,
             uses_memory,
+            delivery,
         } => {
             require_configured_agent(config, &agent_alias)?;
+            let delivery_requested = delivery.any_set();
             if expression.is_none()
                 && tz.is_none()
                 && command.is_none()
                 && name.is_none()
                 && allowed_tools.is_empty()
                 && uses_memory.is_none()
+                && !delivery_requested
             {
                 bail!("{}", get_required_cli_string("cli-cron-update-no-field"));
             }
 
-            let existing = if expression.is_some() || tz.is_some() || !allowed_tools.is_empty() {
+            let existing = if expression.is_some()
+                || tz.is_some()
+                || !allowed_tools.is_empty()
+                || delivery_requested
+            {
                 Some(get_job(config, &id)?)
+            } else {
+                None
+            };
+
+            // Delivery flags are a patch over the stored config, matching this
+            // command's contract that only the fields you name change. The
+            // create paths validate inside `add_*_with_approval`; the update
+            // path does not, so validate the merged result here.
+            let delivery = if delivery_requested {
+                let existing = existing
+                    .as_ref()
+                    .expect("existing job must be loaded when updating delivery");
+                let merged = merge_delivery(&existing.delivery, &delivery);
+                validate_delivery_config(merged.as_ref())?;
+                merged
             } else {
                 None
             };
@@ -476,6 +610,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                     Some(allowed_tools)
                 },
                 uses_memory,
+                delivery,
                 ..CronJobPatch::default()
             };
 
@@ -499,6 +634,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                 "{}",
                 get_required_cli_string_with_args("cli-cron-cmd", &[("v", &job.command)])
             );
+            print_delivery_line(&job);
             Ok(())
         }
         crate::CronCommands::Remove { id } => {
@@ -576,6 +712,7 @@ mod tests {
                 prompt: false,
                 allowed_tools: vec![],
                 uses_memory: None,
+                delivery: crate::CronDeliveryArgs::default(),
                 command: "echo at".into(),
             },
             &config,
@@ -589,5 +726,521 @@ mod tests {
         );
         assert!(message.contains("2026-05-18T09:00:00Z"));
         assert!(message.contains("2026-05-18T09:00:00-04:00"));
+    }
+
+    #[test]
+    fn cli_add_persists_delivery_config() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        handle_command(
+            crate::CronCommands::Add {
+                expression: "*/5 * * * *".into(),
+                agent_alias: "test-agent".into(),
+                tz: None,
+                prompt: false,
+                allowed_tools: vec![],
+                uses_memory: None,
+                delivery: crate::CronDeliveryArgs {
+                    delivery_channel: Some("telegram".into()),
+                    delivery_to: Some("12345".into()),
+                    delivery_thread: None,
+                    no_best_effort: true,
+                    best_effort: false,
+                },
+                command: "echo ok".into(),
+            },
+            &config,
+        )
+        .unwrap();
+
+        let jobs = list_jobs(&config).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].delivery.mode, "announce");
+        assert_eq!(jobs[0].delivery.channel.as_deref(), Some("telegram"));
+        assert_eq!(jobs[0].delivery.to.as_deref(), Some("12345"));
+        assert!(!jobs[0].delivery.best_effort);
+    }
+
+    #[test]
+    fn cli_add_with_thread_persists_thread_id() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        handle_command(
+            crate::CronCommands::Add {
+                expression: "*/5 * * * *".into(),
+                agent_alias: "test-agent".into(),
+                tz: None,
+                prompt: false,
+                allowed_tools: vec![],
+                uses_memory: None,
+                delivery: crate::CronDeliveryArgs {
+                    delivery_channel: Some("webhook".into()),
+                    delivery_to: Some("hook-1".into()),
+                    delivery_thread: Some("thread-9".into()),
+                    no_best_effort: false,
+                    best_effort: false,
+                },
+                command: "echo ok".into(),
+            },
+            &config,
+        )
+        .unwrap();
+
+        let jobs = list_jobs(&config).unwrap();
+        assert_eq!(jobs[0].delivery.thread_id.as_deref(), Some("thread-9"));
+        assert!(jobs[0].delivery.best_effort);
+    }
+
+    #[test]
+    fn cli_add_without_delivery_flags_defaults_to_none() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        handle_command(
+            crate::CronCommands::Add {
+                expression: "*/5 * * * *".into(),
+                agent_alias: "test-agent".into(),
+                tz: None,
+                prompt: false,
+                allowed_tools: vec![],
+                uses_memory: None,
+                delivery: crate::CronDeliveryArgs::default(),
+                command: "echo ok".into(),
+            },
+            &config,
+        )
+        .unwrap();
+
+        let jobs = list_jobs(&config).unwrap();
+        assert_eq!(jobs[0].delivery.mode, "none");
+    }
+
+    #[test]
+    fn cli_update_patches_delivery_config() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        handle_command(
+            crate::CronCommands::Add {
+                expression: "*/5 * * * *".into(),
+                agent_alias: "test-agent".into(),
+                tz: None,
+                prompt: false,
+                allowed_tools: vec![],
+                uses_memory: None,
+                delivery: crate::CronDeliveryArgs::default(),
+                command: "echo test".into(),
+            },
+            &config,
+        )
+        .unwrap();
+        let id = list_jobs(&config).unwrap()[0].id.clone();
+
+        handle_command(
+            crate::CronCommands::Update {
+                id: id.clone(),
+                agent_alias: "test-agent".into(),
+                expression: None,
+                tz: None,
+                command: None,
+                name: None,
+                allowed_tools: vec![],
+                uses_memory: None,
+                delivery: crate::CronDeliveryArgs {
+                    delivery_channel: Some("discord".into()),
+                    delivery_to: Some("chan-42".into()),
+                    delivery_thread: None,
+                    no_best_effort: false,
+                    best_effort: false,
+                },
+            },
+            &config,
+        )
+        .unwrap();
+
+        let updated = get_job(&config, &id).unwrap();
+        assert_eq!(updated.delivery.mode, "announce");
+        assert_eq!(updated.delivery.channel.as_deref(), Some("discord"));
+        assert_eq!(updated.delivery.to.as_deref(), Some("chan-42"));
+        assert!(updated.delivery.best_effort);
+    }
+
+    #[test]
+    fn cli_update_rejects_announce_without_recipient() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        handle_command(
+            crate::CronCommands::Add {
+                expression: "*/5 * * * *".into(),
+                agent_alias: "test-agent".into(),
+                tz: None,
+                prompt: false,
+                allowed_tools: vec![],
+                uses_memory: None,
+                delivery: crate::CronDeliveryArgs::default(),
+                command: "echo test".into(),
+            },
+            &config,
+        )
+        .unwrap();
+        let id = list_jobs(&config).unwrap()[0].id.clone();
+
+        // --channel without --to is an incomplete announce config; the update
+        // path must reject it rather than persist an unroutable delivery.
+        let result = handle_command(
+            crate::CronCommands::Update {
+                id,
+                agent_alias: "test-agent".into(),
+                expression: None,
+                tz: None,
+                command: None,
+                name: None,
+                allowed_tools: vec![],
+                uses_memory: None,
+                delivery: crate::CronDeliveryArgs {
+                    delivery_channel: Some("telegram".into()),
+                    delivery_to: None,
+                    delivery_thread: None,
+                    no_best_effort: false,
+                    best_effort: false,
+                },
+            },
+            &config,
+        );
+        let err = result.expect_err("announce without --to must be rejected");
+        assert!(
+            err.to_string().contains("delivery.to is required"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Delivery flags on `update` are a patch, not a replacement: changing the
+    /// destination must not silently clear the thread id or reset the
+    /// best-effort policy the job already had.
+    #[test]
+    fn cli_update_preserves_unspecified_delivery_fields() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        handle_command(
+            crate::CronCommands::Add {
+                expression: "*/5 * * * *".into(),
+                agent_alias: "test-agent".into(),
+                tz: None,
+                prompt: false,
+                allowed_tools: vec![],
+                uses_memory: None,
+                delivery: crate::CronDeliveryArgs {
+                    delivery_channel: Some("telegram".into()),
+                    delivery_to: Some("111".into()),
+                    delivery_thread: Some("t-1".into()),
+                    no_best_effort: true,
+                    best_effort: false,
+                },
+                command: "echo test".into(),
+            },
+            &config,
+        )
+        .unwrap();
+        let id = list_jobs(&config).unwrap()[0].id.clone();
+
+        handle_command(
+            crate::CronCommands::Update {
+                id: id.clone(),
+                agent_alias: "test-agent".into(),
+                expression: None,
+                tz: None,
+                command: None,
+                name: None,
+                allowed_tools: vec![],
+                uses_memory: None,
+                delivery: crate::CronDeliveryArgs {
+                    delivery_channel: Some("discord".into()),
+                    delivery_to: Some("222".into()),
+                    delivery_thread: None,
+                    no_best_effort: false,
+                    best_effort: false,
+                },
+            },
+            &config,
+        )
+        .unwrap();
+
+        let updated = get_job(&config, &id).unwrap();
+        assert_eq!(updated.delivery.channel.as_deref(), Some("discord"));
+        assert_eq!(updated.delivery.to.as_deref(), Some("222"));
+        assert_eq!(
+            updated.delivery.thread_id.as_deref(),
+            Some("t-1"),
+            "thread id must survive a channel/recipient change"
+        );
+        assert!(
+            !updated.delivery.best_effort,
+            "best_effort=false must survive a channel/recipient change"
+        );
+    }
+
+    /// `--thread` alone amends the destination of an announcing job without
+    /// restating the channel and recipient.
+    #[test]
+    fn cli_update_thread_alone_patches_existing_delivery() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        handle_command(
+            crate::CronCommands::Add {
+                expression: "*/5 * * * *".into(),
+                agent_alias: "test-agent".into(),
+                tz: None,
+                prompt: false,
+                allowed_tools: vec![],
+                uses_memory: None,
+                delivery: crate::CronDeliveryArgs {
+                    delivery_channel: Some("webhook".into()),
+                    delivery_to: Some("hook-1".into()),
+                    delivery_thread: None,
+                    no_best_effort: false,
+                    best_effort: false,
+                },
+                command: "echo test".into(),
+            },
+            &config,
+        )
+        .unwrap();
+        let id = list_jobs(&config).unwrap()[0].id.clone();
+
+        handle_command(
+            crate::CronCommands::Update {
+                id: id.clone(),
+                agent_alias: "test-agent".into(),
+                expression: None,
+                tz: None,
+                command: None,
+                name: None,
+                allowed_tools: vec![],
+                uses_memory: None,
+                delivery: crate::CronDeliveryArgs {
+                    delivery_channel: None,
+                    delivery_to: None,
+                    delivery_thread: Some("t-99".into()),
+                    no_best_effort: false,
+                    best_effort: false,
+                },
+            },
+            &config,
+        )
+        .unwrap();
+
+        let updated = get_job(&config, &id).unwrap();
+        assert_eq!(updated.delivery.channel.as_deref(), Some("webhook"));
+        assert_eq!(updated.delivery.to.as_deref(), Some("hook-1"));
+        assert_eq!(updated.delivery.thread_id.as_deref(), Some("t-99"));
+    }
+
+    /// `--no-best-effort` alone is a real request. It must reach the job rather
+    /// than being read as "no delivery flags given".
+    #[test]
+    fn cli_update_no_best_effort_alone_patches_policy() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        handle_command(
+            crate::CronCommands::Add {
+                expression: "*/5 * * * *".into(),
+                agent_alias: "test-agent".into(),
+                tz: None,
+                prompt: false,
+                allowed_tools: vec![],
+                uses_memory: None,
+                delivery: crate::CronDeliveryArgs {
+                    delivery_channel: Some("telegram".into()),
+                    delivery_to: Some("111".into()),
+                    delivery_thread: None,
+                    no_best_effort: false,
+                    best_effort: false,
+                },
+                command: "echo test".into(),
+            },
+            &config,
+        )
+        .unwrap();
+        let id = list_jobs(&config).unwrap()[0].id.clone();
+        assert!(get_job(&config, &id).unwrap().delivery.best_effort);
+
+        handle_command(
+            crate::CronCommands::Update {
+                id: id.clone(),
+                agent_alias: "test-agent".into(),
+                expression: None,
+                tz: None,
+                command: None,
+                name: None,
+                allowed_tools: vec![],
+                uses_memory: None,
+                delivery: crate::CronDeliveryArgs {
+                    delivery_channel: None,
+                    delivery_to: None,
+                    delivery_thread: None,
+                    no_best_effort: true,
+                    best_effort: false,
+                },
+            },
+            &config,
+        )
+        .unwrap();
+
+        let updated = get_job(&config, &id).unwrap();
+        assert!(!updated.delivery.best_effort);
+        assert_eq!(
+            updated.delivery.channel.as_deref(),
+            Some("telegram"),
+            "destination must be preserved"
+        );
+    }
+
+    /// `--best-effort` restores the default after a `--no-best-effort`, so the
+    /// policy is reversible from the CLI.
+    #[test]
+    fn cli_update_best_effort_restores_default() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        handle_command(
+            crate::CronCommands::Add {
+                expression: "*/5 * * * *".into(),
+                agent_alias: "test-agent".into(),
+                tz: None,
+                prompt: false,
+                allowed_tools: vec![],
+                uses_memory: None,
+                delivery: crate::CronDeliveryArgs {
+                    delivery_channel: Some("telegram".into()),
+                    delivery_to: Some("111".into()),
+                    delivery_thread: None,
+                    no_best_effort: true,
+                    best_effort: false,
+                },
+                command: "echo test".into(),
+            },
+            &config,
+        )
+        .unwrap();
+        let id = list_jobs(&config).unwrap()[0].id.clone();
+        assert!(!get_job(&config, &id).unwrap().delivery.best_effort);
+
+        handle_command(
+            crate::CronCommands::Update {
+                id: id.clone(),
+                agent_alias: "test-agent".into(),
+                expression: None,
+                tz: None,
+                command: None,
+                name: None,
+                allowed_tools: vec![],
+                uses_memory: None,
+                delivery: crate::CronDeliveryArgs {
+                    delivery_channel: None,
+                    delivery_to: None,
+                    delivery_thread: None,
+                    no_best_effort: false,
+                    best_effort: true,
+                },
+            },
+            &config,
+        )
+        .unwrap();
+
+        assert!(get_job(&config, &id).unwrap().delivery.best_effort);
+    }
+
+    /// `--no-best-effort` on create is a delivery request with no destination.
+    /// It must fail validation rather than be silently dropped.
+    #[test]
+    fn cli_add_no_best_effort_without_destination_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let result = handle_command(
+            crate::CronCommands::Add {
+                expression: "*/5 * * * *".into(),
+                agent_alias: "test-agent".into(),
+                tz: None,
+                prompt: false,
+                allowed_tools: vec![],
+                uses_memory: None,
+                delivery: crate::CronDeliveryArgs {
+                    delivery_channel: None,
+                    delivery_to: None,
+                    delivery_thread: None,
+                    no_best_effort: true,
+                    best_effort: false,
+                },
+                command: "echo ok".into(),
+            },
+            &config,
+        );
+
+        let err = result.expect_err("--no-best-effort with no destination must be rejected");
+        assert!(
+            err.to_string().contains("delivery.channel is required"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            list_jobs(&config).unwrap().is_empty(),
+            "no job should have been created"
+        );
+    }
+
+    /// A job with delivery off has nothing worth preserving, so a stale channel
+    /// left in the stored row must not be resurrected by an unrelated flag.
+    #[test]
+    fn cli_update_does_not_resurrect_disabled_delivery() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        handle_command(
+            crate::CronCommands::Add {
+                expression: "*/5 * * * *".into(),
+                agent_alias: "test-agent".into(),
+                tz: None,
+                prompt: false,
+                allowed_tools: vec![],
+                uses_memory: None,
+                delivery: crate::CronDeliveryArgs::default(),
+                command: "echo test".into(),
+            },
+            &config,
+        )
+        .unwrap();
+        let id = list_jobs(&config).unwrap()[0].id.clone();
+        assert_eq!(get_job(&config, &id).unwrap().delivery.mode, "none");
+
+        let result = handle_command(
+            crate::CronCommands::Update {
+                id: id.clone(),
+                agent_alias: "test-agent".into(),
+                expression: None,
+                tz: None,
+                command: None,
+                name: None,
+                allowed_tools: vec![],
+                uses_memory: None,
+                delivery: crate::CronDeliveryArgs {
+                    delivery_channel: None,
+                    delivery_to: None,
+                    delivery_thread: Some("t-1".into()),
+                    no_best_effort: false,
+                    best_effort: false,
+                },
+            },
+            &config,
+        );
+
+        let err = result.expect_err("thread alone cannot enable delivery from scratch");
+        assert!(
+            err.to_string().contains("delivery.channel is required"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            get_job(&config, &id).unwrap().delivery.mode,
+            "none",
+            "rejected update must leave the stored job untouched"
+        );
     }
 }
