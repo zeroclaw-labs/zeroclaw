@@ -259,6 +259,7 @@ non_row_features = [
 dist_extra_features = [
     "channel-matrix",
     "channel-lark",
+    "channel-slack",
     "whatsapp-web",
 ]
 

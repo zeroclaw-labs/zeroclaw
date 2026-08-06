@@ -1429,7 +1429,17 @@ mod tests {
     fn dist_matches_lean_release_contract() {
         let features = resolve_feature_list(&root(), &Selection::Dist).unwrap();
         let mut expected = resolve_feature_list(&root(), &Selection::Full).unwrap();
-        expected.extend(["channel-matrix", "channel-lark", "whatsapp-web"].map(str::to_owned));
+        // Fork deviation: `channel-slack` is shipped in `dist` here. See the
+        // commit that added it for why this does not go upstream (#7952).
+        expected.extend(
+            [
+                "channel-matrix",
+                "channel-lark",
+                "channel-slack",
+                "whatsapp-web",
+            ]
+            .map(str::to_owned),
+        );
         expected.sort();
         expected.dedup();
         assert_eq!(features, expected);
