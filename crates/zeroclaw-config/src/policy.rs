@@ -1215,6 +1215,60 @@ fn is_allowlist_entry_match(allowed: &str, executable: &str, executable_base: &s
     command_names_equivalent(allowed, executable_base)
 }
 
+/// Detect an unquoted brace-expansion or glob metacharacter (`{`, `*`, `?`, `[`)
+/// that a POSIX shell expands but a plain word tokenizer (shlex) leaves literal.
+///
+/// This is the gap the risk classifier must fail closed on: `shlex::split`
+/// models quoting, but it does NOT perform brace or pathname expansion, so its
+/// token stream can differ from the argument vector the shell actually runs.
+/// For example bash expands `git -C {.,commit}` to `git -C . commit`, promoting
+/// `commit` into the subcommand position — a write the shlex tokens never show.
+/// Quoting and escaping suppress expansion in the shell, so a quoted (`'*.rs'`)
+/// or escaped (`\{`) metacharacter is deliberately ignored here to match it.
+fn contains_unquoted_expansion_metachar(command: &str) -> bool {
+    let mut quote = QuoteState::None;
+    let mut escaped = false;
+
+    for ch in command.chars() {
+        match quote {
+            QuoteState::Single => {
+                if ch == '\'' {
+                    quote = QuoteState::None;
+                }
+            }
+            QuoteState::Double => {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                if ch == '\\' {
+                    escaped = true;
+                    continue;
+                }
+                if ch == '"' {
+                    quote = QuoteState::None;
+                }
+                // Brace/glob metacharacters are literal inside double quotes.
+            }
+            QuoteState::None => {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                match ch {
+                    '\\' => escaped = true,
+                    '\'' => quote = QuoteState::Single,
+                    '"' => quote = QuoteState::Double,
+                    '{' | '*' | '?' | '[' => return true,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    false
+}
+
 impl SecurityPolicy {
     // ── Risk Classification ──────────────────────────────────────────────
     // Risk is assessed per-segment (split on shell operators), and the
@@ -1276,7 +1330,17 @@ impl SecurityPolicy {
     /// resolved. A segment that cannot be tokenized (unbalanced quotes) is
     /// treated conservatively as a write, so a malformed command can never slip
     /// under the gate.
+    ///
+    /// `shlex` models quoting but NOT brace or pathname expansion, so its tokens
+    /// can differ from the shell's real argument vector: bash expands `git -C
+    /// {.,commit}` to `git -C . commit`, injecting a write verb the tokens never
+    /// show. When the segment carries any unquoted expansion metacharacter we
+    /// cannot certify the resolved subcommand, so we fail closed to a write
+    /// (Medium). Quoted/escaped metacharacters are not expanded and stay Low.
     fn git_segment_is_write(segment: &str) -> bool {
+        if contains_unquoted_expansion_metachar(segment) {
+            return true; // unmodeled shell expansion → effective verb unknown → Medium
+        }
         let Some(tokens) = shlex::split(segment) else {
             return true; // ambiguous parse → conservative Medium
         };
@@ -3154,6 +3218,58 @@ mod tests {
             p.validate_command_execution(r#"git -C "/repo with spaces" status"#, false),
             Ok(CommandRiskLevel::Low),
             "quoted-path read-git must remain Low"
+        );
+    }
+
+    #[test]
+    fn shell_expansion_write_git_is_gated_at_the_enforcement_boundary() {
+        // `shlex::split` models quoting but not brace/glob expansion, so the shell
+        // can run a different argument vector than the tokens show: bash expands
+        // `git -C {.,commit}` to `git -C . commit`, promoting `commit` into the
+        // subcommand slot. The classifier must fail closed on any unmodeled
+        // unquoted expansion so this write cannot skip the medium-risk gate.
+        // Drive the real approval decision through `validate_command_execution`.
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into()],
+            autonomy: AutonomyLevel::Supervised,
+            require_approval_for_medium_risk: true,
+            ..SecurityPolicy::default()
+        };
+
+        for expand in [
+            "git -C {.,commit}",  // brace expands to `git -C . commit`
+            "git {log,commit}",   // brace expands to inject `commit`
+            "git -C {.,push} -f", // brace expands to `git -C . push -f`
+        ] {
+            assert!(
+                p.validate_command_execution(expand, false).is_err(),
+                "unapproved shell-expansion write-git must be rejected: {expand}"
+            );
+            assert_eq!(
+                p.validate_command_execution(expand, true),
+                Ok(CommandRiskLevel::Medium),
+                "approved shell-expansion write-git must classify Medium: {expand}"
+            );
+        }
+
+        // At the classifier level, any unquoted brace/glob makes the effective
+        // verb unknowable, so even a read-looking segment fails closed to Medium
+        // — a glob can shift the pre-verb region (`git -C * commit`) exactly like
+        // a brace does.
+        for expand in ["git -C * commit", "git log -- *.rs", "git ??? status"] {
+            assert_eq!(
+                p.command_risk_level(expand),
+                CommandRiskLevel::Medium,
+                "unquoted shell expansion in a git segment must classify Medium: {expand}"
+            );
+        }
+
+        // Quoting suppresses expansion in the shell, so a quoted glob in a read
+        // pathspec is not treated as an injection and stays Low.
+        assert_eq!(
+            p.validate_command_execution(r#"git log --oneline -- "*.rs""#, false),
+            Ok(CommandRiskLevel::Low),
+            "quoted read-git pathspec glob must remain Low"
         );
     }
 
