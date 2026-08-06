@@ -172,6 +172,12 @@ rpc_type! {
         pub exclude_memory: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub chat_mode: Option<ChatMode>,
+        /// When true, skip the same-mode idle-sibling eviction normally
+        /// performed on `session/new` for the calling TUI. Sent by
+        /// multi-session-aware clients that manage sibling session lifecycle
+        /// themselves. Absent or false preserves the eviction sweep.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub keep_siblings: Option<bool>,
     }
 }
 
@@ -1543,6 +1549,28 @@ mod tests {
             serde_json::from_value::<ChatMode>(json!("acp")).unwrap(),
             ChatMode::Acp
         );
+    }
+
+    #[test]
+    fn session_new_params_keep_siblings_round_trips_and_defaults_absent() {
+        // Older clients omit the field entirely: it must parse as None and
+        // serialize back out without a `keep_siblings` key.
+        let legacy: SessionNewParams =
+            serde_json::from_value(json!({ "agent_alias": "a" })).unwrap();
+        assert_eq!(legacy.keep_siblings, None);
+        let wire = serde_json::to_value(&legacy).unwrap();
+        assert!(wire.get("keep_siblings").is_none());
+
+        for keep in [true, false] {
+            let params: SessionNewParams = serde_json::from_value(json!({
+                "agent_alias": "a",
+                "keep_siblings": keep,
+            }))
+            .unwrap();
+            assert_eq!(params.keep_siblings, Some(keep));
+            let wire = serde_json::to_value(&params).unwrap();
+            assert_eq!(wire["keep_siblings"], json!(keep));
+        }
     }
 
     #[test]

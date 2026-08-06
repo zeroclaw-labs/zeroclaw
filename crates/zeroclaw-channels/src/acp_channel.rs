@@ -407,11 +407,24 @@ impl Channel for AcpChannel {
         }
     }
 
+    /// Delegates to [`Self::request_approval_attributed`] and drops the
+    /// provenance, so the prompt logic lives in exactly one place.
     async fn request_approval(
+        &self,
+        recipient: &str,
+        request: &ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
+        Ok(self
+            .request_approval_attributed(recipient, request)
+            .await?
+            .map(|attributed| attributed.response))
+    }
+
+    async fn request_approval_attributed(
         &self,
         _recipient: &str,
         request: &ChannelApprovalRequest,
-    ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
+    ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
         let is_edit_tool = matches!(request.tool_name.as_str(), "file_edit" | "file_write");
         let mut options = vec![
             json!({
@@ -498,22 +511,34 @@ impl Channel for AcpChannel {
                     .and_then(|o| o.get("optionId"))
                     .and_then(|s| s.as_str())
                     .unwrap_or("");
-                match option_id {
-                    "allow-once" => Ok(Some(ChannelApprovalResponse::Approve)),
-                    "allow-always" => Ok(Some(ChannelApprovalResponse::AlwaysApprove)),
-                    "reject-once" | "reject-always" => Ok(Some(ChannelApprovalResponse::Deny)),
+                // "selected" means the operator picked one of the options we
+                // offered, so every arm here is a genuine operator decision.
+                let response = match option_id {
+                    "allow-once" => ChannelApprovalResponse::Approve,
+                    "allow-always" => ChannelApprovalResponse::AlwaysApprove,
+                    "reject-once" | "reject-always" => ChannelApprovalResponse::Deny,
                     "reject-with-edit" => {
                         let replacement = outcome
                             .and_then(|o| o.get("replacementContent"))
                             .and_then(|s| s.as_str())
                             .unwrap_or("")
                             .to_string();
-                        Ok(Some(ChannelApprovalResponse::DenyWithEdit { replacement }))
+                        ChannelApprovalResponse::DenyWithEdit { replacement }
                     }
                     other => anyhow::bail!("ACP returned unknown permission optionId: {other}"),
-                }
+                };
+                Ok(Some(
+                    zeroclaw_api::channel::AttributedApprovalResponse::operator(response),
+                ))
             }
-            "cancelled" => Ok(Some(ChannelApprovalResponse::Deny)),
+            // The client withdrew the prompt; nobody chose anything. Still a
+            // deny, but the runtime's, not the operator's.
+            "cancelled" => Ok(Some(
+                zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                    ChannelApprovalResponse::Deny,
+                    zeroclaw_api::channel::ApprovalSource::Unreachable,
+                ),
+            )),
             other => anyhow::bail!("ACP returned unexpected permission outcome: {other}"),
         }
     }

@@ -2850,11 +2850,24 @@ impl Channel for LarkChannel {
         }
     }
 
+    /// Delegates to [`Self::request_approval_attributed`] and drops the
+    /// provenance, so the prompt/timeout logic lives in exactly one place.
     async fn request_approval(
         &self,
         recipient: &str,
         request: &zeroclaw_api::channel::ChannelApprovalRequest,
     ) -> anyhow::Result<Option<zeroclaw_api::channel::ChannelApprovalResponse>> {
+        Ok(self
+            .request_approval_attributed(recipient, request)
+            .await?
+            .map(|attributed| attributed.response))
+    }
+
+    async fn request_approval_attributed(
+        &self,
+        recipient: &str,
+        request: &zeroclaw_api::channel::ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
         let approval_id = Uuid::new_v4().to_string();
         let card =
             build_approval_card(&approval_id, &request.tool_name, &request.arguments_summary);
@@ -3175,17 +3188,32 @@ impl LarkChannel {
 impl LarkChannel {
     /// Wait for the user's approval click; on timeout, evict the pending entry
     /// and synthesize a `Deny` response. Never panics.
+    ///
+    /// The returned provenance separates a real click from the synthesized
+    /// deny, so the caller does not report an operator refusal nobody made.
     async fn wait_for_decision(
         &self,
         rx: tokio::sync::oneshot::Receiver<zeroclaw_api::channel::ChannelApprovalResponse>,
         approval_id: &str,
-    ) -> zeroclaw_api::channel::ChannelApprovalResponse {
-        use zeroclaw_api::channel::ChannelApprovalResponse;
+    ) -> zeroclaw_api::channel::AttributedApprovalResponse {
+        use zeroclaw_api::channel::{
+            ApprovalSource, AttributedApprovalResponse, ChannelApprovalResponse,
+        };
         match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), rx).await {
-            Ok(Ok(response)) => response,
-            _ => {
+            Ok(Ok(response)) => AttributedApprovalResponse::operator(response),
+            Ok(Err(_)) => {
                 self.pending_approvals.lock().await.remove(approval_id);
-                ChannelApprovalResponse::Deny
+                AttributedApprovalResponse::from_runtime(
+                    ChannelApprovalResponse::Deny,
+                    ApprovalSource::Unreachable,
+                )
+            }
+            Err(_) => {
+                self.pending_approvals.lock().await.remove(approval_id);
+                AttributedApprovalResponse::from_runtime(
+                    ChannelApprovalResponse::Deny,
+                    ApprovalSource::TimedOut,
+                )
             }
         }
     }
@@ -3405,14 +3433,23 @@ impl LarkChannel {
             "deny" => ChannelApprovalResponse::Deny,
             "always" => ChannelApprovalResponse::AlwaysApprove,
             other => {
+                // Do NOT resolve the pending approval. `wait_for_decision`
+                // stamps every value received on the oneshot as
+                // `ApprovalSource::Operator`, so synthesizing a Deny here would
+                // reach the gate as "Denied by user." for a card action no
+                // operator ever took -- the exact false attribution this change
+                // exists to remove. Leaving the approval pending lets it resolve
+                // through the timeout path, which carries runtime provenance.
                 ::zeroclaw_log::record!(
                     WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                         .with_attrs(::serde_json::json!({"decision_str": other})),
-                    "Lark: unknown approval decision — treating as deny"
+                    "Lark: unknown approval decision — rejecting the callback without resolving the approval"
                 );
-                ChannelApprovalResponse::Deny
+                return Err(anyhow::Error::msg(
+                    "card.action.trigger: unknown decision value",
+                ));
             }
         };
 
@@ -5781,6 +5818,56 @@ mod tests {
             .expect("handler ok");
         let result = rx.await.expect("oneshot delivered");
         assert_eq!(result, ChannelApprovalResponse::AlwaysApprove);
+    }
+
+    #[tokio::test]
+    async fn unknown_lark_decision_cannot_become_an_operator_denial() {
+        // An unrecognized `decision` value used to be mapped to Deny and sent
+        // through the pending-approval oneshot. `wait_for_decision` stamps
+        // everything it receives from that oneshot as `ApprovalSource::Operator`,
+        // so a malformed card action arrived at the gate as "Denied by user."
+        // even though no operator decided anything.
+        //
+        // The approval must be left PENDING so it resolves through the timeout
+        // path, which carries runtime provenance.
+        let ch = make_channel();
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let approval_id = "test-unknown-decision".to_string();
+        ch.pending_approvals.lock().await.insert(
+            approval_id.clone(),
+            PendingApproval {
+                sender: tx,
+                message_id: String::new(),
+                tool_name: String::new(),
+                arguments_summary: String::new(),
+            },
+        );
+
+        let event = serde_json::json!({
+            "action": {
+                "tag": "button",
+                "value": { "approval_id": approval_id, "decision": "sudo-make-me-a-sandwich" }
+            }
+        });
+        let outcome = ch.handle_card_action_event(&event).await;
+        assert!(
+            outcome.is_err(),
+            "an unknown decision must be rejected, not silently accepted"
+        );
+
+        // Nothing was sent: the receiver is still empty and still open, so the
+        // gate will see a runtime-sourced timeout rather than an operator Deny.
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "no decision may be delivered for an unrecognized card action"
+        );
+        assert!(
+            ch.pending_approvals.lock().await.contains_key(&approval_id),
+            "the approval must stay pending so it resolves with runtime provenance"
+        );
     }
 
     #[tokio::test]

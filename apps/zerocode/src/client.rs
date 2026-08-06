@@ -1979,6 +1979,12 @@ pub struct SkillFrontmatter {
     pub version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub category: Option<String>,
+    /// Keeps this skill's instructions inlined in the system prompt even in
+    /// compact skill-prompt mode. Not editable from this TUI mirror, but must
+    /// be carried through the load→edit→save round-trip so editing a skill
+    /// here doesn't silently reset it to `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub always: bool,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -2002,6 +2008,34 @@ pub struct SkillsWriteResult {}
 
 #[derive(Debug, serde::Deserialize)]
 pub struct SkillsDeleteResult {}
+
+#[cfg(test)]
+mod skill_frontmatter_tests {
+    use super::*;
+
+    #[test]
+    fn always_true_survives_deserialize_then_serialize_round_trip() {
+        let value = serde_json::json!({
+            "name": "security-policy",
+            "description": "Critical safety rules",
+            "always": true,
+        });
+
+        let frontmatter: SkillFrontmatter = serde_json::from_value(value).unwrap();
+        assert!(
+            frontmatter.always,
+            "always: true in the wire payload must deserialize into the mirror struct"
+        );
+
+        let reserialized = serde_json::to_value(&frontmatter).unwrap();
+        assert_eq!(
+            reserialized.get("always"),
+            Some(&serde_json::Value::Bool(true)),
+            "always must round-trip through re-serialization, not be silently dropped \
+             on the TUI's load -> edit -> save path"
+        );
+    }
+}
 
 // ── Quickstart types ─────────────────────────────────────────────
 //

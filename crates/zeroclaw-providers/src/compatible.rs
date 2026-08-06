@@ -982,6 +982,12 @@ struct ApiChatRequest {
     tool_choice: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    /// Extra fields merged at the top level of the serialized JSON body.
+    /// Mirrors `NativeChatRequest::extra_body` so config-driven extras
+    /// (`provider_extra`, `chat_template_kwargs`) reach the no-tools request
+    /// paths too, not just the native-tools path.
+    #[serde(flatten)]
+    extra_body: Option<serde_json::Value>,
 }
 
 /// OpenAI-compatible `stream_options.include_usage` toggle.
@@ -1023,6 +1029,27 @@ struct ApiChatResponse {
     choices: Vec<Choice>,
     #[serde(default)]
     usage: Option<UsageInfo>,
+}
+
+/// OpenAI-compatible chat response, either in the standard top-level shape or
+/// wrapped by a gateway in a top-level `data` object.
+///
+/// Keep the direct variant first: a valid top-level response remains
+/// authoritative when a provider also includes a `data` metadata field.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ApiChatResponseEnvelope {
+    Direct(ApiChatResponse),
+    Wrapped { data: ApiChatResponse },
+}
+
+impl ApiChatResponseEnvelope {
+    fn into_response(self) -> ApiChatResponse {
+        match self {
+            Self::Direct(response) => response,
+            Self::Wrapped { data } => data,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1958,22 +1985,24 @@ fn sse_bytes_to_events_for_contract(
 }
 
 fn parse_chat_response_body(name: &str, body: &str) -> anyhow::Result<ApiChatResponse> {
-    serde_json::from_str(body).map_err(|_| {
-        let sanitized = super::sanitize_api_error(body);
-        ::zeroclaw_log::record!(
-            ERROR,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(::serde_json::json!({
-                    "model_provider": name,
-                    "body": &sanitized,
-                })),
-            "compatible: unexpected chat-completions payload"
-        );
-        anyhow::Error::msg(format!(
-            "{name} API returned an unexpected chat-completions payload; body={sanitized}"
-        ))
-    })
+    serde_json::from_str::<ApiChatResponseEnvelope>(body)
+        .map(ApiChatResponseEnvelope::into_response)
+        .map_err(|_| {
+            let sanitized = super::sanitize_api_error(body);
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "model_provider": name,
+                        "body": &sanitized,
+                    })),
+                "compatible: unexpected chat-completions payload"
+            );
+            anyhow::Error::msg(format!(
+                "{name} API returned an unexpected chat-completions payload; body={sanitized}"
+            ))
+        })
 }
 
 impl OpenAiCompatibleModelProvider {
@@ -2698,6 +2727,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             tools: None,
             tool_choice: None,
             max_tokens: self.max_tokens,
+            extra_body: self.extra_body.clone(),
         };
 
         let url = self.chat_completions_url();
@@ -2787,6 +2817,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             tools: None,
             tool_choice: None,
             max_tokens: self.max_tokens,
+            extra_body: self.extra_body.clone(),
         };
 
         let url = self.chat_completions_url();
@@ -3024,7 +3055,8 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             anyhow::bail!("{} API error ({status}): {sanitized}", self.name);
         }
 
-        let native_response: ApiChatResponse = response.json().await?;
+        let body = response.text().await?;
+        let native_response = parse_chat_response_body(&self.name, &body)?;
         let usage = native_response.usage.map(UsageInfo::into_provider_usage);
         let message = native_response
             .choices
@@ -3171,6 +3203,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     tools: None,
                     tool_choice: None,
                     max_tokens: provider.max_tokens,
+                    extra_body: provider.extra_body.clone(),
                 })
             };
 
@@ -3322,6 +3355,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 tools: None,
                 tool_choice: None,
                 max_tokens: provider.max_tokens,
+                extra_body: provider.extra_body.clone(),
             };
 
             let url = provider.chat_completions_url();
@@ -3440,6 +3474,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 tools: None,
                 tool_choice: None,
                 max_tokens: provider.max_tokens,
+                extra_body: provider.extra_body.clone(),
             };
 
             let url = provider.chat_completions_url();
@@ -3581,6 +3616,99 @@ mod tests {
             .credential(key)
             .auth_style(AuthStyle::Bearer)
             .build()
+    }
+
+    async fn mock_non_streaming_response(
+        response_body: serde_json::Value,
+    ) -> (
+        OpenAiCompatibleModelProvider,
+        std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::{Json, Router, routing::post};
+        use tokio::net::TcpListener;
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_for_route = std::sync::Arc::clone(&captured);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(request): Json<serde_json::Value>| {
+                let captured = std::sync::Arc::clone(&captured_for_route);
+                let response_body = response_body.clone();
+                async move {
+                    captured.lock().unwrap().push(request);
+                    Json(response_body)
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let provider = make_model_provider("custom", &format!("http://{addr}"), Some("test-key"));
+
+        (provider, captured, server)
+    }
+
+    fn non_streaming_response_cases() -> Vec<(&'static str, serde_json::Value, Option<&'static str>)>
+    {
+        vec![
+            (
+                "direct",
+                serde_json::json!({
+                    "choices": [{"message": {"content": "direct"}}]
+                }),
+                Some("direct"),
+            ),
+            (
+                "wrapped",
+                serde_json::json!({
+                    "data": {
+                        "choices": [{"message": {"content": "wrapped"}}]
+                    },
+                    "success": true
+                }),
+                Some("wrapped"),
+            ),
+            (
+                "direct_precedence",
+                serde_json::json!({
+                    "choices": [{"message": {"content": "top-level"}}],
+                    "data": {
+                        "choices": [{"message": {"content": "nested"}}]
+                    }
+                }),
+                Some("top-level"),
+            ),
+            (
+                "malformed",
+                serde_json::json!({
+                    "data": {
+                        "choices": "invalid",
+                        "api_key": "sk-test-secret-value"
+                    }
+                }),
+                None,
+            ),
+        ]
+    }
+
+    fn assert_sanitized_envelope_error(error: &anyhow::Error, case: &str) {
+        let message = error.to_string();
+        assert!(
+            message.contains("custom API returned an unexpected chat-completions payload"),
+            "{case}: unexpected error: {message}"
+        );
+        assert!(
+            message.contains("[REDACTED]"),
+            "{case}: sanitized body missing redaction: {message}"
+        );
+        assert!(
+            !message.contains("sk-test-secret-value"),
+            "{case}: secret leaked in error: {message}"
+        );
     }
 
     #[test]
@@ -3974,6 +4102,44 @@ mod tests {
     }
 
     #[test]
+    fn api_chat_request_flattens_extra_body_into_top_level() {
+        // Regression: the no-tools request struct (`chat_with_system`,
+        // `chat_with_history`, no-tools streaming) must also carry the
+        // config-driven `extra_body`, not just the native-tools path.
+        let req = ApiChatRequest {
+            model: "qwen".to_string(),
+            messages: vec![],
+            temperature: None,
+            stream: None,
+            stream_options: None,
+            reasoning_effort: None,
+            tool_stream: None,
+            tools: None,
+            tool_choice: None,
+            max_tokens: None,
+            extra_body: Some(serde_json::json!({
+                "top_p": 0.95,
+                "chat_template_kwargs": {"thinking": true, "reasoning_effort": "max"},
+            })),
+        };
+        let value: serde_json::Value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value.get("top_p").and_then(serde_json::Value::as_f64),
+            Some(0.95),
+            "provider_extra keys must serialize at the top level of a no-tools request"
+        );
+        assert_eq!(
+            value.pointer("/chat_template_kwargs/reasoning_effort"),
+            Some(&serde_json::json!("max")),
+            "chat_template_kwargs must be nested under its own top-level key in a no-tools request"
+        );
+        assert!(
+            value.get("extra_body").is_none(),
+            "extra_body key itself must not appear in serialized JSON"
+        );
+    }
+
+    #[test]
     fn normalize_model_ids_trims_filters_and_sorts() {
         let body = serde_json::from_value(serde_json::json!({
             "data": [
@@ -4009,6 +4175,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             max_tokens: None,
+            extra_body: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("llama-3.3-70b"));
@@ -4074,6 +4241,88 @@ mod tests {
         assert!(msg.contains("body="));
         assert!(msg.contains("[REDACTED]"));
         assert!(!msg.contains("sk-test-secret-value"));
+    }
+
+    #[tokio::test]
+    async fn ordinary_non_streaming_path_uses_shared_envelope_parser() {
+        for (case, response_body, expected_text) in non_streaming_response_cases() {
+            let (provider, captured, server) = mock_non_streaming_response(response_body).await;
+            let result = provider
+                .chat_with_system(None, "hello", "test-model", None)
+                .await;
+            server.abort();
+
+            let requests = captured.lock().unwrap();
+            assert_eq!(requests.len(), 1, "{case}: expected one request");
+            assert!(
+                requests[0].get("tools").is_none(),
+                "{case}: ordinary request unexpectedly contained tools: {}",
+                requests[0]
+            );
+
+            match expected_text {
+                Some(expected) => assert_eq!(
+                    result.unwrap_or_else(|error| panic!("{case}: request failed: {error}")),
+                    expected,
+                    "{case}: response text mismatch"
+                ),
+                None => assert_sanitized_envelope_error(
+                    &result.expect_err("malformed response must fail"),
+                    case,
+                ),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_tool_non_streaming_path_uses_shared_envelope_parser() {
+        for (case, response_body, expected_text) in non_streaming_response_cases() {
+            let (provider, captured, server) = mock_non_streaming_response(response_body).await;
+            let messages = vec![ChatMessage::user("hello")];
+            let tools = vec![zeroclaw_api::tool::ToolSpec::new(
+                "echo",
+                "Echo a value",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}}
+                }),
+            )];
+            let result = provider
+                .chat(
+                    ProviderChatRequest {
+                        messages: &messages,
+                        tools: Some(&tools),
+                        thinking: None,
+                    },
+                    "test-model",
+                    None,
+                )
+                .await;
+            server.abort();
+
+            let requests = captured.lock().unwrap();
+            assert_eq!(requests.len(), 1, "{case}: expected one request");
+            assert_eq!(
+                requests[0]["tools"][0]["function"]["name"], "echo",
+                "{case}: request did not exercise the native-tool path: {}",
+                requests[0]
+            );
+
+            match expected_text {
+                Some(expected) => assert_eq!(
+                    result
+                        .unwrap_or_else(|error| panic!("{case}: request failed: {error}"))
+                        .text
+                        .as_deref(),
+                    Some(expected),
+                    "{case}: response text mismatch"
+                ),
+                None => assert_sanitized_envelope_error(
+                    &result.expect_err("malformed response must fail"),
+                    case,
+                ),
+            }
+        }
     }
 
     #[test]
@@ -5263,6 +5512,7 @@ mod tests {
             tools: Some(tools),
             tool_choice: Some("auto".to_string()),
             max_tokens: None,
+            extra_body: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"tools\""));
@@ -5299,6 +5549,7 @@ mod tests {
             })]),
             tool_choice: Some("auto".to_string()),
             max_tokens: None,
+            extra_body: None,
         };
 
         let json = serde_json::to_string(&req).unwrap();
@@ -5334,6 +5585,7 @@ mod tests {
             })]),
             tool_choice: Some("auto".to_string()),
             max_tokens: None,
+            extra_body: None,
         };
 
         let json = serde_json::to_string(&req).unwrap();
@@ -6858,6 +7110,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             max_tokens: None,
+            extra_body: None,
         }
     }
 
