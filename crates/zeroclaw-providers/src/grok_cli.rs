@@ -1466,6 +1466,14 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires an installed and authenticated Grok Build CLI"]
     async fn live_grok_acp_waits_for_native_tool_completion() {
+        // Tool-enabled aliases are an explicit `extra_args` opt-in. Grok must
+        // pre-authorize the shell form via `--allow` so the ACP client never
+        // sees `session/request_permission` (the client defaults to
+        // reject-once). Under the default `--sandbox strict`, Grok Build
+        // 0.2.118 still escalates a matching `Bash(printf *)` allow to the
+        // ACP host; `--sandbox=workspace` lets the allow rule pre-authorize
+        // without host approval. Bypass flags are covered by a separate live
+        // test; this one proves the allow-preauth path.
         let temp = TempDir::new().expect("live Grok cwd");
         let model_provider = provider(
             None,
@@ -1473,6 +1481,7 @@ mod tests {
             vec![
                 "--tools=run_terminal_cmd".to_string(),
                 "--allow=Bash(printf *)".to_string(),
+                "--sandbox=workspace".to_string(),
             ],
             Some(120),
         );

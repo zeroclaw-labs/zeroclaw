@@ -189,11 +189,23 @@ extra_args = [
 Treat these bypass flags as authorization for Grok to execute every
 request-supported tool on that alias without a human approval round trip. Other
 permission modes, including `acceptEdits`, do not enable ACP auto-approval.
-Grok evaluates permission rules discovered from its user and project
-configuration before asking the ACP client. Those files are therefore trusted
-operator policy: an `allow` rule may pre-authorize a tool, and project MCP
-servers, plugins, or hooks may add capabilities. Use a dedicated, reviewed
-`working_directory` for channel agents.
+Grok evaluates CLI `--allow` / `--deny` rules and discovered user/project
+permission configuration before asking the ACP client. Those surfaces are
+trusted operator policy: a matching allow rule may pre-authorize a tool so the
+ACP client never sees a permission request, and project MCP servers, plugins,
+or hooks may add capabilities. Use a dedicated, reviewed `working_directory`
+for channel agents.
+
+When an allow rule does **not** pre-authorize the tool, Grok still sends
+`session/request_permission` and ZeroClaw's default reject-once policy fails
+the tool closed. In practice this matters for shell/`execute` tools under the
+default `--sandbox strict`: a CLI `--allow=Bash(...)` rule can still escalate
+to the ACP host on current Grok Build, so a tool-enabled shell alias should
+either set an explicit bypass flag (`--always-approve` /
+`--permission-mode=bypassPermissions`) or pair allow rules with a sandbox
+profile that Grok will pre-authorize without host approval (for example
+`--sandbox=workspace`). Read-only tool grants such as `--tools=Read,Grep` with
+matching `--allow` remain the narrower opt-in.
 
 Operators can also grant tools or relax sandbox/permission policy with alias
 `extra_args`; both surfaces are explicit opt-ins to a wider subprocess boundary.
@@ -253,7 +265,20 @@ model = "grok-4.5"
 binary_path = "/home/you/.grok/bin/grok"
 working_directory = "/path/to/agents/ops/workspace"
 env_passthrough = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]
+# Read-only tools: matching --allow can pre-authorize without ACP approval.
 extra_args = ["--tools=Read,Grep", "--allow=Read", "--allow=Grep"]
+
+# Shell-capable ops alias: either bypass ACP approval, or pair allow with a
+# sandbox profile that Grok pre-authorizes (workspace is the common choice).
+[providers.models.grok_cli.ops_shell]
+model = "grok-4.5"
+binary_path = "/home/you/.grok/bin/grok"
+working_directory = "/path/to/agents/ops/workspace"
+extra_args = [
+  "--tools=run_terminal_cmd",
+  "--allow=Bash(printf *)",
+  "--sandbox=workspace",
+]
 
 [agents.default]
 model_provider = "grok_cli.default"
