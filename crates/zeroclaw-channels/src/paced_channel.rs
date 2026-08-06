@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::{Mutex, oneshot};
+use tokio_util::sync::CancellationToken;
 use zeroclaw_api::attribution::{Attributable, Role};
 use zeroclaw_api::channel::{
     Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, ProgressEvent,
@@ -341,6 +342,14 @@ impl Channel for PacedChannel {
 
     async fn start_typing(&self, recipient: &str) -> Result<()> {
         self.inner.start_typing(recipient).await
+    }
+
+    fn set_cancel_token(&self, token: CancellationToken) {
+        self.inner.set_cancel_token(token);
+    }
+
+    fn uses_cancel_token(&self) -> bool {
+        self.inner.uses_cancel_token()
     }
 
     async fn stop_typing(&self, recipient: &str) -> Result<()> {

@@ -616,6 +616,18 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
     /// Start listening for incoming messages (long-running)
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()>;
 
+    /// Receive the supervisor lifecycle token before `listen()` is called.
+    /// Channels that internally wait for shutdown can subscribe instead of
+    /// independently catching SIGINT.
+    fn set_cancel_token(&self, _token: CancellationToken) {}
+
+    /// Whether this channel participates in the cooperative cancellation
+    /// contract via `set_cancel_token`. Only participating channels get
+    /// a bounded grace period for cleanup after cancellation.
+    fn uses_cancel_token(&self) -> bool {
+        false
+    }
+
     /// Check if channel is healthy
     async fn health_check(&self) -> bool {
         true
