@@ -174,8 +174,17 @@ pub(crate) fn split_base64_image_data_uri(
     let header = &rest[..comma];
     let payload = rest[comma + 1..].trim();
 
-    // Matched case-sensitively, exactly as `normalize_data_uri` does.
-    if !header.contains(";base64") {
+    // Matched case-sensitively, exactly as `normalize_data_uri` does, but on a
+    // whole parameter rather than a substring. `contains(";base64")` also
+    // accepted `;base64foo`, which the Anthropic adapter's residual sweep
+    // declines to sweep because it requires an exact `base64` parameter — so
+    // such a header fell between the two and left raw base64 in a text position.
+    // The parameter may sit anywhere in the list, which is what the sweep allows.
+    if !header
+        .split(';')
+        .skip(1)
+        .any(|parameter| parameter == "base64")
+    {
         return Err(ImageDataUriRejection::NotBase64Encoded);
     }
 
