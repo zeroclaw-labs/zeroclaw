@@ -117,9 +117,13 @@ pub(crate) fn trim_conversation_to_recent_turns(
 }
 
 fn is_turn_boundary(msg: &ChatMessage) -> bool {
-    msg.role == "user"
-        && !msg.content.starts_with(TOOL_RESULTS_PREFIX)
-        && msg.content != crate::i18n::get_required_cli_string("history-trim-breadcrumb")
+    // A real user message starts a turn. The synthetic trim breadcrumb is NOT
+    // identified here by its (localized) content — a real user could send that
+    // exact text — but positionally by the caller, which knows it inserted one
+    // (see `has_leading_breadcrumb`). Identifying it by content would let a
+    // user-authored breadcrumb-equivalent message be excluded from the turn
+    // count and stall trimming.
+    msg.role == "user" && !msg.content.starts_with(TOOL_RESULTS_PREFIX)
 }
 
 fn is_system(msg: &ChatMessage) -> bool {
@@ -266,12 +270,20 @@ pub fn count_turns_pub(history: &[ChatMessage]) -> usize {
 /// dispatch enforcement, and the meter all share one source of truth instead
 /// of trusting a raw-marker estimate that over-counts images the multimodal
 /// preparation will drop.
-pub fn drop_oldest_turn(history: &mut Vec<ChatMessage>) -> Option<usize> {
+pub fn drop_oldest_turn(
+    history: &mut Vec<ChatMessage>,
+    has_leading_breadcrumb: bool,
+) -> Option<usize> {
     let leading_system = history.iter().take_while(|m| is_system(m)).count();
     let boundaries: Vec<usize> = history[leading_system..]
         .iter()
         .enumerate()
-        .filter(|(_, m)| is_turn_boundary(m))
+        // A synthetic trim breadcrumb, when present, occupies the first
+        // non-system slot. Exclude it positionally so it is not counted as a
+        // real turn — otherwise the "oldest turn" dropped would be the
+        // breadcrumb, which the caller immediately reinserts, and no real turn
+        // is ever removed.
+        .filter(|(i, m)| is_turn_boundary(m) && !(has_leading_breadcrumb && *i == 0))
         .map(|(i, _)| leading_system + i)
         .collect();
     if boundaries.len() <= 1 {
@@ -949,16 +961,43 @@ mod tests {
             asst("answer 3"),
         ];
 
-        assert_eq!(drop_oldest_turn(&mut history), Some(2));
+        // No breadcrumb yet: drop the oldest real turn.
+        assert_eq!(drop_oldest_turn(&mut history, false), Some(2));
         insert_breadcrumb_deduped(&mut history);
+        // Breadcrumb now leads the body; it must be skipped positionally so the
+        // next real turn is dropped, not the breadcrumb.
         assert_eq!(
-            drop_oldest_turn(&mut history),
+            drop_oldest_turn(&mut history, true),
             Some(2),
             "the synthetic user breadcrumb must not become a turn boundary"
         );
         assert!(history.iter().any(|m| m.content == "current"));
         assert!(!history.iter().any(|m| m.content == "middle"));
-        assert_eq!(drop_oldest_turn(&mut history), None);
+        assert_eq!(drop_oldest_turn(&mut history, true), None);
+    }
+
+    #[test]
+    fn user_authored_breadcrumb_text_is_still_a_droppable_turn() {
+        // A real user message whose text equals the trim breadcrumb must NOT be
+        // mistaken for the synthetic breadcrumb: it is a real turn and can be
+        // dropped. Without the positional-provenance fix this turn was excluded
+        // by content comparison and trimming could stall.
+        let crumb = breadcrumb().content;
+        let mut history = vec![
+            sys("system"),
+            user(&crumb), // real user turn that happens to match the breadcrumb text
+            asst("answer 1"),
+            user("current"),
+            asst("answer 2"),
+        ];
+        // has_leading_breadcrumb = false: nothing synthetic here, so the
+        // breadcrumb-equivalent user turn is a real boundary and is dropped.
+        assert_eq!(drop_oldest_turn(&mut history, false), Some(2));
+        assert!(
+            !history.iter().any(|m| m.content == crumb),
+            "the user-authored breadcrumb-equivalent turn must be droppable"
+        );
+        assert!(history.iter().any(|m| m.content == "current"));
     }
 
     #[test]

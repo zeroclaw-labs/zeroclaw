@@ -460,6 +460,14 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
     let mut sop_exec_cache: std::collections::HashMap<String, OwnedAgentExecution> =
         std::collections::HashMap::new();
 
+    // Provenance for the synthetic trim breadcrumb: true once we have inserted
+    // one at the head of `turn_state.history` (preflight trim or the multimodal
+    // enforcement loop). Trimming uses this — not the breadcrumb's localized
+    // text — to skip it, so a user-authored breadcrumb-equivalent message is
+    // never mistaken for the synthetic one. Persists across iterations because
+    // the breadcrumb stays in history once inserted.
+    let mut has_leading_breadcrumb = false;
+
     for iteration in 0..max_iterations {
         for steering_message in drain_steering_messages(&mut steering) {
             match ingress_policy(&steering_message, &ingress, &ingress_policy_cfg) {
@@ -539,6 +547,8 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             }
             let result = turn_state.trim_to_budget(context_token_budget);
             if result.trimmed {
+                // trim_to_budget inserts the synthetic breadcrumb when it trims.
+                has_leading_breadcrumb = true;
                 {
                     let __zc_trim_span = ::zeroclaw_log::info_span!(
                         target: "zeroclaw_log_internal_scope",
@@ -685,9 +695,10 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     if !prepared.contains_images || prepared_tokens <= context_token_budget {
                         break;
                     }
-                    let Some(dropped_messages) =
-                        crate::agent::history_trim::drop_oldest_turn(turn_state.history)
-                    else {
+                    let Some(dropped_messages) = crate::agent::history_trim::drop_oldest_turn(
+                        turn_state.history,
+                        has_leading_breadcrumb,
+                    ) else {
                         // Only system messages plus the current turn remain, and
                         // that turn's prepared payload alone exceeds the budget.
                         // Surface the estimate so the meter shows the overflow,
@@ -722,6 +733,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                         return Err(anyhow::Error::msg(remediation));
                     };
                     crate::agent::history_trim::insert_breadcrumb_deduped(turn_state.history);
+                    has_leading_breadcrumb = true;
                     if let Some(tx) = event_tx.as_ref() {
                         let _ = tx
                             .send(TurnEvent::HistoryTrimmed {
