@@ -60,6 +60,19 @@ impl EstopState {
         self.frozen_tools = dedup_sort(&self.frozen_tools);
     }
 
+    /// Fold another state's engaged dimensions into this one, never clearing an
+    /// already-engaged dimension. Used by the enforcement latch so a freshly
+    /// engaged stop is picked up while a deletion or disengaged replacement
+    /// cannot turn an engaged dimension back off.
+    fn merge_engaged_from(&mut self, other: &EstopState) {
+        self.kill_all |= other.kill_all;
+        self.network_kill |= other.network_kill;
+        self.blocked_domains
+            .extend(other.blocked_domains.iter().cloned());
+        self.frozen_tools.extend(other.frozen_tools.iter().cloned());
+        self.normalize();
+    }
+
     /// Read the current estop state for a per-tool-call enforcement check
     /// WITHOUT mutating anything on disk. Unlike [`EstopManager::load`] this
     /// never persists a fail-closed file, so it is safe to call on every tool
@@ -142,11 +155,42 @@ impl<'a> EstopEnforcement<'a> {
         })
     }
 
-    /// Re-read the live state file and return the reason to refuse `tool_name`,
-    /// or `None` to allow it. Reading per call means a `zeroclaw estop` engaged
-    /// from another process takes effect on the next tool call.
+    /// Return the reason to refuse `tool_name`, or `None` to allow it, consulting
+    /// the live state file merged with the process latch (see [`Self::enforced_state`]).
     pub fn block_reason(&self, tool_name: &str) -> Option<String> {
-        EstopState::load_for_enforcement(self.config, self.config_dir).tool_block_reason(tool_name)
+        self.enforced_state().tool_block_reason(tool_name)
+    }
+
+    /// Like [`Self::block_reason`] but blocks if *any* of `tool_names` is halted,
+    /// reading the state once. The dispatcher passes both a tool's advertised
+    /// name and its delegated canonical name so a skill-scoped alias cannot slip
+    /// a frozen builtin past the gate.
+    pub fn block_reason_any(&self, tool_names: &[&str]) -> Option<String> {
+        let state = self.enforced_state();
+        tool_names
+            .iter()
+            .find_map(|name| state.tool_block_reason(name))
+    }
+
+    /// The live state file folded into a per-state-file process latch.
+    ///
+    /// Reading per call means a `zeroclaw estop` engaged from another process
+    /// takes effect on the next tool call. The latch additionally makes an
+    /// engaged stop tamper-resistant: once any engagement is observed, deleting
+    /// the state file or replacing it with a disengaged one — exactly what the
+    /// halted tool activity could attempt — no longer clears the stop for this
+    /// process. A concurrently engaged dimension is still merged in (monotonic
+    /// union), so live engage works; a legitimate disengage takes effect after
+    /// the agent restarts.
+    fn enforced_state(&self) -> EstopState {
+        let live = EstopState::load_for_enforcement(self.config, self.config_dir);
+        let path = resolve_state_file_path(self.config_dir, &self.config.state_file);
+        let mut guard = engaged_latch()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let latched = guard.entry(path).or_default();
+        latched.merge_engaged_from(&live);
+        latched.clone()
     }
 
     /// Construct enforcement context directly from parts, for tests that don't
@@ -344,6 +388,16 @@ impl EstopManager {
     }
 }
 
+/// Per-state-file latch of engaged estop dimensions, preserved for the process
+/// lifetime. Keyed by the resolved state-file path so independent agents/tests
+/// don't cross-contaminate. See [`EstopEnforcement::enforced_state`].
+fn engaged_latch() -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, EstopState>> {
+    static LATCH: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, EstopState>>,
+    > = std::sync::OnceLock::new();
+    LATCH.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
 pub fn resolve_state_file_path(config_dir: &Path, state_file: &str) -> PathBuf {
     let expanded = shellexpand::tilde(state_file).into_owned();
     let path = PathBuf::from(expanded);
@@ -529,6 +583,104 @@ mod tests {
         assert!(state.tool_block_reason("anything").is_some());
         // The read did not rewrite the file (still the corrupt bytes).
         assert_eq!(fs::read_to_string(&state_path).unwrap(), "{ truncated");
+    }
+
+    #[test]
+    fn enforcement_latch_survives_state_file_deletion() {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("estop-state.json");
+        let cfg = estop_config(&state_path);
+        let enforcement = EstopEnforcement::from_parts(&cfg, dir.path());
+
+        // Operator freezes `shell`; the gate observes it.
+        {
+            let mut manager = EstopManager::load(&cfg, dir.path()).unwrap();
+            manager
+                .engage(EstopLevel::ToolFreeze(vec!["shell".into()]))
+                .unwrap();
+        }
+        assert!(enforcement.block_reason("shell").is_some());
+
+        // The halted tool deletes the state file to unblock itself.
+        fs::remove_file(&state_path).unwrap();
+        assert!(!state_path.exists());
+
+        // The stop is preserved: the frozen tool is still refused.
+        assert!(
+            enforcement.block_reason("shell").is_some(),
+            "deleting the state file must not clear an engaged freeze"
+        );
+    }
+
+    #[test]
+    fn enforcement_latch_survives_disengaged_replacement() {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("estop-state.json");
+        let cfg = estop_config(&state_path);
+        let enforcement = EstopEnforcement::from_parts(&cfg, dir.path());
+
+        {
+            let mut manager = EstopManager::load(&cfg, dir.path()).unwrap();
+            manager.engage(EstopLevel::KillAll).unwrap();
+        }
+        assert!(enforcement.block_reason("anything").is_some());
+
+        // The halted tool overwrites the file with a valid, disengaged state.
+        let disengaged = serde_json::to_string(&EstopState::default()).unwrap();
+        fs::write(&state_path, disengaged).unwrap();
+
+        assert!(
+            enforcement.block_reason("anything").is_some(),
+            "replacing the state file with a disengaged one must not clear kill_all"
+        );
+    }
+
+    #[test]
+    fn enforcement_latch_still_picks_up_a_new_engagement() {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("estop-state.json");
+        let cfg = estop_config(&state_path);
+        let enforcement = EstopEnforcement::from_parts(&cfg, dir.path());
+
+        // Nothing engaged yet: tools run.
+        assert!(enforcement.block_reason("shell").is_none());
+
+        // A concurrent `zeroclaw estop` engages a freeze; the latch merges it in.
+        {
+            let mut manager = EstopManager::load(&cfg, dir.path()).unwrap();
+            manager
+                .engage(EstopLevel::ToolFreeze(vec!["shell".into()]))
+                .unwrap();
+        }
+        assert!(
+            enforcement.block_reason("shell").is_some(),
+            "a freshly engaged freeze must take effect live"
+        );
+        // A different tool is unaffected by a scoped freeze.
+        assert!(enforcement.block_reason("browser").is_none());
+    }
+
+    #[test]
+    fn block_reason_any_blocks_on_delegated_name() {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("estop-state.json");
+        let cfg = estop_config(&state_path);
+        let enforcement = EstopEnforcement::from_parts(&cfg, dir.path());
+
+        {
+            let mut manager = EstopManager::load(&cfg, dir.path()).unwrap();
+            manager
+                .engage(EstopLevel::ToolFreeze(vec!["shell".into()]))
+                .unwrap();
+        }
+        // The advertised alias is not frozen by name, but its delegated target is.
+        assert!(enforcement.block_reason("my_skill__shell").is_none());
+        assert!(
+            enforcement
+                .block_reason_any(&["my_skill__shell", "shell"])
+                .is_some(),
+            "a skill alias delegating to a frozen builtin must be refused"
+        );
     }
 
     #[test]

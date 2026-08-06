@@ -248,29 +248,36 @@ pub(crate) async fn execute_one_tool(
     // Emergency stop: consult the live estop state (re-read from disk) before
     // running the tool, so `zeroclaw estop` engaged from another process halts
     // the next tool call instead of being a no-op state file nothing reads.
-    if let Some(estop) = dispatch.estop
-        && let Some(reason) = estop.block_reason(tool.name())
-    {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                .with_category(::zeroclaw_log::EventCategory::Tool)
-                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(::serde_json::json!({
-                    "tool": call_name,
-                    "reason": reason,
-                })),
-            format!("tool call blocked by emergency stop: {call_name}")
-        );
-        return Ok(estop_blocked_outcome(
-            call_name,
-            tool_call_id_owned,
-            &full_args,
-            meta,
-            observer,
-            start.elapsed(),
-            reason,
-        ));
+    if let Some(estop) = dispatch.estop {
+        // Check the advertised name and, for a wrapper such as a skill-scoped
+        // alias, its delegated canonical name — so freezing `shell` also halts a
+        // `skill__shell` alias whose `name()` differs but which executes `shell`.
+        let mut enforced_names = vec![tool.name()];
+        if let Some(delegated) = tool.delegated_tool_name() {
+            enforced_names.push(delegated);
+        }
+        if let Some(reason) = estop.block_reason_any(&enforced_names) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_category(::zeroclaw_log::EventCategory::Tool)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "tool": call_name,
+                        "reason": reason,
+                    })),
+                format!("tool call blocked by emergency stop: {call_name}")
+            );
+            return Ok(estop_blocked_outcome(
+                call_name,
+                tool_call_id_owned,
+                &full_args,
+                meta,
+                observer,
+                start.elapsed(),
+                reason,
+            ));
+        }
     }
 
     use ::zeroclaw_log::Instrument;
@@ -798,6 +805,144 @@ mod tests {
             invocations.load(Ordering::SeqCst),
             0,
             "the frozen tool must never execute"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_one_tool_blocks_every_tool_under_kill_all() {
+        use crate::security::{EstopEnforcement, EstopLevel, EstopManager};
+
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("estop-state.json");
+        let cfg = zeroclaw_config::schema::EstopConfig {
+            enabled: true,
+            state_file: state_path.display().to_string(),
+            require_otp_to_resume: false,
+        };
+        {
+            let mut manager = EstopManager::load(&cfg, dir.path()).unwrap();
+            manager.engage(EstopLevel::KillAll).unwrap();
+        }
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "browser",
+            Arc::clone(&invocations),
+        ))];
+        let meta = crate::agent::turn::TurnMeta {
+            parent_agent_alias: None,
+            agent_alias: None,
+            turn_id: "test-turn-id",
+            channel_name: "test",
+        };
+
+        let outcome = execute_one_tool(
+            "browser",
+            serde_json::json!({}),
+            None,
+            ToolDispatchContext {
+                tools_registry: &tools,
+                activated_tools: None,
+                excluded_tools: &[],
+                model_switch_callback: None,
+                estop: Some(EstopEnforcement::from_parts(&cfg, dir.path())),
+            },
+            &meta,
+            &NoopObserver,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("execute_one_tool should return a blocked outcome, not error");
+
+        assert!(!outcome.success, "kill_all must block an unnamed tool");
+        assert!(outcome.output.contains("kill_all"), "{}", outcome.output);
+        assert_eq!(invocations.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn execute_one_tool_blocks_skill_alias_delegating_to_frozen_builtin() {
+        use crate::security::{EstopEnforcement, EstopLevel, EstopManager};
+        use crate::tools::SkillBuiltinTool;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("estop-state.json");
+        let cfg = zeroclaw_config::schema::EstopConfig {
+            enabled: true,
+            state_file: state_path.display().to_string(),
+            require_otp_to_resume: false,
+        };
+        // Freeze the canonical builtin `shell`.
+        {
+            let mut manager = EstopManager::load(&cfg, dir.path()).unwrap();
+            manager
+                .engage(EstopLevel::ToolFreeze(vec!["shell".into()]))
+                .unwrap();
+        }
+
+        // A skill exposes `my_skill__shell`, which delegates to the `shell` builtin.
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let target: Arc<dyn Tool> = Arc::new(CountingTool::new("shell", Arc::clone(&invocations)));
+        let manifest = crate::skills::SkillTool {
+            name: "shell".to_string(),
+            description: "Shell via skill".to_string(),
+            kind: "builtin".to_string(),
+            command: String::new(),
+            args: std::collections::HashMap::new(),
+            target: Some("shell".to_string()),
+            locked_args: std::collections::HashMap::new(),
+            timeout_secs: None,
+        };
+        let alias = SkillBuiltinTool::new(
+            "my_skill",
+            &manifest,
+            target,
+            std::collections::HashMap::new(),
+        );
+        let alias_name = alias.name().to_string();
+        assert_eq!(alias_name, "my_skill__shell");
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(alias)];
+        let meta = crate::agent::turn::TurnMeta {
+            parent_agent_alias: None,
+            agent_alias: None,
+            turn_id: "test-turn-id",
+            channel_name: "test",
+        };
+
+        let outcome = execute_one_tool(
+            &alias_name,
+            serde_json::json!({}),
+            None,
+            ToolDispatchContext {
+                tools_registry: &tools,
+                activated_tools: None,
+                excluded_tools: &[],
+                model_switch_callback: None,
+                estop: Some(EstopEnforcement::from_parts(&cfg, dir.path())),
+            },
+            &meta,
+            &NoopObserver,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("execute_one_tool should return a blocked outcome, not error");
+
+        assert!(
+            !outcome.success,
+            "a skill alias delegating to a frozen builtin must be blocked"
+        );
+        assert!(
+            outcome.output.contains("emergency stop"),
+            "{}",
+            outcome.output
+        );
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            0,
+            "the frozen builtin must never execute through its skill alias"
         );
     }
 

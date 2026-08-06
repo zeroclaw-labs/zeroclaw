@@ -6419,19 +6419,21 @@ fn build_engage_level(
             Ok(security::EstopLevel::KillAll)
         }
         EstopLevelArg::NetworkKill => {
-            if !domains.is_empty() || !tools.is_empty() {
-                bail!("--domain/--tool are not valid with --level network-kill");
-            }
-            Ok(security::EstopLevel::NetworkKill)
+            // Runtime enforcement covers kill-all and tool-freeze only; network
+            // and domain gating are not wired yet. Reject rather than report a
+            // false "engaged" for a mode nothing enforces.
+            bail!(
+                "--level network-kill is not enforced yet; only --level kill-all and \
+                 --level tool-freeze are enforced at runtime. Use `--level tool-freeze \
+                 --tool <name>` or `--level kill-all` to actually halt tool calls."
+            )
         }
         EstopLevelArg::DomainBlock => {
-            if domains.is_empty() {
-                bail!("--level domain-block requires at least one --domain");
-            }
-            if !tools.is_empty() {
-                bail!("--tool is not valid with --level domain-block");
-            }
-            Ok(security::EstopLevel::DomainBlock(domains))
+            bail!(
+                "--level domain-block is not enforced yet; only --level kill-all and \
+                 --level tool-freeze are enforced at runtime. Use `--level tool-freeze \
+                 --tool <name>` or `--level kill-all` to actually halt tool calls."
+            )
         }
         EstopLevelArg::ToolFreeze => {
             if tools.is_empty() {
@@ -8131,6 +8133,35 @@ mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
     use std::net::TcpListener;
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn build_engage_level_rejects_unenforced_modes() {
+        // network-kill and domain-block are not enforced at runtime yet; the CLI
+        // must reject them instead of writing state and printing "Estop engaged".
+        let net = build_engage_level(Some(EstopLevelArg::NetworkKill), vec![], vec![])
+            .expect_err("network-kill must be rejected");
+        assert!(net.to_string().contains("not enforced yet"), "{net}");
+
+        let dom = build_engage_level(
+            Some(EstopLevelArg::DomainBlock),
+            vec!["*.chase.com".into()],
+            vec![],
+        )
+        .expect_err("domain-block must be rejected");
+        assert!(dom.to_string().contains("not enforced yet"), "{dom}");
+
+        // The enforced modes still build.
+        assert!(build_engage_level(Some(EstopLevelArg::KillAll), vec![], vec![]).is_ok());
+        assert!(
+            build_engage_level(
+                Some(EstopLevelArg::ToolFreeze),
+                vec![],
+                vec!["shell".into()]
+            )
+            .is_ok()
+        );
+    }
 
     #[test]
     fn probe_config_dir_extracts_global_flag_in_all_forms() {
