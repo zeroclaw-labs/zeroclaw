@@ -5287,8 +5287,13 @@ mod tests {
         // default. `warm_capabilities_metadata` must preload the catalog from
         // async turn context so `capabilities_for_model` resolves per-model
         // vision — an image-input model and a text-only model, both cataloged.
-        use crate::models_dev::{CACHED_CATALOG, parse_catalog};
+        use crate::models_dev::{__private_test_catalog_lock, CACHED_CATALOG, parse_catalog};
         use std::sync::Arc;
+
+        // The catalog is a process-global OnceCell shared with the models_dev
+        // lifecycle tests; serialize the mutation so a concurrently seeding
+        // lifecycle test cannot make this `set` fail silently.
+        let _catalog_guard = __private_test_catalog_lock().await;
 
         let catalog_json = br#"{
             "mock-compatible": {

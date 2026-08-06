@@ -31,6 +31,25 @@ static LAST_CATALOG_FETCH_FAILURE_UNIX: AtomicI64 = AtomicI64::new(0);
 /// before starting its own attempt.
 static CATALOG_FETCH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Serializes the tests that mutate the process-global catalog state
+/// (`CACHED_CATALOG` / `LAST_CATALOG_FETCH_FAILURE_UNIX`). Shared by the
+/// lifecycle tests in this module and the catalog-injection tests in
+/// `compatible.rs` / `reliable.rs`, so a lifecycle test that seeds
+/// `TINY_CATALOG` cannot race an injection test's `CACHED_CATALOG.set` in the
+/// same test binary (OnceCell `set` fails on an already-populated cell and the
+/// injection then silently looks up the wrong catalog).
+#[cfg(test)]
+static CATALOG_LIFECYCLE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Test-only: acquire the process-global catalog-state lock before mutating
+/// `CACHED_CATALOG` / `LAST_CATALOG_FETCH_FAILURE_UNIX`. Catalog-injection
+/// tests in sibling modules share the same global state as this module's
+/// lifecycle tests and must serialize on the same lock.
+#[cfg(test)]
+pub(crate) async fn __private_test_catalog_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    CATALOG_LIFECYCLE_TEST_LOCK.lock().await
+}
+
 /// Injectable fetcher for tests. Production code never sets this; tests
 /// install an RAII guard so [`ensure_catalog_loaded`] can be exercised without
 /// network access. The `Fn` returns a boxed future so the override can own
@@ -423,11 +442,6 @@ mod tests {
         }
     }
 
-    /// Serializes the catalog-lifecycle tests: they share the process-global
-    /// `CACHED_CATALOG` / `LAST_CATALOG_FETCH_FAILURE_UNIX`, so concurrent
-    /// execution would interleave their mutations.
-    static CATALOG_LIFECYCLE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
     #[test]
     fn parses_catalog_with_typical_shape() {
         let catalog = parse_catalog(TINY_CATALOG.as_bytes()).expect("parses");
@@ -642,7 +656,7 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_catalog_loaded_respects_retry_backoff() {
-        let _serial = CATALOG_LIFECYCLE_TEST_LOCK.lock().await;
+        let _serial = __private_test_catalog_lock().await;
         // If another lifecycle test already populated the process-global
         // cache, the backoff branch is unreachable (the cached path wins) —
         // assert that and return rather than fail spuriously.
@@ -684,7 +698,7 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_catalog_loaded_does_not_backoff_without_prior_failure() {
-        let _serial = CATALOG_LIFECYCLE_TEST_LOCK.lock().await;
+        let _serial = __private_test_catalog_lock().await;
         if CACHED_CATALOG.get().is_some() {
             assert!(ensure_catalog_loaded().await.is_ok());
             return;
@@ -720,7 +734,7 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_catalog_loaded_serializes_concurrent_fetches() {
-        let _serial = CATALOG_LIFECYCLE_TEST_LOCK.lock().await;
+        let _serial = __private_test_catalog_lock().await;
         if CACHED_CATALOG.get().is_some() {
             assert!(ensure_catalog_loaded().await.is_ok());
             return;
@@ -755,7 +769,7 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_catalog_loaded_recovers_after_backoff_window() {
-        let _serial = CATALOG_LIFECYCLE_TEST_LOCK.lock().await;
+        let _serial = __private_test_catalog_lock().await;
         if CACHED_CATALOG.get().is_some() {
             assert!(ensure_catalog_loaded().await.is_ok());
             return;
@@ -811,7 +825,7 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_catalog_loaded_skips_backoff_when_cache_populated() {
-        let _serial = CATALOG_LIFECYCLE_TEST_LOCK.lock().await;
+        let _serial = __private_test_catalog_lock().await;
         // Populate the cache (if a sibling test has not already), then set a
         // fresh failure timestamp inside the backoff window. The populated
         // cache must win over the stale deadline: warming must never be
