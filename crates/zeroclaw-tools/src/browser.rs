@@ -3534,6 +3534,19 @@ mod tests {
     /// input).
     #[tokio::test]
     async fn execute_rejects_present_non_string_screenshot_path() {
+        // Parser boundary (no backend dependency): a present non-string path
+        // must be rejected at parse time, never coerced to `None`. This is the
+        // mutation-sensitive assertion — reverting the parser's non-string
+        // branch back to `None` coercion makes `expect_err` fail regardless of
+        // whether a backend is available in the test environment.
+        let parse_err = parse_browser_action("screenshot", &json!({ "path": 123 }))
+            .expect_err("a present non-string path must be rejected by the parser")
+            .to_string();
+        assert!(
+            parse_err.contains("must be a string"),
+            "the parser must name the string contract, got: {parse_err}"
+        );
+
         let tmp = tempfile::TempDir::new().unwrap();
         let ws = tmp.path().join("ws");
         tokio::fs::create_dir_all(&ws).await.unwrap();
