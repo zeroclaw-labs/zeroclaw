@@ -210,6 +210,11 @@ fn sender_session_id(channel: &str, msg: &zeroclaw_api::channel::ChannelMessage)
     }
 }
 
+#[cfg(feature = "channel-linq")]
+fn linq_channel_ref(alias: &str) -> String {
+    format!("linq.{alias}")
+}
+
 fn webhook_session_id(headers: &HeaderMap) -> Option<String> {
     const MAX_SESSION_ID_LEN: usize = 128;
     headers
@@ -440,10 +445,33 @@ fn default_agent_alias(config: &Config) -> Option<String> {
         .min()
 }
 
+/// Owned guard for [`AppState::config_write_lock`]. Owned (not borrowed) so
+/// a handler can release it explicitly at its commit point, or pass it by
+/// value into a delegated helper without lifetime coupling.
+pub(crate) type ConfigWriteGuard = tokio::sync::OwnedMutexGuard<()>;
+
 /// Shared state for all axum handlers
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<RwLock<Config>>,
+
+    /// Serializes the read-mutate-save-swap critical section of every HTTP
+    /// handler that mutates `config` (per-property PUT/DELETE/PATCH, map-key
+    /// create/delete/rename, channel bind, config migrate, section select,
+    /// quickstart apply, cron settings patch, pairing-token persistence). A
+    /// tokio mutex, not `parking_lot`, because the guard must survive the
+    /// `.await` on config-save I/O. Mirrors
+    /// `RpcContext::config_write_lock` in the RPC path.
+    ///
+    /// Invariant: every mutation of `config` must happen while holding this
+    /// mutex, acquired before the first `config` read-for-modify and held
+    /// through the swap that installs the mutated snapshot. Never acquire it
+    /// while holding a `config` guard — lock order is this mutex first,
+    /// `config` second, always. A writer that bypasses this lock and swaps
+    /// the live config while a concurrent writer's save is in flight loses
+    /// that writer's change — clobbered in memory and, if its save hadn't
+    /// landed yet, on disk too.
+    pub config_write_lock: Arc<tokio::sync::Mutex<()>>,
     pub model_provider: Arc<dyn ModelProvider>,
     pub model: String,
     /// `None` means "let the provider decide" — required for models
@@ -512,6 +540,9 @@ pub struct AppState {
     pub reload_tx: Option<tokio::sync::watch::Sender<bool>>,
     /// Registry of dynamically connected nodes
     pub node_registry: Arc<nodes::NodeRegistry>,
+    /// LAN-local peer hints discovered by multicast. These are informational
+    /// only; they never authorize or connect a peer.
+    pub mdns_peer_registry: nodes::mdns::MdnsPeerRegistry,
     /// Path prefix for reverse-proxy deployments (empty string = no prefix)
     pub path_prefix: String,
     /// Filesystem path to `web/dist/` for serving the dashboard (None = API-only)
@@ -565,6 +596,7 @@ pub async fn run_gateway(
     // Shared SOP engine from the daemon. `None` when standalone — sessions build their own.
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
 ) -> Result<()> {
     // ── Security: warn on public bind without tunnel or explicit opt-in ──
     if is_public_bind(host)
@@ -613,7 +645,8 @@ pub async fn run_gateway(
         }
     };
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    let actual_port = listener.local_addr()?.port();
+    let actual_addr = listener.local_addr()?;
+    let actual_port = actual_addr.port();
     let display_addr = format!("{host}:{actual_port}");
 
     let (boot_family, boot_alias, boot_entry) = config
@@ -699,13 +732,9 @@ pub async fn run_gateway(
     let mem: Arc<dyn Memory> = if config.agents.is_empty() {
         Arc::new(zeroclaw_memory::NoneMemory::new("none"))
     } else {
-        match zeroclaw_memory::create_memory_with_storage_and_routes(
-            &config.memory,
-            &config.embedding_routes,
-            config.resolve_active_storage(),
-            &config.data_dir,
+        match zeroclaw_memory::create_memory_from_config(
+            &config,
             fallback.and_then(|e| e.api_key.as_deref()),
-            Some(&config.providers.models),
         ) {
             Ok(m) => Arc::from(m),
             Err(e) => {
@@ -824,6 +853,7 @@ pub async fn run_gateway(
                 connect_peripherals: false,
                 emit_assembly_logs: false,
                 exclude_memory: false,
+                acp_delivery: false,
                 list_deferred_mcp_specs: true,
             })
             .await;
@@ -961,6 +991,7 @@ pub async fn run_gateway(
             connect_peripherals: false,
             emit_assembly_logs: false,
             exclude_memory: false,
+            acp_delivery: false,
             list_deferred_mcp_specs: true,
         })
         .await;
@@ -1131,7 +1162,21 @@ pub async fn run_gateway(
                 alias.clone(),
                 Arc::new(NextcloudTalkChannel::new(
                     nc.base_url.clone(),
-                    nc.app_token.clone(),
+                    // Resolve the same installed-bot secret used by inbound
+                    // verification. `webhook_secret` is canonical and
+                    // `bot_token` is a deprecated alias for the same value.
+                    nc.resolve_bot_secret().unwrap_or_else(|e| {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                            &e.to_string()
+                        );
+                        None
+                    }),
                     nc.bot_name.clone().unwrap_or_default(),
                     alias.clone(),
                     peer_resolver,
@@ -1147,12 +1192,23 @@ pub async fn run_gateway(
         .nextcloud_talk
         .iter()
         .filter_map(|(alias, nc)| {
-            let secret = nc
-                .webhook_secret
-                .as_deref()
-                .map(str::trim)
-                .filter(|secret| !secret.is_empty())
-                .map(ToOwned::to_owned)?;
+            // Same resolver as the outbound signing path: Nextcloud installs one
+            // secret per bot, so inbound verification and outbound signing must
+            // agree. A conflict or an unresolved secret yields no entry, and the
+            // handler rejects rather than skipping verification.
+            let secret = match nc.resolve_bot_secret() {
+                Ok(Some(secret)) => secret,
+                Ok(None) => return None,
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        &e.to_string()
+                    );
+                    return None;
+                }
+            };
             Some((alias.clone(), Arc::from(secret)))
         })
         .collect();
@@ -1447,6 +1503,46 @@ pub async fn run_gateway(
 
     // Node registry for dynamic node discovery
     let node_registry = Arc::new(nodes::NodeRegistry::new(config.nodes.max_nodes));
+    let mdns_config_state = Arc::clone(&config_state);
+    let mdns_peer_registry =
+        nodes::mdns::MdnsPeerRegistry::new(move || mdns_config_state.read().nodes.mdns.max_peers);
+    let mdns_task = if config.nodes.mdns.enabled
+        && nodes::mdns::is_advertisable_gateway_addr(&actual_addr)
+    {
+        let mdns_config = config.nodes.mdns.clone();
+        let advertised_gateway = nodes::mdns::MdnsAdvertisedGateway::new(actual_port, path_prefix);
+        let mdns_registry = mdns_peer_registry.clone();
+        let mdns_shutdown_rx = shutdown_tx.subscribe();
+        Some(zeroclaw_spawn::spawn!(async move {
+            if let Err(err) = nodes::mdns::run_peer_discovery(
+                mdns_config,
+                advertised_gateway,
+                mdns_registry,
+                mdns_shutdown_rx,
+            )
+            .await
+            {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{err}")})),
+                    "mDNS local peer discovery stopped"
+                );
+            }
+        }))
+    } else if config.nodes.mdns.enabled {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"bind_addr": actual_addr.to_string()})),
+            "mDNS local peer discovery skipped because the gateway is bound to a loopback-only host"
+        );
+        None
+    } else {
+        None
+    };
 
     // Device registry and pairing store (only when pairing is required)
     let device_registry = if config.gateway.require_pairing {
@@ -1483,6 +1579,7 @@ pub async fn run_gateway(
 
     let state = AppState {
         config: config_state,
+        config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
         model_provider,
         model,
         temperature,
@@ -1520,6 +1617,7 @@ pub async fn run_gateway(
         shutdown_tx,
         reload_tx,
         node_registry,
+        mdns_peer_registry,
         session_backend,
         session_queue: Arc::new(session_queue::SessionActorQueue::new(8, 30, 600)),
         device_registry,
@@ -1968,6 +2066,10 @@ pub async fn run_gateway(
         _ => None,
     };
 
+    if let Some(readiness) = readiness {
+        readiness.report_ready(actual_addr);
+    }
+
     if let Some(tls_acceptor) = tls_acceptor {
         // Manual TLS accept loop — serves each connection via hyper.
         let app = app.into_make_service_with_connect_info::<SocketAddr>();
@@ -2048,8 +2150,27 @@ pub async fn run_gateway(
         .await?;
     }
 
-    drop(broadcast_hook_guard);
+    if let Some(task) = mdns_task {
+        let mut task = task;
+        tokio::select! {
+            result = &mut task => {
+                if let Err(err) = result {
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"error": format!("{err}")})),
+                        "LAN peer discovery task join failed"
+                    );
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_secs(2)) => {
+                task.abort();
+            }
+        }
+    }
 
+    drop(broadcast_hook_guard);
     Ok(())
 }
 
@@ -2232,8 +2353,12 @@ async fn handle_pair(
                     return (StatusCode::INTERNAL_SERVER_ERROR, Json(body));
                 }
             }
-            if let Err(err) =
-                Box::pin(persist_pairing_tokens(state.config.clone(), &state.pairing)).await
+            if let Err(err) = Box::pin(persist_pairing_tokens(
+                state.config.clone(),
+                &state.pairing,
+                state.config_write_lock.clone(),
+            ))
+            .await
             {
                 ::zeroclaw_log::record!(
                     ERROR,
@@ -2291,7 +2416,16 @@ async fn handle_pair(
 pub(crate) async fn persist_pairing_tokens(
     config: Arc<RwLock<Config>>,
     pairing: &PairingGuard,
+    config_write_lock: Arc<tokio::sync::Mutex<()>>,
 ) -> Result<()> {
+    // Self-contained: no caller pre-reads config for modify, so this
+    // acquires the witness itself rather than taking it as a param. Held
+    // across the whole read-modify-save-swap below.
+    let _guard = Arc::clone(&config_write_lock).lock_owned().await;
+    debug_assert!(
+        config_write_lock.try_lock().is_err(),
+        "persist_pairing_tokens must hold config_write_lock across its read-modify-save-swap"
+    );
     let paired_tokens = pairing.tokens();
     // This is needed because parking_lot's guard is not Send so we clone the inner
     // this should be removed once async mutexes are used everywhere
@@ -2375,6 +2509,59 @@ fn needs_quickstart_channel_reply() -> String {
     i18n::get_required_cli_string("channel-needs-quickstart-reply")
 }
 
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GatewayChatDispatchCapture {
+    message: String,
+    session_id: Option<String>,
+    agent_override: Option<String>,
+}
+
+#[cfg(test)]
+static GATEWAY_CHAT_DISPATCH_CAPTURES: std::sync::Mutex<Vec<GatewayChatDispatchCapture>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+static GATEWAY_CHAT_DISPATCH_CAPTURE_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
+#[cfg(test)]
+async fn lock_gateway_chat_dispatch_capture_for_test() -> tokio::sync::MutexGuard<'static, ()> {
+    GATEWAY_CHAT_DISPATCH_CAPTURE_TEST_LOCK.lock().await
+}
+
+#[cfg(test)]
+fn clear_gateway_chat_dispatch_captures_for_test() {
+    GATEWAY_CHAT_DISPATCH_CAPTURES
+        .lock()
+        .expect("gateway chat dispatch capture mutex poisoned")
+        .clear();
+}
+
+#[cfg(test)]
+fn gateway_chat_dispatch_captures_for_test() -> Vec<GatewayChatDispatchCapture> {
+    GATEWAY_CHAT_DISPATCH_CAPTURES
+        .lock()
+        .expect("gateway chat dispatch capture mutex poisoned")
+        .clone()
+}
+
+#[cfg(test)]
+fn record_gateway_chat_dispatch_for_test(
+    message: &str,
+    session_id: Option<&str>,
+    agent_override: Option<&str>,
+) {
+    GATEWAY_CHAT_DISPATCH_CAPTURES
+        .lock()
+        .expect("gateway chat dispatch capture mutex poisoned")
+        .push(GatewayChatDispatchCapture {
+            message: message.to_string(),
+            session_id: session_id.map(ToString::to_string),
+            agent_override: agent_override.map(ToString::to_string),
+        });
+}
+
 pub(crate) async fn run_gateway_chat_with_tools(
     state: &AppState,
     message: &str,
@@ -2391,7 +2578,7 @@ pub(crate) async fn run_gateway_chat_with_tools(
     // doesn't go through the cost-tracking scope.
     #[cfg(test)]
     {
-        let _ = (session_id, agent_override);
+        record_gateway_chat_dispatch_for_test(message, session_id, agent_override);
         let response = state
             .model_provider
             .chat_with_system(None, message, &state.model, state.temperature)
@@ -2903,8 +3090,19 @@ async fn process_whatsapp_message(
     headers: HeaderMap,
     body: Bytes,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    // ── Security: Verify X-Hub-Signature-256 if app_secret is configured ──
-    if let Some(app_secret) = app_secret {
+    // ── Security: WhatsApp Cloud webhooks MUST be signature-verified ──
+    // Fail closed: with no configured app secret we cannot verify the signature, so the
+    // request is rejected. Previously an absent secret skipped verification entirely,
+    // which let any caller who knew the webhook URL inject messages into the agent.
+    let Some(app_secret) = app_secret else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": "whatsapp: no app_secret configured; refusing to accept an unverified webhook"
+            })),
+        );
+    };
+    {
         let signature = headers
             .get("X-Hub-Signature-256")
             .and_then(|v| v.to_str().ok())
@@ -3090,8 +3288,20 @@ async fn process_linq_webhook(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let body_str = String::from_utf8_lossy(&body);
 
-    // ── Security: Verify X-Webhook-Signature if signing_secret is configured ──
-    if let Some(signing_secret) = signing_secret {
+    // ── Security: Linq webhooks MUST be signature-verified ──
+    // Fail closed: with no configured signing secret we cannot verify the signature, so
+    // the request is rejected. Previously an absent secret skipped verification
+    // entirely, which let any caller who knew the webhook URL inject messages into the
+    // agent.
+    let Some(signing_secret) = signing_secret else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": "linq: no signing_secret configured; refusing to accept an unverified webhook"
+            })),
+        );
+    };
+    {
         let timestamp = headers
             .get("X-Webhook-Timestamp")
             .and_then(|v| v.to_str().ok())
@@ -3145,10 +3355,36 @@ async fn process_linq_webhook(
         return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
     }
 
+    let channel_ref = linq_channel_ref(alias);
+    let (agent_override, has_channel_bindings) = {
+        let config = state.config.read();
+        (
+            config.agent_for_channel(&channel_ref).map(str::to_owned),
+            config
+                .agents
+                .values()
+                .any(|agent| !agent.channels.is_empty()),
+        )
+    };
+    if agent_override.is_none() && has_channel_bindings {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"channel": "linq", "alias": alias})),
+            "Linq webhook ignored because no enabled agent owns the channel alias"
+        );
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "ignored", "reason": "no_agent_for_channel"})),
+        );
+    }
+
     // Process each message
     for msg in &messages {
         ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"channel": "linq", "alias": alias, "sender": msg.sender, "content": msg.content})), "inbound webhook message");
-        let session_id = sender_session_id("linq", msg);
+        let session_id =
+            zeroclaw_api::session_keys::sanitize_session_key(&sender_session_id(&channel_ref, msg));
 
         // Auto-save to memory
         if state.auto_save && !zeroclaw_memory::should_skip_autosave_content(&msg.content) {
@@ -3169,12 +3405,18 @@ async fn process_linq_webhook(
             state,
             &msg.content,
             Some(&session_id),
-            None,
+            agent_override.as_deref(),
         ))
         .await
         {
             Ok(GatewayChatOutcome { response, .. }) => {
+                #[cfg(test)]
+                {
+                    let _ = response;
+                }
+
                 // Send reply via Linq
+                #[cfg(not(test))]
                 if let Err(e) = linq
                     .send(&SendMessage::new(response, &msg.reply_target))
                     .await
@@ -3459,8 +3701,20 @@ async fn process_nextcloud_talk_webhook(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let body_str = String::from_utf8_lossy(&body);
 
-    // ── Security: Verify Nextcloud Talk HMAC signature if secret is configured ──
-    if let Some(webhook_secret) = webhook_secret {
+    // ── Security: Nextcloud Talk webhooks MUST be signature-verified ──
+    // Fail closed: with no resolved bot secret we cannot verify the signature, so the
+    // request is rejected. Previously an unresolved secret skipped verification
+    // entirely, which left a bot_token-only configuration accepting unverified inbound
+    // webhooks while still signing outbound replies.
+    let Some(webhook_secret) = webhook_secret else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": "nextcloud_talk: no bot secret configured; refusing to accept an unverified webhook"
+            })),
+        );
+    };
+    {
         let random = headers
             .get("X-Nextcloud-Talk-Random")
             .and_then(|v| v.to_str().ok())
@@ -3919,7 +4173,13 @@ async fn handle_admin_paircode_new(
                     return Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(body)));
                 }
             }
-            if let Err(e) = persist_pairing_tokens(state.config.clone(), &state.pairing).await {
+            if let Err(e) = persist_pairing_tokens(
+                state.config.clone(),
+                &state.pairing,
+                state.config_write_lock.clone(),
+            )
+            .await
+            {
                 let body = serde_json::json!({
                     "success": false,
                     "pairing_required": true,
@@ -3970,7 +4230,13 @@ async fn handle_admin_paircode_new(
                 }
             };
             state.pairing.revoke_token_hash(&token_hash);
-            if let Err(e) = persist_pairing_tokens(state.config.clone(), &state.pairing).await {
+            if let Err(e) = persist_pairing_tokens(
+                state.config.clone(),
+                &state.pairing,
+                state.config_write_lock.clone(),
+            )
+            .await
+            {
                 let body = serde_json::json!({
                     "success": false,
                     "pairing_required": true,
@@ -4316,6 +4582,7 @@ mod tests {
         let registry = with_registry.then(|| Arc::new(api_pairing::DeviceRegistry::new(&data_dir)));
         AppState {
             config: Arc::new(RwLock::new(config)),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider: Arc::new(MockModelProvider::default()),
             model: "test-model".into(),
             temperature: None,
@@ -4357,6 +4624,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -4754,7 +5022,19 @@ mod tests {
         );
 
         let handle = zeroclaw_spawn::spawn!(async move {
-            run_gateway("127.0.0.1", 0, config, None, None, None, None, None, None).await
+            run_gateway(
+                "127.0.0.1",
+                0,
+                config,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
         });
 
         match tokio::time::timeout(
@@ -4810,7 +5090,19 @@ mod tests {
         config.agents.insert("fake123".to_string(), agent);
 
         let handle = zeroclaw_spawn::spawn!(async move {
-            run_gateway("127.0.0.1", 0, config, None, None, None, None, None, None).await
+            run_gateway(
+                "127.0.0.1",
+                0,
+                config,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
         });
 
         match tokio::time::timeout(
@@ -4851,7 +5143,19 @@ mod tests {
         );
 
         let handle = zeroclaw_spawn::spawn!(async move {
-            run_gateway("127.0.0.1", 0, config, None, None, None, None, None, None).await
+            run_gateway(
+                "127.0.0.1",
+                0,
+                config,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
         });
 
         match tokio::time::timeout(
@@ -4879,7 +5183,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_gateway_uses_external_shutdown_sender() {
+    async fn daemon_startup_gateway_reports_ready_and_uses_external_shutdown_sender() {
         let port_probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = port_probe.local_addr().unwrap().port();
         drop(port_probe);
@@ -4898,6 +5202,10 @@ mod tests {
             shutdown_tx: shutdown_tx.clone(),
             reload_tx,
         };
+        let (ready_tx, mut ready_rx) = tokio::sync::watch::channel(None);
+        let readiness = zeroclaw_runtime::daemon::GatewayReadinessReporter::new(move |addr| {
+            let _ = ready_tx.send(Some(addr));
+        });
 
         let handle = zeroclaw_spawn::spawn!(async move {
             run_gateway(
@@ -4910,9 +5218,18 @@ mod tests {
                 None,
                 None,
                 None,
+                Some(readiness),
             )
             .await
         });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            ready_rx.wait_for(Option::is_some).await.unwrap();
+        })
+        .await
+        .expect("gateway should report its successful bind");
+        let ready_addr = *ready_rx.borrow();
+        assert_eq!(ready_addr.unwrap().port(), port);
 
         let addr = format!("127.0.0.1:{port}");
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -4941,9 +5258,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn daemon_startup_gateway_does_not_report_ready_when_tls_setup_fails() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        config.gateway.tls = Some(zeroclaw_config::schema::GatewayTlsConfig {
+            enabled: true,
+            cert_path: tmp.path().join("missing-cert.pem").display().to_string(),
+            key_path: tmp.path().join("missing-key.pem").display().to_string(),
+            client_auth: None,
+        });
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+
+        let (ready_tx, ready_rx) = tokio::sync::watch::channel(None);
+        let readiness = zeroclaw_runtime::daemon::GatewayReadinessReporter::new(move |addr| {
+            let _ = ready_tx.send(Some(addr));
+        });
+        let result = run_gateway(
+            "127.0.0.1",
+            0,
+            config,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(readiness),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "invalid TLS files should fail gateway setup"
+        );
+        assert!(
+            ready_rx.borrow().is_none(),
+            "failed post-bind setup must not report gateway readiness"
+        );
+    }
+
+    #[tokio::test]
     async fn metrics_endpoint_returns_hint_when_prometheus_is_disabled() {
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider: Arc::new(MockModelProvider::default()),
             model: "test-model".into(),
             temperature: None,
@@ -4985,6 +5347,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -5031,6 +5394,7 @@ mod tests {
         let observer: Arc<dyn zeroclaw_runtime::observability::Observer> = Arc::new(prom);
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider: Arc::new(MockModelProvider::default()),
             model: "test-model".into(),
             temperature: None,
@@ -5072,6 +5436,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -5252,9 +5617,14 @@ mod tests {
         assert!(guard.is_authenticated(&token));
 
         let shared_config = Arc::new(RwLock::new(config));
-        Box::pin(persist_pairing_tokens(shared_config.clone(), &guard))
-            .await
-            .unwrap();
+        let config_write_lock = Arc::new(tokio::sync::Mutex::new(()));
+        Box::pin(persist_pairing_tokens(
+            shared_config.clone(),
+            &guard,
+            config_write_lock,
+        ))
+        .await
+        .unwrap();
 
         // In-memory tokens should remain as plaintext 64-char hex hashes.
         let plaintext = {
@@ -5273,6 +5643,81 @@ mod tests {
         assert!(
             zeroclaw_runtime::security::SecretStore::is_encrypted(on_disk),
             "paired_token should be encrypted on disk"
+        );
+    }
+
+    /// Unlike the `persist_and_swap` callers (which pre-acquire the witness
+    /// before their own read-for-modify), `persist_pairing_tokens` acquires
+    /// `config_write_lock` internally since it is self-contained. This
+    /// proves that internal acquisition still serializes it against a
+    /// second, concurrent config mutation the same way. A single Pending
+    /// poll wouldn't distinguish "blocked on `config_write_lock`" from
+    /// "transiently Pending on unrelated I/O", so this polls repeatedly
+    /// with a no-op waker while the witness stays held and asserts the
+    /// future never completes -- proving it stays parked on the lock for as
+    /// long as it's held. Once the lock is released both changes land —
+    /// neither clobbers the other.
+    #[tokio::test]
+    async fn persist_pairing_tokens_serializes_against_concurrent_config_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = Config {
+            config_path: temp.path().join("config.toml"),
+            data_dir: temp.path().join("workspace"),
+            ..Default::default()
+        };
+        config.save().await.unwrap();
+
+        let guard = PairingGuard::new(true, &[]);
+        let code = guard.pairing_code().unwrap();
+        let token = guard.try_pair(&code, "test_client").await.unwrap().unwrap();
+        assert!(guard.is_authenticated(&token));
+
+        let shared_config = Arc::new(RwLock::new(config));
+        let config_write_lock = Arc::new(tokio::sync::Mutex::new(()));
+
+        // Simulate another in-flight config mutation already holding the
+        // witness for its own read-mutate-save-swap section.
+        let held_guard = Arc::clone(&config_write_lock).lock_owned().await;
+
+        let mut persist_fut = Box::pin(persist_pairing_tokens(
+            shared_config.clone(),
+            &guard,
+            config_write_lock.clone(),
+        ));
+
+        // Bounded, sleep-free: `persist_pairing_tokens` acquires the witness
+        // as its very first action, so poll with a no-op waker 50 times
+        // while `held_guard` stays live and assert Pending every time,
+        // rather than resolving synchronously or racing ahead after a
+        // single yield.
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        for _ in 0..50 {
+            assert!(
+                std::future::Future::poll(persist_fut.as_mut(), &mut cx).is_pending(),
+                "persist_pairing_tokens must stay parked on config_write_lock \
+                 acquisition for as long as another writer holds it"
+            );
+        }
+
+        // Land a distinct, concurrent write directly on live config while
+        // persist_pairing_tokens is parked waiting for the lock.
+        shared_config.write().gateway.port = 55555;
+
+        drop(held_guard);
+        persist_fut
+            .await
+            .expect("persist_pairing_tokens must still succeed once unblocked");
+
+        let live = shared_config.read();
+        assert_eq!(
+            live.gateway.port, 55555,
+            "the concurrent writer's change must survive — no lost update"
+        );
+        assert_eq!(
+            live.gateway.paired_tokens.len(),
+            1,
+            "persist_pairing_tokens' own token write must also land"
         );
     }
 
@@ -5625,6 +6070,7 @@ mod tests {
 
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -5666,6 +6112,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -5730,6 +6177,7 @@ mod tests {
 
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -5771,6 +6219,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -5850,6 +6299,7 @@ mod tests {
 
         let state = AppState {
             config: Arc::new(RwLock::new(config)),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
             model: "startup-model".into(),
             temperature: None,
@@ -5891,6 +6341,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -5950,6 +6401,7 @@ mod tests {
 
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -5991,6 +6443,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -6069,6 +6522,7 @@ mod tests {
 
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -6110,6 +6564,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -6154,6 +6609,7 @@ mod tests {
 
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -6195,6 +6651,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -6244,6 +6701,7 @@ mod tests {
 
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -6285,6 +6743,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -6341,6 +6800,7 @@ mod tests {
 
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -6382,6 +6842,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -6422,7 +6883,7 @@ mod tests {
         let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = Arc::new(Vec::new);
         let channel = Arc::new(NextcloudTalkChannel::new(
             "https://cloud.example.com".into(),
-            "app-token".into(),
+            None,
             String::new(),
             alias,
             peer_resolver,
@@ -6436,6 +6897,7 @@ mod tests {
 
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -6475,6 +6937,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -6567,18 +7030,27 @@ mod tests {
         let provider: Arc<dyn ModelProvider> = provider_impl.clone();
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
 
+        // Obviously-fake placeholder, never a real credential.
+        let secret = "fake-nextcloud-webhook-secret-not-real";
+        let random = "0123456789abcdef0123456789abcdef";
+
+        // The same secret governs both directions now, so the channel is built
+        // with that resolved secret as its bot token rather than the `None` this
+        // test used to pass.
         let channel = Arc::new(NextcloudTalkChannel::new(
             "https://cloud.example.com".into(),
-            "app-token".into(),
+            Some(secret.to_string()),
             String::new(),
             "default",
             Arc::new(|| vec!["*".to_string()]),
         ));
 
         let body = r#"{"type":"message","object":{"token":"room-token"},"actor":{"id":"user_a","name":"User A"},"message":{"actorType":"users","actorId":"user_a","message":"hello"}}"#;
+        let signature = compute_nextcloud_signature_hex(secret, random, body);
 
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider: provider,
             model: "test-model".into(),
             temperature: None,
@@ -6604,7 +7076,16 @@ mod tests {
             #[cfg(feature = "channel-linq")]
             linq_signing_secrets: HashMap::new(),
             nextcloud_talk: HashMap::from([("default".to_string(), channel)]),
-            nextcloud_talk_webhook_secret: HashMap::new(),
+            // A resolved secret, not an empty map. Inbound verification is now
+            // mandatory and fail-closed, so an unsigned request is rejected with
+            // 401 before the handler ever spawns the LLM task — which would make
+            // this test pass for the wrong reason (no provider call because the
+            // request was refused, not because the ack raced ahead of a slow
+            // provider). Signing the request keeps it on the fast-ack path.
+            nextcloud_talk_webhook_secret: HashMap::from([(
+                "default".to_string(),
+                std::sync::Arc::<str>::from(secret),
+            )]),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             #[cfg(feature = "channel-wati")]
@@ -6620,6 +7101,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -6636,12 +7118,22 @@ mod tests {
             webauthn: None,
         };
 
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Nextcloud-Talk-Random",
+            HeaderValue::from_str(random).unwrap(),
+        );
+        headers.insert(
+            "X-Nextcloud-Talk-Signature",
+            HeaderValue::from_str(&signature).unwrap(),
+        );
+
         let start = std::time::Instant::now();
         let response = tokio::time::timeout(
             Duration::from_secs(2),
             Box::pin(handle_nextcloud_talk_webhook(
                 State(state),
-                HeaderMap::new(),
+                headers,
                 Bytes::from(body),
             )),
         )
@@ -7367,7 +7859,9 @@ mod tests {
         serde_json::json!({
             "event_type": "message.received",
             "data": {
-                "sender": { "phone": sender },
+                "chat_id": "chat-789",
+                "from": sender,
+                "is_from_me": false,
                 "message": {
                     "parts": [{ "type": "text", "value": text }]
                 }
@@ -7381,6 +7875,15 @@ mod tests {
     /// secret.
     #[cfg(feature = "channel-linq")]
     fn linq_test_state(alias: &str, signing_secret: Option<&str>) -> AppState {
+        linq_test_state_with_config(alias, signing_secret, Config::default())
+    }
+
+    #[cfg(feature = "channel-linq")]
+    fn linq_test_state_with_config(
+        alias: &str,
+        signing_secret: Option<&str>,
+        config: Config,
+    ) -> AppState {
         let model_provider: Arc<dyn ModelProvider> = Arc::new(MockModelProvider::default());
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
 
@@ -7401,7 +7904,8 @@ mod tests {
         }
 
         AppState {
-            config: Arc::new(RwLock::new(Config::default())),
+            config: Arc::new(RwLock::new(config)),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -7443,6 +7947,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -7488,6 +7993,7 @@ mod tests {
 
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -7529,6 +8035,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -7562,6 +8069,42 @@ mod tests {
     #[cfg(feature = "channel-linq")]
     #[tokio::test]
     async fn linq_webhook_accepts_valid_message_for_known_alias() {
+        // This test proves alias routing, not signature handling, but inbound
+        // verification is mandatory, so it has to carry a real secret and a valid
+        // signature to reach the routing it is asserting on.
+        let secret = generate_test_secret();
+        let state = linq_test_state("default", Some(&secret));
+        let body = linq_webhook_body("+15551234567", "hello from test");
+        let timestamp = chrono::Utc::now().timestamp().to_string();
+        let sig = compute_linq_signature_hex(&secret, &timestamp, &body);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Webhook-Signature",
+            HeaderValue::from_str(&format!("sha256={sig}")).unwrap(),
+        );
+        headers.insert(
+            "X-Webhook-Timestamp",
+            HeaderValue::from_str(&timestamp).unwrap(),
+        );
+
+        let response = Box::pin(handle_linq_webhook_alias(
+            State(state),
+            Path("default".to_string()),
+            headers,
+            Bytes::from(body),
+        ))
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[cfg(feature = "channel-linq")]
+    #[tokio::test]
+    async fn linq_webhook_rejects_when_no_signing_secret_is_configured() {
+        // Fail closed. An alias with no resolved signing secret cannot verify
+        // anything, so the webhook is refused rather than processed unverified.
         let state = linq_test_state("default", None);
         let body = linq_webhook_body("+15551234567", "hello from test");
 
@@ -7574,7 +8117,7 @@ mod tests {
         .await
         .into_response();
 
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[cfg(feature = "channel-linq")]
@@ -7638,6 +8181,131 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
+    #[cfg(feature = "channel-linq")]
+    #[tokio::test]
+    async fn linq_webhook_alias_dispatches_to_configured_channel_agent() {
+        use zeroclaw_config::providers::ChannelRef;
+        use zeroclaw_config::schema::AliasedAgentConfig;
+
+        let _capture_guard = lock_gateway_chat_dispatch_capture_for_test().await;
+        clear_gateway_chat_dispatch_captures_for_test();
+
+        let mut config = Config::default();
+        config.agents.insert(
+            "alpha".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "beta".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                channels: vec![ChannelRef::new("linq.work")],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let secret = generate_test_secret();
+        let state = linq_test_state_with_config("work", Some(&secret), config);
+
+        let message = "hello from linq work alias";
+        let body = linq_webhook_body("+15551234567", message);
+        let timestamp = chrono::Utc::now().timestamp().to_string();
+        let sig = compute_linq_signature_hex(&secret, &timestamp, &body);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Webhook-Signature",
+            HeaderValue::from_str(&format!("sha256={sig}")).unwrap(),
+        );
+        headers.insert(
+            "X-Webhook-Timestamp",
+            HeaderValue::from_str(&timestamp).unwrap(),
+        );
+
+        let response = Box::pin(handle_linq_webhook_alias(
+            State(state),
+            Path("work".to_string()),
+            headers,
+            Bytes::from(body),
+        ))
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let captures = gateway_chat_dispatch_captures_for_test();
+        let capture = captures
+            .iter()
+            .find(|capture| capture.message == message)
+            .expect("Linq webhook should dispatch the inbound message");
+        assert_eq!(capture.agent_override.as_deref(), Some("beta"));
+        let session_id = capture
+            .session_id
+            .as_deref()
+            .expect("Linq dispatch should pass a session id");
+        assert_eq!(session_id, "linq_work__15551234567");
+    }
+
+    #[cfg(feature = "channel-linq")]
+    #[tokio::test]
+    async fn linq_webhook_alias_without_enabled_owner_does_not_use_default_agent() {
+        use zeroclaw_config::providers::ChannelRef;
+        use zeroclaw_config::schema::AliasedAgentConfig;
+
+        let _capture_guard = lock_gateway_chat_dispatch_capture_for_test().await;
+        clear_gateway_chat_dispatch_captures_for_test();
+
+        let mut config = Config::default();
+        config.agents.insert(
+            "alpha".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "beta".to_string(),
+            AliasedAgentConfig {
+                enabled: false,
+                channels: vec![ChannelRef::new("linq.work")],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let secret = generate_test_secret();
+        let state = linq_test_state_with_config("work", Some(&secret), config);
+
+        let message = "do not route me to alpha";
+        let body = linq_webhook_body("+15551234567", message);
+        let timestamp = chrono::Utc::now().timestamp().to_string();
+        let sig = compute_linq_signature_hex(&secret, &timestamp, &body);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Webhook-Signature",
+            HeaderValue::from_str(&format!("sha256={sig}")).unwrap(),
+        );
+        headers.insert(
+            "X-Webhook-Timestamp",
+            HeaderValue::from_str(&timestamp).unwrap(),
+        );
+
+        let response = Box::pin(handle_linq_webhook_alias(
+            State(state),
+            Path("work".to_string()),
+            headers,
+            Bytes::from(body),
+        ))
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let captures = gateway_chat_dispatch_captures_for_test();
+        assert!(
+            captures.iter().all(|capture| capture.message != message),
+            "unowned Linq alias must not dispatch through the default agent: {captures:?}"
+        );
+    }
+
     // ── Per-alias webhook routing───────────────────────────────────
 
     /// Baseline `AppState` with no channels configured, for the per-alias
@@ -7648,6 +8316,7 @@ mod tests {
         let mem: Arc<dyn Memory> = Arc::new(MockMemory);
         AppState {
             config: Arc::new(RwLock::new(Config::default())),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -7689,6 +8358,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -7860,6 +8530,27 @@ mod tests {
         ))
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    #[tokio::test]
+    async fn whatsapp_webhook_rejects_when_no_app_secret_is_configured() {
+        // Fail closed. A configured alias with no app secret cannot verify
+        // X-Hub-Signature-256, so the webhook is refused rather than dispatched
+        // to the agent unverified.
+        let mut state = webhook_baseline_state();
+        state.whatsapp = HashMap::from([("work".to_string(), whatsapp_instance("work", "tok"))]);
+        state.whatsapp_app_secret = HashMap::new();
+
+        let body = br#"{"object":"whatsapp_business_account","entry":[]}"#;
+        let resp = Box::pin(handle_whatsapp_message_alias(
+            State(state),
+            Path("work".to_string()),
+            HeaderMap::new(),
+            Bytes::from_static(body),
+        ))
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     /// Build an `AppState` whose device registry points at a non-existent

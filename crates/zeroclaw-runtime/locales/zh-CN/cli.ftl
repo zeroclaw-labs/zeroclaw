@@ -595,6 +595,7 @@ cli-quickstart-error-channel-bound = 通道 `{$reference}` 已绑定到 agent `{
 cli-quickstart-error-channel-required = 必须填写通道类型和别名
 cli-quickstart-error-channel-field-not-advertised = Quickstart 中不支持通道字段 `{$field}`
 cli-quickstart-error-channel-token-required = 必须填写 Telegram Bot 令牌
+cli-quickstart-error-webhook-secret-required = 必须填写 Webhook 共享密钥
 cli-quickstart-error-peer-group-name-required = 必须填写对等组名称
 cli-quickstart-error-peer-group-channel-required = 必须填写对等组通道引用
 cli-quickstart-error-peer-group-unknown-channel = 对等组 `{$name}` 引用了未知通道 `{$channel}`
@@ -797,6 +798,7 @@ cli-models-status-none = 未配置默认模型。
 turn-interrupted-by-user = [被用户中断]
 turn-cancelled-client-rpc = [已通过客户端取消回合]
 turn-stream-interrupted = [流已中断]
+turn-model-fallback-notice = ⚡ { $requested_model }（{ $requested_provider }）不可用；此回复由 { $actual_model }（{ $actual_provider }）生成。
 history-trim-breadcrumb = [earlier turns omitted to fit the context window]
 history-trim-reason-budget = context token budget exceeded
 history-trim-reason-message-cap = 已超出历史消息数量限制
@@ -804,6 +806,12 @@ history-trim-floor-exceeds-budget = system prompt and tool definitions ({$floor}
 turn-ingress-dropped = 此请求未被处理：{ $reason }
 turn-tool-interrupted-before-result = [在此工具产生结果前被用户中断]
 channel-runtime-malformed-tool-output = 我生成了内部工具调用格式错误，无法完成此请求。请重试。
+channel-runtime-progress-received = 已收到
+channel-runtime-progress-planning = 正在规划
+channel-runtime-progress-waiting-on-model = 正在等待模型
+channel-runtime-progress-running-tool = 正在运行工具
+channel-runtime-progress-compacting-context = 正在压缩上下文
+channel-runtime-progress-finalizing-response = 正在完成回复
 channel-runtime-new-session = 对话历史已清除。重新开始。
 channel-runtime-stop-sent = 已发送停止信号。
 channel-runtime-stop-no-task = 此发送者范围内没有正在执行的任务。
@@ -811,6 +819,8 @@ channel-runtime-model-empty = 模型 ID 不能为空。请使用 `/model <model-
 channel-runtime-model-switched = 已切换到模型 `{ $model }`（model_provider：`{ $provider }`）。上下文已保留。
 channel-runtime-agent-scope-rejected = 发送者 `{ $sender }` 无权在 agent `{ $agent }` 上执行 `/model --agent`。请改用 `/model --user { $model }`（仅本次会话生效），或请管理员将 peer group 的 `admin_for_agent_scope` 设为 `true` 并将你列为成员。
 channel-runtime-request-timeout = ⚠️ 等待模型响应超时，请重试。
+channel-runtime-no-reply-refused = 🚫 我无法处理该请求。
+channel-runtime-no-reply-failed = ⚠️ 我无法完成该请求。
 channel-runtime-current-model-status =
     当前 model_provider：`{ $provider }`
     当前模型：`{ $model }`
@@ -916,6 +926,13 @@ cli-gateway-restart-hint-process = 重启 `zeroclaw daemon` 进程
 
 cli-daemon-gateway-already-running = ZeroClaw gateway 已在 {$host}:{$port} 运行。daemon 会管理自己的 gateway，不会在同一地址启动第二个 gateway。请停止该 gateway（或使用 `zeroclaw config set gateway.port <port>` 将 daemon 指向空闲端口），然后重新运行 daemon。
 cli-daemon-gateway-port-occupied = Gateway 地址 {$host}:{$port} 已被另一个进程占用。请释放该端口或将 daemon 指向空闲端口（`zeroclaw config set gateway.port <port>`），然后重新运行 daemon。
+cli-daemon-starting-title = 🧠 ZeroClaw daemon 正在启动…
+cli-daemon-starting-detail = 正在准备已配置的 daemon endpoint
+cli-daemon-started-title = 🧠 ZeroClaw daemon 已就绪
+cli-daemon-started-gateway = Gateway:  {$url}
+cli-daemon-started-socket = Socket:   {$path}
+cli-daemon-started-pairing = 配对：已启用（当前状态请查看上方 gateway 输出）
+cli-daemon-started-stop = 按 Ctrl+C 或发送 SIGTERM 停止
 cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%
 cli-agent-context-bar-unknown = ctx: 未知 / {$max}
 cli-doctor-ctxwin-already-set = {$provider_ref}: 已有 context_window = {$ctx}
@@ -932,9 +949,41 @@ cli-doctor-ctxwin-write-failed = {$provider_ref}: 写入 context_window 失败: 
 # ── Degraded config sections (doctor diagnose, #8835) ──
 cli-doctor-degraded-security = 安全关键配置节 `{$path}` 无效，已重置为默认值以便守护进程启动；当前运行的安全态势可能弱于预期。运行 `zeroclaw config migrate` 查看解析错误，然后修复该文件。
 cli-doctor-degraded-section = 配置节 `{$path}` 格式错误，已重置为默认值；该节中的值当前不生效。运行 `zeroclaw config migrate` 查看解析错误，然后修复该文件。
+cli-doctor-skills-prompt-injection-mode-full-deprecated = 技能提示注入模式 "full" 已弃用。弃用过渡期内仍支持显式 full 模式，但 compact 现已成为默认值；请在 Schema V4 移除 full 模式前完成迁移。
 sop-approval-deferred-at-capacity = 执行槽位已满，无法恢复运行 {$run_id}。审批仍处于等待状态；请在槽位释放后重试。
 sop-approval-policy-unavailable = 无法使用暂停的 SOP 步骤，审批失败：{$reason}。运行仍处于等待状态。
 sop-rpc-decision-invalid-state = 运行 {$run_id} 无法在当前状态下完成决策。
 sop-rpc-decision-unauthorized = RPC 主体无权对该 SOP 步骤作出决策。
 sop-rpc-policy-missing = 未配置 SOP 审批策略“{$name}”。
 sop-rpc-policy-unavailable = 暂停的 SOP 策略不可用：{$reason}。
+
+# ── Tool approval (channels, #9409) ──
+# Human-visible copy for the operator-facing tool-approval prompt, shared
+# across the button adapters (Telegram, Discord, Slack) and the text-reply
+# adapters (Matrix, Signal, WhatsApp, Slack polling fallback). Approval
+# TOKENS, `callback_data`/`custom_id`/`action_id` values, and the reply
+# KEYWORDS parsed by `util::parse_approval_reply` (yes/y/approve, no/n/deny,
+# always) stay hardcoded ASCII in Rust — only the surrounding prose is
+# localized here.
+channel-approval-heading = 需要工具批准
+channel-approval-heading-shout = 需要批准
+channel-approval-tool-label = 工具
+channel-approval-args-label = 参数
+channel-approval-btn-approve = 批准
+channel-approval-btn-deny = 拒绝
+channel-approval-btn-always = 始终
+channel-approval-tap-instruction = 点击下方按钮：
+channel-approval-reply-instruction-yesno = 回复：“{ $yes_command }”、“{ $no_command }” 或 “{ $always_command }”
+channel-approval-reply-instruction-approve-deny = 回复 `{ $approve_command }` / `{ $deny_command }` / `{ $always_command }`。
+channel-telegram-approval-ack-approved = 已批准
+channel-telegram-approval-ack-always-approved = 已始终批准
+channel-telegram-approval-ack-denied = 已拒绝
+channel-telegram-approval-ack-unknown = 未知操作
+channel-discord-approval-btn-allow-once = 仅本次允许
+channel-discord-approval-btn-allow-session = 本会话允许
+channel-discord-approval-btn-allow-always = 始终允许
+channel-approval-title = 批准 { $tool }？
+channel-approval-opt-allow-once = 仅本次允许
+channel-approval-opt-allow-always = 始终允许
+channel-approval-opt-reject = 拒绝
+channel-approval-opt-reject-with-edit = 编辑后拒绝

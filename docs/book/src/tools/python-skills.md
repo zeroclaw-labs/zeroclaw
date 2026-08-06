@@ -106,6 +106,8 @@ When `runtime.docker.mount_workspace = true`, ZeroClaw mounts the configured wor
 
 If your workspace path must be constrained further, configure the workspace allowlist. ZeroClaw validates the host workspace path against that allowlist before adding the Docker volume mount.
 
+Mount validation is fail closed. The workspace must exist and resolve to a canonical path even when the allowlist is empty. Every configured allowlist root must also exist and canonicalize; one stale or invalid entry rejects the command before Docker starts, even if another root matches. Remove stale entries or create the intended directories before upgrading.
+
 ## Choosing a Pattern
 
 - Use trusted native Python when you wrote or reviewed the skills and want the lowest latency on a single-user host.

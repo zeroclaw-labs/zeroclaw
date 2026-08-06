@@ -251,47 +251,42 @@ fn provider_construction_with_different_names() {
     use zeroclaw::providers::compatible::OpenAiCompatibleModelProvider;
 
     // Construction with various names should succeed
-    let _p1 = OpenAiCompatibleModelProvider::new(
-        "test",
-        "DeepSeek",
-        "https://api.deepseek.com",
-        Some("test-key"),
-        AuthStyle::Bearer,
-    );
-    let _p2 = OpenAiCompatibleModelProvider::new(
-        "test",
-        "deepseek",
-        "https://api.test.com",
-        None,
-        AuthStyle::Bearer,
-    );
+    let _p1 = OpenAiCompatibleModelProvider::builder("test")
+        .display_name("DeepSeek")
+        .base_url("https://api.deepseek.com")
+        .credential(Some("test-key"))
+        .auth_style(AuthStyle::Bearer)
+        .build();
+    let _p2 = OpenAiCompatibleModelProvider::builder("test")
+        .display_name("deepseek")
+        .base_url("https://api.test.com")
+        .credential(None)
+        .auth_style(AuthStyle::Bearer)
+        .build();
 }
 
 #[test]
 fn provider_construction_with_different_auth_styles() {
     use zeroclaw::providers::compatible::OpenAiCompatibleModelProvider;
 
-    let _bearer = OpenAiCompatibleModelProvider::new(
-        "test",
-        "Test",
-        "https://api.test.com",
-        Some("key"),
-        AuthStyle::Bearer,
-    );
-    let _xapi = OpenAiCompatibleModelProvider::new(
-        "test",
-        "Test",
-        "https://api.test.com",
-        Some("key"),
-        AuthStyle::XApiKey,
-    );
-    let _custom = OpenAiCompatibleModelProvider::new(
-        "test",
-        "Test",
-        "https://api.test.com",
-        Some("key"),
-        AuthStyle::Custom("X-My-Auth".into()),
-    );
+    let _bearer = OpenAiCompatibleModelProvider::builder("test")
+        .display_name("Test")
+        .base_url("https://api.test.com")
+        .credential(Some("key"))
+        .auth_style(AuthStyle::Bearer)
+        .build();
+    let _xapi = OpenAiCompatibleModelProvider::builder("test")
+        .display_name("Test")
+        .base_url("https://api.test.com")
+        .credential(Some("key"))
+        .auth_style(AuthStyle::XApiKey)
+        .build();
+    let _custom = OpenAiCompatibleModelProvider::builder("test")
+        .display_name("Test")
+        .base_url("https://api.test.com")
+        .credential(Some("key"))
+        .auth_style(AuthStyle::Custom("X-My-Auth".into()))
+        .build();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

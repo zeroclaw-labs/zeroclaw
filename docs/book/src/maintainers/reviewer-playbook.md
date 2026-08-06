@@ -52,6 +52,7 @@ If any intake check fails, leave one actionable checklist comment and stop. Don'
 - Behavior changes are checked against the controlling contract: architecture docs, source-of-truth modules, trait boundaries, existing tests, public API shape, source comments, or explicit maintainer decisions.
 - PR-body provenance is true. Cited RFCs, audits, issues, PRs, paths, generated artifacts, or follow-up findings exist and support the claim.
 - Validation evidence names the checks being relied on and why they cover the changed behavior.
+- Directly user-observable claims identify the user boundary and provide the smallest credible evidence that reaches it; use [User-boundary proof](../contributing/user-boundary-proof.md) when unit, mocked, compile, or generic CI evidence stops short.
 - Duplicate local Cargo is not required when fresh required CI covers the same head, target, and feature set. Ask for extra validation only when it maps to a named gap in the required gate, such as macOS/Windows tests, cross-platform Clippy, desktop coverage, release target builds, stale CI, or unavailable CI.
 - User-facing behavior changes are documented.
 - Author demonstrates understanding of behavior and blast radius (especially for AI-assisted PRs).
@@ -87,6 +88,21 @@ Prefer one of these resolutions:
 hazards, or tradeoffs that the type system and tests cannot express. They
 should explain intent, not restate the nearby control flow or become a second
 contract.
+
+#### Typed dispatch for shared key spaces
+
+For shared key spaces such as wire method names, compiled channel type keys,
+provider slots, or frontend/backend registry keys, apply this rule by resolving
+raw strings at the API or config boundary. Downstream code should dispatch
+through an enum, macro-generated table, trait/factory registry, or another
+canonical owner. Do not add parallel string `match` arms, hand-typed dispatch
+tables, or duplicate lists that must be kept in sync by reviewer memory.
+
+This does not ban string constants at API boundaries. It prevents a second
+dispatch surface where adding a new variant can compile while silently skipping
+one consumer. Good examples are the RPC `Method` registry for wire method names
+and `CHANNEL_COMPILE_SPECS` for channel compile keys, where one canonical owner
+drives downstream coverage.
 
 ### Deep-review checklist (high-risk only)
 

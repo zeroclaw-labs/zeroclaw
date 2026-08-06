@@ -731,60 +731,118 @@ pub struct BedrockModelProvider {
     cred_cache: Mutex<Option<AwsCredentials>>,
 }
 
-impl BedrockModelProvider {
-    pub fn new(alias: &str) -> Self {
-        // Bearer token takes precedence over SigV4 credentials.
-        if let Some(token) = env_optional("BEDROCK_API_KEY") {
-            return Self {
-                alias: alias.to_string(),
-                auth: Some(BedrockAuth::BearerToken(token)),
-                max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
-                cred_cache: Mutex::new(None),
-            };
-        }
-        Self {
-            alias: alias.to_string(),
-            auth: AwsCredentials::from_env()
-                .or_else(|_| AwsCredentials::from_credential_process())
-                .ok()
-                .map(BedrockAuth::SigV4),
-            max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
-            cred_cache: Mutex::new(None),
-        }
-    }
+/// Typed builder for [`BedrockModelProvider`].
+///
+/// `alias` is the only positional argument. Whether the built provider
+/// probes ambient AWS credentials (`BEDROCK_API_KEY` env, then
+/// `AwsCredentials::from_env`, then `AwsCredentials::from_credential_process`)
+/// depends on whether [`Self::bearer_token`] was called: setting an
+/// explicit token bypasses every probe, and specifically avoids
+/// spawning the `credential_process` command from `~/.aws/config`.
+/// Leaving it unset lets `build()` walk the standard AWS resolution
+/// chain — the shape long-standing callers rely on when they wire
+/// Bedrock through the AWS environment.
+#[must_use]
+pub struct BedrockBuilder {
+    alias: String,
+    bearer_token: Option<String>,
+    max_tokens: Option<u32>,
+}
 
-    pub async fn new_async(alias: &str) -> Self {
-        // Bearer token takes precedence over SigV4 credentials.
-        if let Some(token) = env_optional("BEDROCK_API_KEY") {
-            return Self {
-                alias: alias.to_string(),
-                auth: Some(BedrockAuth::BearerToken(token)),
-                max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
-                cred_cache: Mutex::new(None),
-            };
-        }
-        let auth = AwsCredentials::resolve().await.ok().map(BedrockAuth::SigV4);
-        Self {
-            alias: alias.to_string(),
-            auth,
-            max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
-            cred_cache: Mutex::new(None),
-        }
-    }
-
-    /// Create a model_provider using a Bearer token for authentication.
-    pub fn with_bearer_token(alias: &str, token: &str) -> Self {
-        Self {
-            alias: alias.to_string(),
-            auth: Some(BedrockAuth::BearerToken(token.to_string())),
-            max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
-            cred_cache: Mutex::new(None),
-        }
-    }
-    /// Override the maximum output tokens for API requests.
-    pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
-        self.max_tokens = max_tokens;
+impl BedrockBuilder {
+    /// Set an explicit Bearer token. When set, [`Self::build`] uses it
+    /// directly and skips every AWS credential probe (including the
+    /// `credential_process` command that would otherwise spawn a shell).
+    pub fn bearer_token(mut self, token: &str) -> Self {
+        self.bearer_token = Some(token.to_string());
         self
+    }
+
+    /// Override the maximum output tokens for API requests. Defaults to
+    /// [`zeroclaw_api::model_provider::BASELINE_MAX_TOKENS`] when unset.
+    pub fn max_tokens(mut self, max_tokens: u32) -> Self {
+        self.max_tokens = Some(max_tokens);
+        self
+    }
+
+    /// Finalize the provider synchronously.
+    ///
+    /// If `bearer_token` was set, uses it as-is with no ambient probe.
+    /// Otherwise walks the standard chain (`BEDROCK_API_KEY` env →
+    /// `AwsCredentials::from_env` → `AwsCredentials::from_credential_process`),
+    /// which can spawn the `credential_process` command from
+    /// `~/.aws/config`. Use [`Self::build_async`] if you need the
+    /// IMDS-aware resolver (which requires an async context).
+    pub fn build(self) -> BedrockModelProvider {
+        let auth = if let Some(token) = self.bearer_token {
+            Some(BedrockAuth::BearerToken(token))
+        } else {
+            resolve_ambient_auth_blocking()
+        };
+        BedrockModelProvider {
+            alias: self.alias,
+            auth,
+            max_tokens: self
+                .max_tokens
+                .unwrap_or(zeroclaw_api::model_provider::BASELINE_MAX_TOKENS),
+            cred_cache: Mutex::new(None),
+        }
+    }
+
+    /// Finalize the provider through the async credential resolver
+    /// (which additionally probes EC2 IMDSv2). Same bearer-token
+    /// short-circuit as [`Self::build`].
+    pub async fn build_async(self) -> BedrockModelProvider {
+        let auth = if let Some(token) = self.bearer_token {
+            Some(BedrockAuth::BearerToken(token))
+        } else {
+            resolve_ambient_auth_async().await
+        };
+        BedrockModelProvider {
+            alias: self.alias,
+            auth,
+            max_tokens: self
+                .max_tokens
+                .unwrap_or(zeroclaw_api::model_provider::BASELINE_MAX_TOKENS),
+            cred_cache: Mutex::new(None),
+        }
+    }
+}
+
+/// Walk the standard ambient AWS credential chain synchronously:
+/// `BEDROCK_API_KEY` env → `AwsCredentials::from_env` →
+/// `AwsCredentials::from_credential_process`. The last step can spawn
+/// the `credential_process` command from `~/.aws/config`.
+fn resolve_ambient_auth_blocking() -> Option<BedrockAuth> {
+    if let Some(token) = env_optional("BEDROCK_API_KEY") {
+        return Some(BedrockAuth::BearerToken(token));
+    }
+    AwsCredentials::from_env()
+        .or_else(|_| AwsCredentials::from_credential_process())
+        .ok()
+        .map(BedrockAuth::SigV4)
+}
+
+/// Async counterpart of [`resolve_ambient_auth_blocking`] that also
+/// probes EC2 IMDSv2 via [`AwsCredentials::resolve`].
+async fn resolve_ambient_auth_async() -> Option<BedrockAuth> {
+    if let Some(token) = env_optional("BEDROCK_API_KEY") {
+        return Some(BedrockAuth::BearerToken(token));
+    }
+    AwsCredentials::resolve().await.ok().map(BedrockAuth::SigV4)
+}
+
+impl BedrockModelProvider {
+    /// Entry point. Only `alias` is required; use
+    /// [`BedrockBuilder::bearer_token`] to pin an explicit token
+    /// (skipping every ambient probe) or call [`BedrockBuilder::build`]
+    /// with no token to walk the AWS credential chain.
+    pub fn builder(alias: &str) -> BedrockBuilder {
+        BedrockBuilder {
+            alias: alias.to_string(),
+            bearer_token: None,
+            max_tokens: None,
+        }
     }
 
     fn http_client(&self) -> Client {
@@ -1839,7 +1897,7 @@ mod tests {
     #[test]
     fn creates_without_credentials() {
         // ModelProvider should construct even without env vars.
-        let _provider = BedrockModelProvider::new("test");
+        let _provider = BedrockModelProvider::builder("test").build();
     }
 
     #[tokio::test]
@@ -1874,10 +1932,58 @@ mod tests {
 
     #[test]
     fn creates_with_bearer_token() {
-        let model_provider = BedrockModelProvider::with_bearer_token("test", "test-api-key");
+        let model_provider = BedrockModelProvider::builder("test")
+            .bearer_token("test-api-key")
+            .build();
         assert!(model_provider.auth.is_some());
         assert!(
             matches!(model_provider.auth, Some(BedrockAuth::BearerToken(ref t)) if t == "test-api-key")
+        );
+    }
+
+    /// Regression for the factory-side explicit-API-key path.
+    ///
+    /// The pre-refactor code used `BedrockModelProvider::with_bearer_token(alias, api_key)`,
+    /// which directly constructed a bearer-token provider and skipped
+    /// every ambient AWS credential probe. An earlier iteration of this
+    /// refactor routed the same path through `new(alias).with_bearer_token(...)`,
+    /// which meant `new(alias)` would still walk `BEDROCK_API_KEY` env → SigV4
+    /// env → `credential_process` (spawning a shell command from
+    /// `~/.aws/config`) before the bearer-token override took effect —
+    /// an observable security-boundary regression.
+    ///
+    /// This test proves the current builder-based explicit-key path
+    /// bypasses every ambient probe: with the AWS config file pointed at
+    /// `/dev/null` (so any `credential_process` walk would either err out
+    /// or, if the parser were ever changed, spawn `/dev/null` as a
+    /// command) and with `BEDROCK_API_KEY` deliberately set to a
+    /// distractor value, the resulting `auth` must be exactly the
+    /// caller-supplied bearer token.
+    #[test]
+    fn bearer_token_builder_skips_ambient_credential_probe() {
+        let _env_lock = env_lock();
+        // A stale ambient bearer would beat the explicit one if the
+        // builder probed env before applying the caller's token.
+        let _bedrock_env = EnvGuard::set("BEDROCK_API_KEY", Some("distractor-ambient-token"));
+        // Point the AWS config file at /dev/null so any accidental
+        // credential_process walk fails loudly instead of silently
+        // reading from the developer's real ~/.aws/config.
+        let _aws_config = EnvGuard::set("AWS_CONFIG_FILE", Some("/dev/null"));
+        // Also clear the SigV4 env vars so from_env cannot silently
+        // succeed and mask an unintended probe.
+        let _ak = EnvGuard::set("AWS_ACCESS_KEY_ID", None);
+        let _sk = EnvGuard::set("AWS_SECRET_ACCESS_KEY", None);
+
+        let model_provider = BedrockModelProvider::builder("test")
+            .bearer_token("explicit-caller-token")
+            .build();
+
+        assert!(
+            matches!(
+                model_provider.auth,
+                Some(BedrockAuth::BearerToken(ref t)) if t == "explicit-caller-token"
+            ),
+            "explicit bearer_token() must skip BEDROCK_API_KEY probe and win over any ambient value"
         );
     }
 
@@ -1889,7 +1995,7 @@ mod tests {
         let _ak_guard = EnvGuard::set("AWS_ACCESS_KEY_ID", None);
         let _sk_guard = EnvGuard::set("AWS_SECRET_ACCESS_KEY", None);
 
-        let model_provider = BedrockModelProvider::new("test");
+        let model_provider = BedrockModelProvider::builder("test").build();
         assert!(matches!(
             model_provider.auth,
             Some(BedrockAuth::BearerToken(ref t)) if t == "env-bearer-token"
@@ -1903,7 +2009,7 @@ mod tests {
         let _ak_guard = EnvGuard::set("AWS_ACCESS_KEY_ID", Some("AKIAEXAMPLE"));
         let _sk_guard = EnvGuard::set("AWS_SECRET_ACCESS_KEY", Some("secret"));
 
-        let model_provider = BedrockModelProvider::new("test");
+        let model_provider = BedrockModelProvider::builder("test").build();
         // Bearer token should take priority over SigV4 credentials.
         assert!(matches!(
             model_provider.auth,

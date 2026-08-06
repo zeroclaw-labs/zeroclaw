@@ -276,8 +276,16 @@ impl SopMetricsCollector {
                 continue;
             };
             for ev in &events {
+                // An `amend` IS an approval (of the operator's text) — the live
+                // path meters it via `record_approval_metric` exactly like a
+                // plain approve, so the rebuild must count it too or the
+                // counters drift across a restart. Denials, escalations, and
+                // revises (the gate stays open) are not approvals.
                 if ev.kind != "gate_resolved"
-                    || ev.payload.get("decision").and_then(|d| d.as_str()) != Some("approve")
+                    || !matches!(
+                        ev.payload.get("decision").and_then(|d| d.as_str()),
+                        Some("approve") | Some("amend")
+                    )
                 {
                     continue;
                 }
@@ -420,10 +428,7 @@ impl SopMetricsCollector {
             }
             if let Some(sop_key) = best_key {
                 let suffix = &rest[sop_key.len() + 1..];
-                match state.per_sop.get(sop_key) {
-                    Some(c) => (c, suffix),
-                    None => return None,
-                }
+                (state.per_sop.get(sop_key)?, suffix)
             } else {
                 // No matching SOP name prefix — treat as global metric
                 // (handles case where metric name contains dots but isn't per-SOP)
@@ -708,6 +713,8 @@ mod tests {
             step_results,
             waiting_since: None,
             llm_calls_saved: 0,
+            revision: 0,
+            revision_base: 0,
         }
     }
 
@@ -1280,6 +1287,8 @@ mod tests {
             step_results: vec![],
             waiting_since: None,
             llm_calls_saved: 0,
+            revision: 0,
+            revision_base: 0,
         };
         audit.log_run_start(&run).await.unwrap();
 
@@ -1392,6 +1401,8 @@ mod tests {
             step_results: vec![],
             waiting_since: None,
             llm_calls_saved: 0,
+            revision: 0,
+            revision_base: 0,
         };
         audit.log_run_start(&running_run).await.unwrap();
 

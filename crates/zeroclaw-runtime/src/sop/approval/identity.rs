@@ -44,7 +44,10 @@ pub trait ApprovalIdentityResolver: Send + Sync {
 /// (`<source>:<identity>`, e.g. `http:<subject>`, `agent:<alias>`) to grant rights
 /// on ONE transport only - so a subject on the gateway and the same string on the
 /// agent tool do not collide - or a **bare** identity to grant it from any source.
-/// A principal with no identity (e.g. the system tick) belongs to no group.
+/// Channel principals are stricter: they match only
+/// `channel:<channel-key>:<sender>`, never `channel:<sender>` or a bare sender, so
+/// same-looking platform ids from different channel aliases cannot collide. A
+/// principal with no identity (e.g. the system tick) belongs to no group.
 ///
 /// NOTE on the identity each surface actually PRODUCES today. The gateway HTTP and
 /// WS paths both produce the paired-token hash (a stable per-device subject); they
@@ -64,12 +67,26 @@ impl ApprovalIdentityResolver for LocalConfigApprovalIdentityResolver {
         let Some(id) = principal.identity.as_deref() else {
             return Vec::new();
         };
-        // A member is matched by its source-qualified identity (precise, no
-        // cross-channel collision) OR its bare identity (an any-source grant).
-        let qualified = format!("{}:{}", principal.source_label(), id);
+        // Non-channel members match by source-qualified or bare identity. Channel
+        // members must include the channel key to avoid cross-alias sender collisions.
+        let member_keys = match principal.source {
+            super::principal::ApprovalSource::Channel => {
+                let Some(channel) = principal.channel.as_deref().filter(|c| !c.is_empty()) else {
+                    return Vec::new();
+                };
+                vec![format!("channel:{channel}:{id}")]
+            }
+            _ => vec![
+                format!("{}:{}", principal.source_label(), id),
+                id.to_string(),
+            ],
+        };
         let mut groups: Vec<String> = Vec::new();
         for (group_name, group) in &cfg.groups {
-            let is_member = group.members.iter().any(|m| m == &qualified || m == id);
+            let is_member = group
+                .members
+                .iter()
+                .any(|m| member_keys.iter().any(|key| m == key));
             if is_member && !groups.iter().any(|g| g == group_name) {
                 groups.push(group_name.clone());
             }
@@ -132,6 +149,32 @@ mod tests {
             &ApprovalPrincipal::cli(Some("ZeroClawOperator".into())),
             "release"
         ));
+    }
+
+    #[test]
+    fn channel_member_is_scoped_to_channel_key() {
+        let cfg = cfg_with(&[("release", &["channel:discord.ops:123"])]);
+        let r = LocalConfigApprovalIdentityResolver;
+        assert!(r.is_member(
+            &cfg,
+            &ApprovalPrincipal::channel("discord.ops".into(), Some("123".into())),
+            "release"
+        ));
+        assert!(!r.is_member(
+            &cfg,
+            &ApprovalPrincipal::channel("slack.ops".into(), Some("123".into())),
+            "release"
+        ));
+
+        let legacy_unscoped = cfg_with(&[("release", &["channel:123", "123"])]);
+        assert!(
+            r.groups_for(
+                &legacy_unscoped,
+                &ApprovalPrincipal::channel("discord.ops".into(), Some("123".into()))
+            )
+            .is_empty(),
+            "channel principals must not match unscoped channel or bare sender ids"
+        );
     }
 
     #[test]

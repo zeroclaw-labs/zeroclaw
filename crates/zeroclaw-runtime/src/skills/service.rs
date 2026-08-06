@@ -420,6 +420,7 @@ mod tests {
             tools: vec![],
             prompts: vec![],
             slash_options: vec![],
+            always: false,
             location: loc.map(PathBuf::from),
             description_localizations: Default::default(),
         };

@@ -15,7 +15,9 @@ Do not configure both selectors in the same channel unless you intentionally wan
 
 ## Cloud API mode
 
-Cloud API mode is the Meta Business Platform integration. It requires a Meta Business account, a WhatsApp Business app, a phone number ID, a verify token, and an access token. It is the right mode for business deployments that receive messages through Meta webhooks.
+Cloud API mode is the Meta Business Platform integration. It requires a Meta Business account, a WhatsApp Business app, a phone number ID, a verify token, an access token, and an app secret. It is the right mode for business deployments that receive messages through Meta webhooks.
+
+Inbound webhooks are signature-verified against `app_secret`, and verification is mandatory. With no app secret configured the gateway cannot verify a request, so it answers `401` and processes nothing. Set `app_secret` before pointing Meta at the callback URL.
 
 The gateway must be reachable by Meta for inbound webhooks. Configure a tunnel under the top-level `[tunnel]` section (`tunnel_provider` and the related provider blocks, see the [config reference](../reference/config.md#tunnel)), or front the gateway with your own reverse proxy when developing locally.
 

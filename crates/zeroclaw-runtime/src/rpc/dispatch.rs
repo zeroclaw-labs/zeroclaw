@@ -1,6 +1,6 @@
 //! JSON-RPC 2.0 method dispatch. Transport-agnostic.
 
-use super::context::RpcContext;
+use super::context::{ConfigWriteGuard, RpcContext};
 use super::transport::RpcTransport;
 use super::turn::{TurnAttribution, TurnOutcome, execute_turn};
 use super::types::*;
@@ -15,6 +15,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use zeroclaw_config::schema::Config;
 
 use zeroclaw_api::jsonrpc::error_codes::*;
 use zeroclaw_api::jsonrpc::{
@@ -23,6 +24,7 @@ use zeroclaw_api::jsonrpc::{
     SopRunsRequest, SopSaveRequest, SopSelectRequest,
 };
 use zeroclaw_api::model_provider::ChatMessage;
+use zeroclaw_api::runtime_status::RuntimeConfigKind;
 
 /// Wire protocol version. Bump on breaking changes.
 pub const RPC_PROTOCOL_VERSION: u64 = 1;
@@ -31,6 +33,36 @@ mod notification {
     pub const SESSION_UPDATE: &str = "session/update";
     pub const LOGS_EVENT: &str = "logs/event";
 }
+
+struct StatusRuntimeContext {
+    config_dir: String,
+    config_file: String,
+    config_kind: RuntimeConfigKind,
+    local_ipc_endpoint: String,
+}
+
+fn status_runtime_context(config: &Config, config_kind: RuntimeConfigKind) -> StatusRuntimeContext {
+    let config_file = config.config_path.display().to_string();
+    let config_dir = config
+        .config_path
+        .parent()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let local_ipc_endpoint = super::local::socket_path(config).display().to_string();
+
+    StatusRuntimeContext {
+        config_dir,
+        config_file,
+        config_kind,
+        local_ipc_endpoint,
+    }
+}
+
+// ── Method registry ──────────────────────────────────────────────
+//
+// Single source of truth. Every variant maps to exactly one wire
+// string. `from_wire` is a table scan — no hand-written string
+// matching anywhere in this file.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Method {
@@ -501,23 +533,64 @@ impl RpcDispatcher {
         }
     }
 
-    /// Flush dirty config paths to disk. Clone the config out of the
-    /// lock (parking_lot guards are !Send), save to disk, then write
-    /// the clone (with cleared dirty set) back.
-    async fn flush_config(&self) -> Result<(), JsonRpcError> {
+    /// Flush dirty config paths to disk.
+    ///
+    /// `_guard` is never read — it is a witness reminding the caller to
+    /// serialize on `ctx.config_write_lock` for the whole read-mutate-flush
+    /// critical section. It is NOT compile-time proof of holding *that*
+    /// mutex (a guard is not statically tied to a specific instance); the
+    /// `debug_assert!` below catches a caller holding a look-alike guard
+    /// from the wrong mutex. The invariant lives on
+    /// [`RpcContext::config_write_lock`]: every mutation of `ctx.config`
+    /// must hold it, and a bypassing writer that re-dirties a just-saved
+    /// path during a flush loses disk persistence of that write.
+    ///
+    /// Clone the config out of the lock (parking_lot guards are !Send, so
+    /// the clone can't be held across `snapshot.save_dirty().await`), save
+    /// the clone to disk, then remove only the paths that were actually
+    /// saved from the LIVE config's dirty set. This must NOT swap the live
+    /// config wholesale: a write landed on `ctx.config` while this method
+    /// awaits disk I/O would otherwise be overwritten by the stale snapshot
+    /// on write-back, silently erasing an in-memory change that was never
+    /// given a chance to be saved.
+    async fn flush_config(&self, _guard: &ConfigWriteGuard) -> Result<(), JsonRpcError> {
+        debug_assert!(
+            self.ctx.config_write_lock.try_lock().is_err(),
+            "flush_config caller must hold ctx.config_write_lock"
+        );
         let mut snapshot = self.ctx.config.read().clone();
+        let saved_paths = snapshot.dirty_paths.clone();
         snapshot
             .save_dirty()
             .await
             .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config save failed: {e}")))?;
-        *self.ctx.config.write() = snapshot;
+        self.ctx
+            .config
+            .write()
+            .dirty_paths
+            .retain(|path| !saved_paths.contains(path));
         Ok(())
     }
 
+    /// Save `snapshot` to disk, then install it as the live config.
+    ///
+    /// `_guard` is the same serialization witness as in
+    /// [`Self::flush_config`] (a reminder, not compile-time proof — see
+    /// there). Unlike `flush_config`, this deliberately swaps: callers pass
+    /// a clone that was itself mutated beyond just `dirty_paths` (e.g. an
+    /// alias rename), and installing that mutated snapshot wholesale is the
+    /// point. Holding `config_write_lock` is what makes the swap safe — no
+    /// other handler can land a concurrent `config` write while this is in
+    /// flight.
     async fn save_and_swap_config(
         &self,
         mut snapshot: zeroclaw_config::schema::Config,
+        _guard: &ConfigWriteGuard,
     ) -> Result<(), JsonRpcError> {
+        debug_assert!(
+            self.ctx.config_write_lock.try_lock().is_err(),
+            "save_and_swap_config caller must hold ctx.config_write_lock"
+        );
         snapshot
             .save_dirty()
             .await
@@ -841,6 +914,7 @@ impl RpcDispatcher {
         to_result(InitializeResult {
             protocol_version: RPC_PROTOCOL_VERSION,
             server_version: env!("CARGO_PKG_VERSION").to_string(),
+            server_pid: std::process::id(),
             tui_id: Some(tui_id),
             tui_sig,
             capabilities,
@@ -849,6 +923,12 @@ impl RpcDispatcher {
 
     async fn handle_status(&self) -> RpcResult {
         let ids = self.ctx.sessions.list_ids().await;
+        let config_path = self.ctx.config.read().config_path.clone();
+        let config_kind = zeroclaw_config::schema::classify_runtime_config_kind(&config_path).await;
+        let runtime_context = {
+            let config = self.ctx.config.read();
+            status_runtime_context(&config, config_kind)
+        };
         // Count persisted sessions (channel-originated) that aren't already
         // in the in-memory RPC store.
         let persisted_count = self
@@ -863,6 +943,10 @@ impl RpcDispatcher {
             protocol_version: RPC_PROTOCOL_VERSION,
             active_sessions: total,
             session_ids: ids,
+            config_dir: Some(runtime_context.config_dir),
+            config_file: Some(runtime_context.config_file),
+            config_kind: Some(runtime_context.config_kind),
+            local_ipc_endpoint: Some(runtime_context.local_ipc_endpoint),
         })
     }
 
@@ -1006,7 +1090,7 @@ impl RpcDispatcher {
         // gateway exposes for this agent; ACP (Code) sessions skip it to keep
         // `session/new` prompt
         let initialize_mcp = session_should_initialize_mcp(&chat_mode);
-        let agent = crate::agent::agent::Agent::from_live_config_with_tui_env(
+        let mut agent = crate::agent::agent::Agent::from_live_config_with_tui_env(
             Arc::clone(&self.ctx.config),
             &req.agent_alias,
             cwd_path,
@@ -1026,6 +1110,10 @@ impl RpcDispatcher {
             Arc::clone(&self.ctx.approval_pending),
             self.client_elicitation_caps,
         ));
+        // Align agent.channel_name with the registered back-channel key so
+        // ask_user/poll/escalate default to this conversation (not an arbitrary
+        // external channel from the seeded channel map).
+        agent.set_channel_name("rpc".to_string());
         agent.channel_handles().register_channel("rpc", approval_ch);
 
         self.ctx
@@ -1038,7 +1126,9 @@ impl RpcDispatcher {
             .await
             .map_err(|_| rpc_err(SESSION_LIMIT_REACHED, "Session limit reached"))?;
 
-        if let Some(ref tui_id) = self.tui_id {
+        if let Some(ref tui_id) = self.tui_id
+            && req.keep_siblings != Some(true)
+        {
             let evicted = self
                 .ctx
                 .sessions
@@ -1466,7 +1556,7 @@ impl RpcDispatcher {
         let exclude_memory = true;
         // Reaped sessions always rehydrate as ACP, which skips eager MCP init to
         // stay prompt — matching `session_should_initialize_mcp(ChatMode::Acp)`.
-        let agent = crate::agent::agent::Agent::from_live_config_with_tui_env(
+        let mut agent = crate::agent::agent::Agent::from_live_config_with_tui_env(
             Arc::clone(&self.ctx.config),
             &data.agent_alias,
             cwd_path,
@@ -1486,6 +1576,9 @@ impl RpcDispatcher {
             Arc::clone(&self.ctx.approval_pending),
             self.client_elicitation_caps,
         ));
+        // See session/new: channel_name must match the registered back-channel
+        // key so interactive tools default to this conversation.
+        agent.set_channel_name("rpc".to_string());
         agent.channel_handles().register_channel("rpc", approval_ch);
 
         let message_count = data.messages.len();
@@ -1934,6 +2027,12 @@ impl RpcDispatcher {
     async fn handle_session_configure(&self, params: &Value) -> RpcResult {
         let req: SessionConfigureParams = parse_params(params)?;
         validate_session_configure_overrides(&req.overrides)?;
+        let _model_provider_update = self
+            .ctx
+            .sessions
+            .lock_model_provider_update(&req.session_id)
+            .await
+            .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
 
         let merged = self
             .ctx
@@ -2603,6 +2702,7 @@ impl RpcDispatcher {
     async fn handle_config_set(&self, params: &Value) -> RpcResult {
         let req: ConfigSetParams = parse_params(params)?;
         let refresh_model_provider_ref = model_provider_ref_from_provider_profile_prop(&req.prop);
+        let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
         {
             let mut config = self.ctx.config.write();
             if config.ensure_map_key_for_path(&req.prop) {
@@ -2651,7 +2751,7 @@ impl RpcDispatcher {
                 .set_prop_persistent(&req.prop, &value_str)
                 .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config set failed: {e}")))?;
         }
-        self.flush_config().await?;
+        self.flush_config(&config_write_guard).await?;
         if let Some(model_provider_ref) = refresh_model_provider_ref {
             self.refresh_memory_embedder_for_model_provider(&model_provider_ref);
             self.schedule_live_sessions_refresh_for_model_provider(model_provider_ref);
@@ -2734,20 +2834,20 @@ impl RpcDispatcher {
     fn schedule_live_sessions_refresh_for_agent(&self, agent_alias: String) {
         let ctx = Arc::clone(&self.ctx);
         zeroclaw_spawn::spawn!(async move {
-            let provider_ref = {
-                let config = ctx.config.read();
-                config
-                    .agent(&agent_alias)
-                    .map(|agent| agent.model_provider.to_string())
-            };
-            let Some(provider_ref) = provider_ref else {
-                return;
-            };
-            Self::refresh_live_sessions_matching(ctx, &provider_ref, |session_agent, overrides| {
-                agent_scoped_refresh_selects(&agent_alias, session_agent, overrides)
-            })
-            .await;
+            Self::refresh_live_sessions_for_agent(ctx, &agent_alias).await;
         });
+    }
+
+    async fn refresh_live_sessions_for_agent(ctx: Arc<RpcContext>, agent_alias: &str) {
+        Self::refresh_live_sessions_matching(ctx, |config, session_agent, overrides| {
+            if !agent_scoped_refresh_selects(agent_alias, session_agent, overrides) {
+                return None;
+            }
+            config
+                .agent(agent_alias)
+                .map(|agent| agent.model_provider.to_string())
+        })
+        .await;
     }
 
     async fn refresh_live_sessions_for_model_provider(
@@ -2755,45 +2855,44 @@ impl RpcDispatcher {
         model_provider_ref: &str,
     ) {
         let target_ref = model_provider_ref.to_string();
-        Self::refresh_live_sessions_matching(ctx, model_provider_ref, move |_agent, overrides| {
-            provider_scoped_refresh_selects(&target_ref, overrides)
+        Self::refresh_live_sessions_matching(ctx, move |config, session_agent, overrides| {
+            if !provider_scoped_refresh_selects(&target_ref, overrides) {
+                return None;
+            }
+            let effective_ref = overrides.model_provider.as_deref().or_else(|| {
+                config
+                    .agent(session_agent)
+                    .map(|agent| agent.model_provider.as_str())
+            });
+            (effective_ref == Some(target_ref.as_str())).then(|| target_ref.clone())
         })
         .await;
     }
 
-    async fn refresh_live_sessions_matching<F>(
-        ctx: Arc<RpcContext>,
-        model_provider_ref: &str,
-        select: F,
-    ) where
-        F: Fn(&str, &SessionOverrides) -> bool,
+    async fn refresh_live_sessions_matching<F>(ctx: Arc<RpcContext>, resolve_provider_ref: F)
+    where
+        F: Fn(&Config, &str, &SessionOverrides) -> Option<String>,
     {
         let session_ids = ctx.sessions.list_ids().await;
         for session_id in session_ids {
+            let Some(_model_provider_update) =
+                ctx.sessions.lock_model_provider_update(&session_id).await
+            else {
+                continue;
+            };
             let Some(agent_alias) = ctx.sessions.get_agent_alias(&session_id).await else {
                 continue;
             };
             let Some(overrides) = ctx.sessions.get_overrides(&session_id).await else {
                 continue;
             };
-            if !select(&agent_alias, &overrides) {
-                continue;
-            }
-            let resolves_provider = {
-                let config = ctx.config.read();
-                let effective_ref = overrides.model_provider.as_deref().or_else(|| {
-                    config
-                        .agent(&agent_alias)
-                        .map(|agent| agent.model_provider.as_str())
-                });
-                effective_ref == Some(model_provider_ref)
-            };
-            if !resolves_provider {
-                continue;
-            }
-
             let (model_provider, model_provider_name, model_name, tool_dispatcher, temperature) = {
                 let config = ctx.config.read();
+                let Some(model_provider_ref) =
+                    resolve_provider_ref(&config, &agent_alias, &overrides)
+                else {
+                    continue;
+                };
                 let provider_temperature = model_provider_ref.split_once('.').and_then(
                     |(provider_type, provider_alias)| {
                         config
@@ -2822,7 +2921,7 @@ impl RpcDispatcher {
                 };
                 match crate::agent::agent::build_session_model_provider(
                     &config,
-                    model_provider_ref,
+                    &model_provider_ref,
                     overrides.model.as_deref(),
                 ) {
                     Ok((model_provider, model_provider_name, model_name)) => {
@@ -2946,13 +3045,14 @@ impl RpcDispatcher {
     async fn handle_config_delete(&self, params: &Value) -> RpcResult {
         let req: ConfigDeleteParams = parse_params(params)?;
         let refresh_model_provider_ref = model_provider_ref_from_provider_profile_prop(&req.prop);
+        let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
         {
             let mut config = self.ctx.config.write();
             config
                 .set_prop_persistent(&req.prop, "")
                 .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config delete failed: {e}")))?;
         }
-        self.flush_config().await?;
+        self.flush_config(&config_write_guard).await?;
         if let Some(model_provider_ref) = refresh_model_provider_ref {
             self.refresh_memory_embedder_for_model_provider(&model_provider_ref);
             self.schedule_live_sessions_refresh_for_model_provider(model_provider_ref);
@@ -2990,6 +3090,7 @@ impl RpcDispatcher {
 
     async fn handle_config_map_key_create(&self, params: &Value) -> RpcResult {
         let req: ConfigMapKeyCreateParams = parse_params(params)?;
+        let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
         let created = {
             let mut config = self.ctx.config.write();
             // Shared guarded boundary: enforces the reserved-agent rule (the
@@ -3007,7 +3108,7 @@ impl RpcDispatcher {
             created
         };
         if created {
-            self.flush_config().await?;
+            self.flush_config(&config_write_guard).await?;
         }
         to_result(ConfigMapKeyCreateResult {
             path: req.path,
@@ -3018,6 +3119,7 @@ impl RpcDispatcher {
 
     async fn handle_config_map_key_delete(&self, params: &Value) -> RpcResult {
         let req: ConfigMapKeyDeleteParams = parse_params(params)?;
+        let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
         let deleted = {
             let mut config = self.ctx.config.write();
             let deleted = config
@@ -3029,7 +3131,7 @@ impl RpcDispatcher {
             deleted
         };
         if deleted {
-            self.flush_config().await?;
+            self.flush_config(&config_write_guard).await?;
         }
         to_result(ConfigMapKeyDeleteResult {
             path: req.path,
@@ -3043,11 +3145,20 @@ impl RpcDispatcher {
             Ok(req) => req,
             Err(err) => return Box::pin(std::future::ready(Err(err))),
         };
-        if let Some(kind) = zeroclaw_config::alias_refs::alias_kind_for_map_path(&req.path) {
-            return self.handle_config_alias_rename(req, kind);
-        }
 
         Box::pin(async move {
+            // Acquired once here, not inside `handle_config_alias_rename`:
+            // the alias-kind branch below delegates into it, and the tokio
+            // Mutex is not reentrant. The guard moves by value into the
+            // alias-rename path so it can be released at that handler's
+            // commit point, before its slow post-commit side effects.
+            let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
+            if let Some(kind) = zeroclaw_config::alias_refs::alias_kind_for_map_path(&req.path) {
+                return self
+                    .handle_config_alias_rename(req, kind, config_write_guard)
+                    .await;
+            }
+
             let renamed = {
                 let mut config = self.ctx.config.write();
                 let renamed = config
@@ -3060,7 +3171,7 @@ impl RpcDispatcher {
                 renamed
             };
             if renamed {
-                self.flush_config().await?;
+                self.flush_config(&config_write_guard).await?;
             }
             to_result(ConfigMapKeyRenameResult {
                 path: req.path,
@@ -3076,6 +3187,7 @@ impl RpcDispatcher {
         &'a self,
         req: ConfigMapKeyRenameParams,
         kind: zeroclaw_config::alias_refs::AliasKind,
+        config_write_guard: ConfigWriteGuard,
     ) -> BoxRpcFuture<'a> {
         Box::pin(async move {
             let is_agent = matches!(kind, zeroclaw_config::alias_refs::AliasKind::Agent);
@@ -3122,8 +3234,15 @@ impl RpcDispatcher {
                 for path in &report.dirty_paths {
                     working.mark_dirty(path);
                 }
-                self.save_and_swap_config(working.clone()).await?;
+                self.save_and_swap_config(working.clone(), &config_write_guard)
+                    .await?;
             }
+            // Config is committed (saved + swapped, or already committed by a
+            // prior crashed run). Release before the post-commit side effects
+            // below: workspace moves and the memory/cron/ACP/session-backend
+            // cascade can be slow or wedge, and holding the lock across them
+            // would stall every config-mutating RPC daemon-wide.
+            drop(config_write_guard);
             let new_workspace = is_agent.then(|| working.agent_workspace_dir(&req.to));
 
             let mut warnings = Vec::new();
@@ -4131,22 +4250,39 @@ impl RpcDispatcher {
         );
         let _guard = span.enter();
 
-        let mut resumed_action = None;
+        let mut resolved_outcome = None;
         {
             let mut guard = engine
                 .lock()
                 .map_err(|_| rpc_err(INTERNAL_ERROR, "SOP engine lock poisoned"))?;
+            let run_sop_name = guard
+                .get_run(&req.run_id)
+                .map(|run| run.sop_name.clone())
+                .ok_or_else(|| {
+                    rpc_err(INVALID_PARAMS, format!("run '{}' not found", req.run_id))
+                })?;
+            if run_sop_name != req.name {
+                return Err(rpc_err(
+                    INVALID_PARAMS,
+                    format!(
+                        "run '{}' belongs to SOP '{}', not '{}'",
+                        req.run_id, run_sop_name, req.name
+                    ),
+                ));
+            }
             use crate::sop::approval::{BrokerOutcome, ResolveOutcome};
             let principal = crate::sop::approval::ApprovalPrincipal::cli(self.tui_id.clone());
             match guard
                 .resolve_via_broker(&req.run_id, decision, principal)
                 .map_err(|e| rpc_err(INTERNAL_ERROR, e.to_string()))?
             {
-                BrokerOutcome::Resolved(ResolveOutcome::Resumed(action)) => {
-                    resumed_action = Some(*action);
+                outcome @ BrokerOutcome::Resolved(ResolveOutcome::Resumed(_)) => {
+                    resolved_outcome = Some(outcome);
                 }
                 BrokerOutcome::Resolved(
-                    ResolveOutcome::Denied | ResolveOutcome::AlreadyResolved,
+                    ResolveOutcome::Denied
+                    | ResolveOutcome::AlreadyResolved
+                    | ResolveOutcome::Revised,
                 )
                 | BrokerOutcome::PendingQuorum { .. } => {}
                 BrokerOutcome::Resolved(
@@ -4189,13 +4325,13 @@ impl RpcDispatcher {
             }
         }
 
-        if let Some(action) = resumed_action {
-            let config = self.ctx.config.read().clone();
-            crate::sop::spawn_headless_run_driver(
-                config,
+        if let Some(outcome) = resolved_outcome {
+            let config = self.ctx.config.read();
+            crate::sop::drive_resumed_broker_action(
+                &config,
                 Arc::clone(&engine),
                 self.ctx.sop_audit.clone(),
-                action,
+                &outcome,
             );
         }
 
@@ -4373,9 +4509,15 @@ impl RpcDispatcher {
 
     async fn handle_quickstart_apply(&self, params: &Value) -> RpcResult {
         let req: QuickstartApplyParams = parse_params(params)?;
+        // Serializes with every other config-mutating handler for the whole
+        // clone-apply-save-swap below, so the install on success can't race
+        // a concurrent config write (see `ctx.config_write_lock`).
+        let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
         // Clone out of the lock to satisfy `&mut Config`. On success
-        // write the mutated snapshot back, mirroring `flush_config`
-        // and the gateway's `handle_apply`.
+        // install the mutated snapshot, mirroring the gateway's
+        // `handle_apply`. `apply_with_surface` already ran `save_dirty` on
+        // the clone, so `save_and_swap_config` performs no second disk
+        // write (empty dirty set short-circuits) — just the guarded swap.
         let mut working = self.ctx.config.read().clone();
         let result = crate::quickstart::apply_with_surface(
             req.submission,
@@ -4385,7 +4527,8 @@ impl RpcDispatcher {
         .await;
         let body = match result {
             Ok(agent) => {
-                *self.ctx.config.write() = working;
+                self.save_and_swap_config(working, &config_write_guard)
+                    .await?;
                 let reload_signalled = self.signal_daemon_reload();
                 QuickstartApplyResult::Applied {
                     agent,
@@ -4592,7 +4735,14 @@ fn notification_for_turn_event(
             name: name.clone(),
             raw_input: args.clone(),
         },
-        TurnEvent::ToolResult { id, name, output } => SessionUpdateEvent::ToolResult {
+        // The RPC/SessionUpdateEvent surface forwards the text output only; file
+        // attachment happens on the direct ACP path, so `artifact` is not needed here.
+        TurnEvent::ToolResult {
+            id,
+            name,
+            output,
+            artifact: _,
+        } => SessionUpdateEvent::ToolResult {
             session_id: session_id.to_string(),
             tool_call_id: id.clone(),
             name: name.clone(),
@@ -4620,12 +4770,7 @@ fn notification_for_turn_event(
             kept_turns: *kept_turns,
             reason: reason.clone(),
         },
-        TurnEvent::Usage {
-            input_tokens,
-            cached_input_tokens: _,
-            output_tokens: _,
-            ..
-        } => SessionUpdateEvent::ContextUsage {
+        TurnEvent::Usage { input_tokens, .. } => SessionUpdateEvent::ContextUsage {
             session_id: session_id.to_string(),
             input_tokens: *input_tokens,
             max_context_tokens,
@@ -5520,7 +5665,6 @@ mod tests {
             agent: None,
         };
         crate::sop::save_sop(&sops_dir, &sop).unwrap();
-
         let mut groups = HashMap::new();
         groups.insert(
             "release".to_string(),
@@ -5616,6 +5760,338 @@ mod tests {
                 .get_run(&run_id)
                 .map(|run| run.status),
             Some(SopRunStatus::PausedCheckpoint)
+        );
+    }
+
+    #[tokio::test]
+    async fn sops_decide_drives_resumed_execute_step() {
+        use crate::sop::{
+            Sop, SopEvent, SopExecutionMode, SopPriority, SopRunAction, SopRunStatus, SopStep,
+            SopStepKind, SopTrigger, SopTriggerSource,
+        };
+        use std::sync::{Arc, Mutex};
+        use zeroclaw_config::schema::{Config, SopConfig};
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let tmp = tempfile::TempDir::new().expect("temporary SOP directory");
+        let sops_dir = tmp.path().join("sops");
+        let sop_config = SopConfig {
+            sops_dir: Some(sops_dir.to_string_lossy().into_owned()),
+            ..SopConfig::default()
+        };
+        let config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            sop: sop_config.clone(),
+            ..Config::default()
+        };
+        let sop = Sop {
+            name: "rpc-resumed-execute".to_string(),
+            description: "RPC resume driver regression".to_string(),
+            version: "1.0.0".to_string(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Supervised,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![SopStep {
+                number: 1,
+                title: "Execute after approval".to_string(),
+                kind: SopStepKind::Execute,
+                ..SopStep::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: false,
+            agent: None,
+            admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+        };
+        crate::sop::save_sop(&sops_dir, &sop).expect("save temporary SOP");
+
+        let mut engine = crate::sop::SopEngine::new(sop_config);
+        engine.reload(tmp.path());
+        let engine = Arc::new(Mutex::new(engine));
+        let run_id = {
+            let mut guard = engine.lock().expect("engine lock");
+            let action = guard
+                .start_run(
+                    "rpc-resumed-execute",
+                    SopEvent {
+                        source: SopTriggerSource::Manual,
+                        topic: None,
+                        payload: None,
+                        timestamp: crate::sop::engine::now_iso8601(),
+                    },
+                )
+                .expect("start approval-gated SOP");
+            let SopRunAction::WaitApproval { run_id, .. } = action else {
+                panic!("supervised Execute step must park for approval: {action:?}");
+            };
+            run_id
+        };
+
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal_with_sop_engine(config, sessions, Arc::clone(&engine));
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-rpc:pid=1".to_string());
+
+        dispatcher
+            .handle_sops_decide(&serde_json::json!({
+                "name": "rpc-resumed-execute",
+                "run_id": run_id,
+                "decision": "approve",
+            }))
+            .await
+            .expect("RPC approval must accept the parked run");
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let status = engine
+                    .lock()
+                    .expect("engine lock")
+                    .get_run(&run_id)
+                    .map(|run| run.status);
+                if status == Some(SopRunStatus::Failed) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("RPC approval must schedule the resumed ExecuteStep");
+    }
+
+    #[tokio::test]
+    async fn sops_decide_rejects_approval_mode_rejection() {
+        use crate::sop::{
+            Sop, SopEvent, SopExecutionMode, SopPriority, SopRunAction, SopRunStatus, SopStep,
+            SopStepKind, SopTrigger, SopTriggerSource,
+        };
+        use std::sync::{Arc, Mutex};
+        use zeroclaw_config::schema::{ApprovalMode, Config, SopConfig};
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        fn dispatcher_with_sop_engine(
+            config: Config,
+            engine: Arc<Mutex<crate::sop::SopEngine>>,
+        ) -> RpcDispatcher {
+            let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+            let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+            let ctx = RpcContext::minimal_with_sop_engine(config, sessions, engine);
+            let (tx, _rx) = tokio::sync::mpsc::channel(64);
+            let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-rpc:pid=1".to_string());
+            dispatcher.set_tui_id_for_test(Some("alice".to_string()));
+            dispatcher
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sops_dir = tmp.path().join("sops");
+        let sop_config = SopConfig {
+            sops_dir: Some(sops_dir.to_string_lossy().into_owned()),
+            default_execution_mode: "deterministic".to_string(),
+            approval_mode: ApprovalMode::AgentTool,
+            ..SopConfig::default()
+        };
+        let config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            sop: sop_config.clone(),
+            ..Config::default()
+        };
+
+        let sop = Sop {
+            name: "rpc-agent-tool-only".to_string(),
+            description: "rpc approval-mode checkpoint".to_string(),
+            version: "1.0.0".to_string(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Deterministic,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![SopStep {
+                number: 1,
+                title: "Policy gate".to_string(),
+                kind: SopStepKind::Checkpoint,
+                ..SopStep::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: true,
+            agent: None,
+            admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+        };
+        crate::sop::save_sop(&sops_dir, &sop).expect("save temp SOP");
+
+        let mut engine = crate::sop::SopEngine::new(sop_config);
+        engine.reload(tmp.path());
+        let engine = Arc::new(Mutex::new(engine));
+        let run_id = {
+            let mut guard = engine.lock().expect("engine lock");
+            let action = guard
+                .start_run(
+                    "rpc-agent-tool-only",
+                    SopEvent {
+                        source: SopTriggerSource::Manual,
+                        topic: None,
+                        payload: None,
+                        timestamp: crate::sop::engine::now_iso8601(),
+                    },
+                )
+                .expect("start approval-mode SOP");
+            let SopRunAction::CheckpointWait { run_id, .. } = action else {
+                panic!("approval-mode SOP must park at checkpoint, got {action:?}");
+            };
+            run_id
+        };
+
+        let dispatcher = dispatcher_with_sop_engine(config, Arc::clone(&engine));
+        let err = dispatcher
+            .handle_sops_decide(&serde_json::json!({
+                "name": "rpc-agent-tool-only",
+                "run_id": run_id,
+                "decision": "approve",
+            }))
+            .await
+            .expect_err("RPC principal must be rejected by approval_mode=agent_tool");
+        assert_eq!(err.code, AUTH_REQUIRED);
+        assert!(
+            err.message.contains(&crate::i18n::get_required_cli_string(
+                "sop-rpc-decision-unauthorized",
+            )),
+            "approval_mode rejection must surface, got: {}",
+            err.message
+        );
+        let guard = engine.lock().expect("engine lock");
+        assert_eq!(
+            guard.get_run(&run_id).expect("run still active").status,
+            SopRunStatus::PausedCheckpoint
+        );
+        assert!(
+            !guard
+                .run_events(&run_id)
+                .unwrap_or_default()
+                .iter()
+                .any(|event| event.kind == "gate_resolved"),
+            "rejected RPC decision must not append a gate_resolved row"
+        );
+    }
+
+    #[tokio::test]
+    async fn sops_decide_rejects_run_id_from_different_sop_before_broker_resolution() {
+        use crate::sop::{
+            Sop, SopEvent, SopExecutionMode, SopPriority, SopRunAction, SopRunStatus, SopStep,
+            SopStepKind, SopTrigger, SopTriggerSource,
+        };
+        use std::sync::{Arc, Mutex};
+        use zeroclaw_config::schema::{Config, SopConfig};
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        fn dispatcher_with_sop_engine(
+            config: Config,
+            engine: Arc<Mutex<crate::sop::SopEngine>>,
+        ) -> RpcDispatcher {
+            let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+            let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+            let ctx = RpcContext::minimal_with_sop_engine(config, sessions, engine);
+            let (tx, _rx) = tokio::sync::mpsc::channel(64);
+            let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-rpc:pid=1".to_string());
+            dispatcher.set_tui_id_for_test(Some("alice".to_string()));
+            dispatcher
+        }
+
+        fn checkpoint_sop(name: &str) -> Sop {
+            Sop {
+                name: name.to_string(),
+                description: format!("{name} checkpoint"),
+                version: "1.0.0".to_string(),
+                priority: SopPriority::Normal,
+                execution_mode: SopExecutionMode::Deterministic,
+                triggers: vec![SopTrigger::Manual],
+                steps: vec![SopStep {
+                    number: 1,
+                    title: "Gate".to_string(),
+                    kind: SopStepKind::Checkpoint,
+                    ..SopStep::default()
+                }],
+                cooldown_secs: 0,
+                max_concurrent: 1,
+                location: None,
+                deterministic: true,
+                agent: None,
+                admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+                max_pending_approvals: 0,
+            }
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sops_dir = tmp.path().join("sops");
+        let sop_config = SopConfig {
+            sops_dir: Some(sops_dir.to_string_lossy().into_owned()),
+            default_execution_mode: "deterministic".to_string(),
+            ..SopConfig::default()
+        };
+        let config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            sop: sop_config.clone(),
+            ..Config::default()
+        };
+
+        crate::sop::save_sop(&sops_dir, &checkpoint_sop("rpc-a")).expect("save rpc-a");
+        crate::sop::save_sop(&sops_dir, &checkpoint_sop("rpc-b")).expect("save rpc-b");
+
+        let mut engine = crate::sop::SopEngine::new(sop_config);
+        engine.reload(tmp.path());
+        assert_eq!(engine.sops().len(), 2, "both temp SOPs should load");
+        let engine = Arc::new(Mutex::new(engine));
+
+        let run_id = {
+            let mut guard = engine.lock().expect("engine lock");
+            let action = guard
+                .start_run(
+                    "rpc-b",
+                    SopEvent {
+                        source: SopTriggerSource::Manual,
+                        topic: None,
+                        payload: None,
+                        timestamp: crate::sop::engine::now_iso8601(),
+                    },
+                )
+                .expect("start rpc-b SOP");
+            let SopRunAction::CheckpointWait { run_id, .. } = action else {
+                panic!("rpc-b must park at checkpoint, got {action:?}");
+            };
+            run_id
+        };
+
+        let dispatcher = dispatcher_with_sop_engine(config, Arc::clone(&engine));
+        let err = dispatcher
+            .handle_sops_decide(&serde_json::json!({
+                "name": "rpc-a",
+                "run_id": run_id,
+                "decision": "approve",
+            }))
+            .await
+            .expect_err("mismatched name/run_id must be rejected before broker resolution");
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(
+            err.message.contains("belongs to SOP 'rpc-b', not 'rpc-a'"),
+            "mismatch rejection must name both SOPs, got: {}",
+            err.message
+        );
+
+        let guard = engine.lock().expect("engine lock");
+        let run = guard.get_run(&run_id).expect("rpc-b run still active");
+        assert_eq!(run.sop_name, "rpc-b");
+        assert_eq!(run.status, SopRunStatus::PausedCheckpoint);
+        assert!(
+            !guard
+                .run_events(&run_id)
+                .unwrap_or_default()
+                .iter()
+                .any(|event| event.kind == "gate_resolved"),
+            "mismatched RPC decision must not append a gate_resolved row"
         );
     }
 
@@ -5940,6 +6416,7 @@ mod tests {
             id: "tc_1".into(),
             name: "bash".into(),
             output: "file.txt".into(),
+            artifact: None,
         };
         let json = notification_for_turn_event("s1", &event, None).unwrap();
         let v = parse(&json);
@@ -6317,6 +6794,7 @@ mod tests {
         let r = InitializeResult {
             protocol_version: 1,
             server_version: "0.1.0".into(),
+            server_pid: 42,
             tui_id: None,
             tui_sig: None,
             capabilities: vec![],
@@ -6324,8 +6802,74 @@ mod tests {
         let val = to_result(r).unwrap();
         assert_eq!(val["protocol_version"], 1);
         assert_eq!(val["server_version"], "0.1.0");
+        assert_eq!(val["server_pid"], 42);
     }
 
+    #[test]
+    fn status_runtime_context_reports_config_root_and_local_endpoint() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+
+        let context = status_runtime_context(&config, RuntimeConfigKind::Temporary);
+
+        assert_eq!(context.config_dir, tmp.path().display().to_string());
+        assert_eq!(
+            context.config_file,
+            tmp.path().join("config.toml").display().to_string()
+        );
+        assert_eq!(context.config_kind, RuntimeConfigKind::Temporary);
+        assert_eq!(
+            context.local_ipc_endpoint,
+            crate::rpc::local::socket_path(&config)
+                .display()
+                .to_string()
+        );
+
+        config.config_path = std::path::PathBuf::from("/opt/zeroclaw/config.toml");
+        assert_eq!(
+            status_runtime_context(&config, RuntimeConfigKind::Custom).config_kind,
+            RuntimeConfigKind::Custom
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_status_includes_runtime_context_fields() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        let (dispatcher, _sessions) = make_acp_test_dispatcher(config.clone());
+
+        let value = dispatcher.handle_status().await.expect("status result");
+        let status: StatusResult = serde_json::from_value(value).expect("status shape");
+
+        assert_eq!(
+            status.config_dir.as_deref(),
+            Some(tmp.path().to_str().unwrap())
+        );
+        assert_eq!(
+            status.config_file.as_deref(),
+            Some(tmp.path().join("config.toml").to_str().unwrap())
+        );
+        assert_eq!(status.config_kind, Some(RuntimeConfigKind::Temporary));
+        assert_eq!(
+            status.local_ipc_endpoint.as_deref(),
+            Some(crate::rpc::local::socket_path(&config).to_str().unwrap())
+        );
+    }
+
+    /// Cover the `initialize` parsing path that caches the TUI's
+    /// `clientCapabilities.elicitation` block so the per-session
+    /// `RpcApprovalChannel` can route `request_choice` over
+    /// `elicitation/create`. Source-of-truth check: the dispatcher
+    /// is the canonical owner; the test reads the field directly.
     #[tokio::test]
     async fn handle_initialize_caches_elicitation_form_capability() {
         let (mut dispatcher, _sessions) =
@@ -6431,6 +6975,104 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let dispatcher = RpcDispatcher::new(Arc::new(ctx), tx, "test-peer".into());
         (dispatcher, sessions)
+    }
+
+    /// Create a Chat-mode session through the real `session/new` handler,
+    /// optionally sending the `keep_siblings` opt-out.
+    async fn new_chat_session_for_eviction_test(
+        dispatcher: &RpcDispatcher,
+        session_id: &str,
+        keep_siblings: Option<bool>,
+    ) {
+        let mut params = json!({
+            "agent_alias": "test-agent",
+            "chat_mode": "chat",
+            "session_id": session_id,
+        });
+        if let Some(keep) = keep_siblings {
+            params["keep_siblings"] = json!(keep);
+        }
+        let result = dispatcher.handle_session_new_for_test(&params).await;
+        assert!(
+            result.is_ok(),
+            "session/new for {session_id} should succeed; got: {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn session_new_default_evicts_idle_same_mode_sibling() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (mut dispatcher, sessions) = make_acp_test_dispatcher(config);
+        dispatcher.set_tui_id_for_test(Some("tui-evict-default".into()));
+
+        new_chat_session_for_eviction_test(&dispatcher, "sibling-old", None).await;
+        new_chat_session_for_eviction_test(&dispatcher, "sibling-new", None).await;
+
+        assert!(
+            sessions.get_agent("sibling-old").await.is_none(),
+            "an unflagged session/new must evict the idle same-mode sibling"
+        );
+        assert!(
+            sessions.get_agent("sibling-new").await.is_some(),
+            "the new session must survive the sweep"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_new_keep_siblings_spares_idle_same_mode_sibling() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (mut dispatcher, sessions) = make_acp_test_dispatcher(config);
+        dispatcher.set_tui_id_for_test(Some("tui-keep".into()));
+
+        new_chat_session_for_eviction_test(&dispatcher, "kept-old", None).await;
+        new_chat_session_for_eviction_test(&dispatcher, "kept-new", Some(true)).await;
+
+        assert!(
+            sessions.get_agent("kept-old").await.is_some(),
+            "keep_siblings: true must skip the idle-sibling sweep"
+        );
+        assert!(sessions.get_agent("kept-new").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn session_new_keep_siblings_false_matches_default_eviction() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (mut dispatcher, sessions) = make_acp_test_dispatcher(config);
+        dispatcher.set_tui_id_for_test(Some("tui-keep-false".into()));
+
+        new_chat_session_for_eviction_test(&dispatcher, "false-old", None).await;
+        new_chat_session_for_eviction_test(&dispatcher, "false-new", Some(false)).await;
+
+        assert!(
+            sessions.get_agent("false-old").await.is_none(),
+            "an explicit keep_siblings: false must behave like an absent flag"
+        );
+        assert!(sessions.get_agent("false-new").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn keep_siblings_shields_only_the_flagged_call() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (mut dispatcher, sessions) = make_acp_test_dispatcher(config);
+        dispatcher.set_tui_id_for_test(Some("tui-keep-scope".into()));
+
+        new_chat_session_for_eviction_test(&dispatcher, "scoped-a", Some(true)).await;
+        new_chat_session_for_eviction_test(&dispatcher, "scoped-b", Some(true)).await;
+        assert!(sessions.get_agent("scoped-a").await.is_some());
+        assert!(sessions.get_agent("scoped-b").await.is_some());
+
+        // A later unflagged session/new under the same TUI still garbage
+        // collects previously kept idle siblings: the flag protects a single
+        // call's sweep, not the sessions it leaves behind.
+        new_chat_session_for_eviction_test(&dispatcher, "scoped-c", None).await;
+        assert!(sessions.get_agent("scoped-a").await.is_none());
+        assert!(sessions.get_agent("scoped-b").await.is_none());
+        assert!(sessions.get_agent("scoped-c").await.is_some());
     }
 
     #[tokio::test]
@@ -7477,6 +8119,86 @@ mod tests {
         cfg
     }
 
+    // `make_config_set_test_dispatcher` takes the `Config` by value and adds no
+    // isolation of its own, and a successful `config/set` falls through to
+    // `flush_config()` -> `save_dirty()`. Always hand it a TempDir-rooted config
+    // (`make_secret_test_config`), never a bare `Config::default()`.
+
+    #[tokio::test]
+    async fn config_set_does_not_materialize_resource_keyed_rate_alias() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_secret_test_config(&tmp));
+        let res = dispatcher
+            .handle_config_set(&json!({
+                "prop": "cost.rates.providers.models.openai.gpt-5.input_per_mtok",
+                "value": 1.5
+            }))
+            .await;
+        assert!(res.is_err(), "unknown rate path must not be auto-created");
+        assert!(
+            dispatcher
+                .ctx
+                .config
+                .read()
+                .cost
+                .rates
+                .providers
+                .models
+                .openai
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_on_dotted_resource_id_does_not_plant_phantom_sibling() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut cfg = make_secret_test_config(&tmp);
+        cfg.create_map_key("cost.rates.providers.models.openai", "gpt-4.1")
+            .expect("create the dotted resource id");
+        let dispatcher = make_config_set_test_dispatcher(cfg);
+        let res = dispatcher
+            .handle_config_set(&json!({
+                "prop": "cost.rates.providers.models.openai.gpt-4.1.input_per_mtok",
+                "value": 1.5
+            }))
+            .await;
+        assert!(res.is_ok(), "editing a real dotted rate must work: {res:?}");
+        assert_eq!(
+            dispatcher
+                .ctx
+                .config
+                .read()
+                .get_map_keys("cost.rates.providers.models.openai")
+                .expect("known section"),
+            vec!["gpt-4.1".to_string()],
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_still_materializes_operator_chosen_alias() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_secret_test_config(&tmp));
+        let res = dispatcher
+            .handle_config_set(&json!({
+                "prop": "channels.telegram.newbot.bot_token",
+                "value": "tok"
+            }))
+            .await;
+        assert!(
+            res.is_ok(),
+            "operator-chosen alias must still vivify: {res:?}"
+        );
+        assert!(
+            dispatcher
+                .ctx
+                .config
+                .read()
+                .channels
+                .telegram
+                .contains_key("newbot")
+        );
+    }
+
     #[tokio::test]
     async fn config_set_writes_real_secret_through_set_prop() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -8067,6 +8789,241 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn model_provider_update_blocks_session_configure() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = Arc::new(make_config_set_test_dispatcher(
+            make_model_refresh_test_config(&tmp),
+        ));
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        let update_guard = dispatcher
+            .ctx
+            .sessions
+            .lock_model_provider_update(&session_id)
+            .await
+            .expect("session update lock exists");
+
+        let configure_dispatcher = Arc::clone(&dispatcher);
+        let configure_waiting = dispatcher.ctx.sessions.model_provider_update_waiting();
+        let configure_wait = configure_waiting.notified();
+        let configure = zeroclaw_spawn::spawn!(async move {
+            configure_dispatcher
+                .handle_session_configure(&json!({
+                    "session_id": session_id,
+                    "overrides": { "temperature": 0.6 }
+                }))
+                .await
+        });
+        let mut configure = Box::pin(configure);
+        tokio::time::timeout(std::time::Duration::from_secs(1), configure_wait)
+            .await
+            .expect("session/configure must reach the provider update boundary");
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), &mut configure)
+                .await
+                .is_err(),
+            "session/configure must wait while a provider update owns the ordering boundary"
+        );
+
+        drop(update_guard);
+        configure
+            .await
+            .expect("session/configure task must complete")
+            .expect("session/configure must succeed after the update boundary is released");
+    }
+
+    #[tokio::test]
+    async fn model_provider_update_does_not_block_unrelated_session_configure() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_model_refresh_test_config(&tmp));
+        let blocked_session = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        let other_session = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        let blocked_guard = dispatcher
+            .ctx
+            .sessions
+            .lock_model_provider_update(&blocked_session)
+            .await
+            .expect("session update lock exists");
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            dispatcher.handle_session_configure(&json!({
+                "session_id": other_session,
+                "overrides": { "temperature": 0.6 }
+            })),
+        )
+        .await
+        .expect("an unrelated session must not wait for this session's provider update")
+        .expect("session/configure must succeed for the unrelated session");
+
+        drop(blocked_guard);
+    }
+
+    #[tokio::test]
+    async fn model_provider_update_preserves_newer_session_override() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut cfg = make_model_refresh_test_config(&tmp);
+        let other = cfg
+            .providers
+            .models
+            .ensure("openai", "other-provider")
+            .expect("openai provider slot exists");
+        other.api_key = Some("test-key".into());
+        other.uri = Some("http://127.0.0.1:1".into());
+        other.model = Some("other-model".into());
+
+        let dispatcher = make_config_set_test_dispatcher(cfg);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        let update_guard = dispatcher
+            .ctx
+            .sessions
+            .lock_model_provider_update(&session_id)
+            .await
+            .expect("session update lock exists");
+
+        dispatcher
+            .ctx
+            .config
+            .write()
+            .agents
+            .get_mut("test-agent")
+            .expect("test agent exists")
+            .model_provider = "openai.other-provider".into();
+        let refresh_ctx = Arc::clone(&dispatcher.ctx);
+        let refresh_waiting = dispatcher.ctx.sessions.model_provider_update_waiting();
+        let refresh_wait = refresh_waiting.notified();
+        let refresh = zeroclaw_spawn::spawn!(async move {
+            RpcDispatcher::refresh_live_sessions_for_agent(refresh_ctx, "test-agent").await;
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), refresh_wait)
+            .await
+            .expect("agent refresh must reach the provider update boundary");
+
+        let configure_dispatcher = Arc::new(dispatcher);
+        let configure_task_dispatcher = Arc::clone(&configure_dispatcher);
+        let configure_session_id = session_id.clone();
+        let configure_waiting = configure_dispatcher
+            .ctx
+            .sessions
+            .model_provider_update_waiting();
+        let configure_wait = configure_waiting.notified();
+        let configure = zeroclaw_spawn::spawn!(async move {
+            configure_task_dispatcher
+                .handle_session_configure(&json!({
+                    "session_id": configure_session_id,
+                    "overrides": { "model_provider": "openai.test-provider" }
+                }))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), configure_wait)
+            .await
+            .expect("session/configure must queue behind the agent refresh");
+        drop(update_guard);
+
+        refresh.await.expect("agent refresh task must complete");
+        configure
+            .await
+            .expect("session/configure task must complete")
+            .expect("session/configure must apply the newer override");
+        assert_eq!(
+            model_name_for_session(&configure_dispatcher, &session_id).await,
+            "old-model",
+            "a queued agent refresh must not overwrite a newer session provider override"
+        );
+        assert_eq!(
+            configure_dispatcher
+                .ctx
+                .sessions
+                .get_overrides(&session_id)
+                .await
+                .and_then(|overrides| overrides.model_provider),
+            Some("openai.test-provider".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn model_provider_update_converges_on_latest_agent_config() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut cfg = make_model_refresh_test_config(&tmp);
+        for (alias, model) in [
+            ("other-provider", "other-model"),
+            ("latest-provider", "latest-model"),
+        ] {
+            let provider = cfg
+                .providers
+                .models
+                .ensure("openai", alias)
+                .expect("openai provider slot exists");
+            provider.api_key = Some("test-key".into());
+            provider.uri = Some("http://127.0.0.1:1".into());
+            provider.model = Some(model.into());
+        }
+
+        let dispatcher = make_config_set_test_dispatcher(cfg);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        let update_guard = dispatcher
+            .ctx
+            .sessions
+            .lock_model_provider_update(&session_id)
+            .await
+            .expect("session update lock exists");
+
+        dispatcher
+            .ctx
+            .config
+            .write()
+            .agents
+            .get_mut("test-agent")
+            .expect("test agent exists")
+            .model_provider = "openai.other-provider".into();
+        let release_older_refresh = Arc::new(tokio::sync::Notify::new());
+        let older_release = Arc::clone(&release_older_refresh);
+        let older_ctx = Arc::clone(&dispatcher.ctx);
+        let older_refresh = zeroclaw_spawn::spawn!(async move {
+            older_release.notified().await;
+            RpcDispatcher::refresh_live_sessions_for_agent(older_ctx, "test-agent").await;
+        });
+
+        dispatcher
+            .ctx
+            .config
+            .write()
+            .agents
+            .get_mut("test-agent")
+            .expect("test agent exists")
+            .model_provider = "openai.latest-provider".into();
+        let latest_ctx = Arc::clone(&dispatcher.ctx);
+        let latest_waiting = dispatcher.ctx.sessions.model_provider_update_waiting();
+        let latest_wait = latest_waiting.notified();
+        let latest_refresh = zeroclaw_spawn::spawn!(async move {
+            RpcDispatcher::refresh_live_sessions_for_agent(latest_ctx, "test-agent").await;
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), latest_wait)
+            .await
+            .expect("latest agent refresh must reach the provider update boundary");
+
+        let older_waiting = dispatcher.ctx.sessions.model_provider_update_waiting();
+        let older_wait = older_waiting.notified();
+        release_older_refresh.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(1), older_wait)
+            .await
+            .expect("older agent refresh must queue after the latest refresh");
+        drop(update_guard);
+
+        latest_refresh
+            .await
+            .expect("latest agent refresh task must complete");
+        older_refresh
+            .await
+            .expect("older agent refresh task must complete");
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "latest-model",
+            "queued refreshes must resolve the latest persisted agent provider"
+        );
+    }
+
+    #[tokio::test]
     async fn existing_session_uses_reloaded_structured_history_cap() {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut config = make_model_refresh_test_config(&tmp);
@@ -8618,6 +9575,7 @@ mod tests {
             config: Arc::new(parking_lot::RwLock::new(
                 zeroclaw_config::schema::Config::default(),
             )),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             sessions: Arc::clone(&sessions),
             session_backend: None,
             memory: None,
@@ -8660,6 +9618,7 @@ mod tests {
             config: Arc::new(parking_lot::RwLock::new(
                 zeroclaw_config::schema::Config::default(),
             )),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             sessions: Arc::clone(&sessions),
             session_backend: None,
             memory: None,
@@ -8759,6 +9718,7 @@ mod tests {
             config: Arc::new(parking_lot::RwLock::new(
                 zeroclaw_config::schema::Config::default(),
             )),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             sessions: Arc::clone(&sessions),
             session_backend: None,
             memory: None,
@@ -8786,6 +9746,280 @@ mod tests {
             end_count.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "session_end must fire when a real session is closed"
+        );
+    }
+
+    // ── config_write_lock races ─────────────────────────────────
+
+    fn make_two_provider_test_config(tmp: &tempfile::TempDir) -> zeroclaw_config::schema::Config {
+        let mut cfg = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        cfg.create_map_key("providers.models.anthropic", "default")
+            .expect("create anthropic.default");
+        cfg.create_map_key("providers.models.openai", "default")
+            .expect("create openai.default");
+        cfg
+    }
+
+    fn provider_model(config: &zeroclaw_config::schema::Config, provider: &str) -> Option<String> {
+        match provider {
+            "anthropic" => config
+                .providers
+                .models
+                .anthropic
+                .get("default")
+                .and_then(|e| e.base.model.clone()),
+            "openai" => config
+                .providers
+                .models
+                .openai
+                .get("default")
+                .and_then(|e| e.base.model.clone()),
+            other => panic!("unexpected provider {other}"),
+        }
+    }
+
+    /// Regression test: `flush_config` used to clone the live config,
+    /// await `save_dirty()` on the clone, then swap the clone back over the
+    /// live config wholesale. A write landed on `ctx.config` while that save
+    /// was in flight was silently erased by the swap even though it was
+    /// never given a chance to reach disk.
+    ///
+    /// This drives `flush_config` to its first real yield point (inside
+    /// `save_dirty`'s disk I/O) with a single manual poll, proving the
+    /// snapshot has already been cloned out from under the live lock, lands
+    /// a second write directly on the live config, then lets the flush
+    /// finish. Against the old swap-based body this fails: P2 disappears
+    /// from live config when the stale snapshot lands on top of it. It was
+    /// confirmed to fail this way by temporarily reverting `flush_config` to
+    /// the swap-based body and re-running this test.
+    #[tokio::test]
+    async fn flush_config_preserves_write_landed_during_save() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let mut cfg = make_two_provider_test_config(&tmp);
+        cfg.set_prop_persistent("providers.models.anthropic.default.model", "p1-value")
+            .expect("mark P1 dirty");
+
+        let dispatcher = make_config_set_test_dispatcher(cfg);
+        let guard = Arc::clone(&dispatcher.ctx.config_write_lock)
+            .lock_owned()
+            .await;
+        let mut flush_fut = Box::pin(dispatcher.flush_config(&guard));
+
+        // Single manual poll: past the synchronous clone-and-capture prefix
+        // of `flush_config`, into `save_dirty`'s disk I/O, which must
+        // suspend rather than resolve synchronously.
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        let first_poll = std::future::Future::poll(flush_fut.as_mut(), &mut cx);
+        assert!(
+            first_poll.is_pending(),
+            "flush must suspend on save_dirty's disk I/O for this test to interleave"
+        );
+
+        // P2: lands directly on the live config while the flush above is
+        // mid-save over its own (now stale) snapshot.
+        {
+            let mut live = dispatcher.ctx.config.write();
+            live.set_prop_persistent("providers.models.openai.default.model", "p2-value")
+                .expect("mark P2 dirty");
+        }
+
+        flush_fut.await.expect("flush of P1 must still succeed");
+        drop(guard);
+
+        let live = dispatcher.ctx.config.read();
+        assert_eq!(
+            provider_model(&live, "openai").as_deref(),
+            Some("p2-value"),
+            "P2, written while the flush was mid-save, must survive in live config"
+        );
+        assert!(
+            live.dirty_paths
+                .contains("providers.models.openai.default.model"),
+            "P2 must still be dirty -- this flush never saved it"
+        );
+        assert!(
+            !live
+                .dirty_paths
+                .contains("providers.models.anthropic.default.model"),
+            "P1 was actually saved, so it must no longer be dirty"
+        );
+        drop(live);
+
+        let on_disk = std::fs::read_to_string(&config_path).unwrap();
+        let reparsed: zeroclaw_config::schema::Config = toml::from_str(&on_disk).unwrap();
+        assert_eq!(
+            provider_model(&reparsed, "anthropic").as_deref(),
+            Some("p1-value"),
+            "P1 must have reached disk; on-disk file:\n{on_disk}"
+        );
+    }
+
+    /// Shared blocking scaffold: hold `config_write_lock`, spawn the RPC
+    /// call, assert it stays parked across a bounded sleep-free yield loop,
+    /// release, and return the task's result for caller-specific asserts.
+    async fn assert_rpc_blocks_on_config_write_lock<F>(
+        ctx: Arc<RpcContext>,
+        rpc_call: F,
+        blocked_msg: &'static str,
+    ) -> RpcResult
+    where
+        F: std::future::Future<Output = RpcResult> + Send + 'static,
+    {
+        let guard = Arc::clone(&ctx.config_write_lock).lock_owned().await;
+        let task = zeroclaw_spawn::spawn!(rpc_call);
+
+        // Bounded, sleep-free: the handler must not race ahead of the
+        // externally held guard no matter how many times it's polled.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+            assert!(!task.is_finished(), "{blocked_msg}");
+        }
+
+        drop(guard);
+        task.await.expect("blocked RPC task must not panic")
+    }
+
+    #[tokio::test]
+    async fn config_set_blocks_while_config_write_lock_held() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let cfg = make_two_provider_test_config(&tmp);
+        let dispatcher = make_config_set_test_dispatcher(cfg);
+        let ctx = Arc::clone(&dispatcher.ctx);
+
+        let params = json!({
+            "prop": "providers.models.anthropic.default.model",
+            "value": "blocked-value"
+        });
+        let result = assert_rpc_blocks_on_config_write_lock(
+            ctx,
+            async move { dispatcher.handle_config_set(&params).await },
+            "config/set must block on config_write_lock while it is held",
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "config/set must succeed once the guard is released: {result:?}"
+        );
+
+        let on_disk = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            on_disk.contains("blocked-value"),
+            "config/set must persist once unblocked; on-disk file:\n{on_disk}"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_config_sets_both_persist() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let cfg = make_two_provider_test_config(&tmp);
+        let (dispatcher_a, dispatcher_b, _sessions) = make_two_dispatchers_sharing_context(cfg);
+
+        let params_a = json!({
+            "prop": "providers.models.anthropic.default.model",
+            "value": "concurrent-a"
+        });
+        let params_b = json!({
+            "prop": "providers.models.openai.default.model",
+            "value": "concurrent-b"
+        });
+
+        let (result_a, result_b) = tokio::join!(
+            dispatcher_a.handle_config_set(&params_a),
+            dispatcher_b.handle_config_set(&params_b),
+        );
+        assert!(
+            result_a.is_ok(),
+            "first config/set must succeed: {result_a:?}"
+        );
+        assert!(
+            result_b.is_ok(),
+            "second config/set must succeed: {result_b:?}"
+        );
+
+        let live = dispatcher_a.ctx.config.read();
+        assert_eq!(
+            provider_model(&live, "anthropic").as_deref(),
+            Some("concurrent-a")
+        );
+        assert_eq!(
+            provider_model(&live, "openai").as_deref(),
+            Some("concurrent-b")
+        );
+        drop(live);
+
+        let on_disk = std::fs::read_to_string(&config_path).unwrap();
+        let reparsed: zeroclaw_config::schema::Config = toml::from_str(&on_disk).unwrap();
+        assert_eq!(
+            provider_model(&reparsed, "anthropic").as_deref(),
+            Some("concurrent-a"),
+            "provider a's set must have reached disk:\n{on_disk}"
+        );
+        assert_eq!(
+            provider_model(&reparsed, "openai").as_deref(),
+            Some("concurrent-b"),
+            "provider b's set must have reached disk:\n{on_disk}"
+        );
+    }
+
+    /// Same blocking pattern as `config_set_blocks_while_config_write_lock_held`,
+    /// but for the `save_and_swap_config` path used by alias rename: proves
+    /// alias rename and config/set share the same `config_write_lock` and so
+    /// can never interleave their read-mutate-flush critical sections.
+    #[tokio::test]
+    async fn alias_rename_serializes_with_config_set() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_agent_rename_test_config(&tmp);
+        let config_path = config.config_path.clone();
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, _sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let ctx = Arc::clone(&dispatcher.ctx);
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut rename_dispatcher =
+            RpcDispatcher::new(Arc::clone(&ctx), tx, "test-peer-rename".into());
+        rename_dispatcher.authenticated = true;
+        let params = json!({
+            "path": "agents",
+            "from": "alpha",
+            "to": "beta"
+        });
+        let result = assert_rpc_blocks_on_config_write_lock(
+            ctx,
+            async move {
+                rename_dispatcher
+                    .handle_config_map_key_rename(&params)
+                    .await
+            },
+            "alias rename must block on config_write_lock while it is held",
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "alias rename must succeed once the guard is released: {result:?}"
+        );
+
+        let live = dispatcher.ctx.config.read();
+        assert!(!live.agents.contains_key("alpha"));
+        assert!(live.agents.contains_key("beta"));
+        drop(live);
+
+        let on_disk = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            on_disk.contains("[agents.beta]"),
+            "renamed alias must persist:\n{on_disk}"
+        );
+        assert!(
+            !on_disk.contains("[agents.alpha]"),
+            "old alias must not survive on disk:\n{on_disk}"
         );
     }
 }

@@ -401,6 +401,9 @@ impl Observer for OtelObserver {
                 num_entries,
                 backend,
                 success,
+                channel,
+                agent_alias,
+                turn_id,
             } => {
                 let secs = duration.as_secs_f64();
                 let start_time = SystemTime::now()
@@ -415,6 +418,9 @@ impl Observer for OtelObserver {
                     KeyValue::new("duration_s", secs),
                     KeyValue::new("gen_ai.operation.name", "retrieval"),
                     KeyValue::new("gen_ai.system", backend.clone()),
+                    KeyValue::new("zeroclaw.channel", channel.clone().unwrap_or_default()),
+                    KeyValue::new("gen_ai.agent.name", agent_alias.clone().unwrap_or_default()),
+                    KeyValue::new("zeroclaw.turn_id", turn_id.clone().unwrap_or_default()),
                 ];
                 if let Some(q) = query_summary {
                     // Langfuse-specific Input/Output pane attrs. Emitting
@@ -428,11 +434,13 @@ impl Observer for OtelObserver {
                     ));
                 }
 
-                let mut span = tracer.build(
+                let parent_cx = self.parent_cx_for(turn_id.as_deref());
+                let mut span = tracer.build_with_context(
                     opentelemetry::trace::SpanBuilder::from_name("memory.recall")
                         .with_kind(SpanKind::Internal)
                         .with_start_time(start_time)
                         .with_attributes(span_attrs),
+                    &parent_cx,
                 );
                 if *success {
                     span.set_status(Status::Ok);
@@ -450,6 +458,9 @@ impl Observer for OtelObserver {
                 duration,
                 num_chunks,
                 num_boards,
+                channel,
+                agent_alias,
+                turn_id,
             } => {
                 let secs = duration.as_secs_f64();
                 let start_time = SystemTime::now()
@@ -462,6 +473,9 @@ impl Observer for OtelObserver {
                     KeyValue::new("duration_s", secs),
                     KeyValue::new("gen_ai.operation.name", "retrieval"),
                     KeyValue::new("gen_ai.system", "zeroclaw_rag"),
+                    KeyValue::new("zeroclaw.channel", channel.clone().unwrap_or_default()),
+                    KeyValue::new("gen_ai.agent.name", agent_alias.clone().unwrap_or_default()),
+                    KeyValue::new("zeroclaw.turn_id", turn_id.clone().unwrap_or_default()),
                 ];
                 if let Some(q) = query_summary {
                     span_attrs.push(KeyValue::new("input.value", q.clone()));
@@ -471,11 +485,13 @@ impl Observer for OtelObserver {
                     ));
                 }
 
-                let mut span = tracer.build(
+                let parent_cx = self.parent_cx_for(turn_id.as_deref());
+                let mut span = tracer.build_with_context(
                     opentelemetry::trace::SpanBuilder::from_name("rag.retrieve")
                         .with_kind(SpanKind::Internal)
                         .with_start_time(start_time)
                         .with_attributes(span_attrs),
+                    &parent_cx,
                 );
                 span.set_status(Status::Ok);
                 span.end();
@@ -488,6 +504,9 @@ impl Observer for OtelObserver {
                 backend,
                 duration,
                 success,
+                channel,
+                agent_alias,
+                turn_id,
             } => {
                 let secs = duration.as_secs_f64();
                 let start_time = SystemTime::now()
@@ -501,13 +520,18 @@ impl Observer for OtelObserver {
                     KeyValue::new("duration_s", secs),
                     KeyValue::new("db.system", backend.clone()),
                     KeyValue::new("db.operation", "INSERT"),
+                    KeyValue::new("zeroclaw.channel", channel.clone().unwrap_or_default()),
+                    KeyValue::new("gen_ai.agent.name", agent_alias.clone().unwrap_or_default()),
+                    KeyValue::new("zeroclaw.turn_id", turn_id.clone().unwrap_or_default()),
                 ];
 
-                let mut span = tracer.build(
+                let parent_cx = self.parent_cx_for(turn_id.as_deref());
+                let mut span = tracer.build_with_context(
                     opentelemetry::trace::SpanBuilder::from_name("memory.store")
                         .with_kind(SpanKind::Internal)
                         .with_start_time(start_time)
                         .with_attributes(span_attrs),
+                    &parent_cx,
                 );
                 if *success {
                     span.set_status(Status::Ok);
@@ -909,44 +933,25 @@ impl Observer for OtelObserver {
     }
 }
 
+fn strip_first_complete_block(content: &mut String, start_marker: &str, end_marker: &str) {
+    let Some(start) = content.find(start_marker) else {
+        return;
+    };
+    let end_search_start = start + start_marker.len();
+    let Some(relative_end) = content[end_search_start..].find(end_marker) else {
+        return;
+    };
+    let end = end_search_start + relative_end + end_marker.len();
+    content.replace_range(start..end, "");
+}
+
 fn clean_for_display(content: &str) -> String {
     let mut cleaned = content.to_string();
 
-    // Remove memory context blocks - only if both start and end tags present
-    let memory_start = "[Memory context]";
-    let memory_end = "[/Memory context]";
-    if let Some(start) = cleaned.find(memory_start)
-        && let Some(end) = cleaned.find(memory_end)
-    {
-        cleaned.replace_range(start..(end + memory_end.len()), "");
-    }
-
-    // Remove tool result blocks - only if both start and end tags present
-    let tool_result_start = "<tool_result";
-    let tool_result_end = "</tool_result>";
-    if let Some(start) = cleaned.find(tool_result_start)
-        && let Some(end) = cleaned.find(tool_result_end)
-    {
-        cleaned.replace_range(start..(end + tool_result_end.len()), "");
-    }
-
-    // Remove thinking blocks (<thinking>...</thinking>) - only if both tags present
-    let thinking_start = "<thinking>";
-    let thinking_end = "</thinking>";
-    if let Some(start) = cleaned.find(thinking_start)
-        && let Some(end) = cleaned.find(thinking_end)
-    {
-        cleaned.replace_range(start..(end + thinking_end.len()), "");
-    }
-
-    // Remove think blocks (<think>...</think>`) - only if both tags present
-    let think_start = "<think>";
-    let think_end = "</think>";
-    if let Some(start) = cleaned.find(think_start)
-        && let Some(end) = cleaned.find(think_end)
-    {
-        cleaned.replace_range(start..(end + think_end.len()), "");
-    }
+    strip_first_complete_block(&mut cleaned, "[Memory context]", "[/Memory context]");
+    strip_first_complete_block(&mut cleaned, "<tool_result", "</tool_result>");
+    strip_first_complete_block(&mut cleaned, "<thinking>", "</thinking>");
+    strip_first_complete_block(&mut cleaned, "<think>", "</think>");
 
     // Remove timestamp patterns like [2026-06-30 16:44:51 +08:00]
     let timestamp_regex =
@@ -1422,6 +1427,9 @@ mod tests {
             num_entries: 7,
             backend: "sqlite".into(),
             success: true,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         // MemoryRecall failure path with query_summary: None.
         obs.record_event(&ObserverEvent::MemoryRecall {
@@ -1430,6 +1438,9 @@ mod tests {
             num_entries: 0,
             backend: "qdrant".into(),
             success: false,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
 
         // RagRetrieve with populated query_summary.
@@ -1438,6 +1449,9 @@ mod tests {
             duration: Duration::from_millis(120),
             num_chunks: 12,
             num_boards: 3,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         // RagRetrieve with query_summary: None.
         obs.record_event(&ObserverEvent::RagRetrieve {
@@ -1445,6 +1459,9 @@ mod tests {
             duration: Duration::ZERO,
             num_chunks: 0,
             num_boards: 0,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
 
         // MemoryStore success path.
@@ -1453,6 +1470,9 @@ mod tests {
             backend: "sqlite".into(),
             duration: Duration::from_millis(8),
             success: true,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         // MemoryStore failure path.
         obs.record_event(&ObserverEvent::MemoryStore {
@@ -1460,6 +1480,9 @@ mod tests {
             backend: "qdrant".into(),
             duration: Duration::from_millis(3),
             success: false,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         obs.record_event(&ObserverEvent::MemoryAudit {
             action: "store".into(),
@@ -1648,6 +1671,97 @@ mod tests {
                 .contains_key("turn-1"),
             "AgentEnd should close the live span"
         );
+    }
+
+    /// Memory/RAG events carrying a live turn_id must parent under the
+    /// active agent span. As with the other span tests we
+    /// cannot assert exported parent/child linkage (OTLP export is async);
+    /// we assert the recording path exercises `parent_cx_for` for all three
+    /// arms without panicking and without disturbing the live turn entry.
+    #[test]
+    fn memory_rag_spans_nest_under_turn() {
+        let obs = test_observer();
+        obs.record_event(&ObserverEvent::AgentStart {
+            model_provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            channel: Some("cli".into()),
+            agent_alias: Some("default".into()),
+            turn_id: Some("turn-m1".into()),
+        });
+        assert!(
+            obs.active_agent_spans
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key("turn-m1"),
+            "AgentStart should open a live span keyed by turn_id"
+        );
+
+        obs.record_event(&ObserverEvent::MemoryRecall {
+            query_summary: Some("coffee preferences".into()),
+            duration: Duration::from_millis(45),
+            num_entries: 3,
+            backend: "sqlite".into(),
+            success: true,
+            channel: Some("cli".into()),
+            agent_alias: Some("default".into()),
+            turn_id: Some("turn-m1".into()),
+        });
+        obs.record_event(&ObserverEvent::RagRetrieve {
+            query_summary: Some("ESP32 pinout".into()),
+            duration: Duration::from_millis(12),
+            num_chunks: 4,
+            num_boards: 1,
+            channel: Some("cli".into()),
+            agent_alias: Some("default".into()),
+            turn_id: Some("turn-m1".into()),
+        });
+        obs.record_event(&ObserverEvent::MemoryStore {
+            category: "conversation".into(),
+            backend: "sqlite".into(),
+            duration: Duration::from_millis(8),
+            success: true,
+            channel: Some("cli".into()),
+            agent_alias: Some("default".into()),
+            turn_id: Some("turn-m1".into()),
+        });
+
+        assert!(
+            obs.active_agent_spans
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key("turn-m1"),
+            "memory/RAG child events must not remove the live turn entry"
+        );
+
+        obs.record_event(&ObserverEvent::AgentEnd {
+            model_provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            duration: Duration::from_millis(90),
+            tokens_used: None,
+            cost_usd: None,
+            channel: Some("cli".into()),
+            agent_alias: Some("default".into()),
+            turn_id: Some("turn-m1".into()),
+        });
+        assert!(
+            !obs.active_agent_spans
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key("turn-m1"),
+            "AgentEnd should close the live span"
+        );
+
+        // Unknown or absent turn_id degrades to a root span, no panic.
+        obs.record_event(&ObserverEvent::MemoryRecall {
+            query_summary: None,
+            duration: Duration::from_millis(5),
+            num_entries: 0,
+            backend: "sqlite".into(),
+            success: false,
+            channel: None,
+            agent_alias: None,
+            turn_id: Some("no-such-turn".into()),
+        });
     }
 
     #[test]
@@ -1961,5 +2075,45 @@ mod tests {
         let input = "Result<tool_result>some tool output";
         let cleaned = clean_for_display(input);
         assert_eq!(cleaned, "Result<tool_result>some tool output");
+    }
+
+    #[test]
+    fn clean_for_display_preserves_openings_without_later_closings() {
+        let cases = [
+            "before[/Memory context]keep[Memory context]after",
+            "before</tool_result>keep<tool_result>after",
+            "before</thinking>keep<thinking>after",
+            "before</think>keep<think>after",
+        ];
+
+        for input in cases {
+            assert_eq!(clean_for_display(input), input);
+        }
+    }
+
+    #[test]
+    fn clean_for_display_pairs_openings_with_later_closings() {
+        let cases = [
+            (
+                "before[/Memory context]keep[Memory context]hidden[/Memory context]after",
+                "before[/Memory context]keepafter",
+            ),
+            (
+                "before</tool_result>keep<tool_result>hidden</tool_result>after",
+                "before</tool_result>keepafter",
+            ),
+            (
+                "before</thinking>keep<thinking>hidden</thinking>after",
+                "before</thinking>keepafter",
+            ),
+            (
+                "before</think>keep<think>hidden</think>after",
+                "before</think>keepafter",
+            ),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(clean_for_display(input), expected);
+        }
     }
 }

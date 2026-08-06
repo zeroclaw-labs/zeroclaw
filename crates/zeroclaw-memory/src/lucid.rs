@@ -1,11 +1,14 @@
 use super::sqlite::SqliteMemory;
 use super::traits::{Memory, MemoryCategory, MemoryEntry, normalize_recent_recall_query};
+use anyhow::Context;
 use async_trait::async_trait;
 use chrono::Local;
 use parking_lot::Mutex;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::time::timeout;
 
@@ -25,22 +28,48 @@ pub struct LucidMemory {
 impl LucidMemory {
     const DEFAULT_LUCID_CMD: &'static str = "lucid";
     const DEFAULT_TOKEN_BUDGET: usize = 200;
-    // Lucid CLI cold start can exceed 120ms on slower machines, which causes
-    // avoidable fallback to local-only memory and premature cooldown.
-    const DEFAULT_RECALL_TIMEOUT_MS: u64 = 500;
-    const DEFAULT_STORE_TIMEOUT_MS: u64 = 800;
+    // Lucid CLI cold starts include loading the local embedding model and can
+    // exceed 1.5s on ARM hosts. Keep the bound finite while avoiding fallback
+    // before a healthy process has had time to initialize.
+    const DEFAULT_RECALL_TIMEOUT_MS: u64 = 3_000;
+    const DEFAULT_STORE_TIMEOUT_MS: u64 = 3_000;
     const DEFAULT_LOCAL_HIT_THRESHOLD: usize = 3;
     const DEFAULT_FAILURE_COOLDOWN_MS: u64 = 15_000;
 
     pub fn new(alias: &str, workspace_dir: &Path, local: SqliteMemory) -> Self {
+        Self::with_overrides(alias, workspace_dir, local, None, None, None)
+    }
+
+    /// Construct with config-sourced overrides (`[storage.lucid.<alias>]`).
+    /// Each `None` falls back to the built-in default, so an unconfigured
+    /// alias behaves exactly like [`Self::new`]. Explicit blank commands stay
+    /// invalid instead of falling through to `PATH`; zero deadlines fall back
+    /// because normal config loading warns and keeps the process available for
+    /// operator repair after validation errors.
+    pub fn with_overrides(
+        alias: &str,
+        workspace_dir: &Path,
+        local: SqliteMemory,
+        lucid_cmd: Option<String>,
+        recall_timeout_ms: Option<u64>,
+        store_timeout_ms: Option<u64>,
+    ) -> Self {
+        let lucid_cmd = lucid_cmd.unwrap_or_else(|| Self::DEFAULT_LUCID_CMD.to_string());
+        let recall_timeout_ms = recall_timeout_ms
+            .filter(|timeout| *timeout > 0)
+            .unwrap_or(Self::DEFAULT_RECALL_TIMEOUT_MS);
+        let store_timeout_ms = store_timeout_ms
+            .filter(|timeout| *timeout > 0)
+            .unwrap_or(Self::DEFAULT_STORE_TIMEOUT_MS);
+
         Self {
             alias: alias.to_string(),
             local,
-            lucid_cmd: Self::DEFAULT_LUCID_CMD.to_string(),
+            lucid_cmd,
             token_budget: Self::DEFAULT_TOKEN_BUDGET,
             workspace_dir: workspace_dir.to_path_buf(),
-            recall_timeout: Duration::from_millis(Self::DEFAULT_RECALL_TIMEOUT_MS),
-            store_timeout: Duration::from_millis(Self::DEFAULT_STORE_TIMEOUT_MS),
+            recall_timeout: Duration::from_millis(recall_timeout_ms),
+            store_timeout: Duration::from_millis(store_timeout_ms),
             local_hit_threshold: Self::DEFAULT_LOCAL_HIT_THRESHOLD,
             failure_cooldown: Duration::from_millis(Self::DEFAULT_FAILURE_COOLDOWN_MS),
             last_failure_at: Mutex::new(None),
@@ -72,6 +101,11 @@ impl LucidMemory {
             failure_cooldown,
             last_failure_at: Mutex::new(None),
         }
+    }
+
+    #[cfg(all(test, unix))]
+    pub(super) fn test_process_config(&self) -> (&str, Duration, Duration) {
+        (&self.lucid_cmd, self.recall_timeout, self.store_timeout)
     }
 
     fn in_failure_cooldown(&self) -> bool {
@@ -205,31 +239,80 @@ impl LucidMemory {
         timeout_window: Duration,
     ) -> anyhow::Result<String> {
         let mut cmd = Command::new(lucid_cmd);
-        cmd.args(args);
+        cmd.args(args)
+            .kill_on_drop(true)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
 
-        let output = timeout(timeout_window, cmd.output()).await.map_err(|_| {
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Timeout)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "command": lucid_cmd,
-                        "timeout_ms": timeout_window.as_millis() as u64,
-                    })),
-                "lucid command timed out"
+        let child = cmd
+            .spawn()
+            .with_context(|| format!("failed to spawn lucid command {lucid_cmd:?}"))?;
+
+        Self::wait_for_lucid_child(child, lucid_cmd, timeout_window).await
+    }
+
+    async fn wait_for_lucid_child(
+        mut child: tokio::process::Child,
+        lucid_cmd: &str,
+        timeout_window: Duration,
+    ) -> anyhow::Result<String> {
+        let mut stdout = child
+            .stdout
+            .take()
+            .context("lucid command stdout pipe was not captured")?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .context("lucid command stderr pipe was not captured")?;
+        let mut stdout_bytes = Vec::new();
+        let mut stderr_bytes = Vec::new();
+
+        let output = timeout(timeout_window, async {
+            let (status, stdout_result, stderr_result) = tokio::join!(
+                child.wait(),
+                stdout.read_to_end(&mut stdout_bytes),
+                stderr.read_to_end(&mut stderr_bytes),
             );
-            anyhow::Error::msg(format!(
-                "lucid command timed out after {}ms",
-                timeout_window.as_millis()
-            ))
-        })??;
+            stdout_result.context("failed to read lucid command stdout")?;
+            stderr_result.context("failed to read lucid command stderr")?;
+            status.context("failed to wait for lucid command")
+        })
+        .await;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+        let status = match output {
+            Ok(status) => status?,
+            Err(_) => {
+                let cleanup_error = child.kill().await.err().map(|error| error.to_string());
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Timeout)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "command": lucid_cmd,
+                            "timeout_ms": timeout_window.as_millis() as u64,
+                            "cleanup_error": cleanup_error,
+                        })),
+                    "lucid command timed out"
+                );
+                if let Some(cleanup_error) = cleanup_error {
+                    anyhow::bail!(
+                        "lucid command timed out after {}ms; failed to terminate and reap child: {cleanup_error}",
+                        timeout_window.as_millis()
+                    );
+                }
+                anyhow::bail!(
+                    "lucid command timed out after {}ms",
+                    timeout_window.as_millis()
+                );
+            }
+        };
+
+        if !status.success() {
+            let stderr = String::from_utf8_lossy(&stderr_bytes);
             anyhow::bail!("lucid command failed: {stderr}");
         }
 
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        Ok(String::from_utf8_lossy(&stdout_bytes).to_string())
     }
 
     async fn run_lucid_command(
@@ -535,6 +618,49 @@ impl Memory for LucidMemory {
     }
 }
 
+impl ::zeroclaw_api::attribution::Attributable for LucidMemory {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Memory(::zeroclaw_api::attribution::MemoryKind::Lucid)
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
+
+#[cfg(test)]
+mod platform_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn with_overrides_keeps_blank_command_invalid_and_normalizes_zero_timeouts() {
+        let tmp = TempDir::new().unwrap();
+        let sqlite = SqliteMemory::new("test", tmp.path()).unwrap();
+        let memory = LucidMemory::with_overrides(
+            "test",
+            tmp.path(),
+            sqlite,
+            Some("   ".into()),
+            Some(0),
+            Some(0),
+        );
+
+        assert_eq!(
+            memory.lucid_cmd, "   ",
+            "an explicit invalid selector must not fall through to PATH"
+        );
+        assert_eq!(
+            memory.recall_timeout,
+            Duration::from_millis(LucidMemory::DEFAULT_RECALL_TIMEOUT_MS)
+        );
+        assert_eq!(
+            memory.store_timeout,
+            Duration::from_secs(3),
+            "the production store timeout must retain the documented cold-start allowance"
+        );
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -607,8 +733,8 @@ if [ "${1:-}" = "store" ]; then
 fi
 
 if [ "${1:-}" = "context" ]; then
-  # Simulate a cold start that is slower than 120ms but below the 500ms timeout.
-  sleep 0.2
+  # Simulate an ARM cold start that exceeds the previous 500ms timeout.
+  sleep 1.5
   cat <<'EOF'
 <lucid-context>
 - [decision] Delayed token refresh guidance
@@ -620,6 +746,37 @@ fi
 echo "unsupported command" >&2
 exit 1
 "#;
+
+        fs::write(&script_path, script).unwrap();
+        let mut perms = fs::metadata(&script_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).unwrap();
+        script_path.display().to_string()
+    }
+
+    fn write_delayed_store_lucid_script(dir: &Path, marker_path: &Path) -> String {
+        let script_path = dir.join("delayed-store-lucid.sh");
+        let script = format!(
+            r#"#!/bin/sh
+set -eu
+
+if [ "${{1:-}}" = "store" ]; then
+  sleep 1.5
+  printf 'completed\n' > "{}"
+  printf '{{"success":true,"id":"mem_1"}}\n'
+  exit 0
+fi
+
+if [ "${{1:-}}" = "context" ]; then
+  printf '<lucid-context>\n</lucid-context>\n'
+  exit 0
+fi
+
+echo "unsupported command" >&2
+exit 1
+"#,
+            marker_path.display()
+        );
 
         fs::write(&script_path, script).unwrap();
         let mut perms = fs::metadata(&script_path).unwrap().permissions();
@@ -726,10 +883,21 @@ exit 1
     }
 
     #[tokio::test]
-    async fn recall_handles_lucid_cold_start_delay_within_timeout() {
+    async fn recall_waits_for_delayed_lucid_process_with_test_timeout() {
         let tmp = TempDir::new().unwrap();
         let delayed_cmd = write_delayed_lucid_script(tmp.path());
-        let memory = test_memory(tmp.path(), delayed_cmd);
+        let sqlite = SqliteMemory::new("test", tmp.path()).unwrap();
+        let memory = LucidMemory::with_options(
+            "test",
+            tmp.path(),
+            sqlite,
+            delayed_cmd,
+            200,
+            3,
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+            Duration::from_secs(2),
+        );
 
         memory
             .store(
@@ -752,6 +920,139 @@ exit 1
             entries
                 .iter()
                 .any(|e| e.content.contains("Delayed token refresh guidance"))
+        );
+    }
+
+    #[tokio::test]
+    async fn store_waits_for_delayed_lucid_process_with_test_timeout() {
+        let tmp = TempDir::new().unwrap();
+        let marker_path = tmp.path().join("store-completed.marker");
+        let delayed_cmd = write_delayed_store_lucid_script(tmp.path(), &marker_path);
+        let sqlite = SqliteMemory::new("test", tmp.path()).unwrap();
+        let memory = LucidMemory::with_options(
+            "test",
+            tmp.path(),
+            sqlite,
+            delayed_cmd,
+            200,
+            3,
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+            Duration::from_secs(2),
+        );
+
+        memory
+            .store(
+                "cold_start",
+                "Store survives Lucid cold start",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            marker_path.exists(),
+            "the store path must wait for a healthy delayed Lucid process"
+        );
+    }
+
+    #[tokio::test]
+    async fn timeout_terminates_and_reaps_lucid_child() {
+        let mut command = Command::new("sleep");
+        command
+            .arg("10")
+            .kill_on_drop(true)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = command.spawn().expect("sleep command must start");
+        let pid = child.id().expect("spawned sleep command must have a PID");
+        let timeout = Duration::from_millis(100);
+
+        let error = LucidMemory::wait_for_lucid_child(child, "sleep", timeout)
+            .await
+            .expect_err("delayed command must time out");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("timed out after {}ms", timeout.as_millis()))
+        );
+
+        let still_running = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("kill -0 must be available on Unix")
+            .success();
+        assert!(
+            !still_running,
+            "timed-out Lucid child PID {pid} still exists"
+        );
+    }
+
+    #[test]
+    fn with_overrides_none_matches_new_defaults() {
+        let tmp = TempDir::new().unwrap();
+        let sqlite = SqliteMemory::new("test", tmp.path()).unwrap();
+        let memory = LucidMemory::with_overrides(
+            "test",
+            tmp.path(),
+            sqlite,
+            Some("lucid-test".to_string()),
+            None,
+            None,
+        );
+
+        assert_eq!(
+            memory.recall_timeout,
+            Duration::from_millis(LucidMemory::DEFAULT_RECALL_TIMEOUT_MS)
+        );
+        assert_eq!(
+            memory.store_timeout,
+            Duration::from_millis(LucidMemory::DEFAULT_STORE_TIMEOUT_MS)
+        );
+    }
+
+    #[tokio::test]
+    async fn with_overrides_recall_timeout_ms_is_applied() {
+        let tmp = TempDir::new().unwrap();
+        let delayed_cmd = write_delayed_lucid_script(tmp.path());
+        let sqlite = SqliteMemory::new("test", tmp.path()).unwrap();
+        let memory = LucidMemory::with_overrides(
+            "test",
+            tmp.path(),
+            sqlite,
+            Some(delayed_cmd),
+            Some(50),
+            None,
+        );
+
+        memory
+            .store(
+                "local_note",
+                "Local sqlite auth fallback note",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let entries = memory.recall("auth", 5, None, None, None).await.unwrap();
+
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.content.contains("Local sqlite auth fallback note")),
+            "local sqlite results must still come back on Lucid timeout"
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|e| !e.content.contains("Delayed token refresh guidance")),
+            "a 50ms recall_timeout_ms override must time out against the \
+             1.5s simulated cold start, proving the override reaches the \
+             running timeout rather than being ignored"
         );
     }
 
@@ -855,14 +1156,5 @@ exit 1
 
         let calls = tokio::fs::read_to_string(&marker).await.unwrap_or_default();
         assert_eq!(calls.lines().count(), 1);
-    }
-}
-
-impl ::zeroclaw_api::attribution::Attributable for LucidMemory {
-    fn role(&self) -> ::zeroclaw_api::attribution::Role {
-        ::zeroclaw_api::attribution::Role::Memory(::zeroclaw_api::attribution::MemoryKind::Lucid)
-    }
-    fn alias(&self) -> &str {
-        &self.alias
     }
 }

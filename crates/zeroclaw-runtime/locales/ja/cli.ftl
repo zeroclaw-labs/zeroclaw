@@ -596,6 +596,7 @@ cli-quickstart-error-channel-bound = チャンネル `{$reference}` は既にエ
 cli-quickstart-error-channel-required = チャンネルタイプとエイリアスが必要です
 cli-quickstart-error-channel-field-not-advertised = チャンネルフィールド `{$field}` は Quickstart では使用できません
 cli-quickstart-error-channel-token-required = Telegram Bot トークンが必要です
+cli-quickstart-error-webhook-secret-required = Webhook 共有シークレットが必要です
 cli-quickstart-error-peer-group-name-required = ピアグループ名が必要です
 cli-quickstart-error-peer-group-channel-required = ピアグループのチャンネル参照が必要です
 cli-quickstart-error-peer-group-unknown-channel = ピアグループ `{$name}` が不明なチャンネル `{$channel}` を参照しています
@@ -798,6 +799,7 @@ cli-models-status-none = デフォルトモデルが設定されていません�
 turn-interrupted-by-user = [ユーザーによって中断されました]
 turn-cancelled-client-rpc = [クライアント経由でターンがキャンセルされました]
 turn-stream-interrupted = [ストリームが中断されました]
+turn-model-fallback-notice = ⚡ { $requested_model }（{ $requested_provider }）が利用できなかったため、この応答は { $actual_model }（{ $actual_provider }）によって生成されました。
 history-trim-breadcrumb = [earlier turns omitted to fit the context window]
 history-trim-reason-budget = context token budget exceeded
 history-trim-reason-message-cap = 履歴メッセージ数の上限を超えました
@@ -805,6 +807,12 @@ history-trim-floor-exceeds-budget = system prompt and tool definitions ({$floor}
 turn-ingress-dropped = このリクエストは処理されませんでした: { $reason }
 turn-tool-interrupted-before-result = [このツールが結果を生成する前にユーザーによって中断されました]
 channel-runtime-malformed-tool-output = 内部ツール呼び出し形式のエラーが発生し、このリクエストを完了できませんでした。もう一度お試しください。
+channel-runtime-progress-received = 受信しました
+channel-runtime-progress-planning = 計画中
+channel-runtime-progress-waiting-on-model = モデルの応答を待っています
+channel-runtime-progress-running-tool = ツールを実行中
+channel-runtime-progress-compacting-context = コンテキストを圧縮中
+channel-runtime-progress-finalizing-response = 応答を最終処理中
 channel-runtime-new-session = 会話履歴を消去しました。新しく開始します。
 channel-runtime-stop-sent = 停止シグナルを送信しました。
 channel-runtime-stop-no-task = この送信者スコープに実行中のタスクはありません。
@@ -812,6 +820,8 @@ channel-runtime-model-empty = モデル ID は空にできません。`/model <m
 channel-runtime-model-switched = モデルを `{ $model }`（model_provider: `{ $provider }`）に切り替えました。コンテキストは保持されています。
 channel-runtime-agent-scope-rejected = 送信者 `{ $sender }` はエージェント `{ $agent }` で `/model --agent` を実行する権限がありません。セッション限定の上書きには `/model --user { $model }` を使用するか、管理者にあなたをメンバーとして `admin_for_agent_scope = true` のピアグループへ登録するよう依頼してください。
 channel-runtime-request-timeout = ⚠️ モデルの応答待ちがタイムアウトしました。もう一度お試しください。
+channel-runtime-no-reply-refused = 🚫 そのリクエストにはお応えできません。
+channel-runtime-no-reply-failed = ⚠️ そのリクエストを完了できませんでした。
 channel-runtime-current-model-status =
     現在の model_provider: `{ $provider }`
     現在のモデル: `{ $model }`
@@ -917,6 +927,13 @@ cli-gateway-restart-hint-process = `zeroclaw daemon` プロセスを再起動し
 
 cli-daemon-gateway-already-running = ZeroClaw ゲートウェイは既に {$host}:{$port} で実行中です。デーモンは自身のゲートウェイを監視しており、同じアドレスで2つ目を開始しません。そのゲートウェイを停止するか、`zeroclaw config set gateway.port <port>` でデーモンを空きポートに向けてから、もう一度デーモンを実行してください。
 cli-daemon-gateway-port-occupied = ゲートウェイアドレス {$host}:{$port} は別のプロセスで既に使用されています。ポートを解放するか、デーモンを空きポートに向けて (`zeroclaw config set gateway.port <port>`)、もう一度デーモンを実行してください。
+cli-daemon-starting-title = 🧠 ZeroClaw デーモンを起動しています…
+cli-daemon-starting-detail = 設定済みのデーモンエンドポイントを準備しています
+cli-daemon-started-title = 🧠 ZeroClaw デーモンの準備ができました
+cli-daemon-started-gateway = ゲートウェイ: {$url}
+cli-daemon-started-socket = ソケット:     {$path}
+cli-daemon-started-pairing = ペアリング: 有効（現在の状態は上のゲートウェイ出力を確認してください）
+cli-daemon-started-stop = Ctrl+C または SIGTERM で停止
 cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%
 cli-agent-context-bar-unknown = ctx: 不明 / {$max}
 cli-doctor-ctxwin-already-set = {$provider_ref}: 既に context_window = {$ctx} が設定されています
@@ -933,9 +950,41 @@ cli-doctor-ctxwin-write-failed = {$provider_ref}: context_window の書き込み
 # ── Degraded config sections (doctor diagnose, #8835) ──
 cli-doctor-degraded-security = セキュリティ上重要な設定セクション `{$path}` が無効なため、デーモンを起動できるようデフォルト値にリセットされました。実行中のセキュリティ設定は意図したものより弱くなっている可能性があります。`zeroclaw config migrate` を実行してパースエラーを確認し、ファイルを修復してください。
 cli-doctor-degraded-section = 設定セクション `{$path}` は不正な形式のためデフォルト値にリセットされました。このセクションの値は反映されていません。`zeroclaw config migrate` を実行してパースエラーを確認し、ファイルを修復してください。
+cli-doctor-skills-prompt-injection-mode-full-deprecated = スキルプロンプト注入モード "full" は非推奨です。明示的な full モードは移行期間中もサポートされますが、現在のデフォルトは compact です。Schema V4 で full モードが削除される前に移行してください。
 sop-approval-deferred-at-capacity = 実行スロットが満杯のため、実行 {$run_id} を再開できませんでした。承認は待機状態のままです。スロットが空いてから再試行してください。
 sop-approval-policy-unavailable = 待機中の SOP ステップを利用できないため、承認に失敗しました: {$reason}。実行は待機状態のままです。
 sop-rpc-decision-invalid-state = 実行 {$run_id} は現在の状態では解決できません。
 sop-rpc-decision-unauthorized = RPC プリンシパルには、この SOP ステップを解決する権限がありません。
 sop-rpc-policy-missing = SOP 承認ポリシー '{$name}' が構成されていません。
 sop-rpc-policy-unavailable = 待機中の SOP ポリシーを利用できません: {$reason}。
+
+# ── Tool approval (channels, #9409) ──
+# Human-visible copy for the operator-facing tool-approval prompt, shared
+# across the button adapters (Telegram, Discord, Slack) and the text-reply
+# adapters (Matrix, Signal, WhatsApp, Slack polling fallback). Approval
+# TOKENS, `callback_data`/`custom_id`/`action_id` values, and the reply
+# KEYWORDS parsed by `util::parse_approval_reply` (yes/y/approve, no/n/deny,
+# always) stay hardcoded ASCII in Rust — only the surrounding prose is
+# localized here.
+channel-approval-heading = ツールの承認が必要です
+channel-approval-heading-shout = 承認が必要です
+channel-approval-tool-label = ツール
+channel-approval-args-label = 引数
+channel-approval-btn-approve = 承認
+channel-approval-btn-deny = 拒否
+channel-approval-btn-always = 常に
+channel-approval-tap-instruction = 下のボタンをタップしてください：
+channel-approval-reply-instruction-yesno = 返信：「{ $yes_command }」、「{ $no_command }」、または「{ $always_command }」
+channel-approval-reply-instruction-approve-deny = 「{ $approve_command }」/「{ $deny_command }」/「{ $always_command }」と返信してください。
+channel-telegram-approval-ack-approved = 承認しました
+channel-telegram-approval-ack-always-approved = 常に承認しました
+channel-telegram-approval-ack-denied = 拒否しました
+channel-telegram-approval-ack-unknown = 不明な操作です
+channel-discord-approval-btn-allow-once = 今回のみ許可
+channel-discord-approval-btn-allow-session = このセッションのみ許可
+channel-discord-approval-btn-allow-always = 常に許可
+channel-approval-title = { $tool } を承認しますか？
+channel-approval-opt-allow-once = 今回のみ許可
+channel-approval-opt-allow-always = 常に許可
+channel-approval-opt-reject = 拒否
+channel-approval-opt-reject-with-edit = 編集して拒否

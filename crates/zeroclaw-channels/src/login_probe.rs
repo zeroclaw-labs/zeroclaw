@@ -86,7 +86,12 @@ pub fn persisted_login(channel: QrPairingChannel, config: &Config, alias: &str) 
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    #[cfg(any(feature = "channel-wechat", feature = "whatsapp-web"))]
+    use super::{PersistedLogin, persisted_login};
+    #[cfg(any(feature = "channel-wechat", feature = "whatsapp-web"))]
+    use crate::listing::QrPairingChannel;
+    #[cfg(any(feature = "channel-wechat", feature = "whatsapp-web"))]
+    use zeroclaw_config::schema::Config;
 
     #[test]
     fn channels_without_a_probe_resolve_to_no_qr_pairing_key() {
