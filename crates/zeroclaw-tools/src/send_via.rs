@@ -43,9 +43,14 @@ pub struct TurnRoutingEntry {
 /// duration of the loop, and reads it back after the loop completes.
 pub type TurnRoutingHandle = Arc<Mutex<Vec<TurnRoutingEntry>>>;
 
-/// Static routing/modality wording that suggests a `send_via` call. Multiword
-/// phrases keep case-insensitive substring matching from firing on ordinary
-/// prose; live channel and peer-group names are added per call on top.
+/// Static routing/modality wording that suggests a `send_via` call. Each entry
+/// is a multiword phrase that, taken whole, requests a destination or delivery
+/// modality — chosen to survive the trait's word-boundary matching contract
+/// without firing on ordinary prose. Deliberately excluded: bare deadline /
+/// style wording like "reply by" ("reply by Friday"), "respond by", "reply in"
+/// ("reply in 5 minutes"), and "reply as" ("reply as soon as you can"), which
+/// carry no routing intent. Live channel and peer-group names are added per
+/// call on top.
 const STATIC_INVOCATION_TRIGGERS: &[&str] = &[
     "send this to",
     "send it to",
@@ -54,28 +59,25 @@ const STATIC_INVOCATION_TRIGGERS: &[&str] = &[
     "forward this to",
     "forward it to",
     "redirect to",
-    "deliver to",
-    "reply by",
-    "reply as",
-    "reply in",
-    "respond by",
+    "reply by voice",
+    "reply by text",
+    "reply via",
     "by voice",
     "via voice",
     "as voice",
     "voice message",
     "voice note",
-    "by text",
-    "as text",
     "text only",
-    "by email",
     "via email",
     "email this",
     "email it",
     "email me",
 ];
 
-/// Dynamic trigger entries shorter than this are dropped: single short
-/// tokens ("a", "io") match everywhere and poison substring scanning.
+/// Dynamic trigger entries shorter than this are dropped. Word-boundary
+/// matching already stops `dev` from firing inside `device`, but very short
+/// names (1–2 characters) collide with too many standalone words to be useful
+/// triggers. Compared by character count, not byte length.
 const MIN_DYNAMIC_TRIGGER_LEN: usize = 3;
 
 /// Agent-callable tool for per-turn output routing and channel fanout.
@@ -233,26 +235,31 @@ impl Tool for SendViaTool {
             .map(|t| (*t).to_string())
             .collect();
 
+        // Character count, not byte length: the rule excludes 1–2 *character*
+        // names, and a short multibyte name (e.g. a 1-char CJK alias) has a
+        // byte length >= 3 that a `.len()` check would wrongly admit.
+        let long_enough = |s: &str| s.chars().count() >= MIN_DYNAMIC_TRIGGER_LEN;
+
         // Live views, mirroring resolve_target: recomputed per call so config
         // reloads (channels, peer groups) take effect without a registry rebuild.
         for key in self.channel_map.read().keys() {
             let lower = key.to_lowercase();
             if let Some((channel_type, alias)) = lower.split_once('.') {
-                if channel_type.len() >= MIN_DYNAMIC_TRIGGER_LEN {
+                if long_enough(channel_type) {
                     triggers.insert(channel_type.to_string());
                 }
                 // "default" is an implementation alias, not user wording.
-                if alias != "default" && alias.len() >= MIN_DYNAMIC_TRIGGER_LEN {
+                if alias != "default" && long_enough(alias) {
                     triggers.insert(alias.to_string());
                 }
             }
-            if lower.len() >= MIN_DYNAMIC_TRIGGER_LEN {
+            if long_enough(&lower) {
                 triggers.insert(lower);
             }
         }
         for group in (self.agent_peer_groups)().keys() {
             let lower = group.to_lowercase();
-            if lower.len() >= MIN_DYNAMIC_TRIGGER_LEN {
+            if long_enough(&lower) {
                 triggers.insert(lower);
             }
         }
@@ -625,9 +632,28 @@ mod tests {
         assert!(has("family"));
         // The implementation alias never becomes a bare trigger word.
         assert!(!has("default"));
+        // Deadline / style wording that carries no routing intent must NOT be
+        // a trigger (would false-positive under the matching contract on
+        // "reply by Friday", "respond by noon", "reply as soon as you can").
+        for prose in [
+            "reply by",
+            "respond by",
+            "reply in",
+            "reply as",
+            "deliver to",
+        ] {
+            assert!(
+                !has(prose),
+                "ambiguous phrase must not be a trigger: {prose}"
+            );
+        }
         // Everything is lowercase: the scan contract is case-insensitive
         // matching against a lowercased message.
         assert!(triggers.iter().all(|t| t == &t.to_lowercase()));
+        // Under word-boundary matching (zeroclaw_api::tool::
+        // invocation_trigger_matches), a short channel type like "email" is a
+        // safe whole-word trigger and must not be dropped for length.
+        assert!(has("email"));
     }
 
     #[test]
@@ -661,6 +687,24 @@ mod tests {
         assert!(after.iter().any(|t| t == "discord"));
         assert!(after.iter().any(|t| t == "main"));
         assert!(after.iter().any(|t| t == "family"));
+    }
+
+    #[test]
+    fn short_multibyte_names_are_excluded_by_character_count() {
+        // A one-character CJK peer-group name is 3 bytes but 1 character; the
+        // min-length rule excludes 1–2 character names, so it must not become
+        // a trigger (a byte-length check would wrongly admit it). A
+        // three-character CJK name clears the rule.
+        let (tool, _routing) = make_tool(
+            vec![("telegram.default", Arc::new(StubChannel::new("telegram")))],
+            HashMap::from([
+                ("東".to_string(), pg("telegram", &["ana"])),
+                ("東京都".to_string(), pg("telegram", &["ana"])),
+            ]),
+        );
+        let triggers = tool.inner.invocation_triggers();
+        assert!(!triggers.iter().any(|t| t == "東"));
+        assert!(triggers.iter().any(|t| t == "東京都"));
     }
 
     fn pg_with_peers(channel: &str, agents: &[&str], peers: &[&str]) -> PeerGroupConfig {
