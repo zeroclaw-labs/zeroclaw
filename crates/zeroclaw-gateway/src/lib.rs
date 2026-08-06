@@ -5139,6 +5139,7 @@ mod tests {
                     api_key: Some("sk-test-openai-shaped-key".to_string()),
                     ..Default::default()
                 },
+                ..Default::default()
             },
         );
 
@@ -6285,6 +6286,7 @@ mod tests {
                     model: Some("agent-model".into()),
                     ..Default::default()
                 },
+                ..Default::default()
             },
         );
         let expected_provider = "anthropic.default".to_string();

@@ -1005,7 +1005,9 @@ impl FamilyProviderFactory for AnthropicModelProviderConfig {
         api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        let mut b = crate::anthropic::AnthropicModelProvider::builder(alias).credential(key);
+        let mut b = crate::anthropic::AnthropicModelProvider::builder(alias)
+            .credential(key)
+            .server_fallback_models(self.server_fallback_models.clone());
         if let Some(url) = api_url {
             b = b.base_url(url);
         }
