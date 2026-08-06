@@ -874,6 +874,32 @@ where
     })
 }
 
+/// Wall-clock stamp for a heartbeat task prompt, in the daemon's local zone.
+///
+/// Inbound channel messages already reach the model with a `[YYYY-MM-DD
+/// HH:MM:SS TZ]` prefix (`timestamp_channel_user_content` in the channels
+/// orchestrator), so a replying agent always knows what time it is. A heartbeat
+/// tick is not an inbound message: it is assembled here, and until this stamp
+/// existed it carried no clock at all. The agent knew the DATE (from the cached
+/// `DateTimeSection`) and how long the user had been quiet, but not whether
+/// "now" was noon or three in the morning — precisely the judgement a proactive
+/// message depends on.
+///
+/// The clock is deliberately kept OUT of the cached system prompt (#6931): that
+/// section is cached per conversation, and a value that changes every minute
+/// would invalidate it on every turn. That argument does not apply here. This
+/// prompt is rebuilt from scratch on every tick and already varies (session
+/// context, silence note), so stamping it costs no cache.
+///
+/// Renders in the process timezone, which is what the operator sets to the
+/// user's zone (`TZ=` on the unit), the same source `Local::now()` uses for
+/// inbound stamps — one clock for both paths, no second source of truth.
+fn heartbeat_wall_clock() -> String {
+    chrono::Local::now()
+        .format("%Y-%m-%d %H:%M:%S %Z")
+        .to_string()
+}
+
 fn resolve_heartbeat_workspace_dir(config: &Config) -> Result<(String, PathBuf)> {
     let agent_alias = config.heartbeat.agent.trim().to_string();
     if agent_alias.is_empty() {
@@ -1575,7 +1601,12 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
         let mut tick_had_error = false;
         for task in &tasks_to_run {
             let task_start = std::time::Instant::now();
-            let task_prompt = format!("[Heartbeat Task | {}] {}", task.priority, task.text);
+            let task_prompt = format!(
+                "[{} | Heartbeat Task | {}] {}",
+                heartbeat_wall_clock(),
+                task.priority,
+                task.text
+            );
 
             // Memory context is injected once in the engine, keyed on the
             // Daemon origin (agent::memory_inject): Conversation entries are
@@ -2244,6 +2275,50 @@ mod tests {
             backend.append(key, &message).unwrap();
         }
         std::sync::Arc::new(backend)
+    }
+
+    /// A heartbeat tick must carry the wall clock, because deciding whether to
+    /// message someone unprompted is a time-of-day judgement.
+    ///
+    /// Inbound channel messages arrive stamped (`timestamp_channel_user_content`),
+    /// so a REPLYING agent always knows the hour. A heartbeat prompt is built
+    /// here instead, and carried no clock at all: the agent knew the date, the
+    /// weekday and how long the user had been silent, but not whether "now" was
+    /// the middle of the afternoon or the middle of the night. A proactive
+    /// message is exactly where that distinction matters.
+    #[test]
+    fn heartbeat_task_prompt_carries_the_wall_clock() {
+        let stamp = heartbeat_wall_clock();
+
+        // Same shape as the inbound stamp: date, clock to the second, zone.
+        // Asserted structurally rather than against a frozen string so the
+        // test does not fail once a minute.
+        let parts: Vec<&str> = stamp.split_whitespace().collect();
+        assert_eq!(
+            parts.len(),
+            3,
+            "expected `YYYY-MM-DD HH:MM:SS TZ`, got {stamp:?}"
+        );
+        assert_eq!(parts[0].len(), 10, "date should be YYYY-MM-DD: {stamp:?}");
+        assert_eq!(
+            parts[1].matches(':').count(),
+            2,
+            "clock should carry seconds: {stamp:?}"
+        );
+        assert!(!parts[2].is_empty(), "timezone must be present: {stamp:?}");
+
+        // The clock itself is the point: a prompt that omits the hour is the
+        // bug this guards. Rebuild the prompt exactly as the tick does.
+        let task_prompt = format!("[{} | Heartbeat Task | {}] {}", stamp, "medium", "decide");
+        let hour_minute = chrono::Local::now().format("%H:%M").to_string();
+        assert!(
+            task_prompt.contains(&hour_minute),
+            "the heartbeat prompt must contain the current time {hour_minute}: {task_prompt}"
+        );
+        assert!(
+            task_prompt.contains("Heartbeat Task"),
+            "the task framing must survive the stamp: {task_prompt}"
+        );
     }
 
     /// A heartbeat memory must read as something the agent said, because that
