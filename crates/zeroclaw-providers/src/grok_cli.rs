@@ -5,7 +5,13 @@
 //! never placed in argv or a temporary file.
 //! Authentication uses the Grok CLI login cache by default. API-key auth is an
 //! explicit per-alias opt-in: export `XAI_API_KEY` into the ZeroClaw process and
-//! include that exact name in `env_passthrough`.
+//! list that name in `env_passthrough`. Typed alias `api_key` is rejected; this
+//! provider does not store the key in config. At each spawn the child allowlist
+//! resolves process env by name (including `XAI_API_KEY` when opted in) so the
+//! CLI login cache remains the default owner and the key is never snapshotted
+//! into the long-lived provider handle. A future typed Config bridge may map
+//! the same name at load time; until then the documented process-env +
+//! `env_passthrough` surface is the single operator credential path.
 //!
 //! # Usage
 //!
@@ -491,7 +497,7 @@ impl GrokCliModelProvider {
     }
 
     fn normalize_and_validate_env_passthrough(names: Vec<String>) -> anyhow::Result<Vec<String>> {
-        let mut normalized = Vec::with_capacity(names.len());
+        let mut normalized: Vec<String> = Vec::with_capacity(names.len());
         for name in names {
             let name = name.trim();
             if !is_valid_env_var_name(name) {
@@ -504,7 +510,12 @@ impl GrokCliModelProvider {
                     "grok_cli env_passthrough entry `{name}` is provider-owned; only `XAI_API_KEY` may be passed for authentication, and Grok policy belongs in `extra_args`"
                 );
             }
-            if !normalized.iter().any(|existing| existing == name) {
+            if !normalized
+                .iter()
+                .any(|existing| env_names_equal(existing.as_str(), name))
+            {
+                // Preserve the operator-supplied spelling; equality is
+                // case-insensitive on Windows when checking membership later.
                 normalized.push(name.to_string());
             }
         }
@@ -670,7 +681,7 @@ impl GrokCliModelProvider {
         let mut xai_api_key_available = false;
         for (key, value) in variables {
             if env_var_allowed(&key, env_passthrough) {
-                if key == XAI_API_KEY_ENV {
+                if env_names_equal(&key, XAI_API_KEY_ENV) {
                     xai_api_key_available = !value.is_empty();
                 }
                 cmd.env(key, value);
@@ -786,12 +797,13 @@ impl GrokCliModelProvider {
             return vec![acp::AcpPromptContent::Text(message.to_string())];
         }
 
-        // TEMPORARY: Grok Build CLI 0.2.112 advertises
-        // `promptCapabilities.image = false`, although its ACP
-        // `session/prompt` endpoint accepts image blocks. `vision = true` is
-        // the explicit per-alias opt-in that bypasses that bad advertisement.
-        // Re-evaluate and remove this workaround once Grok advertises the
-        // capability correctly upstream.
+        // TODO(grok-cli-vision): TEMPORARY workaround for Grok Build advertising
+        // `promptCapabilities.image = false` while ACP `session/prompt` still
+        // accepts image blocks (observed on 0.2.112; re-check on upgrade).
+        // `vision = true` is the explicit per-alias opt-in that bypasses that
+        // bad advertisement. Remove this branch when initialize advertises
+        // `promptCapabilities.image = true` for the deployed CLI and a live
+        // ACP smoke with an image block succeeds without the override.
         let (text, image_refs) = crate::multimodal::parse_image_markers(message);
         if image_refs.is_empty() {
             return vec![acp::AcpPromptContent::Text(message.to_string())];
@@ -887,14 +899,38 @@ fn is_valid_env_var_name(name: &str) -> bool {
         && chars.all(|character| character == '_' || character.is_ascii_alphanumeric())
 }
 
+/// Environment name equality for allow/deny/dedup. Windows process env is
+/// case-insensitive, so mixed-case spellings of the same variable must not
+/// bypass denylists or miss allowlists there.
+fn env_names_equal(left: &str, right: &str) -> bool {
+    if cfg!(windows) {
+        left.eq_ignore_ascii_case(right)
+    } else {
+        left == right
+    }
+}
+
+fn env_name_starts_with(name: &str, prefix: &str) -> bool {
+    if cfg!(windows) {
+        name.len() >= prefix.len() && name.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+    } else {
+        name.starts_with(prefix)
+    }
+}
+
 fn is_disallowed_provider_env_var(name: &str) -> bool {
-    name != XAI_API_KEY_ENV && (name.starts_with("XAI_") || name.starts_with("GROK_"))
+    !env_names_equal(name, XAI_API_KEY_ENV)
+        && (env_name_starts_with(name, "XAI_") || env_name_starts_with(name, "GROK_"))
 }
 
 fn env_var_allowed(key: &str, env_passthrough: &[String]) -> bool {
-    ENV_ALLOWLIST_EXACT.contains(&key)
-        || key.starts_with("LC_")
-        || env_passthrough.iter().any(|name| name == key)
+    ENV_ALLOWLIST_EXACT
+        .iter()
+        .any(|allowed| env_names_equal(key, allowed))
+        || env_name_starts_with(key, "LC_")
+        || env_passthrough
+            .iter()
+            .any(|name| env_names_equal(name, key))
 }
 
 #[async_trait]
@@ -1287,6 +1323,59 @@ mod tests {
         let passthrough = vec!["AWS_ACCESS_KEY_ID".to_string()];
         assert!(env_var_allowed("AWS_ACCESS_KEY_ID", &passthrough));
         assert!(!env_var_allowed("AWS_SECRET_ACCESS_KEY", &passthrough));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_env_allow_and_deny_are_case_insensitive() {
+        assert!(env_var_allowed("Path", &[]), "Windows PATH via mixed case");
+        assert!(
+            env_var_allowed("SystemRoot", &[]),
+            "Windows SYSTEMROOT via mixed case"
+        );
+        assert!(
+            is_disallowed_provider_env_var("grok_sandbox"),
+            "GROK_* denylist must match case-insensitively on Windows"
+        );
+        assert!(
+            is_disallowed_provider_env_var("Xai_Auth_Token"),
+            "XAI_* denylist must match case-insensitively on Windows"
+        );
+        assert!(
+            !is_disallowed_provider_env_var("xai_api_key"),
+            "XAI_API_KEY exception must match case-insensitively on Windows"
+        );
+        let deduped = GrokCliModelProvider::normalize_and_validate_env_passthrough(vec![
+            "Aws_Access_Key_Id".to_string(),
+            "AWS_ACCESS_KEY_ID".to_string(),
+        ])
+        .expect("mixed-case passthrough");
+        assert_eq!(
+            deduped.len(),
+            1,
+            "duplicate names that differ only by case must collapse on Windows"
+        );
+        let mut command = Command::new("grok");
+        let available = GrokCliModelProvider::apply_env_allowlist_from(
+            &mut command,
+            &["XAI_API_KEY".to_string()],
+            [("xai_api_key".to_string(), "mixed-case-key".to_string())],
+        );
+        assert!(available);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_env_allow_and_deny_remain_case_sensitive() {
+        assert!(
+            !env_var_allowed("Path", &[]),
+            "Unix PATH allowlist stays exact-case"
+        );
+        assert!(
+            !is_disallowed_provider_env_var("grok_sandbox"),
+            "Unix GROK_* denylist stays exact-case"
+        );
+        assert!(is_disallowed_provider_env_var("GROK_SANDBOX"));
     }
 
     #[test]

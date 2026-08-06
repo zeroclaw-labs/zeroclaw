@@ -20,15 +20,23 @@ use zeroclaw_api::jsonrpc::{
 };
 
 /// Maximum size of one newline-delimited JSON-RPC frame.
+///
+/// Bounded independently of Grok's published CLI limits so a single oversized
+/// NDJSON line cannot grow without bound. See the Grok Build sandbox/settings
+/// reference for the agent subprocess model:
+/// <https://docs.x.ai/build/settings/reference>
 const MAX_ACP_FRAME_BYTES: usize = 1_048_576;
 
-/// Default aggregate stdout budget consumed during one ACP request.
+/// Default aggregate stdout budget consumed during one ACP request (4 MiB).
+///
+/// Caps protocol frames plus native-tool updates for one one-shot turn. Alias
+/// `max_acp_stdout_bytes` may raise this up to [`MAX_ACP_STDOUT_LIMIT_BYTES`].
 pub(super) const DEFAULT_ACP_STDOUT_LIMIT_BYTES: usize = 4_194_304;
 
 /// The aggregate stdout budget must admit at least one valid ACP frame.
 pub(super) const MIN_ACP_STDOUT_LIMIT_BYTES: usize = MAX_ACP_FRAME_BYTES;
 
-/// Keep a configured transport budget bounded even for tool-heavy aliases.
+/// Keep a configured transport budget bounded even for tool-heavy aliases (64 MiB).
 pub(super) const MAX_ACP_STDOUT_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 
 /// How the headless ACP client answers interactive permission requests.
@@ -238,6 +246,11 @@ struct AcpReader<R> {
     inner: BufReader<R>,
     bytes_read: usize,
     max_stdout_bytes: usize,
+    /// Bytes of the current NDJSON line that have already been consumed from
+    /// the underlying reader. Must survive `tokio::time::timeout` cancellation
+    /// of `next_message` / `read_frame` (for example during output settle) so a
+    /// frame split across a quiet interval is not dropped after `consume()`.
+    pending_frame: Vec<u8>,
 }
 
 impl<R> AcpReader<R>
@@ -249,6 +262,7 @@ where
             inner: BufReader::new(reader),
             bytes_read: 0,
             max_stdout_bytes,
+            pending_frame: Vec::new(),
         }
     }
 
@@ -268,7 +282,6 @@ where
     }
 
     async fn read_frame(&mut self, phase: &'static str) -> Result<Option<Vec<u8>>, AcpError> {
-        let mut frame = Vec::new();
         loop {
             let available = self
                 .inner
@@ -276,10 +289,10 @@ where
                 .await
                 .map_err(|_| AcpError::Read { phase })?;
             if available.is_empty() {
-                return if frame.is_empty() {
+                return if self.pending_frame.is_empty() {
                     Ok(None)
                 } else {
-                    Ok(Some(frame))
+                    Ok(Some(std::mem::take(&mut self.pending_frame)))
                 };
             }
 
@@ -296,20 +309,24 @@ where
                     limit: self.max_stdout_bytes,
                 });
             }
-            let next_frame = frame.len().checked_add(take).ok_or(AcpError::FrameLimit {
-                limit: MAX_ACP_FRAME_BYTES,
-            })?;
+            let next_frame = self
+                .pending_frame
+                .len()
+                .checked_add(take)
+                .ok_or(AcpError::FrameLimit {
+                    limit: MAX_ACP_FRAME_BYTES,
+                })?;
             if next_frame > MAX_ACP_FRAME_BYTES {
                 return Err(AcpError::FrameLimit {
                     limit: MAX_ACP_FRAME_BYTES,
                 });
             }
 
-            frame.extend_from_slice(&available[..take]);
+            self.pending_frame.extend_from_slice(&available[..take]);
             self.inner.consume(take);
             self.bytes_read = next_total;
             if newline.is_some() {
-                return Ok(Some(frame));
+                return Ok(Some(std::mem::take(&mut self.pending_frame)));
             }
         }
     }
@@ -687,6 +704,55 @@ mod tests {
             select_auth_method_id(&api_key_only, false),
             Err(AcpError::NoAuthenticationMethod)
         ));
+    }
+
+    #[tokio::test]
+    async fn partial_ndjson_frame_survives_settle_timeout_cancellation() {
+        // A quiet-interval timeout must not drop bytes already consumed from
+        // the underlying reader while a newline-delimited frame is incomplete.
+        let (client, mut peer) = duplex(4096);
+        let mut reader = AcpReader::new(client, DEFAULT_ACP_STDOUT_LIMIT_BYTES);
+
+        let full = concat!(
+            r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"SPLIT_FRAME_OK"}}}}"#,
+            "\n"
+        );
+        let split_at = full.len() / 2;
+        peer.write_all(&full.as_bytes()[..split_at])
+            .await
+            .expect("write frame prefix");
+        peer.flush().await.expect("flush prefix");
+        // Let the duplex deliver the prefix before the settle timer starts so
+        // the cancelled read has already consumed into pending_frame.
+        tokio::task::yield_now().await;
+
+        // Cancel mid-frame after the settle interval budget; prefix must remain
+        // in AcpReader::pending_frame rather than being dropped with the future.
+        let cancelled = timeout(OUTPUT_SETTLE_INTERVAL, reader.next_message("output settle")).await;
+        assert!(
+            cancelled.is_err(),
+            "prefix-only read must not complete a frame before the timeout"
+        );
+        assert!(
+            !reader.pending_frame.is_empty(),
+            "consumed frame prefix must be retained across timeout cancellation"
+        );
+
+        peer.write_all(&full.as_bytes()[split_at..])
+            .await
+            .expect("write frame suffix");
+        peer.flush().await.expect("flush suffix");
+        drop(peer);
+
+        let message = reader
+            .next_message("output settle")
+            .await
+            .expect("complete frame after resume")
+            .expect("message present");
+        assert_eq!(
+            extract_agent_message_chunk(&message),
+            Some("SPLIT_FRAME_OK")
+        );
     }
 
     #[tokio::test]

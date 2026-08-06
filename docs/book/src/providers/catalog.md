@@ -69,8 +69,11 @@ vision = true
 With this explicit opt-in, ZeroClaw reports vision support for that alias and
 sends normalized image attachments as ACP `image` blocks. It does not override
 other ACP advertisements, such as tool or permission capabilities. Leave the
-setting unset by default; revalidate the upstream behavior and remove this
-temporary setting after Grok advertises image support correctly.
+setting unset by default. **Removal condition:** after the deployed Grok Build
+CLI advertises `promptCapabilities.image = true` on ACP initialize and a live
+image-block smoke succeeds without the override, delete the temporary
+`vision = true` opt-in and the matching code path
+(`GrokCliModelProvider::acp_prompt_content`).
 
 #### Ubuntu 24.04: keep the Grok sandbox when `bwrap` needs user namespaces
 
@@ -139,10 +142,13 @@ max_acp_stdout_bytes = 8388608
 ```
 
 Export `XAI_API_KEY` into the daemon environment before starting ZeroClaw. The
-ACP client selects `xai.api_key` only when that exact name is listed and a
-non-empty value is copied to the child; otherwise it falls back to the CLI login
-cache. The key value remains owned by the daemon environment and is not stored
-in provider config.
+ACP client selects `xai.api_key` only when that name is listed in
+`env_passthrough` and a non-empty value is present in the process environment at
+**child spawn** (not snapshotted into the long-lived provider handle). Otherwise
+it falls back to the CLI login cache. Typed alias `api_key` remains rejected:
+this is an intentional process-env bridge rather than a second Config secret
+field. Values are not written to provider TOML; a future typed Config bridge
+may load the same name at config time without changing the operator surface.
 
 An existing absolute `working_directory` is required. It is canonicalized and
 used for both the child cwd and ACP session boundary, so the provider never
@@ -293,7 +299,7 @@ model_provider = "grok_cli.ops"
 | ----- | ----- | ------- |
 | Reply precheck | `classifier_provider` → API alias (e.g. `xai.default`) | REPLY / `NO_REPLY[*]` only; avoids CLI thinking text as the message body |
 | Full answer | `model_provider` → `grok_cli.default` | Grok Build ACP; prompt only on stdin |
-| OS sandbox | Default `--sandbox strict` (or `extra_args` override) | Read CWD + system paths only (not `~/.ssh` / home); write CWD + `~/.grok` + tmp; child network blocked on Linux |
+| OS sandbox | Default `--sandbox strict` (or `extra_args` override) | Read CWD + system paths; write CWD + `~/.grok` + tmp; child network blocked on Linux. Built-ins are not a permanent credential boundary — use custom `deny` for secrets |
 | App permissions | Empty built-in tool set + fail-closed ACP default | Explicit bypass flags select `allow_once`; discovered Grok rules may also pre-authorize configured tools |
 | Channel delivery | ZeroClaw `thread_replies` / channel config | Single in-thread reply path |
 | Optional gate | Slack `mention_only` + `strict_mention_in_thread` | Drop unmentioned group/thread traffic before the agent (see [Slack](../channels/slack.md)); independent of the classifier |
@@ -330,14 +336,18 @@ live in project `<workspace>/.grok/sandbox.toml`; pass
 | ------- | ------- | -------- | ----------------------------- | ----------- |
 | `off` (default) | unrestricted | unrestricted | unrestricted | Full access |
 | `workspace` | everywhere | CWD + `~/.grok` + tmp | allowed | Everyday coding |
-| `read-only` | everywhere (includes home / `~/.ssh`) | `~/.grok` + tmp only | blocked | Review when broad reads are OK |
-| `strict` | CWD + system paths (not home / `~/.ssh`) | CWD + `~/.grok` + tmp | blocked | **Default channel chatbot (recommended)** |
+| `read-only` | everywhere | `~/.grok` + tmp only | blocked | Review when broad reads are OK |
+| `strict` | CWD + system paths | CWD + `~/.grok` + tmp | blocked | **Default channel chatbot (recommended)** |
 | `devbox` | everywhere | most of the tree | allowed | Disposable VMs |
 
 Child-network blocking applies to **shell children** on Linux only; in-process
 Grok tools (LLM, built-in web search) still need network. Prefer **`strict`**
-for messaging bots so home-directory secrets stay out of reach; use
-`read-only` only when the agent must read outside the workspace without
+for messaging bots to narrow the default filesystem write surface to the agent
+workspace plus Grok runtime paths. Built-in profiles are **not** a permanent
+credential boundary: [xAI's sandbox docs](https://docs.x.ai/build/features/sandbox)
+warn that paths such as `~/.ssh` are not guaranteed protected by built-ins, and
+recommend a custom profile with a kernel-enforced `deny` list for secrets.
+Use `read-only` only when the agent must read outside the workspace without
 writing project files.
 
 **Custom profile example** (define in workspace, select from ZeroClaw):
