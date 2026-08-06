@@ -1765,7 +1765,7 @@ pub fn default_model_provider_url(name: &str) -> Option<&'static str> {
         RekaModelProviderConfig, SambanovaModelProviderConfig, SglangModelProviderConfig,
         SiliconflowModelProviderConfig, SyntheticModelProviderConfig, TogetherModelProviderConfig,
         UpstageModelProviderConfig, VercelModelProviderConfig, VllmModelProviderConfig,
-        YiModelProviderConfig, ZerorouterModelProviderConfig,
+        YiModelProviderConfig,
     };
 
     match name {
@@ -1814,7 +1814,7 @@ pub fn default_model_provider_url(name: &str) -> Option<&'static str> {
         "lambda_ai" => Some(<LambdaAiModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
         "inception" => Some(<InceptionModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
         "nearai" => Some(<NearaiModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "zerorouter" => Some(<ZerorouterModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
+        "zerorouter" => Some(crate::factory::ZEROROUTER_DEFAULT_URL),
         "baichuan" => Some(<BaichuanModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
         "yi" => Some(<YiModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
         _ => None,

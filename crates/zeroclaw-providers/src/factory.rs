@@ -1400,19 +1400,60 @@ impl FamilyProviderFactory for KiloCliModelProviderConfig {
 
 // ── ZeroRouter (self-hosted LLM gateway — OpenAI-compatible) ───────────
 
-impl CompatFamilySpec for ZerorouterModelProviderConfig {
-    const DISPLAY: &'static str = "ZeroRouter";
-    // No hosted deployment exists yet: default to the router container's
-    // own default bind (ZEROROUTER_BIND=0.0.0.0:8080); remote routers are
-    // reached via base.uri. Must stay in lockstep with ZerorouterEndpoint
-    // in zeroclaw-config — see
-    // `zerorouter_default_url_matches_schema_endpoint`.
-    const DEFAULT_URL: &'static str = "http://localhost:8080/v1";
-    const AUTH: AuthStyle = AuthStyle::Bearer;
-    // ZeroRouter's GET /v1/models is unauthenticated and carries pricing
-    // (OpenRouter-shaped per-token decimal strings), so live pricing works
-    // before any key is configured.
-    const PUBLIC_MODEL_LISTING: bool = true;
+/// No hosted deployment is the default: the router container's own bind
+/// (ZEROROUTER_BIND=0.0.0.0:8080); remote routers are reached via
+/// `base.uri`. Must stay in lockstep with ZerorouterEndpoint in
+/// zeroclaw-config — see `zerorouter_default_url_matches_schema_endpoint`.
+pub const ZEROROUTER_DEFAULT_URL: &str = "http://localhost:8080/v1";
+
+/// Direct factory impl rather than the CompatFamilySpec blanket: the
+/// device-flow login stores the minted `zcr_` key as a Token-kind auth
+/// profile, and consuming it needs the auth-service bridge that only the
+/// full `create_provider` signature can reach (the xai pattern). Without
+/// this, `zeroclaw auth login --model-provider zerorouter` would store a
+/// credential the factory then ignores — caught by the first end-to-end
+/// device-flow run.
+impl FamilyProviderFactory for ZerorouterModelProviderConfig {
+    fn create_provider(
+        &self,
+        alias: &str,
+        key: Option<&str>,
+        api_url: Option<&str>,
+        opts: &ModelProviderRuntimeOptions,
+    ) -> Result<Box<dyn ModelProvider>> {
+        let mut b = OpenAiCompatibleModelProvider::builder(alias)
+            .display_name("ZeroRouter")
+            .base_url(api_url.unwrap_or(ZEROROUTER_DEFAULT_URL))
+            .credential(key)
+            .auth_style(AuthStyle::Bearer)
+            // ZeroRouter's GET /v1/models is unauthenticated and carries
+            // pricing (OpenRouter-shaped per-token decimal strings), so live
+            // pricing works before any key is configured.
+            .public_model_listing();
+
+        if !has_api_key(key) {
+            let state_dir = opts.zeroclaw_dir.clone().unwrap_or_else(|| {
+                directories::UserDirs::new().map_or_else(
+                    || std::path::PathBuf::from(".zeroclaw"),
+                    |dirs| dirs.home_dir().join(".zeroclaw"),
+                )
+            });
+            let auth_service = crate::auth::AuthService::new(&state_dir, opts.secrets_encrypt);
+            b = b.auth_profile(
+                "zerorouter",
+                auth_service,
+                opts.auth_profile_override.clone(),
+            );
+        }
+
+        Ok(apply_compat_options(b, opts))
+    }
+
+    /// A device-flow profile can supply the credential when config has no
+    /// api_key, so a keyless slot is still viable.
+    fn fallback_auth_ready(&self, _key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
+        true
+    }
 }
 
 impl CompatFamilySpec for KiloModelProviderConfig {
@@ -1642,7 +1683,7 @@ mod tests {
     fn zerorouter_default_url_matches_schema_endpoint() {
         use zeroclaw_config::schema::{ModelEndpoint, ZerorouterEndpoint};
         assert_eq!(
-            <ZerorouterModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
+            ZEROROUTER_DEFAULT_URL,
             ZerorouterEndpoint::default().uri(),
             "schema ZerorouterEndpoint and factory DEFAULT_URL disagree on the ZeroRouter URL"
         );
