@@ -12517,6 +12517,30 @@ pub struct HeartbeatConfig {
     /// during quiet periods. Default: `true`.
     #[serde(default = "default_two_phase")]
     pub two_phase: bool,
+
+    /// Deliver a heartbeat result ONLY when the agent explicitly marks it as
+    /// something to send. Default `false` — existing heartbeats keep the
+    /// deliver-by-default behaviour byte for byte.
+    ///
+    /// The default path suppresses delivery only for the exact `NO_REPLY`
+    /// sentinels: an allowlist of *silence* inside a deliver-by-default flow.
+    /// That is a blocklist of an infinite space — there are unbounded ways for
+    /// a model to phrase "I have decided not to write", and every one of them
+    /// that is not the literal token gets delivered. On an operator channel a
+    /// stray line is noise. On a persona channel it is the agent's private
+    /// reasoning arriving as a message from a person, in the third person,
+    /// about the recipient.
+    ///
+    /// Measured: a tick produced "Ya le pregunté lo de la hora. Si responde
+    /// bien, respondo. Si no... ya veré cuando abra el celular." — a decision
+    /// NOT to write, delivered as if it were the message.
+    ///
+    /// With this set, the deliverable part must sit inside `<send>…</send>`.
+    /// Anything outside the marker is deliberation and is dropped. Silence stops
+    /// depending on the model reproducing one exact token under pressure, and
+    /// becomes the default outcome; sending becomes the deliberate act.
+    #[serde(default)]
+    pub require_explicit_send: bool,
     /// Optional fallback task text when `HEARTBEAT.md` has no task entries.
     #[serde(default)]
     pub message: Option<String>,
@@ -12608,6 +12632,8 @@ impl Default for HeartbeatConfig {
             agent: String::new(),
             interval_minutes: default_heartbeat_interval(),
             two_phase: true,
+            // Off by default: existing heartbeats keep deliver-by-default.
+            require_explicit_send: false,
             message: None,
             target: None,
             to: None,

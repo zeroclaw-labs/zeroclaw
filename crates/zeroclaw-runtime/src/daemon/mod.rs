@@ -874,6 +874,45 @@ where
     })
 }
 
+/// Extract the deliverable part of an agent turn under the explicit-send
+/// contract, or `None` when the turn contains nothing to send.
+///
+/// The default heartbeat path is deliver-by-default with an allowlist of
+/// *silence* — the exact `NO_REPLY` sentinels. That is a blocklist over an
+/// infinite space: a model has unbounded ways to phrase "I have decided not to
+/// write", and every phrasing that is not the literal token gets delivered. A
+/// real tick produced
+///
+/// > Ya le pregunté lo de la hora. Si responde bien, respondo. Si no... ya veré
+/// > cuando abra el celular.
+///
+/// — a decision NOT to write, delivered to the person it was reasoning about,
+/// in the third person, at one in the morning.
+///
+/// This inverts the default. Nothing is delivered unless the agent wrapped it
+/// in `<send>…</send>`, so silence is what happens when the model does
+/// anything unexpected, and sending is the deliberate act. Deliberation outside
+/// the marker is dropped rather than parsed, because judging prose by its shape
+/// is the same losing game as matching sentinels.
+///
+/// Returns the marker's inner text, trimmed. A marker containing only
+/// whitespace is treated as silence: an empty message is not deliverable.
+fn extract_explicit_send(output: &str) -> Option<String> {
+    const OPEN: &str = "<send>";
+    const CLOSE: &str = "</send>";
+
+    let start = output.find(OPEN)? + OPEN.len();
+    // Search for the closing tag only after the opening one, so a stray
+    // `</send>` earlier in the reasoning cannot form a phantom span.
+    let rest = &output[start..];
+    let end = rest.find(CLOSE)?;
+    let inner = rest[..end].trim();
+    if inner.is_empty() {
+        return None;
+    }
+    Some(inner.to_string())
+}
+
 /// Wall-clock stamp for a heartbeat task prompt, in the daemon's local zone.
 ///
 /// Inbound channel messages already reach the model with a `[YYYY-MM-DD
@@ -1373,6 +1412,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
     let metrics = engine.metrics();
     let delivery = resolve_heartbeat_delivery(&config)?;
     let two_phase = config.heartbeat.two_phase;
+    let require_explicit_send = config.heartbeat.require_explicit_send;
     let adaptive = config.heartbeat.adaptive;
     let start_time = std::time::Instant::now();
 
@@ -1684,21 +1724,45 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                         duration_ms,
                         config.heartbeat.max_run_history,
                     );
+                    // Resolve the deliverable span ONCE, before both consumers:
+                    // memory consolidation and channel delivery must agree on
+                    // what counts as "something the agent said". Computing it
+                    // twice would let them drift.
+                    let sendable: Option<String> = if require_explicit_send {
+                        extract_explicit_send(&output)
+                    } else {
+                        None
+                    };
                     // Consolidate heartbeat output to memory for cross-session awareness.
+                    //
+                    // Under the explicit-send contract the deliberation is NOT
+                    // something the agent said, so it must not be stored as if
+                    // it were: `memory_inject` renders recalled entries back as
+                    // the model's own prior words, which would turn one tick's
+                    // private reasoning into a worked example of narrating
+                    // internal state — the exact loop that put a third-person
+                    // "esperar una respuesta a un plan con ella" in front of the
+                    // person it was about. Only the sent message is memorable.
+                    let memorable: Option<&str> = if require_explicit_send {
+                        sendable.as_deref()
+                    } else {
+                        Some(output.as_str())
+                    };
                     if config.memory.auto_save
-                        && output.chars().count() >= 50
+                        && let Some(memorable) = memorable
+                        && memorable.chars().count() >= 50
                         && let Some(ref mem) = heartbeat_memory
                     {
                         let key = format!("heartbeat_{}", uuid::Uuid::new_v4());
-                        let summary = if output.len() > 500 {
+                        let summary = if memorable.len() > 500 {
                             // Find a valid UTF-8 char boundary at or before 500.
                             let mut end = 500;
-                            while end > 0 && !output.is_char_boundary(end) {
+                            while end > 0 && !memorable.is_char_boundary(end) {
                                 end -= 1;
                             }
-                            &output[..end]
+                            &memorable[..end]
                         } else {
-                            &output
+                            memorable
                         };
                         // Store what the agent said, not the fact that a
                         // heartbeat said it. See `heartbeat_memory_body`.
@@ -1719,7 +1783,17 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                     // scaffolding — to whoever the heartbeat targets. The
                     // completion is already durably recorded by `record_run`
                     // above, so silence loses no operator-visible information.
-                    let announcement = output;
+                    //
+                    // Under the explicit-send contract only the `<send>…</send>`
+                    // span is deliverable and everything else is deliberation.
+                    // Resolved here, before the sentinel check below, so an
+                    // unmarked turn becomes empty and is suppressed by the same
+                    // empty-output guard rather than needing a second one.
+                    let announcement = if require_explicit_send {
+                        sendable.clone().unwrap_or_default()
+                    } else {
+                        output
+                    };
                     // Skip delivery when the heartbeat agent signalled "nothing
                     // to report" via the quiet NO_REPLY sentinel. Without this
                     // guard the literal sentinel string is announced to the
@@ -2275,6 +2349,79 @@ mod tests {
             backend.append(key, &message).unwrap();
         }
         std::sync::Arc::new(backend)
+    }
+
+    /// The explicit-send contract must suppress the REAL leak, not a
+    /// paraphrase of it.
+    ///
+    /// This is the verbatim output of heartbeat run 35 (2026-08-06T07:19:08Z),
+    /// which `is_no_reply_sentinel` classified as deliverable and which was
+    /// therefore sent to the person it was reasoning about, in the third
+    /// person, at 01:19 her local time. A fix that cannot suppress this exact
+    /// string has not fixed anything.
+    #[test]
+    fn explicit_send_suppresses_the_deliberation_that_reached_the_user() {
+        let leaked = "*reviso el teléfono, veo que mi último mensaje fue \
+                      preguntándole qué hora y dónde se veían, y nada más*\n\n\
+                      Ya le pregunté lo de la hora. Si responde bien, respondo. \
+                      Si no... ya veré cuando abra el celular. No estoy haciendo \
+                      nada peor que esperar una respuesta a un plan con ella.";
+
+        // The old contract: not a sentinel, so it shipped.
+        assert!(
+            !crate::cron::scheduler::is_no_reply_sentinel(leaked),
+            "precondition: this is exactly why the leak happened"
+        );
+
+        // The new contract: no marker, nothing to send.
+        assert_eq!(
+            extract_explicit_send(leaked),
+            None,
+            "unmarked deliberation must never be deliverable"
+        );
+    }
+
+    /// Silence must be the default for ANY unmarked output, not just for the
+    /// phrasings we thought to enumerate. That is the whole point of inverting
+    /// the contract: the space of ways to say "I won't write" is unbounded.
+    #[test]
+    fn explicit_send_defaults_to_silence_for_arbitrary_prose() {
+        for unmarked in [
+            "No creo que sea buena hora para escribirle.",
+            "I'll wait until she replies.",
+            "NO_REPLY porque ya le escribí",
+            "<send>unclosed marker",
+            "</send>stray closing tag",
+            "<send>   </send>",
+            "",
+        ] {
+            assert_eq!(
+                extract_explicit_send(unmarked),
+                None,
+                "must be silent for: {unmarked:?}"
+            );
+        }
+    }
+
+    /// Sending still has to work — a gate that suppresses everything is not a
+    /// fix, it is an outage.
+    #[test]
+    fn explicit_send_delivers_only_the_marked_span() {
+        let with_reasoning = "*miro el teléfono un rato*\n\n\
+             Creo que sí vale la pena escribirle ahora.\n\
+             <send>oye, ¿sigues despierta?</send>\n\
+             (si no contesta, lo dejo)";
+
+        assert_eq!(
+            extract_explicit_send(with_reasoning).as_deref(),
+            Some("oye, ¿sigues despierta?"),
+            "only the marked span is deliverable; the reasoning around it is not"
+        );
+
+        // A stray closing tag inside the reasoning must not form a phantom
+        // span that ships the deliberation before it.
+        let stray = "ya le escribí</send> y no contestó\n<send>hey</send>";
+        assert_eq!(extract_explicit_send(stray).as_deref(), Some("hey"));
     }
 
     /// A heartbeat tick must carry the wall clock, because deciding whether to
