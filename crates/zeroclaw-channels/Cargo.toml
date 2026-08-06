@@ -130,19 +130,31 @@ rand = "0.10"
 webpki-roots = "1.0.6"
 tokio-socks = "0.5"
 
-# WhatsApp Web (optional). Pinned to oxidezap/whatsapp-rust @ cbcdd2a
+# WhatsApp Web (optional). Pinned to oxidezap/whatsapp-rust @ b5daf75
 # until upstream ships 0.6.1 to crates.io.
-whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "cbcdd2a6b931d804f3c2693554dce75e654834e3", optional = true, default-features = false, features = [
+#
+# b5daf75 (2026-07-02) is a DELIBERATE ceiling, not just "some recent commit".
+# It is the last revision before a6fb1174 "migrate from prost to buffa for
+# protobuf codegen", which rewrites every generated waproto field from
+# Option<Box<T>> to MessageField<T>. Moving past a6fb1174 is a port of
+# whatsapp_web.rs and whatsapp_storage.rs, not a pin bump — at upstream HEAD
+# this crate fails with 46 errors, versus 18 mechanical ones here.
+#
+# The floor is 3fb4729e (2026-07-01), the SHORTCAKE passkey companion-linking
+# fix for #8627; anything below it cannot complete a device link at all now
+# that WhatsApp's passkey gate is rolling out. So the usable window is
+# 3fb4729e..a6fb1174~1, and this pin sits at the top of it.
+whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "b5daf757fdb08c7cad068cdd04ea0461cc2f5f13", optional = true, default-features = false, features = [
   "tokio-runtime",
 ] }
-wacore = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "cbcdd2a6b931d804f3c2693554dce75e654834e3", optional = true, default-features = false }
-wacore-binary = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "cbcdd2a6b931d804f3c2693554dce75e654834e3", optional = true, default-features = false }
-waproto = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "cbcdd2a6b931d804f3c2693554dce75e654834e3", optional = true, default-features = false }
+wacore = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "b5daf757fdb08c7cad068cdd04ea0461cc2f5f13", optional = true, default-features = false }
+wacore-binary = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "b5daf757fdb08c7cad068cdd04ea0461cc2f5f13", optional = true, default-features = false }
+waproto = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "b5daf757fdb08c7cad068cdd04ea0461cc2f5f13", optional = true, default-features = false }
 serde-big-array = { version = "0.5", optional = true }
 
 cpal = { version = "0.18.1", optional = true }
-whatsapp-rust-ureq-http-client = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "cbcdd2a6b931d804f3c2693554dce75e654834e3", optional = true }
-whatsapp-rust-tokio-transport = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "cbcdd2a6b931d804f3c2693554dce75e654834e3", optional = true, default-features = false }
+whatsapp-rust-ureq-http-client = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "b5daf757fdb08c7cad068cdd04ea0461cc2f5f13", optional = true }
+whatsapp-rust-tokio-transport = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "b5daf757fdb08c7cad068cdd04ea0461cc2f5f13", optional = true, default-features = false }
 qrcode = { version = "0.14", optional = true }
 # `bytes` is required for the `Bytes` return types in wacore 0.6 storage
 # traits (SignalStore::get_session / load_prekey). Feature-gated to

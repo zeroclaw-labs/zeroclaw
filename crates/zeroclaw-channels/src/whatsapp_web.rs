@@ -719,7 +719,7 @@ impl WhatsAppWebChannel {
                 .await
                 .ok()
                 .flatten()
-                .map(|entry| entry.phone_number)
+                .map(|entry| entry.phone_number.to_string())
         } else {
             None
         };
@@ -1746,13 +1746,12 @@ impl WhatsAppWebChannel {
         #[allow(clippy::cast_possible_truncation)]
         let estimated_seconds = std::cmp::max(1, (upload.file_length / 4000) as u32);
 
-        // whatsapp-rust 0.6: UploadResponse cryptographic fields became
-        // `[u8; 32]` for type safety. Pull the Vec<u8> copies before
-        // consuming the strings so the partial-move on `upload.direct_path`
-        // doesn't bite.
-        let media_key = upload.media_key_vec();
-        let file_enc_sha256 = upload.file_enc_sha256_vec();
-        let file_sha256 = upload.file_sha256_vec();
+        // whatsapp-rust 0.6: UploadResponse cryptographic fields are `[u8; 32]`
+        // for type safety. Copy them out before consuming the strings so the
+        // partial-move on `upload.direct_path` doesn't bite.
+        let media_key = upload.media_key.to_vec();
+        let file_enc_sha256 = upload.file_enc_sha256.to_vec();
+        let file_sha256 = upload.file_sha256.to_vec();
         let voice_msg = waproto::whatsapp::Message {
             audio_message: Some(Box::new(waproto::whatsapp::message::AudioMessage {
                 url: Some(upload.url),
@@ -1815,9 +1814,9 @@ impl WhatsAppWebChannel {
             .await
             .map_err(|e| anyhow::Error::msg(format!("WhatsApp media upload failed: {e}")))?;
 
-        let media_key = upload.media_key_vec();
-        let file_enc_sha256 = upload.file_enc_sha256_vec();
-        let file_sha256 = upload.file_sha256_vec();
+        let media_key = upload.media_key.to_vec();
+        let file_enc_sha256 = upload.file_enc_sha256.to_vec();
+        let file_sha256 = upload.file_sha256.to_vec();
         let outgoing = match marker.kind {
             WhatsAppMediaKind::Image => waproto::whatsapp::Message {
                 image_message: Some(Box::new(waproto::whatsapp::message::ImageMessage {
@@ -2730,7 +2729,7 @@ impl Channel for WhatsAppWebChannel {
             };
 
             let mut builder = Bot::builder()
-                .with_backend(backend)
+                .with_backend_arc(backend)
                 .with_transport_factory(transport_factory)
                 .with_http_client(http_client)
                 .with_runtime(TokioRuntime)
@@ -2773,8 +2772,7 @@ impl Channel for WhatsAppWebChannel {
                                 WhatsAppWebChannel::reset_retry(&retry_count);
                                 let device = client
                                     .persistence_manager()
-                                    .get_device_snapshot()
-                                    .await;
+                                    .get_device_snapshot();
                                 // Resolve bot identity from the device store
                                 if mention_only {
                                     if let Some(ref pn) = device.pn
@@ -2833,6 +2831,61 @@ impl Channel for WhatsAppWebChannel {
                                 eprintln!("pair code: {code}");
                                 eprintln!();
                             }
+                            // WhatsApp's SHORTCAKE passkey gate (server-side
+                            // rollout from 2026-06-30). Linking now demands a
+                            // WebAuthn assertion signed by a passkey already
+                            // registered to the account. Without a registered
+                            // `PasskeyAuthenticator` the library cannot answer
+                            // it, so the QR loop would otherwise spin forever
+                            // with nothing in the logs. Surface it instead.
+                            Event::PairPasskeyRequest(_) => {
+                                crate::login_events::LoginEvent::Failed {
+                                    reason: "whatsapp_passkey_required",
+                                }
+                                .emit(
+                                    "whatsapp",
+                                    alias.as_ref(),
+                                    "WhatsApp requires a passkey to link this device; ZeroClaw cannot complete the WebAuthn step on its own",
+                                );
+                                ::zeroclaw_log::record!(
+                                    ERROR,
+                                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                                    "WhatsApp Web linking requires a passkey (SHORTCAKE); no authenticator is configured, so this link attempt cannot complete"
+                                );
+                            }
+                            Event::PairPasskeyConfirmation(confirmation) => {
+                                ::zeroclaw_log::record!(
+                                    INFO,
+                                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                                    "WhatsApp Web passkey verification code received"
+                                );
+                                eprintln!();
+                                eprintln!(
+                                    "WhatsApp passkey verification code: {}",
+                                    confirmation.code
+                                );
+                                eprintln!();
+                            }
+                            Event::PairPasskeyError(err) => {
+                                crate::login_events::LoginEvent::Failed {
+                                    reason: err.error.as_str(),
+                                }
+                                .emit(
+                                    "whatsapp",
+                                    alias.as_ref(),
+                                    "WhatsApp Web passkey linking failed",
+                                );
+                                ::zeroclaw_log::record!(
+                                    ERROR,
+                                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                                    &format!(
+                                        "WhatsApp Web passkey linking failed: {} (continuation: {})",
+                                        err.error, err.continuation
+                                    )
+                                );
+                            }
                             Event::PairingQrCode { code, .. } => {
                                 crate::login_events::LoginEvent::Qr {
                                     payload: code.as_str(),
@@ -2888,11 +2941,14 @@ impl Channel for WhatsAppWebChannel {
                 );
             }
 
-            let mut bot = builder.build().await?;
+            let bot = builder.build().await?;
             *self.client.lock() = Some(bot.client());
 
-            // Run the bot
-            let bot_handle = bot.run().await?;
+            // Start the bot in the background. `Bot::run` now consumes the bot
+            // and drives the loop to completion in-place; `spawn` is the
+            // handle-returning form this channel needs so it can await a
+            // logout signal and shut the bot down on its own terms.
+            let bot_handle = bot.spawn();
 
             // Store the bot handle for later shutdown
             *self.bot_handle.lock() = Some(bot_handle);
@@ -2923,11 +2979,11 @@ impl Channel for WhatsAppWebChannel {
                 let _ = handle.await;
             }
 
-            // Drop bot/device so the SQLite connection is closed
-            // before we remove session files (releases WAL/SHM locks).
-            // `backend` was moved into the builder, so dropping `bot`
-            // releases the last Arc reference to the storage backend.
-            drop(bot);
+            // Drop the device so the SQLite connection is closed before we
+            // remove session files (releases WAL/SHM locks). `backend` was
+            // moved into the builder and then into the spawned task, so the
+            // awaited handle above is what releases the storage backend's
+            // last Arc reference — there is no local `bot` left to drop.
             drop(device);
 
             if should_reconnect {
@@ -3953,7 +4009,7 @@ mod tests {
 
         let cache = Arc::new(TestCacheStore::default());
         let bot = Bot::builder()
-            .with_backend(store.clone())
+            .with_backend_arc(store.clone())
             .with_transport_factory(TokioWebSocketTransportFactory::new())
             .with_http_client(UreqHttpClient::new())
             .with_runtime(TokioRuntime)
