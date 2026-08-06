@@ -718,6 +718,8 @@ where
         if std::fs::remove_file(&temp_path).is_ok() {
             temp_guard.disarm();
         }
+        // Sync parent dir so the new directory entry is crash-durable.
+        sync_parent_dir(key_path)?;
     }
 
     // Windows: MoveFileExW(temp, final, 0) — atomic rename WITHOUT
@@ -726,15 +728,36 @@ where
     #[cfg(windows)]
     {
         match move_file_no_replace(&temp_path, key_path) {
-            Ok(()) => temp_guard.disarm(), // temp renamed away — nothing to remove
+            Ok(()) => {
+                temp_guard.disarm(); // temp renamed away — nothing to remove
+            }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 return Err(e)
                     .context("Key file already exists — another process created it concurrently");
             }
             Err(e) => return Err(e).context("Failed to atomically publish key file"),
         }
+        // Sync parent dir so the renamed entry is crash-durable.
+        sync_parent_dir(key_path)?;
     }
 
+    Ok(())
+}
+
+/// Sync the parent directory so the new directory entry is crash-durable.
+/// `sync_all()` on a directory fd calls `fsync` (Unix) or `FlushFileBuffers`
+/// (Windows); both flush the directory metadata to the underlying volume.
+fn sync_parent_dir(file_path: &Path) -> Result<()> {
+    if let Some(parent) = file_path.parent() {
+        std::fs::File::open(parent)
+            .and_then(|d| d.sync_all())
+            .with_context(|| {
+                format!(
+                    "Failed to sync parent directory '{}' after key publication",
+                    parent.display()
+                )
+            })?;
+    }
     Ok(())
 }
 
@@ -1986,6 +2009,17 @@ exit 65
             0o600,
             "Key file must be 0o600 immediately after write_key_file returns"
         );
+    }
+
+    // Smoke-test: sync_parent_dir on a live key file must not error.
+    #[test]
+    fn sync_parent_dir_smoke() {
+        let tmp = TempDir::new().unwrap();
+        let key_path = tmp.path().join(".secret_key");
+        let key = generate_random_key();
+        write_key_file(&key_path, &key).unwrap();
+        // Already called during publication; exercise helper directly.
+        sync_parent_dir(&key_path).unwrap();
     }
 
     // Verifies that write_key_file applies a non-inherited DACL before key bytes
