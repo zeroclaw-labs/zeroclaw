@@ -2881,19 +2881,26 @@ impl Channel for WhatsAppWebChannel {
                             | Event::PairPasskeyError(_)) => {
                                 match Self::passkey_notice(passkey_event) {
                                     Some(PasskeyNotice::Required) => {
-                                        crate::login_events::LoginEvent::Failed {
-                                            reason: "whatsapp_passkey_required",
+                                        // Not a failure: the registered
+                                        // authenticator is now waiting for the
+                                        // operator to drop an assertion file,
+                                        // and it logs the exact paths itself.
+                                        crate::login_events::LoginEvent::Qr {
+                                            payload: "",
+                                            image_url: None,
+                                            attempt: None,
+                                            max_attempts: None,
                                         }
                                         .emit(
                                             "whatsapp",
                                             alias.as_ref(),
-                                            "WhatsApp requires a passkey to link this device; ZeroClaw cannot complete the WebAuthn step on its own",
+                                            "WhatsApp requires a passkey assertion to link this device — awaiting the operator's WebAuthn ceremony",
                                         );
                                         ::zeroclaw_log::record!(
-                                            ERROR,
-                                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                                                .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                                            "WhatsApp Web linking requires a passkey (SHORTCAKE); no authenticator is configured, so this link attempt cannot complete"
+                                            WARN,
+                                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                                            "WhatsApp Web linking requires a passkey (SHORTCAKE); the file broker is waiting for a signed assertion"
                                         );
                                     }
                                     Some(PasskeyNotice::Confirm { code }) => {
@@ -2983,7 +2990,25 @@ impl Channel for WhatsAppWebChannel {
             }
 
             let bot = builder.build().await?;
-            *self.client.lock() = Some(bot.client());
+            let client = bot.client();
+
+            // Answer WhatsApp's SHORTCAKE passkey gate. With an authenticator
+            // registered the library drives the assertion step itself (and
+            // auto-confirms a re-link, where the handoff proof already proves
+            // continuity); without one it can only emit the events the handler
+            // above surfaces, and linking stalls. The broker waits on a file
+            // beside this session, so nothing here blocks the run loop until
+            // the server actually demands an assertion.
+            client
+                .set_passkey_authenticator(
+                    crate::whatsapp_passkey::FilePasskeyAuthenticator::new(
+                        expanded_session_path.clone(),
+                    )
+                    .into_arc(),
+                )
+                .await;
+
+            *self.client.lock() = Some(client);
 
             // Start the bot in the background. `Bot::run` now consumes the bot
             // and drives the loop to completion in-place; `spawn` is the
