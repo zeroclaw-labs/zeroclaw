@@ -1059,7 +1059,9 @@ impl BrowserTool {
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure),
                 "browser: screenshot args must be a JSON object"
             );
-            anyhow::Error::msg("screenshot args must be a JSON object")
+            anyhow::Error::msg(crate::i18n::get_required_tool_string(
+                "tool-browser-screenshot-error-args-not-object",
+            ))
         })?;
 
         // Remove path from params - we'll handle the write locally after validation
@@ -1133,7 +1135,9 @@ impl BrowserTool {
                         .and_then(|d| d.get("png_base64"))
                         .and_then(|v| v.as_str())
                         .ok_or_else(|| {
-                            anyhow::Error::msg("computer-use sidecar did not return PNG data")
+                            anyhow::Error::msg(crate::i18n::get_required_tool_string(
+                                "tool-browser-screenshot-error-sidecar-no-png-data",
+                            ))
                         })?;
 
                     // Decode and validate the PNG payload: it must decode to a
@@ -1145,12 +1149,16 @@ impl BrowserTool {
                         .decode(png_data)
                         .with_context(|| "Failed to decode PNG base64 data")?;
                     if png_bytes.is_empty() {
-                        anyhow::bail!("computer-use sidecar returned an empty screenshot payload");
+                        anyhow::bail!(crate::i18n::get_required_tool_string(
+                            "tool-browser-screenshot-error-sidecar-empty-png",
+                        ));
                     }
                     const PNG_SIGNATURE: &[u8] =
                         &[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
                     if !png_bytes.starts_with(PNG_SIGNATURE) {
-                        anyhow::bail!("computer-use sidecar returned a non-PNG screenshot payload");
+                        anyhow::bail!(crate::i18n::get_required_tool_string(
+                            "tool-browser-screenshot-error-sidecar-not-png",
+                        ));
                     }
 
                     tokio::fs::write(path_str, &png_bytes)
@@ -1214,11 +1222,9 @@ impl BrowserTool {
                 return Ok(ToolResult {
                     success: false,
                     output: ToolOutput::default(),
-                    error: Some(
-                        "computer-use sidecar returned a non-JSON success response for a \
-                         path-bearing screenshot; the requested file was not written"
-                            .into(),
-                    ),
+                    error: Some(crate::i18n::get_required_tool_string(
+                        "tool-browser-screenshot-error-sidecar-non-json-success",
+                    )),
                 });
             }
             return Ok(ToolResult {
@@ -2401,9 +2407,9 @@ fn parse_browser_action(action_str: &str, args: &Value) -> anyhow::Result<Browse
                         .and_then(serde_json::Value::as_bool)
                         .unwrap_or(false),
                 }),
-                Some(_) => Err(anyhow::Error::msg(
-                    "screenshot 'path' must be a string or absent",
-                )),
+                Some(_) => Err(anyhow::Error::msg(crate::i18n::get_required_tool_string(
+                    "tool-browser-screenshot-error-non-string-path",
+                ))),
             }
         }
         "wait" => Ok(BrowserAction::Wait {
