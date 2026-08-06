@@ -63,6 +63,91 @@ fn record_provider_fallback(
     });
 }
 
+struct ProviderFallbackRecord {
+    requested_provider: String,
+    requested_model: String,
+    actual_provider: String,
+    actual_model: String,
+}
+
+impl ProviderFallbackRecord {
+    fn new_if_recovered(
+        requested_provider: &str,
+        requested_model: &str,
+        actual_provider: &str,
+        actual_model: &str,
+    ) -> Option<Self> {
+        if requested_provider == actual_provider && requested_model == actual_model {
+            return None;
+        }
+
+        Some(Self {
+            requested_provider: requested_provider.to_string(),
+            requested_model: requested_model.to_string(),
+            actual_provider: actual_provider.to_string(),
+            actual_model: actual_model.to_string(),
+        })
+    }
+
+    fn record(&self) {
+        record_provider_fallback(
+            &self.requested_provider,
+            &self.requested_model,
+            &self.actual_provider,
+            &self.actual_model,
+        );
+    }
+}
+
+fn stream_with_success_recording<T, IsFinal>(
+    rx: tokio::sync::mpsc::Receiver<StreamResult<T>>,
+    guard: AbortOnDrop,
+    fallback_record: Option<ProviderFallbackRecord>,
+    is_final: IsFinal,
+) -> stream::BoxStream<'static, StreamResult<T>>
+where
+    T: Send + 'static,
+    IsFinal: Fn(&T) -> bool + Send + 'static,
+{
+    stream::unfold(
+        (rx, guard, fallback_record, false, false, is_final),
+        |(mut rx, guard, fallback_record, saw_error, recorded, is_final)| async move {
+            match rx.recv().await {
+                Some(event) => {
+                    let mut saw_error = saw_error;
+                    let mut recorded = recorded;
+                    match &event {
+                        Ok(value) if !saw_error && !recorded && is_final(value) => {
+                            if let Some(record) = &fallback_record {
+                                record.record();
+                            }
+                            recorded = true;
+                        }
+                        Err(_) => {
+                            saw_error = true;
+                        }
+                        Ok(_) => {}
+                    }
+                    Some((
+                        event,
+                        (rx, guard, fallback_record, saw_error, recorded, is_final),
+                    ))
+                }
+                None => {
+                    if !saw_error
+                        && !recorded
+                        && let Some(record) = &fallback_record
+                    {
+                        record.record();
+                    }
+                    None
+                }
+            }
+        },
+    )
+    .boxed()
+}
+
 pub fn transient_error_hint(err: &anyhow::Error) -> Option<&'static str> {
     let msg = err.to_string();
     // 503 / service unavailable / high demand (Gemini, OpenAI, etc.)
@@ -543,11 +628,25 @@ fn provider_exhausted_attrs(
     })
 }
 
-/// Truncate conversation history by dropping the oldest non-system messages.
-/// Returns the number of messages dropped. Keeps at least the system message
-/// (if any) and the most recent user message.
+fn is_context_turn_boundary(message: &ChatMessage) -> bool {
+    message.role == "user"
+        && !crate::multimodal::is_prompt_tool_result_message(message)
+        && !message.is_pruned_context_separator()
+}
+
+fn context_truncation_limit(messages: &[ChatMessage]) -> &'static str {
+    if messages.iter().any(is_context_turn_boundary) {
+        "only one complete user turn remains"
+    } else {
+        "history contains no complete user turn"
+    }
+}
+
+/// Truncate conversation history at a user-turn boundary near the oldest half.
+/// Returns the number of non-system messages dropped while keeping at least the
+/// most recent complete turn and preserving tool calls with all of their
+/// results.
 fn truncate_for_context(messages: &mut Vec<ChatMessage>) -> usize {
-    // Find all non-system message indices
     let non_system: Vec<usize> = messages
         .iter()
         .enumerate()
@@ -555,21 +654,36 @@ fn truncate_for_context(messages: &mut Vec<ChatMessage>) -> usize {
         .map(|(i, _)| i)
         .collect();
 
-    // Keep at least the last non-system message (most recent user turn)
-    if non_system.len() <= 1 {
+    let turn_boundaries: Vec<usize> = non_system
+        .iter()
+        .enumerate()
+        .filter_map(|(position, &message_index)| {
+            is_context_turn_boundary(&messages[message_index]).then_some(position)
+        })
+        .collect();
+    if turn_boundaries.len() <= 1 {
         return 0;
     }
 
-    // Drop the oldest half of non-system messages
-    let drop_count = non_system.len() / 2;
-    let indices_to_remove: Vec<usize> = non_system[..drop_count].to_vec();
+    let target_drop = non_system.len() / 2;
+    let Some(&last_boundary) = turn_boundaries.last() else {
+        return 0;
+    };
+    let first_kept_position = turn_boundaries
+        .iter()
+        .copied()
+        .skip(1)
+        .find(|&position| position >= target_drop)
+        .unwrap_or(last_boundary);
+    let first_kept_index = non_system[first_kept_position];
+    let mut original_index = 0usize;
+    messages.retain(|message| {
+        let keep = message.role == "system" || original_index >= first_kept_index;
+        original_index += 1;
+        keep
+    });
 
-    // Remove in reverse order to preserve indices
-    for &idx in indices_to_remove.iter().rev() {
-        messages.remove(idx);
-    }
-
-    drop_count
+    first_kept_position
 }
 
 fn push_failure(
@@ -606,10 +720,31 @@ fn is_empty_completion(resp: &ChatResponse) -> bool {
             .is_none_or(|r| r.trim().is_empty())
 }
 
+enum ReliableModelProviderEntryProvider {
+    Direct(Box<dyn ModelProvider>),
+    Pinned(crate::model_pin::ModelPinnedProvider),
+}
+
+impl ReliableModelProviderEntryProvider {
+    fn as_model_provider(&self) -> &dyn ModelProvider {
+        match self {
+            Self::Direct(provider) => provider.as_ref(),
+            Self::Pinned(provider) => provider,
+        }
+    }
+
+    fn served_model<'a>(&'a self, requested_model: &'a str) -> &'a str {
+        match self {
+            Self::Direct(_) => requested_model,
+            Self::Pinned(provider) => provider.pinned_model(),
+        }
+    }
+}
+
 pub(crate) struct ReliableModelProviderEntry {
     display_name: String,
     cooldown_key: String,
-    provider: Box<dyn ModelProvider>,
+    provider: ReliableModelProviderEntryProvider,
 }
 
 impl ReliableModelProviderEntry {
@@ -621,8 +756,41 @@ impl ReliableModelProviderEntry {
         Self {
             display_name: display_name.into(),
             cooldown_key: cooldown_key.into(),
-            provider,
+            provider: ReliableModelProviderEntryProvider::Direct(provider),
         }
+    }
+
+    /// Build an entry that serves `pinned_model` regardless of the requested
+    /// model. The [`crate::model_pin::ModelPinnedProvider`] wrapper is the
+    /// source of truth for the pinned model; this entry reads it from the
+    /// wrapper at use-time.
+    pub(crate) fn new_pinned(
+        display_name: impl Into<String>,
+        cooldown_key: impl Into<String>,
+        alias: &str,
+        pinned_model: &str,
+        inner: Box<dyn ModelProvider>,
+    ) -> Self {
+        Self {
+            display_name: display_name.into(),
+            cooldown_key: cooldown_key.into(),
+            provider: ReliableModelProviderEntryProvider::Pinned(
+                crate::model_pin::ModelPinnedProvider::builder(alias)
+                    .pinned_model(pinned_model)
+                    .inner(inner)
+                    .build(),
+            ),
+        }
+    }
+
+    /// Model this entry serves for `requested_model`: the pinned model when
+    /// the entry is model-pinned, otherwise the requested model unchanged.
+    fn served_model<'a>(&'a self, requested_model: &'a str) -> &'a str {
+        self.provider.served_model(requested_model)
+    }
+
+    fn provider(&self) -> &dyn ModelProvider {
+        self.provider.as_model_provider()
     }
 }
 
@@ -845,7 +1013,7 @@ impl ModelProvider for ReliableModelProvider {
                     .with_attrs(::serde_json::json!({"model_provider": provider_name})),
                 "Warming up model_provider connection pool"
             );
-            if ProviderDispatch::from_ref(entry.provider.as_ref())
+            if ProviderDispatch::from_ref(entry.provider())
                 .warmup()
                 .await
                 .is_err()
@@ -890,7 +1058,7 @@ impl ModelProvider for ReliableModelProvider {
                 let mut last_diagnostic: Option<ProviderErrorDiagnostic> = None;
 
                 for attempt in 0..=self.max_retries {
-                    match ProviderDispatch::from_ref(entry.provider.as_ref())
+                    match ProviderDispatch::from_ref(entry.provider())
                         .chat_with_system(system_prompt, message, current_model, temperature)
                         .await
                     {
@@ -908,15 +1076,16 @@ impl ModelProvider for ReliableModelProvider {
                                 .await;
                                 continue;
                             }
+                            let served_model = entry.served_model(current_model);
                             if attempt > 0
-                                || *current_model != model
+                                || served_model != model
                                 || self
                                     .model_providers
                                     .first()
                                     .map(|entry| entry.display_name.as_str())
                                     != Some(provider_name)
                             {
-                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": *current_model, "attempt": attempt, "original_model": model})), "ModelProvider recovered (failover/retry)");
+                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": served_model, "attempt": attempt, "original_model": model})), "ModelProvider recovered (failover/retry)");
                                 let primary = self
                                     .model_providers
                                     .first()
@@ -926,7 +1095,7 @@ impl ModelProvider for ReliableModelProvider {
                                     primary,
                                     model,
                                     provider_name,
-                                    current_model,
+                                    served_model,
                                 );
                             }
                             return Ok(resp);
@@ -1088,7 +1257,7 @@ impl ModelProvider for ReliableModelProvider {
                 let mut last_diagnostic: Option<ProviderErrorDiagnostic> = None;
 
                 for attempt in 0..=self.max_retries {
-                    match ProviderDispatch::from_ref(entry.provider.as_ref())
+                    match ProviderDispatch::from_ref(entry.provider())
                         .chat_with_history(&effective_messages, current_model, temperature)
                         .await
                     {
@@ -1106,8 +1275,9 @@ impl ModelProvider for ReliableModelProvider {
                                 .await;
                                 continue;
                             }
+                            let served_model = entry.served_model(current_model);
                             if attempt > 0
-                                || *current_model != model
+                                || served_model != model
                                 || context_truncated
                                 || self
                                     .model_providers
@@ -1115,7 +1285,7 @@ impl ModelProvider for ReliableModelProvider {
                                     .map(|entry| entry.display_name.as_str())
                                     != Some(provider_name)
                             {
-                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": *current_model, "attempt": attempt, "original_model": model, "context_truncated": context_truncated})), "ModelProvider recovered (failover/retry)");
+                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": served_model, "attempt": attempt, "original_model": model, "context_truncated": context_truncated})), "ModelProvider recovered (failover/retry)");
                                 let primary = self
                                     .model_providers
                                     .first()
@@ -1125,7 +1295,7 @@ impl ModelProvider for ReliableModelProvider {
                                     primary,
                                     model,
                                     provider_name,
-                                    current_model,
+                                    served_model,
                                 );
                             }
                             return Ok(resp);
@@ -1139,10 +1309,10 @@ impl ModelProvider for ReliableModelProvider {
                                     ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": *current_model, "dropped": dropped, "remaining": effective_messages.len()})), "Context window exceeded; truncated history and retrying");
                                     continue; // Retry with truncated messages (counts as an attempt)
                                 }
-                                // Nothing to truncate (system prompt alone exceeds
-                                // the model's context window) — bail immediately
-                                // instead of wasting retry attempts.
+                                // No complete older turn can be removed safely.
                                 let error_detail = compact_error_detail(&e);
+                                let truncation_limit =
+                                    context_truncation_limit(&effective_messages);
                                 push_failure(
                                     &mut failures,
                                     provider_name,
@@ -1154,7 +1324,8 @@ impl ModelProvider for ReliableModelProvider {
                                     None,
                                 );
                                 anyhow::bail!(
-                                    "Request exceeds model context window and cannot be reduced further. \
+                                    "Request exceeds model context window and cannot be reduced without \
+                                     breaking message/tool pairing ({truncation_limit}). \
                                      Try using a model with a larger context window, reducing the number \
                                      of tools/skills, or enabling compact_context in config. Attempts:\n{}",
                                     failures.join("\n")
@@ -1270,7 +1441,7 @@ impl ModelProvider for ReliableModelProvider {
         let mut capabilities = self
             .model_providers
             .first()
-            .map(|entry| entry.provider.capabilities())
+            .map(|entry| entry.provider().capabilities())
             .unwrap_or_default();
         // A request may advance past the primary after a retryable failure.
         // Report vision only when every reachable provider can accept images;
@@ -1280,7 +1451,7 @@ impl ModelProvider for ReliableModelProvider {
             && self
                 .model_providers
                 .iter()
-                .all(|entry| entry.provider.supports_vision());
+                .all(|entry| entry.provider().supports_vision());
         capabilities
     }
 
@@ -1288,20 +1459,20 @@ impl ModelProvider for ReliableModelProvider {
         let mut capabilities = self
             .model_providers
             .first()
-            .map(|entry| entry.provider.capabilities_for_model(model))
+            .map(|entry| entry.provider().capabilities_for_model(model))
             .unwrap_or_default();
         capabilities.vision = !self.model_providers.is_empty()
             && self
                 .model_providers
                 .iter()
-                .all(|entry| entry.provider.capabilities_for_model(model).vision);
+                .all(|entry| entry.provider().capabilities_for_model(model).vision);
         capabilities
     }
 
     fn supports_native_tools(&self) -> bool {
         self.model_providers
             .first()
-            .map(|entry| entry.provider.supports_native_tools())
+            .map(|entry| entry.provider().supports_native_tools())
             .unwrap_or(false)
     }
 
@@ -1335,7 +1506,7 @@ impl ModelProvider for ReliableModelProvider {
                 let mut last_diagnostic: Option<ProviderErrorDiagnostic> = None;
 
                 for attempt in 0..=self.max_retries {
-                    match ProviderDispatch::from_ref(entry.provider.as_ref())
+                    match ProviderDispatch::from_ref(entry.provider())
                         .chat_with_tools(&effective_messages, tools, current_model, temperature)
                         .await
                     {
@@ -1354,8 +1525,9 @@ impl ModelProvider for ReliableModelProvider {
                                 .await;
                                 continue;
                             }
+                            let served_model = entry.served_model(current_model);
                             if attempt > 0
-                                || *current_model != model
+                                || served_model != model
                                 || context_truncated
                                 || self
                                     .model_providers
@@ -1363,7 +1535,7 @@ impl ModelProvider for ReliableModelProvider {
                                     .map(|entry| entry.display_name.as_str())
                                     != Some(provider_name)
                             {
-                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": *current_model, "attempt": attempt, "original_model": model, "context_truncated": context_truncated})), "ModelProvider recovered (failover/retry)");
+                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": served_model, "attempt": attempt, "original_model": model, "context_truncated": context_truncated})), "ModelProvider recovered (failover/retry)");
                                 let primary = self
                                     .model_providers
                                     .first()
@@ -1373,7 +1545,7 @@ impl ModelProvider for ReliableModelProvider {
                                     primary,
                                     model,
                                     provider_name,
-                                    current_model,
+                                    served_model,
                                 );
                             }
                             return Ok(resp);
@@ -1387,10 +1559,10 @@ impl ModelProvider for ReliableModelProvider {
                                     ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": *current_model, "dropped": dropped, "remaining": effective_messages.len()})), "Context window exceeded; truncated history and retrying");
                                     continue; // Retry with truncated messages (counts as an attempt)
                                 }
-                                // Nothing to truncate (system prompt alone exceeds
-                                // the model's context window) — bail immediately
-                                // instead of wasting retry attempts.
+                                // No complete older turn can be removed safely.
                                 let error_detail = compact_error_detail(&e);
+                                let truncation_limit =
+                                    context_truncation_limit(&effective_messages);
                                 push_failure(
                                     &mut failures,
                                     provider_name,
@@ -1402,7 +1574,8 @@ impl ModelProvider for ReliableModelProvider {
                                     None,
                                 );
                                 anyhow::bail!(
-                                    "Request exceeds model context window and cannot be reduced further. \
+                                    "Request exceeds model context window and cannot be reduced without \
+                                     breaking message/tool pairing ({truncation_limit}). \
                                      Try using a model with a larger context window, reducing the number \
                                      of tools/skills, or enabling compact_context in config. Attempts:\n{}",
                                     failures.join("\n")
@@ -1544,7 +1717,7 @@ impl ModelProvider for ReliableModelProvider {
                         tools: request.tools,
                         thinking: request.thinking,
                     };
-                    match ProviderDispatch::from_ref(entry.provider.as_ref())
+                    match ProviderDispatch::from_ref(entry.provider())
                         .chat(req, current_model, temperature)
                         .await
                     {
@@ -1563,8 +1736,9 @@ impl ModelProvider for ReliableModelProvider {
                                 .await;
                                 continue;
                             }
+                            let served_model = entry.served_model(current_model);
                             if attempt > 0
-                                || *current_model != model
+                                || served_model != model
                                 || context_truncated
                                 || self
                                     .model_providers
@@ -1572,7 +1746,7 @@ impl ModelProvider for ReliableModelProvider {
                                     .map(|entry| entry.display_name.as_str())
                                     != Some(provider_name)
                             {
-                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": *current_model, "attempt": attempt, "original_model": model, "context_truncated": context_truncated})), "ModelProvider recovered (failover/retry)");
+                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": served_model, "attempt": attempt, "original_model": model, "context_truncated": context_truncated})), "ModelProvider recovered (failover/retry)");
                                 let primary = self
                                     .model_providers
                                     .first()
@@ -1582,7 +1756,7 @@ impl ModelProvider for ReliableModelProvider {
                                     primary,
                                     model,
                                     provider_name,
-                                    current_model,
+                                    served_model,
                                 );
                             }
                             return Ok(resp);
@@ -1596,10 +1770,10 @@ impl ModelProvider for ReliableModelProvider {
                                     ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": *current_model, "dropped": dropped, "remaining": effective_messages.len()})), "Context window exceeded; truncated history and retrying");
                                     continue; // Retry with truncated messages (counts as an attempt)
                                 }
-                                // Nothing to truncate (system prompt alone exceeds
-                                // the model's context window) — bail immediately
-                                // instead of wasting retry attempts.
+                                // No complete older turn can be removed safely.
                                 let error_detail = compact_error_detail(&e);
+                                let truncation_limit =
+                                    context_truncation_limit(&effective_messages);
                                 push_failure(
                                     &mut failures,
                                     provider_name,
@@ -1611,7 +1785,8 @@ impl ModelProvider for ReliableModelProvider {
                                     None,
                                 );
                                 anyhow::bail!(
-                                    "Request exceeds model context window and cannot be reduced further. \
+                                    "Request exceeds model context window and cannot be reduced without \
+                                     breaking message/tool pairing ({truncation_limit}). \
                                      Try using a model with a larger context window, reducing the number \
                                      of tools/skills, or enabling compact_context in config. Attempts:\n{}",
                                     failures.join("\n")
@@ -1730,13 +1905,13 @@ impl ModelProvider for ReliableModelProvider {
     fn supports_streaming(&self) -> bool {
         self.model_providers
             .iter()
-            .any(|entry| entry.provider.supports_streaming())
+            .any(|entry| entry.provider().supports_streaming())
     }
 
     fn supports_streaming_tool_events(&self) -> bool {
         self.model_providers
             .iter()
-            .any(|entry| entry.provider.supports_streaming_tool_events())
+            .any(|entry| entry.provider().supports_streaming_tool_events())
     }
 
     fn stream_chat(
@@ -1750,7 +1925,7 @@ impl ModelProvider for ReliableModelProvider {
 
         for entry in &self.model_providers {
             let provider_name = entry.display_name.as_str();
-            let model_provider = entry.provider.as_ref();
+            let model_provider = entry.provider();
             if !model_provider.supports_streaming() || !options.enabled {
                 continue;
             }
@@ -1772,6 +1947,16 @@ impl ModelProvider for ReliableModelProvider {
                 .copied()
                 .unwrap_or(model)
                 .to_string();
+            let served_model = entry.served_model(&current_model).to_string();
+            let fallback_record = ProviderFallbackRecord::new_if_recovered(
+                self.model_providers
+                    .first()
+                    .map(|entry| entry.display_name.as_str())
+                    .unwrap_or(""),
+                model,
+                provider_name,
+                &served_model,
+            );
 
             let req = ChatRequest {
                 messages: request.messages,
@@ -1799,10 +1984,9 @@ impl ModelProvider for ReliableModelProvider {
             });
 
             let guard = AbortOnDrop::new(handle.abort_handle());
-            return stream::unfold((rx, guard), |(mut rx, guard)| async move {
-                rx.recv().await.map(|event| (event, (rx, guard)))
-            })
-            .boxed();
+            return stream_with_success_recording(rx, guard, fallback_record, |event| {
+                matches!(event, StreamEvent::Final)
+            });
         }
 
         let message = if needs_tool_events {
@@ -1825,7 +2009,7 @@ impl ModelProvider for ReliableModelProvider {
         // For streaming, we use the first model_provider that supports it and has streaming enabled
         for entry in &self.model_providers {
             let provider_name = entry.display_name.as_str();
-            let model_provider = entry.provider.as_ref();
+            let model_provider = entry.provider();
             if !model_provider.supports_streaming() || !options.enabled {
                 continue;
             }
@@ -1843,6 +2027,16 @@ impl ModelProvider for ReliableModelProvider {
                 Some(m) => (*m).to_string(),
                 None => model.to_string(),
             };
+            let served_model = entry.served_model(&current_model).to_string();
+            let fallback_record = ProviderFallbackRecord::new_if_recovered(
+                self.model_providers
+                    .first()
+                    .map(|entry| entry.display_name.as_str())
+                    .unwrap_or(""),
+                model,
+                provider_name,
+                &served_model,
+            );
 
             // For streaming, we attempt once and propagate errors
             // The caller can retry the entire request if needed
@@ -1871,10 +2065,9 @@ impl ModelProvider for ReliableModelProvider {
 
             // Convert channel receiver to stream
             let guard = AbortOnDrop::new(handle.abort_handle());
-            return stream::unfold((rx, guard), |(mut rx, guard)| async move {
-                rx.recv().await.map(|chunk| (chunk, (rx, guard)))
-            })
-            .boxed();
+            return stream_with_success_recording(rx, guard, fallback_record, |chunk| {
+                chunk.is_final
+            });
         }
 
         // No streaming support available
@@ -1898,7 +2091,7 @@ impl ModelProvider for ReliableModelProvider {
         // model_provider's stream_chat_with_history, preserving the full conversation.
         for entry in &self.model_providers {
             let provider_name = entry.display_name.as_str();
-            let model_provider = entry.provider.as_ref();
+            let model_provider = entry.provider();
             if !model_provider.supports_streaming() || !options.enabled {
                 continue;
             }
@@ -1914,6 +2107,16 @@ impl ModelProvider for ReliableModelProvider {
                 Some(m) => (*m).to_string(),
                 None => model.to_string(),
             };
+            let served_model = entry.served_model(&current_model).to_string();
+            let fallback_record = ProviderFallbackRecord::new_if_recovered(
+                self.model_providers
+                    .first()
+                    .map(|entry| entry.display_name.as_str())
+                    .unwrap_or(""),
+                model,
+                provider_name,
+                &served_model,
+            );
 
             let stream = model_provider.stream_chat_with_history(
                 messages,
@@ -1937,10 +2140,9 @@ impl ModelProvider for ReliableModelProvider {
             });
 
             let guard = AbortOnDrop::new(handle.abort_handle());
-            return stream::unfold((rx, guard), |(mut rx, guard)| async move {
-                rx.recv().await.map(|chunk| (chunk, (rx, guard)))
-            })
-            .boxed();
+            return stream_with_success_recording(rx, guard, fallback_record, |chunk| {
+                chunk.is_final
+            });
         }
 
         // No streaming support available
@@ -1956,7 +2158,7 @@ impl ModelProvider for ReliableModelProvider {
 impl ::zeroclaw_api::attribution::Attributable for ReliableModelProvider {
     fn role(&self) -> ::zeroclaw_api::attribution::Role {
         match self.model_providers.first() {
-            Some(entry) => ::zeroclaw_api::attribution::Attributable::role(&*entry.provider),
+            Some(entry) => ::zeroclaw_api::attribution::Attributable::role(entry.provider()),
             None => ::zeroclaw_api::attribution::Role::System,
         }
     }
@@ -1966,7 +2168,7 @@ impl ::zeroclaw_api::attribution::Attributable for ReliableModelProvider {
         // as `role()`. Falls back to the wrapper's own configured alias
         // when no inner provider is registered.
         match self.model_providers.first() {
-            Some(entry) => ::zeroclaw_api::attribution::Attributable::alias(&*entry.provider),
+            Some(entry) => ::zeroclaw_api::attribution::Attributable::alias(entry.provider()),
             None => &self.alias,
         }
     }
@@ -2158,6 +2360,105 @@ mod tests {
         assert_eq!(result, "from fallback");
         assert_eq!(primary_calls.load(Ordering::SeqCst), 2);
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// A `fallback_models` downgrade uses model-PINNED entries on one
+    /// provider: the model swap happens inside `ModelPinnedProvider`, so the
+    /// failover loop must read the entry's pinned model to record the
+    /// downgrade. Regression test for the case where the requested model's
+    /// entry fails and a sibling entry pinned to another model serves the
+    /// turn: the recorded fallback must name the SERVED model.
+    #[tokio::test]
+    async fn pinned_model_fallback_records_served_model() {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+
+        let model_provider = ReliableModelProvider::new_with_entries(
+            "mock",
+            vec![
+                ReliableModelProviderEntry::new_pinned(
+                    "openai",
+                    "openai.mock",
+                    "mock",
+                    "model-primary",
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&primary_calls),
+                        fail_until_attempt: usize::MAX,
+                        response: "never",
+                        error: "primary model down",
+                    }),
+                ),
+                ReliableModelProviderEntry::new_pinned(
+                    "openai",
+                    "openai.mock",
+                    "mock",
+                    "model-served",
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&fallback_calls),
+                        fail_until_attempt: 0,
+                        response: "from pinned fallback",
+                        error: "unused",
+                    }),
+                ),
+            ],
+            0,
+            1,
+        );
+
+        let (result, fallback) = scope_provider_fallback(async {
+            let result = model_provider
+                .simple_chat("hello", "model-primary", Some(0.0))
+                .await;
+            (result, take_last_provider_fallback())
+        })
+        .await;
+
+        assert_eq!(result.unwrap(), "from pinned fallback");
+        let fallback = fallback.expect("pinned-model downgrade must be recorded");
+        assert_eq!(fallback.requested_model, "model-primary");
+        assert_eq!(
+            fallback.actual_model, "model-served",
+            "the record must carry the model the pinned entry actually served"
+        );
+        assert_eq!(fallback.requested_provider, fallback.actual_provider);
+    }
+
+    /// The requested model served by its own pinned entry (attempt 0, first
+    /// entry) is not a fallback — nothing may be recorded.
+    #[tokio::test]
+    async fn pinned_primary_success_records_nothing() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new_with_entries(
+            "mock",
+            vec![ReliableModelProviderEntry::new_pinned(
+                "openai",
+                "openai.mock",
+                "mock",
+                "model-primary",
+                Box::new(MockModelProvider {
+                    calls: Arc::clone(&calls),
+                    fail_until_attempt: 0,
+                    response: "ok",
+                    error: "unused",
+                }),
+            )],
+            0,
+            1,
+        );
+
+        let (result, fallback) = scope_provider_fallback(async {
+            let result = model_provider
+                .simple_chat("hello", "model-primary", Some(0.0))
+                .await;
+            (result, take_last_provider_fallback())
+        })
+        .await;
+
+        assert_eq!(result.unwrap(), "ok");
+        assert!(
+            fallback.is_none(),
+            "primary pinned entry serving the requested model is not a fallback"
+        );
     }
 
     /// Returns an empty completion (blank `chat_with_system` text, which the
@@ -3786,6 +4087,219 @@ mod tests {
         assert_eq!(messages.len(), 1);
     }
 
+    fn native_tool_call(ids: &[&str]) -> ChatMessage {
+        let tool_calls = ids
+            .iter()
+            .map(|id| {
+                serde_json::json!({
+                    "id": id,
+                    "name": "shell",
+                    "arguments": "{}",
+                })
+            })
+            .collect::<Vec<_>>();
+        ChatMessage::assistant(
+            serde_json::json!({
+                "content": "",
+                "tool_calls": tool_calls,
+            })
+            .to_string(),
+        )
+    }
+
+    fn native_tool_result(id: &str) -> ChatMessage {
+        ChatMessage::tool(
+            serde_json::json!({
+                "tool_call_id": id,
+                "content": format!("result for {id}"),
+            })
+            .to_string(),
+        )
+    }
+
+    fn context_overflow_native_tool_history() -> Vec<ChatMessage> {
+        vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("old request"),
+            ChatMessage::assistant("old response"),
+            ChatMessage::user("run both tools"),
+            native_tool_call(&["call_1", "call_2"]),
+            native_tool_result("call_1"),
+            native_tool_result("call_2"),
+            ChatMessage::assistant("tool summary"),
+            ChatMessage::user("recent request"),
+            ChatMessage::assistant("recent response"),
+            ChatMessage::user("current question"),
+        ]
+    }
+
+    #[test]
+    fn truncate_for_context_drops_complete_parallel_native_tool_turn() {
+        let mut messages = context_overflow_native_tool_history();
+
+        let dropped = truncate_for_context(&mut messages);
+
+        assert_eq!(dropped, 7);
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[1].content, "recent request");
+        assert_eq!(messages[2].content, "recent response");
+        assert_eq!(messages[3].content, "current question");
+        assert!(messages.iter().all(|message| message.role != "tool"));
+    }
+
+    #[test]
+    fn truncate_for_context_retains_complete_latest_parallel_native_tool_turn() {
+        let mut messages = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("old request"),
+            ChatMessage::assistant("old response"),
+            ChatMessage::user("run both tools"),
+            native_tool_call(&["call_1", "call_2"]),
+            native_tool_result("call_1"),
+            native_tool_result("call_2"),
+        ];
+
+        let dropped = truncate_for_context(&mut messages);
+
+        assert_eq!(dropped, 2);
+        assert_eq!(messages.len(), 5);
+        assert_eq!(messages[1].content, "run both tools");
+        assert_eq!(messages[2].role, "assistant");
+        assert_eq!(messages[3].role, "tool");
+        assert_eq!(messages[4].role, "tool");
+    }
+
+    #[test]
+    fn truncate_for_context_does_not_split_only_native_tool_turn() {
+        let mut messages = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("current request"),
+            native_tool_call(&["call_1", "call_2"]),
+            native_tool_result("call_1"),
+            native_tool_result("call_2"),
+        ];
+        let original = messages.clone();
+
+        let dropped = truncate_for_context(&mut messages);
+
+        assert_eq!(dropped, 0);
+        assert_eq!(
+            serde_json::to_value(&messages).unwrap(),
+            serde_json::to_value(&original).unwrap()
+        );
+    }
+
+    #[test]
+    fn truncate_for_context_treats_prompt_tool_results_as_part_of_turn() {
+        let mut messages = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("old request"),
+            ChatMessage::assistant("old response"),
+            ChatMessage::user("run a prompt tool"),
+            ChatMessage::assistant("<tool_call>...</tool_call>"),
+            ChatMessage::user("[Tool results]\n<tool_result>ok</tool_result>"),
+            ChatMessage::assistant("tool summary"),
+            ChatMessage::user("current question"),
+        ];
+
+        let dropped = truncate_for_context(&mut messages);
+
+        assert_eq!(dropped, 6);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[1].content, "current question");
+    }
+
+    struct NativeContextOverflowMock {
+        calls: Arc<AtomicUsize>,
+        histories: Arc<parking_lot::Mutex<Vec<Vec<ChatMessage>>>>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for NativeContextOverflowMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            let attempt = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            self.histories.lock().push(request.messages.to_vec());
+            if attempt == 1 {
+                anyhow::bail!("maximum context length exceeded");
+            }
+            Ok(ChatResponse {
+                text: Some("recovered".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for NativeContextOverflowMock {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "NativeContextOverflowMock"
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_context_overflow_retry_sends_complete_native_tool_turns() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let histories = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mock = NativeContextOverflowMock {
+            calls: Arc::clone(&calls),
+            histories: Arc::clone(&histories),
+        };
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![("local".into(), Box::new(mock) as Box<dyn ModelProvider>)],
+            2,
+            1,
+        );
+        let messages = context_overflow_native_tool_history();
+        let request = ChatRequest {
+            messages: &messages,
+            tools: None,
+            thinking: None,
+        };
+
+        let response = model_provider
+            .chat(request, "local-model", Some(0.0))
+            .await
+            .unwrap();
+
+        assert_eq!(response.text.as_deref(), Some("recovered"));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let histories = histories.lock();
+        assert_eq!(histories.len(), 2);
+        assert_eq!(histories[1][1].content, "recent request");
+        assert!(histories[1].iter().all(|message| message.role != "tool"));
+    }
+
     /// Mock that fails with context error on first N calls, then succeeds.
     /// Tracks the number of messages received on each call.
     struct ContextOverflowMock {
@@ -3897,7 +4411,7 @@ mod tests {
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("cannot be reduced further"),
+            err_msg.contains("without breaking message/tool pairing"),
             "Should bail with actionable message, got: {err_msg}"
         );
         // Should only be called once — no useless retries
@@ -4028,6 +4542,169 @@ mod tests {
 
     // Arc<StreamingToolEventMock> ModelProvider impl provided by blanket impl in zeroclaw-types.
 
+    #[derive(Clone, Copy)]
+    enum StreamingRecordMode {
+        Success,
+        Error,
+    }
+
+    struct StreamingRecordMock {
+        stream_calls: Arc<AtomicUsize>,
+        supports: bool,
+        mode: StreamingRecordMode,
+    }
+
+    impl StreamingRecordMock {
+        fn success(stream_calls: Arc<AtomicUsize>) -> Self {
+            Self {
+                stream_calls,
+                supports: true,
+                mode: StreamingRecordMode::Success,
+            }
+        }
+
+        fn unsupported(stream_calls: Arc<AtomicUsize>) -> Self {
+            Self {
+                stream_calls,
+                supports: false,
+                mode: StreamingRecordMode::Success,
+            }
+        }
+
+        fn error(stream_calls: Arc<AtomicUsize>) -> Self {
+            Self {
+                stream_calls,
+                supports: true,
+                mode: StreamingRecordMode::Error,
+            }
+        }
+
+        fn stream_error() -> crate::traits::StreamError {
+            crate::traits::StreamError::ModelProvider("stream failed".to_string())
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for StreamingRecordMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        fn supports_streaming(&self) -> bool {
+            self.supports
+        }
+
+        fn supports_streaming_tool_events(&self) -> bool {
+            self.supports
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            match self.mode {
+                StreamingRecordMode::Success => stream::iter(vec![
+                    Ok(StreamEvent::TextDelta(StreamChunk::delta("streamed"))),
+                    Ok(StreamEvent::Final),
+                ])
+                .boxed(),
+                StreamingRecordMode::Error => stream::iter(vec![Err(Self::stream_error())]).boxed(),
+            }
+        }
+
+        fn stream_chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            match self.mode {
+                StreamingRecordMode::Success => stream::iter(vec![
+                    Ok(StreamChunk::delta("streamed")),
+                    Ok(StreamChunk::final_chunk()),
+                ])
+                .boxed(),
+                StreamingRecordMode::Error => stream::iter(vec![Err(Self::stream_error())]).boxed(),
+            }
+        }
+
+        fn stream_chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            match self.mode {
+                StreamingRecordMode::Success => stream::iter(vec![
+                    Ok(StreamChunk::delta("streamed")),
+                    Ok(StreamChunk::final_chunk()),
+                ])
+                .boxed(),
+                StreamingRecordMode::Error => stream::iter(vec![Err(Self::stream_error())]).boxed(),
+            }
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for StreamingRecordMock {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "StreamingRecordMock"
+        }
+    }
+
+    fn reliable_with_streaming_pinned_fallback(
+        primary_calls: Arc<AtomicUsize>,
+        fallback: StreamingRecordMock,
+    ) -> ReliableModelProvider {
+        ReliableModelProvider::new_with_entries(
+            "test",
+            vec![
+                ReliableModelProviderEntry::new(
+                    "primary",
+                    "primary.key",
+                    Box::new(StreamingRecordMock::unsupported(primary_calls))
+                        as Box<dyn ModelProvider>,
+                ),
+                ReliableModelProviderEntry::new_pinned(
+                    "fallback",
+                    "fallback.key",
+                    "fallback-alias",
+                    "model-served",
+                    Box::new(fallback) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            1,
+        )
+    }
+
+    fn assert_streaming_fallback_record(fallback: ProviderFallbackInfo) {
+        assert_eq!(fallback.requested_provider, "primary");
+        assert_eq!(fallback.requested_model, "model-requested");
+        assert_eq!(fallback.actual_provider, "fallback");
+        assert_eq!(fallback.actual_model, "model-served");
+    }
+
     #[tokio::test]
     async fn stream_chat_prefers_provider_with_tool_event_support() {
         let primary = Arc::new(StreamingToolEventMock::new(false));
@@ -4084,6 +4761,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_chat_records_pinned_fallback_on_success() {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = reliable_with_streaming_pinned_fallback(
+            Arc::clone(&primary_calls),
+            StreamingRecordMock::success(Arc::clone(&fallback_calls)),
+        );
+
+        let messages = vec![ChatMessage::user("hello")];
+        let fallback = scope_provider_fallback(async {
+            let mut stream = model_provider.stream_chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "model-requested",
+                Some(0.0),
+                StreamOptions::new(true),
+            );
+
+            assert!(matches!(
+                stream.next().await.unwrap().unwrap(),
+                StreamEvent::TextDelta(_)
+            ));
+            assert!(matches!(
+                stream.next().await.unwrap().unwrap(),
+                StreamEvent::Final
+            ));
+            take_last_provider_fallback()
+        })
+        .await
+        .expect("successful fallback stream must record fallback info");
+
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+        assert_streaming_fallback_record(fallback);
+    }
+
+    #[tokio::test]
     async fn stream_chat_errors_when_no_provider_supports_tool_events() {
         let primary = Arc::new(StreamingToolEventMock::new(false));
         let model_provider = ReliableModelProvider::new(
@@ -4122,6 +4839,73 @@ mod tests {
         );
         assert!(stream.next().await.is_none());
         assert_eq!(primary.stream_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn stream_chat_error_does_not_record_stale_fallback_info() {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = reliable_with_streaming_pinned_fallback(
+            Arc::clone(&primary_calls),
+            StreamingRecordMock::error(Arc::clone(&fallback_calls)),
+        );
+
+        let messages = vec![ChatMessage::user("hello")];
+        let fallback = scope_provider_fallback(async {
+            let mut stream = model_provider.stream_chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "model-requested",
+                Some(0.0),
+                StreamOptions::new(true),
+            );
+
+            let first = stream.next().await.unwrap();
+            assert!(first.is_err(), "stream must surface the provider error");
+            assert!(stream.next().await.is_none());
+            take_last_provider_fallback()
+        })
+        .await;
+
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            fallback.is_none(),
+            "failed streams must not leave successful fallback info behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_chat_with_system_records_pinned_fallback_on_success() {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = reliable_with_streaming_pinned_fallback(
+            Arc::clone(&primary_calls),
+            StreamingRecordMock::success(Arc::clone(&fallback_calls)),
+        );
+
+        let fallback = scope_provider_fallback(async {
+            let mut stream = model_provider.stream_chat_with_system(
+                Some("system"),
+                "hello",
+                "model-requested",
+                Some(0.0),
+                StreamOptions::new(true),
+            );
+
+            assert_eq!(stream.next().await.unwrap().unwrap().delta, "streamed");
+            assert!(stream.next().await.unwrap().unwrap().is_final);
+            take_last_provider_fallback()
+        })
+        .await
+        .expect("successful fallback stream must record fallback info");
+
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+        assert_streaming_fallback_record(fallback);
     }
 
     // ── stream_chat_with_history failover tests ──────────────────────
@@ -4314,6 +5098,36 @@ mod tests {
             "cooled-down streaming provider should be skipped"
         );
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn stream_chat_with_history_records_pinned_fallback_on_success() {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = reliable_with_streaming_pinned_fallback(
+            Arc::clone(&primary_calls),
+            StreamingRecordMock::success(Arc::clone(&fallback_calls)),
+        );
+
+        let messages = vec![ChatMessage::user("hello")];
+        let fallback = scope_provider_fallback(async {
+            let mut stream = model_provider.stream_chat_with_history(
+                &messages,
+                "model-requested",
+                Some(0.0),
+                StreamOptions::new(true),
+            );
+
+            assert_eq!(stream.next().await.unwrap().unwrap().delta, "streamed");
+            assert!(stream.next().await.unwrap().unwrap().is_final);
+            take_last_provider_fallback()
+        })
+        .await
+        .expect("successful fallback stream must record fallback info");
+
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+        assert_streaming_fallback_record(fallback);
     }
 
     #[tokio::test]

@@ -91,8 +91,9 @@ for the full procedure. In summary:
 3. Maintainer triggers `release-stable-manual.yml` via `workflow_dispatch`
    with the version number, or pushes an annotated tag `vX.Y.Z`.
 4. Workflow builds all targets, creates the GitHub Release, pushes the prebuilt
-   Docker images, calls the generated Docker variant matrix, and notifies
-   distribution channels.
+   Docker images, calls the generated Docker variant matrix, updates Scoop and
+   AUR, and sends announcements. Homebrew Core discovers the release through
+   its own autobump service.
 5. Maintainer approves the two environment gates (`github-releases`, `docker`)
    when prompted.
 
@@ -109,7 +110,9 @@ for the full procedure. In summary:
 | Target | `ci.yml` | `cross-platform-build-manual.yml` | `release-stable-manual.yml` |
 |---|:---:|:---:|:---:|
 | `x86_64-unknown-linux-gnu` | ✓ | ✓ | ✓ |
+| `x86_64-unknown-linux-musl` | | ✓ | ✓ |
 | `aarch64-unknown-linux-gnu` | | ✓ | ✓ |
+| `aarch64-unknown-linux-musl` | | ✓ | ✓ |
 | `armv7-unknown-linux-gnueabihf` | | ✓ | ✓ |
 | `arm-unknown-linux-gnueabihf` | | ✓ | ✓ |
 | `aarch64-apple-darwin` | ✓ | ✓ | ✓ |
@@ -147,7 +150,8 @@ flowchart TD
   BLD --> PUB["publish\nGitHub Release · SHA256SUMS"]
   BLD --> DOC["docker\nprebuilt :vX.Y.Z · :latest · :debian"]
   PUB & DOC --> MATRIX["docker-publish.yml\nminimal · default-features · dist · all-features"]
-  PUB --> DIST["scoop · aur · homebrew"]
+  PUB --> DIST["scoop · aur"]
+  PUB -. release detected .-> HB["homebrew core\nofficial autobump"]
   PUB --> ANN["discord · tweet"]
 ```
 

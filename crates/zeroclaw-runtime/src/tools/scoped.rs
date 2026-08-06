@@ -78,6 +78,12 @@ pub struct ScopedAssembly<'a> {
     pub connect_peripherals: bool,
     /// Documented divergence: ACP excludes persistent memory tools.
     pub exclude_memory: bool,
+    /// `deliver_file` hands the client a typed file attachment that only an
+    /// ACP-capable turn actually transports (the model history, WS, and RPC
+    /// paths all drop the artifact). Every non-ACP assembly passes `false` so
+    /// the tool is absent rather than returning a false success on a channel
+    /// that cannot deliver it. Only the ACP turn path passes `true`.
+    pub acp_delivery: bool,
     pub list_deferred_mcp_specs: bool,
     pub emit_assembly_logs: bool,
     /// Pre-built MCP registry supplied by the caller. The daemon heartbeat
@@ -173,6 +179,7 @@ impl ScopedToolRegistry {
             connect_mcp,
             connect_peripherals,
             exclude_memory,
+            acp_delivery,
             list_deferred_mcp_specs,
             emit_assembly_logs,
             mcp_registry: overrides_mcp_registry,
@@ -230,6 +237,14 @@ impl ScopedToolRegistry {
         // 3. Documented divergence: ACP strips persistent memory tools.
         if exclude_memory {
             tools_registry.retain(|t| !zeroclaw_tools::MEMORY_TOOL_NAMES.contains(&t.name()));
+        }
+
+        // 3b. `deliver_file` is an ACP-only delivery surface: only an ACP-capable
+        //     turn transports the typed attachment it emits, so every other path
+        //     drops it rather than let it report a false success on a channel that
+        //     silently discards the artifact (see the delivery-contract fix).
+        if !acp_delivery {
+            tools_registry.retain(|t| t.name() != "deliver_file");
         }
 
         // 4. MCP: scope servers per `mcp_bundles` (omission is not a grant), then gate
@@ -603,6 +618,7 @@ mod tests {
             connect_mcp: false, // exercise the filter path without MCP fixtures
             connect_peripherals: false,
             exclude_memory: false,
+            acp_delivery: true, // keep deliver_file so name-filter tests are unaffected
             list_deferred_mcp_specs: false,
             emit_assembly_logs: false,
             mcp_registry: None,
@@ -636,6 +652,57 @@ mod tests {
         assert!(
             !names.iter().any(|n| n == "spawn_subagent"),
             "excluded tool dropped: {names:?}"
+        );
+    }
+
+    /// `deliver_file` emits a typed attachment only an ACP turn transports, so it
+    /// is gated on `acp_delivery`: absent on every non-ACP assembly (where it would
+    /// otherwise report a false success), present only when the ACP turn path opts in.
+    async fn assemble_names_with_acp_delivery(acp_delivery: bool) -> Vec<String> {
+        let config = Config::default();
+        let security = Arc::new(SecurityPolicy::default());
+        let out = ScopedToolRegistry::assemble(ScopedAssembly {
+            config: &config,
+            agent_alias: "default",
+            security: &security,
+            built: built_with(vec![
+                Box::new(MockTool("shell")),
+                Box::new(MockTool("deliver_file")),
+            ]),
+            skills: &[],
+            runtime: Arc::new(crate::platform::NativeRuntime::new()),
+            caller_allowed: None,
+            connect_mcp: false,
+            connect_peripherals: false,
+            exclude_memory: false,
+            acp_delivery,
+            list_deferred_mcp_specs: false,
+            emit_assembly_logs: false,
+            mcp_registry: None,
+        })
+        .await;
+        out.registry.iter().map(|t| t.name().to_string()).collect()
+    }
+
+    #[tokio::test]
+    async fn non_acp_assembly_omits_deliver_file() {
+        let names = assemble_names_with_acp_delivery(false).await;
+        assert!(
+            names.iter().any(|n| n == "shell"),
+            "unrelated tool kept: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "deliver_file"),
+            "deliver_file must be dropped on a non-ACP turn: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_assembly_keeps_deliver_file() {
+        let names = assemble_names_with_acp_delivery(true).await;
+        assert!(
+            names.iter().any(|n| n == "deliver_file"),
+            "deliver_file must survive on the ACP turn path: {names:?}"
         );
     }
 
@@ -685,6 +752,7 @@ mod tests {
                 connect_mcp: true,
                 connect_peripherals: false,
                 exclude_memory: false,
+                acp_delivery: false,
                 list_deferred_mcp_specs: false,
                 emit_assembly_logs: false,
                 mcp_registry: None,
@@ -817,6 +885,7 @@ mod tests {
                 connect_mcp: true,
                 connect_peripherals: false,
                 exclude_memory: false,
+                acp_delivery: false,
                 list_deferred_mcp_specs: true,
                 emit_assembly_logs: false,
                 mcp_registry: None,
@@ -960,6 +1029,7 @@ mod tests {
             connect_mcp: false,
             connect_peripherals: false,
             exclude_memory: false,
+            acp_delivery: false,
             list_deferred_mcp_specs: false,
             emit_assembly_logs: false,
             mcp_registry: None,

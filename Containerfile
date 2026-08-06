@@ -4,7 +4,7 @@
 # Alpine, no core-llvm-libgcc, no external deps for the GCC runtime.
 
 # ── Stage: config-gen (generate default config template) ────
-FROM docker.io/stagex/pallet-rust@sha256:2d90b9552412ee2c4fa2a13b489c2f28c044be7fb5d6a942bfd5a480a5c288fd AS config-gen
+FROM docker.io/stagex/pallet-rust@sha256:abe9b95c93a5afa271f69fcd5eb18c8cd405fe5df6491a63c9418e3a170573dc AS config-gen
 
 # Default config template consumed by build/build-fat. Single source of truth
 # so operators get a working config on first run without migration overhead.
@@ -38,10 +38,10 @@ RUN <<-EOF
 EOF
 
 # ── Stage: nodejs (reference for Node.js toolchain) ──────────
-FROM docker.io/stagex/pallet-nodejs@sha256:81bc04b9490a4f4401a8b6fd277736d75f1f0ad4bd98e8f6b4b3616e18b75f7b AS nodejs
+FROM docker.io/stagex/pallet-nodejs@sha256:5c96b25c18713976497a21c770057f2179c5014c5a025a02d2df9041d8f861f6 AS nodejs
 
 # ── Stage: web-build (web dashboard via xtask + npm build) ──
-FROM docker.io/stagex/pallet-rust@sha256:2d90b9552412ee2c4fa2a13b489c2f28c044be7fb5d6a942bfd5a480a5c288fd AS web-build
+FROM docker.io/stagex/pallet-rust@sha256:abe9b95c93a5afa271f69fcd5eb18c8cd405fe5df6491a63c9418e3a170573dc AS web-build
 
 WORKDIR /src
 COPY . .
@@ -76,13 +76,13 @@ RUN test -f /usr/lib/libunwind.so && ln -s libunwind.so /usr/lib/libgcc_s.so.1 |
 RUN npm ci --prefix web && npm install --prefix web lightningcss-linux-$(uname -m | sed 's/x86_64/x64/;s/aarch64/arm64/')-musl
 
 # Fetch cargo dependencies (network allowed)
-RUN --mount=type=cache,target=/root/.cargo/registry \
-    --mount=type=cache,target=/root/.cargo/git \
+RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/git,sharing=locked \
     cargo fetch --locked
 
 # Build the web dashboard (gen-api + typescript build), no network
-RUN --mount=type=cache,target=/root/.cargo/registry \
-    --mount=type=cache,target=/root/.cargo/git \
+RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/git,sharing=locked \
     --network=none \
     <<-EOF
     set -e
@@ -97,22 +97,22 @@ EOF
 # Single source of truth for "what passes" in the deterministic StageX
 # musl environment. Used by CI and developers as a pre-push gate.
 # Does NOT depend on web-build (creates a stub for compilation).
-FROM docker.io/stagex/pallet-rust@sha256:2d90b9552412ee2c4fa2a13b489c2f28c044be7fb5d6a942bfd5a480a5c288fd AS check
+FROM docker.io/stagex/pallet-rust@sha256:abe9b95c93a5afa271f69fcd5eb18c8cd405fe5df6491a63c9418e3a170573dc AS check
 
 WORKDIR /src
 COPY . .
 
 # Fetch all workspace dependencies (network available)
-RUN --mount=type=cache,target=/root/.cargo/registry \
-    --mount=type=cache,target=/root/.cargo/git \
+RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/git,sharing=locked \
     cargo fetch
 
 # Format + clippy (fully isolated — no network, reproducible)
 # -crt-static: the musl target defaults crt-static on, but host == target in
 # StageX, so proc-macro/build-script host artifacts cannot link statically.
 # This validates code correctness; the target static link is checked in build.
-RUN --mount=type=cache,target=/root/.cargo/registry \
-    --mount=type=cache,target=/root/.cargo/git \
+RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/git,sharing=locked \
     --network=none \
     <<-EOF
     set -e
@@ -143,8 +143,8 @@ EOF
 #   compiled by rustdoc as host artifacts that hit the musl static-link wall,
 #   and the criterion bench links a C dep (alloca) that the static link
 #   rejects. Both run in the standard CI Test/Benchmarks jobs.
-RUN --mount=type=cache,target=/root/.cargo/registry \
-    --mount=type=cache,target=/root/.cargo/git \
+RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/git,sharing=locked \
     <<-EOF
     set -e
     export RUSTFLAGS="-C target-feature=-crt-static"
@@ -152,19 +152,19 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
 EOF
 
 # ── Stage: build (zeroclaw + zerocode, default channels) ────
-FROM docker.io/stagex/pallet-rust@sha256:2d90b9552412ee2c4fa2a13b489c2f28c044be7fb5d6a942bfd5a480a5c288fd AS build
+FROM docker.io/stagex/pallet-rust@sha256:abe9b95c93a5afa271f69fcd5eb18c8cd405fe5df6491a63c9418e3a170573dc AS build
 
 WORKDIR /src
 COPY . .
 
 # Fetch all workspace dependencies (network available)
-RUN --mount=type=cache,target=/root/.cargo/registry \
-    --mount=type=cache,target=/root/.cargo/git \
+RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/git,sharing=locked \
     cargo fetch
 
 # Offline build: release binaries (validation moved to check stage)
-RUN --mount=type=cache,target=/root/.cargo/registry \
-    --mount=type=cache,target=/root/.cargo/git \
+RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/git,sharing=locked \
     --network=none \
     <<-EOF
     set -e
@@ -215,7 +215,7 @@ COPY --from=config-gen /rootfs/ /rootfs/
 COPY --from=web-build /src/web/dist /rootfs/usr/share/zeroclawlabs/web/dist
 
 # ── Stage: package (minimal runtime) ─────────────────────────
-FROM docker.io/stagex/core-filesystem@sha256:cd3a66471ce1f630fa77d5c9bd9829f9f9fab6302a1aaa64d67b74f1f069b750 AS package
+FROM docker.io/stagex/core-filesystem@sha256:da28831927652291b0fa573092fd41c8c96ca181ea224df7bff40e1833c3db13 AS package
 
 # Copy binaries, web dist, and default config; set data dir ownership to nobody(65534)
 COPY --from=build /rootfs/ /
@@ -237,20 +237,20 @@ ENTRYPOINT ["/usr/bin/zeroclaw"]
 CMD ["daemon"]
 
 # ── Stage: build-fat (zeroclaw + zerocode, all channels) ────
-FROM docker.io/stagex/pallet-rust@sha256:2d90b9552412ee2c4fa2a13b489c2f28c044be7fb5d6a942bfd5a480a5c288fd AS build-fat
+FROM docker.io/stagex/pallet-rust@sha256:abe9b95c93a5afa271f69fcd5eb18c8cd405fe5df6491a63c9418e3a170573dc AS build-fat
 
 WORKDIR /src
 COPY . .
 
 # Fetch all workspace dependencies (network available)
 # Shares cache with the build stage via mount target
-RUN --mount=type=cache,target=/root/.cargo/registry \
-    --mount=type=cache,target=/root/.cargo/git \
+RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/git,sharing=locked \
     cargo fetch
 
 # Offline build: release binaries with all channels
-RUN --mount=type=cache,target=/root/.cargo/registry \
-    --mount=type=cache,target=/root/.cargo/git \
+RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/git,sharing=locked \
     --network=none \
     <<-EOF
     set -e
@@ -301,7 +301,7 @@ COPY --from=config-gen /rootfs/ /rootfs/
 COPY --from=web-build /src/web/dist /rootfs/usr/share/zeroclawlabs/web/dist
 
 # ── Stage: package-fat (full-channel runtime) ────────────────
-FROM docker.io/stagex/core-filesystem@sha256:cd3a66471ce1f630fa77d5c9bd9829f9f9fab6302a1aaa64d67b74f1f069b750 AS package-fat
+FROM docker.io/stagex/core-filesystem@sha256:da28831927652291b0fa573092fd41c8c96ca181ea224df7bff40e1833c3db13 AS package-fat
 
 # Copy binaries, web dist, and default config; set data dir ownership to nobody(65534)
 COPY --from=build-fat /rootfs/ /

@@ -125,6 +125,7 @@ pub async fn run_local_listener(
     ctx: Arc<RpcContext>,
     cancel: CancellationToken,
     client_count: Arc<AtomicUsize>,
+    readiness: Option<crate::daemon::SocketReadinessReporter>,
 ) -> Result<()> {
     let path = {
         let config = ctx.config.read();
@@ -137,6 +138,10 @@ pub async fn run_local_listener(
     let mut listener = platform::bind(&path).context("binding local IPC endpoint")?;
 
     platform::secure_endpoint(&path).await;
+
+    if let Some(readiness) = readiness {
+        readiness.report_ready();
+    }
 
     ::zeroclaw_log::record!(
         INFO,
@@ -451,19 +456,57 @@ mod tests {
         panic!("socket never appeared at {}", path.display());
     }
 
+    /// Wait for the server-side client count to reach `expected`, or fail with
+    /// the value actually observed.
+    ///
+    /// `run_local_listener` increments the count in its accept loop but
+    /// decrements it at the end of the per-connection task, so a disconnect
+    /// becomes visible only once the dispatcher has seen EOF and that task has
+    /// finished. Waiting a fixed interval assumes that completes within it;
+    /// under a loaded test harness it may not.
+    #[cfg(unix)]
+    async fn wait_for_client_count(count: &Arc<AtomicUsize>, expected: usize) {
+        for _ in 0..250 {
+            if count.load(Ordering::Relaxed) == expected {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!(
+            "client count never reached {expected}; last observed {}",
+            count.load(Ordering::Relaxed)
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
-    async fn socket_initialize_handshake() {
+    async fn daemon_startup_socket_initialize_handshake_reports_readiness() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = test_ctx(tmp.path());
         let sock_path = ctx.config.read().data_dir.join("daemon.sock");
         let cancel = CancellationToken::new();
+        let (ready_tx, mut ready_rx) = tokio::sync::watch::channel(false);
+        let readiness = crate::daemon::SocketReadinessReporter::new(move || {
+            let _ = ready_tx.send(true);
+        });
 
         let server_cancel = cancel.clone();
         let server_ctx = ctx.clone();
         let handle = zeroclaw_spawn::spawn!(async move {
-            run_local_listener(server_ctx, server_cancel, test_client_count()).await
+            run_local_listener(
+                server_ctx,
+                server_cancel,
+                test_client_count(),
+                Some(readiness),
+            )
+            .await
         });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            ready_rx.wait_for(|ready| *ready).await.unwrap();
+        })
+        .await
+        .expect("local IPC should report its secured bind");
 
         wait_for_socket(&sock_path).await;
 
@@ -515,7 +558,7 @@ mod tests {
         let server_cancel = cancel.clone();
         let server_ctx = ctx.clone();
         zeroclaw_spawn::spawn!(async move {
-            let _ = run_local_listener(server_ctx, server_cancel, test_client_count()).await;
+            let _ = run_local_listener(server_ctx, server_cancel, test_client_count(), None).await;
         });
 
         wait_for_socket(&sock_path).await;
@@ -553,7 +596,7 @@ mod tests {
         let server_cancel = cancel.clone();
         let server_ctx = ctx.clone();
         zeroclaw_spawn::spawn!(async move {
-            let _ = run_local_listener(server_ctx, server_cancel, test_client_count()).await;
+            let _ = run_local_listener(server_ctx, server_cancel, test_client_count(), None).await;
         });
 
         wait_for_socket(&sock_path).await;
@@ -584,7 +627,7 @@ mod tests {
         let server_cancel = cancel.clone();
         let server_ctx = ctx.clone();
         zeroclaw_spawn::spawn!(async move {
-            let _ = run_local_listener(server_ctx, server_cancel, test_client_count()).await;
+            let _ = run_local_listener(server_ctx, server_cancel, test_client_count(), None).await;
         });
 
         for _ in 0..50 {
@@ -614,7 +657,7 @@ mod tests {
         let server_cancel = cancel.clone();
         let server_ctx = ctx.clone();
         zeroclaw_spawn::spawn!(async move {
-            let _ = run_local_listener(server_ctx, server_cancel, test_client_count()).await;
+            let _ = run_local_listener(server_ctx, server_cancel, test_client_count(), None).await;
         });
         wait_for_socket(&sock_path).await;
 
@@ -660,7 +703,7 @@ mod tests {
         let server_ctx = ctx.clone();
         let server_count = count.clone();
         zeroclaw_spawn::spawn!(async move {
-            let _ = run_local_listener(server_ctx, server_cancel, server_count).await;
+            let _ = run_local_listener(server_ctx, server_cancel, server_count, None).await;
         });
 
         wait_for_socket(&sock_path).await;
@@ -669,16 +712,13 @@ mod tests {
 
         let s1 = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
         let s2 = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert_eq!(count.load(Ordering::Relaxed), 2);
+        wait_for_client_count(&count, 2).await;
 
         drop(s1);
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert_eq!(count.load(Ordering::Relaxed), 1);
+        wait_for_client_count(&count, 1).await;
 
         drop(s2);
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert_eq!(count.load(Ordering::Relaxed), 0);
+        wait_for_client_count(&count, 0).await;
 
         cancel.cancel();
     }
@@ -697,7 +737,7 @@ mod tests {
         let server_cancel = cancel.clone();
         let server_ctx = ctx.clone();
         let handle = zeroclaw_spawn::spawn!(async move {
-            run_local_listener(server_ctx, server_cancel, test_client_count()).await
+            run_local_listener(server_ctx, server_cancel, test_client_count(), None).await
         });
 
         // Poll-connect until the server creates its pending instance.

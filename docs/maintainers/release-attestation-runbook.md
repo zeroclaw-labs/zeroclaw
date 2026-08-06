@@ -1,85 +1,88 @@
-# Release Runbook — Attestation Step Failure
+# Release Runbook: Artifact Attestations
 
-**File:** `.github/workflows/release-stable-manual.yml` — `publish` job
-**Step:** `Attach SLSA provenance attestation`
-**Policy:** `continue-on-error: true` (Phase A — best-effort)
+**File:** `.github/workflows/release-stable-manual.yml`, `publish` job
 
----
+**Policy:** best-effort Phase A (`continue-on-error: true`)
 
-## Symptoms
+**Canonical downloadable-asset mechanism:** GitHub artifact attestations
 
-- The `Attach SLSA provenance attestation` step logs a failure
-- The `Download attestation bundles for offline verification` step fails or is skipped
-- The `Create tag and release` step runs anyway
-- If attestation failed, release notes include an attestation-unavailable note with the workflow run URL
-- If bundle download failed, online verification still works but release assets lack offline bundle files
+## Expected sequence
 
----
+The `publish` job performs these operations in order:
 
-## Immediate Triage
+1. generate SPDX and CycloneDX SBOMs;
+2. collect every release payload, including `install.sh` and both SBOMs;
+3. attest those payloads through GitHub;
+4. download and locally verify each offline bundle;
+5. package the bundles, trusted root, and index into one verification archive;
+6. generate final `SHA256SUMS`, including the verification archive;
+7. attest `SHA256SUMS` and the verification archive;
+8. create the GitHub Release from `release-assets/*`.
 
-Read the step log. Match the error:
+Do not move checksum generation before archive creation or edit
+`SHA256SUMS` after its attestation. Either change produces stale metadata.
 
-| Error Pattern | Likely Cause | Action |
+## Failure symptoms
+
+| Failed step | Expected release behavior | Consumer impact |
 |---|---|---|
-| `401 Unauthorized` | OIDC token issue — transient | Retry the workflow. If it passes, done. |
-| `429 Too Many Requests` | GitHub API rate limit — burst | Wait 5 minutes, retry. |
-| `500 Internal Server Error` | GitHub API outage | Check [status.github.com](https://status.github.com). Retry when green. |
-| `404 Not Found` | Subject path glob matched nothing or attestation not visible yet | Check `release-assets/` directory contents. Retry if assets exist. |
-| `could not parse OIDC token` | Runner identity issue | Check `id-token: write` permission is still on the `publish` job. |
-| `unknown flag` | GitHub CLI interface changed | Update the affected `gh attestation` invocation and docs together. |
-| Timeout (>260s) | Network issue or GH API slow | Retry. If persistent, check runner connectivity. |
+| `Attest release payloads` | Release continues | No downloadable payload has trusted provenance; release notes disclose the gap. |
+| `Package offline verification archive` | Release continues | Online payload verification remains available; no offline archive is published. |
+| `Attest final checksums` | Release continues | Payloads remain verifiable, but release notes do not advertise the offline bootstrap path. |
+| `Attest verification archive` | Release continues | The archive may be present but release notes do not advertise it for trusted offline staging. |
+| Either SBOM generation step | Release stops before publication | Neither partial SBOM coverage nor a partially assembled release is published. |
 
----
+For HTTP 401, 429, 5xx, OIDC-token, or GitHub API failures, check
+[GitHub Status](https://www.githubstatus.com/) and retry the workflow once the
+service is healthy. A missing `id-token: write` or `attestations: write`
+permission is a workflow regression, not a transient failure.
 
-## Decision Matrix
+Attestations require the GitHub-issued OIDC token from the workflow run. They
+cannot be recreated later from a maintainer workstation.
 
-| Scenario | Action | Escalation? |
-|---|---|---|
-| First failure in weeks | Retry the workflow | No |
-| 2-3 failures in a row | Retry once. If still fails, check status.github.com | No |
-| 3+ consecutive releases failing | Investigate permissions or action version change | File a security issue with collected evidence |
-| Every release fails since deploy | Bug in the workflow change — revert the attestation step | Page author |
+## Required release rehearsal
 
----
+The first release after changing this contract requires a human maintainer to
+complete this checklist before issue #9101 is closed:
 
-## How to Retry
+```text
+[ ] Release contains both SBOM formats.
+[ ] Release contains SHA256SUMS and exactly one *-verification.tar.gz.
+[ ] Release contains no *.bundle, loose *.attestation.jsonl, or *.intoto.jsonl assets.
+[ ] SHA256SUMS contains the verification archive and all other release assets.
+[ ] gh attestation verify succeeds online for a binary, install.sh, one SBOM,
+    SHA256SUMS, and the verification archive.
+[ ] The archive contains trusted_root.jsonl, ATTESTATION-BUNDLES.md, and one
+    bundle for every payload listed in its index.
+[ ] With network access disabled, gh attestation verify succeeds for the
+    spot-checked binary using only its extracted bundle and trusted root.
+[ ] Both GHCR image variants remain cosign-verifiable by immutable digest.
+[ ] Release notes state the Build Level 2 claim and threat-model limits.
+```
 
-1. Go to the failed workflow run
-2. Click **Re-run jobs** → **Re-run failed jobs**
-3. Only the `publish` job re-runs — build artifacts are preserved
+Record the release tag, workflow-run URL, exact commands, and redacted output in
+the implementing PR. Do not claim the rehearsal is complete based only on
+workflow linting, a dry run, or a previous release.
 
-## If All Else Fails — Manual Remediation
-
-If attestation succeeded but bundle download failed, users can still download bundles themselves:
+## Manual inspection commands
 
 ```bash
-gh attestation download <artifact> --repo zeroclaw-labs/zeroclaw
-gh attestation trusted-root > trusted_root.jsonl
-gh attestation verify <artifact> \
+TAG=vX.Y.Z
+SOURCE_DIGEST=<release-commit-sha>
+VERIFY_ARCHIVE="zeroclaw-${TAG}-verification.tar.gz"
+
+gh release view "$TAG" --repo zeroclaw-labs/zeroclaw \
+  --json assets --jq '.assets[].name'
+gh release download "$TAG" --repo zeroclaw-labs/zeroclaw \
+  --pattern SHA256SUMS --pattern "$VERIFY_ARCHIVE"
+awk -v file="$VERIFY_ARCHIVE" '$2 == file { print }' SHA256SUMS | sha256sum -c -
+gh attestation verify "$VERIFY_ARCHIVE" \
   --repo zeroclaw-labs/zeroclaw \
   --signer-workflow zeroclaw-labs/zeroclaw/.github/workflows/release-stable-manual.yml \
-  --source-digest <commit-sha> \
-  --bundle sha256:<digest>.jsonl \
-  --custom-trusted-root trusted_root.jsonl
+  --source-digest "$SOURCE_DIGEST"
+tar -tzf "$VERIFY_ARCHIVE"
 ```
 
-If the release was published without attestations, document the gap in the release notes:
-
-```bash
-gh release edit <tag> --notes-file - <<EOF
-NOTE: SLSA attestation is unavailable for this release due to a
-transient pipeline failure. See PR #8277 for context.
-EOF
-```
-
-**Key constraint:** Attestation generation requires GitHub's OIDC token, which only exists inside a workflow run. You cannot retroactively generate attestations from a local machine.
-
----
-
-## Prevention
-
-- Consider promoting to Phase B (`continue-on-error: false` + alert on failure)
-  once Phase A has stabilized
-- Monitor attestation step duration — sudden slowdowns precede outages
-- Keep `actions/attest-build-provenance` version pinned (already done)
+The complete consumer commands are maintained in
+`docs/book/src/maintainers/release-verification.md` and must be tested
+verbatim during the rehearsal.

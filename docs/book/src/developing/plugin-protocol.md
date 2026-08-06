@@ -190,7 +190,7 @@ Registry entries use this shape:
   "plugins": [
     {
       "name": "team-calendar",
-      "version": "0.8.3",
+      "version": "0.8.4",
       "description": "Schedule meetings on a team calendar",
       "author": "Example Team",
       "capabilities": ["tool"],
@@ -588,11 +588,12 @@ workspace `Cargo.toml` select whether plugins are built in at all and which
 execution backend ships:
 
 - `plugins-wasm` is the umbrella that pulls the plugin host and its runtime
-  integration into the binary. It is **required**: the backend features below
-  select an execution engine but do not imply the umbrella, so building with
-  only a backend feature succeeds and silently yields a binary with no
-  `plugin` subcommand. Always pass `plugins-wasm` plus your chosen backend,
-  e.g. `--features plugins-wasm,plugins-wasm-cranelift`.
+  integration into the binary. Every backend feature below implies it, so
+  enabling any execution backend (e.g. `--features plugins-wasm-cranelift`)
+  always carries the plugin host and its CLI surface; a backend-only build
+  cannot silently produce a binary without the `plugin` subcommand. The
+  umbrella alone is equivalent to `plugins-wasm-runtime-only`: no JIT, so
+  only precompiled `.cwasm` components load.
 - `plugins-wasm-runtime-only` is the smallest and fastest to start: no JIT, so
   components are deserialized from a precompiled `.cwasm`.
 - `plugins-wasm-cranelift` adds the Cranelift JIT, so a `.wasm` component is

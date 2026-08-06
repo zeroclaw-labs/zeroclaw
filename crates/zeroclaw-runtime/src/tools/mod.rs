@@ -9,10 +9,12 @@ pub mod cron_run;
 pub mod cron_runs;
 pub mod cron_update;
 pub mod delegate;
+pub mod deliver_file;
 pub mod file_read;
 pub mod model_switch;
 pub mod param_options;
 pub mod read_skill;
+mod runtime_command_error;
 pub mod schedule;
 pub mod scoped;
 pub mod security_ops;
@@ -127,6 +129,10 @@ pub use cron_run::CronRunTool;
 pub use cron_runs::CronRunsTool;
 pub use cron_update::CronUpdateTool;
 pub use delegate::DelegateTool;
+pub use deliver_file::{
+    DeliverFileTool, MAX_DELIVER_FILE_BYTES, attachment_deliver_uri,
+    read_delivered_artifact_bounded,
+};
 pub use file_read::FileReadTool;
 pub use model_switch::ModelSwitchTool;
 pub use read_skill::ReadSkillTool;
@@ -276,6 +282,10 @@ pub fn default_tools_with_runtime(
                 FileReadTool::new_with_persistence(security.clone(), persistent_writes),
                 security.clone(),
             ),
+            security.clone(),
+        )),
+        Box::new(RateLimitedTool::new(
+            PathGuardedTool::new(DeliverFileTool::new(security.clone()), security.clone()),
             security.clone(),
         )),
         Box::new(RateLimitedTool::new(
@@ -582,6 +592,10 @@ pub fn all_tools_with_runtime(
             security.clone(),
         )),
         Arc::new(RateLimitedTool::new(
+            PathGuardedTool::new(DeliverFileTool::new(security.clone()), security.clone()),
+            security.clone(),
+        )),
+        Arc::new(RateLimitedTool::new(
             PathGuardedTool::new(
                 FileWriteTool::new_with_persistence(security.clone(), persistent_writes),
                 security.clone(),
@@ -744,8 +758,8 @@ pub fn all_tools_with_runtime(
         root_config.effective_skills_prompt_mode(agent_alias),
         zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
     ) {
-        // ReadSkillTool now holds full config to support all skill sources:
-        // workspace skills, open-skills, agent-bound bundles, and plugin skills.
+        // ReadSkillTool holds full config to support workspace skills,
+        // open-skills, agent-bound bundles, and plugin skills.
         tool_arcs.push(Arc::new(ReadSkillTool::new(
             config.clone(),
             agent_alias.to_string(),
@@ -1430,17 +1444,12 @@ pub fn all_tools_with_runtime(
         Some(parent_tools)
     };
 
-    // Verifiable Intent tool (opt-in via config)
-    if root_config.verifiable_intent.enabled {
-        let strictness = match root_config.verifiable_intent.strictness.as_str() {
-            "permissive" => crate::verifiable_intent::StrictnessMode::Permissive,
-            _ => crate::verifiable_intent::StrictnessMode::Strict,
-        };
-        tool_arcs.push(Arc::new(VerifiableIntentTool::new(
-            security.clone(),
-            strictness,
-        )));
-    }
+    // `vi_verify` is deliberately absent while no chain verifier exists: it checked
+    // caller-supplied constraints against a caller-supplied fulfillment with nothing
+    // establishing that either came from a signed credential. The operator-facing
+    // notice lives at config load, since this function also runs per gateway request
+    // and per nested registry rebuild. Register it again only behind a
+    // verify-and-evaluate path that consumes a verified chain result.
 
     // ── WASM plugin tools (requires plugins-wasm feature) ──
     #[cfg(feature = "plugins-wasm")]
@@ -1458,9 +1467,17 @@ pub fn all_tools_with_runtime(
                 trusted_publisher_keys,
             ) {
                 Ok(host) => {
-                    let details = host.tool_plugin_details();
+                    let mut details = host.tool_plugin_details();
+                    details.sort_unstable_by(|(left, _), (right, _)| left.name.cmp(&right.name));
                     let discovered_count = details.len();
                     let mut registered_count = 0_usize;
+                    let mut registered_names: std::collections::HashSet<String> = tool_arcs
+                        .iter()
+                        .map(|tool| tool.name().to_string())
+                        .collect();
+                    if root_config.pipeline.enabled {
+                        registered_names.insert(PipelineTool::NAME.to_string());
+                    }
                     let plugin_limits = zeroclaw_plugins::component::PluginLimits {
                         call_fuel: config.plugins.limits.call_fuel,
                         max_memory_bytes: config
@@ -1494,6 +1511,25 @@ pub fn all_tools_with_runtime(
                         })();
                         match tool {
                             Ok(tool) => {
+                                if !claim_plugin_tool_name(&mut registered_names, tool.name()) {
+                                    ::zeroclaw_log::record!(
+                                        WARN,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Load
+                                        )
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                        .with_attrs(
+                                            ::serde_json::json!({
+                                                "plugin": manifest.name,
+                                                "tool": tool.name(),
+                                                "error_key": "plugin_tool_name_conflict",
+                                            })
+                                        ),
+                                        "Plugin tool conflicts with an already registered tool"
+                                    );
+                                    continue;
+                                }
                                 tool_arcs.push(Arc::new(tool));
                                 registered_count += 1;
                             }
@@ -1576,6 +1612,14 @@ pub fn all_tools_with_runtime(
     }
 }
 
+#[cfg(feature = "plugins-wasm")]
+fn claim_plugin_tool_name(
+    registered_names: &mut std::collections::HashSet<String>,
+    plugin_name: &str,
+) -> bool {
+    registered_names.insert(plugin_name.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1617,7 +1661,28 @@ mod tests {
     fn default_tools_has_expected_count() {
         let security = Arc::new(SecurityPolicy::default());
         let tools = default_tools(security);
-        assert_eq!(tools.len(), 6);
+        assert_eq!(tools.len(), 7);
+    }
+
+    #[cfg(feature = "plugins-wasm")]
+    #[test]
+    fn plugin_tool_names_cannot_shadow_native_reserved_or_prior_plugin_tools() {
+        let mut registered_names =
+            std::collections::HashSet::from(["shell".to_string(), PipelineTool::NAME.to_string()]);
+        let accepted = ["shell", PipelineTool::NAME, "novel-tool", "novel-tool"]
+            .into_iter()
+            .filter(|name| claim_plugin_tool_name(&mut registered_names, name))
+            .collect::<Vec<_>>();
+
+        assert_eq!(accepted, vec!["novel-tool"]);
+        assert_eq!(
+            registered_names,
+            std::collections::HashSet::from([
+                "shell".to_string(),
+                PipelineTool::NAME.to_string(),
+                "novel-tool".to_string(),
+            ])
+        );
     }
 
     #[cfg(feature = "plugins-wasm")]
@@ -2504,6 +2569,7 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"shell"));
         assert!(names.contains(&"file_read"));
+        assert!(names.contains(&"deliver_file"));
         assert!(names.contains(&"file_write"));
         assert!(names.contains(&"file_edit"));
         assert!(names.contains(&"glob_search"));
@@ -2719,7 +2785,7 @@ mod tests {
     }
 
     #[test]
-    fn all_tools_excludes_read_skill_in_full_mode() {
+    fn all_tools_excludes_read_skill_for_explicit_global_full() {
         let tmp = TempDir::new().unwrap();
         let security = Arc::new(SecurityPolicy::default());
         let mem_cfg = MemoryConfig {
@@ -2884,7 +2950,8 @@ mod tests {
         let http = zeroclaw_config::schema::HttpRequestConfig::default();
         let mut cfg = test_config(&tmp);
         // Global is Compact; a runtime profile pins this agent to Full and the
-        // agent selects it via `runtime_profile`.
+        // agent selects it via `runtime_profile`. The Full pin inlines skills
+        // eagerly, so read_skill must be omitted.
         cfg.skills.prompt_injection_mode =
             zeroclaw_config::schema::SkillsPromptInjectionMode::Compact;
         cfg.runtime_profiles.insert(
@@ -2928,6 +2995,56 @@ mod tests {
         assert!(
             !names.contains(&"read_skill"),
             "full runtime-profile override should omit read_skill even when global is compact"
+        );
+    }
+
+    /// `vi_verify` checked caller-supplied constraints against a caller-supplied
+    /// fulfillment with nothing establishing that either came from a signed
+    /// credential. Until a chain verifier exists the tool must not reach the model
+    /// even when an operator opts in.
+    #[test]
+    fn vi_verify_is_not_registered_even_when_verifiable_intent_is_enabled() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let mut cfg = test_config(&tmp);
+        cfg.verifiable_intent.enabled = true;
+
+        let tools = all_tools(
+            Arc::new(cfg.clone()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            mem,
+            None,
+            None,
+            &BrowserConfig::default(),
+            &zeroclaw_config::schema::HttpRequestConfig::default(),
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+            false,
+            None,
+        )
+        .tools;
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+
+        assert!(
+            !names.contains(&"vi_verify"),
+            "vi_verify must not be model-callable while no chain verifier exists"
+        );
+        assert!(
+            names.contains(&"shell"),
+            "positive control: the registry must still be populated"
         );
     }
 }

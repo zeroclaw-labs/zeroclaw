@@ -381,6 +381,31 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_progress_strings_exist_in_every_builtin_locale() {
+        let keys = [
+            "channel-runtime-progress-received",
+            "channel-runtime-progress-planning",
+            "channel-runtime-progress-waiting-on-model",
+            "channel-runtime-progress-running-tool",
+            "channel-runtime-progress-compacting-context",
+            "channel-runtime-progress-finalizing-response",
+        ];
+        for (source, locale) in [
+            (include_str!("../locales/en/cli.ftl"), "en"),
+            (include_str!("../locales/es/cli.ftl"), "es"),
+            (include_str!("../locales/fr/cli.ftl"), "fr"),
+            (include_str!("../locales/ja/cli.ftl"), "ja"),
+            (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+        ] {
+            for key in keys {
+                let value = format_ftl_message(source, locale, key, &[])
+                    .unwrap_or_else(|| panic!("{key} should format in {locale}"));
+                assert!(!value.trim().is_empty(), "{key} is empty in {locale}");
+            }
+        }
+    }
+
+    #[test]
     fn zh_cn_wechat_translations_preserve_machine_facing_tokens() {
         let zh_cn = include_str!("../locales/zh-CN/cli.ftl");
         let bind = format_ftl_message(
@@ -440,6 +465,35 @@ mod tests {
         .expect("missing disk key should fall back to built-in zh-CN");
         assert!(built_in.contains("123456"));
         assert!(built_in.contains("需要绑定"));
+    }
+
+    #[test]
+    fn disk_approval_override_cannot_rewrite_parser_commands() {
+        let sources = CliFtlSources {
+            locale: "es".to_string(),
+            disk: Some(
+                "channel-approval-reply-instruction-yesno = Traducido: { $always_command }, { $yes_command }, { $no_command }"
+                    .to_string(),
+            ),
+            builtin: builtin_cli_ftl_source("es"),
+        };
+        let token = "abc123";
+        let yes_command = format!("{token} yes");
+        let no_command = format!("{token} no");
+        let always_command = format!("{token} always");
+
+        let rendered = format_cli_string_with_args(
+            &sources,
+            "channel-approval-reply-instruction-yesno",
+            &[
+                ("yes_command", yes_command.as_str()),
+                ("no_command", no_command.as_str()),
+                ("always_command", always_command.as_str()),
+            ],
+        )
+        .expect("disk override should format");
+
+        assert_eq!(rendered, "Traducido: abc123 always, abc123 yes, abc123 no");
     }
 
     #[test]
@@ -545,6 +599,48 @@ mod tests {
     }
 
     #[test]
+    fn daemon_startup_cli_strings_format_in_all_locales() {
+        let url = "http://127.0.0.1:42617";
+        let path = "/tmp/zeroclaw-test/daemon.sock";
+        let cases = [
+            ("cli-daemon-starting-title", &[][..], &["ZeroClaw"][..]),
+            ("cli-daemon-starting-detail", &[][..], &[][..]),
+            ("cli-daemon-started-title", &[][..], &["ZeroClaw"][..]),
+            (
+                "cli-daemon-started-gateway",
+                &[("url", url)][..],
+                &[url][..],
+            ),
+            (
+                "cli-daemon-started-socket",
+                &[("path", path)][..],
+                &[path][..],
+            ),
+            ("cli-daemon-started-pairing", &[][..], &[][..]),
+            ("cli-daemon-started-stop", &[][..], &["Ctrl+C"][..]),
+        ];
+
+        for (source, locale) in [
+            (include_str!("../locales/en/cli.ftl"), "en"),
+            (include_str!("../locales/es/cli.ftl"), "es"),
+            (include_str!("../locales/fr/cli.ftl"), "fr"),
+            (include_str!("../locales/ja/cli.ftl"), "ja"),
+            (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+        ] {
+            for &(key, args, expected_parts) in &cases {
+                let value = format_ftl_message(source, locale, key, args)
+                    .unwrap_or_else(|| panic!("{key} should format in {locale}"));
+                for &expected in expected_parts {
+                    assert!(
+                        value.contains(expected),
+                        "{key} in {locale} should preserve {expected:?}; got: {value:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn channel_compile_guidance_cli_strings_format_from_fluent() {
         let cases = [
             (
@@ -629,6 +725,16 @@ mod tests {
                 .as_slice(),
             ),
             ("channel-runtime-request-timeout", &[][..], [].as_slice()),
+            (
+                "channel-runtime-no-reply-refused",
+                &[][..],
+                ["🚫"].as_slice(),
+            ),
+            (
+                "channel-runtime-no-reply-failed",
+                &[][..],
+                ["⚠️"].as_slice(),
+            ),
             (
                 "channel-runtime-current-model-status",
                 &[("provider", "openai.default"), ("model", "gpt-test")][..],
@@ -1142,6 +1248,231 @@ mod tests {
             assert!(
                 !bar_formatted.contains("{pct}"),
                 "{locale}: cli-agent-context-bar has unformatted placeholder in: {bar_formatted}"
+            );
+        }
+    }
+
+    /// Argless `channel-approval-*` keys must be defined and non-empty in
+    /// every committed locale.
+    const CHANNEL_APPROVAL_ARGLESS_KEYS: &[&str] = &[
+        "channel-approval-heading",
+        "channel-approval-heading-shout",
+        "channel-approval-tool-label",
+        "channel-approval-args-label",
+        "channel-approval-btn-approve",
+        "channel-approval-btn-deny",
+        "channel-approval-btn-always",
+        "channel-approval-tap-instruction",
+        "channel-telegram-approval-ack-approved",
+        "channel-telegram-approval-ack-always-approved",
+        "channel-telegram-approval-ack-denied",
+        "channel-telegram-approval-ack-unknown",
+        "channel-discord-approval-btn-allow-once",
+        "channel-discord-approval-btn-allow-session",
+        "channel-discord-approval-btn-allow-always",
+        "channel-approval-opt-allow-once",
+        "channel-approval-opt-allow-always",
+        "channel-approval-opt-reject",
+        "channel-approval-opt-reject-with-edit",
+    ];
+
+    fn channel_approval_locale_sources() -> [(&'static str, &'static str); 5] {
+        [
+            (include_str!("../locales/en/cli.ftl"), "en"),
+            (include_str!("../locales/es/cli.ftl"), "es"),
+            (include_str!("../locales/fr/cli.ftl"), "fr"),
+            (include_str!("../locales/ja/cli.ftl"), "ja"),
+            (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+        ]
+    }
+
+    #[test]
+    fn channel_approval_keys_are_defined_in_every_locale() {
+        // Key-parity + command-preservation guard: every new
+        // `channel-approval-*` key must be defined in all 5 committed
+        // locales, and the complete Rust-built reply commands — plus the
+        // tool arg — must survive translation verbatim.
+        for (source, locale) in channel_approval_locale_sources() {
+            for key in CHANNEL_APPROVAL_ARGLESS_KEYS {
+                let value = format_ftl_message(source, locale, key, &[])
+                    .unwrap_or_else(|| panic!("{locale}: {key} should be defined"));
+                assert!(!value.is_empty(), "{locale}: {key} should not be empty");
+            }
+
+            let title =
+                format_ftl_message(source, locale, "channel-approval-title", &[("tool", "git")])
+                    .unwrap_or_else(|| {
+                        panic!("{locale}: channel-approval-title should be defined")
+                    });
+            assert!(
+                title.contains("git"),
+                "{locale}: channel-approval-title should inline the tool arg; got {title:?}"
+            );
+
+            let yesno = format_ftl_message(
+                source,
+                locale,
+                "channel-approval-reply-instruction-yesno",
+                &[
+                    ("yes_command", "abc123 yes"),
+                    ("no_command", "abc123 no"),
+                    ("always_command", "abc123 always"),
+                ],
+            )
+            .unwrap_or_else(|| {
+                panic!("{locale}: channel-approval-reply-instruction-yesno should be defined")
+            });
+            for expected in ["abc123 yes", "abc123 no", "abc123 always"] {
+                assert!(
+                    yesno.contains(expected),
+                    "{locale}: reply-instruction-yesno should preserve {expected:?} verbatim; got {yesno:?}"
+                );
+            }
+
+            let approve_deny = format_ftl_message(
+                source,
+                locale,
+                "channel-approval-reply-instruction-approve-deny",
+                &[
+                    ("approve_command", "abc123 approve"),
+                    ("deny_command", "abc123 deny"),
+                    ("always_command", "abc123 always"),
+                ],
+            )
+            .unwrap_or_else(|| {
+                panic!(
+                    "{locale}: channel-approval-reply-instruction-approve-deny should be defined"
+                )
+            });
+            for expected in ["abc123 approve", "abc123 deny", "abc123 always"] {
+                assert!(
+                    approve_deny.contains(expected),
+                    "{locale}: reply-instruction-approve-deny should preserve {expected:?} verbatim; got {approve_deny:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn channel_approval_en_catalogue_matches_expected_literals() {
+        // Byte-exact regression guard: the `en` values are the
+        // source of truth the button/text-reply adapters compose their
+        // rendered prompts from. Pinning them here proves a future catalogue
+        // edit can't silently change the English UI text.
+        type ExpectedCase<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a str);
+
+        let en = include_str!("../locales/en/cli.ftl");
+        let cases: &[ExpectedCase<'_>] = &[
+            ("channel-approval-heading", &[], "Tool approval required"),
+            ("channel-approval-heading-shout", &[], "APPROVAL REQUIRED"),
+            ("channel-approval-tool-label", &[], "Tool"),
+            ("channel-approval-args-label", &[], "Args"),
+            ("channel-approval-btn-approve", &[], "Approve"),
+            ("channel-approval-btn-deny", &[], "Deny"),
+            ("channel-approval-btn-always", &[], "Always"),
+            (
+                "channel-approval-tap-instruction",
+                &[],
+                "Tap a button below:",
+            ),
+            (
+                "channel-approval-reply-instruction-yesno",
+                &[
+                    ("yes_command", "abc123 yes"),
+                    ("no_command", "abc123 no"),
+                    ("always_command", "abc123 always"),
+                ],
+                "Reply: \"abc123 yes\", \"abc123 no\", or \"abc123 always\"",
+            ),
+            (
+                "channel-approval-reply-instruction-approve-deny",
+                &[
+                    ("approve_command", "abc123 approve"),
+                    ("deny_command", "abc123 deny"),
+                    ("always_command", "abc123 always"),
+                ],
+                "Reply `abc123 approve` / `abc123 deny` / `abc123 always`.",
+            ),
+            ("channel-telegram-approval-ack-approved", &[], "Approved"),
+            (
+                "channel-telegram-approval-ack-always-approved",
+                &[],
+                "Always approved",
+            ),
+            ("channel-telegram-approval-ack-denied", &[], "Denied"),
+            (
+                "channel-telegram-approval-ack-unknown",
+                &[],
+                "Unknown action",
+            ),
+            ("channel-discord-approval-btn-allow-once", &[], "Allow once"),
+            (
+                "channel-discord-approval-btn-allow-session",
+                &[],
+                "Allow this session",
+            ),
+            (
+                "channel-discord-approval-btn-allow-always",
+                &[],
+                "Always allow",
+            ),
+            ("channel-approval-title", &[("tool", "git")], "Approve git?"),
+            ("channel-approval-opt-allow-once", &[], "Allow once"),
+            ("channel-approval-opt-allow-always", &[], "Always allow"),
+            ("channel-approval-opt-reject", &[], "Reject"),
+            (
+                "channel-approval-opt-reject-with-edit",
+                &[],
+                "Reject with edit",
+            ),
+        ];
+        for (key, args, expected) in cases {
+            let value = format_ftl_message(en, "en", key, args)
+                .unwrap_or_else(|| panic!("en: {key} should format"));
+            assert_eq!(&value, expected, "en: {key} literal drifted");
+        }
+    }
+
+    #[test]
+    fn channel_approval_keys_resolve_via_required_apis_without_sentinel() {
+        // Exercises the production entry point (`get_required_cli_string*`)
+        // rather than only the raw locale sources, pinned to English via the
+        // existing test-only helper (locale is a process-wide `OnceLock`, so
+        // a live locale switch isn't available mid-test-binary) so a typo'd
+        // key at a call site would show up as the `{key}` missing-string
+        // sentinel here exactly as it would in production.
+        for key in CHANNEL_APPROVAL_ARGLESS_KEYS {
+            let value = get_english_cli_string_with_args(key, &[]);
+            assert_ne!(
+                value,
+                format!("{{{key}}}"),
+                "{key} resolved to the missing-string sentinel"
+            );
+        }
+        for (key, args) in [
+            ("channel-approval-title", &[("tool", "git")][..]),
+            (
+                "channel-approval-reply-instruction-yesno",
+                &[
+                    ("yes_command", "abc123 yes"),
+                    ("no_command", "abc123 no"),
+                    ("always_command", "abc123 always"),
+                ][..],
+            ),
+            (
+                "channel-approval-reply-instruction-approve-deny",
+                &[
+                    ("approve_command", "abc123 approve"),
+                    ("deny_command", "abc123 deny"),
+                    ("always_command", "abc123 always"),
+                ][..],
+            ),
+        ] {
+            let value = get_english_cli_string_with_args(key, args);
+            assert_ne!(
+                value,
+                format!("{{{key}}}"),
+                "{key} resolved to the missing-string sentinel"
             );
         }
     }

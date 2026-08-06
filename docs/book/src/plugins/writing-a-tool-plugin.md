@@ -19,14 +19,12 @@ the plugin host compiled in to run it.
 > **The release binary is not that binary.** The prebuilt binaries the
 > installer ships do not include the plugin host (`zeroclaw plugin …` is an
 > unrecognized subcommand), and `plugins-wasm` is not in the crate's default
-> feature set. Build the host side from source, and note the backend
-> features do **not** imply the umbrella: `--features plugins-wasm-cranelift`
-> alone builds cleanly and still produces a plugin-less binary, because the
-> runtime integration is gated on `plugins-wasm` itself. The working
-> invocation is:
+> feature set. Build the host side from source with an execution backend;
+> every backend feature carries the `plugins-wasm` umbrella itself, so one
+> flag is enough:
 >
 > ```bash
-> cargo build --release --features plugins-wasm,plugins-wasm-cranelift
+> cargo build --release --features plugins-wasm-cranelift
 > ```
 >
 > The [protocol page](../developing/plugin-protocol.md#build-features)
