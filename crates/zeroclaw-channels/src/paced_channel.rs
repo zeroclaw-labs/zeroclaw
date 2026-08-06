@@ -9,8 +9,8 @@ use async_trait::async_trait;
 use tokio::sync::{Mutex, oneshot};
 use zeroclaw_api::attribution::{Attributable, Role};
 use zeroclaw_api::channel::{
-    Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, RoomCreationOptions,
-    SendMessage,
+    Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, ProgressEvent,
+    RoomCreationOptions, SendMessage,
 };
 use zeroclaw_config::schema::{DEFAULT_REPLY_QUEUE_DEPTH, HasReplyPacing, PACING_RECIPIENT_CAP};
 
@@ -380,6 +380,17 @@ impl Channel for PacedChannel {
             .await
     }
 
+    async fn update_draft_lifecycle(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        event: ProgressEvent,
+    ) -> Result<()> {
+        self.inner
+            .update_draft_lifecycle(recipient, message_id, event)
+            .await
+    }
+
     async fn finalize_draft(
         &self,
         recipient: &str,
@@ -443,6 +454,19 @@ impl Channel for PacedChannel {
         request: &ChannelApprovalRequest,
     ) -> Result<Option<ChannelApprovalResponse>> {
         self.inner.request_approval(recipient, request).await
+    }
+
+    /// Must be forwarded explicitly: without this the trait default would call
+    /// [`Channel::request_approval`] on the *wrapper* and relabel the inner
+    /// channel's synthesized timeout deny as an operator decision.
+    async fn request_approval_attributed(
+        &self,
+        recipient: &str,
+        request: &ChannelApprovalRequest,
+    ) -> Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
+        self.inner
+            .request_approval_attributed(recipient, request)
+            .await
     }
 
     async fn request_choice(

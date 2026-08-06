@@ -54,6 +54,9 @@ The parallel runtime gate repeats the complete `zeroclaw-runtime` and
 `zeroclaw-channels` library test binaries with 16 harness threads. Running the
 whole binaries is intentional: it detects interference between state-mutating
 tests and otherwise unrelated agent turns that filtered test runs cannot expose.
+Required CI runs this gate in a separate job for changes to either crate, the
+workspace dependency manifests, or the gate's own CI files. Other PRs skip it;
+pushes to `master` and merge queue runs retain the full regression backstop.
 Override repetitions with `ZEROCLAW_PARALLEL_TEST_RUNS` and harness threads
 with `ZEROCLAW_PARALLEL_TEST_THREADS`.
 

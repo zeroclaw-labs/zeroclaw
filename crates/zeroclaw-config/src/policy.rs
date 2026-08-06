@@ -2,7 +2,7 @@ use anyhow::Context as _;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 // Re-export from zeroclaw-config.
 pub use crate::autonomy::AutonomyLevel;
@@ -29,6 +29,14 @@ pub struct ActionTracker {
     actions: Mutex<Vec<Instant>>,
 }
 
+const ACTION_WINDOW: Duration = Duration::from_secs(3600);
+
+fn retain_actions_after(actions: &mut Vec<Instant>, cutoff: Option<Instant>) {
+    if let Some(cutoff) = cutoff {
+        actions.retain(|timestamp| *timestamp > cutoff);
+    }
+}
+
 impl Default for ActionTracker {
     fn default() -> Self {
         Self::new()
@@ -45,21 +53,16 @@ impl ActionTracker {
     /// Record an action and return the current count within the window.
     pub fn record(&self) -> usize {
         let mut actions = self.actions.lock();
-        let cutoff = Instant::now()
-            .checked_sub(std::time::Duration::from_secs(3600))
-            .unwrap_or_else(Instant::now);
-        actions.retain(|t| *t > cutoff);
-        actions.push(Instant::now());
+        let now = Instant::now();
+        retain_actions_after(&mut actions, now.checked_sub(ACTION_WINDOW));
+        actions.push(now);
         actions.len()
     }
 
     /// Count of actions in the current window without recording.
     pub fn count(&self) -> usize {
         let mut actions = self.actions.lock();
-        let cutoff = Instant::now()
-            .checked_sub(std::time::Duration::from_secs(3600))
-            .unwrap_or_else(Instant::now);
-        actions.retain(|t| *t > cutoff);
+        retain_actions_after(&mut actions, Instant::now().checked_sub(ACTION_WINDOW));
         actions.len()
     }
 }
@@ -1143,6 +1146,49 @@ fn strip_windows_exe_suffix(name: &str) -> &str {
     }
 }
 
+/// Compare two bare command names using the same semantics everywhere a
+/// command allowlist is interpreted. Path-like entries are handled by their
+/// callers and deliberately do not pass through this case-folding rule.
+fn command_names_equivalent(left: &str, right: &str) -> bool {
+    let left_lower = left.to_ascii_lowercase();
+    let right_lower = right.to_ascii_lowercase();
+    if left_lower == right_lower {
+        return true;
+    }
+
+    // On Windows, an omitted executable suffix does not distinguish command
+    // names (for example, `git` and `git.exe` grant the same command access).
+    #[cfg(target_os = "windows")]
+    {
+        for ext in &[".exe", ".cmd", ".bat"] {
+            if right_lower == format!("{left_lower}{ext}") {
+                return true;
+            }
+            if left_lower == format!("{right_lower}{ext}") {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn command_allowlist_entries_equivalent(left: &str, right: &str) -> bool {
+    let left = strip_wrapping_quotes(left).trim();
+    let right = strip_wrapping_quotes(right).trim();
+    if left.is_empty() || right.is_empty() {
+        return false;
+    }
+
+    // Preserve exact equality for paths. Case-folding a path would widen the
+    // policy on case-sensitive filesystems.
+    if looks_like_path(left) || looks_like_path(right) {
+        return left == right;
+    }
+
+    command_names_equivalent(left, right)
+}
+
 fn is_allowlist_entry_match(allowed: &str, executable: &str, executable_base: &str) -> bool {
     let allowed = strip_wrapping_quotes(allowed).trim();
     if allowed.is_empty() {
@@ -1162,28 +1208,11 @@ fn is_allowlist_entry_match(allowed: &str, executable: &str, executable_base: &s
         return executable_path == allowed_path;
     }
 
-    // Command-name entries continue to match by basename.
-    // On Windows, also match when the executable has a .exe/.cmd/.bat suffix
-    // that the allowlist entry omits (e.g., allowlist "git" matches "git.exe").
-    if allowed == executable_base {
-        return true;
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        let base_lower = executable_base.to_ascii_lowercase();
-        let allowed_lower = allowed.to_ascii_lowercase();
-        for ext in &[".exe", ".cmd", ".bat"] {
-            if base_lower == format!("{allowed_lower}{ext}") {
-                return true;
-            }
-            if allowed_lower == format!("{base_lower}{ext}") {
-                return true;
-            }
-        }
-    }
-
-    false
+    // Command-name entries continue to match by basename, case-insensitively.
+    // Callers lowercase the basename before it reaches here, so folding only
+    // one side would leave an entry written as `Git` or `Docker` unable to
+    // match anything.
+    command_names_equivalent(allowed, executable_base)
 }
 
 impl SecurityPolicy {
@@ -1803,6 +1832,36 @@ impl SecurityPolicy {
         false
     }
 
+    /// Return the canonical allowlisted root directory that authorizes reading
+    /// `resolved`: the workspace first, then read-write roots, then read-only
+    /// roots. Callers bind a directory-handle-scoped open (cap-std beneath/
+    /// no-follow) to this boundary instead of re-walking a pathname that could be
+    /// swapped between the readability check and the open. Returns `None` when no
+    /// bounded allowlist root contains the path (e.g. a fully permissive,
+    /// non-`workspace_only` policy, or a device path) — there is then no
+    /// confinement boundary to bind to. Assumes `resolved` is already canonical
+    /// and has passed [`Self::is_resolved_path_readable`].
+    pub fn approved_read_root(&self, resolved: &Path) -> Option<PathBuf> {
+        let workspace_root = self
+            .workspace_dir
+            .canonicalize()
+            .unwrap_or_else(|_| self.workspace_dir.clone());
+        if resolved.starts_with(&workspace_root) {
+            return Some(workspace_root);
+        }
+        for root in self
+            .allowed_roots
+            .iter()
+            .chain(self.allowed_roots_read_only.iter())
+        {
+            let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
+            if resolved.starts_with(&canonical) {
+                return Some(canonical);
+            }
+        }
+        None
+    }
+
     pub fn is_resolved_path_allowed(&self, resolved: &Path) -> bool {
         if is_null_device(resolved) {
             return true;
@@ -2058,7 +2117,11 @@ impl SecurityPolicy {
             }
         }
         for cmd in &self.allowed_commands {
-            if !parent.allowed_commands.iter().any(|p| p == cmd) {
+            if !parent
+                .allowed_commands
+                .iter()
+                .any(|p| command_allowlist_entries_equivalent(p, cmd))
+            {
                 return Err(EscalationViolation::CommandNotInParent {
                     command: cmd.clone(),
                 });
@@ -2877,6 +2940,34 @@ mod tests {
     }
 
     #[test]
+    fn mixed_case_bare_allowlist_entry_matches_on_every_platform() {
+        // Callers lowercase the executable basename before the allowlist
+        // comparison, so an entry written with any uppercase could never match
+        // until both sides were folded.
+        let p = SecurityPolicy {
+            allowed_commands: vec!["Git".into(), "DOCKER".into()],
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_command_allowed("git status"));
+        assert!(p.is_command_allowed("docker ps"));
+        // The invocation may also be capitalized; the basename is folded too.
+        assert!(p.is_command_allowed("GIT status"));
+        // Entries that are genuinely absent are still refused.
+        assert!(!p.is_command_allowed("kubectl get pods"));
+    }
+
+    #[test]
+    fn mixed_case_allowlist_entry_does_not_widen_path_matching() {
+        // Path-like entries stay exact rather than using command-name folding.
+        let p = SecurityPolicy {
+            allowed_commands: vec!["/usr/bin/Antigravity".into()],
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_command_allowed("/usr/bin/Antigravity"));
+        assert!(!p.is_command_allowed("/usr/bin/antigravity"));
+    }
+
+    #[test]
     fn empty_allowlist_blocks_everything() {
         let p = SecurityPolicy {
             allowed_commands: vec![],
@@ -3285,6 +3376,15 @@ mod tests {
         assert_eq!(tracker.record(), 2);
         assert_eq!(tracker.record(), 3);
         assert_eq!(tracker.count(), 3);
+    }
+
+    #[test]
+    fn action_tracker_retains_actions_when_cutoff_is_unavailable() {
+        let mut actions = vec![Instant::now(), Instant::now()];
+
+        retain_actions_after(&mut actions, None);
+
+        assert_eq!(actions.len(), 2);
     }
 
     #[test]
@@ -4886,6 +4986,41 @@ mod tests {
     }
 
     #[test]
+    fn ensure_no_escalation_accepts_case_equivalent_command_names() {
+        let parent = SecurityPolicy {
+            allowed_commands: vec!["Git".into(), "DOCKER".into()],
+            ..parent_policy_for_escalation_tests()
+        };
+        let child = SecurityPolicy {
+            allowed_commands: vec!["git".into(), "docker".into()],
+            ..parent.clone()
+        };
+
+        assert!(child.ensure_no_escalation_beyond(&parent).is_ok());
+    }
+
+    #[test]
+    fn ensure_no_escalation_keeps_command_paths_case_sensitive() {
+        let parent = SecurityPolicy {
+            allowed_commands: vec!["/usr/bin/Git".into()],
+            ..parent_policy_for_escalation_tests()
+        };
+        let child = SecurityPolicy {
+            allowed_commands: vec!["/usr/bin/git".into()],
+            ..parent.clone()
+        };
+
+        let err = child
+            .ensure_no_escalation_beyond(&parent)
+            .expect_err("case-distinct paths must not be treated as equivalent");
+        assert!(matches!(
+            err,
+            EscalationViolation::CommandNotInParent { ref command }
+            if command == "/usr/bin/git"
+        ));
+    }
+
+    #[test]
     fn ensure_no_escalation_accepts_rw_root_downgraded_to_read_only_on_child() {
         // A SubAgent giving up its write privilege is a narrowing,
         // not an escalation.
@@ -5462,6 +5597,41 @@ mod tests {
         };
         assert!(p.is_command_allowed("diff <(ls dir1) <(ls dir2)"));
         assert!(p.is_command_allowed("tee >(grep error > errors.log)"));
+    }
+
+    #[test]
+    fn approved_read_root_returns_workspace_for_contained_paths() {
+        let ws = tempfile::tempdir().unwrap();
+        let ws_canon = ws.path().canonicalize().unwrap();
+        let policy = SecurityPolicy {
+            workspace_dir: ws.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        };
+        // A path inside the workspace binds to the canonical workspace root.
+        assert_eq!(
+            policy.approved_read_root(&ws_canon.join("sub").join("a.txt")),
+            Some(ws_canon.clone())
+        );
+        // A path outside every allowlist has no bounded root.
+        let outside = tempfile::tempdir().unwrap();
+        let outside_canon = outside.path().canonicalize().unwrap();
+        assert_eq!(policy.approved_read_root(&outside_canon.join("x")), None);
+    }
+
+    #[test]
+    fn approved_read_root_honors_read_only_allowlist() {
+        let ws = tempfile::tempdir().unwrap();
+        let ro = tempfile::tempdir().unwrap();
+        let ro_canon = ro.path().canonicalize().unwrap();
+        let policy = SecurityPolicy {
+            workspace_dir: ws.path().to_path_buf(),
+            allowed_roots_read_only: vec![ro.path().to_path_buf()],
+            ..SecurityPolicy::default()
+        };
+        assert_eq!(
+            policy.approved_read_root(&ro_canon.join("doc.pdf")),
+            Some(ro_canon.clone())
+        );
     }
 
     #[test]

@@ -17,6 +17,7 @@ zeroclaw-infra.workspace = true
 anyhow = "1.0"
 async-trait = "0.1"
 base64 = "0.22"
+cap-std = "4"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 directories = "6.0"
 futures-util = { version = "0.3", default-features = false }

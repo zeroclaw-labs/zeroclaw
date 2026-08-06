@@ -599,6 +599,7 @@ cli-quickstart-error-channel-bound = le canal `{$reference}` est déjà lié à 
 cli-quickstart-error-channel-required = le type de canal et l'alias sont requis
 cli-quickstart-error-channel-field-not-advertised = le champ de canal `{$field}` n'est pas disponible dans Quickstart
 cli-quickstart-error-channel-token-required = le jeton du bot Telegram est requis
+cli-quickstart-error-webhook-secret-required = le secret partagé du webhook est requis
 cli-quickstart-error-peer-group-name-required = le nom du groupe de pairs est requis
 cli-quickstart-error-peer-group-channel-required = la référence de canal du groupe de pairs est requise
 cli-quickstart-error-peer-group-unknown-channel = le groupe de pairs `{$name}` référence un canal inconnu `{$channel}`
@@ -809,6 +810,12 @@ history-trim-floor-exceeds-budget = system prompt and tool definitions ({$floor}
 turn-ingress-dropped = Cette requête n'a pas été traitée : { $reason }
 turn-tool-interrupted-before-result = [interrompu par l'utilisateur avant que cet outil ne produise un résultat]
 channel-runtime-malformed-tool-output = J'ai généré une erreur de format d'appel d'outil interne et n'ai pas pu terminer cette requête. Veuillez réessayer.
+channel-runtime-progress-received = Reçu
+channel-runtime-progress-planning = Planification
+channel-runtime-progress-waiting-on-model = En attente du modèle
+channel-runtime-progress-running-tool = Exécution d’un outil
+channel-runtime-progress-compacting-context = Compactage du contexte
+channel-runtime-progress-finalizing-response = Finalisation de la réponse
 channel-runtime-new-session = Historique de conversation effacé. Nouveau départ.
 channel-runtime-stop-sent = Signal d'arrêt envoyé.
 channel-runtime-stop-no-task = Aucune tâche en cours pour ce périmètre d'expéditeur.
@@ -816,6 +823,8 @@ channel-runtime-model-empty = L'ID du modèle ne peut pas être vide. Utilisez `
 channel-runtime-model-switched = Modèle changé vers `{ $model }` (model_provider : `{ $provider }`). Contexte conservé.
 channel-runtime-agent-scope-rejected = L'expéditeur `{ $sender }` n'est pas autorisé à utiliser `/model --agent` sur l'agent `{ $agent }`. Utilisez `/model --user { $model }` pour un remplacement limité à la session, ou demandez à un administrateur de marquer un groupe de pairs `admin_for_agent_scope = true` avec vous comme membre.
 channel-runtime-request-timeout = ⚠️ La requête a expiré en attendant le modèle. Veuillez réessayer.
+channel-runtime-no-reply-refused = 🚫 Je ne peux pas répondre à cette demande.
+channel-runtime-no-reply-failed = ⚠️ Je n'ai pas pu traiter cette demande.
 channel-runtime-current-model-status =
     model_provider actuel : `{ $provider }`
     Modèle actuel : `{ $model }`
@@ -921,6 +930,13 @@ cli-gateway-restart-hint-process = redémarrez le processus `zeroclaw daemon`
 
 cli-daemon-gateway-already-running = Une passerelle ZeroClaw est déjà en cours d'exécution sur {$host}:{$port}. Le démon supervise sa propre passerelle et ne démarrera pas une seconde passerelle sur la même adresse. Arrêtez cette passerelle (ou pointez le démon vers un port libre avec `zeroclaw config set gateway.port <port>`), puis relancez le démon.
 cli-daemon-gateway-port-occupied = L'adresse de passerelle {$host}:{$port} est déjà utilisée par un autre processus. Libérez le port ou pointez le démon vers un port libre (`zeroclaw config set gateway.port <port>`), puis relancez le démon.
+cli-daemon-starting-title = 🧠 Le démon ZeroClaw démarre…
+cli-daemon-starting-detail = Préparation des endpoints configurés du démon
+cli-daemon-started-title = 🧠 Le démon ZeroClaw est prêt
+cli-daemon-started-gateway = Passerelle : {$url}
+cli-daemon-started-socket = Socket :     {$path}
+cli-daemon-started-pairing = Appairage : activé (voir ci-dessus l'état actuel de la passerelle)
+cli-daemon-started-stop = Ctrl+C ou SIGTERM pour arrêter
 cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%
 cli-agent-context-bar-unknown = ctx: inconnu / {$max}
 cli-doctor-ctxwin-already-set = {$provider_ref}: a déjà context_window = {$ctx}
@@ -937,9 +953,41 @@ cli-doctor-ctxwin-write-failed = {$provider_ref}: échec de l'écriture de conte
 # ── Degraded config sections (doctor diagnose, #8835) ──
 cli-doctor-degraded-security = La section de configuration CRITIQUE POUR LA SÉCURITÉ `{$path}` est invalide et a été réinitialisée à sa valeur par défaut pour permettre au daemon de démarrer ; la posture en cours d'exécution peut être PLUS FAIBLE que prévu. Exécutez `zeroclaw config migrate` pour voir l'erreur d'analyse, puis réparez le fichier.
 cli-doctor-degraded-section = La section de configuration `{$path}` est malformée et a été réinitialisée aux valeurs par défaut ; les valeurs de cette section ne sont PAS en vigueur. Exécutez `zeroclaw config migrate` pour voir l'erreur d'analyse, puis réparez le fichier.
+cli-doctor-skills-prompt-injection-mode-full-deprecated = Le mode d'injection des instructions de compétences "full" est obsolète. Le mode full explicite reste pris en charge pendant la période de dépréciation, mais compact est désormais la valeur par défaut ; effectuez la migration avant que Schema V4 ne supprime le mode full.
 sop-approval-deferred-at-capacity = Impossible de reprendre l’exécution {$run_id} : tous les créneaux d’exécution sont occupés. L’approbation reste en attente ; réessayez lorsqu’un créneau se libère.
 sop-approval-policy-unavailable = L’approbation a échoué car l’étape SOP en attente est indisponible : {$reason}. L’exécution reste en attente.
 sop-rpc-decision-invalid-state = L’exécution {$run_id} ne peut pas être résolue dans son état actuel.
 sop-rpc-decision-unauthorized = L’identité RPC n’est pas autorisée à résoudre cette étape SOP.
 sop-rpc-policy-missing = La politique d’approbation SOP « {$name} » n’est pas configurée.
 sop-rpc-policy-unavailable = La politique du SOP en attente est indisponible : {$reason}.
+
+# ── Tool approval (channels, #9409) ──
+# Human-visible copy for the operator-facing tool-approval prompt, shared
+# across the button adapters (Telegram, Discord, Slack) and the text-reply
+# adapters (Matrix, Signal, WhatsApp, Slack polling fallback). Approval
+# TOKENS, `callback_data`/`custom_id`/`action_id` values, and the reply
+# KEYWORDS parsed by `util::parse_approval_reply` (yes/y/approve, no/n/deny,
+# always) stay hardcoded ASCII in Rust — only the surrounding prose is
+# localized here.
+channel-approval-heading = Approbation de l'outil requise
+channel-approval-heading-shout = APPROBATION REQUISE
+channel-approval-tool-label = Outil
+channel-approval-args-label = Arguments
+channel-approval-btn-approve = Approuver
+channel-approval-btn-deny = Refuser
+channel-approval-btn-always = Toujours
+channel-approval-tap-instruction = Appuyez sur un bouton ci-dessous :
+channel-approval-reply-instruction-yesno = Répondez : "{ $yes_command }", "{ $no_command }" ou "{ $always_command }"
+channel-approval-reply-instruction-approve-deny = Répondez par `{ $approve_command }` / `{ $deny_command }` / `{ $always_command }`.
+channel-telegram-approval-ack-approved = Approuvé
+channel-telegram-approval-ack-always-approved = Toujours approuvé
+channel-telegram-approval-ack-denied = Refusé
+channel-telegram-approval-ack-unknown = Action inconnue
+channel-discord-approval-btn-allow-once = Autoriser une fois
+channel-discord-approval-btn-allow-session = Autoriser pour cette session
+channel-discord-approval-btn-allow-always = Toujours autoriser
+channel-approval-title = Approuver { $tool } ?
+channel-approval-opt-allow-once = Autoriser une fois
+channel-approval-opt-allow-always = Toujours autoriser
+channel-approval-opt-reject = Rejeter
+channel-approval-opt-reject-with-edit = Rejeter avec modification
