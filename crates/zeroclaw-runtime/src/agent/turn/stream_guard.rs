@@ -655,4 +655,72 @@ mod tests {
             "a standalone fence without an example trailer is a protocol leak"
         );
     }
+
+    #[test]
+    fn suppresses_reverse_solidus_dsml_envelope_split_across_stream_chunks() {
+        let mut guard = shell_guard();
+
+        assert_eq!(guard.push("<＼DSML＼tool_calls>\n"), None);
+        assert_eq!(guard.push("<＼DSML＼invoke name=\"shell\">\n"), None);
+        assert_eq!(
+            guard.push(
+                "<＼DSML＼parameter name=\"command\" string=\"true\">ls</＼DSML＼parameter>\n"
+            ),
+            None
+        );
+        assert_eq!(guard.push("</＼DSML＼invoke>\n</＼DSML＼tool_calls>"), None);
+
+        assert_eq!(guard.finish(), None);
+        assert!(
+            guard.suppressed_protocol,
+            "fullwidth reverse-solidus DSML envelope must be suppressed"
+        );
+    }
+
+    #[test]
+    fn forwards_plain_text_with_reverse_solidus_dsml_prefixes() {
+        let mut guard = shell_guard();
+
+        assert_eq!(guard.push("<＼dsml"), None);
+        assert_eq!(guard.push("data"), None);
+        assert_eq!(guard.finish(), Some("<＼dsmldata".to_string()));
+    }
+
+    #[test]
+    fn forwards_narration_before_embedded_reverse_solidus_dsml_marker() {
+        let mut guard = shell_guard();
+
+        assert_eq!(
+            guard.push(
+                "I will run it. <＼DSML＼tool_calls><＼DSML＼invoke name=\"shell\"><＼DSML＼parameter name=\"command\" string=\"true\">ls</＼DSML＼parameter></＼DSML＼invoke></＼DSML＼tool_calls>"
+            ),
+            Some("I will run it.".to_string())
+        );
+        assert_eq!(guard.finish(), None);
+        assert!(
+            guard.suppressed_protocol,
+            "narration forwarded but reverse-solidus DSML envelope suppressed"
+        );
+    }
+
+    #[test]
+    fn narration_before_reverse_solidus_marker_split_at_chunk_boundary() {
+        let mut guard = shell_guard();
+
+        assert_eq!(guard.push("I will run it. <＼DSM"), None);
+        assert_eq!(guard.push("L＼tool_calls>"), None);
+        assert_eq!(guard.push("<＼DSML＼invoke name=\"shell\">\n"), None);
+        assert_eq!(
+            guard.push(
+                "<＼DSML＼parameter name=\"command\" string=\"true\">ls</＼DSML＼parameter>\n"
+            ),
+            None
+        );
+        assert_eq!(
+            guard.push("</＼DSML＼invoke>\n</＼DSML＼tool_calls>"),
+            Some("I will run it.".to_string())
+        );
+        assert_eq!(guard.finish(), None);
+        assert!(guard.suppressed_protocol);
+    }
 }

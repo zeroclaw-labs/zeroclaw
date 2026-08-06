@@ -18,7 +18,14 @@ pub(crate) fn longest_suffix_matching_prefix(text: &str, pattern: &str) -> usize
 fn ends_with_partial_marker(text: &str) -> Option<usize> {
     let lower = text.to_ascii_lowercase();
     let mut best: Option<usize> = None;
-    for marker in ["<|dsml|", "<|tool_call|", "<｜dsml｜", "<｜tool_call｜"] {
+    for marker in [
+        "<|dsml|",
+        "<|tool_call|",
+        "<｜dsml｜",
+        "<｜tool_call｜",
+        "<＼dsml＼",
+        "<＼tool_call＼",
+    ] {
         let matched = longest_suffix_matching_prefix(&lower, marker);
         if matched >= 2 {
             best = Some(best.map_or(matched, |current| current.max(matched)));
@@ -40,6 +47,7 @@ pub(crate) fn find_embedded_protocol_candidate_start(text: &str) -> Option<usize
         "<|dsml",
         "<|tool_call",
         "<｜dsml",
+        "<＼dsml",
         "```tool",
         "```invoke",
         "```json",
@@ -71,6 +79,7 @@ pub(crate) fn find_incomplete_protocol_candidate_start(text: &str) -> Option<usi
         "<|dsml",
         "<|tool_call",
         "<｜dsml",
+        "<＼dsml",
         "```tool",
         "```invoke",
         "```json",
@@ -114,6 +123,7 @@ pub(crate) fn starts_suspicious_protocol_prefix(text: &str) -> bool {
         || lower.starts_with("<|dsml")
         || lower.starts_with("<|tool_call")
         || lower.starts_with("<｜dsml")
+        || lower.starts_with("<＼dsml")
         || lower.starts_with("```tool")
         || lower.starts_with("```invoke")
         || lower.starts_with("```json")
@@ -127,6 +137,7 @@ pub(crate) fn starts_suspicious_tag_or_fence_prefix(text: &str) -> bool {
         || lower.starts_with("<|dsml")
         || lower.starts_with("<|tool_call")
         || lower.starts_with("<｜dsml")
+        || lower.starts_with("<＼dsml")
         || lower.starts_with("```tool")
         || lower.starts_with("```invoke")
         || lower.starts_with("```json")
@@ -145,6 +156,8 @@ pub(crate) fn contains_close_tag_marker(text: &str) -> bool {
         "</|tool_call|",
         "</｜dsml｜",
         "</｜dsml",
+        "</＼dsml＼",
+        "</＼dsml",
     ]
     .iter()
     .any(|marker| lower.contains(marker))
@@ -152,9 +165,10 @@ pub(crate) fn contains_close_tag_marker(text: &str) -> bool {
 
 /// Lowercase close-marker prefixes for tool-protocol envelopes. Shared by the
 /// envelope-boundary and continuation-fragment helpers below.
-const SUPPRESSED_CLOSE_MARKERS: [&str; 11] = [
+const SUPPRESSED_CLOSE_MARKERS: [&str; 12] = [
     "</|dsml|>",
     "</｜dsml｜",
+    "</＼dsml＼",
     "</|tool_call|>",
     "</tool_call>",
     "</tool_calls>",
@@ -225,7 +239,7 @@ pub(crate) fn protocol_envelope_end(text: &str, start: usize) -> Option<usize> {
     if rest.starts_with('{') || rest.starts_with('[') {
         return first_json_value_end(rest).map(|end| start + end);
     }
-    for open in ["<|dsml|>", "<｜dsml｜", "<|tool_call|>"] {
+    for open in ["<|dsml|>", "<｜dsml｜", "<＼dsml＼", "<|tool_call|>"] {
         if !lower.starts_with(open) {
             continue;
         }
@@ -438,6 +452,22 @@ mod tests {
     }
 
     #[test]
+    fn detects_fullwidth_reverse_solidus_dsml_candidates() {
+        let embedded = r#"Here it is: <＼DSML＼tool_calls>"#;
+        assert_eq!(
+            find_embedded_protocol_candidate_start(embedded),
+            Some(embedded.find("<＼DSML＼tool_calls>").unwrap())
+        );
+        assert!(starts_suspicious_protocol_prefix(
+            "<＼dsml＼invoke name=\"shell\">"
+        ));
+        assert!(starts_suspicious_tag_or_fence_prefix(
+            "<＼dsml＼tool_calls>"
+        ));
+        assert!(find_incomplete_protocol_candidate_start("x<＼dsml").is_some());
+    }
+
+    #[test]
     fn detects_marker_split_across_chunk_boundary() {
         assert!(find_incomplete_protocol_candidate_start("I will <|").is_some());
         assert!(find_incomplete_protocol_candidate_start("I will <|D").is_some());
@@ -455,5 +485,12 @@ mod tests {
             find_incomplete_protocol_candidate_start("wrote 5 < 10").is_none(),
             "'<' inside plain text is not a protocol candidate"
         );
+    }
+
+    #[test]
+    fn detects_reverse_solidus_marker_split_across_chunk_boundary() {
+        assert!(find_incomplete_protocol_candidate_start("I will <＼").is_some());
+        assert!(find_incomplete_protocol_candidate_start("I will <＼D").is_some());
+        assert!(find_incomplete_protocol_candidate_start("I will <＼DSM").is_some());
     }
 }
