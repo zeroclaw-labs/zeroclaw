@@ -234,8 +234,11 @@ pub struct GrokCliModelProvider {
     max_acp_stdout_bytes: usize,
     /// Wall-clock timeout for the ACP request.
     timeout: Duration,
-    /// Whether this alias explicitly overrides Grok ACP's advertised vision
-    /// capability and serializes normalized image markers as ACP image blocks.
+    /// When true, serialize image markers as ACP `image` blocks and report
+    /// vision capability. Does **not** rewrite Grok's `promptCapabilities.image`
+    /// advertise (still false through 0.2.118); only ZeroClaw's send path.
+    /// Live probes: protocol accepts the blocks, model does not reliably use
+    /// the image content.
     vision_enabled: bool,
 }
 
@@ -295,7 +298,9 @@ impl GrokCliBuilder {
         self
     }
 
-    /// Enable the explicit vision override from the alias configuration.
+    /// Enable sending ACP image blocks from the alias `vision = true` config.
+    /// See the field docs: this is a local send-path switch, not a Grok
+    /// capability rewrite.
     pub fn vision_enabled(mut self, vision_enabled: bool) -> Self {
         self.vision_enabled = vision_enabled;
         self
@@ -797,13 +802,13 @@ impl GrokCliModelProvider {
             return vec![acp::AcpPromptContent::Text(message.to_string())];
         }
 
-        // TODO(grok-cli-vision): TEMPORARY workaround for Grok Build advertising
-        // `promptCapabilities.image = false` while ACP `session/prompt` still
-        // accepts image blocks (observed on 0.2.112; re-check on upgrade).
-        // `vision = true` is the explicit per-alias opt-in that bypasses that
-        // bad advertisement. Remove this branch when initialize advertises
-        // `promptCapabilities.image = true` for the deployed CLI and a live
-        // ACP smoke with an image block succeeds without the override.
+        // TODO(grok-cli-vision): Grok Build through 0.2.118 still advertises
+        // `promptCapabilities.image = false`. With `vision = true`, ZeroClaw
+        // sends ACP image blocks anyway. Live smoke on 0.2.118: session/prompt
+        // accepts the blocks (no protocol error) but the model does not use
+        // the image content. Keep this path experimental until advertise is
+        // true *and* a live recognition smoke passes; then prefer following
+        // the advertise bit instead of a local override.
         let (text, image_refs) = crate::multimodal::parse_image_markers(message);
         if image_refs.is_empty() {
             return vec![acp::AcpPromptContent::Text(message.to_string())];

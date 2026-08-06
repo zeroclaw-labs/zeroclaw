@@ -51,29 +51,35 @@ The documented ACP integration and default argument profile are validated
 against Grok Build CLI `0.2.111`. Treat upgrades of the external CLI as a
 compatibility change and revalidate `grok agent stdio` before deploying them.
 
-#### Temporary ACP vision-advertisement workaround for Grok Build 0.2.112
+#### ACP vision / image input (current Grok Build behavior)
 
-Grok Build CLI `0.2.112` advertises `promptCapabilities.image = false` during
-ACP initialization even though its `session/prompt` endpoint accepts ACP `image`
-blocks. To opt into ZeroClaw's temporary workaround for that upstream
-misadvertisement, set `vision = true` on the specific `grok_cli` alias:
+Grok Build CLI (checked through `0.2.118`) still advertises
+`promptCapabilities.image = false` on ACP `initialize`. That is not an env-var
+override on either side: ZeroClaw never rewrites Grok's advertisement. The
+only ZeroClaw control is the shared per-alias config field `vision`.
+
+| Layer | Behavior on `0.2.118` |
+| ----- | --------------------- |
+| ACP advertise | `promptCapabilities.image = false` |
+| Default `grok_cli` | `vision` unset → ZeroClaw treats the alias as non-vision; image markers stay text |
+| `vision = true` | ZeroClaw reports vision on the alias and **sends** ACP `{type: image, data, mimeType}` blocks (does not change Grok's advertise) |
+| Model recognition | Live probe: image blocks are accepted by `session/prompt` (no protocol error) but the agent answered as if **no image was received** |
 
 ```toml
 [providers.models.grok_cli.default]
 model = "grok-4.5"
 working_directory = "/srv/zeroclaw/grok-workspace"
-# TEMPORARY: bypass Grok Build 0.2.112's incorrect ACP image advertisement.
-vision = true
+# Optional experiment only: send ACP image blocks despite image=false advertise.
+# Does not make Grok Build 0.2.118 reliably see or describe the image.
+# vision = true
 ```
 
-With this explicit opt-in, ZeroClaw reports vision support for that alias and
-sends normalized image attachments as ACP `image` blocks. It does not override
-other ACP advertisements, such as tool or permission capabilities. Leave the
-setting unset by default. **Removal condition:** after the deployed Grok Build
-CLI advertises `promptCapabilities.image = true` on ACP initialize and a live
-image-block smoke succeeds without the override, delete the temporary
-`vision = true` opt-in and the matching code path
-(`GrokCliModelProvider::acp_prompt_content`).
+Leave `vision` unset for production `grok_cli` aliases. Do not route channel
+attachments that require real image understanding to `grok_cli` until a deployed
+CLI both advertises `image = true` and a live smoke shows the model using the
+image content. When that holds, drop any temporary `vision = true` opt-in and
+revisit whether ZeroClaw should follow the advertise bit instead of a local
+override (`GrokCliModelProvider::acp_prompt_content`).
 
 #### Ubuntu 24.04: keep the Grok sandbox when `bwrap` needs user namespaces
 

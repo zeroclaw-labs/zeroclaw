@@ -1442,9 +1442,10 @@ impl FamilyProviderFactory for GrokCliModelProviderConfig {
                 .extra_args(self.extra_args.clone())
                 .max_acp_stdout_bytes(self.max_acp_stdout_bytes)
                 .timeout_secs(self.base.timeout_secs)
-                // TEMPORARY: Grok Build 0.2.112 advertises ACP image=false
-                // while accepting image blocks. The existing per-alias
-                // `vision = true` override is the sole operator opt-in.
+                // Optional send-path only: alias `vision = true` makes
+                // ZeroClaw emit ACP image blocks. Grok still advertises
+                // image=false through 0.2.118 and does not reliably use the
+                // pixels; leave unset in production until upstream vision works.
                 .vision_enabled(opts.vision == Some(true))
                 .build()?,
         ))
