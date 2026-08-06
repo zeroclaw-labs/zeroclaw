@@ -637,16 +637,26 @@ impl AnthropicModelProvider {
 
     /// Sweeps residual raw base64 out of marker-cleaned prose and appends the
     /// omission note when references were rejected.
+    ///
+    /// The two tool arms use this unconditionally: their input is machine
+    /// output, where a quoted data URI is far rarer than a truncated
+    /// screenshot. The user arm sweeps only marker-carrying text and then calls
+    /// [`Self::text_with_note`] directly — see its call site.
     fn text_with_omission_note(cleaned: &str, omitted: usize) -> String {
-        let swept = Self::sweep_residual_image_data(cleaned);
+        Self::text_with_note(&Self::sweep_residual_image_data(cleaned), omitted)
+    }
+
+    /// Appends the omission note to text that has already been swept, or that
+    /// deliberately was not.
+    fn text_with_note(text: &str, omitted: usize) -> String {
         if omitted == 0 {
-            return swept.into_owned();
+            return text.to_string();
         }
         let note = Self::image_omission_note(omitted);
-        if swept.is_empty() {
+        if text.is_empty() {
             note
         } else {
-            format!("{swept}\n\n{note}")
+            format!("{text}\n\n{note}")
         }
     }
 
@@ -672,9 +682,12 @@ impl AnthropicModelProvider {
     /// a truncated marker was never a reference. Keeping it out of the count is
     /// what stops the sweep from double-reporting.
     ///
-    /// Prose that legitimately quotes a data URI is rewritten too. That is
-    /// accepted: a documentation-style example in a tool result is far rarer
-    /// than a truncated screenshot, and the replacement says what happened.
+    /// On the two tool arms, prose that legitimately quotes a data URI is
+    /// rewritten too. That is accepted: a documentation-style example in a tool
+    /// result is far rarer than a truncated screenshot, and the replacement says
+    /// what happened. The user arm does **not** accept that trade — a person
+    /// asking what a data URI decodes to must keep their own text — so it runs
+    /// this only on marker-carrying messages, where residue is possible at all.
     ///
     /// **What this does not cover**, stated so a reader does not credit it with
     /// more than it does:
@@ -683,10 +696,13 @@ impl AnthropicModelProvider {
     ///   character, such as `data:imagé/png;base64,…`. Such a header cannot come
     ///   from this crate's preparation code, and loosening the header rule would
     ///   let any `data:` in prose claim a `;base64,` further down the string.
-    /// - Assistant message text. This runs on the two tool-result arms and the
-    ///   user arm — the three arms built from `parse_image_markers` output.
+    /// - Assistant message text. This runs on the two tool-result arms
+    ///   unconditionally and on the user arm only for marker-carrying messages.
     ///   Assistant content is copied to the wire verbatim, so a data URI the
     ///   model itself wrote is left as the model wrote it.
+    /// - A bare data URI a user typed with no image marker anywhere in the
+    ///   message. Nothing normalized it, so nothing is residual; it is the
+    ///   author's own text and is delivered as written.
     /// - The last, shorter line of a wrapped payload, and the tail of a run that
     ///   is not uniformly wrapped. See [`Self::residual_payload_end`].
     ///
@@ -1180,10 +1196,23 @@ impl AnthropicModelProvider {
                         });
                     }
 
+                    // The sweep runs only on marker-carrying text here. Residual
+                    // base64 in a user message can only come from this crate's
+                    // own marker normalization, so a message with no marker at
+                    // all has nothing residual in it — and sweeping anyway
+                    // deleted a data URI the author quoted on purpose ("what does
+                    // this data:application/json;base64,… decode to?"). The tool
+                    // arms still sweep unconditionally: their input is machine
+                    // output, not something a person typed.
+                    let swept = if crate::multimodal::carries_image_marker(&msg.content) {
+                        Self::sweep_residual_image_data(&text)
+                    } else {
+                        Cow::Borrowed(text.as_str())
+                    };
                     // Every reference that produced no block is counted, so a
                     // message whose images were all rejected says so instead of
                     // serializing as empty content.
-                    let text = Self::text_with_omission_note(&text, omitted);
+                    let text = Self::text_with_note(&swept, omitted);
 
                     // The `[image]` placeholder is gated on a block having been
                     // built, not on references existing: after the stricter
@@ -5146,6 +5175,51 @@ data: {\"type\":\"message_stop\"}\n\n";
             elapsed < std::time::Duration::from_secs(10),
             "the sweep must stay linear; took {elapsed:?} on {} bytes",
             text.len()
+        );
+    }
+
+    /// A data URI a user typed on purpose survives, because nothing normalized
+    /// it and so nothing about it is residual.
+    ///
+    /// The sweep ran on every user message, so "what does this
+    /// `data:application/json;base64,…` decode to?" reached the model as
+    /// `[truncated inline data removed]` and the question became unanswerable.
+    #[test]
+    fn user_text_keeps_a_deliberately_quoted_data_uri() {
+        let quoted =
+            format!("what does data:application/json;base64,{CANONICAL_PNG_B64} decode to?");
+        let messages = vec![ChatMessage::user(&quoted)];
+
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let wire = serde_json::to_string(&native_msgs).expect("serialize");
+
+        assert!(
+            wire.contains(CANONICAL_PNG_B64),
+            "a user's own data URI must reach the model intact: {wire}"
+        );
+        assert!(
+            !wire.contains("[truncated inline data removed]"),
+            "nothing was truncated, so nothing may claim it was: {wire}"
+        );
+    }
+
+    /// The user arm still sweeps when the message carries a marker, which is the
+    /// only way residual base64 gets into user text in the first place.
+    #[test]
+    fn user_text_with_an_unterminated_marker_is_still_swept() {
+        let truncated = format!("here it is [IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}");
+        let messages = vec![ChatMessage::user(&truncated)];
+
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let wire = serde_json::to_string(&native_msgs).expect("serialize");
+
+        assert!(
+            !wire.contains(CANONICAL_PNG_B64),
+            "marker residue must still be swept out of user text: {wire}"
+        );
+        assert!(
+            wire.contains("[truncated inline data removed]"),
+            "the replacement literal must say what happened: {wire}"
         );
     }
 
