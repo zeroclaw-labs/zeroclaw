@@ -52,13 +52,15 @@
 //!
 //! - Only the system prompt (if present) and final user message are forwarded.
 //! - The provider is one-shot; ACP sessions are not resumed.
-//! - Native ZeroClaw tool calls are not emitted.
+//! - Native ZeroClaw tool calls are not emitted; `ChatRequest.tools` is ignored.
+//! - Token usage is not reported (`ChatResponse.usage` is `None`).
 //! - Only temperatures `0.7` and `1.0` are accepted because Grok Build has no
 //!   corresponding sampling flag.
+//! - `timeout_secs` is clamped to one hour maximum.
 
 mod acp;
 
-use crate::traits::{ChatRequest, ChatResponse, ModelProvider, ProviderCapabilities, TokenUsage};
+use crate::traits::{ChatRequest, ChatResponse, ModelProvider, ProviderCapabilities};
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -83,6 +85,10 @@ const DEFAULT_MODEL_MARKER: &str = "default";
 
 /// Default wall-clock budget when `timeout_secs` is unset on the alias.
 const DEFAULT_GROK_CLI_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Upper bound for alias `timeout_secs` so a misconfigured value cannot hold a
+/// provider slot indefinitely. Values above this are clamped.
+const MAX_GROK_CLI_TIMEOUT_SECS: u64 = 3_600;
 
 /// Additional bounded time allowed for reaping a terminated child.
 const PROCESS_REAP_TIMEOUT: Duration = Duration::from_secs(2);
@@ -322,7 +328,7 @@ impl GrokCliBuilder {
         let timeout = self
             .timeout_secs
             .filter(|seconds| *seconds > 0)
-            .map(Duration::from_secs)
+            .map(|seconds| Duration::from_secs(seconds.min(MAX_GROK_CLI_TIMEOUT_SECS)))
             .unwrap_or(DEFAULT_GROK_CLI_TIMEOUT);
         Ok(GrokCliModelProvider {
             alias: self.alias,
@@ -512,7 +518,10 @@ impl GrokCliModelProvider {
             }
             if is_disallowed_provider_env_var(name) {
                 anyhow::bail!(
-                    "grok_cli env_passthrough entry `{name}` is provider-owned; only `XAI_API_KEY` may be passed for authentication, and Grok policy belongs in `extra_args`"
+                    "grok_cli env_passthrough entry `{name}` is provider-owned \
+                     (`XAI_*` other than `XAI_API_KEY`, and all `GROK_*`); \
+                     other names (for example tool credentials) may be listed \
+                     explicitly, and Grok CLI policy flags belong in `extra_args`"
                 );
             }
             if !normalized
@@ -583,31 +592,42 @@ impl GrokCliModelProvider {
     }
 
     fn acp_permission_policy(extra_args: &[String]) -> acp::AcpPermissionPolicy {
+        // Last matching permission-related flag wins, matching CLI last-wins
+        // conventions so earlier bypass cannot stick after a later dontAsk.
+        let mut policy = acp::AcpPermissionPolicy::RejectOnce;
         let mut index = 0;
         while index < extra_args.len() {
             let arg = &extra_args[index];
             if matches!(
                 arg.as_str(),
                 "--always-approve" | "--dangerously-skip-permissions" | "--yolo"
-            ) || arg
-                .strip_prefix("--permission-mode=")
-                .is_some_and(|mode| mode == "bypassPermissions")
-            {
-                return acp::AcpPermissionPolicy::AllowOnce;
+            ) {
+                policy = acp::AcpPermissionPolicy::AllowOnce;
+                index += 1;
+                continue;
+            }
+            if let Some(mode) = arg.strip_prefix("--permission-mode=") {
+                policy = if mode == "bypassPermissions" {
+                    acp::AcpPermissionPolicy::AllowOnce
+                } else {
+                    acp::AcpPermissionPolicy::RejectOnce
+                };
+                index += 1;
+                continue;
             }
             if arg == "--permission-mode" {
-                if extra_args
-                    .get(index + 1)
-                    .is_some_and(|mode| mode == "bypassPermissions")
-                {
-                    return acp::AcpPermissionPolicy::AllowOnce;
-                }
+                let mode = extra_args.get(index + 1).map(String::as_str).unwrap_or("");
+                policy = if mode == "bypassPermissions" {
+                    acp::AcpPermissionPolicy::AllowOnce
+                } else {
+                    acp::AcpPermissionPolicy::RejectOnce
+                };
                 index += 2;
                 continue;
             }
             index += 1;
         }
-        acp::AcpPermissionPolicy::RejectOnce
+        policy
     }
 
     fn should_forward_model(model: &str) -> bool {
@@ -674,7 +694,13 @@ impl GrokCliModelProvider {
     }
 
     fn apply_env_allowlist(cmd: &mut Command, env_passthrough: &[String]) -> bool {
-        Self::apply_env_allowlist_from(cmd, env_passthrough, std::env::vars())
+        // Skip non-Unicode names/values rather than panicking on `vars()`.
+        let variables = std::env::vars_os().filter_map(|(key, value)| {
+            let key = key.into_string().ok()?;
+            let value = value.into_string().ok()?;
+            Some((key, value))
+        });
+        Self::apply_env_allowlist_from(cmd, env_passthrough, variables)
     }
 
     fn apply_env_allowlist_from(
@@ -722,19 +748,22 @@ impl GrokCliModelProvider {
 
         let mut child = match spawn_result {
             Ok(child) => child,
-            Err(_) => {
+            Err(err) => {
                 ::zeroclaw_log::record!(
                     ERROR,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                         .with_attrs(::serde_json::json!({
+                            "binary": self.binary_path.display().to_string(),
                             "phase": "spawn",
                             "error_key": "grok_cli_spawn_failed",
+                            "error": format!("{err}"),
+                            "os_error": err.raw_os_error(),
                         })),
                     "grok_cli: failed to spawn ACP binary"
                 );
                 return Err(anyhow::Error::msg(format!(
-                    "Failed to spawn Grok Build CLI ACP binary at {}. \
+                    "Failed to spawn Grok Build CLI ACP binary at {}: {err}. \
                      Ensure `grok` is installed and on PATH, or set binary_path.",
                     self.binary_path.display()
                 )));
@@ -917,7 +946,8 @@ fn env_names_equal(left: &str, right: &str) -> bool {
 
 fn env_name_starts_with(name: &str, prefix: &str) -> bool {
     if cfg!(windows) {
-        name.len() >= prefix.len() && name.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+        name.len() >= prefix.len()
+            && name.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
     } else {
         name.starts_with(prefix)
     }
@@ -977,7 +1007,8 @@ impl ModelProvider for GrokCliModelProvider {
         Ok(ChatResponse {
             text: Some(text),
             tool_calls: Vec::new(),
-            usage: Some(TokenUsage::default()),
+            // ACP one-shot path does not surface reliable token accounting.
+            usage: None,
             reasoning_content: None,
         })
     }
@@ -1294,12 +1325,26 @@ mod tests {
                 "--permission-mode=acceptEdits".to_string(),
                 "--always-approve".to_string(),
             ],
+            // last-wins: earlier dontAsk does not stick after bypass
+            vec![
+                "--permission-mode=dontAsk".to_string(),
+                "--permission-mode=bypassPermissions".to_string(),
+            ],
         ] {
             assert_eq!(
                 GrokCliModelProvider::acp_permission_policy(&extra),
                 acp::AcpPermissionPolicy::AllowOnce
             );
         }
+
+        // last-wins: earlier bypass is cancelled by a later non-bypass mode
+        assert_eq!(
+            GrokCliModelProvider::acp_permission_policy(&[
+                "--permission-mode=bypassPermissions".to_string(),
+                "--permission-mode=dontAsk".to_string(),
+            ]),
+            acp::AcpPermissionPolicy::RejectOnce
+        );
     }
 
     #[test]
@@ -1661,7 +1706,7 @@ mod tests {
 printf '%s\n' "$@" > args.txt
 IFS= read -r line
 printf '%s\n' "$line" >> requests.ndjson
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"authMethods":[{"id":"cached_token"}]}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"authMethods":[{"id":"cached_token"}]}}'
 IFS= read -r line
 printf '%s\n' "$line" >> requests.ndjson
 printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}'
@@ -1679,7 +1724,7 @@ while IFS= read -r line; do :; done
 
         const PROGRESS_THEN_TOOL_BODY: &str = r#"
 IFS= read -r line
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"authMethods":[{"id":"cached_token"}]}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"authMethods":[{"id":"cached_token"}]}}'
 IFS= read -r line
 printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}'
 IFS= read -r line
@@ -1694,7 +1739,7 @@ while IFS= read -r line; do :; done
 
         const PERMISSION_REQUEST_BODY: &str = r#"
 IFS= read -r line
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"authMethods":[{"id":"cached_token"}]}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"authMethods":[{"id":"cached_token"}]}}'
 IFS= read -r line
 printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}'
 IFS= read -r line
@@ -1955,7 +2000,7 @@ sleep 30
             let temp = TempDir::new().expect("tempdir");
             let body = r#"
 IFS= read -r line
-printf '%s' '{"jsonrpc":"2.0","id":1,"result":{"authMethods":[{"id":"cached_token"}],"padding":"'
+printf '%s' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"authMethods":[{"id":"cached_token"}],"padding":"'
 head -c 600000 /dev/zero | tr '\000' x
 printf '%s\n' '"}}'
 IFS= read -r line
@@ -1981,7 +2026,7 @@ sleep 30
             let temp = TempDir::new().expect("tempdir");
             let body = r#"
 IFS= read -r line
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"authMethods":[{"id":"cached_token"}]}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"authMethods":[{"id":"cached_token"}]}}'
 IFS= read -r line
 printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}'
 IFS= read -r line

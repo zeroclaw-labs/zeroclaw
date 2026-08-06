@@ -48,7 +48,7 @@ Small and large prompts both travel on stdin and never appear in argv or a
 prompt file.
 
 The documented ACP integration and default argument profile are validated
-against Grok Build CLI `0.2.111`. Treat upgrades of the external CLI as a
+against Grok Build CLI `0.2.118` (ACP advertise/live probes) with earlier baseline `0.2.111`. Treat upgrades of the external CLI as a
 compatibility change and revalidate `grok agent stdio` before deploying them.
 
 #### ACP vision / image input (current Grok Build behavior)
@@ -265,7 +265,7 @@ model = "grok-4.5"
 binary_path = "/home/you/.grok/bin/grok"
 working_directory = "/path/to/agents/default/workspace"
 
-# REPLY / NO_REPLY precheck — API (format-stable). Reuse an existing xAI
+# REPLY / NO_REPLY precheck - API (format-stable). Reuse an existing xAI
 # HTTP alias if you already have one; do not point this at grok_cli.
 [providers.models.xai.default]
 model = "grok-4.5"
@@ -305,7 +305,7 @@ model_provider = "grok_cli.ops"
 | ----- | ----- | ------- |
 | Reply precheck | `classifier_provider` → API alias (e.g. `xai.default`) | REPLY / `NO_REPLY[*]` only; avoids CLI thinking text as the message body |
 | Full answer | `model_provider` → `grok_cli.default` | Grok Build ACP; prompt only on stdin |
-| OS sandbox | Default `--sandbox strict` (or `extra_args` override) | Read CWD + system paths; write CWD + `~/.grok` + tmp; child network blocked on Linux. Built-ins are not a permanent credential boundary — use custom `deny` for secrets |
+| OS sandbox | Default `--sandbox strict` (or `extra_args` override) | Read CWD + system paths; write CWD + `~/.grok` + tmp; child network blocked on Linux. Built-ins are not a permanent credential boundary - use custom `deny` for secrets |
 | App permissions | Empty built-in tool set + fail-closed ACP default | Explicit bypass flags select `allow_once`; discovered Grok rules may also pre-authorize configured tools |
 | Channel delivery | ZeroClaw `thread_replies` / channel config | Single in-thread reply path |
 | Optional gate | Slack `mention_only` + `strict_mention_in_thread` | Drop unmentioned group/thread traffic before the agent (see [Slack](../channels/slack.md)); independent of the classifier |

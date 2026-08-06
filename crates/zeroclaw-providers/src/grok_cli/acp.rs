@@ -116,14 +116,18 @@ pub(super) enum AcpError {
     AssistantLimit { limit: usize },
     #[error("Grok ACP returned invalid JSON during {phase}")]
     InvalidJson { phase: &'static str },
-    #[error("Grok ACP returned an error during {phase}")]
-    Remote { phase: &'static str },
+    #[error("Grok ACP returned an error during {phase}{code}")]
+    Remote { phase: &'static str, code: String },
     #[error("Grok ACP {phase} response was incomplete")]
     Incomplete { phase: &'static str },
     #[error("Grok ACP initialize returned no usable authentication method")]
     NoAuthenticationMethod,
+    #[error("Grok ACP initialize protocolVersion mismatch: expected {expected}, got {got}")]
+    ProtocolVersion { expected: u64, got: String },
     #[error("Grok ACP session/prompt completed without agent message text")]
     EmptyOutput,
+    #[error("Grok ACP session/prompt ended with stopReason={stop_reason}")]
+    StopReason { stop_reason: String },
     #[error("Grok ACP could not encode an internal request")]
     Encode,
 }
@@ -141,9 +145,41 @@ impl AcpError {
             Self::Remote { .. } => "grok_cli_acp_remote_error",
             Self::Incomplete { .. } => "grok_cli_acp_incomplete_response",
             Self::NoAuthenticationMethod => "grok_cli_acp_auth_unavailable",
+            Self::ProtocolVersion { .. } => "grok_cli_acp_protocol_version",
             Self::EmptyOutput => "grok_cli_acp_empty_output",
+            Self::StopReason { .. } => "grok_cli_acp_stop_reason",
             Self::Encode => "grok_cli_acp_encode_failed",
         }
+    }
+}
+
+fn remote_error(phase: &'static str, message: &Value) -> AcpError {
+    let code = message
+        .pointer("/error/code")
+        .and_then(|value| match value {
+            Value::Number(number) => Some(number.to_string()),
+            Value::String(text) => Some(text.clone()),
+            _ => None,
+        })
+        .map(|code| format!(" (code {code})"))
+        .unwrap_or_default();
+    AcpError::Remote { phase, code }
+}
+
+fn json_rpc_id_matches(value: Option<&Value>, expected: u64) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    match value {
+        Value::Number(number) => {
+            number.as_u64() == Some(expected)
+                || number.as_i64() == Some(expected as i64)
+                || number
+                    .as_f64()
+                    .is_some_and(|float| float.is_finite() && float as u64 == expected)
+        }
+        Value::String(text) => text.parse::<u64>().ok() == Some(expected),
+        _ => false,
     }
 }
 
@@ -181,6 +217,7 @@ where
         permission_policy,
     )
     .await?;
+    validate_protocol_version(&initialize)?;
 
     let method_id = select_auth_method_id(&initialize, xai_api_key_available)?;
     rpc_request(
@@ -220,7 +257,7 @@ where
 
     // Authentication/session notifications are not part of the answer.
     assistant.clear();
-    rpc_request(
+    let prompt_result = rpc_request(
         stdin,
         &mut reader,
         &mut next_id,
@@ -233,6 +270,7 @@ where
         permission_policy,
     )
     .await?;
+    reject_failed_stop_reason(&prompt_result)?;
 
     settle_trailing_output(stdin, &mut reader, &mut assistant, permission_policy).await?;
     let trimmed = assistant.trim();
@@ -309,13 +347,13 @@ where
                     limit: self.max_stdout_bytes,
                 });
             }
-            let next_frame = self
-                .pending_frame
-                .len()
-                .checked_add(take)
-                .ok_or(AcpError::FrameLimit {
-                    limit: MAX_ACP_FRAME_BYTES,
-                })?;
+            let next_frame =
+                self.pending_frame
+                    .len()
+                    .checked_add(take)
+                    .ok_or(AcpError::FrameLimit {
+                        limit: MAX_ACP_FRAME_BYTES,
+                    })?;
             if next_frame > MAX_ACP_FRAME_BYTES {
                 return Err(AcpError::FrameLimit {
                     limit: MAX_ACP_FRAME_BYTES,
@@ -375,13 +413,58 @@ where
             append_agent_message_chunk(&message, assistant)?;
             continue;
         }
-        if message.get(field::ID).and_then(Value::as_u64) != Some(id) {
+        // Bare error responses with null/missing id still fail the turn.
+        if message.get(field::ERROR).is_some()
+            && (message.get(field::ID).is_none() || message.get(field::ID) == Some(&Value::Null))
+        {
+            return Err(remote_error(method, &message));
+        }
+        if !json_rpc_id_matches(message.get(field::ID), id) {
             continue;
         }
         if message.get(field::ERROR).is_some() {
-            return Err(AcpError::Remote { phase: method });
+            return Err(remote_error(method, &message));
         }
         return Ok(message.get(field::RESULT).cloned().unwrap_or(Value::Null));
+    }
+}
+
+fn validate_protocol_version(initialize: &Value) -> Result<(), AcpError> {
+    let Some(version) = initialize.get("protocolVersion") else {
+        return Err(AcpError::ProtocolVersion {
+            expected: ACP_PROTOCOL_VERSION,
+            got: "missing".to_string(),
+        });
+    };
+    let accepted = match version {
+        Value::Number(number) => number.as_u64() == Some(ACP_PROTOCOL_VERSION),
+        Value::String(text) => text.parse::<u64>().ok() == Some(ACP_PROTOCOL_VERSION),
+        _ => false,
+    };
+    if accepted {
+        Ok(())
+    } else {
+        Err(AcpError::ProtocolVersion {
+            expected: ACP_PROTOCOL_VERSION,
+            got: version.to_string(),
+        })
+    }
+}
+
+/// Fail closed on explicit non-success stop reasons from session/prompt.
+fn reject_failed_stop_reason(prompt_result: &Value) -> Result<(), AcpError> {
+    let Some(stop_reason) = prompt_result
+        .get("stopReason")
+        .or_else(|| prompt_result.get("stop_reason"))
+        .and_then(Value::as_str)
+    else {
+        return Ok(());
+    };
+    match stop_reason {
+        "end_turn" | "end_turn_tool" | "max_tokens" | "" => Ok(()),
+        other => Err(AcpError::StopReason {
+            stop_reason: other.to_string(),
+        }),
     }
 }
 
