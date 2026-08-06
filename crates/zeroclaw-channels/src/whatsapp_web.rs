@@ -401,6 +401,23 @@ struct SenderAllowlistResolution {
     allowed_phone: Option<String>,
 }
 
+/// What a WhatsApp passkey (SHORTCAKE) linking event means for the operator.
+///
+/// A borrowed view computed on demand from the upstream event by
+/// [`WhatsAppWebChannel::passkey_notice`]; the event stays the source of truth.
+#[cfg(feature = "whatsapp-web")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PasskeyNotice<'a> {
+    /// The server demanded a WebAuthn assertion. Nothing in this process can
+    /// produce one without a registered authenticator, so the link stalls here.
+    Required,
+    /// A verification code the operator must confirm on the primary phone.
+    Confirm { code: &'a str },
+    /// Upstream reported the passkey link attempt failed. `continuation`
+    /// distinguishes a retryable continuation from a terminal failure.
+    Failed { error: &'a str, continuation: bool },
+}
+
 #[cfg(feature = "whatsapp-web")]
 #[derive(Clone)]
 struct WhatsAppInboundContext {
@@ -1156,6 +1173,27 @@ impl WhatsAppWebChannel {
     #[cfg(feature = "whatsapp-web")]
     fn is_jid(recipient: &str) -> bool {
         recipient.trim().contains('@')
+    }
+
+    /// Classify a passkey linking event into what the operator must be told.
+    ///
+    /// Split out from the event loop so the mapping is testable without a
+    /// live socket — the handler arm only renders what this returns. Returns
+    /// `None` for every non-passkey event.
+    #[cfg(feature = "whatsapp-web")]
+    fn passkey_notice(event: &wacore::types::events::Event) -> Option<PasskeyNotice<'_>> {
+        use wacore::types::events::Event;
+        match event {
+            Event::PairPasskeyRequest(_) => Some(PasskeyNotice::Required),
+            Event::PairPasskeyConfirmation(confirmation) => Some(PasskeyNotice::Confirm {
+                code: confirmation.code.as_str(),
+            }),
+            Event::PairPasskeyError(err) => Some(PasskeyNotice::Failed {
+                error: err.error.as_str(),
+                continuation: err.continuation,
+            }),
+            _ => None,
+        }
     }
 
     /// Render a WhatsApp pairing QR payload into terminal-friendly text.
@@ -2838,53 +2876,56 @@ impl Channel for WhatsAppWebChannel {
                             // `PasskeyAuthenticator` the library cannot answer
                             // it, so the QR loop would otherwise spin forever
                             // with nothing in the logs. Surface it instead.
-                            Event::PairPasskeyRequest(_) => {
-                                crate::login_events::LoginEvent::Failed {
-                                    reason: "whatsapp_passkey_required",
+                            passkey_event @ (Event::PairPasskeyRequest(_)
+                            | Event::PairPasskeyConfirmation(_)
+                            | Event::PairPasskeyError(_)) => {
+                                match Self::passkey_notice(passkey_event) {
+                                    Some(PasskeyNotice::Required) => {
+                                        crate::login_events::LoginEvent::Failed {
+                                            reason: "whatsapp_passkey_required",
+                                        }
+                                        .emit(
+                                            "whatsapp",
+                                            alias.as_ref(),
+                                            "WhatsApp requires a passkey to link this device; ZeroClaw cannot complete the WebAuthn step on its own",
+                                        );
+                                        ::zeroclaw_log::record!(
+                                            ERROR,
+                                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                                                .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                                            "WhatsApp Web linking requires a passkey (SHORTCAKE); no authenticator is configured, so this link attempt cannot complete"
+                                        );
+                                    }
+                                    Some(PasskeyNotice::Confirm { code }) => {
+                                        ::zeroclaw_log::record!(
+                                            INFO,
+                                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                                            "WhatsApp Web passkey verification code received"
+                                        );
+                                        eprintln!();
+                                        eprintln!("WhatsApp passkey verification code: {code}");
+                                        eprintln!();
+                                    }
+                                    Some(PasskeyNotice::Failed { error, continuation }) => {
+                                        crate::login_events::LoginEvent::Failed { reason: error }
+                                            .emit(
+                                                "whatsapp",
+                                                alias.as_ref(),
+                                                "WhatsApp Web passkey linking failed",
+                                            );
+                                        ::zeroclaw_log::record!(
+                                            ERROR,
+                                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                                                .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                                            &format!(
+                                                "WhatsApp Web passkey linking failed: {error} (continuation: {continuation})"
+                                            )
+                                        );
+                                    }
+                                    // Unreachable: the arm pattern admits only
+                                    // the three passkey variants above.
+                                    None => {}
                                 }
-                                .emit(
-                                    "whatsapp",
-                                    alias.as_ref(),
-                                    "WhatsApp requires a passkey to link this device; ZeroClaw cannot complete the WebAuthn step on its own",
-                                );
-                                ::zeroclaw_log::record!(
-                                    ERROR,
-                                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                                    "WhatsApp Web linking requires a passkey (SHORTCAKE); no authenticator is configured, so this link attempt cannot complete"
-                                );
-                            }
-                            Event::PairPasskeyConfirmation(confirmation) => {
-                                ::zeroclaw_log::record!(
-                                    INFO,
-                                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                                    "WhatsApp Web passkey verification code received"
-                                );
-                                eprintln!();
-                                eprintln!(
-                                    "WhatsApp passkey verification code: {}",
-                                    confirmation.code
-                                );
-                                eprintln!();
-                            }
-                            Event::PairPasskeyError(err) => {
-                                crate::login_events::LoginEvent::Failed {
-                                    reason: err.error.as_str(),
-                                }
-                                .emit(
-                                    "whatsapp",
-                                    alias.as_ref(),
-                                    "WhatsApp Web passkey linking failed",
-                                );
-                                ::zeroclaw_log::record!(
-                                    ERROR,
-                                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                                    &format!(
-                                        "WhatsApp Web passkey linking failed: {} (continuation: {})",
-                                        err.error, err.continuation
-                                    )
-                                );
                             }
                             Event::PairingQrCode { code, .. } => {
                                 crate::login_events::LoginEvent::Qr {
@@ -4143,6 +4184,66 @@ mod tests {
         assert_eq!(
             WhatsAppWebChannel::compute_retry_delay(0),
             WhatsAppWebChannel::BASE_DELAY_SECS
+        );
+    }
+
+    /// The regression this whole change exists for: before the pin bump these
+    /// three variants did not exist, so the server's passkey demand fell into
+    /// the handler's `_ => {}` arm and the operator saw an endless QR loop with
+    /// nothing in the logs. Each must now classify into an operator notice.
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn passkey_events_are_surfaced_not_swallowed() {
+        use wacore::types::events::{
+            Event, PairPasskeyConfirmation, PairPasskeyError, PairPasskeyRequest,
+        };
+
+        let request = Event::PairPasskeyRequest(PairPasskeyRequest {
+            request_options_json: r#"{"challenge":"abc"}"#.to_string(),
+        });
+        assert_eq!(
+            WhatsAppWebChannel::passkey_notice(&request),
+            Some(PasskeyNotice::Required),
+            "a passkey request must reach the operator, not the catch-all arm"
+        );
+
+        let confirmation = Event::PairPasskeyConfirmation(PairPasskeyConfirmation {
+            code: "1234-5678".to_string(),
+            skip_handoff_ux: false,
+        });
+        assert_eq!(
+            WhatsAppWebChannel::passkey_notice(&confirmation),
+            Some(PasskeyNotice::Confirm { code: "1234-5678" }),
+            "the verification code must be surfaced verbatim to be typed on the phone"
+        );
+
+        let failure = Event::PairPasskeyError(PairPasskeyError {
+            error: "assertion rejected".to_string(),
+            continuation: true,
+        });
+        assert_eq!(
+            WhatsAppWebChannel::passkey_notice(&failure),
+            Some(PasskeyNotice::Failed {
+                error: "assertion rejected",
+                continuation: true,
+            }),
+            "the upstream error and its continuation flag must both survive"
+        );
+    }
+
+    /// The classifier must stay scoped to passkey events: a non-passkey event
+    /// returning `Some` would mean the handler arm hijacks unrelated traffic.
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn non_passkey_events_produce_no_passkey_notice() {
+        use wacore::types::events::Event;
+
+        assert_eq!(
+            WhatsAppWebChannel::passkey_notice(&Event::PairingQrCode {
+                code: "qr-payload".to_string(),
+                timeout: std::time::Duration::from_secs(60),
+            }),
+            None
         );
     }
 
