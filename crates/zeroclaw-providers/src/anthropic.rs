@@ -800,6 +800,38 @@ impl AnthropicModelProvider {
     /// quoted data URI. And a payload wrapped with an indent on its continuation
     /// lines is not rejoined.
     fn residual_payload_end(text: &str, payload_start: usize) -> usize {
+        let end = Self::residual_payload_run_end(text, payload_start);
+        Self::without_trailing_scheme_prefix(text, payload_start, end)
+    }
+
+    /// Backs `end` off a trailing `data` when the byte at `end` is the `:` of
+    /// another `data:`, so the overlapping occurrence is still examined.
+    ///
+    /// Every letter of `data` is in the base64 alphabet, so a payload run
+    /// swallows the scheme name of a following data URI and stops at its colon.
+    /// Resuming the scan there skipped the overlap entirely and left
+    /// `:<media type>;base64,<payload>` in a text position. Ending the run before
+    /// the scheme name instead moves the cursor *forward* from the run's start,
+    /// so the sweep still advances and stays linear.
+    fn without_trailing_scheme_prefix(text: &str, payload_start: usize, end: usize) -> usize {
+        const SCHEME_NAME: &str = "data";
+
+        if !text[end..].starts_with(':') {
+            return end;
+        }
+        let Some(candidate) = end.checked_sub(SCHEME_NAME.len()) else {
+            return end;
+        };
+        // Never reach back into the header: only payload bytes may be given up.
+        if candidate < payload_start || &text[candidate..end] != SCHEME_NAME {
+            return end;
+        }
+        candidate
+    }
+
+    /// End of the base64 run itself, before the overlap adjustment in
+    /// [`Self::residual_payload_end`].
+    fn residual_payload_run_end(text: &str, payload_start: usize) -> usize {
         let first_end =
             payload_start + Self::run_len(&text[payload_start..], is_base64_payload_char);
         let first_len = first_end - payload_start;
@@ -5115,6 +5147,100 @@ data: {\"type\":\"message_stop\"}\n\n";
             "the sweep must stay linear; took {elapsed:?} on {} bytes",
             text.len()
         );
+    }
+
+    /// A `data:` that starts inside the *payload* of the run being swept is
+    /// still examined.
+    ///
+    /// The letters of `data` are all in the base64 alphabet, so a payload run
+    /// swallowed them and stopped at the `:` of the next scheme. Resuming the
+    /// scan at that colon meant the overlapping `data:` was never seen, and
+    /// `[IMAGE:data:image/png;base64,AAAAdata:image/png;base64,<payload>` came
+    /// back with `:image/png;base64,<payload>` still in a text position. Same
+    /// class of hole as [`Self::nested_data_prefix_does_not_bypass_the_sweep`],
+    /// at the other boundary of the run.
+    #[test]
+    fn payload_boundary_data_prefix_does_not_bypass_the_sweep() {
+        for (label, text) in [
+            (
+                "overlap after base64-legal payload bytes",
+                format!(
+                    "[IMAGE:data:image/png;base64,AAAAdata:image/png;base64,{CANONICAL_PNG_B64}"
+                ),
+            ),
+            (
+                "overlap with an empty payload before it",
+                format!("data:image/png;base64,data:image/png;base64,{CANONICAL_PNG_B64}"),
+            ),
+            (
+                "two overlaps in a row",
+                format!(
+                    "data:image/png;base64,AAdata:image/png;base64,AAdata:image/png;base64,{CANONICAL_PNG_B64}"
+                ),
+            ),
+        ] {
+            let swept = AnthropicModelProvider::sweep_residual_image_data(&text);
+            assert!(
+                !swept.contains(CANONICAL_PNG_B64),
+                "{label}: the payload must not survive: {swept}"
+            );
+            assert!(
+                !swept.contains(";base64,"),
+                "{label}: no header may survive either: {swept}"
+            );
+        }
+    }
+
+    /// The payload of an overlapping run reaches no text field on the wire.
+    ///
+    /// The unit test above pins the sweep itself; this pins the property a
+    /// reader actually cares about, through the whole conversion.
+    #[test]
+    fn overlapping_marker_payload_reaches_no_serialized_text_field() {
+        let overlapped =
+            format!("[IMAGE:data:image/png;base64,AAAAdata:image/png;base64,{CANONICAL_PNG_B64}");
+        let messages = history_with_tool_result(&format!("saved {overlapped}"));
+
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let wire = serde_json::to_string(&native_msgs).expect("serialize");
+
+        assert!(
+            !wire.contains(CANONICAL_PNG_B64),
+            "the overlapped payload must not survive anywhere on the wire: {wire}"
+        );
+        assert!(
+            wire.contains("[truncated inline data removed]"),
+            "the replacement literal must say what happened: {wire}"
+        );
+    }
+
+    /// A near-miss `base64` parameter is refused by the splitter, so it cannot
+    /// be delivered as an image while the sweep declines to sweep it.
+    ///
+    /// The splitter accepted any header *containing* `;base64`, while the sweep
+    /// requires an exact `base64` parameter. A truncated `;base64foo` header
+    /// therefore fell between them: no reference to deliver, and no sweep.
+    #[test]
+    fn near_miss_base64_parameter_is_refused_by_the_splitter() {
+        for header in [";base64foo", ";base64=1", ";xbase64"] {
+            let candidate = format!("data:image/png{header},{CANONICAL_PNG_B64}");
+            assert!(
+                crate::multimodal::split_base64_image_data_uri(&candidate, 10 * 1024 * 1024)
+                    .is_err(),
+                "{header}: a header without an exact base64 parameter is not a base64 data URI"
+            );
+        }
+
+        // The forms the sweep does accept must still split, including `base64`
+        // ahead of another parameter.
+        for header in [";base64", ";base64;charset=x", ";charset=x;base64"] {
+            let candidate = format!("data:image/png{header},{CANONICAL_PNG_B64}");
+            assert!(
+                crate::multimodal::split_base64_image_data_uri(&candidate, 10 * 1024 * 1024)
+                    .is_ok(),
+                "{header}: an exact base64 parameter must still be accepted"
+            );
+        }
     }
 
     /// A `data:` that starts inside another `data:` header is still examined.
