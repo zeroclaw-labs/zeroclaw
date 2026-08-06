@@ -2,8 +2,10 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::time::Duration;
 use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
@@ -16,6 +18,9 @@ const LOCK_FILENAME: &str = "auth-profiles.lock";
 const LOCK_WAIT_MS: u64 = 50;
 const LOCK_TIMEOUT_MS: u64 = 10_000;
 
+type DirectorySyncFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+type FileSyncFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AuthProfileKind {
@@ -23,7 +28,7 @@ pub enum AuthProfileKind {
     Token,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenSet {
     pub access_token: String,
     #[serde(default)]
@@ -51,7 +56,7 @@ impl TokenSet {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthProfile {
     pub id: String,
     pub model_provider: String,
@@ -132,6 +137,45 @@ pub struct AuthProfilesData {
     pub profiles: BTreeMap<String, AuthProfile>,
 }
 
+/// Exact state for one provider/profile binding, used only to compensate a
+/// failed multi-store operation. It deliberately does not expose a whole
+/// profile-store replacement, so unrelated providers and profiles remain
+/// outside the rollback scope.
+#[derive(Debug, Clone)]
+pub struct ProfileBindingSnapshot {
+    pub profile: Option<AuthProfile>,
+}
+
+/// Result of replacing the profile store atomically.
+///
+/// A rename has already committed the new store contents. Failure to fsync the
+/// containing directory is therefore reported as a warning, not as a failed
+/// replace that callers might try to compensate by discarding committed state.
+#[derive(Debug)]
+pub enum ProfileSaveOutcome {
+    Durable,
+    CommittedWithDurabilityWarning(anyhow::Error),
+}
+
+impl ProfileSaveOutcome {
+    fn into_result(self) -> Result<()> {
+        match self {
+            Self::Durable => Ok(()),
+            Self::CommittedWithDurabilityWarning(err) => Err(err),
+        }
+    }
+}
+
+/// A single-lock profile write together with the state it displaced. This is
+/// used to compensate a later failure in a separate store without a window in
+/// which another writer can be overwritten before the rollback CAS applies.
+#[derive(Debug)]
+pub struct StagedProfileBinding {
+    pub snapshot: ProfileBindingSnapshot,
+    pub staged_profile: AuthProfile,
+    pub save_outcome: ProfileSaveOutcome,
+}
+
 impl Default for AuthProfilesData {
     fn default() -> Self {
         Self {
@@ -166,6 +210,64 @@ impl AuthProfilesStore {
     pub async fn load(&self) -> Result<AuthProfilesData> {
         let _lock = self.acquire_lock().await?;
         self.load_locked().await
+    }
+
+    /// Replace one profile binding and capture the state it displaced while
+    /// holding the same store lock. This write never changes active selection.
+    pub async fn stage_profile_binding(
+        &self,
+        mut profile: AuthProfile,
+    ) -> Result<StagedProfileBinding> {
+        let _lock = self.acquire_lock().await?;
+        let mut data = self.load_locked().await?;
+        let snapshot = ProfileBindingSnapshot {
+            profile: data.profiles.get(&profile.id).cloned(),
+        };
+
+        profile.updated_at = Utc::now();
+        if let Some(existing) = &snapshot.profile {
+            profile.created_at = existing.created_at;
+        }
+        data.profiles.insert(profile.id.clone(), profile.clone());
+        data.updated_at = Utc::now();
+        let save_outcome = self.save_locked_with_outcome(&data).await?;
+
+        Ok(StagedProfileBinding {
+            snapshot,
+            staged_profile: profile,
+            save_outcome,
+        })
+    }
+
+    /// Restore exactly one profile only when it still contains the staged
+    /// value. The active selector is deliberately not restored: a staged
+    /// alias-bound write never changes it, and replacing it could erase a
+    /// concurrent operator choice.
+    pub async fn restore_profile_binding(
+        &self,
+        profile_id: &str,
+        snapshot: ProfileBindingSnapshot,
+        expected_current: &AuthProfile,
+    ) -> Result<()> {
+        let _lock = self.acquire_lock().await?;
+        let mut data = self.load_locked().await?;
+
+        if data.profiles.get(profile_id) != Some(expected_current) {
+            anyhow::bail!(
+                "refusing auth-profile rollback because the binding changed concurrently"
+            );
+        }
+
+        match snapshot.profile {
+            Some(profile) => {
+                data.profiles.insert(profile_id.to_string(), profile);
+            }
+            None => {
+                data.profiles.remove(profile_id);
+            }
+        }
+        data.updated_at = Utc::now();
+        self.save_locked(&data).await
     }
 
     pub async fn list_profile_ids(&self) -> Result<Vec<String>> {
@@ -338,7 +440,9 @@ impl AuthProfilesStore {
         }
 
         if migrated {
-            self.write_persisted_locked(&persisted).await?;
+            self.write_persisted_locked(&persisted)
+                .await?
+                .into_result()?;
         }
 
         Ok(AuthProfilesData {
@@ -350,6 +454,13 @@ impl AuthProfilesStore {
     }
 
     async fn save_locked(&self, data: &AuthProfilesData) -> Result<()> {
+        self.save_locked_with_outcome(data).await?.into_result()
+    }
+
+    async fn save_locked_with_outcome(
+        &self,
+        data: &AuthProfilesData,
+    ) -> Result<ProfileSaveOutcome> {
         let mut persisted = PersistedAuthProfiles {
             schema_version: CURRENT_SCHEMA_VERSION,
             updated_at: data.updated_at.to_rfc3339(),
@@ -437,7 +548,48 @@ impl AuthProfilesStore {
         Ok(persisted)
     }
 
-    async fn write_persisted_locked(&self, persisted: &PersistedAuthProfiles) -> Result<()> {
+    async fn write_persisted_locked(
+        &self,
+        persisted: &PersistedAuthProfiles,
+    ) -> Result<ProfileSaveOutcome> {
+        self.write_persisted_locked_with_directory_sync(persisted, |parent_dir| {
+            Box::pin(sync_directory(parent_dir))
+        })
+        .await
+    }
+
+    async fn write_persisted_locked_with_directory_sync<F>(
+        &self,
+        persisted: &PersistedAuthProfiles,
+        sync_parent_directory: F,
+    ) -> Result<ProfileSaveOutcome>
+    where
+        F: for<'a> FnOnce(&'a Path) -> DirectorySyncFuture<'a>,
+    {
+        self.write_persisted_locked_with_sync(
+            persisted,
+            |file| {
+                Box::pin(async move {
+                    file.sync_all()
+                        .await
+                        .context("Failed to fsync temporary auth profile file")
+                })
+            },
+            sync_parent_directory,
+        )
+        .await
+    }
+
+    async fn write_persisted_locked_with_sync<F, G>(
+        &self,
+        persisted: &PersistedAuthProfiles,
+        sync_temp_file: F,
+        sync_parent_directory: G,
+    ) -> Result<ProfileSaveOutcome>
+    where
+        F: for<'a> FnOnce(&'a tokio::fs::File) -> FileSyncFuture<'a>,
+        G: for<'a> FnOnce(&'a Path) -> DirectorySyncFuture<'a>,
+    {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).await.with_context(|| {
                 format!(
@@ -445,6 +597,7 @@ impl AuthProfilesStore {
                     parent.display()
                 )
             })?;
+            set_owner_only_directory_permissions(parent).await?;
         }
 
         let json =
@@ -457,21 +610,45 @@ impl AuthProfilesStore {
         );
         let tmp_path = self.path.with_file_name(tmp_name);
 
-        fs::write(&tmp_path, &json).await.with_context(|| {
-            format!(
-                "Failed to write temporary auth profile file at {}",
-                tmp_path.display()
-            )
-        })?;
+        let mut temp_file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&tmp_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to create temporary auth profile file at {}",
+                    tmp_path.display()
+                )
+            })?;
+        set_owner_only_file_permissions(&tmp_path).await?;
 
-        fs::rename(&tmp_path, &self.path).await.with_context(|| {
-            format!(
-                "Failed to replace auth profile store at {}",
-                self.path.display()
-            )
-        })?;
+        if let Err(err) = temp_file.write_all(&json).await {
+            drop(temp_file);
+            let _ = fs::remove_file(&tmp_path).await;
+            return Err(err).context("Failed to write temporary auth profile contents");
+        }
+        if let Err(err) = sync_temp_file(&temp_file).await {
+            drop(temp_file);
+            let _ = fs::remove_file(&tmp_path).await;
+            return Err(err);
+        }
+        drop(temp_file);
 
-        Ok(())
+        if let Err(err) = fs::rename(&tmp_path, &self.path).await {
+            let _ = fs::remove_file(&tmp_path).await;
+            return Err(err).with_context(|| {
+                format!(
+                    "Failed to replace auth profile store at {}",
+                    self.path.display()
+                )
+            });
+        }
+
+        match sync_parent_directory(self.path.parent().expect("profile path has a parent")).await {
+            Ok(()) => Ok(ProfileSaveOutcome::Durable),
+            Err(err) => Ok(ProfileSaveOutcome::CommittedWithDurabilityWarning(err)),
+        }
     }
 
     fn encrypt_optional(&self, value: Option<&str>) -> Result<Option<String>> {
@@ -560,6 +737,42 @@ impl AuthProfilesStore {
             }
         }
     }
+}
+
+#[cfg(unix)]
+async fn set_owner_only_directory_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to set owner-only auth-profile directory permissions: {}",
+                path.display()
+            )
+        })
+}
+
+#[cfg(not(unix))]
+async fn set_owner_only_directory_permissions(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn set_owner_only_file_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to set owner-only auth-profile file permissions: {}",
+                path.display()
+            )
+        })
+}
+
+#[cfg(not(unix))]
+async fn set_owner_only_file_permissions(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 struct AuthProfileLockGuard {
@@ -668,10 +881,124 @@ pub fn profile_id(model_provider: &str, profile_name: &str) -> String {
     format!("{}:{}", model_provider.trim(), profile_name.trim())
 }
 
+#[allow(clippy::unused_async)]
+async fn sync_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let dir = tokio::fs::File::open(path).await.with_context(|| {
+            format!(
+                "Failed to open auth-profile directory for fsync: {}",
+                path.display()
+            )
+        })?;
+        dir.sync_all().await.with_context(|| {
+            format!(
+                "Failed to fsync auth-profile directory metadata: {}",
+                path.display()
+            )
+        })
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn profile_write_fsync_failure_leaves_no_committed_store() {
+        let tmp = TempDir::new().unwrap();
+        let store = AuthProfilesStore::new(tmp.path(), false);
+
+        let err = store
+            .write_persisted_locked_with_sync(
+                &PersistedAuthProfiles::default(),
+                |_| Box::pin(async { anyhow::bail!("synthetic file fsync failure") }),
+                |parent| Box::pin(sync_directory(parent)),
+            )
+            .await
+            .expect_err("pre-rename fsync failure must fail the write");
+
+        assert!(err.to_string().contains("synthetic file fsync failure"));
+        assert!(
+            !store.path().exists(),
+            "a pre-rename failure must not commit the profile store"
+        );
+    }
+
+    #[tokio::test]
+    async fn profile_write_reports_post_rename_directory_sync_failure_as_committed() {
+        let tmp = TempDir::new().unwrap();
+        let store = AuthProfilesStore::new(tmp.path(), false);
+
+        let outcome = store
+            .write_persisted_locked_with_directory_sync(&PersistedAuthProfiles::default(), |_| {
+                Box::pin(async { anyhow::bail!("synthetic parent fsync failure") })
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            ProfileSaveOutcome::CommittedWithDurabilityWarning(_)
+        ));
+        assert!(store.path().exists(), "rename must remain committed");
+        let persisted: PersistedAuthProfiles =
+            serde_json::from_slice(&tokio::fs::read(store.path()).await.unwrap()).unwrap();
+        assert_eq!(persisted.schema_version, CURRENT_SCHEMA_VERSION);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn profile_write_uses_owner_only_permissions_for_parent_and_replaced_store() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let state_dir = tmp.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let store = AuthProfilesStore::new(&state_dir, false);
+        std::fs::write(store.path(), b"legacy").unwrap();
+        std::fs::set_permissions(store.path(), std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let outcome = store
+            .write_persisted_locked_with_sync(
+                &PersistedAuthProfiles::default(),
+                |file| {
+                    Box::pin(async move {
+                        let mode = file.metadata().await?.permissions().mode() & 0o777;
+                        assert_eq!(mode, 0o600, "temporary profile store must be owner-only");
+                        Ok(())
+                    })
+                },
+                |parent| Box::pin(sync_directory(parent)),
+            )
+            .await
+            .expect("profile replacement must succeed");
+
+        assert!(matches!(outcome, ProfileSaveOutcome::Durable));
+        assert_eq!(
+            std::fs::metadata(&state_dir).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "auth-profile parent directory must be owner-only"
+        );
+        assert_eq!(
+            std::fs::metadata(store.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "replaced auth-profile store must inherit owner-only temporary-file permissions"
+        );
+    }
 
     #[test]
     fn profile_id_format() {
@@ -775,6 +1102,45 @@ mod tests {
 
         let contents = tokio::fs::read_to_string(path).await.unwrap();
         assert!(contents.contains("\"schema_version\": 1"));
+    }
+
+    #[tokio::test]
+    async fn rollback_refuses_to_overwrite_a_concurrent_profile_update() {
+        let tmp = TempDir::new().unwrap();
+        let store = AuthProfilesStore::new(tmp.path(), false);
+        let id = profile_id("anthropic", "subscription");
+
+        let previous = AuthProfile::new_token("anthropic", "subscription", "old".into());
+        store.upsert_profile(previous, false).await.unwrap();
+        let staged = store
+            .stage_profile_binding(AuthProfile::new_token(
+                "anthropic",
+                "subscription",
+                "staged".into(),
+            ))
+            .await
+            .unwrap();
+        store
+            .upsert_profile(
+                AuthProfile::new_token("anthropic", "subscription", "concurrent".into()),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let err = store
+            .restore_profile_binding(&id, staged.snapshot, &staged.staged_profile)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("changed concurrently"));
+
+        let data = store.load().await.unwrap();
+        assert_eq!(
+            data.profiles
+                .get(&id)
+                .and_then(|profile| profile.token.as_deref()),
+            Some("concurrent")
+        );
     }
 
     #[tokio::test]

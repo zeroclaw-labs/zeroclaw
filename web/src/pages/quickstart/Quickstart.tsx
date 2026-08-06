@@ -19,6 +19,7 @@ import {
   type QuickstartFieldDescriptor,
   type QuickstartState,
   type QuickstartStep,
+  type QuickstartWarning,
   getCatalogModels,
   getPersonalityTemplates,
   getQuickstartState,
@@ -109,6 +110,8 @@ export default function Quickstart() {
   const [form, setForm] = useState<FormState>(DEFAULT_FORM);
   const [busy, setBusy] = useState(false);
   const [errors, setErrors] = useState<QuickstartError[]>([]);
+  const [warnings, setWarnings] = useState<QuickstartWarning[]>([]);
+  const [appliedAgent, setAppliedAgent] = useState<string | null>(null);
   const [state, setState] = useState<QuickstartState | null>(null);
   const runIdRef = useRef<string>(
     `${Date.now().toString(16)}${Math.random().toString(16).slice(2, 10)}`,
@@ -167,6 +170,7 @@ export default function Quickstart() {
     if (!runtimeProfile) return;
     setBusy(true);
     setErrors([]);
+    setWarnings([]);
     const res = await quickstartApply({
       model_provider: { mode: "fresh", value: form.provider! },
       risk_profile: { mode: "fresh", value: form.risk!.preset_name },
@@ -201,6 +205,11 @@ export default function Quickstart() {
       return;
     }
     submittedRef.current = true;
+    if (res.warnings.length > 0) {
+      setWarnings(res.warnings);
+      setAppliedAgent(res.agent.alias);
+      return;
+    }
     navigate(`/agent/${encodeURIComponent(res.agent.alias)}`);
   };
 
@@ -469,11 +478,34 @@ export default function Quickstart() {
         </ul>
       )}
 
+      {warnings.length > 0 && appliedAgent && (
+        <div className="rounded-[var(--radius-md)] border border-status-warning/20 bg-status-warning/10 p-4 space-y-3 text-sm text-pc-text">
+          <p className="font-medium">{t("quickstart.warnings_title")}</p>
+          <ul className="space-y-1">
+            {warnings.map((warning, i) => (
+              <li key={i}>
+                <code>
+                  {warning.step}
+                  {warning.field ? `.${warning.field}` : ""}
+                </code>
+                : {warning.message}
+              </li>
+            ))}
+          </ul>
+          <Button
+            size="sm"
+            onClick={() => navigate(`/agent/${encodeURIComponent(appliedAgent)}`)}
+          >
+            {t("quickstart.open_created_agent")}
+          </Button>
+        </div>
+      )}
+
       <div className="flex justify-end pt-2">
         <Button
           size="md"
           className="px-6"
-          disabled={busy || !allDone}
+          disabled={busy || !allDone || appliedAgent !== null}
           onClick={() => void submit()}
         >
           {busy ? t("quickstart.creating") : t("quickstart.create")}

@@ -331,6 +331,7 @@ zc-quickstart-status-created = 已创建 `{ $alias }`。正在重新加载守护
 zc-quickstart-status-errors = { $count } 个错误 — 修正选择器并重新提交
 zc-quickstart-status-first-error = { $where }{ $field }：{ $message }{ $more }
 zc-quickstart-status-more-errors = { " " }（还有 { $count } 个）
+zc-quickstart-status-more-warnings = { " " }（另外 { $count } 个警告）
 zc-quickstart-status-can-create = 所有必填选择器 ✓。按 `{ $chord }` 创建。
 zc-quickstart-status-hint = ↑/↓ 移动，回车打开。当所有必填选择器都为 ✓ 时启用 `{ $chord }`。
 zc-quickstart-missing-model-provider = 创建前请选择一个模型提供商。

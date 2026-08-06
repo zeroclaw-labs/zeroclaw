@@ -7,6 +7,7 @@ use zeroclaw_api::model_provider::ModelProvider;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
+use zeroclaw_config::schema::Config;
 use zeroclaw_providers::ProviderDispatch;
 
 /// Tool that runs a single prompt through an LLM and optionally validates
@@ -14,35 +15,31 @@ use zeroclaw_providers::ProviderDispatch;
 /// this is a pure text-in, text-out (or JSON-out) call.
 pub struct LlmTaskTool {
     security: Arc<SecurityPolicy>,
-    /// Default model_provider name from root config (e.g. "openrouter").
-    default_model_provider: String,
+    /// Full `<family>.<alias>` provider reference from root config.
+    model_provider_ref: String,
+    /// Canonical configuration used to resolve alias-bound credentials.
+    config: Arc<Config>,
     /// Default model from root config.
     default_model: String,
     /// Default temperature from root config. `None` means no temperature
     /// is sent on the wire; provider applies its own default.
     default_temperature: Option<f64>,
-    /// API key for model_provider authentication.
-    api_key: Option<String>,
-    /// ModelProvider runtime options inherited from root config.
-    provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions,
 }
 
 impl LlmTaskTool {
     pub fn new(
         security: Arc<SecurityPolicy>,
-        default_model_provider: String,
+        config: Arc<Config>,
+        model_provider_ref: String,
         default_model: String,
         default_temperature: Option<f64>,
-        api_key: Option<String>,
-        provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions,
     ) -> Self {
         Self {
             security,
-            default_model_provider,
+            config,
+            model_provider_ref,
             default_model,
             default_temperature,
-            api_key,
-            provider_runtime_options,
         }
     }
 }
@@ -140,12 +137,10 @@ impl Tool for LlmTaskTool {
         };
 
         // Create model_provider
-        let api_key_ref = self.api_key.as_deref();
         let model_provider: Box<dyn ModelProvider> =
-            match zeroclaw_providers::create_model_provider_with_options(
-                &self.default_model_provider,
-                api_key_ref,
-                &self.provider_runtime_options,
+            match zeroclaw_providers::create_model_provider_from_ref(
+                self.config.as_ref(),
+                &self.model_provider_ref,
             ) {
                 Ok(p) => p,
                 Err(e) => {
@@ -410,11 +405,10 @@ mod tests {
     fn tool_metadata() {
         let tool = LlmTaskTool::new(
             Arc::new(SecurityPolicy::default()),
+            Arc::new(Config::default()),
             "openrouter".to_string(),
             "test-model".to_string(),
             Some(0.7),
-            None,
-            zeroclaw_providers::ModelProviderRuntimeOptions::default(),
         );
 
         assert_eq!(tool.name(), "llm_task");
@@ -436,11 +430,10 @@ mod tests {
     async fn execute_missing_prompt_returns_error() {
         let tool = LlmTaskTool::new(
             Arc::new(SecurityPolicy::default()),
+            Arc::new(Config::default()),
             "openrouter".to_string(),
             "test-model".to_string(),
             Some(0.7),
-            None,
-            zeroclaw_providers::ModelProviderRuntimeOptions::default(),
         );
 
         let result = tool.execute(json!({})).await.unwrap();
@@ -452,11 +445,10 @@ mod tests {
     async fn execute_empty_prompt_returns_error() {
         let tool = LlmTaskTool::new(
             Arc::new(SecurityPolicy::default()),
+            Arc::new(Config::default()),
             "openrouter".to_string(),
             "test-model".to_string(),
             Some(0.7),
-            None,
-            zeroclaw_providers::ModelProviderRuntimeOptions::default(),
         );
 
         let result = tool.execute(json!({"prompt": "  "})).await.unwrap();
@@ -468,11 +460,10 @@ mod tests {
     async fn execute_with_invalid_provider_returns_error() {
         let tool = LlmTaskTool::new(
             Arc::new(SecurityPolicy::default()),
+            Arc::new(Config::default()),
             "nonexistent_provider_xyz".to_string(),
             "test-model".to_string(),
             Some(0.7),
-            None,
-            zeroclaw_providers::ModelProviderRuntimeOptions::default(),
         );
 
         let result = tool
@@ -481,5 +472,46 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.error.as_deref().unwrap().contains("model_provider"));
+    }
+
+    #[tokio::test]
+    async fn execute_preserves_anthropic_oauth_dotted_alias() {
+        use zeroclaw_config::schema::{
+            AnthropicModelProviderConfig, AuthMode, ModelProviderConfig,
+        };
+
+        let mut config = Config {
+            ..Default::default()
+        };
+        config.providers.models.anthropic.insert(
+            "subscription".to_string(),
+            AnthropicModelProviderConfig {
+                base: ModelProviderConfig {
+                    uri: Some("http://127.0.0.1:1".to_string()),
+                    model: Some("claude-sonnet-4-5".to_string()),
+                    ..Default::default()
+                },
+                auth_mode: Some(AuthMode::OAuth),
+            },
+        );
+        let tool = LlmTaskTool::new(
+            Arc::new(SecurityPolicy::default()),
+            Arc::new(config),
+            "anthropic.subscription".to_string(),
+            "claude-sonnet-4-5".to_string(),
+            None,
+        );
+
+        let result = tool.execute(json!({"prompt": "hello"})).await.unwrap();
+        assert!(!result.success, "tool result: {result:?}");
+        let error = result.error.as_deref().unwrap_or_default();
+        assert!(
+            error.contains("providers.models.anthropic.subscription"),
+            "dotted alias was not preserved: {error}"
+        );
+        assert!(
+            error.contains("requires the official https://api.anthropic.com endpoint"),
+            "OAuth endpoint guard was not applied: {error}"
+        );
     }
 }

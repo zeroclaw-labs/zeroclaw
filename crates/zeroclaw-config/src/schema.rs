@@ -14,7 +14,9 @@ use directories::UserDirs;
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{OnceLock, RwLock};
 #[cfg(unix)]
 use tokio::fs::File;
@@ -659,6 +661,31 @@ pub struct Config {
     pub escalation: EscalationConfig,
 }
 
+/// Result of a config replacement that reached the destination path.
+///
+/// A directory fsync can fail after the atomic rename has replaced the old
+/// config. Callers that coordinate another durable resource must preserve that
+/// resource in this case: the new config is already visible at its path, even
+/// though durability could not be confirmed.
+#[derive(Debug)]
+pub enum ConfigSaveOutcome {
+    /// The config replacement and directory metadata sync completed.
+    Durable,
+    /// The replacement completed, but syncing the parent directory failed.
+    CommittedWithDurabilityWarning(anyhow::Error),
+}
+
+impl ConfigSaveOutcome {
+    /// Return the legacy `Result<()>` view used by callers that do not need to
+    /// distinguish an uncommitted write from a post-rename warning.
+    pub fn into_legacy_result(self) -> Result<()> {
+        match self {
+            Self::Durable => Ok(()),
+            Self::CommittedWithDurabilityWarning(err) => Err(err),
+        }
+    }
+}
+
 /// Multi-client workspace isolation configuration.
 ///
 /// When enabled, each client engagement gets an isolated workspace with
@@ -764,6 +791,7 @@ pub enum AuthMode {
     ApiKey,
     /// OAuth flow — credential resolution defers to the family runtime impl
     /// (typically reading a vendor-specific token cache or env var).
+    #[serde(rename = "oauth", alias = "o_auth")]
     OAuth,
 }
 
@@ -1103,9 +1131,11 @@ impl ModelEndpoint for AnthropicEndpoint {
     }
 }
 
-/// Anthropic model model_provider config. No family-specific extras yet — typed
-/// slot reserved for future Anthropic-only knobs (cache_control, beta
-/// headers) so they land cleanly without another schema rework.
+/// Anthropic model provider config.
+///
+/// Omitting `auth_mode` deliberately preserves the legacy static-credential
+/// path, including setup tokens stored in `api_key`. Set `auth_mode = "oauth"`
+/// only to resolve the stored Anthropic auth profile with the same alias.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "providers.models.anthropic"]
@@ -1113,6 +1143,14 @@ pub struct AnthropicModelProviderConfig {
     #[nested]
     #[serde(flatten)]
     pub base: ModelProviderConfig,
+    /// Resolve credentials from the same-named stored Anthropic auth profile.
+    ///
+    /// `None` (the compatibility default) and `api_key` use `base.api_key`.
+    /// OAuth mode must leave `api_key` unset so the credential source is
+    /// unambiguous.
+    #[tab(Connection)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_mode: Option<AuthMode>,
 }
 
 // ── Moonshot (multi-region exemplar) ──
@@ -19809,6 +19847,31 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         validate_memory_rerank_config(&self.memory)?;
 
+        // TOML deserialization inserts provider aliases directly into their
+        // maps. Preserve legacy aliases that are broader than the mutation
+        // API grammar, but reject ':' because it is an auth-profile-id
+        // separator and can change credential ownership.
+        for (family, alias, _) in self.providers.models.iter_entries() {
+            if alias.contains(':') {
+                validation_bail!(
+                    InvalidFormat,
+                    format!("providers.models.{family}.{alias}"),
+                    "provider alias `{alias}` must not contain ':'"
+                );
+            }
+        }
+
+        for (alias, provider) in &self.providers.models.anthropic {
+            if provider.auth_mode == Some(AuthMode::OAuth) && provider.base.api_key.is_some() {
+                let path = format!("providers.models.anthropic.{alias}.api_key");
+                validation_bail!(
+                    InvalidFormat,
+                    path,
+                    "providers.models.anthropic.{alias}: auth_mode = \"oauth\" must not be combined with api_key"
+                );
+            }
+        }
+
         // Tunnel — OpenVPN
         if self.tunnel.tunnel_provider.trim() == "openvpn" {
             let openvpn = self.tunnel.openvpn.as_ref().ok_or_else(|| {
@@ -21577,6 +21640,14 @@ impl Config {
     }
 
     pub async fn save(&self) -> Result<()> {
+        self.save_with_outcome().await?.into_legacy_result()
+    }
+
+    /// Save the complete config and report whether a post-rename directory
+    /// sync warning occurred. Most callers should use [`Self::save`]; callers
+    /// coordinating another durable resource can keep that resource when the
+    /// config has already been committed.
+    pub async fn save_with_outcome(&self) -> Result<ConfigSaveOutcome> {
         // Encrypt secrets before serialization
         let mut config_to_save = self.clone();
         // Stamp the current schema version on every write. The in-memory
@@ -21660,13 +21731,39 @@ impl Config {
     /// written. Falls back to a full `save()` when the file doesn't
     /// exist yet. Clears the dirty set on success.
     pub async fn save_dirty(&mut self) -> Result<()> {
+        let original_dirty_paths = self.dirty_paths.clone();
+        let outcome = self.save_dirty_with_outcome().await?;
+        self.apply_legacy_save_dirty_outcome(original_dirty_paths, outcome)
+    }
+
+    fn apply_legacy_save_dirty_outcome(
+        &mut self,
+        original_dirty_paths: std::collections::HashSet<String>,
+        outcome: ConfigSaveOutcome,
+    ) -> Result<()> {
+        match outcome {
+            ConfigSaveOutcome::Durable => Ok(()),
+            ConfigSaveOutcome::CommittedWithDurabilityWarning(err) => {
+                // Preserve the legacy retry contract: `save_dirty()` reports
+                // this as an error, so callers must retain their dirty paths
+                // rather than receiving a silent no-op on retry.
+                self.dirty_paths = original_dirty_paths;
+                Err(err)
+            }
+        }
+    }
+
+    /// Incrementally save dirty paths and report whether a post-rename
+    /// directory sync warning occurred. A returned warning still means the
+    /// new config has replaced the old file and the dirty set is cleared.
+    pub async fn save_dirty_with_outcome(&mut self) -> Result<ConfigSaveOutcome> {
         if self.dirty_paths.is_empty() {
-            return Ok(());
+            return Ok(ConfigSaveOutcome::Durable);
         }
 
         let config_path = self.resolve_config_path_for_save().await?;
         if !config_path.exists() {
-            let result = self.save().await;
+            let result = self.save_with_outcome().await;
             if result.is_ok() {
                 self.clear_dirty();
             }
@@ -21730,9 +21827,9 @@ impl Config {
 
         let toml_str = ensure_blank_line_before_sections(&doc.to_string());
 
-        write_config_atomically(&config_path, &toml_str).await?;
+        let outcome = write_config_atomically(&config_path, &toml_str).await?;
         self.clear_dirty();
-        Ok(())
+        Ok(outcome)
     }
 }
 
@@ -21772,8 +21869,24 @@ fn restore_onepassword_references_for_save(
     Ok(())
 }
 
+type DirectorySyncFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+
 /// Atomic write shared by `save()` and `save_dirty()`.
-async fn write_config_atomically(config_path: &Path, toml_str: &str) -> Result<()> {
+async fn write_config_atomically(config_path: &Path, toml_str: &str) -> Result<ConfigSaveOutcome> {
+    write_config_atomically_with_directory_sync(config_path, toml_str, |parent_dir| {
+        Box::pin(sync_directory(parent_dir))
+    })
+    .await
+}
+
+async fn write_config_atomically_with_directory_sync<F>(
+    config_path: &Path,
+    toml_str: &str,
+    sync_parent_directory: F,
+) -> Result<ConfigSaveOutcome>
+where
+    F: for<'a> FnOnce(&'a Path) -> DirectorySyncFuture<'a>,
+{
     let parent_dir = config_path
         .parent()
         .context("Config path must have a parent directory")?;
@@ -21850,13 +21963,16 @@ async fn write_config_atomically(config_path: &Path, toml_str: &str) -> Result<(
         }
     }
 
-    sync_directory(parent_dir).await?;
+    let outcome = match sync_parent_directory(parent_dir).await {
+        Ok(()) => ConfigSaveOutcome::Durable,
+        Err(err) => ConfigSaveOutcome::CommittedWithDurabilityWarning(err),
+    };
 
     if had_existing_config {
         let _ = fs::remove_file(&backup_path).await;
     }
 
-    Ok(())
+    Ok(outcome)
 }
 
 /// Write the in-memory value at `dotted` into the doc, or delete the leaf
@@ -26642,6 +26758,50 @@ default_temperature = 0.7
     }
 
     #[tokio::test]
+    async fn atomic_write_reports_post_rename_directory_sync_failure_as_committed() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+
+        let outcome = write_config_atomically_with_directory_sync(
+            &config_path,
+            "schema_version = 2\n",
+            |_| Box::pin(async { anyhow::bail!("injected directory sync failure") }),
+        )
+        .await
+        .expect("rename completed, so the write must report an outcome");
+
+        assert!(matches!(
+            outcome,
+            ConfigSaveOutcome::CommittedWithDurabilityWarning(_)
+        ));
+        assert_eq!(
+            fs::read_to_string(&config_path).await.unwrap(),
+            "schema_version = 2\n",
+            "a post-rename failure must not be reported as an uncommitted write"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_save_dirty_keeps_retry_paths_after_committed_warning() {
+        let mut config = Config::default();
+        let original_dirty_paths =
+            std::collections::HashSet::from(["agents.bot.model_provider".to_string()]);
+        config.dirty_paths.clear();
+
+        let err = config
+            .apply_legacy_save_dirty_outcome(
+                original_dirty_paths.clone(),
+                ConfigSaveOutcome::CommittedWithDurabilityWarning(anyhow::Error::msg(
+                    "injected directory sync failure",
+                )),
+            )
+            .expect_err("legacy save_dirty must retain its error contract");
+
+        assert!(err.to_string().contains("injected directory sync failure"));
+        assert_eq!(config.dirty_paths, original_dirty_paths);
+    }
+
+    #[tokio::test]
     async fn config_save_prunes_unchanged_default_blocks() {
         // Fresh-init config without any operator edits should write a
         // tiny config.toml — only `schema_version` and any operator-
@@ -26706,6 +26866,7 @@ default_temperature = 0.7
                     model: Some("claude-sonnet-4".into()),
                     ..Default::default()
                 },
+                auth_mode: None,
             },
         );
         config.save().await.unwrap();
@@ -26895,6 +27056,7 @@ default_temperature = 0.7
                     )]),
                     ..Default::default()
                 },
+                auth_mode: None,
             },
         );
         // ModelProvider fields are now resolved directly — no cache needed.
@@ -28872,6 +29034,7 @@ model = "primary-model"
                     temperature: Some(0.5),
                     ..Default::default()
                 },
+                auth_mode: None,
             },
         );
         // ModelProvider fields are now resolved directly — no cache needed.
@@ -38598,5 +38761,81 @@ model_provider = \"ollama.default\"
             ..Default::default()
         };
         assert!(agent.is_dispatchable());
+    }
+
+    #[::core::prelude::v1::test]
+    fn anthropic_legacy_alias_omits_auth_mode_on_round_trip() {
+        let legacy: AnthropicModelProviderConfig =
+            toml::from_str("model = \"claude-sonnet-4-5\"\napi_key = \"sk-ant-oat01-legacy\"\n")
+                .expect("legacy Anthropic alias should deserialize");
+        assert_eq!(legacy.auth_mode, None);
+        assert_eq!(legacy.base.api_key.as_deref(), Some("sk-ant-oat01-legacy"));
+
+        let serialized = toml::to_string(&legacy).expect("legacy alias should serialize");
+        assert!(
+            !serialized.contains("auth_mode"),
+            "legacy aliases must not be rewritten with auth_mode: {serialized}"
+        );
+        let round_trip: AnthropicModelProviderConfig =
+            toml::from_str(&serialized).expect("serialized alias should deserialize");
+        assert_eq!(round_trip.auth_mode, None);
+        assert_eq!(round_trip.base.api_key, legacy.base.api_key);
+    }
+
+    #[::core::prelude::v1::test]
+    fn anthropic_oauth_rejects_inline_api_key() {
+        let mut config = Config::default();
+        config.providers.models.anthropic.insert(
+            "subscription".into(),
+            AnthropicModelProviderConfig {
+                base: ModelProviderConfig {
+                    api_key: Some("not-allowed-in-oauth-mode".into()),
+                    ..Default::default()
+                },
+                auth_mode: Some(AuthMode::OAuth),
+            },
+        );
+
+        let error = config.validate().expect_err("OAuth plus api_key must fail");
+        assert!(error.to_string().contains("auth_mode = \"oauth\""));
+    }
+
+    #[::core::prelude::v1::test]
+    fn validation_rejects_colon_bearing_provider_aliases() {
+        let mut config = Config::default();
+        config.providers.models.anthropic.insert(
+            "subscription:other-provider".into(),
+            AnthropicModelProviderConfig::default(),
+        );
+
+        let error = config
+            .validate()
+            .expect_err("provider aliases must not contain the profile-id separator");
+        assert!(error.to_string().contains("must not contain ':'"));
+        assert!(error.to_string().contains("subscription:other-provider"));
+    }
+
+    #[::core::prelude::v1::test]
+    fn validation_preserves_legacy_hyphenated_provider_aliases() {
+        let mut config = Config::default();
+        config
+            .providers
+            .models
+            .custom
+            .insert("kimi-k2-5".into(), CustomModelProviderConfig::default());
+
+        config
+            .validate()
+            .expect("legacy hyphenated provider aliases must remain valid");
+    }
+
+    #[::core::prelude::v1::test]
+    fn auth_mode_accepts_legacy_o_auth_spelling_but_serializes_as_oauth() {
+        let parsed: AuthMode = serde_json::from_str("\"o_auth\"").expect("legacy spelling parses");
+        assert_eq!(parsed, AuthMode::OAuth);
+        assert_eq!(
+            serde_json::to_string(&parsed).expect("serialize mode"),
+            "\"oauth\""
+        );
     }
 }

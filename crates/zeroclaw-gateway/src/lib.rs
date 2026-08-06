@@ -454,6 +454,9 @@ pub(crate) type ConfigWriteGuard = tokio::sync::OwnedMutexGuard<()>;
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<RwLock<Config>>,
+    /// Shared with RPC/TUI to reject additional Quickstart commits after a
+    /// successful submission has been admitted for delayed daemon reload.
+    pub quickstart_reload_admission: Arc<std::sync::atomic::AtomicBool>,
 
     /// Serializes the read-mutate-save-swap critical section of every HTTP
     /// handler that mutates `config` (per-property PUT/DELETE/PATCH, map-key
@@ -579,7 +582,7 @@ pub struct AppState {
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub async fn run_gateway(
     host: &str,
     port: u16,
@@ -596,6 +599,7 @@ pub async fn run_gateway(
     // Shared SOP engine from the daemon. `None` when standalone — sessions build their own.
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    quickstart_config: Option<zeroclaw_runtime::quickstart::QuickstartConfigState>,
     readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
 ) -> Result<()> {
     // ── Security: warn on public bind without tunnel or explicit opt-in ──
@@ -613,7 +617,10 @@ pub async fn run_gateway(
              Docker/VM: if you are running inside a container or VM, this is expected."
         );
     }
-    let config_state = Arc::new(RwLock::new(config.clone()));
+    let quickstart_config = quickstart_config.unwrap_or_else(|| {
+        zeroclaw_runtime::quickstart::QuickstartConfigState::new(config.clone())
+    });
+    let config_state = quickstart_config.config();
 
     // ── Hooks ──────────────────────────────────────────────────────
     let hooks: Option<std::sync::Arc<zeroclaw_runtime::hooks::HookRunner>> = if config.hooks.enabled
@@ -657,11 +664,11 @@ pub async fn run_gateway(
         .map(|(f, a, e)| (f.to_string(), a.to_string(), Some(e)))
         .unwrap_or_else(|| ("openrouter".to_string(), "default".to_string(), None));
     let fallback = boot_entry;
-    let model_provider_name = boot_family.as_str();
+    let model_provider_name = format!("{boot_family}.{boot_alias}");
     let (model_provider, boot_provider_failed): (Arc<dyn ModelProvider>, bool) =
         match zeroclaw_providers::create_resilient_model_provider_from_ref(
             &config,
-            model_provider_name,
+            &model_provider_name,
             fallback.and_then(|e| e.api_key.as_deref()),
             fallback.and_then(|e| e.uri.as_deref()),
             &config.reliability,
@@ -678,7 +685,7 @@ pub async fn run_gateway(
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note,)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                         .with_attrs(::serde_json::json!({
-                            "model_provider": model_provider_name,
+                            "model_provider": &model_provider_name,
                             "alias": boot_alias,
                             "error": format!("{e}"),
                         })),
@@ -704,7 +711,7 @@ pub async fn run_gateway(
             Some(m) => m.to_string(),
             None => match config.resolve_default_model() {
                 Some(m) => {
-                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": model_provider_name, "model": m})), "first model_provider has no `model` set; using first configured \
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": &model_provider_name, "model": m})), "first model_provider has no `model` set; using first configured \
                      providers.models entry as default. Set \
                      [providers.models.<type>.<alias>] model = \"...\" to silence \
                      this warning.");
@@ -1579,7 +1586,8 @@ pub async fn run_gateway(
 
     let state = AppState {
         config: config_state,
-        config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+        quickstart_reload_admission: quickstart_config.reload_admission(),
+        config_write_lock: quickstart_config.write_lock(),
         model_provider,
         model,
         temperature,
@@ -2509,7 +2517,7 @@ fn needs_quickstart_channel_reply() -> String {
     i18n::get_required_cli_string("channel-needs-quickstart-reply")
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "channel-linq"))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct GatewayChatDispatchCapture {
     message: String,
@@ -2517,20 +2525,20 @@ struct GatewayChatDispatchCapture {
     agent_override: Option<String>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "channel-linq"))]
 static GATEWAY_CHAT_DISPATCH_CAPTURES: std::sync::Mutex<Vec<GatewayChatDispatchCapture>> =
     std::sync::Mutex::new(Vec::new());
 
-#[cfg(test)]
+#[cfg(all(test, feature = "channel-linq"))]
 static GATEWAY_CHAT_DISPATCH_CAPTURE_TEST_LOCK: tokio::sync::Mutex<()> =
     tokio::sync::Mutex::const_new(());
 
-#[cfg(test)]
+#[cfg(all(test, feature = "channel-linq"))]
 async fn lock_gateway_chat_dispatch_capture_for_test() -> tokio::sync::MutexGuard<'static, ()> {
     GATEWAY_CHAT_DISPATCH_CAPTURE_TEST_LOCK.lock().await
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "channel-linq"))]
 fn clear_gateway_chat_dispatch_captures_for_test() {
     GATEWAY_CHAT_DISPATCH_CAPTURES
         .lock()
@@ -2538,7 +2546,7 @@ fn clear_gateway_chat_dispatch_captures_for_test() {
         .clear();
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "channel-linq"))]
 fn gateway_chat_dispatch_captures_for_test() -> Vec<GatewayChatDispatchCapture> {
     GATEWAY_CHAT_DISPATCH_CAPTURES
         .lock()
@@ -2546,7 +2554,7 @@ fn gateway_chat_dispatch_captures_for_test() -> Vec<GatewayChatDispatchCapture> 
         .clone()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "channel-linq"))]
 fn record_gateway_chat_dispatch_for_test(
     message: &str,
     session_id: Option<&str>,
@@ -2578,7 +2586,10 @@ pub(crate) async fn run_gateway_chat_with_tools(
     // doesn't go through the cost-tracking scope.
     #[cfg(test)]
     {
+        #[cfg(feature = "channel-linq")]
         record_gateway_chat_dispatch_for_test(message, session_id, agent_override);
+        #[cfg(not(feature = "channel-linq"))]
+        let _ = (session_id, agent_override);
         let response = state
             .model_provider
             .chat_with_system(None, message, &state.model, state.temperature)
@@ -4582,6 +4593,7 @@ mod tests {
         let registry = with_registry.then(|| Arc::new(api_pairing::DeviceRegistry::new(&data_dir)));
         AppState {
             config: Arc::new(RwLock::new(config)),
+            quickstart_reload_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider: Arc::new(MockModelProvider::default()),
             model: "test-model".into(),
@@ -5033,6 +5045,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
         });
@@ -5101,6 +5114,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
         });
@@ -5139,6 +5153,7 @@ mod tests {
                     api_key: Some("sk-test-openai-shaped-key".to_string()),
                     ..Default::default()
                 },
+                auth_mode: None,
             },
         );
 
@@ -5147,6 +5162,7 @@ mod tests {
                 "127.0.0.1",
                 0,
                 config,
+                None,
                 None,
                 None,
                 None,
@@ -5183,6 +5199,198 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_gateway_bootstraps_anthropic_oauth_alias() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        config.providers.models.anthropic.insert(
+            "subscription".to_string(),
+            zeroclaw_config::schema::AnthropicModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    model: Some("claude-sonnet-4-5".to_string()),
+                    ..Default::default()
+                },
+                auth_mode: Some(zeroclaw_config::schema::AuthMode::OAuth),
+            },
+        );
+        zeroclaw_providers::auth::AuthService::from_config(&config)
+            .store_model_provider_token(
+                "anthropic",
+                "subscription",
+                "synthetic-setup-token",
+                std::collections::HashMap::from([(
+                    "auth_kind".to_string(),
+                    "authorization".to_string(),
+                )]),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let handle = zeroclaw_spawn::spawn!(async move {
+            run_gateway(
+                "127.0.0.1",
+                0,
+                config,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        if handle.is_finished() {
+            let result = handle.await.expect("gateway task did not panic");
+            panic!("gateway bootstrap must construct an OAuth-bound Anthropic alias: {result:?}");
+        }
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn production_gateway_router_applies_anthropic_setup_token() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use zeroclaw_config::presets::{
+            AgentIdentity, BuilderSubmission, MemoryChoice, ModelProviderChoice, SelectorChoice,
+        };
+
+        let port_probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = port_probe.local_addr().unwrap().port();
+        drop(port_probe);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        config.gateway.require_pairing = false;
+        config.save().await.unwrap();
+
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (reload_tx, _) = tokio::sync::watch::channel(false);
+        let reload_controls = zeroclaw_runtime::daemon::GatewayReloadControls {
+            shutdown_tx: shutdown_tx.clone(),
+            reload_tx,
+        };
+        let handle = zeroclaw_spawn::spawn!(async move {
+            run_gateway(
+                "127.0.0.1",
+                port,
+                config,
+                None,
+                Some(reload_controls),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+        });
+
+        let base_url = format!("http://127.0.0.1:{port}");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+                    .await
+                    .is_ok()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("gateway must accept HTTP before Quickstart apply");
+
+        let submission = BuilderSubmission {
+            model_provider: SelectorChoice::Fresh(ModelProviderChoice {
+                provider_type: "anthropic".into(),
+                alias: "subscription".into(),
+                model: "claude-sonnet-4-5".into(),
+                fields: std::collections::HashMap::from([
+                    ("auth_mode".to_string(), "setup_token".to_string()),
+                    ("api_key".to_string(), "synthetic-setup-token".to_string()),
+                ]),
+            }),
+            risk_profile: SelectorChoice::Fresh("balanced".into()),
+            runtime_profile: SelectorChoice::Fresh("balanced".into()),
+            memory: SelectorChoice::Fresh(MemoryChoice::Sqlite),
+            channels: vec![],
+            peer_groups: vec![],
+            agent: AgentIdentity {
+                name: "quickstart_bot".into(),
+                system_prompt: "You are helpful.".into(),
+                personality_file: None,
+                personality_files: vec![],
+            },
+        };
+        let body = serde_json::to_vec(&submission).unwrap();
+        let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        let request = format!(
+            "POST /api/quickstart/apply HTTP/1.1\r\nHost: {base_url}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len(),
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        stream.write_all(&body).await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(
+            response
+                .to_ascii_lowercase()
+                .contains("x-content-type-options"),
+            "production gateway middleware must add security headers"
+        );
+        let json = response.split_once("\r\n\r\n").unwrap().1;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(json).unwrap()["kind"],
+            "applied"
+        );
+
+        let mut reloaded: Config =
+            toml::from_str(&std::fs::read_to_string(tmp.path().join("config.toml")).unwrap())
+                .unwrap();
+        reloaded.config_path = tmp.path().join("config.toml");
+        assert!(
+            reloaded
+                .providers
+                .models
+                .find("anthropic", "subscription")
+                .is_some_and(|entry| entry.api_key.is_none()),
+            "production router must persist an OAuth alias without an inline token"
+        );
+        assert!(
+            zeroclaw_providers::auth::AuthService::from_config(&reloaded)
+                .get_profile("anthropic", Some("subscription"))
+                .await
+                .unwrap()
+                .is_some(),
+            "production router must persist the matching stored profile"
+        );
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("gateway must shut down")
+            .expect("gateway task must not panic")
+            .expect("gateway shutdown must be graceful");
+    }
+
+    #[tokio::test]
     async fn daemon_startup_gateway_reports_ready_and_uses_external_shutdown_sender() {
         let port_probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = port_probe.local_addr().unwrap().port();
@@ -5214,6 +5422,7 @@ mod tests {
                 config,
                 None,
                 Some(reload_controls),
+                None,
                 None,
                 None,
                 None,
@@ -5287,6 +5496,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Some(readiness),
         )
         .await;
@@ -5305,6 +5515,7 @@ mod tests {
     async fn metrics_endpoint_returns_hint_when_prometheus_is_disabled() {
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
+            quickstart_reload_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider: Arc::new(MockModelProvider::default()),
             model: "test-model".into(),
@@ -5394,6 +5605,7 @@ mod tests {
         let observer: Arc<dyn zeroclaw_runtime::observability::Observer> = Arc::new(prom);
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
+            quickstart_reload_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider: Arc::new(MockModelProvider::default()),
             model: "test-model".into(),
@@ -6070,6 +6282,7 @@ mod tests {
 
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
+            quickstart_reload_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
             model: "test-model".into(),
@@ -6177,6 +6390,7 @@ mod tests {
 
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
+            quickstart_reload_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
             model: "test-model".into(),
@@ -6285,6 +6499,7 @@ mod tests {
                     model: Some("agent-model".into()),
                     ..Default::default()
                 },
+                auth_mode: None,
             },
         );
         let expected_provider = "anthropic.default".to_string();
@@ -6299,6 +6514,7 @@ mod tests {
 
         let state = AppState {
             config: Arc::new(RwLock::new(config)),
+            quickstart_reload_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
             model: "startup-model".into(),
@@ -6401,6 +6617,7 @@ mod tests {
 
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
+            quickstart_reload_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
             model: "test-model".into(),
@@ -6522,6 +6739,7 @@ mod tests {
 
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
+            quickstart_reload_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
             model: "test-model".into(),
@@ -6609,6 +6827,7 @@ mod tests {
 
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
+            quickstart_reload_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
             model: "test-model".into(),
@@ -6701,6 +6920,7 @@ mod tests {
 
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
+            quickstart_reload_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
             model: "test-model".into(),
@@ -6800,6 +7020,7 @@ mod tests {
 
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
+            quickstart_reload_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
             model: "test-model".into(),
@@ -6897,6 +7118,7 @@ mod tests {
 
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
+            quickstart_reload_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
             model: "test-model".into(),
@@ -7050,6 +7272,7 @@ mod tests {
 
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
+            quickstart_reload_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider: provider,
             model: "test-model".into(),
@@ -7905,6 +8128,7 @@ mod tests {
 
         AppState {
             config: Arc::new(RwLock::new(config)),
+            quickstart_reload_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
             model: "test-model".into(),
@@ -7993,6 +8217,7 @@ mod tests {
 
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
+            quickstart_reload_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
             model: "test-model".into(),
@@ -8316,6 +8541,7 @@ mod tests {
         let mem: Arc<dyn Memory> = Arc::new(MockMemory);
         AppState {
             config: Arc::new(RwLock::new(Config::default())),
+            quickstart_reload_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
             model: "test-model".into(),

@@ -122,6 +122,11 @@ pub struct RpcContext {
     /// flag is cleared by the concurrent flush).
     pub config_write_lock: Arc<tokio::sync::Mutex<()>>,
 
+    /// Daemon-owned Quickstart reload admission shared with the gateway.
+    /// Once a Quickstart commit schedules delayed reload, another Quickstart
+    /// apply must not commit into the outgoing daemon instance.
+    pub quickstart_reload_admission: Arc<std::sync::atomic::AtomicBool>,
+
     /// In-memory session store for active RPC sessions.
     pub sessions: Arc<SessionStore>,
 
@@ -180,6 +185,7 @@ impl RpcContext {
         Arc::new(Self {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            quickstart_reload_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sessions,
             session_backend: None,
             memory: None,
@@ -201,6 +207,7 @@ impl RpcContext {
         Arc::new(Self {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            quickstart_reload_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sessions,
             session_backend: None,
             memory: None,
@@ -226,6 +233,7 @@ impl RpcContext {
         Arc::new(Self {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            quickstart_reload_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sessions,
             session_backend: None,
             memory: None,
@@ -251,6 +259,7 @@ impl RpcContext {
         Arc::new(Self {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            quickstart_reload_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sessions,
             session_backend: None,
             memory: None,
@@ -276,6 +285,7 @@ impl RpcContext {
         Arc::new(Self {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            quickstart_reload_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sessions,
             session_backend: None,
             memory: Some(memory),
@@ -301,6 +311,7 @@ impl RpcContext {
         Arc::new(Self {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            quickstart_reload_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sessions,
             session_backend: None,
             memory: None,
@@ -327,6 +338,7 @@ impl RpcContext {
         Arc::new(Self {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            quickstart_reload_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sessions,
             session_backend,
             memory: None,
@@ -353,6 +365,7 @@ impl RpcContext {
         Arc::new(Self {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            quickstart_reload_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sessions,
             session_backend: None,
             memory: None,

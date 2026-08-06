@@ -259,6 +259,15 @@ mod tests {
             assert!(controls.contains('↑'));
             assert!(controls.contains('↓'));
             assert!(controls.contains("Esc"));
+
+            let warnings = format_ftl_message(
+                source,
+                locale,
+                "zc-quickstart-status-more-warnings",
+                &[("count", "2")],
+            )
+            .unwrap_or_else(|| panic!("quickstart warnings message must format for {locale}"));
+            assert!(warnings.contains('2'));
         }
     }
 

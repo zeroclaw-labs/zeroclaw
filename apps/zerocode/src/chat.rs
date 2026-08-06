@@ -412,6 +412,15 @@ impl Chat {
         self.pick_or_start_session(agent_alias).await;
     }
 
+    /// Show a transient post-navigation notice when a Quickstart handoff has
+    /// created an active Chat session. The handoff itself owns the message so
+    /// it survives leaving the Quickstart pane.
+    pub(crate) fn set_info_notice(&mut self, msg: String) {
+        if let ChatPhase::Active(state) = &mut self.phase {
+            state.set_info_notice(msg);
+        }
+    }
+
     pub(crate) async fn refresh_if_inactive(&mut self) {
         if should_retry_on_entry(&self.phase) {
             let _ = self.init().await;
@@ -10767,6 +10776,20 @@ mod tests {
             agents: Vec::new(),
         };
         assert!(!chat.claims_pane_navigation(&word_left));
+    }
+
+    #[tokio::test]
+    async fn quickstart_handoff_notice_reaches_the_active_chat_info_surface() {
+        let (mut chat, _rx) = test_chat();
+        chat.phase = ChatPhase::Active(Box::new(state()));
+
+        chat.set_info_notice("credential durability warning".to_string());
+
+        assert_eq!(
+            chat.info_message().map(|message| message.text.as_str()),
+            Some("credential durability warning"),
+            "the Chat info surface consumed by the app renderer must retain the handoff notice"
+        );
     }
 
     #[tokio::test]

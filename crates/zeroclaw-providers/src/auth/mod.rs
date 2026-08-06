@@ -9,7 +9,8 @@ pub mod xai_oauth;
 use crate::auth::oauth_common::{RefreshRetryPolicy, refresh_with_retries};
 use crate::auth::openai_oauth::refresh_access_token;
 use crate::auth::profiles::{
-    AuthProfile, AuthProfileKind, AuthProfilesData, AuthProfilesStore, TokenSet, profile_id,
+    AuthProfile, AuthProfileKind, AuthProfilesData, AuthProfilesStore, ProfileBindingSnapshot,
+    StagedProfileBinding, TokenSet, profile_id,
 };
 use anyhow::Result;
 use std::collections::HashMap;
@@ -51,6 +52,40 @@ impl AuthService {
 
     pub async fn load_profiles(&self) -> Result<AuthProfilesData> {
         self.store.load().await
+    }
+
+    /// Replace one provider/profile token binding and capture the exact state
+    /// it displaced under the same store lock. This never changes the active
+    /// profile selection.
+    pub async fn stage_model_provider_token(
+        &self,
+        model_provider: &str,
+        profile_name: &str,
+        token: &str,
+        metadata: HashMap<String, String>,
+    ) -> Result<StagedProfileBinding> {
+        let model_provider = normalize_model_provider(model_provider)?;
+        let mut profile = AuthProfile::new_token(&model_provider, profile_name, token.to_string());
+        profile.metadata.extend(metadata);
+        self.store.stage_profile_binding(profile).await
+    }
+
+    /// Restore a binding captured by [`stage_model_provider_token`].
+    /// This is intentionally scoped to one profile binding and never changes
+    /// a provider-local active selector, so it cannot overwrite unrelated
+    /// credentials or a concurrent selection change.
+    pub async fn restore_model_provider_profile(
+        &self,
+        model_provider: &str,
+        profile_name: &str,
+        snapshot: ProfileBindingSnapshot,
+        expected_current: &AuthProfile,
+    ) -> Result<()> {
+        let model_provider = normalize_model_provider(model_provider)?;
+        let profile_id = resolve_requested_profile_id(&model_provider, profile_name);
+        self.store
+            .restore_profile_binding(&profile_id, snapshot, expected_current)
+            .await
     }
 
     /// Read-only listing of persisted profile IDs (no decrypt, no migration).
@@ -176,7 +211,17 @@ impl AuthService {
         let Some(profile_id) = select_profile_id(&data, &model_provider, profile_override) else {
             return Ok(None);
         };
-        Ok(data.profiles.get(&profile_id).cloned())
+        let Some(profile) = data.profiles.get(&profile_id) else {
+            return Ok(None);
+        };
+        if profile.model_provider != model_provider {
+            anyhow::bail!(
+                "Profile {profile_id} belongs to model_provider {}, not {}",
+                profile.model_provider,
+                model_provider
+            );
+        }
+        Ok(Some(profile.clone()))
     }
 
     pub async fn get_provider_bearer_token(
@@ -1904,6 +1949,27 @@ mod tests {
             select_profile_id(&data, "openai-codex", None),
             Some(id_active)
         );
+    }
+
+    #[tokio::test]
+    async fn get_profile_rejects_an_explicit_profile_owned_by_another_provider() {
+        let temp = tempfile::tempdir().expect("temp auth dir");
+        let auth = AuthService::new(temp.path(), false);
+        auth.store_model_provider_token(
+            "openai-codex",
+            "default",
+            "token",
+            std::collections::HashMap::new(),
+            true,
+        )
+        .await
+        .expect("store profile");
+
+        let error = auth
+            .get_profile("anthropic", Some("openai-codex:default"))
+            .await
+            .expect_err("cross-provider profile lookup must fail closed");
+        assert!(error.to_string().contains("belongs to model_provider"));
     }
 
     #[tokio::test]

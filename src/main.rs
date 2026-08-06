@@ -1275,7 +1275,7 @@ async fn run_quickstart_cli(
         RISK_PRESETS, SelectorChoice,
     };
     use zeroclaw_runtime::quickstart::{
-        FieldSection, QuickstartTypeOption, Surface, apply_with_surface, field_shape,
+        FieldSection, QuickstartTypeOption, Surface, apply_with_surface_outcome, field_shape,
         snapshot_state,
     };
 
@@ -2394,7 +2394,7 @@ async fn run_quickstart_cli(
         })
         .collect();
     let agent_choice = form.agent.expect("agent satisfied");
-    let submission = BuilderSubmission {
+    let mut submission = BuilderSubmission {
         model_provider,
         risk_profile,
         runtime_profile,
@@ -2409,8 +2409,29 @@ async fn run_quickstart_cli(
         },
     };
 
-    match Box::pin(apply_with_surface(submission, &mut cfg, Surface::Cli)).await {
-        Ok(applied) => {
+    // Anthropic setup tokens are transport-only. Acquire the value before the
+    // shared Quickstart transaction so its profile write and the OAuth alias
+    // configuration either commit together or are both rejected. OpenAI's
+    // distinct login flow remains a post-Quickstart operation.
+    if let Some(InlineProviderAuth::AnthropicSetupToken { alias }) = &inline_auth {
+        let Some(token) = Box::pin(collect_anthropic_setup_token_inline(alias)).await? else {
+            return Ok(());
+        };
+        let SelectorChoice::Fresh(model_provider) = &mut submission.model_provider else {
+            anyhow::bail!("Anthropic setup-token Quickstart must create a fresh model provider");
+        };
+        model_provider.fields.insert("api_key".to_string(), token);
+    }
+
+    match Box::pin(apply_with_surface_outcome(
+        submission,
+        &mut cfg,
+        Surface::Cli,
+    ))
+    .await
+    {
+        Ok(outcome) => {
+            let applied = outcome.agent;
             println!();
             println!(
                 "{}",
@@ -2420,7 +2441,18 @@ async fn run_quickstart_cli(
                     "Quickstart complete."
                 )
             );
-            if let Some(auth) = inline_auth {
+            for warning in outcome.warnings {
+                eprintln!(
+                    "{}",
+                    ta(
+                        "cli-quickstart-warning",
+                        &[("message", &warning.message)],
+                        "WARNING: {$message}",
+                    )
+                );
+            }
+            if matches!(inline_auth, Some(InlineProviderAuth::Codex)) {
+                let auth = InlineProviderAuth::Codex;
                 Box::pin(run_inline_provider_auth(auth, &mut cfg)).await;
             }
             println!();
@@ -2439,20 +2471,33 @@ async fn run_quickstart_cli(
         }
         Err(errs) => {
             eprintln!();
-            eprintln!(
-                "{}",
-                t(
-                    "cli-agent-not-created",
-                    "Your agent was not created — and nothing on disk was changed."
-                )
-            );
-            eprintln!(
-                "{}",
-                t(
-                    "cli-quickstart-fix-and-rerun",
-                    "Your existing config is untouched. Fix the following and run quickstart again:",
-                )
-            );
+            if errs.iter().any(|err| {
+                err.message
+                    .contains("Anthropic setup-token rollback also failed")
+            }) {
+                eprintln!(
+                    "{}",
+                    t(
+                        "cli-agent-not-created-disk-state-uncertain",
+                        "Your agent was not created. The config was not saved, but the Anthropic credential rollback failed; inspect the stored profile before retrying."
+                    )
+                );
+            } else {
+                eprintln!(
+                    "{}",
+                    t(
+                        "cli-agent-not-created",
+                        "Your agent was not created — and nothing on disk was changed."
+                    )
+                );
+                eprintln!(
+                    "{}",
+                    t(
+                        "cli-quickstart-fix-and-rerun",
+                        "Your existing config is untouched. Fix the following and run quickstart again:",
+                    )
+                );
+            }
             eprintln!();
             for e in &errs {
                 eprintln!("  • {}: {}", quickstart_step_label(e.step), e.message);
@@ -3656,22 +3701,13 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     );
                 }
 
-                let (provider_name, resolved_entry) = config
-                    .resolved_model_provider_for_agent(&agent_alias)
-                    .map(|(ty, _alias, entry)| (ty, Some(entry)))
-                    .unwrap_or(("openai", None));
-                let model_provider = zeroclaw::providers::create_model_provider(
-                    provider_name,
-                    resolved_entry.and_then(|e| e.api_key.as_deref()),
-                )?;
-                let model_name = resolved_entry
-                    .and_then(|e| e.model.as_deref())
-                    .unwrap_or("default");
+                let (model_provider, model_name) =
+                    resolve_kernel_agent_model_provider(&config, &agent_alias)?;
                 match message {
                     Some(msg) => {
                         let response =
                             zeroclaw_providers::ProviderDispatch::from_ref(&*model_provider)
-                                .simple_chat(&msg, model_name, Some(final_temperature))
+                                .simple_chat(&msg, &model_name, Some(final_temperature))
                                 .await?;
                         println!("{response}");
                     }
@@ -3700,7 +3736,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                             };
                             let response =
                                 zeroclaw_providers::ProviderDispatch::from_ref(&*model_provider)
-                                    .simple_chat(line.trim(), model_name, Some(final_temperature))
+                                    .simple_chat(line.trim(), &model_name, Some(final_temperature))
                                     .await?;
                             println!("{response}");
                         }
@@ -4223,7 +4259,14 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 registry.register_gateway(Box::new({
                     let sop_e = sop_engine.clone();
                     let sop_a = sop_audit.clone();
-                    move |host, port, config, tx, reload_controls, tui_registry, ready_tx| {
+                    move |host,
+                          port,
+                          config,
+                          tx,
+                          reload_controls,
+                          tui_registry,
+                          quickstart_config,
+                          ready_tx| {
                         let canvas_store = canvas_store_for_gateway.clone();
                         let sop_engine = sop_e.clone();
                         let sop_audit = sop_a.clone();
@@ -4238,6 +4281,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                                 Some(canvas_store),
                                 sop_engine,
                                 sop_audit,
+                                quickstart_config,
                                 ready_tx,
                             ))
                             .await
@@ -6401,6 +6445,26 @@ async fn async_main(command: clap::Command) -> Result<()> {
     }
 }
 
+/// Resolve the provider reference used by the kernel-only `zeroclaw agent`
+/// path. Keeping this construction in a named helper makes its alias behavior
+/// directly testable without duplicating the command's resolution logic.
+#[cfg(any(not(feature = "agent-runtime"), test))]
+fn resolve_kernel_agent_model_provider(
+    config: &Config,
+    agent_alias: &str,
+) -> Result<(Box<dyn zeroclaw_api::model_provider::ModelProvider>, String)> {
+    let (provider_ref, resolved_entry) = config
+        .resolved_model_provider_for_agent(agent_alias)
+        .map(|(ty, alias, entry)| (format!("{ty}.{alias}"), Some(entry)))
+        .unwrap_or_else(|| ("openai".to_string(), None));
+    let model_provider = zeroclaw_providers::create_model_provider_from_ref(config, &provider_ref)?;
+    let model_name = resolved_entry
+        .and_then(|entry| entry.model.as_deref())
+        .unwrap_or("default")
+        .to_string();
+    Ok((model_provider, model_name))
+}
+
 #[cfg(feature = "agent-runtime")]
 fn handle_estop_command(
     config: &Config,
@@ -7314,25 +7378,13 @@ async fn run_inline_provider_auth(auth: InlineProviderAuth, config: &mut Config)
 
 #[cfg(feature = "agent-runtime")]
 async fn run_anthropic_setup_token_inline(alias: &str, config: &mut Config) -> Result<()> {
-    let status = tokio::process::Command::new("claude")
-        .arg("setup-token")
-        .status()
-        .await
-        .context("failed to run `claude setup-token`; is the Claude CLI installed and on PATH?")?;
-    if !status.success() {
-        bail!("`claude setup-token` exited with status {status}");
-    }
+    let Some(token) = collect_anthropic_setup_token_inline(alias).await? else {
+        return Ok(());
+    };
 
-    let token = read_auth_input(&t(
-        "cli-quickstart-auth-anthropic-token-prompt",
-        "Paste the token from `claude setup-token`",
-    ))?;
-    if token.trim().is_empty() {
-        bail!("Token cannot be empty");
-    }
-
-    let path = format!("providers.models.anthropic.{alias}.api_key");
-    config.set_prop_persistent(&path, token.trim())?;
+    zeroclaw_runtime::quickstart::store_anthropic_setup_token(config, alias, &token).await?;
+    let path = format!("providers.models.anthropic.{alias}.auth_mode");
+    config.set_prop_persistent(&path, "oauth")?;
     Box::pin(config.save_dirty()).await?;
     println!(
         "{}",
@@ -7343,6 +7395,77 @@ async fn run_anthropic_setup_token_inline(alias: &str, config: &mut Config) -> R
         )
     );
     Ok(())
+}
+
+#[cfg(feature = "agent-runtime")]
+async fn collect_anthropic_setup_token_inline(alias: &str) -> Result<Option<String>> {
+    use dialoguer::Confirm;
+
+    let prompt = ta(
+        "cli-quickstart-auth-anthropic-prompt",
+        &[("alias", alias)],
+        "Run `claude setup-token` for this Anthropic provider now?",
+    );
+    let skip_hint = ta(
+        "cli-quickstart-auth-anthropic-skip-hint",
+        &[("alias", alias)],
+        "  Finish later with: claude setup-token",
+    );
+    let approved = Confirm::new()
+        .with_prompt(prompt)
+        .default(true)
+        .interact()
+        .unwrap_or(false);
+    if !approved {
+        println!("{skip_hint}");
+    }
+
+    collect_anthropic_setup_token_from_actions(
+        approved,
+        || async {
+            tokio::process::Command::new("claude")
+                .arg("setup-token")
+                .status()
+                .await
+                .context(
+                    "failed to run `claude setup-token`; is the Claude CLI installed and on PATH?",
+                )
+        },
+        || {
+            read_auth_input(&t(
+                "cli-quickstart-auth-anthropic-token-prompt",
+                "Paste the token from `claude setup-token`",
+            ))
+        },
+    )
+    .await
+}
+
+async fn collect_anthropic_setup_token_from_actions<Run, RunFuture, Read>(
+    approved: bool,
+    run_setup_token: Run,
+    read_token: Read,
+) -> Result<Option<String>>
+where
+    Run: FnOnce() -> RunFuture,
+    RunFuture: std::future::Future<Output = Result<std::process::ExitStatus>>,
+    Read: FnOnce() -> Result<String>,
+{
+    if !approved {
+        return Ok(None);
+    }
+
+    let status = run_setup_token().await?;
+    if !status.success() {
+        bail!("`claude setup-token` exited with status {status}");
+    }
+
+    let token = read_token()?;
+    if token.trim().is_empty() {
+        bail!("Token cannot be empty");
+    }
+
+    Ok(Some(token))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -8029,7 +8152,7 @@ async fn run_gateway_if_enabled(
     // manually" message, None for tui_registry (no TUI socket), and None
     // for canvas_store so the gateway falls back to its own default.
     let result = Box::pin(gateway::run_gateway(
-        host, port, config, tx, None, None, None, None, None, None,
+        host, port, config, tx, None, None, None, None, None, None, None,
     ))
     .await;
     // Self-respawn after the listener is released, if an in-app upgrade
@@ -8450,6 +8573,35 @@ mod tests {
         );
 
         assert_eq!(quickstart_inline_auth("openai", "api", &fields), None);
+    }
+
+    #[tokio::test]
+    async fn anthropic_setup_token_collection_decline_does_not_run_or_read() {
+        let result = collect_anthropic_setup_token_from_actions(
+            false,
+            || async { anyhow::bail!("setup-token command must not run after decline") },
+            || anyhow::bail!("token prompt must not run after decline"),
+        )
+        .await
+        .expect("declining setup-token collection must be a clean no-op");
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn anthropic_setup_token_collection_rejects_blank_token() {
+        let error = collect_anthropic_setup_token_from_actions(
+            true,
+            || async {
+                tokio::process::Command::new("true")
+                    .status()
+                    .await
+                    .context("run test setup-token command")
+            },
+            || Ok("  \n".to_string()),
+        )
+        .await
+        .expect_err("blank setup tokens must be rejected before Quickstart applies");
+        assert!(error.to_string().contains("Token cannot be empty"));
     }
 
     #[test]
@@ -9813,6 +9965,7 @@ mod tests {
                     model: Some("claude-opus-4-7".to_string()),
                     ..Default::default()
                 },
+                auth_mode: None,
             },
         );
 
@@ -9868,5 +10021,54 @@ mod tests {
             msg.contains("No model provider configured"),
             "error must mention missing provider; got: {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn kernel_agent_provider_construction_resolves_anthropic_oauth_alias() {
+        use crate::config::schema::{
+            AliasedAgentConfig, AnthropicModelProviderConfig, AuthMode, ModelProviderConfig,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("workspace"),
+            ..Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        config.providers.models.anthropic.insert(
+            "subscription".to_string(),
+            AnthropicModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("claude-sonnet-4-5".to_string()),
+                    ..Default::default()
+                },
+                auth_mode: Some(AuthMode::OAuth),
+            },
+        );
+        config.agents.insert(
+            "reviewer".to_string(),
+            AliasedAgentConfig {
+                model_provider: "anthropic.subscription".into(),
+                ..Default::default()
+            },
+        );
+        zeroclaw_providers::auth::AuthService::from_config(&config)
+            .store_model_provider_token(
+                "anthropic",
+                "subscription",
+                "synthetic-setup-token",
+                std::collections::HashMap::from([(
+                    "auth_kind".to_string(),
+                    "authorization".to_string(),
+                )]),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let (_provider, model) = resolve_kernel_agent_model_provider(&config, "reviewer")
+            .expect("kernel CLI must construct the OAuth-bound alias");
+        assert_eq!(model, "claude-sonnet-4-5");
     }
 }

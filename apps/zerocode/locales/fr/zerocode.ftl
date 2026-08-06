@@ -331,6 +331,7 @@ zc-quickstart-status-created = `{ $alias }` créé. Rechargement du daemon — l
 zc-quickstart-status-errors = { $count } erreur(s) — corrigez les sélecteurs et resoumettez
 zc-quickstart-status-first-error = { $where }{ $field } : { $message }{ $more }
 zc-quickstart-status-more-errors = { " " }(+{ $count } de plus)
+zc-quickstart-status-more-warnings = { " " }(+{ $count } avertissement(s) de plus)
 zc-quickstart-status-can-create = Tous les sélecteurs requis ✓. Appuyez sur `{ $chord }` pour Créer.
 zc-quickstart-status-hint = ↑/↓ pour se déplacer, Entrée pour ouvrir. `{ $chord }` s'active lorsque tous les sélecteurs requis sont ✓.
 zc-quickstart-missing-model-provider = Choisissez un fournisseur de modèle avant de créer.

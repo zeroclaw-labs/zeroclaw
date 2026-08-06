@@ -3673,6 +3673,7 @@ mod tests {
                 uri: Some("https://api.default.example/v1/messages".into()),
                 ..ModelProviderConfig::default()
             },
+            auth_mode: None,
         };
         let work_alias = AnthropicModelProviderConfig {
             base: ModelProviderConfig {
@@ -3681,6 +3682,7 @@ mod tests {
                 uri: Some("https://work-proxy.example/v1/v1/anthropic/messages".into()),
                 ..ModelProviderConfig::default()
             },
+            auth_mode: None,
         };
         config
             .providers

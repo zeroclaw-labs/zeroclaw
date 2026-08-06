@@ -1005,7 +1005,43 @@ impl FamilyProviderFactory for AnthropicModelProviderConfig {
         api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        let mut b = crate::anthropic::AnthropicModelProvider::builder(alias).credential(key);
+        let oauth = self.auth_mode == Some(AuthMode::OAuth);
+        if oauth && has_api_key(key) {
+            anyhow::bail!(
+                "providers.models.anthropic.{alias}: auth_mode = \"oauth\" must not be combined with api_key"
+            );
+        }
+        if oauth
+            && api_url.is_some_and(|url| {
+                reqwest::Url::parse(url)
+                    .map(|parsed| {
+                        parsed.scheme() != "https"
+                            || parsed.host_str() != Some("api.anthropic.com")
+                            || parsed.port().is_some()
+                    })
+                    .unwrap_or(true)
+            })
+        {
+            anyhow::bail!(
+                "providers.models.anthropic.{alias}: auth_mode = \"oauth\" requires the official https://api.anthropic.com endpoint"
+            );
+        }
+
+        let mut b = crate::anthropic::AnthropicModelProvider::builder(alias);
+        if oauth {
+            let state_dir = opts.zeroclaw_dir.clone().unwrap_or_else(|| {
+                directories::UserDirs::new().map_or_else(
+                    || std::path::PathBuf::from(".zeroclaw"),
+                    |dirs| dirs.home_dir().join(".zeroclaw"),
+                )
+            });
+            b = b.auth_profile(crate::auth::AuthService::new(
+                &state_dir,
+                opts.secrets_encrypt,
+            ));
+        } else {
+            b = b.credential(key);
+        }
         if let Some(url) = api_url {
             b = b.base_url(url);
         }
@@ -1016,6 +1052,10 @@ impl FamilyProviderFactory for AnthropicModelProviderConfig {
             b = b.timeout_secs(ts);
         }
         Ok(Box::new(b.build()))
+    }
+
+    fn fallback_auth_ready(&self, key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
+        self.auth_mode == Some(AuthMode::OAuth) || has_api_key(key)
     }
 }
 
