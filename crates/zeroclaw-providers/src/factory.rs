@@ -1736,9 +1736,11 @@ mod tests {
         assert_eq!(
             ZerorouterEndpoint::default().uri(),
             "http://localhost:8080/v1"
+        );
+    }
 
     #[test]
-fn merge_extra_body_nests_chat_template_kwargs_under_own_key() {
+    fn merge_extra_body_nests_chat_template_kwargs_under_own_key() {
         let kwargs = serde_json::json!({"thinking": true, "reasoning_effort": "max"});
         let merged = merge_extra_body(None, Some(&kwargs))
             .expect("chat_template_kwargs alone must produce an extra_body object");
