@@ -17,6 +17,14 @@ static TOOL_DESCRIPTION: OnceLock<String> = OnceLock::new();
 pub struct FileDownloadTool {
     security: Arc<SecurityPolicy>,
     config: FileDownloadConfig,
+    /// Resolves `allowed_private_hosts` from the canonical config at use time.
+    /// Wired to the live `Config` handle by the channel daemon so an operator
+    /// removing an internal CDN entry through `config/set` takes effect on the
+    /// next dispatch; one-shot callers fall back to the construction-time
+    /// snapshot. Mirrors the `image_gen` allowlist resolver seam, so the tool
+    /// never retains a stale policy copy per the single-source-of-truth rule
+    /// (AGENTS.md).
+    allowed_private_hosts_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     /// Whether the downloaded file persists on the host filesystem. `false` on
     /// an ephemeral runtime (Docker tmpfs / no volume mount), where the file is
     /// written inside the container but invisible on the host and discarded at
@@ -35,17 +43,45 @@ impl FileDownloadTool {
     /// runtime adapter's `has_filesystem_access()`. Mirrors
     /// [`super::file_write::FileWriteTool::new_with_persistence`].
     ///
-    /// `allowed_private_hosts` lives on `config` and is normalized on demand
-    /// by [`normalize_allowed_private_hosts`] per dispatch — the canonical
-    /// state is the config field.
+    /// `allowed_private_hosts` is resolved from the construction-time `config`
+    /// snapshot on each dispatch by [`normalize_allowed_private_hosts`]. The
+    /// channel daemon instead wires the live config handle via
+    /// [`Self::new_with_persistence_and_resolver`].
     pub fn new_with_persistence(
         security: Arc<SecurityPolicy>,
         config: FileDownloadConfig,
         persistent_writes: bool,
     ) -> Self {
+        let snapshot = config.allowed_private_hosts.clone();
         Self {
             security,
             config,
+            allowed_private_hosts_resolver: Arc::new(move || snapshot.clone()),
+            persistent_writes,
+        }
+    }
+
+    /// Construct with a resolver closure that reads `allowed_private_hosts`
+    /// from the canonical config at use time. The resolver is called on each
+    /// dispatch and its result normalized via [`normalize_allowed_private_hosts`],
+    /// so a live `config/set` that adds or removes an internal CDN entry takes
+    /// effect on the next call instead of the construction-time snapshot.
+    ///
+    /// The tool therefore never holds a second policy copy that can go stale,
+    /// per the repository's single-source-of-truth rule (AGENTS.md).
+    pub fn new_with_persistence_and_resolver<F>(
+        security: Arc<SecurityPolicy>,
+        config: FileDownloadConfig,
+        persistent_writes: bool,
+        allowed_private_hosts_resolver: F,
+    ) -> Self
+    where
+        F: Fn() -> Vec<String> + Send + Sync + 'static,
+    {
+        Self {
+            security,
+            config,
+            allowed_private_hosts_resolver: Arc::new(allowed_private_hosts_resolver),
             persistent_writes,
         }
     }
@@ -74,7 +110,7 @@ impl FileDownloadTool {
     ) -> Result<(String, Vec<std::net::SocketAddr>), String> {
         let (transport_host, policy_host, port) = parse_endpoint_url(raw_url)?;
         let resolved_addrs = resolve_endpoint_ips(&policy_host, port).await?;
-        let allowed = normalize_allowed_private_hosts(&self.config.allowed_private_hosts);
+        let allowed = normalize_allowed_private_hosts(&(self.allowed_private_hosts_resolver)());
         ssrf_check_endpoint(&policy_host, &resolved_addrs, &allowed)?;
         // Return transport_host for resolve_to_addrs binding — this preserves
         // the exact hostname spelling (including trailing dot) that reqwest
@@ -2291,6 +2327,65 @@ mod tests {
                 || err.contains("link-local"),
             "the malformed allowlist entry must fail closed and reject the loopback endpoint; \
              got: {err}"
+        );
+    }
+
+    /// Pins the live-config wiring: the allowlist resolver reads the canonical
+    /// `Config.file_download.allowed_private_hosts` at use time, so removing an
+    /// entry through a live `config/set` (no tool rebuild) must reject the same
+    /// URL on the next dispatch. Reverting this PR's `live_config` threading
+    /// (snapshot-only resolver) fails this test: the construction snapshot
+    /// would keep admitting the removed entry.
+    #[tokio::test]
+    async fn live_allowlist_resolver_reflects_config_mutation() {
+        use parking_lot::RwLock;
+
+        let tmp = TempDir::new().unwrap();
+        let live = Arc::new(RwLock::new(zeroclaw_config::schema::Config {
+            file_download: FileDownloadConfig {
+                url: Some("http://127.0.0.1:1/x".into()),
+                allowed_private_hosts: vec!["127.0.0.1".into()],
+                ..FileDownloadConfig::default()
+            },
+            ..zeroclaw_config::schema::Config::default()
+        }));
+
+        let resolver_live = Arc::clone(&live);
+        let tool = FileDownloadTool::new_with_persistence_and_resolver(
+            test_security(tmp.path().to_path_buf(), AutonomyLevel::Full),
+            FileDownloadConfig {
+                url: Some("http://127.0.0.1:1/x".into()),
+                allowed_private_hosts: vec!["127.0.0.1".into()],
+                ..FileDownloadConfig::default()
+            },
+            true,
+            move || {
+                resolver_live
+                    .read()
+                    .file_download
+                    .allowed_private_hosts
+                    .clone()
+            },
+        );
+
+        // Side 1: allowlist admits the loopback endpoint.
+        tool.validate_endpoint_host("http://127.0.0.1:1/x")
+            .await
+            .expect("live allowlist containing 127.0.0.1 must admit the endpoint");
+
+        // Side 2: operator removes the entry via live config — no rebuild.
+        live.write().file_download.allowed_private_hosts.clear();
+        let err = tool
+            .validate_endpoint_host("http://127.0.0.1:1/x")
+            .await
+            .unwrap_err()
+            .to_lowercase();
+        assert!(
+            err.contains("private")
+                || err.contains("non-global")
+                || err.contains("loopback")
+                || err.contains("link-local"),
+            "after the live config drops the entry the same URL must be rejected; got: {err}"
         );
     }
 }
