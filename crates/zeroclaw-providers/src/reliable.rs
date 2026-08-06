@@ -5607,11 +5607,15 @@ mod tests {
         // child so `capabilities_for_model` resolves per-model vision from the
         // catalog; without delegation this returns the family default.
         use crate::compatible::{AuthStyle, OpenAiCompatibleModelProvider};
-        use crate::models_dev::{CACHED_CATALOG, parse_catalog};
+        use crate::models_dev::{__private_test_catalog_lock, CACHED_CATALOG, parse_catalog};
 
         // Same provider key as the compatible.rs catalog-injection test so the
         // process-wide OnceCell resolves identically regardless of which test
-        // runs first (only the first set() wins).
+        // runs first (only the first set() wins). Serialize with the models_dev
+        // lifecycle tests, which seed the same global with TINY_CATALOG; a
+        // racing seed would make this set() fail silently and the lookup below
+        // return None.
+        let _catalog_guard = __private_test_catalog_lock().await;
         let catalog_json = br#"{
             "mock-compatible": {
                 "models": {
