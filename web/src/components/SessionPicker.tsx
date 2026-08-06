@@ -188,11 +188,16 @@ export function SessionPicker({ agentAlias }: { agentAlias: string }) {
   }, [startNewSession, closeMenu]);
 
   const handleSelect = useCallback((id: string) => {
+    // Exclusive ownership is enforced here, not only by the row's `disabled`
+    // attribute: styling is one refactor away from being lost, and taking a
+    // conversation a sibling pane is live on would put two sockets on one
+    // gateway session.
+    if (reserved.has(id)) return;
     // Selecting the row already on screen is still a completed picker action.
     // goToSession correctly reports false for that no-op, but the menu should
     // dismiss just as it does after selecting a different conversation.
     if (id === sessionId || goToSession(id)) closeMenu();
-  }, [sessionId, goToSession, closeMenu]);
+  }, [reserved, sessionId, goToSession, closeMenu]);
 
   const commitRename = useCallback(async (id: string) => {
     const name = renameDraft.trim();
@@ -213,6 +218,10 @@ export function SessionPicker({ agentAlias }: { agentAlias: string }) {
   }, [renameDraft, renameConversation, resetRowActions, load]);
 
   const handleDelete = useCallback(async (id: string) => {
+    // Deleting a conversation a sibling pane is live on would leave that pane
+    // streaming into a session the gateway no longer has. Same reasoning as
+    // handleSelect: the guard belongs in the action, not just the affordance.
+    if (reserved.has(id)) return;
     try {
       // Tolerates "nothing stored"; rejects only on a real failure, where the
       // transcript survives on the server and the row must not vanish as if it
@@ -224,7 +233,7 @@ export function SessionPicker({ agentAlias }: { agentAlias: string }) {
     }
     resetRowActions();
     await load();
-  }, [removeSession, resetRowActions, load]);
+  }, [reserved, removeSession, resetRowActions, load]);
 
   const activeRow = rows.find((row) => row.id === sessionId);
   const activeLabel = activeRow

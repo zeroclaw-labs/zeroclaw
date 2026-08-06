@@ -3,41 +3,16 @@ import { AgentProvider } from '@/contexts/AgentContext';
 import { AgentChatInner, type AgentChatStatus } from '@/pages/AgentChat';
 import { ChatTabBar, type TabIndicator, type WorkspaceLayout } from '@/components/ChatTabBar';
 import { basePath } from '@/lib/basePath';
-import { getActiveSessionId, newSessionId } from '@/lib/chatSessions';
-import { generateUUID } from '@/lib/uuid';
-
-const STORAGE_KEY = 'zeroclaw-chat-workspace';
-
-/**
- * One open pane.
- *
- * `key`, not the alias, is the tab's identity — that is what lets an agent be
- * open more than once. It is minted when the tab opens and never changes, so
- * switching the conversation inside a pane does not alter the React key and
- * therefore does not remount the provider and drop its WebSocket.
- */
-export interface ChatTab {
-  key: string;
-  alias: string;
-  /** Conversation this pane is showing; updated when the pane switches. */
-  sessionId: string;
-}
-
-interface PersistedState {
-  version: 2;
-  tabs: ChatTab[];
-  activeKey: string;
-  layout: WorkspaceLayout;
-  splitKeys: [string, string | null];
-}
-
-/** Pre-multi-tab shape, when a tab was just an alias. */
-interface PersistedStateV1 {
-  openChats?: string[];
-  activeAlias?: string;
-  layout?: WorkspaceLayout;
-  splitAliases?: [string, string | null];
-}
+import {
+  applySessionChange,
+  loadPersisted,
+  makeTab,
+  reservationsByKey,
+  STORAGE_KEY,
+  tabForOpenRequest,
+  type ChatTab,
+  type PersistedState,
+} from '@/pages/chatWorkspace.state';
 
 interface PaneStatus {
   /** Last message count the workspace has "seen" while this alias was visible. */
@@ -48,77 +23,6 @@ interface PaneStatus {
   streaming: boolean;
   /** New messages arrived while this alias was hidden. */
   unread: boolean;
-}
-
-/** Build a tab for `alias`, resuming its last conversation unless one is given. */
-function makeTab(alias: string, sessionId?: string): ChatTab {
-  return { key: generateUUID(), alias, sessionId: sessionId ?? getActiveSessionId(alias) };
-}
-
-/**
- * Guarantee no two panes claim the same conversation.
- *
- * Live panes cannot reach that state — the picker refuses it — but a workspace
- * stored by an earlier build could, and restoring it would put two sockets on
- * one gateway session. The later pane is moved to a fresh conversation instead.
- */
-function withDistinctSessions(tabs: ChatTab[]): ChatTab[] {
-  const claimed = new Set<string>();
-  return tabs.map((tb) => {
-    if (!claimed.has(tb.sessionId)) {
-      claimed.add(tb.sessionId);
-      return tb;
-    }
-    const sessionId = newSessionId();
-    claimed.add(sessionId);
-    return { ...tb, sessionId };
-  });
-}
-
-/**
- * Read the stored workspace, upgrading the pre-multi-tab shape.
- *
- * A v1 entry listed bare aliases, so each becomes one tab resuming that alias's
- * last conversation — the layout an operator had before the upgrade.
- */
-function loadPersisted(): Partial<PersistedState> {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return {};
-    const parsed = JSON.parse(raw) as unknown;
-    if (!parsed || typeof parsed !== 'object') return {};
-
-    const candidate = parsed as Partial<PersistedState> & PersistedStateV1;
-    if (Array.isArray(candidate.tabs)) {
-      // Drop anything malformed rather than rendering a pane with no alias.
-      const tabs = candidate.tabs.filter(
-        (tb): tb is ChatTab =>
-          !!tb && typeof tb.key === 'string' && typeof tb.alias === 'string' && typeof tb.sessionId === 'string',
-      );
-      if (!tabs.length) return { layout: candidate.layout };
-      return {
-        tabs: withDistinctSessions(tabs),
-        activeKey: candidate.activeKey,
-        layout: candidate.layout,
-        splitKeys: candidate.splitKeys,
-      };
-    }
-
-    const aliases = Array.from(new Set((candidate.openChats ?? []).filter(Boolean)));
-    if (!aliases.length) return { layout: candidate.layout };
-    const tabs = aliases.map((alias) => makeTab(alias));
-    const active = tabs.find((tb) => tb.alias === candidate.activeAlias) ?? tabs[0];
-    const splitLeft = tabs.find((tb) => tb.alias === candidate.splitAliases?.[0]) ?? active;
-    const splitRight = tabs.find((tb) => tb.alias === candidate.splitAliases?.[1]);
-    return {
-      tabs,
-      activeKey: active?.key,
-      layout: candidate.layout,
-      splitKeys: [splitLeft?.key ?? '', splitRight?.key ?? null],
-    };
-  } catch {
-    return {};
-  }
 }
 
 export interface ChatWorkspaceProps {
@@ -300,9 +204,7 @@ export default function ChatWorkspace({ initialAlias }: ChatWorkspaceProps) {
 
   /** Record the conversation a pane moved to, so a reload restores it there. */
   const handleSessionChange = useCallback((key: string, sessionId: string) => {
-    setTabs((prev) =>
-      prev.map((tb) => (tb.key === key && tb.sessionId !== sessionId ? { ...tb, sessionId } : tb)),
-    );
+    setTabs((prev) => applySessionChange(prev, key, sessionId));
   }, []);
 
   /**
@@ -317,13 +219,7 @@ export default function ChatWorkspace({ initialAlias }: ChatWorkspaceProps) {
    * that owns it. The identity array is cached so a pane's props stay stable
    * between renders that did not change its siblings.
    */
-  const reservedByKey = useMemo(() => {
-    const byKey: Record<string, string[]> = {};
-    for (const tb of tabs) {
-      byKey[tb.key] = tabs.filter((other) => other.key !== tb.key).map((other) => other.sessionId);
-    }
-    return byKey;
-  }, [tabs]);
+  const reservedByKey = useMemo(() => reservationsByKey(tabs), [tabs]);
 
   // Cached per tab so each pane gets a stable callback identity, matching the
   // reason onStatusFor is cached.
@@ -366,8 +262,7 @@ export default function ChatWorkspace({ initialAlias }: ChatWorkspaceProps) {
   // Mint the tab outside the updater: React double-invokes updaters in
   // StrictMode, which would generate two keys and activate the discarded one.
   const openChat = useCallback((alias: string) => {
-    const alreadyOpen = tabsRef.current.some((tb) => tb.alias === alias);
-    const tab = makeTab(alias, alreadyOpen ? newSessionId() : undefined);
+    const tab = tabForOpenRequest(tabsRef.current, alias);
     setTabs((prev) => [...prev, tab]);
     setActiveKey(tab.key);
   }, []);
