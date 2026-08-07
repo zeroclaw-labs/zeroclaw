@@ -1215,6 +1215,60 @@ fn is_allowlist_entry_match(allowed: &str, executable: &str, executable_base: &s
     command_names_equivalent(allowed, executable_base)
 }
 
+/// Detect an unquoted brace-expansion or glob metacharacter (`{`, `*`, `?`, `[`)
+/// that a POSIX shell expands but a plain word tokenizer (shlex) leaves literal.
+///
+/// This is the gap the risk classifier must fail closed on: `shlex::split`
+/// models quoting, but it does NOT perform brace or pathname expansion, so its
+/// token stream can differ from the argument vector the shell actually runs.
+/// For example bash expands `git -C {.,commit}` to `git -C . commit`, promoting
+/// `commit` into the subcommand position — a write the shlex tokens never show.
+/// Quoting and escaping suppress expansion in the shell, so a quoted (`'*.rs'`)
+/// or escaped (`\{`) metacharacter is deliberately ignored here to match it.
+fn contains_unquoted_expansion_metachar(command: &str) -> bool {
+    let mut quote = QuoteState::None;
+    let mut escaped = false;
+
+    for ch in command.chars() {
+        match quote {
+            QuoteState::Single => {
+                if ch == '\'' {
+                    quote = QuoteState::None;
+                }
+            }
+            QuoteState::Double => {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                if ch == '\\' {
+                    escaped = true;
+                    continue;
+                }
+                if ch == '"' {
+                    quote = QuoteState::None;
+                }
+                // Brace/glob metacharacters are literal inside double quotes.
+            }
+            QuoteState::None => {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                match ch {
+                    '\\' => escaped = true,
+                    '\'' => quote = QuoteState::Single,
+                    '"' => quote = QuoteState::Double,
+                    '{' | '*' | '?' | '[' => return true,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    false
+}
+
 impl SecurityPolicy {
     // ── Risk Classification ──────────────────────────────────────────────
     // Risk is assessed per-segment (split on shell operators), and the
@@ -1222,6 +1276,100 @@ impl SecurityPolicy {
     // `ls && rm -rf /` from being classified as Low just because `ls` is safe.
 
     /// Classify command risk. Any high-risk segment marks the whole command high.
+    /// Resolve the real `git` subcommand, skipping leading global options:
+    /// `-C <path>`, `-c <cfg>`, `--git-dir[=]<p>`, `--work-tree[=]<p>`,
+    /// `--namespace <n>`, `--super-prefix <p>`, `--config-env <n>`,
+    /// `--exec-path[=<p>]`, the `--opt=value` glued form, and value-less flags
+    /// (`-p`/`--paginate`/`--no-pager`/`--bare`/…).
+    ///
+    /// Agents have no `cd`, so they address repositories with
+    /// `git -C <path> <verb>`. Reading the verb as `args.first()` then returns
+    /// the global option instead of the subcommand, which misclassifies
+    /// write-git as Low and lets it skip the medium-risk approval gate.
+    fn git_subcommand(args: &[String]) -> Option<&str> {
+        // Options that consume the NEXT token as a value (space-separated form).
+        // `-C` folds to `-c` under the case-insensitive check below; both take
+        // a value, so either way the value token is skipped.
+        const TAKES_VALUE: &[&str] = &[
+            "-c",
+            "--git-dir",
+            "--work-tree",
+            "--namespace",
+            "--super-prefix",
+            "--config-env",
+            "--exec-path",
+        ];
+        let mut i = 0;
+        while i < args.len() {
+            let a = args[i].as_str();
+            if !a.starts_with('-') {
+                return Some(a); // first non-option token is the subcommand
+            }
+            if a.contains('=') {
+                i += 1; // `--opt=value` / `-C=...` glued form consumes nothing extra
+                continue;
+            }
+            if TAKES_VALUE.contains(&a.to_ascii_lowercase().as_str()) {
+                i += 2; // skip the option and its value
+                continue;
+            }
+            i += 1; // value-less flag
+        }
+        None
+    }
+
+    /// Shell-aware Medium-risk classification of a single `git` command segment.
+    ///
+    /// `command_risk_level` word-splits each segment on whitespace, which
+    /// fragments a quoted or escaped global-option value: `git -C "/repo with
+    /// spaces" commit` naively tokenizes to `-C`, `"/repo`, `with`, `spaces"`,
+    /// `commit`, so `git_subcommand` reads `with` as the verb and misses the
+    /// real `commit` — letting a write skip the medium-risk approval gate.
+    /// Re-tokenize the segment with shell quoting rules so the value stays a
+    /// single token and the subcommand the shell would actually run is
+    /// resolved. A segment that cannot be tokenized (unbalanced quotes) is
+    /// treated conservatively as a write, so a malformed command can never slip
+    /// under the gate.
+    ///
+    /// `shlex` models quoting but NOT brace or pathname expansion, so its tokens
+    /// can differ from the shell's real argument vector: bash expands `git -C
+    /// {.,commit}` to `git -C . commit`, injecting a write verb the tokens never
+    /// show. When the segment carries any unquoted expansion metacharacter we
+    /// cannot certify the resolved subcommand, so we fail closed to a write
+    /// (Medium). Quoted/escaped metacharacters are not expanded and stay Low.
+    fn git_segment_is_write(segment: &str) -> bool {
+        if contains_unquoted_expansion_metachar(segment) {
+            return true; // unmodeled shell expansion → effective verb unknown → Medium
+        }
+        let Some(tokens) = shlex::split(segment) else {
+            return true; // ambiguous parse → conservative Medium
+        };
+        // tokens[0] is the `git` executable; classify the verb the shell would
+        // run, past any leading global options.
+        let args: Vec<String> = tokens
+            .into_iter()
+            .skip(1)
+            .map(|t| t.to_ascii_lowercase())
+            .collect();
+        Self::git_subcommand(&args).is_some_and(|verb| {
+            matches!(
+                verb,
+                "commit"
+                    | "push"
+                    | "reset"
+                    | "clean"
+                    | "rebase"
+                    | "merge"
+                    | "cherry-pick"
+                    | "revert"
+                    | "branch"
+                    | "checkout"
+                    | "switch"
+                    | "tag"
+            )
+        })
+    }
+
     pub fn command_risk_level(&self, command: &str) -> CommandRiskLevel {
         let mut saw_medium = false;
 
@@ -1300,23 +1448,7 @@ impl SecurityPolicy {
 
             // Medium-risk commands (state-changing, but not inherently destructive)
             let medium = match base {
-                "git" => args.first().is_some_and(|verb| {
-                    matches!(
-                        verb.as_str(),
-                        "commit"
-                            | "push"
-                            | "reset"
-                            | "clean"
-                            | "rebase"
-                            | "merge"
-                            | "cherry-pick"
-                            | "revert"
-                            | "branch"
-                            | "checkout"
-                            | "switch"
-                            | "tag"
-                    )
-                }),
+                "git" => Self::git_segment_is_write(cmd_part),
                 "npm" | "pnpm" | "yarn" => args.first().is_some_and(|verb| {
                     matches!(
                         verb.as_str(),
@@ -2997,6 +3129,147 @@ mod tests {
         assert_eq!(
             p.command_risk_level("touch file.txt"),
             CommandRiskLevel::Medium
+        );
+    }
+
+    #[test]
+    fn command_risk_medium_for_write_git_behind_global_options() {
+        // Regression: agents address repos via `git -C <path> <verb>`
+        // (no `cd`), so the verb must be resolved past leading global options.
+        // Otherwise write-git slips from Medium to Low and skips the approval gate.
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+        for cmd in [
+            "git -C /repo commit -m x",
+            "git -C /repo push",
+            "git --git-dir=/r/.git push",
+            "git --git-dir /r/.git reset --hard HEAD~1",
+            "git --no-pager -C /repo branch -D dev",
+        ] {
+            assert_eq!(
+                p.command_risk_level(cmd),
+                CommandRiskLevel::Medium,
+                "write-git behind global options must stay Medium: {cmd}"
+            );
+        }
+        // Read-git behind the same global options stays Low.
+        assert_eq!(
+            p.command_risk_level("git -C /repo status"),
+            CommandRiskLevel::Low
+        );
+    }
+
+    #[test]
+    fn git_subcommand_skips_global_options() {
+        let v = |s: &str| {
+            let args: Vec<String> = s
+                .split_whitespace()
+                .map(|w| w.to_ascii_lowercase())
+                .collect();
+            SecurityPolicy::git_subcommand(&args).map(str::to_string)
+        };
+        assert_eq!(v("commit -m x").as_deref(), Some("commit"));
+        assert_eq!(v("-C /repo commit").as_deref(), Some("commit"));
+        assert_eq!(v("--git-dir=/r/.git push").as_deref(), Some("push"));
+        assert_eq!(v("--git-dir /r/.git push").as_deref(), Some("push"));
+        assert_eq!(v("-c user.name=x status").as_deref(), Some("status"));
+        assert_eq!(v("--no-pager -C /repo log").as_deref(), Some("log"));
+        assert_eq!(v("-C /repo").as_deref(), None); // options only, no subcommand
+        assert_eq!(v("").as_deref(), None);
+    }
+
+    #[test]
+    fn quoted_path_write_git_is_gated_at_the_enforcement_boundary() {
+        // The write verb hides behind a quoted (or escaped) `-C` / `--git-dir`
+        // value that naive whitespace splitting fragments. Drive the real
+        // approval decision through `validate_command_execution`, not just
+        // helper tokens: an unapproved quoted-path write must be REJECTED, the
+        // approved form must classify Medium, and the matching quoted-path read
+        // must stay Low and need no approval. This proves the classifier is
+        // wired to the enforcement boundary.
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into()],
+            // Preconditions the medium gate depends on (also the defaults):
+            autonomy: AutonomyLevel::Supervised,
+            require_approval_for_medium_risk: true,
+            ..SecurityPolicy::default()
+        };
+
+        for write in [
+            r#"git -C "/repo with spaces" commit -m x"#,
+            r"git -C /repo\ with\ spaces commit",
+            r#"git --git-dir "/r with spaces/.git" push"#,
+        ] {
+            assert!(
+                p.validate_command_execution(write, false).is_err(),
+                "unapproved quoted/escaped-path write-git must be rejected: {write}"
+            );
+            assert_eq!(
+                p.validate_command_execution(write, true),
+                Ok(CommandRiskLevel::Medium),
+                "approved quoted/escaped-path write-git must classify Medium: {write}"
+            );
+        }
+
+        // The corresponding quoted-path read stays Low and needs no approval.
+        assert_eq!(
+            p.validate_command_execution(r#"git -C "/repo with spaces" status"#, false),
+            Ok(CommandRiskLevel::Low),
+            "quoted-path read-git must remain Low"
+        );
+    }
+
+    #[test]
+    fn shell_expansion_write_git_is_gated_at_the_enforcement_boundary() {
+        // `shlex::split` models quoting but not brace/glob expansion, so the shell
+        // can run a different argument vector than the tokens show: bash expands
+        // `git -C {.,commit}` to `git -C . commit`, promoting `commit` into the
+        // subcommand slot. The classifier must fail closed on any unmodeled
+        // unquoted expansion so this write cannot skip the medium-risk gate.
+        // Drive the real approval decision through `validate_command_execution`.
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into()],
+            autonomy: AutonomyLevel::Supervised,
+            require_approval_for_medium_risk: true,
+            ..SecurityPolicy::default()
+        };
+
+        for expand in [
+            "git -C {.,commit}",  // brace expands to `git -C . commit`
+            "git {log,commit}",   // brace expands to inject `commit`
+            "git -C {.,push} -f", // brace expands to `git -C . push -f`
+        ] {
+            assert!(
+                p.validate_command_execution(expand, false).is_err(),
+                "unapproved shell-expansion write-git must be rejected: {expand}"
+            );
+            assert_eq!(
+                p.validate_command_execution(expand, true),
+                Ok(CommandRiskLevel::Medium),
+                "approved shell-expansion write-git must classify Medium: {expand}"
+            );
+        }
+
+        // At the classifier level, any unquoted brace/glob makes the effective
+        // verb unknowable, so even a read-looking segment fails closed to Medium
+        // — a glob can shift the pre-verb region (`git -C * commit`) exactly like
+        // a brace does.
+        for expand in ["git -C * commit", "git log -- *.rs", "git ??? status"] {
+            assert_eq!(
+                p.command_risk_level(expand),
+                CommandRiskLevel::Medium,
+                "unquoted shell expansion in a git segment must classify Medium: {expand}"
+            );
+        }
+
+        // Quoting suppresses expansion in the shell, so a quoted glob in a read
+        // pathspec is not treated as an injection and stays Low.
+        assert_eq!(
+            p.validate_command_execution(r#"git log --oneline -- "*.rs""#, false),
+            Ok(CommandRiskLevel::Low),
+            "quoted read-git pathspec glob must remain Low"
         );
     }
 
