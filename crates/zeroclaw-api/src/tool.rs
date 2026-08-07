@@ -345,6 +345,13 @@ pub trait Tool: Send + Sync + crate::attribution::Attributable {
     /// Execute the tool with given arguments
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult>;
 
+    /// Assemble this tool's spec. The default recomposes it from
+    /// `parameters_schema()` and allocates a fresh `Arc` per call, so tools
+    /// with large stored schemas override it to hand out `Arc::clone`
+    /// instead (see `McpToolWrapper`). Delegating wrappers around a
+    /// `dyn Tool` MUST forward `spec()` to the inner tool — relying on this
+    /// default silently reintroduces a per-iteration deep clone of the
+    /// inner schema and breaks `Arc` identity for downstream sharing.
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: self.name().to_string(),

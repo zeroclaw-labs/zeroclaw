@@ -1146,6 +1146,49 @@ fn strip_windows_exe_suffix(name: &str) -> &str {
     }
 }
 
+/// Compare two bare command names using the same semantics everywhere a
+/// command allowlist is interpreted. Path-like entries are handled by their
+/// callers and deliberately do not pass through this case-folding rule.
+fn command_names_equivalent(left: &str, right: &str) -> bool {
+    let left_lower = left.to_ascii_lowercase();
+    let right_lower = right.to_ascii_lowercase();
+    if left_lower == right_lower {
+        return true;
+    }
+
+    // On Windows, an omitted executable suffix does not distinguish command
+    // names (for example, `git` and `git.exe` grant the same command access).
+    #[cfg(target_os = "windows")]
+    {
+        for ext in &[".exe", ".cmd", ".bat"] {
+            if right_lower == format!("{left_lower}{ext}") {
+                return true;
+            }
+            if left_lower == format!("{right_lower}{ext}") {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn command_allowlist_entries_equivalent(left: &str, right: &str) -> bool {
+    let left = strip_wrapping_quotes(left).trim();
+    let right = strip_wrapping_quotes(right).trim();
+    if left.is_empty() || right.is_empty() {
+        return false;
+    }
+
+    // Preserve exact equality for paths. Case-folding a path would widen the
+    // policy on case-sensitive filesystems.
+    if looks_like_path(left) || looks_like_path(right) {
+        return left == right;
+    }
+
+    command_names_equivalent(left, right)
+}
+
 fn is_allowlist_entry_match(allowed: &str, executable: &str, executable_base: &str) -> bool {
     let allowed = strip_wrapping_quotes(allowed).trim();
     if allowed.is_empty() {
@@ -1165,28 +1208,11 @@ fn is_allowlist_entry_match(allowed: &str, executable: &str, executable_base: &s
         return executable_path == allowed_path;
     }
 
-    // Command-name entries continue to match by basename.
-    // On Windows, also match when the executable has a .exe/.cmd/.bat suffix
-    // that the allowlist entry omits (e.g., allowlist "git" matches "git.exe").
-    if allowed == executable_base {
-        return true;
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        let base_lower = executable_base.to_ascii_lowercase();
-        let allowed_lower = allowed.to_ascii_lowercase();
-        for ext in &[".exe", ".cmd", ".bat"] {
-            if base_lower == format!("{allowed_lower}{ext}") {
-                return true;
-            }
-            if allowed_lower == format!("{base_lower}{ext}") {
-                return true;
-            }
-        }
-    }
-
-    false
+    // Command-name entries continue to match by basename, case-insensitively.
+    // Callers lowercase the basename before it reaches here, so folding only
+    // one side would leave an entry written as `Git` or `Docker` unable to
+    // match anything.
+    command_names_equivalent(allowed, executable_base)
 }
 
 impl SecurityPolicy {
@@ -2091,7 +2117,11 @@ impl SecurityPolicy {
             }
         }
         for cmd in &self.allowed_commands {
-            if !parent.allowed_commands.iter().any(|p| p == cmd) {
+            if !parent
+                .allowed_commands
+                .iter()
+                .any(|p| command_allowlist_entries_equivalent(p, cmd))
+            {
                 return Err(EscalationViolation::CommandNotInParent {
                     command: cmd.clone(),
                 });
@@ -2907,6 +2937,34 @@ mod tests {
         assert!(p.is_command_allowed("kubectl get pods"));
         assert!(!p.is_command_allowed("ls"));
         assert!(!p.is_command_allowed("git status"));
+    }
+
+    #[test]
+    fn mixed_case_bare_allowlist_entry_matches_on_every_platform() {
+        // Callers lowercase the executable basename before the allowlist
+        // comparison, so an entry written with any uppercase could never match
+        // until both sides were folded.
+        let p = SecurityPolicy {
+            allowed_commands: vec!["Git".into(), "DOCKER".into()],
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_command_allowed("git status"));
+        assert!(p.is_command_allowed("docker ps"));
+        // The invocation may also be capitalized; the basename is folded too.
+        assert!(p.is_command_allowed("GIT status"));
+        // Entries that are genuinely absent are still refused.
+        assert!(!p.is_command_allowed("kubectl get pods"));
+    }
+
+    #[test]
+    fn mixed_case_allowlist_entry_does_not_widen_path_matching() {
+        // Path-like entries stay exact rather than using command-name folding.
+        let p = SecurityPolicy {
+            allowed_commands: vec!["/usr/bin/Antigravity".into()],
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_command_allowed("/usr/bin/Antigravity"));
+        assert!(!p.is_command_allowed("/usr/bin/antigravity"));
     }
 
     #[test]
@@ -4925,6 +4983,41 @@ mod tests {
             ..parent.clone()
         };
         assert!(child.ensure_no_escalation_beyond(&parent).is_ok());
+    }
+
+    #[test]
+    fn ensure_no_escalation_accepts_case_equivalent_command_names() {
+        let parent = SecurityPolicy {
+            allowed_commands: vec!["Git".into(), "DOCKER".into()],
+            ..parent_policy_for_escalation_tests()
+        };
+        let child = SecurityPolicy {
+            allowed_commands: vec!["git".into(), "docker".into()],
+            ..parent.clone()
+        };
+
+        assert!(child.ensure_no_escalation_beyond(&parent).is_ok());
+    }
+
+    #[test]
+    fn ensure_no_escalation_keeps_command_paths_case_sensitive() {
+        let parent = SecurityPolicy {
+            allowed_commands: vec!["/usr/bin/Git".into()],
+            ..parent_policy_for_escalation_tests()
+        };
+        let child = SecurityPolicy {
+            allowed_commands: vec!["/usr/bin/git".into()],
+            ..parent.clone()
+        };
+
+        let err = child
+            .ensure_no_escalation_beyond(&parent)
+            .expect_err("case-distinct paths must not be treated as equivalent");
+        assert!(matches!(
+            err,
+            EscalationViolation::CommandNotInParent { ref command }
+            if command == "/usr/bin/git"
+        ));
     }
 
     #[test]

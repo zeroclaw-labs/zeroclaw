@@ -119,6 +119,17 @@ Hugging Face repo IDs (e.g. `meta-llama/Meta-Llama-3.1-8B-Instruct`). Key from
 the newer `mercury-2`). Key from the
 [Inception platform](https://platform.inceptionlabs.ai).
 
+**Atlas Cloud**: slot `atlascloud`. OpenAI-compatible endpoint
+`https://api.atlascloud.ai/v1` with bearer-token auth. Use the canonical
+`atlascloud` slot only; `atlas`, `atlas-cloud`, and `atlas_cloud` are not
+runtime aliases.
+
+```toml
+[providers.models.atlascloud.home]
+model = "..."
+api_key = "..."
+```
+
 > Credentials come only from config (`api_key`) or the `--credential` override at run
 > time, these slots do **not** read a per-provider `*_API_KEY` environment variable.
 

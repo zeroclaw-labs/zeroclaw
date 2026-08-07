@@ -1,5 +1,7 @@
+#[cfg(feature = "channel-slack")]
 use zeroclaw_api::channel::ProgressEvent;
 
+#[cfg(feature = "channel-slack")]
 pub(crate) fn lifecycle_progress_fluent_key(event: ProgressEvent) -> &'static str {
     match event {
         ProgressEvent::Received => "channel-runtime-progress-received",
@@ -11,6 +13,7 @@ pub(crate) fn lifecycle_progress_fluent_key(event: ProgressEvent) -> &'static st
     }
 }
 
+#[cfg(feature = "channel-slack")]
 pub(crate) fn localized_lifecycle_progress(event: ProgressEvent) -> String {
     zeroclaw_runtime::i18n::get_required_cli_string(lifecycle_progress_fluent_key(event))
 }
@@ -474,6 +477,7 @@ pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> 
 mod tests {
     use super::*;
 
+    #[cfg(feature = "channel-slack")]
     #[test]
     fn lifecycle_progress_maps_typed_events_to_fluent_keys() {
         assert_eq!(
