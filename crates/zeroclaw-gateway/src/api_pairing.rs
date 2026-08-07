@@ -1024,4 +1024,67 @@ mod tests {
             "response must come from the shared authentication limiter: {body}"
         );
     }
+
+    #[tokio::test]
+    async fn submit_pairing_enhanced_invalid_code_feeds_shared_auth_limiter() {
+        // The handler must *record* each invalid attempt into the shared auth
+        // limiter, not merely check pre-existing state. Preload the limiter to
+        // one below the threshold, then a single invalid pairing call must push
+        // it to the threshold so the *next* request is locked out by the shared
+        // limiter. This fails if the handler's `record_attempt` call is dropped:
+        // the second request would still see `MAX_ATTEMPTS - 1` and return 400.
+        // PairingGuard sees only two attempts here (< its 5-attempt lockout), so
+        // it never produces the 429 — the lockout can only come from the shared
+        // limiter the handler fed.
+        let mut state = test_state(Config::default());
+        state.pairing = Arc::new(PairingGuard::new(true, &[]));
+        state.rate_limiter = Arc::new(GatewayRateLimiter::new(100, 100, 100));
+        state.auth_limiter = Arc::new(AuthRateLimiter::new());
+        let peer: SocketAddr = "203.0.113.40:55555".parse().unwrap();
+        let client_id = peer.ip().to_string();
+
+        for _ in 0..(MAX_ATTEMPTS - 1) {
+            state.auth_limiter.record_attempt(&client_id);
+        }
+
+        let (status, _) = response_json(
+            submit_pairing_enhanced(
+                State(state.clone()),
+                ConnectInfo(peer),
+                HeaderMap::new(),
+                Json(serde_json::json!({"code": "wrong"})),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "an invalid code returns 400 and records the attempt into the shared limiter"
+        );
+
+        let (status, body) = response_json(
+            submit_pairing_enhanced(
+                State(state),
+                ConnectInfo(peer),
+                HeaderMap::new(),
+                Json(serde_json::json!({"code": "wrong"})),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "the handler's own recording pushed the shared limiter to its threshold"
+        );
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|error| error.starts_with("Too many auth attempts.")),
+            "the lockout must come from the shared auth limiter, not PairingGuard: {body}"
+        );
+    }
 }
