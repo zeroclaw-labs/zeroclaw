@@ -908,6 +908,7 @@ const KEY_PREFIX_MODEL_PROVIDERS: &[(&str, &str)] = &[
     ("xai-", "xai"),
     ("nvapi-", "nvidia"),
     ("KEY-", "telnyx"),
+    ("zcr_", "zerorouter"),
 ];
 
 fn check_api_key_prefix(model_provider_name: &str, key: &str) -> Option<&'static str> {
@@ -1816,6 +1817,7 @@ pub fn default_model_provider_url(name: &str) -> Option<&'static str> {
         "lambda_ai" => Some(<LambdaAiModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
         "inception" => Some(<InceptionModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
         "nearai" => Some(<NearaiModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
+        "zerorouter" => Some(crate::factory::ZEROROUTER_DEFAULT_URL),
         "baichuan" => Some(<BaichuanModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
         "yi" => Some(<YiModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
         _ => None,
@@ -1912,6 +1914,7 @@ pub fn list_model_providers() -> Vec<ModelProviderInfo> {
             ("gemini_cli", "Gemini CLI", true),
             ("kilocli", "KiloCLI", true),
             ("kilo", "Kilo", false),
+            ("zerorouter", "ZeroRouter", false),
             ("lmstudio", "LM Studio", true),
             ("llamacpp", "llama.cpp server", true),
             ("sglang", "SGLang", true),
@@ -2247,6 +2250,17 @@ mod tests {
         assert!(
             !model_provider.capabilities().native_tool_calling,
             "Venice should use prompt-guided tools, not native tool calling"
+        );
+    }
+
+    #[test]
+    fn factory_zerorouter() {
+        let model_provider = create_model_provider("zerorouter", Some("zcr_test")).unwrap();
+        // ZeroRouter speaks the OpenAI chat-completions wire: Bearer auth +
+        // native tool calling, no .without_native_tools() override.
+        assert!(
+            model_provider.capabilities().native_tool_calling,
+            "ZeroRouter should use OpenAI-compatible native tool calling"
         );
     }
 

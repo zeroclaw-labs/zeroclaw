@@ -5,6 +5,7 @@ pub mod oauth_common;
 pub mod openai_oauth;
 pub mod profiles;
 pub mod xai_oauth;
+pub mod zerorouter_device;
 
 use crate::auth::oauth_common::{RefreshRetryPolicy, refresh_with_retries};
 use crate::auth::openai_oauth::refresh_access_token;
@@ -22,6 +23,7 @@ const OPENAI_CODEX_PROVIDER: &str = "openai-codex";
 const ANTHROPIC_PROVIDER: &str = "anthropic";
 const GEMINI_PROVIDER: &str = "gemini";
 const XAI_PROVIDER: &str = "xai";
+const ZEROROUTER_PROVIDER: &str = "zerorouter";
 const DEFAULT_PROFILE_NAME: &str = "default";
 const OPENAI_REFRESH_SKEW_SECS: u64 = 90;
 const OPENAI_REFRESH_FAILURE_BACKOFF_SECS: u64 = 10;
@@ -603,6 +605,8 @@ pub enum AuthProvider {
     Gemini,
     #[serde(alias = "grok")]
     Xai,
+    #[serde(alias = "zr")]
+    Zerorouter,
 }
 
 impl std::str::FromStr for AuthProvider {
@@ -638,6 +642,7 @@ impl AuthProvider {
             Self::Anthropic => ANTHROPIC_PROVIDER,
             Self::Gemini => GEMINI_PROVIDER,
             Self::Xai => XAI_PROVIDER,
+            Self::Zerorouter => ZEROROUTER_PROVIDER,
         }
     }
 }
@@ -1093,6 +1098,7 @@ impl AuthProvider {
             Self::Gemini => Box::new(GeminiFlow),
             Self::Anthropic => Box::new(AnthropicFlow),
             Self::Xai => Box::new(XaiFlow),
+            Self::Zerorouter => Box::new(ZerorouterFlow),
         }
     }
 }
@@ -1559,6 +1565,101 @@ pub struct AnthropicFlow;
 impl AuthProviderFlow for AnthropicFlow {}
 
 // ── xAI impl ───────────────────────────────────────────────────────────
+
+// ── ZeroRouter impl ────────────────────────────────────────────────────
+
+pub struct ZerorouterFlow;
+
+impl ZerorouterFlow {
+    /// The issuer is the operator's own router: the first configured
+    /// `providers.models.zerorouter` slot's `uri` (aliases in sorted order
+    /// for determinism), else the family default. The `/v1` API suffix is
+    /// stripped — discovery lives at the router root.
+    fn resolve_issuer(config: &Config) -> String {
+        let mut aliases: Vec<&String> = config.providers.models.zerorouter.keys().collect();
+        aliases.sort();
+        let uri = aliases
+            .first()
+            .and_then(|alias| {
+                config.providers.models.zerorouter[*alias]
+                    .base
+                    .uri
+                    .as_deref()
+            })
+            .unwrap_or_else(|| {
+                use zeroclaw_config::schema::{ModelEndpoint, ZerorouterEndpoint};
+                ZerorouterEndpoint::default().uri()
+            });
+        crate::auth::zerorouter_device::issuer_from_provider_uri(uri)
+    }
+}
+
+#[async_trait::async_trait]
+impl AuthProviderFlow for ZerorouterFlow {
+    async fn login(
+        &self,
+        ctx: &AuthFlowContext<'_>,
+        profile: &str,
+        _device_code: bool,
+        import: Option<&std::path::Path>,
+    ) -> Result<()> {
+        if import.is_some() {
+            anyhow::bail!(
+                "`auth login --import` is not supported for zerorouter; run the device flow \
+                 (the router mints a fresh key at approval) or set `api_key` in config."
+            );
+        }
+        // Device flow is the ONLY arm: ZeroRouter's authorization_endpoint
+        // is a portal redirect, not a CLI-usable OAuth endpoint, so the
+        // browser-PKCE arm the other providers fall back to cannot exist
+        // here. The --device-code flag is accepted and redundant.
+        let issuer = Self::resolve_issuer(ctx.config);
+        let discovery =
+            crate::auth::zerorouter_device::fetch_device_discovery(ctx.client, &issuer).await?;
+        // ZeroRouter's key_name extension: label the minted key with this
+        // machine's hostname so the portal list reads as an inventory.
+        let key_name = hostname::get()
+            .ok()
+            .and_then(|name| name.into_string().ok())
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| "zeroclaw".to_string());
+        let device = crate::auth::zerorouter_device::start_device_flow(
+            ctx.client,
+            &issuer,
+            &discovery.device_authorization_endpoint,
+            &key_name,
+        )
+        .await?;
+        println!("ZeroRouter device login started (router: {issuer}).");
+        println!("Visit: {}", device.verification_uri);
+        println!("Code:  {}", device.user_code);
+        if let Some(uri_complete) = &device.verification_uri_complete {
+            println!("Fast link: {uri_complete}");
+        }
+        let key = crate::auth::zerorouter_device::poll_device_key(
+            ctx.client,
+            &discovery.token_endpoint,
+            &device,
+        )
+        .await?;
+        // The access_token IS a freshly minted permanent `zcr_` API key —
+        // a Token-kind profile, deliberately not a TokenSet: there is no
+        // refresh arm and nothing to expire.
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("issuer".to_string(), issuer.clone());
+        metadata.insert("key_name".to_string(), key_name);
+        ctx.auth_service
+            .store_model_provider_token(ZEROROUTER_PROVIDER, profile, &key, metadata, true)
+            .await?;
+        println!("Saved profile {profile}");
+        println!("Active profile for zerorouter: {profile}");
+        println!(
+            "The stored credential is a permanent ZeroRouter API key; revoke it from the \
+             router portal if this machine is retired."
+        );
+        Ok(())
+    }
+}
 
 pub struct XaiFlow;
 
