@@ -381,20 +381,23 @@ fn telegram_audio_send_spec(
 
 /// Build the user-facing content string for an incoming attachment.
 ///
-/// Anything the typed envelope conservatively classifies as an image
-/// (`looks_like_image()`: image MIME, image extension, or image magic
-/// bytes) uses `[IMAGE:/path]` so the multimodal pipeline can validate
-/// vision capability, regardless of whether Telegram delivered it as a
-/// photo or a document. Marker and envelope agreeing matters downstream:
-/// the media pipeline suppresses its own base64-inlining annotation only
-/// for attachments whose path the channel already marked in the text, so
-/// an image sent "as file" (even extensionless) must not fall back to the
-/// `[Document: name] /path` format reserved for genuine non-images.
+/// An attachment earns the `[IMAGE:/path]` marker when the multimodal loader
+/// will actually accept it (`provider_loadable_image_mime()`), regardless of
+/// whether Telegram delivered it as a photo or a document — so an image sent
+/// "as file", even extensionless, is still marked as an image rather than
+/// falling back to the `[Document: name] /path` form.
+///
+/// The check is deliberately the *loadable* one rather than the conservative
+/// `looks_like_image()`. A marker the loader rejects is worse than no marker:
+/// preparation drops it in favour of a "could not be loaded" note, and the
+/// `[Document: ...]` line that would have kept the saved path reachable was
+/// never emitted. Formats outside the provider's set therefore stay documents,
+/// which leaves both the bytes and a usable path in the model's hands.
 fn format_attachment_content(
     attachment: &zeroclaw_api::media::MediaAttachment,
     local_path: &Path,
 ) -> String {
-    if attachment.looks_like_image() {
+    if attachment.provider_loadable_image_mime().is_some() {
         format!("[IMAGE:{}]", local_path.display())
     } else {
         format!(
@@ -2179,10 +2182,14 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             file_name: local_filename.clone(),
             data: file_data,
             mime_type: attachment.mime_type.clone(),
+            // The saved path is exactly what the rendering below references,
+            // so downstream consumers can join text markers back to these
+            // bytes without guessing at file names.
+            marker_target: Some(local_path.display().to_string()),
         };
 
         // Build message content. The marker is decided by the envelope's
-        // conservative image verdict, not Telegram's photo/document
+        // loadable-image verdict, not Telegram's photo/document
         // classification, so image documents get the same re-loadable
         // [IMAGE:] marker as photos and the media pipeline can recognize
         // them as already-marked instead of re-inlining base64.
@@ -8841,6 +8848,7 @@ mod tests {
             file_name: file_name.to_string(),
             data: data.to_vec(),
             mime_type: mime_type.map(str::to_string),
+            marker_target: None,
         }
     }
 
@@ -8872,24 +8880,76 @@ mod tests {
     }
 
     /// An image sent "as file" must get the `[IMAGE:]` marker even without an
-    /// image extension, as long as any envelope signal (MIME here, magic bytes
-    /// below) says it is an image. The marker keeps the media pipeline from
-    /// re-inlining the same image as base64.
+    /// image extension, as long as the loader can resolve the payload to a
+    /// format it accepts. The marker keeps the media pipeline from re-inlining
+    /// the same image as base64.
     #[test]
     fn image_document_content_uses_image_marker() {
         let local_path = std::path::Path::new("/tmp/workspace/telegram_files/upload");
 
-        // Sender-declared image MIME, no extension.
-        let content =
-            format_attachment_content(&envelope("upload", Some("image/jpeg"), &[]), local_path);
-        assert_eq!(content, "[IMAGE:/tmp/workspace/telegram_files/upload]");
-
-        // Magic bytes only: no MIME, no extension.
+        // Magic bytes only: no MIME, no extension. The loader sniffs the same
+        // bytes and reaches the same verdict.
         let content = format_attachment_content(
             &envelope("upload", None, &[0xFF, 0xD8, 0xFF, 0xE0]),
             local_path,
         );
         assert_eq!(content, "[IMAGE:/tmp/workspace/telegram_files/upload]");
+
+        // The sender's declared MIME travels with the envelope but the loader
+        // never sees it for a path marker: it resolves extension then magic.
+        // A declared type alone therefore cannot earn a marker the loader
+        // would reject.
+        let content = format_attachment_content(
+            &envelope("upload", Some("image/jpeg"), b"not actually an image"),
+            local_path,
+        );
+        assert!(
+            content.starts_with("[Document:"),
+            "a declared MIME must not outvote the loader's own resolution: {content}"
+        );
+    }
+
+    /// Formats the multimodal loader cannot normalize must stay documents.
+    /// Marking them would be strictly worse than not marking them: preparation
+    /// drops the rejected marker for a "could not be loaded" note, and the
+    /// `[Document:]` line that would have kept the saved path reachable was
+    /// never emitted, so both the bytes and the path are lost.
+    #[test]
+    fn unloadable_image_formats_stay_documents() {
+        for (filename, data) in [
+            ("photo.heic", &b"\x00\x00\x00\x18ftypheic"[..]),
+            ("scan.tiff", &b"\x49\x49\x2a\x00rest"[..]),
+            (
+                "logo.svg",
+                &b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>"[..],
+            ),
+            ("old.bmp", &b"BMxxxx"[..]),
+        ] {
+            let path_str = format!("/tmp/ws/{filename}");
+            let path = std::path::Path::new(&path_str);
+            let content = format_attachment_content(&envelope(filename, None, data), path);
+            assert!(
+                content.starts_with("[Document:"),
+                "{filename}: unloadable image must stay a document, got: {content}"
+            );
+            assert!(
+                content.contains(&path_str),
+                "{filename}: the saved path must remain reachable, got: {content}"
+            );
+        }
+    }
+
+    /// An extensionless upload whose magic bytes are an unloadable format is
+    /// rejected the same way, so sniffing cannot smuggle one past the gate.
+    #[test]
+    fn unloadable_magic_bytes_stay_documents() {
+        let path = std::path::Path::new("/tmp/ws/upload");
+        let content =
+            format_attachment_content(&envelope("upload", None, b"\x49\x49\x2a\x00rest"), path);
+        assert!(
+            content.starts_with("[Document:"),
+            "TIFF magic must not earn an image marker: {content}"
+        );
     }
 
     /// A `.md` upload is text, so no envelope signal ever classifies it as an
@@ -8939,10 +8999,12 @@ mod tests {
         }
     }
 
-    /// All recognized image extensions produce `[IMAGE:]` markers.
+    /// Every extension the multimodal loader accepts produces an `[IMAGE:]`
+    /// marker. The list is exactly the loader's, not a wider "looks like an
+    /// image" set — see `unloadable_image_formats_stay_documents`.
     #[test]
     fn image_extensions_produce_image_marker() {
-        for ext in ["png", "jpg", "jpeg", "gif", "webp", "bmp"] {
+        for ext in ["png", "jpg", "jpeg", "gif", "webp"] {
             let filename = format!("photo_1_2.{ext}");
             let path_str = format!("/tmp/ws/{filename}");
             let path = std::path::Path::new(&path_str);

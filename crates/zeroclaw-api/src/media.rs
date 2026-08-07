@@ -1,3 +1,27 @@
+//! Inbound media attachments and the three questions callers ask about them.
+//!
+//! An attachment carries several signals — a sender-declared MIME, a file
+//! name, and the payload itself — and they can disagree. Rather than force one
+//! verdict on every caller, this module exposes three deliberately different
+//! answers, each matched to what its consumer does with it:
+//!
+//! * [`MediaAttachment::kind`] — routing. Resolves one kind, declared MIME
+//!   first, so an attachment is processed as whatever the sender said it is.
+//! * [`MediaAttachment::looks_like_image`] — restriction. True when *any*
+//!   signal says image, so a contradictory MIME cannot smuggle a photo past an
+//!   image-turn gate. Over-applies rather than under-applies, because its
+//!   consumers only remove capability.
+//! * [`MediaAttachment::provider_loadable_image_mime`] — grant. `Some` only
+//!   when the multimodal loader will actually accept the bytes, so nothing
+//!   promises the provider an image it will drop.
+//!
+//! The three are ordered by strictness (`provider_loadable_image_mime` implies
+//! `looks_like_image`), but `kind` is independent and may disagree with both.
+//! Callers that render user-visible annotations must therefore not let two of
+//! these decide the same attachment: the channel that received the bytes
+//! records what it rendered in [`MediaAttachment::marker_target`], and later
+//! stages defer to that instead of re-deciding.
+
 /// Classifies an attachment by MIME type or file extension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaKind {
@@ -8,7 +32,7 @@ pub enum MediaKind {
 }
 
 /// A single media attachment on an inbound message.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct MediaAttachment {
     /// Original file name (e.g. `voice.ogg`, `photo.jpg`).
     pub file_name: String,
@@ -16,6 +40,22 @@ pub struct MediaAttachment {
     pub data: Vec<u8>,
     /// MIME type if known (e.g. `audio/ogg`, `image/jpeg`).
     pub mime_type: Option<String>,
+    /// The exact `[Kind:<target>]` target the receiving channel already
+    /// rendered into the message text for **these** bytes, if it rendered
+    /// one.
+    ///
+    /// This field creates the fact. A channel's text rendering is otherwise
+    /// unrecoverable from the envelope: `file_name` is the sender's name,
+    /// which need not equal the on-disk name the channel marked (Discord
+    /// prefixes a UUID; a URL fallback is not a file name at all). Consumers
+    /// that need to know whether the text already carries a re-loadable
+    /// reference to this attachment must compare against this target rather
+    /// than pattern-matching the rendered text, which also carries
+    /// sender-authored content.
+    ///
+    /// `None` means the channel supplied bytes without rendering a marker for
+    /// them; consumers must then treat the attachment as unreferenced.
+    pub marker_target: Option<String>,
 }
 
 impl MediaAttachment {
@@ -59,6 +99,7 @@ impl MediaAttachment {
             file_name,
             data,
             mime_type,
+            marker_target: None,
         })
     }
 
@@ -124,34 +165,102 @@ impl MediaAttachment {
 
         sniff_image_magic(&self.data)
     }
+
+    /// The MIME the multimodal image loader will assign these bytes, if that
+    /// MIME is one the provider path can actually send.
+    ///
+    /// Where [`looks_like_image`](Self::looks_like_image) answers "must this
+    /// turn be treated as carrying an image?" (deliberately permissive,
+    /// because its consumers only ever *remove* capability), this answers the
+    /// narrower question "will an `[IMAGE:<path>]` reference to these bytes
+    /// survive provider preparation?" — so it is the signal for any decision
+    /// that *grants* image handling: emitting an image marker, or routing a
+    /// turn to a vision provider.
+    ///
+    /// `None` means the loader would reject the reference and drop it in
+    /// favour of a "could not be loaded" note. Callers must then keep the
+    /// bytes reachable some other way rather than emitting a marker that is
+    /// guaranteed to be discarded.
+    pub fn provider_loadable_image_mime(&self) -> Option<&'static str> {
+        let ext = self
+            .file_name
+            .rsplit_once('.')
+            .map(|(_, e)| e.to_ascii_lowercase())
+            .unwrap_or_default();
+
+        // Mirrors the loader's own precedence: a declared extension wins over
+        // the payload, so bytes that merely *look* loadable cannot rescue a
+        // file whose name commits it to a format the provider rejects.
+        let resolved =
+            image_mime_from_extension(&ext).or_else(|| image_mime_from_magic(&self.data));
+
+        resolved.filter(|mime| is_provider_image_mime(mime))
+    }
+}
+
+/// Image MIME types the multimodal provider path accepts.
+///
+/// Canonical for the whole workspace: the provider's own validation resolves
+/// against this list, and channels consult it before promising the loader an
+/// image it cannot send.
+pub const PROVIDER_IMAGE_MIME_TYPES: &[&str] =
+    &["image/png", "image/jpeg", "image/webp", "image/gif"];
+
+/// Whether `mime` is one the multimodal provider path accepts.
+pub fn is_provider_image_mime(mime: &str) -> bool {
+    PROVIDER_IMAGE_MIME_TYPES.contains(&mime)
+}
+
+/// Map a bare file extension to the image MIME the multimodal loader assigns
+/// it. Returns `Some` for formats the loader *recognizes*, which is a wider
+/// set than it accepts — `bmp` resolves here so the loader can reject it by
+/// name instead of failing as an unknown format.
+pub fn image_mime_from_extension(ext: &str) -> Option<&'static str> {
+    match ext.to_ascii_lowercase().as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "webp" => Some("image/webp"),
+        "gif" => Some("image/gif"),
+        "bmp" => Some("image/bmp"),
+        _ => None,
+    }
+}
+
+/// Map leading magic bytes to the image MIME the multimodal loader assigns
+/// them. Recognizes the same wider-than-accepted set as
+/// [`image_mime_from_extension`].
+pub fn image_mime_from_magic(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n']) {
+        return Some("image/png");
+    }
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    if bytes.starts_with(b"BM") {
+        return Some("image/bmp");
+    }
+    None
 }
 
 /// Shared image-extension list used by both [`MediaAttachment::kind`] and
 /// [`MediaAttachment::looks_like_image`], so the two classifiers cannot
-/// drift apart.
+/// drift apart. Extends the loader-recognized set with formats a sender can
+/// plausibly call an image even though the provider path cannot send them.
 fn is_image_extension(ext: &str) -> bool {
-    matches!(
-        ext,
-        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "heic" | "tiff" | "svg"
-    )
+    image_mime_from_extension(ext).is_some() || matches!(ext, "heic" | "tiff" | "svg")
 }
 
-/// Detect common image formats from leading magic bytes.
+/// Detect common image formats from leading magic bytes. Extends the
+/// loader-recognized set the same way [`is_image_extension`] does.
 fn sniff_image_magic(data: &[u8]) -> bool {
-    if data.starts_with(&[0xFF, 0xD8, 0xFF]) {
-        return true; // JPEG
-    }
-    if data.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) {
-        return true; // PNG
-    }
-    if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
-        return true; // GIF
-    }
-    if data.starts_with(b"BM") {
-        return true; // BMP
-    }
-    if data.len() >= 12 && data.starts_with(b"RIFF") && &data[8..12] == b"WEBP" {
-        return true; // WebP
+    if image_mime_from_magic(data).is_some() {
+        return true;
     }
     if data.starts_with(&[0x49, 0x49, 0x2A, 0x00]) || data.starts_with(&[0x4D, 0x4D, 0x00, 0x2A]) {
         return true; // TIFF (little/big endian)
@@ -178,6 +287,7 @@ mod tests {
             file_name: file_name.to_string(),
             data: Vec::new(),
             mime_type: mime_type.map(str::to_string),
+            marker_target: None,
         }
     }
 
@@ -225,6 +335,7 @@ mod tests {
             file_name: file_name.to_string(),
             data: data.to_vec(),
             mime_type: mime_type.map(str::to_string),
+            marker_target: None,
         }
     }
 
@@ -262,6 +373,76 @@ mod tests {
         assert!(!att("voice.ogg", Some("audio/ogg")).looks_like_image());
         assert!(!att_with_data("notes", None, b"plain text bytes").looks_like_image());
         assert!(!att("noextension", None).looks_like_image());
+    }
+
+    #[test]
+    fn provider_loadable_image_mime_admits_only_what_the_loader_sends() {
+        // Extension resolves the format the loader will assume.
+        assert_eq!(
+            att("photo.png", None).provider_loadable_image_mime(),
+            Some("image/png")
+        );
+        assert_eq!(
+            att("photo.JPEG", None).provider_loadable_image_mime(),
+            Some("image/jpeg")
+        );
+        assert_eq!(
+            att("sticker.webp", None).provider_loadable_image_mime(),
+            Some("image/webp")
+        );
+        assert_eq!(
+            att("anim.gif", None).provider_loadable_image_mime(),
+            Some("image/gif")
+        );
+
+        // No extension: magic bytes decide, so an image sent "as file" is
+        // still loadable.
+        assert_eq!(
+            att_with_data("upload", None, &[0xFF, 0xD8, 0xFF, 0xE0]).provider_loadable_image_mime(),
+            Some("image/jpeg")
+        );
+    }
+
+    #[test]
+    fn provider_loadable_image_mime_rejects_formats_the_loader_drops() {
+        // These are images by every conservative signal, but the multimodal
+        // loader cannot normalize them: promising it a marker would lose both
+        // the bytes and the path.
+        for name in ["photo.heic", "scan.tiff", "logo.svg", "old.bmp"] {
+            let a = att(name, None);
+            assert!(
+                a.looks_like_image(),
+                "{name} must still count as an image for restriction purposes"
+            );
+            assert_eq!(
+                a.provider_loadable_image_mime(),
+                None,
+                "{name} must not earn an image marker"
+            );
+        }
+
+        // TIFF and HEIC magic bytes are recognized as images but are equally
+        // unloadable, so an extensionless upload of one is not marked either.
+        assert!(att_with_data("upload", None, &[0x49, 0x49, 0x2A, 0x00]).looks_like_image());
+        assert_eq!(
+            att_with_data("upload", None, &[0x49, 0x49, 0x2A, 0x00]).provider_loadable_image_mime(),
+            None
+        );
+    }
+
+    #[test]
+    fn provider_loadable_image_mime_lets_the_declared_extension_win() {
+        // The loader resolves the extension before sniffing, so a name that
+        // commits the file to an unsupported format is rejected even when the
+        // payload would have sniffed as a supported one. Matching that
+        // precedence here is what keeps the marker decision honest.
+        let a = att_with_data("photo.bmp", None, &[0xFF, 0xD8, 0xFF, 0xE0]);
+        assert_eq!(a.provider_loadable_image_mime(), None);
+
+        // A sender-declared MIME does not widen the set either; only the
+        // loader's own resolution counts.
+        let b = att("scan.tiff", Some("image/png"));
+        assert_eq!(b.provider_loadable_image_mime(), None);
     }
 
     #[test]
