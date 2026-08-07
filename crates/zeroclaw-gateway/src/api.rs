@@ -2094,7 +2094,6 @@ pub(crate) mod tests {
     #[cfg(any(
         feature = "channel-linq",
         feature = "channel-nextcloud",
-        feature = "channel-wati",
         feature = "channel-whatsapp-cloud"
     ))]
     use std::collections::HashMap;
@@ -2291,8 +2290,6 @@ pub(crate) mod tests {
             nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk_webhook_secret: HashMap::new(),
-            #[cfg(feature = "channel-wati")]
-            wati: HashMap::new(),
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),

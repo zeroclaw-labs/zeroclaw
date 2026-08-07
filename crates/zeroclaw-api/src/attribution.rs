@@ -92,6 +92,8 @@ pub enum ChannelKind {
     Twitter,
     VoiceCall,
     VoiceWake,
+    /// Retained after the WATI channel was removed so historical
+    /// attribution records that name it still deserialize.
     Wati,
     #[strum(serialize = "wecom")]
     WeCom,
@@ -106,12 +108,13 @@ pub enum ChannelKind {
 
 impl ChannelKind {
     /// Whether this channel can deliver inbound events that fan into an SOP.
-    /// `Cli` is a local interactive session, not a background event source, and
-    /// `Plugin` is a synthetic attribution bucket; both are excluded. Everything
-    /// else is a real inbound channel a SOP can trigger on.
+    /// `Cli` is a local interactive session, `Plugin` is a synthetic attribution
+    /// bucket, and `Wati` is retained only for historical attribution records;
+    /// none is a live background event source. Every other kind is a real inbound
+    /// channel a SOP can trigger on.
     #[must_use]
     pub fn inbound_capable(self) -> bool {
-        !matches!(self, Self::Cli | Self::Plugin)
+        !matches!(self, Self::Cli | Self::Plugin | Self::Wati)
     }
 
     /// Canonical snake_case wire string, single-sourced from `IntoStaticStr`.
@@ -443,6 +446,20 @@ mod tests {
             <&'static str>::from(ChannelKind::WhatsappBusiness),
             "whatsapp_business"
         );
+    }
+
+    #[test]
+    fn retired_wati_kind_still_deserializes_from_historical_attribution() {
+        #[derive(serde::Deserialize)]
+        struct StoredAttribution {
+            #[serde(default, with = "super::channel_kind_opt_serde")]
+            channel_type: Option<ChannelKind>,
+        }
+
+        let stored: StoredAttribution = serde_json::from_str(r#"{"channel_type":"wati"}"#)
+            .expect("historical WATI attribution must remain readable");
+        assert_eq!(stored.channel_type, Some(ChannelKind::Wati));
+        assert!(!ChannelKind::Wati.inbound_capable());
     }
 
     #[test]

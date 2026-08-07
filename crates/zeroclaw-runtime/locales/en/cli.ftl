@@ -371,7 +371,7 @@ cli-desktop-long-about =
 
 # Channel-side reply emitted when chat dispatch refuses because the
 # gateway has no model configured. Used by the gateway crate channel
-# webhook handlers (WhatsApp, Linq, WATI, Nextcloud Talk).
+# webhook handlers (WhatsApp, Linq, Nextcloud Talk).
 channel-needs-quickstart-reply = This agent isn't fully set up yet. The operator needs to run Quickstart before I can reply.
 
 channel-whatsapp-web-feature-missing-warning =   ⚠ WhatsApp Web is configured but the 'whatsapp-web' feature is not compiled in.
