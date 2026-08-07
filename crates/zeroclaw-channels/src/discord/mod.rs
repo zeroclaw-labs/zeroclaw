@@ -2483,6 +2483,7 @@ impl Channel for DiscordChannel {
                                             return;
                                         }
 
+                                        let mut invoked_skill: Option<String> = None;
                                         let content = if command == "ask" {
                                             Some(prompt)
                                         } else {
@@ -2500,6 +2501,12 @@ impl Channel for DiscordChannel {
                                             };
                                             match specs.into_iter().find(|spec| spec.slug == command) {
                                                 Some(spec) => {
+                                                    // Carry the resolved identity alongside the
+                                                    // rendering: the prose below names the skill
+                                                    // but is not in a form a text matcher
+                                                    // recognizes, and a registered command must
+                                                    // still apply its skill's policy.
+                                                    invoked_skill = Some(spec.skill_name.clone());
                                                     skill_command_prompt(&spec, &input, &submitted)
                                                 }
                                                 None => None, // stale or foreign command
@@ -2535,6 +2542,7 @@ impl Channel for DiscordChannel {
                                             thread_ts: None,
                                             attachments: Vec::new(),
                                             subject: None,
+                                            invoked_skill,
 
                                             ..Default::default()};
                                         if tx.send(channel_msg).await.is_err() {

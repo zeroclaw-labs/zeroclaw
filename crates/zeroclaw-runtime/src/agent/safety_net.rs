@@ -13,7 +13,7 @@ use zeroclaw_providers::{ChatResponse, ToolCall};
 
 // ── shared fixtures ─────────────────────────────────────────────────────
 
-struct TestAgent {
+pub(super) struct TestAgent {
     agent: Agent,
     _workspace: tempfile::TempDir,
 }
@@ -163,7 +163,10 @@ impl Tool for CountingTool {
     }
 }
 
-fn build_agent(provider: Box<dyn ModelProvider>, tools_vec: Vec<Box<dyn Tool>>) -> TestAgent {
+pub(super) fn build_agent(
+    provider: Box<dyn ModelProvider>,
+    tools_vec: Vec<Box<dyn Tool>>,
+) -> TestAgent {
     let workspace = test_workspace();
     let agent = Agent::builder()
         .model_provider(provider)

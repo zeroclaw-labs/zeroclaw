@@ -2577,6 +2577,10 @@ impl DelegateTool {
         temperature: Option<f64>,
         admission: DelegateAdmission,
     ) -> anyhow::Result<ToolResult> {
+        // The delegating turn's capability ceiling. A turn that removed a tool
+        // for itself must not get it back by delegating: the child loop starts
+        // from static configuration and has never heard of the restriction.
+        let inherited_tool_ceiling = crate::agent::tool_ceiling::current_tool_ceiling();
         let Some(tool_policy) = self.resolve_tool_policy(&agent_config.risk_profile) else {
             return Ok(ToolResult {
                 success: false,
@@ -2796,7 +2800,7 @@ impl DelegateTool {
                     },
                     ResolvedRuntimeKnobs {
                         max_tool_iterations: loop_runtime.max_tool_iterations,
-                        excluded_tools: &[],
+                        excluded_tools: &inherited_tool_ceiling,
                         dedup_exempt_tools: tool_policy.excluded_tools.as_deref().unwrap_or(&[]),
                         pacing: &pacing,
                         strict_tool_parsing: loop_runtime.strict_tool_parsing,
@@ -6378,6 +6382,9 @@ mod tests {
             slash_options: Vec::new(),
             always: false,
             location: None,
+            provider: None,
+            triggers: Vec::new(),
+            blocked_tools_with_image: Vec::new(),
         }];
 
         let tool = DelegateTool::new(root_config.agents.clone(), None, test_security())
@@ -9745,6 +9752,58 @@ command = "echo hi"
         assert!(
             !result.output.contains("forbidden_tool_seen"),
             "parent excluded_tools should have filtered out shell, but got: {}",
+            result.output
+        );
+    }
+
+    /// A restriction the *turn* imposed, as opposed to one in the parent's
+    /// static policy, must also reach the delegated child. Otherwise a model
+    /// that cannot call a tool directly on an image turn simply delegates it.
+    ///
+    /// The parent policy here excludes nothing and the target's risk profile
+    /// allows `shell`, so the only thing that can keep it out of the child's
+    /// tool list is the turn ceiling.
+    #[tokio::test]
+    async fn delegate_honors_the_turn_capability_ceiling() {
+        let config = agentic_agent_config();
+        let tool = DelegateTool::new(HashMap::new(), None, Arc::new(SecurityPolicy::default()))
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles(vec![
+                "shell".to_string(),
+                "file_read".to_string(),
+            ]))
+            .with_parent_tools(Arc::new(RwLock::new(vec![
+                Arc::new(MockShellTool),
+                Arc::new(FileReadTool),
+            ])));
+
+        let model_provider = ToolListInspector {
+            forbidden_names: vec!["shell".to_string()],
+        };
+
+        let result = crate::agent::tool_ceiling::with_tool_ceiling(
+            &["shell".to_string()],
+            Box::pin(tool.execute_agentic(
+                "agentic",
+                &config,
+                "openrouter",
+                "model-test",
+                &model_provider,
+                "run",
+                Some(0.2),
+            )),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            result.success,
+            "expected success, got error: {:?}",
+            result.error
+        );
+        assert!(
+            !result.output.contains("forbidden_tool_seen"),
+            "the turn ceiling should have kept shell out of the delegated child, but got: {}",
             result.output
         );
     }
