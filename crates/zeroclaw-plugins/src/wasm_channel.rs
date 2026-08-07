@@ -184,6 +184,7 @@ fn to_wit_media(a: &MediaAttachment) -> WitMediaAttachment {
         file_name: a.file_name.clone(),
         data: a.data.clone(),
         mime_type: a.mime_type.clone(),
+        marker_target: None,
     }
 }
 
@@ -192,6 +193,7 @@ fn from_wit_media(a: WitMediaAttachment) -> MediaAttachment {
         file_name: a.file_name,
         data: a.data,
         mime_type: a.mime_type,
+        marker_target: None,
     }
 }
 
@@ -759,6 +761,7 @@ mod tests {
             file_name: "photo.jpg".into(),
             data: vec![0xFF, 0xD8, 0xFF],
             mime_type: Some("image/jpeg".into()),
+            marker_target: None,
         };
         let back = from_wit_media(to_wit_media(&ma));
         assert_eq!(back.file_name, "photo.jpg");
