@@ -4,7 +4,8 @@
 use crate::component::bindings::tool::ToolPlugin;
 use crate::component::bindings::tool::exports::zeroclaw::plugin::tool::ToolResult as WitToolResult;
 use crate::component::{
-    PluginState, PluginStoreSpec, call_plugin, engine, load_component, wt, wt_instantiate,
+    PluginState, PluginStoreSpec, WarmPluginState, call_plugin, call_store, engine, load_component,
+    wt, wt_instantiate,
 };
 use crate::instance::{PluginGrantSet, PluginInstanceScope};
 use crate::{PluginCapability, PluginPermission};
@@ -28,7 +29,7 @@ pub struct ToolMetadata {
 
 /// A warm tool plugin: store and bindings created once, reused per call.
 pub struct Plugin {
-    state: Arc<Mutex<(Store<PluginState>, ToolPlugin)>>,
+    state: Arc<Mutex<WarmPluginState<ToolPlugin>>>,
 }
 
 fn base_linker() -> Result<Linker<PluginState>> {
@@ -87,39 +88,59 @@ pub async fn create_plugin(
         tool_linker()
     };
     crate::component::ensure_http_coherent(&store, http)?;
-    let bindings = wt_instantiate(
-        ToolPlugin::instantiate_async(&mut store, &component, linker).await,
-        "failed to instantiate tool plugin",
-    )?;
+    let bindings = call_store!(store, async move |store: &mut Store<PluginState>| {
+        wt_instantiate(
+            ToolPlugin::instantiate_async(store, &component, linker).await,
+            "failed to instantiate tool plugin",
+        )
+    })?;
     Ok(Plugin {
-        state: Arc::new(Mutex::new((store, bindings))),
+        state: Arc::new(Mutex::new(Some((store, bindings)))),
     })
 }
 
 /// Read the exported tool's metadata.
 pub async fn call_tool_metadata(plugin: &mut Plugin) -> Result<ToolMetadata> {
-    call_plugin!(
+    let name = call_plugin!(
         plugin,
         async move |store: &mut Store<PluginState>, bindings: &mut ToolPlugin| {
-            let tool = bindings.zeroclaw_plugin_tool();
-            let name = wt(tool.call_name(&mut *store).await, "tool.name failed")?;
-            let description = wt(
-                tool.call_description(&mut *store).await,
-                "tool.description failed",
-            )?;
-            let schema_json = wt(
-                tool.call_parameters_schema(&mut *store).await,
-                "tool.parameters-schema failed",
-            )?;
-            let parameters_schema = serde_json::from_str(&schema_json)
-                .context("tool parameters-schema is not valid JSON")?;
-            Ok(ToolMetadata {
-                name,
-                description,
-                parameters_schema,
-            })
+            wt(
+                bindings.zeroclaw_plugin_tool().call_name(store).await,
+                "tool.name failed",
+            )
         }
-    )
+    )?;
+    let description = call_plugin!(
+        plugin,
+        async move |store: &mut Store<PluginState>, bindings: &mut ToolPlugin| {
+            wt(
+                bindings
+                    .zeroclaw_plugin_tool()
+                    .call_description(store)
+                    .await,
+                "tool.description failed",
+            )
+        }
+    )?;
+    let schema_json = call_plugin!(
+        plugin,
+        async move |store: &mut Store<PluginState>, bindings: &mut ToolPlugin| {
+            wt(
+                bindings
+                    .zeroclaw_plugin_tool()
+                    .call_parameters_schema(store)
+                    .await,
+                "tool.parameters-schema failed",
+            )
+        }
+    )?;
+    let parameters_schema =
+        serde_json::from_str(&schema_json).context("tool parameters-schema is not valid JSON")?;
+    Ok(ToolMetadata {
+        name,
+        description,
+        parameters_schema,
+    })
 }
 
 /// Invoke the exported tool's `execute`, injecting the plugin's resolved config.

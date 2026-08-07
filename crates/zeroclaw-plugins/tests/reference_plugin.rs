@@ -19,6 +19,7 @@ fn test_limits() -> PluginLimits {
         max_memory_bytes: 256 * 1024 * 1024,
         max_table_elements: 100_000,
         max_instances: 64,
+        call_timeout: std::time::Duration::from_secs(30),
     }
 }
 
@@ -139,6 +140,7 @@ async fn reference_plugin_traps_when_fuel_exhausted() {
         max_memory_bytes: 256 * 1024 * 1024,
         max_table_elements: 100_000,
         max_instances: 64,
+        call_timeout: std::time::Duration::from_secs(30),
     };
     let scope = scope([]);
     let mut plugin = runtime::create_plugin(&fixture, &scope, starved)
@@ -162,6 +164,7 @@ async fn reference_plugin_traps_when_memory_capped() {
         max_memory_bytes: 1,
         max_table_elements: 100_000,
         max_instances: 64,
+        call_timeout: std::time::Duration::from_secs(30),
     };
     let scope = scope([]);
     let outcome = runtime::create_plugin(&fixture, &scope, capped).await;

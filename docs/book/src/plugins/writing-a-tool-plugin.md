@@ -417,7 +417,7 @@ Two operational constraints worth repeating from the
 | Tool registered but schema is a generic `input` object, name from manifest | The metadata probe failed at registration (the host substitutes the manifest name, description, and a fallback single-`input` schema; `wasm_tool.rs`). Check the log for the probe error; usually a component built against mismatched WIT. |
 | Tool never selected by the model | Name collides with a built-in, or the description/schema do not tell the model when the tool applies. |
 | `__config` absent despite configured section | Manifest lacks `config_read`, or the entry name does not match the manifest `name`. |
-| Call traps | Fuel or memory ceiling hit. Raise `plugins.limits.call_fuel` / `plugins.limits.max_memory_mb`, or do less per call. |
+| Call fails or traps | Fuel, wall-clock, or memory ceiling hit. Raise `plugins.limits.call_fuel`, `plugins.limits.call_timeout_ms`, or `plugins.limits.max_memory_mb` as appropriate, or do less per call. |
 | Load fails on a runtime-only host | You shipped `.wasm` to a host with no JIT; ship a version-matched `.cwasm` instead. |
 
 ## Next

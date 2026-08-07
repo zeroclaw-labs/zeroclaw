@@ -41,9 +41,10 @@ matches at once:
    exactly the set of host imports its world declares plus whatever its
    manifest permissions add, and nothing else.
 2. **Metered execution.** The engine is built with fuel metering enabled, and
-   every call gets a fresh fuel budget. A plugin that loops forever traps; it
+   every call gets a fresh fuel budget plus a wall-clock deadline that includes
+   awaited host work. A plugin that loops forever or waits forever fails; it
    cannot hang the agent. Memory, table, and instance ceilings are enforced by
-   a store limiter. All four bounds come from operator config
+   a store limiter. All five bounds come from operator config
    (`plugins.limits.*`) and are validated non-zero, and a store cannot be
    constructed without them, so no load path can produce an unsandboxed
    plugin.
@@ -127,7 +128,9 @@ Tool calls are stateless by construction: `WasmTool::execute` builds a fresh
 store, runs the call, and drops it. Channels and memory backends are stateful
 by nature, so they hold one warm store for the plugin's lifetime; the host
 refuels it before every call so a long-lived plugin gets a full budget per
-call rather than draining over time.
+call rather than draining over time. A deadline interruption discards the warm
+store instead of resuming partially unwound guest state. Channels recreate the
+instance on the next call; memory stays unavailable until its owner rebuilds it.
 
 The boundary is 32-bit: `wasm32-wasip2` is the only WASI Preview 2 target the
 Rust toolchain ships, and the component ABI lowers offsets as 32-bit
@@ -171,6 +174,7 @@ zeroclaw config set plugins.security.signature_mode strict
 
 # per-call sandbox limits
 zeroclaw config set plugins.limits.call_fuel 1000000000
+zeroclaw config set plugins.limits.call_timeout_ms 30000
 zeroclaw config set plugins.limits.max_memory_mb 256
 ```
 

@@ -8460,8 +8460,10 @@ impl Default for PluginSecurityConfig {
 ///
 /// Bounds a single plugin call so a runaway or malicious component traps
 /// instead of hanging the host or exhausting memory. `call_fuel` caps
-/// instructions per call; the memory, table, and instance ceilings bound a
-/// store's growth. Every value is operator-tunable and validated as non-zero.
+/// instructions per call; `call_timeout_ms` caps elapsed wall-clock time,
+/// including time awaiting async host imports; the memory, table, and instance
+/// ceilings bound a store's growth. Every value is operator-tunable and
+/// validated as non-zero.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "plugins.limits"]
@@ -8478,6 +8480,9 @@ pub struct PluginLimitsConfig {
     /// Maximum component instances a plugin store may create.
     #[serde(default = "default_plugin_max_instances")]
     pub max_instances: usize,
+    /// Wall-clock deadline for one plugin export call, in milliseconds.
+    #[serde(default = "default_plugin_call_timeout_ms")]
+    pub call_timeout_ms: u64,
 }
 
 fn default_plugin_call_fuel() -> u64 {
@@ -8496,6 +8501,10 @@ fn default_plugin_max_instances() -> usize {
     64
 }
 
+fn default_plugin_call_timeout_ms() -> u64 {
+    30_000
+}
+
 impl Default for PluginLimitsConfig {
     fn default() -> Self {
         Self {
@@ -8503,6 +8512,7 @@ impl Default for PluginLimitsConfig {
             max_memory_mb: default_plugin_max_memory_mb(),
             max_table_elements: default_plugin_max_table_elements(),
             max_instances: default_plugin_max_instances(),
+            call_timeout_ms: default_plugin_call_timeout_ms(),
         }
     }
 }
@@ -21504,6 +21514,13 @@ impl Config {
                 "plugins.limits.max_instances must be greater than 0; a zero ceiling rejects every plugin at instantiation"
             );
         }
+        if self.plugins.limits.call_timeout_ms == 0 {
+            validation_bail!(
+                InvalidNumericRange,
+                "plugins.limits.call_timeout_ms",
+                "plugins.limits.call_timeout_ms must be greater than 0; a zero deadline aborts every plugin call before it runs"
+            );
+        }
 
         Ok(())
     }
@@ -24650,6 +24667,32 @@ enabled = true
             .expect_err("zero call_fuel must be rejected");
         assert!(
             err.to_string().contains("plugins.limits.call_fuel"),
+            "error must name the offending path; got: {err}"
+        );
+    }
+
+    #[test]
+    async fn plugin_call_timeout_defaults_and_deserializes_compatibly() {
+        assert_eq!(PluginLimitsConfig::default().call_timeout_ms, 30_000);
+
+        let limits: PluginLimitsConfig =
+            toml::from_str("call_fuel = 42").expect("legacy limits deserialize");
+        assert_eq!(limits.call_fuel, 42);
+        assert_eq!(
+            limits.call_timeout_ms, 30_000,
+            "omitting the additive field keeps the host-safe default"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_zero_plugin_call_timeout() {
+        let mut config = Config::default();
+        config.plugins.limits.call_timeout_ms = 0;
+        let err = config
+            .validate()
+            .expect_err("zero call_timeout_ms must be rejected");
+        assert!(
+            err.to_string().contains("plugins.limits.call_timeout_ms"),
             "error must name the offending path; got: {err}"
         );
     }

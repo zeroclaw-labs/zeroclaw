@@ -381,7 +381,21 @@ log-record: func(level: log-level, event: plugin-event);
 
 The call is fire-and-forget: it returns nothing and the host
 (`component_logging.rs`) absorbs all errors, so a failed log write can never
-crash plugin execution. `plugin-action` and `plugin-outcome` mirror the closed
+crash plugin execution. Delivery is asynchronous: the import hands the record
+to a bounded host-side queue drained by a dedicated thread and returns without
+blocking, so a slow or wedged log consumer can never hold a guest export past
+`plugins.limits.call_timeout_ms`. Deferral does not change what an event
+means: each record captures the host span current at the guest call site and
+is written inside that scope, so agent/channel/tool attribution and the
+terminal label match inline emission. The bound is a real memory bound, because
+the event fields are unbounded strings copied to host memory outside the
+guest's `max_memory_mb` ceiling: a record whose guest-controlled bytes exceed
+64 KiB is dropped rather than truncated, and queued records draw on a fixed
+8 MiB aggregate byte budget that is released only after a record is written.
+A full queue, an over-cap record, or an exhausted budget all drop the newest
+record; the drain thread reports the accumulated drop count after each write
+and on an idle wake, so the loss stays observable even when no accepted
+record ever follows the rejected ones. `plugin-action` and `plugin-outcome` mirror the closed
 `Action` / `EventOutcome` taxonomies in `zeroclaw-log`; there is no escape-hatch
 variant on purpose. Do not call `wasi:logging` directly, plugin events would be
 formatted inconsistently and would not reach all of the destinations
@@ -434,20 +448,31 @@ the cranelift compiler is in the build, not off pulley.
 
 ### Per-call execution limits
 
-Every plugin call runs under per-call resource limits the host applies to the
+Every guest export runs under per-call resource limits the host applies to the
 store. The engine enables fuel metering, and each call is given a fresh fuel
-budget so a runaway or malicious component traps instead of hanging the host. A
+budget so a runaway or malicious component traps instead of hanging the host.
+The host also applies a wall-clock deadline around the complete export future,
+including time awaiting async host imports such as `wasi:http`; periodic fuel
+yields ensure uninterrupted guest computation cannot starve that timer, and
+guest-reachable host imports never block the executor (log records are handed
+to a bounded queue and written by a dedicated host thread), so the deadline
+stays observable while host work runs. A
 `StoreLimits` ceiling bounds linear memory, table elements, and instance count.
 The tool world gets a fresh store per execute; the warm channel and memory
 stores are refueled before each call so a long-lived plugin gets a fresh budget
 rather than draining over its lifetime.
 
-The four bounds are operator-tunable and every value is validated as non-zero:
+The five bounds are operator-tunable and every value is validated as non-zero:
 `plugins.limits.call_fuel` (default 1,000,000,000 instruction units),
+`plugins.limits.call_timeout_ms` (default 30,000 milliseconds),
 `plugins.limits.max_memory_mb` (default 256), `plugins.limits.max_table_elements`
 (default 100,000), and `plugins.limits.max_instances` (default 64). A store can
 only be built with explicit limits, so no load path can construct an
-unsandboxed plugin. The canonical fields and defaults live in the
+unsandboxed plugin. Guest `wasi:http` request options may end a call sooner but
+cannot extend the host deadline. An interrupted warm store is never resumed:
+channels recreate it from host-owned inputs on the next call, while memory
+instances remain unavailable until their owner rebuilds them. The canonical
+fields and defaults live in the
 [Config reference](../reference/index.md).
 
 ### 32-bit address space (wasip2 is wasm32)

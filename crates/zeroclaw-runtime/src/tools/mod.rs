@@ -1501,6 +1501,9 @@ pub fn all_tools_with_runtime(
                             .saturating_mul(1024 * 1024),
                         max_table_elements: config.plugins.limits.max_table_elements,
                         max_instances: config.plugins.limits.max_instances,
+                        call_timeout: std::time::Duration::from_millis(
+                            config.plugins.limits.call_timeout_ms,
+                        ),
                     };
                     for (manifest, wasm_path) in details {
                         let plugin_config = config

@@ -4,6 +4,7 @@ use anyhow::Result;
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 use wasmtime::component::{Component, ResourceTable};
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
@@ -69,6 +70,8 @@ pub struct PluginLimits {
     pub max_memory_bytes: usize,
     pub max_table_elements: usize,
     pub max_instances: usize,
+    /// Wall-clock ceiling for one guest export, including awaited host work.
+    pub call_timeout: Duration,
 }
 
 #[cfg(test)]
@@ -78,6 +81,7 @@ pub(crate) fn test_limits(call_fuel: u64) -> PluginLimits {
         max_memory_bytes: 1024 * 1024,
         max_table_elements: 100,
         max_instances: 10,
+        call_timeout: Duration::from_secs(30),
     }
 }
 
@@ -159,7 +163,11 @@ pub struct PluginState {
     inbound: InboundQueue,
     limits: StoreLimits,
     fuel_per_call: u64,
+    call_timeout: Duration,
 }
+
+/// Warm component state held between export calls.
+pub(crate) type WarmPluginState<Bindings> = Option<(Store<PluginState>, Bindings)>;
 
 impl PluginState {
     /// Build store state from one typed, host-issued specification.
@@ -182,6 +190,7 @@ impl PluginState {
                 .instances(spec.limits.max_instances)
                 .build(),
             fuel_per_call: spec.limits.call_fuel,
+            call_timeout: spec.limits.call_timeout,
         }
     }
 
@@ -199,6 +208,11 @@ impl PluginState {
     /// The inbound queue this plugin drains. Host code holds a clone to enqueue.
     pub(crate) fn inbound(&self) -> &InboundQueue {
         &self.inbound
+    }
+
+    /// Host-owned wall-clock ceiling for one guest export call.
+    pub(crate) fn call_timeout(&self) -> Duration {
+        self.call_timeout
     }
 }
 
@@ -271,6 +285,14 @@ pub(crate) fn new_store(spec: PluginStoreSpec) -> Store<PluginState> {
     let mut store = Store::new(engine(), state);
     store.limiter(|state| &mut state.limits);
     set_call_fuel(&mut store, call_fuel);
+    // Tokio deadlines can only be observed while the Wasmtime future yields.
+    // All host imports are async; this additionally prevents uninterrupted
+    // guest computation from starving the deadline until its full fuel budget
+    // is exhausted. Invariant: `engine()` unconditionally enables fuel and the
+    // interval literal is non-zero, which are the only documented error cases.
+    store
+        .fuel_async_yield_interval(Some(100_000))
+        .expect("plugin engine enables fuel and async yield interval is non-zero");
     store
 }
 
@@ -289,6 +311,21 @@ pub fn refuel(store: &mut Store<PluginState>) {
 
 pub fn wt<T>(r: wasmtime::Result<T>, ctx: &'static str) -> Result<T> {
     r.map_err(|e| anyhow::Error::msg(format!("{ctx}: {e}")))
+}
+
+/// Error returned when a guest export exceeds its host-owned wall-clock bound.
+pub(crate) fn call_timeout_error(deadline: Duration) -> anyhow::Error {
+    anyhow::Error::msg(format!(
+        "plugin call exceeded wall-clock deadline of {} ms",
+        deadline.as_millis()
+    ))
+}
+
+/// Error returned after an interrupted warm instance has been discarded.
+pub(crate) fn unavailable_instance_error() -> anyhow::Error {
+    anyhow::Error::msg(
+        "plugin instance is unavailable: a previous call was interrupted before completion",
+    )
 }
 
 /// Hint appended to instantiation failures, pointing plugin authors at the
@@ -329,18 +366,82 @@ fn load_inner(wasm_path: &Path) -> wasmtime::Result<Component> {
     unsafe { Component::deserialize_file(engine(), wasm_path) }
 }
 
-/// Run an async call against a warm mutex-protected `(Store, bindings)` pair,
-/// holding the store lock for the duration of the single component call.
+/// Run one guest export against a warm instance.
+///
+/// Ownership is moved out of the shared slot before awaiting. If the deadline
+/// fires, or if the caller cancels and drops this future, the in-flight
+/// Wasmtime future is dropped and unwound before the store is discarded. The
+/// interrupted store is therefore never resumed.
 macro_rules! call_plugin {
     ($self:expr, $body:expr) => {{
         let mut guard = $self.state.lock().await;
-        let (ref mut store, ref mut bindings) = *guard;
-        crate::component::refuel(store);
-        let f = $body;
-        f(store, bindings).await
+        match guard.take() {
+            None => Err(crate::component::unavailable_instance_error()),
+            Some((mut store, mut bindings)) => {
+                crate::component::refuel(&mut store);
+                let deadline = store.data().call_timeout();
+                let f = $body;
+                match ::tokio::time::timeout(deadline, f(&mut store, &mut bindings)).await {
+                    Ok(result) => {
+                        *guard = Some((store, bindings));
+                        result
+                    }
+                    Err(_) => Err(crate::component::call_timeout_error(deadline)),
+                }
+            }
+        }
     }};
 }
 pub(crate) use call_plugin;
+
+/// Run one guest export on an owned store during instantiation/probing.
+///
+/// A timed-out or externally cancelled constructor drops its local store, so
+/// there is no warm slot to poison.
+macro_rules! call_store {
+    ($store:expr, $body:expr) => {{
+        crate::component::refuel(&mut $store);
+        let deadline = $store.data().call_timeout();
+        let f = $body;
+        match ::tokio::time::timeout(deadline, f(&mut $store)).await {
+            Ok(result) => result,
+            Err(_) => Err(crate::component::call_timeout_error(deadline)),
+        }
+    }};
+}
+pub(crate) use call_store;
+
+/// Channel warm calls use the same discard-on-interruption rule as other warm
+/// instances, then reconstruct from host-owned inputs on the next call.
+macro_rules! call_channel {
+    ($self:expr, $body:expr) => {{
+        'plugin_call: {
+            let mut guard = $self.state.lock().await;
+            if guard.is_none() {
+                match $self.reinstantiate().await {
+                    Ok(pair) => *guard = Some(pair),
+                    Err(error) => break 'plugin_call Err(error),
+                }
+            }
+            let Some((mut store, mut bindings)) = guard.take() else {
+                break 'plugin_call Err(crate::component::unavailable_instance_error());
+            };
+            crate::component::refuel(&mut store);
+            let deadline = store.data().call_timeout();
+            let f = $body;
+            match ::tokio::time::timeout(deadline, f(&mut store, &mut bindings)).await {
+                Ok(result) => {
+                    *guard = Some((store, bindings));
+                    break 'plugin_call result;
+                }
+                Err(_) => {
+                    break 'plugin_call Err(crate::component::call_timeout_error(deadline));
+                }
+            }
+        }
+    }};
+}
+pub(crate) use call_channel;
 
 #[cfg(test)]
 mod tests {
@@ -564,6 +665,14 @@ mod tests {
             500,
             "refuel must reset a drained warm store to the configured per-call budget"
         );
+    }
+
+    #[test]
+    fn store_enables_periodic_async_fuel_yields() {
+        let mut store = new_store(spec([], 500));
+        store
+            .fuel_async_yield_interval(Some(100_000))
+            .expect("plugin stores support async fuel yields");
     }
 
     #[test]

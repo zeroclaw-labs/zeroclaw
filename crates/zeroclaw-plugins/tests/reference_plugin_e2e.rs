@@ -114,6 +114,7 @@ async fn reference_plugin_end_to_end_from_throwaway_config() {
             max_memory_bytes: 256 * 1024 * 1024,
             max_table_elements: 100_000,
             max_instances: 64,
+            call_timeout: std::time::Duration::from_secs(30),
         },
     )
     .await
