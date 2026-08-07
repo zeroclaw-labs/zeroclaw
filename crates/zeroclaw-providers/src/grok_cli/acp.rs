@@ -645,11 +645,11 @@ where
                     } else {
                         handle_server_request_cancelled(stdin, &message).await?;
                     }
-                } else if message.get(field::METHOD).is_some() {
-                    if session_matches(&message, session_id) {
-                        discard_non_final_output(&message, assistant);
-                        append_agent_message_chunk(&message, assistant)?;
-                    }
+                } else if message.get(field::METHOD).is_some()
+                    && session_matches(&message, session_id)
+                {
+                    discard_non_final_output(&message, assistant);
+                    append_agent_message_chunk(&message, assistant)?;
                 }
             }
         }
