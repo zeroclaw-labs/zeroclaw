@@ -1370,9 +1370,11 @@ pub enum SessionUpdateEvent {
         timeout_secs: u64,
     },
     /// Per-LLM-call token usage. `input_tokens` is the cumulative context size
-    /// for this turn; `max_context_tokens` is the runtime-profile context
-    /// budget (`[runtime_profiles.<name>] max_context_tokens`). Both may be
-    /// absent when the provider doesn't report usage.
+    /// for this turn; `max_context_tokens` is the effective pre-dispatch context
+    /// budget — the runtime-profile `[runtime_profiles.<name>] max_context_tokens`
+    /// after the optional `history_pruning.max_tokens` floor is applied (see
+    /// `Config::effective_context_budget`), which may be lower than the raw
+    /// profile value. Both may be absent when the provider doesn't report usage.
     ///
     /// When `estimated` is true the `input_tokens` value is a pre-dispatch
     /// estimate derived from the prepared payload, not a provider-reported

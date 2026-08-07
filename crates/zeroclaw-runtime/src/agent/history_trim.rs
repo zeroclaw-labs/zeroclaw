@@ -255,9 +255,15 @@ fn count_turns(history: &[ChatMessage]) -> usize {
 
 /// Public wrapper over the whole-turn count, for callers outside this module
 /// that need the kept-turn figure after a [`drop_oldest_turn`] pass.
+///
+/// When `has_leading_breadcrumb` is set, a synthetic trim breadcrumb occupies
+/// the first non-system slot and is counted as a turn boundary by
+/// [`count_turns`]; discount it so `kept_turns` reflects only real retained
+/// turns. Provenance comes from the caller, not the breadcrumb's text, so a
+/// real user message with the same content is still counted as a real turn.
 #[must_use]
-pub fn count_turns_pub(history: &[ChatMessage]) -> usize {
-    count_turns(history)
+pub fn count_turns_pub(history: &[ChatMessage], has_leading_breadcrumb: bool) -> usize {
+    count_turns(history).saturating_sub(usize::from(has_leading_breadcrumb))
 }
 
 /// Drop the single oldest whole non-system turn in place, keeping leading
@@ -305,16 +311,26 @@ pub fn breadcrumb() -> ChatMessage {
 
 /// Insert the trim breadcrumb after the leading system messages, unless one is
 /// already sitting there.
-pub fn insert_breadcrumb_deduped(history: &mut Vec<ChatMessage>) {
+///
+/// Returns `true` when a synthetic breadcrumb was inserted by this call. It is
+/// `false` when the head slot already holds a matching message and insertion is
+/// skipped — that message may be an earlier synthetic breadcrumb *or* a real
+/// user message that happens to carry the same localized text. Callers must not
+/// treat a `false` return as "a synthetic breadcrumb is present": they carry the
+/// provenance forward from the call that actually inserted one (see
+/// `has_leading_breadcrumb` in the turn loop), so a user-authored
+/// breadcrumb-equivalent message is never mistaken for the synthetic one.
+pub fn insert_breadcrumb_deduped(history: &mut Vec<ChatMessage>) -> bool {
     let system_count = history.iter().take_while(|m| is_system(m)).count();
     let crumb = breadcrumb();
     let already_present = history
         .get(system_count)
         .is_some_and(|m| m.role == crumb.role && m.content == crumb.content);
     if already_present {
-        return;
+        return false;
     }
     history.insert(system_count, crumb);
+    true
 }
 
 /// Insert the trim breadcrumb into structured history after leading system
@@ -1076,5 +1092,73 @@ mod tests {
         assert_eq!(h[1].role, "system");
         assert_eq!(h[2].role, breadcrumb().role);
         assert_eq!(h[2].content, breadcrumb().content);
+    }
+
+    #[test]
+    fn insert_breadcrumb_deduped_reports_whether_it_inserted() {
+        let mut h = vec![sys("system"), user("turn1"), asst("a1")];
+        assert!(
+            insert_breadcrumb_deduped(&mut h),
+            "the first insertion reports that a synthetic breadcrumb was added"
+        );
+        assert!(
+            !insert_breadcrumb_deduped(&mut h),
+            "a dedup skip reports that this call added no synthetic breadcrumb"
+        );
+    }
+
+    #[test]
+    fn insert_breadcrumb_deduped_skip_does_not_claim_user_authored_match() {
+        // A real user message that happens to carry the breadcrumb's localized
+        // text sits at the head — no synthetic breadcrumb has been inserted.
+        let crumb_text = breadcrumb().content;
+        let mut h = vec![
+            sys("system"),
+            ChatMessage::user(crumb_text.as_str()),
+            asst("a1"),
+            user("turn2"),
+            asst("a2"),
+        ];
+        let before = h.len();
+        assert!(
+            !insert_breadcrumb_deduped(&mut h),
+            "an existing matching message must not be treated as an insertion"
+        );
+        assert_eq!(h.len(), before, "nothing is inserted behind the match");
+        // With provenance = false, that message is an ordinary droppable turn.
+        let dropped =
+            drop_oldest_turn(&mut h, false).expect("two real turns remain, so the oldest drops");
+        assert_eq!(
+            dropped, 2,
+            "the breadcrumb-equivalent user turn and its reply are dropped like any real turn"
+        );
+        assert_eq!(
+            h[1].content, "turn2",
+            "the surviving turn is the newer real one, not a protected pseudo-breadcrumb"
+        );
+    }
+
+    #[test]
+    fn count_turns_pub_discounts_synthetic_breadcrumb_by_provenance() {
+        let mut h = vec![
+            sys("system"),
+            user("turn1"),
+            asst("a1"),
+            user("turn2"),
+            asst("a2"),
+        ];
+        let real_turns = count_turns_pub(&h, false);
+        assert_eq!(real_turns, 2);
+        assert!(insert_breadcrumb_deduped(&mut h));
+        assert_eq!(
+            count_turns_pub(&h, true),
+            real_turns,
+            "a synthetic breadcrumb is discounted from the kept-turn figure"
+        );
+        assert_eq!(
+            count_turns_pub(&h, false),
+            real_turns + 1,
+            "without provenance the same breadcrumb would be over-counted as a real turn"
+        );
     }
 }

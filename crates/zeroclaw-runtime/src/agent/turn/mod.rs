@@ -264,22 +264,22 @@ impl<'a> TurnState<'a> {
     }
 
     /// Trim history to the given token budget, writing the result back
-    /// into `self.history`.  Returns the trim metadata so the caller can
-    /// emit log/observer events (the returned `history` field is empty —
-    /// it was consumed by the assignment to `self.history`).
+    /// into `self.history`.  Returns the trim metadata plus whether this call
+    /// inserted a synthetic breadcrumb, so the caller can carry breadcrumb
+    /// provenance forward and emit log/observer events (the returned `history`
+    /// field is empty — it was consumed by the assignment to `self.history`).
     fn trim_to_budget(
         &mut self,
         context_token_budget: usize,
-    ) -> crate::agent::history_trim::TrimResult {
+    ) -> (crate::agent::history_trim::TrimResult, bool) {
         let taken = std::mem::take(self.history);
         let mut result =
             crate::agent::history_trim::trim_to_recent_turns(taken, context_token_budget);
         let mut history = std::mem::take(&mut result.history);
-        if result.trimmed {
-            crate::agent::history_trim::insert_breadcrumb_deduped(&mut history);
-        }
+        let inserted_breadcrumb =
+            result.trimmed && crate::agent::history_trim::insert_breadcrumb_deduped(&mut history);
         *self.history = history;
-        result
+        (result, inserted_breadcrumb)
     }
 }
 
@@ -553,10 +553,12 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     )
                 );
             }
-            let result = turn_state.trim_to_budget(context_token_budget);
+            let (result, inserted_breadcrumb) = turn_state.trim_to_budget(context_token_budget);
             if result.trimmed {
-                // trim_to_budget inserts the synthetic breadcrumb when it trims.
-                has_leading_breadcrumb = true;
+                // Carry provenance from the actual insertion: a trim that skipped
+                // inserting because a real user message already matched the
+                // breadcrumb text must not mark that message as synthetic.
+                has_leading_breadcrumb |= inserted_breadcrumb;
                 {
                     let __zc_trim_span = ::zeroclaw_log::info_span!(
                         target: "zeroclaw_log_internal_scope",
@@ -740,14 +742,18 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                         );
                         return Err(anyhow::Error::msg(remediation));
                     };
-                    crate::agent::history_trim::insert_breadcrumb_deduped(turn_state.history);
-                    has_leading_breadcrumb = true;
+                    // Carry provenance from the actual insertion, so a dedup
+                    // skip against a real breadcrumb-equivalent message does not
+                    // mark that message as synthetic.
+                    has_leading_breadcrumb |=
+                        crate::agent::history_trim::insert_breadcrumb_deduped(turn_state.history);
                     if let Some(tx) = event_tx.as_ref() {
                         let _ = tx
                             .send(TurnEvent::HistoryTrimmed {
                                 dropped_messages,
                                 kept_turns: crate::agent::history_trim::count_turns_pub(
                                     turn_state.history,
+                                    has_leading_breadcrumb,
                                 ),
                                 reason: crate::i18n::get_required_cli_string(
                                     "history-trim-reason-multimodal-budget",
@@ -760,6 +766,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                             dropped_messages,
                             kept_turns: crate::agent::history_trim::count_turns_pub(
                                 turn_state.history,
+                                has_leading_breadcrumb,
                             ),
                             reason: crate::i18n::get_required_cli_string(
                                 "history-trim-reason-multimodal-budget",
