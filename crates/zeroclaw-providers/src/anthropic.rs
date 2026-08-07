@@ -1254,7 +1254,19 @@ impl AnthropicModelProvider {
                     // this data:application/json;base64,… decode to?"). The tool
                     // arm still sweeps unconditionally: its input is machine
                     // output, not something a person typed.
-                    let swept = if crate::multimodal::carries_image_marker(&msg.content) {
+                    //
+                    // The test is on `text`, the *cleaned* content, not on
+                    // `msg.content`. `parse_image_markers` lifts a loadable marker
+                    // out whole, so its payload is already gone from `text` and
+                    // its prefix with it; only the two shapes that can leave
+                    // residue — an unterminated marker, and a terminated one whose
+                    // reference will not load — are copied through verbatim, and
+                    // both keep the `[IMAGE:` prefix. Testing the raw message
+                    // instead opened the gate for the entire text of any message
+                    // that merely attached an image, so a quoted data URI sitting
+                    // beside a working attachment was swept — the exact case this
+                    // gate exists to prevent, one message shape over.
+                    let swept = if crate::multimodal::carries_image_marker(&text) {
                         Self::sweep_residual_image_data(&text)
                     } else {
                         Cow::Borrowed(text.as_str())
@@ -1591,6 +1603,13 @@ impl AnthropicModelProvider {
     /// user message, which changes no roles, or inserts a user message between the
     /// assistant turn that made the call and a message that is not user-role, so
     /// it cannot create an adjacent pair.
+    /// Merging two assistant turns concatenates their blocks, so the later
+    /// turn's `thinking` lands behind the earlier turn's `tool_use`. Anthropic
+    /// requires an assistant message to *start* with `thinking` when extended
+    /// thinking is on — see [`Self::parse_assistant_tool_call_message`] — and
+    /// rejects the request otherwise, so a merge that fixed the role alternation
+    /// would have traded one 400 for another. [`Self::move_thinking_first`]
+    /// restores the ordering on the message that was actually merged into.
     fn merge_adjacent_same_role(messages: &mut Vec<NativeMessage>) {
         let mut idx = 1;
         while idx < messages.len() {
@@ -1600,7 +1619,36 @@ impl AnthropicModelProvider {
             }
             let merged = messages.remove(idx);
             messages[idx - 1].content.extend(merged.content);
+            if messages[idx - 1].role == "assistant" {
+                Self::move_thinking_first(&mut messages[idx - 1]);
+            }
         }
+    }
+
+    /// Hoist one message's `thinking` blocks ahead of every other block,
+    /// preserving relative order within each group. A no-op when they already
+    /// are, which is every message this converter builds without merging.
+    ///
+    /// Reordering keeps each block's `signature` with its own `thinking` text,
+    /// which is what Anthropic verifies; it does not rewrite either. The reasoning
+    /// of two turns does end up adjacent, and the second turn's reasoning no
+    /// longer sits directly before the calls it produced. That ordering is already
+    /// lost the moment two assistant turns become one message, and the merge only
+    /// happens where the alternative is a request the API refuses outright.
+    fn move_thinking_first(message: &mut NativeMessage) {
+        let out_of_order = message
+            .content
+            .iter()
+            .skip_while(|block| matches!(block, NativeContentOut::Thinking { .. }))
+            .any(|block| matches!(block, NativeContentOut::Thinking { .. }));
+        if !out_of_order {
+            return;
+        }
+        let (thinking, others): (Vec<NativeContentOut>, Vec<NativeContentOut>) =
+            std::mem::take(&mut message.content)
+                .into_iter()
+                .partition(|block| matches!(block, NativeContentOut::Thinking { .. }));
+        message.content = thinking.into_iter().chain(others).collect();
     }
 
     /// Pair any orphaned `tool_use` with a stub `tool_result` so interrupted
@@ -4676,6 +4724,84 @@ data: {\"type\":\"message_stop\"}\n\n";
         );
     }
 
+    /// Merging two assistant turns must not leave `thinking` behind `tool_use`.
+    ///
+    /// Anthropic requires an assistant message to start with `thinking` when
+    /// extended thinking is on. Concatenating the two turns' blocks put the second
+    /// turn's reasoning after the first turn's calls — `[thinking, tool_use,
+    /// tool_use, thinking, tool_use]` — so the merge that fixed the role
+    /// alternation drew a 400 of its own.
+    ///
+    /// Two open calls are what forces the drop: with one, the stray carrier's id
+    /// is recovered from history and no merge happens at all.
+    #[test]
+    fn merging_assistant_turns_keeps_thinking_blocks_first() {
+        let thinking = |text: &str, sig: &str| {
+            serde_json::json!({"type": "thinking", "thinking": text, "signature": sig}).to_string()
+        };
+        let messages = vec![
+            ChatMessage::user("go"),
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": "",
+                    "reasoning_content": thinking("first", "sig_a"),
+                    "tool_calls": [
+                        {"id": "toolu_a", "name": "shell", "arguments": "{}"},
+                        {"id": "toolu_b", "name": "shell", "arguments": "{}"}
+                    ]
+                })
+                .to_string(),
+            ),
+            ChatMessage::tool("stray output".to_string()),
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": "",
+                    "reasoning_content": thinking("second", "sig_b"),
+                    "tool_calls": [{"id": "toolu_c", "name": "shell", "arguments": "{}"}]
+                })
+                .to_string(),
+            ),
+        ];
+
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let wire = serde_json::to_value(&native_msgs).expect("serialize native messages");
+
+        for message in wire.as_array().expect("messages") {
+            if message["role"] != "assistant" {
+                continue;
+            }
+            let types: Vec<&str> = message["content"]
+                .as_array()
+                .expect("content blocks")
+                .iter()
+                .map(|block| block["type"].as_str().unwrap_or("?"))
+                .collect();
+            let after_thinking = types
+                .iter()
+                .position(|kind| *kind != "thinking")
+                .unwrap_or(types.len());
+            assert!(
+                !types[after_thinking..].contains(&"thinking"),
+                "an assistant message must start with its thinking blocks: {types:?}"
+            );
+        }
+
+        // Hoisting reorders; it must not drop reasoning or pair it with the wrong
+        // signature.
+        let serialized = wire.to_string();
+        for (text, signature) in [("first", "sig_a"), ("second", "sig_b")] {
+            assert!(
+                serialized.contains(text) && serialized.contains(signature),
+                "merging must keep both turns' reasoning and signatures: {serialized}"
+            );
+        }
+        assert!(
+            roles_alternate(&native_msgs),
+            "the merge must still do its own job: {:?}",
+            roles_on_the_wire(&native_msgs)
+        );
+    }
+
     #[tokio::test]
     async fn anthropic_factory_forwards_timeout_to_native_provider() {
         use crate::ModelProviderRuntimeOptions;
@@ -6023,6 +6149,52 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert!(
             !wire.contains("[truncated inline data removed]"),
             "nothing was truncated, so nothing may claim it was: {wire}"
+        );
+    }
+
+    /// A quoted data URI survives even when the *same message* also attaches a
+    /// working image.
+    ///
+    /// The sweep gate reads the cleaned text, not the raw message. A loadable
+    /// marker is lifted out whole by `parse_image_markers`, taking its `[IMAGE:`
+    /// prefix with it, so an attachment alone leaves nothing residual behind and
+    /// must not open the gate for the prose around it. Gating on the raw message
+    /// did open it, and this exact message came back as "here is my shot — also
+    /// what does [truncated inline data removed] decode to?".
+    #[test]
+    fn a_working_attachment_does_not_sweep_the_prose_beside_it() {
+        let quoted = format!("data:application/json;base64,{CANONICAL_PNG_B64}");
+        let messages = vec![ChatMessage::user(format!(
+            "here is my shot [IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}] \
+             — also what does {quoted} decode to?"
+        ))];
+
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let wire = serde_json::to_value(&native_msgs).expect("serialize");
+
+        let text = wire[0]["content"]
+            .as_array()
+            .expect("content blocks")
+            .iter()
+            .filter_map(|block| block["text"].as_str())
+            .collect::<String>();
+        assert!(
+            text.contains(&quoted),
+            "the quoted URI is the question; sweeping it makes the question \
+             unanswerable: {text}"
+        );
+        assert!(
+            !text.contains(TRUNCATED_DATA_NOTE),
+            "nothing in the prose was residue, so nothing may claim it was: {text}"
+        );
+        // The attachment itself still arrives as an image block, not as text.
+        assert!(
+            wire[0]["content"]
+                .as_array()
+                .expect("content blocks")
+                .iter()
+                .any(|block| block["type"] == "image"),
+            "the marker must still deliver its image: {wire}"
         );
     }
 
