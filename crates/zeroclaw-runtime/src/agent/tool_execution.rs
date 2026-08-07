@@ -700,6 +700,122 @@ mod tests {
         );
     }
 
+    /// Stands in for `tool_search`: activates a deferred tool part-way through a
+    /// response, so the call after it attempts something the active step denies.
+    struct ActivatingTool {
+        activated: Arc<Mutex<ActivatedToolSet>>,
+        activates: String,
+        target: Arc<dyn Tool>,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for ActivatingTool {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::System
+        }
+        fn alias(&self) -> &str {
+            "test-activating-tool"
+        }
+    }
+
+    #[async_trait]
+    impl Tool for ActivatingTool {
+        fn name(&self) -> &str {
+            "activator"
+        }
+
+        fn description(&self) -> &str {
+            "Activates a deferred tool, as tool_search does"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<zeroclaw_api::tool::ToolResult> {
+            match self.activated.lock() {
+                Ok(mut set) => set.activate(self.activates.clone(), Arc::clone(&self.target)),
+                Err(poisoned) => poisoned
+                    .into_inner()
+                    .activate(self.activates.clone(), Arc::clone(&self.target)),
+            }
+            Ok(zeroclaw_api::tool::ToolResult {
+                success: true,
+                output: String::from("activated").into(),
+                error: None,
+            })
+        }
+    }
+
+    /// The dispatch context is built once for a whole response, so the exclusion
+    /// slice it carries predates anything that response activates. A step that
+    /// denies `sop_execute` — every step does, it is a SOP control tool — must
+    /// still refuse it when an earlier call in the SAME response activated it;
+    /// re-deriving only for the next provider request is one call too late.
+    #[tokio::test]
+    async fn a_tool_activated_mid_response_cannot_escape_the_step_scope() {
+        let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
+        let denied_calls = Arc::new(AtomicUsize::new(0));
+        let denied: Arc<dyn Tool> =
+            Arc::new(CountingTool::new("sop_execute", Arc::clone(&denied_calls)));
+        let registry: Vec<Box<dyn Tool>> = vec![Box::new(ActivatingTool {
+            activated: Arc::clone(&activated),
+            activates: "sop_execute".to_string(),
+            target: Arc::clone(&denied),
+        })];
+
+        let meta = crate::agent::turn::TurnMeta {
+            parent_agent_alias: None,
+            agent_alias: None,
+            turn_id: "test-turn-id",
+            channel_name: "test",
+        };
+        let calls = vec![parsed_tool_call("activator"), parsed_tool_call("sop_execute")];
+        let scope = crate::sop::active_scope::HeadlessStepScope {
+            run_id: "run-1".into(),
+            step: crate::sop::types::SopStep::default(),
+            config: zeroclaw_config::schema::SopConfig::default(),
+        };
+        let excluded: Vec<String> = Vec::new();
+
+        let outcomes = crate::sop::active_scope::with_active_headless_step_scope(scope, async {
+            super::execute_tools_sequential(
+                &calls,
+                ToolDispatchContext {
+                    tools_registry: &registry,
+                    activated_tools: Some(&activated),
+                    excluded_tools: &excluded,
+                    model_switch_callback: None,
+                },
+                &meta,
+                &NoopObserver,
+                None,
+                None,
+                None,
+            )
+            .await
+        })
+        .await
+        .expect("sequential dispatch completes");
+
+        assert_eq!(
+            denied_calls.load(Ordering::SeqCst),
+            0,
+            "a tool the step denies must not execute, even when a call earlier in \
+             the same response activated it"
+        );
+        let second = outcomes[1]
+            .as_ref()
+            .expect("the second call produced an outcome");
+        assert!(
+            !second.success,
+            "the denied tool must be refused, got: {}",
+            second.output
+        );
+    }
+
     #[tokio::test]
     async fn execute_one_tool_blocks_excluded_activated_suffix_resolution() {
         let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
