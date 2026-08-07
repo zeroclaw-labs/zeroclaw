@@ -210,9 +210,18 @@ pub fn trim_to_reported_budget(
     history: Vec<ChatMessage>,
     budget_tokens: usize,
     reported_input_tokens: usize,
+    // Estimated token count of the exact message population that produced
+    // `reported_input_tokens` (the pre-request `prepared_messages`, before any
+    // assistant/tool-result output for this iteration was appended to
+    // `history`). Scaling the selection target against this measured population
+    // keeps it consistent with the calibration ratio used for `tokens_after`;
+    // re-estimating the larger post-append `history` here would select more
+    // retention than the calibration justifies and let the final history
+    // overrun the budget.
+    reported_population_estimated: usize,
     tool_schema_tokens: usize,
 ) -> TrimResult {
-    let estimated = estimate_history_tokens(&history) + tool_schema_tokens;
+    let estimated = reported_population_estimated;
     if budget_tokens == 0 || reported_input_tokens <= budget_tokens || estimated == 0 {
         let total_turns = count_turns(&history);
         return TrimResult {
@@ -920,7 +929,7 @@ mod tests {
         let estimated = estimate_history_tokens(&h);
         let reported = estimated * 4;
         let budget = reported / 2;
-        let r = trim_to_reported_budget(h, budget, reported, 0);
+        let r = trim_to_reported_budget(h, budget, reported, estimated, 0);
         assert!(
             r.trimmed,
             "must trim when provider-reported tokens exceed budget"
@@ -933,7 +942,7 @@ mod tests {
     fn reported_budget_no_trim_when_real_tokens_fit() {
         let h = vec![sys("system"), user("hi"), asst("hello")];
         let estimated = estimate_history_tokens(&h);
-        let r = trim_to_reported_budget(h, estimated * 4, estimated, 0);
+        let r = trim_to_reported_budget(h, estimated * 4, estimated, estimated, 0);
         assert!(!r.trimmed);
     }
 
@@ -950,7 +959,7 @@ mod tests {
         let estimated = estimate_history_tokens(&h);
         let reported = estimated * 5000;
         let budget = reported / 100;
-        let r = trim_to_reported_budget(h, budget, reported, 0);
+        let r = trim_to_reported_budget(h, budget, reported, estimated, 0);
         assert!(r.trimmed, "extreme ratio must still enforce, not no-op");
         assert!(r.history.iter().any(|m| m.content.contains("recent short")));
     }
@@ -994,7 +1003,7 @@ mod tests {
         let budget = reported / 2;
         assert!(budget > tool_tokens, "budget must leave headroom for tools");
 
-        let r = trim_to_reported_budget(h, budget, reported, tool_tokens);
+        let r = trim_to_reported_budget(h, budget, reported, estimated, tool_tokens);
         assert!(
             r.trimmed,
             "must trim when reported population exceeds budget"
@@ -1009,6 +1018,60 @@ mod tests {
             "tokens_after must cover the full provider population, tool schemas included"
         );
         assert!(r.history.iter().any(|m| m.content.contains("turn3 short")));
+    }
+
+    #[test]
+    fn reported_budget_calibrates_selection_against_the_measured_population() {
+        // `reported_population_estimated` describes the population that produced
+        // `reported` — the pre-request transcript. `history` here is the
+        // already-appended transcript (the provider calls back with a larger
+        // estimate after the assistant/tool output was added). The selection
+        // target must scale from the MEASURED population, not from the fresher,
+        // larger post-append estimate, or the retained set would exceed the
+        // budget once calibrated.
+        let big = "x".repeat(2000);
+        // The measured (pre-request) population: several substantial turns so
+        // there is plenty of room to trim toward the budget.
+        let mut measured = vec![sys("system")];
+        for i in 0..8 {
+            measured.push(user(format!("m{i} {big}").as_str()));
+            measured.push(asst(format!("a{i}").as_str()));
+        }
+        let reported = estimate_history_tokens(&measured) * 4;
+        let budget = reported / 2;
+        let measured_population_estimated = estimate_history_tokens(&measured);
+
+        // Post-request append: this iteration's assistant output lands on the
+        // same transcript `trim_to_reported_budget` sees, making it larger than
+        // the measured population — but small enough that the newest whole turn
+        // still fits the post-trim target (no oversized-turn exception).
+        let appended = "y".repeat(400);
+        let mut history = measured;
+        history.push(ChatMessage::assistant(&appended));
+        assert!(
+            estimate_history_tokens(&history) > measured_population_estimated,
+            "the appended output must make the post-append estimate the larger one"
+        );
+
+        let r =
+            trim_to_reported_budget(history, budget, reported, measured_population_estimated, 0);
+        assert!(r.trimmed, "must trim when reported exceeds budget");
+        assert!(
+            r.tokens_after <= budget,
+            "selection must not outpace the calibration ratio: tokens_after {} > budget {budget}",
+            r.tokens_after
+        );
+        // The retained history must also fit the budget under the measured
+        // calibration ratio (the calibration's own check).
+        let kept = estimate_history_tokens(&r.history);
+        let calibrated = (kept as f64 * reported as f64
+            / measured_population_estimated.max(1) as f64)
+            .round() as u64;
+        assert!(
+            calibrated <= budget as u64,
+            "retained history must respect the budget under the measured ratio \
+             (calibrated {calibrated}, budget {budget})"
+        );
     }
 
     #[test]
