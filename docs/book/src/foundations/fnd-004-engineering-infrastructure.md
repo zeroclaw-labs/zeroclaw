@@ -165,7 +165,7 @@ PR changes: crates/zeroclaw-tool-call-parser/src/lib.rs
 Affected crates:
   zeroclaw-tool-call-parser     ← directly changed
   zeroclaw-misc                 ← depends on it
-  zeroclawlabs (root)           ← depends on it
+  zeroclaw (root)               ← depends on it
 
 Not affected:
   zeroclaw-channels             ← no dependency path
