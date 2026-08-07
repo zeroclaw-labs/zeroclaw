@@ -342,6 +342,15 @@ pub trait Tool: Send + Sync + crate::attribution::Attributable {
         Vec::new()
     }
 
+    /// The canonical name of the underlying tool this one delegates to, when it
+    /// is a wrapper around another tool (e.g. a skill-scoped alias that calls a
+    /// builtin). Security gates such as the emergency stop consult this so that
+    /// freezing `shell` also halts a `my_skill__shell` alias whose `name()` is
+    /// the composed alias but which executes `shell`. `None` for a plain tool.
+    fn delegated_tool_name(&self) -> Option<&str> {
+        None
+    }
+
     /// Execute the tool with given arguments
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult>;
 

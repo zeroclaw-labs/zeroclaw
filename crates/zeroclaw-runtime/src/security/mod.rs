@@ -40,7 +40,7 @@ pub use detect::linux_memcg_available;
 pub use detect::{SandboxPosture, sandbox_posture};
 pub use domain_matcher::DomainMatcher;
 #[allow(unused_imports)]
-pub use estop::{EstopLevel, EstopManager, EstopState, ResumeSelector};
+pub use estop::{EstopEnforcement, EstopLevel, EstopManager, EstopState, ResumeSelector};
 #[allow(unused_imports)]
 pub use external_content::{
     ContentSafety, FramingPolicy, OutboundPolicy, ScanOutcome, ScanPolicy, ScreenVerdict,

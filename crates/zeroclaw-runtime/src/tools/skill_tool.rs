@@ -399,6 +399,18 @@ impl Tool for SkillBuiltinTool {
         }
     }
 
+    /// This alias executes `target_tool`, so security gates must see the
+    /// canonical underlying identity — otherwise freezing `shell` would miss a
+    /// `skill__shell` alias. Recurse so a wrapper-of-a-wrapper reports the
+    /// deepest real tool.
+    fn delegated_tool_name(&self) -> Option<&str> {
+        Some(
+            self.target_tool
+                .delegated_tool_name()
+                .unwrap_or_else(|| self.target_tool.name()),
+        )
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         // Audit: elevated skill tools delegate to a target that may be blocked
         // by SecurityPolicy or hidden from the model. Record every invocation
@@ -796,6 +808,21 @@ mod tests {
             HashMap::new(),
         );
         assert_eq!(tool.name(), "my_skill__use_shell");
+    }
+
+    #[test]
+    fn skill_builtin_tool_reports_delegated_target_name() {
+        // Security gates (emergency stop) must see the canonical `shell`, not the
+        // composed alias, so freezing `shell` also stops this alias.
+        let target: Arc<dyn Tool> = Arc::new(MockBuiltinTool::new("shell"));
+        let tool = SkillBuiltinTool::new(
+            "my_skill",
+            &sample_builtin_skill_tool(),
+            target,
+            HashMap::new(),
+        );
+        assert_eq!(tool.name(), "my_skill__use_shell");
+        assert_eq!(tool.delegated_tool_name(), Some("shell"));
     }
 
     #[test]
