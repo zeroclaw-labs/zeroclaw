@@ -988,3 +988,16 @@ channel-approval-opt-allow-once = Permitir una vez
 channel-approval-opt-allow-always = Permitir siempre
 channel-approval-opt-reject = Rechazar
 channel-approval-opt-reject-with-edit = Rechazar con edición
+
+# ── Provider failure leads (#9001) ───────────────────────────────────
+provider-fail-auth-missing = No hay una clave de API configurada para {$provider}. Añade credenciales para el proveedor seleccionado.
+provider-fail-auth-rejected = Las credenciales configuradas para {$provider} fueron rechazadas.
+provider-fail-auth = Las credenciales configuradas para {$provider} fueron rechazadas o faltan. Añade o revisa la clave de API del proveedor seleccionado.
+provider-fail-connect-local = {$provider} no es accesible{$at_endpoint}. Inicia su servidor local o actualiza el endpoint.
+provider-fail-connect-remote = {$provider} no es accesible{$at_endpoint}. Revisa la red, VPN o firewall, o actualiza el endpoint.
+provider-fail-timeout = {$provider} no respondió a tiempo{$at_endpoint}. Reintenta, revisa la red o cambia de proveedor.
+provider-fail-rate-limited = {$provider} limitó la solicitud. Espera, cambia la clave/cuota o cambia de proveedor.
+provider-fail-model-not-found = El modelo configurado no fue encontrado por {$provider}. Revisa el id del modelo del proveedor seleccionado.
+provider-fail-context-window = La solicitud supera la ventana de contexto de {$provider}. Reduce el contexto o usa un modelo con más contexto.
+provider-fail-provider-server = {$provider} devolvió un error de servidor. Reintenta o cambia de proveedor.
+provider-fail-generic = La solicitud a {$provider} falló. Consulta los registros.

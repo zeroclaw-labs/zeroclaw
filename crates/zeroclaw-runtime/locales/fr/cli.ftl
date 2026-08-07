@@ -991,3 +991,16 @@ channel-approval-opt-allow-once = Autoriser une fois
 channel-approval-opt-allow-always = Toujours autoriser
 channel-approval-opt-reject = Rejeter
 channel-approval-opt-reject-with-edit = Rejeter avec modification
+
+# ── Provider failure leads (#9001) ───────────────────────────────────
+provider-fail-auth-missing = Aucune clé d'API configurée pour {$provider}. Ajoutez des identifiants pour le fournisseur sélectionné.
+provider-fail-auth-rejected = Les identifiants configurés pour {$provider} ont été refusés.
+provider-fail-auth = Les identifiants configurés pour {$provider} ont été refusés ou sont manquants. Ajoutez ou vérifiez la clé d'API du fournisseur sélectionné.
+provider-fail-connect-local = {$provider} est injoignable{$at_endpoint}. Démarrez son serveur local ou mettez à jour l'endpoint.
+provider-fail-connect-remote = {$provider} est injoignable{$at_endpoint}. Vérifiez le réseau, le VPN ou le pare-feu, ou mettez à jour l'endpoint.
+provider-fail-timeout = {$provider} n'a pas répondu à temps{$at_endpoint}. Réessayez, vérifiez le réseau ou changez de fournisseur.
+provider-fail-rate-limited = {$provider} a limité la requête. Attendez, changez de clé/quota ou de fournisseur.
+provider-fail-model-not-found = Le modèle configuré est introuvable pour {$provider}. Vérifiez l'id du modèle du fournisseur sélectionné.
+provider-fail-context-window = La requête dépasse la fenêtre de contexte de {$provider}. Réduisez le contexte ou utilisez un modèle à plus grand contexte.
+provider-fail-provider-server = {$provider} a renvoyé une erreur serveur. Réessayez ou changez de fournisseur.
+provider-fail-generic = La requête vers {$provider} a échoué. Consultez les journaux.

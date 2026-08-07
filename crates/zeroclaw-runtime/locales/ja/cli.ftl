@@ -988,3 +988,16 @@ channel-approval-opt-allow-once = 今回のみ許可
 channel-approval-opt-allow-always = 常に許可
 channel-approval-opt-reject = 拒否
 channel-approval-opt-reject-with-edit = 編集して拒否
+
+# ── Provider failure leads (#9001) ───────────────────────────────────
+provider-fail-auth-missing = {$provider} に API キーが設定されていません。選択したプロバイダーの認証情報を追加してください。
+provider-fail-auth-rejected = {$provider} の認証情報が拒否されました。
+provider-fail-auth = {$provider} の認証情報が拒否されたか不足しています。選択したプロバイダーの API キーを追加または確認してください。
+provider-fail-connect-local = {$provider} に到達できません{$at_endpoint}。ローカルサーバーを起動するかエンドポイントを更新してください。
+provider-fail-connect-remote = {$provider} に到達できません{$at_endpoint}。ネットワーク、VPN、ファイアウォールを確認するかエンドポイントを更新してください。
+provider-fail-timeout = {$provider} が時間内に応答しませんでした{$at_endpoint}。再試行、ネットワーク確認、またはプロバイダー切り替えを行ってください。
+provider-fail-rate-limited = {$provider} がリクエストをレート制限しました。待機、キー/クォータの変更、またはプロバイダー切り替えを行ってください。
+provider-fail-model-not-found = 設定されたモデルが {$provider} で見つかりませんでした。選択したプロバイダーのモデル id を確認してください。
+provider-fail-context-window = リクエストが {$provider} のコンテキストウィンドウを超えています。コンテキストを減らすか、より大きいコンテキストのモデルを使用してください。
+provider-fail-provider-server = {$provider} がサーバーエラーを返しました。再試行またはプロバイダーを切り替えてください。
+provider-fail-generic = {$provider} へのリクエストが失敗しました。ログを確認してください。
