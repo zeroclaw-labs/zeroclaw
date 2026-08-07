@@ -1242,6 +1242,45 @@ vision_model_provider = "grok"
     }
 
     #[test]
+    fn v2_explicit_default_provider_overlay_keeps_single_producer() {
+        // Explicit `default_provider = "xai"` names the same slot a legacy
+        // `[providers.models.grok]` already materialized (grok -> xai.default).
+        // The globals fold overlays that existing slot; counting `xai` as a
+        // second producer would make the slot look ambiguous and leave the
+        // bare `grok` reference unrewritten, losing the typed credentials on
+        // the runtime's bare-provider path.
+        let raw = r#"
+schema_version = 2
+
+[providers]
+default_provider = "xai"
+api_key = "global-test-key"
+default_model = "vision-model"
+
+[providers.models.grok]
+api_key = "grok-test-key"
+model = "grok-model"
+
+[multimodal]
+vision_model_provider = "grok"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("xai.default"),
+            "the explicit default_provider overlay must not double-count the \
+             existing producer or strand the bare reference"
+        );
+        let alias = cfg
+            .providers
+            .models
+            .find("xai", "default")
+            .expect("the migrated xai.default alias must exist");
+        assert_eq!(alias.api_key.as_deref(), Some("grok-test-key"));
+        assert_eq!(alias.model.as_deref(), Some("grok-model"));
+    }
+
+    #[test]
     fn v2_globals_create_missing_default_alias_beside_non_default_alias() {
         // No `default_provider`, only a non-default alias (`openai.codex` from
         // `openai-codex`), and global `[providers]` values. The globals fold
