@@ -435,12 +435,15 @@ fn graceful_kill(child: &mut tokio::process::Child) {
 /// before the artifact is removed, so deletion cannot race a still-terminating
 /// process. The child reap and stderr drain never block an executor worker:
 /// `Drop` only requests a graceful `SIGTERM`, checks the child once without
-/// blocking, and if it has not exited hands it to a detached async reaper that
-/// parks (bounded) off any worker thread, escalating to a hard kill after
-/// [`EDGE_TTS_REAP_GRACE`]. Cleanup failure is swallowed so it never masks the
-/// primary synthesis error. The already-exited and no-child branches delete the
-/// temp file with a single synchronous `remove_file` (fast local-unlink); the
-/// pending-reap branch removes it inside the detached reaper.
+/// blocking, and if it has not exited hands it to a detached reaper thread that
+/// reaps it (bounded) off any worker thread, escalating to a hard kill after
+/// [`EDGE_TTS_REAP_GRACE`]. The reaper runs on a `std::thread`, so it is
+/// independent of the Tokio runtime's lifetime — it is not cancelled when a
+/// runtime shuts down the way a `tokio::spawn`ed task would be, and it never
+/// panics for lack of an entered runtime. Cleanup failure is swallowed so it
+/// never masks the primary synthesis error. The already-exited and no-child
+/// branches delete the temp file with a single synchronous `remove_file` (fast
+/// local-unlink); the pending-reap branch removes it inside the reaper thread.
 struct EdgeTtsTempArtifact {
     path: PathBuf,
     child: Option<tokio::process::Child>,
@@ -474,26 +477,58 @@ impl Drop for EdgeTtsTempArtifact {
                     let _ = std::fs::remove_file(&self.path);
                     return;
                 }
-                // Child still terminating: hand it to a detached async reaper
-                // that parks on the executor rather than blocking a worker.
-                // It bounds the wait for the graceful exit, escalates to a
-                // hard kill if the grace window expires, and only then removes
-                // the temp file, preserving the reap-before-delete ordering.
+                // Child still terminating: hand it to a detached reaper thread
+                // rather than a `tokio::spawn`ed task. The reap-and-remove must
+                // not depend on the Tokio runtime staying alive: a spawned task
+                // is cancelled when its runtime shuts down (leaving the artifact
+                // behind) and panics when dropped with no runtime entered. A
+                // thread owns the bounded wait, escalates to a hard kill if the
+                // grace window expires, and only then removes the temp file,
+                // preserving the reap-before-delete ordering.
                 let path = self.path.clone();
-                zeroclaw_spawn::spawn!(async move {
-                    let mut child = child;
-                    if tokio::time::timeout(EDGE_TTS_REAP_GRACE, child.wait())
-                        .await
-                        .is_err()
-                    {
-                        let _ = child.kill().await;
-                        let _ = child.wait().await;
-                    }
-                    let _ = std::fs::remove_file(&path);
-                });
+                let _ = std::thread::Builder::new()
+                    .name("edge-tts-reaper".to_string())
+                    .spawn(move || reap_and_remove(child, path));
             }
         }
     }
+}
+
+/// Reap the child until it exits or [`EDGE_TTS_REAP_GRACE`] elapses, escalating
+/// to a hard kill on timeout, then remove the temp file. Runs on a detached
+/// [`std::thread`] so it never depends on a Tokio runtime's lifetime and never
+/// blocks an executor worker. Synchronous-only ([`tokio::process::Child::try_wait`]
+/// / [`tokio::process::Child::start_kill`]) so it needs no runtime context.
+fn reap_and_remove(mut child: tokio::process::Child, path: PathBuf) {
+    let grace_started = std::time::Instant::now();
+    let grace = EDGE_TTS_REAP_GRACE;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() - grace_started < grace => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            // Grace expired (or an unrecoverable wait error): hard kill, then
+            // give it a short final window to be reaped before removing the
+            // file, so deletion cannot race the terminating child.
+            _ => {
+                let _ = child.start_kill();
+                let hard_started = std::time::Instant::now();
+                let hard_budget = std::time::Duration::from_millis(500);
+                loop {
+                    if matches!(child.try_wait(), Ok(Some(_))) {
+                        break;
+                    }
+                    if std::time::Instant::now() - hard_started >= hard_budget {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                break;
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&path);
 }
 
 impl EdgeTtsProvider {
@@ -1754,6 +1789,81 @@ mod tests {
                 "cleanup must not stall the current-thread runtime"
             );
         });
+
+        let _ = std::fs::remove_file(&script_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn edge_tts_cleanup_completes_after_runtime_shutdown() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // A child that ignores SIGTERM for a few seconds then exits on its own,
+        // so the artifact's bounded reap is genuinely pending when the runtime
+        // is torn down. The reaper must finish (reap + remove the temp file)
+        // independently of the Tokio runtime's lifetime: it must not be
+        // cancelled when the runtime that owned the artifact shuts down (a
+        // `tokio::spawn`ed cleanup task would be), nor panic from dropping off
+        // the runtime.
+        let temp_dir = std::env::temp_dir();
+        let script_path =
+            temp_dir.join(format!("zeroclaw_edgetts_test_{}.sh", uuid::Uuid::new_v4()));
+        let artifact_path =
+            temp_dir.join(format!("zeroclaw_edgetts_out_{}.mp3", uuid::Uuid::new_v4()));
+        let script = script_path.to_str().unwrap();
+        let out = artifact_path.to_str().unwrap();
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\n\
+                 : > \"{out}\"\n\
+                 trap '' TERM\n\
+                 sleep 2\n\
+                 exit 0\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("current-thread runtime");
+            rt.block_on(async {
+                let child = tokio::process::Command::new(script)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .kill_on_drop(true)
+                    .spawn()
+                    .expect("spawn fake child");
+                let artifact = EdgeTtsTempArtifact {
+                    path: artifact_path.clone(),
+                    child: Some(child),
+                    stderr_reader: None,
+                };
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+                // Drop hands the still-terminating child to the reaper, then the
+                // runtime is torn down at the end of this block.
+                drop(artifact);
+            });
+            // Runtime is gone; the reaper must still be running on its own
+            // thread, reaping the child and removing the temp file. A
+            // `tokio::spawn`ed reaper would have been cancelled right here (its
+            // task is aborted at runtime shutdown) before removing the file.
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if !std::path::Path::new(&artifact_path).exists() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("Edge TTS temp file was never removed after runtime shutdown");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
 
         let _ = std::fs::remove_file(&script_path);
     }
