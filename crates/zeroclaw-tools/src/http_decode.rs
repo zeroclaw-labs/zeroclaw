@@ -77,7 +77,9 @@ impl BodyDecoder {
             // HTTP `deflate` is zlib-wrapped in practice (and reqwest decoded it
             // that way); the tests encode with `flate2`'s ZlibEncoder.
             Some("deflate") => Some(Self::Zlib(Box::new(flate2::write::ZlibDecoder::new(sink)))),
-            Some("br") => Some(Self::Brotli(Box::new(brotli::DecompressorWriter::new(sink, 4096)))),
+            Some("br") => Some(Self::Brotli(Box::new(brotli::DecompressorWriter::new(
+                sink, 4096,
+            )))),
             // Unsupported or compound (comma-separated) coding.
             Some(_) => None,
         }
@@ -152,12 +154,13 @@ pub(crate) async fn read_decoded_text_capped(
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
 
-    let mut decoder = BodyDecoder::for_encoding(encoding.as_deref(), hard_cap).ok_or_else(|| {
-        anyhow::Error::msg(format!(
-            "unsupported Content-Encoding: {}",
-            encoding.as_deref().unwrap_or_default()
-        ))
-    })?;
+    let mut decoder =
+        BodyDecoder::for_encoding(encoding.as_deref(), hard_cap).ok_or_else(|| {
+            anyhow::Error::msg(format!(
+                "unsupported Content-Encoding: {}",
+                encoding.as_deref().unwrap_or_default()
+            ))
+        })?;
     let mut stream = response.bytes_stream();
     let mut truncated = false;
     while let Some(chunk) = stream.next().await {
