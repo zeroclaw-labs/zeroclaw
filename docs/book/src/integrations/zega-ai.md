@@ -37,7 +37,11 @@ ZeroClaw itself.
 >
 > Connecting without setting the gateway port to match the active ZeroClaw
 > daemon will cause the bridge to report an offline/unreachable state before
+>feat/zega-ai-real-bridge-integration
 > pairing can occur. Remotely reachable gateways should use HTTPS or an authenticated tunnel (such as WireGuard, Tailscale, or an SSH tunnel) rather than plain HTTP to protect bearer credentials transmitted in the `Authorization` header.
+=======
+> pairing can occur.
+>master
 
 The bridge implements the two pairing contracts exposed by the ZeroClaw
 gateway and tries them in order:

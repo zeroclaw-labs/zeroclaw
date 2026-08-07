@@ -793,11 +793,25 @@ pub async fn run(
                     continue;
                 }
 
-                let switch_to: Option<Mode> = match global {
-                    Some(GlobalAction::PaneNavLeft) => Some(mode.cycle(-1)),
-                    Some(GlobalAction::PaneNavRight) => Some(mode.cycle(1)),
-                    _ => None,
+                let editor_claims_pane_navigation = matches!(
+                    global,
+                    Some(GlobalAction::PaneNavLeft | GlobalAction::PaneNavRight)
+                ) && match mode {
+                    Mode::Config => config_app.claims_pane_navigation(&key),
+                    Mode::Acp => acp_pane.claims_pane_navigation(&key),
+                    Mode::Chat => chat_pane.claims_pane_navigation(&key),
+                    _ => false,
                 };
+                // Disconnected panes are skipped below to avoid dead-socket RPCs,
+                // so a retained editor cannot consume its local cursor chord.
+                let pane_can_receive_editor_chord =
+                    !matches!(conn_state, ConnectionState::Disconnected { .. });
+                let switch_to = pane_switch_delta(
+                    global,
+                    editor_claims_pane_navigation,
+                    pane_can_receive_editor_chord,
+                )
+                .map(|delta| mode.cycle(delta));
                 if let Some(next) = switch_to {
                     switch_mode(
                         &mut mode,
@@ -1013,6 +1027,21 @@ fn global_help_entries() -> Vec<HelpEntry> {
         ),
         HelpEntry::spacer(),
     ]
+}
+
+fn pane_switch_delta(
+    global: Option<GlobalAction>,
+    editor_claims_chord: bool,
+    pane_can_receive_editor_chord: bool,
+) -> Option<isize> {
+    if editor_claims_chord && pane_can_receive_editor_chord {
+        return None;
+    }
+    match global {
+        Some(GlobalAction::PaneNavLeft) => Some(-1),
+        Some(GlobalAction::PaneNavRight) => Some(1),
+        _ => None,
+    }
 }
 
 fn resolve_agent_overrides(
@@ -1897,6 +1926,26 @@ mod tests {
         let expected = action_key_labels(GlobalAction::Help);
 
         assert_eq!(help.keys, expected);
+    }
+
+    #[test]
+    fn active_text_editor_can_claim_global_pane_navigation() {
+        assert_eq!(
+            pane_switch_delta(Some(GlobalAction::PaneNavLeft), false, true),
+            Some(-1)
+        );
+        assert_eq!(
+            pane_switch_delta(Some(GlobalAction::PaneNavRight), true, true),
+            None
+        );
+    }
+
+    #[test]
+    fn disconnected_editor_claim_keeps_global_pane_navigation() {
+        assert_eq!(
+            pane_switch_delta(Some(GlobalAction::PaneNavRight), true, false),
+            Some(1)
+        );
     }
 
     #[test]

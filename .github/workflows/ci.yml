@@ -343,6 +343,8 @@ jobs:
     needs: [fmt]
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
     strategy:
       fail-fast: false
       matrix:
@@ -350,9 +352,11 @@ jobs:
           - name: all features
             args: --features ci-all
             sys_deps: libudev-dev
+            rustflags: ""
           - name: no default features
-            args: --no-default-features
+            args: --workspace --exclude zeroclaw-desktop --no-default-features
             sys_deps: ""
+            rustflags: -D warnings
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
@@ -395,7 +399,7 @@ jobs:
         run: |
           base="${{ github.event.pull_request.base.sha }}"
           if [ -z "$base" ]; then echo "run=true" >> "$GITHUB_OUTPUT"; exit 0; fi
-          if git diff --name-only "$base" HEAD | grep -qE '^crates/zeroclaw-plugins/|^wit/|^Cargo\.(toml|lock)$'; then
+          if git diff --name-only "$base" HEAD | grep -qE '^crates/zeroclaw-plugins/|^wit/|^Cargo\.(toml|lock)$|^\.github/workflows/ci\.yml$'; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
@@ -418,10 +422,13 @@ jobs:
       - name: Run channel plugin component test
         if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
         run: cargo test --locked -p zeroclaw-plugins --features plugins-wasm-cranelift --test channel_plugin_e2e
+      - name: Run plugins lib unit tests
+        if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
+        run: cargo test --locked -p zeroclaw-plugins --no-default-features --features plugins-wasm-cranelift --lib
 
   msrv:
     name: MSRV (declared floor)
-    needs: [fmt]
+    needs: [fmt, installer-drift]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -451,12 +458,14 @@ jobs:
         run: bash scripts/ci/apt_install.sh libudev-dev
       - name: Ensure web/dist placeholder exists
         run: mkdir -p web/dist && touch web/dist/.gitkeep
-      # ci-all is the load-bearing one: the container variant that regressed
-      # compiles the widest feature set, and a default-features pass would not
-      # have caught it.
+      # Consume the exact container kitchen-sink selection resolved by the
+      # installer-drift job so the declared-floor check cannot drift from
+      # Containerfile or rebuild the generator under the MSRV toolchain.
       - name: Check at the declared MSRV
         run: |
-          cargo check --locked --workspace --exclude zeroclaw-desktop --features ci-all
+          cargo check --locked --workspace --exclude zeroclaw-desktop \
+            --no-default-features \
+            --features "${{ needs.installer-drift.outputs.all_features }}"
 
   check-32bit:
     name: Check (32-bit)
@@ -555,8 +564,8 @@ jobs:
         run: ./scripts/ci/firmware_protocol_gate.sh
       - name: Ensure web/dist placeholder exists
         run: mkdir -p web/dist && touch web/dist/.gitkeep
-      - name: Install mold linker
-        run: bash scripts/ci/apt_install.sh mold
+      - name: Install test system dependencies
+        run: bash scripts/ci/apt_install.sh mold expect python3
       - name: Install cargo-nextest
         run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ~/.cargo/bin
       - name: Run tests
@@ -819,6 +828,8 @@ jobs:
     needs: [fmt]
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    outputs:
+      all_features: ${{ steps.all_features.outputs.value }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Test installer target detection
@@ -833,6 +844,16 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Check generated install surfaces are in sync with the spec
         run: cargo generate installers --check
+      - name: Resolve canonical all-feature selection
+        id: all_features
+        run: |
+          set -euo pipefail
+          value="$(cargo generate features --selection all)"
+          if [ -z "$value" ]; then
+            echo "::error::canonical all-feature selection is empty"
+            exit 1
+          fi
+          printf 'value=%s\n' "$value" >> "$GITHUB_OUTPUT"
 
   web-permission-tests:
     name: Web Permission Tests
@@ -841,7 +862,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version-file: '.nvmrc'
           cache: npm

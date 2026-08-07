@@ -10,6 +10,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW_PATH = ROOT / ".github/workflows/release-stable-manual.yml"
+ATTEST_ACTION_REF = (
+    "actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1"
+)
 WORKFLOW = WORKFLOW_PATH.read_text(encoding="utf-8")
 
 
@@ -75,12 +78,13 @@ class ReleaseAttestationContractTest(unittest.TestCase):
 
     def test_payload_attestation_is_pinned_and_best_effort(self) -> None:
         step = step_block(self.publish, "attest_payloads")
-        self.assertRegex(
-            step,
-            r"actions/attest-build-provenance@[0-9a-f]{40} # v3\.2\.0",
-        )
+        self.assertIn(f"uses: {ATTEST_ACTION_REF}", step)
         self.assertIn("continue-on-error: true", step)
         self.assertIn("subject-path: release-assets/*", step)
+
+    def test_direct_attestation_action_is_used_exactly_three_times(self) -> None:
+        self.assertEqual(WORKFLOW.count(f"uses: {ATTEST_ACTION_REF}"), 3)
+        self.assertNotIn("actions/attest-build-provenance@", WORKFLOW)
 
     def test_archive_is_built_only_from_verified_offline_material(self) -> None:
         step = step_block(self.publish, "verification_archive")
@@ -140,10 +144,7 @@ class ReleaseAttestationContractTest(unittest.TestCase):
                 step = step_block(self.publish, step_id)
                 self.assertIn(subject, step)
                 self.assertIn("continue-on-error: true", step)
-                self.assertRegex(
-                    step,
-                    r"actions/attest-build-provenance@[0-9a-f]{40} # v3\.2\.0",
-                )
+                self.assertIn(f"uses: {ATTEST_ACTION_REF}", step)
 
     def test_release_uploads_only_the_consolidated_asset_directory(self) -> None:
         self.assertEqual(self.publish.count('gh release create "$TAG" release-assets/*'), 2)

@@ -1,0 +1,6 @@
+services:
+  zeroclaw:
+    build:
+      context: .
+      dockerfile: Dockerfile.alpine
+    image: zeroclaw:alpine

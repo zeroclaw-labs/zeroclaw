@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use std::io::Write;
 use std::path::Path;
-use zeroclaw_config::schema::Config;
+use zeroclaw_config::schema::{Config, UNCONFIGURED_CONTEXT_WINDOW_FALLBACK};
 
 const DAEMON_STALE_SECONDS: i64 = 30;
 const SCHEDULER_STALE_SECONDS: i64 = 120;
@@ -1095,6 +1095,42 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
                 items.push(DiagItem::warn(cat, format!("{label}: no model configured")));
             }
 
+            // A missing value remains unknown until this profile is selected;
+            // zero is explicitly invalid because it leaves recovery with no
+            // usable model-context budget.
+            match entry.context_window {
+                Some(0) => items.push(DiagItem::error(
+                    cat,
+                    crate::i18n::get_required_cli_string_with_args(
+                        "cli-doctor-context-window-zero",
+                        &[("provider_ref", &label)],
+                    ),
+                )),
+                Some(context_window) => items.push(DiagItem::ok(
+                    cat,
+                    crate::i18n::get_required_cli_string_with_args(
+                        "cli-doctor-context-window-ok",
+                        &[
+                            ("provider_ref", &label),
+                            ("context_window", &context_window.to_string()),
+                        ],
+                    ),
+                )),
+                None => items.push(DiagItem::warn(
+                    cat,
+                    crate::i18n::get_required_cli_string_with_args(
+                        "cli-doctor-context-window-unset",
+                        &[
+                            ("provider_ref", &label),
+                            (
+                                "fallback",
+                                &UNCONFIGURED_CONTEXT_WINDOW_FALLBACK.to_string(),
+                            ),
+                        ],
+                    ),
+                )),
+            }
+
             // Temperature range
             match entry.temperature {
                 Some(temperature) if (0.0..=2.0).contains(&temperature) => {
@@ -1275,8 +1311,23 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     for warning in config.collect_warnings() {
         items.push(DiagItem::warn(
             cat,
-            format!("{} (at {})", warning.message, warning.path),
+            format!(
+                "{} (at {})",
+                localized_validation_warning_message(&warning),
+                warning.path
+            ),
         ));
+    }
+}
+
+fn localized_validation_warning_message(
+    warning: &zeroclaw_config::validation_warnings::ValidationWarning,
+) -> String {
+    match warning.code.as_str() {
+        "skills_prompt_injection_mode_full_deprecated" => crate::i18n::get_required_cli_string(
+            "cli-doctor-skills-prompt-injection-mode-full-deprecated",
+        ),
+        _ => warning.message.clone(),
     }
 }
 
@@ -1891,6 +1942,89 @@ mod tests {
         let temp_item = items.iter().find(|i| i.message.contains("temperature"));
         assert!(temp_item.is_some());
         assert_eq!(temp_item.unwrap().severity, Severity::Ok);
+    }
+
+    #[test]
+    fn context_window_diagnostics_distinguish_unset_explicit_and_zero_profiles() {
+        let mut unset = Config::default();
+        let profile = unset
+            .providers
+            .models
+            .ensure("ollama", "local")
+            .expect("known model provider type");
+        profile.model = Some("qwen3".to_string());
+
+        let mut unset_items = Vec::new();
+        check_config_semantics(&unset, &mut unset_items);
+        let unset_message = crate::i18n::get_required_cli_string_with_args(
+            "cli-doctor-context-window-unset",
+            &[
+                ("provider_ref", "ollama.local"),
+                (
+                    "fallback",
+                    &UNCONFIGURED_CONTEXT_WINDOW_FALLBACK.to_string(),
+                ),
+            ],
+        );
+        let unset_item = unset_items
+            .iter()
+            .find(|item| item.message == unset_message)
+            .expect("unset profile must produce the localized warning");
+        assert_eq!(unset_item.severity, Severity::Warn);
+
+        let mut explicit = unset.clone();
+        explicit
+            .providers
+            .models
+            .ensure("ollama", "local")
+            .expect("known model provider type")
+            .context_window = Some(32_000);
+        let mut explicit_items = Vec::new();
+        check_config_semantics(&explicit, &mut explicit_items);
+        let explicit_message = crate::i18n::get_required_cli_string_with_args(
+            "cli-doctor-context-window-ok",
+            &[
+                ("provider_ref", "ollama.local"),
+                ("context_window", "32000"),
+            ],
+        );
+        let explicit_item = explicit_items
+            .iter()
+            .find(|item| item.message == explicit_message)
+            .expect("explicit profile must produce the localized OK result");
+        assert_eq!(explicit_item.severity, Severity::Ok);
+
+        let unset_warnings = unset_items
+            .iter()
+            .filter(|item| item.severity == Severity::Warn)
+            .count();
+        let explicit_warnings = explicit_items
+            .iter()
+            .filter(|item| item.severity == Severity::Warn)
+            .count();
+        assert_eq!(
+            unset_warnings,
+            explicit_warnings + 1,
+            "an unset context window must add exactly one doctor warning"
+        );
+
+        let mut zero = explicit;
+        zero.providers
+            .models
+            .ensure("ollama", "local")
+            .expect("known model provider type")
+            .context_window = Some(0);
+        let mut zero_items = Vec::new();
+        check_config_semantics(&zero, &mut zero_items);
+        let zero_message = crate::i18n::get_required_cli_string_with_args(
+            "cli-doctor-context-window-zero",
+            &[("provider_ref", "ollama.local")],
+        );
+        let zero_item = zero_items
+            .iter()
+            .find(|item| item.message == zero_message)
+            .expect("zero context window must produce the localized error");
+        assert_eq!(zero_item.severity, Severity::Error);
     }
 
     #[test]
@@ -2544,6 +2678,25 @@ mod tests {
                 "expected per-agent SOUL.md diagnostic for {alias}; got {messages:?}"
             );
         }
+    }
+
+    #[test]
+    fn skills_prompt_deprecation_warning_uses_fluent() {
+        let warning = zeroclaw_config::validation_warnings::ValidationWarning::new(
+            "skills_prompt_injection_mode_full_deprecated",
+            "unlocalized fallback",
+            "skills.prompt_injection_mode",
+        );
+
+        let expected = crate::i18n::get_required_cli_string(
+            "cli-doctor-skills-prompt-injection-mode-full-deprecated",
+        );
+        assert_eq!(localized_validation_warning_message(&warning), expected);
+        assert_ne!(expected, "unlocalized fallback");
+        assert_ne!(
+            expected,
+            "{cli-doctor-skills-prompt-injection-mode-full-deprecated}"
+        );
     }
 
     #[test]
