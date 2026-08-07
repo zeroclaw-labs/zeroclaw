@@ -1,3 +1,4 @@
+use pulldown_cmark::{Event, Parser, Tag, TagEnd};
 use std::collections::BTreeSet;
 use std::sync::OnceLock;
 
@@ -54,6 +55,45 @@ const GENERIC_REGISTRY_TERMS: &[&str] = &[
     "Voice Call",
     "Webhook",
 ];
+
+struct ContextualRegistryTerm {
+    text: &'static str,
+    reference_words: &'static [&'static str],
+    distant_reference_pairs: &'static [(&'static str, &'static str)],
+    identifiers: &'static [&'static str],
+    preceding_markers: &'static [&'static str],
+    link_destinations: &'static [&'static str],
+}
+
+const CONTEXTUAL_REGISTRY_TERMS: &[ContextualRegistryTerm] = &[
+    ContextualRegistryTerm {
+        text: "Filesystem",
+        reference_words: &["channel", "listener", "trigger", "watcher"],
+        distant_reference_pairs: &[("filesystem", "watcher")],
+        identifiers: &["channel-filesystem", "channels.filesystem"],
+        preceding_markers: &["SOP Fan-In:"],
+        link_destinations: &[
+            "./filesystem.md",
+            "./channels/filesystem.md",
+            "./sop/fan-in/filesystem.md",
+            "../sop/fan-in/filesystem.md",
+        ],
+    },
+    ContextualRegistryTerm {
+        text: "Signal",
+        reference_words: &[
+            "account", "bot", "channel", "client", "desktop", "message", "mobile", "poll",
+            "protocol",
+        ],
+        distant_reference_pairs: &[],
+        identifiers: &["signal-cli", "channel-signal", "channels.signal"],
+        preceding_markers: &[],
+        link_destinations: &["./signal.md", "./channels/signal.md"],
+    },
+];
+
+const NEARBY_REFERENCE_WORD_LIMIT: usize = 3;
+const DISTANT_REFERENCE_WORD_LIMIT: usize = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FenceLanguage {
@@ -130,8 +170,134 @@ fn collect_protected_terms(text: &str, literals: &mut Vec<ProtectedLiteral>) {
 }
 
 fn contains_protected_term(text: &str, term: &str) -> bool {
+    if let Some(context) = CONTEXTUAL_REGISTRY_TERMS
+        .iter()
+        .find(|candidate| candidate.text == term)
+    {
+        if has_markdown_link_reference(text, context) {
+            return true;
+        }
+
+        return text.match_indices(term).any(|(idx, _)| {
+            has_term_boundary(text, idx, term.len())
+                && has_explicit_registry_term_context(text, idx, term.len(), context)
+        });
+    }
+
     text.match_indices(term)
         .any(|(idx, _)| has_term_boundary(text, idx, term.len()))
+}
+
+fn has_explicit_registry_term_context(
+    text: &str,
+    start: usize,
+    len: usize,
+    context: &ContextualRegistryTerm,
+) -> bool {
+    if text.trim() == context.text {
+        return true;
+    }
+
+    if context
+        .identifiers
+        .iter()
+        .any(|identifier| text.contains(identifier))
+    {
+        return true;
+    }
+
+    if context
+        .preceding_markers
+        .iter()
+        .any(|marker| text[..start].trim_end().ends_with(marker))
+    {
+        return true;
+    }
+
+    if has_adjacent_registry_peer(text, start, len, context.text) {
+        return true;
+    }
+
+    let following = &text[start + len..];
+    let following_cell = following.split(['|', '\n']).next().unwrap_or("");
+    let mut nearby_words = following_cell
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .take(NEARBY_REFERENCE_WORD_LIMIT);
+    let following_words: Vec<_> = following_cell
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .take(DISTANT_REFERENCE_WORD_LIMIT)
+        .collect();
+
+    nearby_words.any(|token| {
+        context
+            .reference_words
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(token))
+    }) || context.distant_reference_pairs.iter().any(|pair| {
+        following_words.windows(2).any(|window| {
+            pair.0.eq_ignore_ascii_case(window[0]) && pair.1.eq_ignore_ascii_case(window[1])
+        })
+    })
+}
+
+fn has_markdown_link_reference(text: &str, context: &ContextualRegistryTerm) -> bool {
+    let mut matching_link = false;
+    let mut visible_label = String::new();
+
+    for event in Parser::new(text) {
+        match event {
+            Event::Start(Tag::Link { dest_url, .. }) => {
+                matching_link = context
+                    .link_destinations
+                    .iter()
+                    .any(|candidate| dest_url.as_ref() == *candidate);
+                visible_label.clear();
+            }
+            Event::Text(label) | Event::Code(label) if matching_link => {
+                visible_label.push_str(&label);
+            }
+            Event::SoftBreak | Event::HardBreak if matching_link => visible_label.push(' '),
+            Event::End(TagEnd::Link) => {
+                if matching_link && visible_label.trim() == context.text {
+                    return true;
+                }
+                matching_link = false;
+                visible_label.clear();
+            }
+            _ => {}
+        }
+    }
+
+    false
+}
+
+fn has_adjacent_registry_peer(text: &str, start: usize, len: usize, term: &str) -> bool {
+    let before = text[..start].trim_end();
+    let after = text[start + len..].trim_start();
+    let (Some(before), Some(after)) = (before.strip_suffix(','), after.strip_prefix(',')) else {
+        return false;
+    };
+
+    let adjacent_segments = [
+        before
+            .rsplit([',', ';', '.', '\n', '|'])
+            .next()
+            .unwrap_or(""),
+        after.split([',', ';', '.', '\n', '|']).next().unwrap_or(""),
+    ];
+
+    adjacent_segments.iter().any(|segment| {
+        protected_terms()
+            .iter()
+            .filter(|peer| peer.as_str() != term)
+            .any(|peer| {
+                segment
+                    .match_indices(peer)
+                    .any(|(idx, _)| has_term_boundary(segment, idx, peer.len()))
+            })
+    })
 }
 
 fn has_term_boundary(text: &str, start: usize, len: usize) -> bool {
@@ -637,6 +803,200 @@ mod tests {
     #[test]
     fn ignores_generic_registry_terms() {
         assert!(!texts("Command").contains(&"Command".to_string()));
+    }
+
+    #[test]
+    fn ignores_ambiguous_registry_terms_in_generic_prose() {
+        assert!(
+            !texts("Signal reviewer trust and contributor experience.")
+                .contains(&"Signal".to_string())
+        );
+        assert!(
+            !texts("Signal name on the board; matched as board/signal.")
+                .contains(&"Signal".to_string())
+        );
+        assert!(
+            !texts("Filesystem access boundaries remain enforced.")
+                .contains(&"Filesystem".to_string())
+        );
+        assert!(!texts("Filesystem components live on disk.").contains(&"Filesystem".to_string()));
+        assert!(
+            !texts(
+                "| Contributor-tier labels | Signal reviewer trust and contributor experience |"
+            )
+            .contains(&"Signal".to_string())
+        );
+        assert!(!texts("A clear Signal.").contains(&"Signal".to_string()));
+        assert!(!texts("Signal is important.").contains(&"Signal".to_string()));
+        assert!(!texts("Signal does matter.").contains(&"Signal".to_string()));
+        assert!(
+            !texts("Signal reviewer trust improves ZeroClaw contributions.")
+                .contains(&"Signal".to_string())
+        );
+        assert!(!texts("# Filesystem components").contains(&"Filesystem".to_string()));
+        assert!(!texts("**Filesystem components**").contains(&"Filesystem".to_string()));
+        assert!(!texts("| Filesystem drivers |").contains(&"Filesystem".to_string()));
+        assert!(
+            !texts("Filesystem access is scoped separately from each channel.")
+                .contains(&"Filesystem".to_string())
+        );
+        assert!(
+            !texts("Status, Signal, indicator; Discord is documented elsewhere.")
+                .contains(&"Signal".to_string())
+        );
+        assert!(!texts("| Signal | Log message |").contains(&"Signal".to_string()));
+    }
+
+    #[test]
+    fn extracts_ambiguous_registry_terms_in_explicit_channel_contexts() {
+        assert!(texts("Configure the Signal channel.").contains(&"Signal".to_string()));
+        assert!(texts("Configure the Filesystem channel.").contains(&"Filesystem".to_string()));
+        assert!(texts("Signal account").contains(&"Signal".to_string()));
+        assert!(texts("Filesystem listener").contains(&"Filesystem".to_string()));
+        assert!(texts("Signal").contains(&"Signal".to_string()));
+        assert!(texts("Filesystem").contains(&"Filesystem".to_string()));
+        assert!(texts("Discord, Signal, Matrix").contains(&"Signal".to_string()));
+        assert!(texts("MQTT, Filesystem, AMQP").contains(&"Filesystem".to_string()));
+        assert!(texts("Signal's desktop app").contains(&"Signal".to_string()));
+        assert!(texts("Signal-compatible client").contains(&"Signal".to_string()));
+        assert!(
+            texts("Filesystem changes can start SOP runs through `channel-filesystem`.")
+                .contains(&"Filesystem".to_string())
+        );
+        assert!(
+            texts("Configure `[channels.signal.default]` for Signal.")
+                .contains(&"Signal".to_string())
+        );
+    }
+
+    #[test]
+    fn configured_contextual_registry_term_fields_are_covered() {
+        for context in CONTEXTUAL_REGISTRY_TERMS {
+            for reference_word in context.reference_words {
+                let source = format!("{} {reference_word}", context.text);
+                assert!(
+                    texts(&source).contains(&context.text.to_string()),
+                    "expected reference word {reference_word:?} to protect {:?}",
+                    context.text
+                );
+            }
+
+            for (first, second) in context.distant_reference_pairs {
+                let source = format!(
+                    "{} change. Live: delivered by the {first} {second}.",
+                    context.text
+                );
+                assert!(
+                    texts(&source).contains(&context.text.to_string()),
+                    "expected distant pair ({first:?}, {second:?}) to protect {:?}",
+                    context.text
+                );
+            }
+
+            for identifier in context.identifiers {
+                let source = format!("Configure `{identifier}` for {}.", context.text);
+                assert!(
+                    texts(&source).contains(&context.text.to_string()),
+                    "expected identifier {identifier:?} to protect {:?}",
+                    context.text
+                );
+            }
+
+            for marker in context.preceding_markers {
+                let source = format!("{marker} {}", context.text);
+                assert!(
+                    texts(&source).contains(&context.text.to_string()),
+                    "expected marker {marker:?} to protect {:?}",
+                    context.text
+                );
+            }
+
+            for destination in context.link_destinations {
+                let source = format!("[{}]({destination})", context.text);
+                assert!(
+                    texts(&source).contains(&context.text.to_string()),
+                    "expected link destination {destination:?} to protect {:?}",
+                    context.text
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn contextual_registry_term_context_does_not_cross_table_cells_or_lines() {
+        for source in [
+            "| Signal | message |",
+            "Signal\nmessage",
+            "| Filesystem | watcher |",
+            "| Filesystem | filesystem watcher |",
+            "Filesystem\nfilesystem watcher",
+        ] {
+            assert!(
+                !texts(source)
+                    .iter()
+                    .any(|term| { term == "Signal" || term == "Filesystem" }),
+                "expected contextual registry term to stay unprotected in {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn extracts_filesystem_from_actual_catalog_reference_shapes() {
+        for source in [
+            "SOP Fan-In: Filesystem",
+            "[SOP Fan-In: Filesystem](../sop/fan-in/filesystem.md): trigger syntax and path matching",
+            "Filesystem change. Live: delivered by the filesystem watcher.",
+        ] {
+            assert!(
+                texts(source).contains(&"Filesystem".to_string()),
+                "expected Filesystem to be protected in {source:?}"
+            );
+        }
+
+        assert_eq!(
+            missing_protected_literal("SOP Fan-In: Filesystem", "SOP Fan-In: Local storage")
+                .map(|literal| literal.text),
+            Some("Filesystem".to_string())
+        );
+    }
+
+    #[test]
+    fn extracts_ambiguous_registry_terms_from_channel_links() {
+        for (source, term) in [
+            ("[Signal](./signal.md)", "Signal"),
+            ("[Filesystem](./filesystem.md)", "Filesystem"),
+            ("[**Signal**](./signal.md)", "Signal"),
+            ("[**Filesystem**](./filesystem.md)", "Filesystem"),
+            ("[Signal](./channels/signal.md)", "Signal"),
+            ("[Filesystem](./channels/filesystem.md)", "Filesystem"),
+        ] {
+            assert!(
+                texts(source).contains(&term.to_string()),
+                "expected {term} to be protected in {source:?}"
+            );
+        }
+
+        assert_eq!(
+            missing_protected_literal("[Signal](./signal.md)", "[Senal](./signal.md)")
+                .map(|literal| literal.text),
+            Some("Signal".to_string())
+        );
+    }
+
+    #[test]
+    fn ignores_generic_labels_on_ambiguous_registry_link_destinations() {
+        for source in [
+            "[Filesystem components](./filesystem.md).",
+            "[Filesystem **components**](./filesystem.md).",
+            "[Filesystem `components`](./filesystem.md).",
+            "memory, and identity (see [Filesystem components](./filesystem.md)), so by",
+            "- [Filesystem components](./filesystem.md): the workspace, memory, and identity",
+        ] {
+            assert!(
+                !texts(source).contains(&"Filesystem".to_string()),
+                "expected generic Filesystem link label to stay unprotected in {source:?}"
+            );
+        }
     }
 
     #[test]

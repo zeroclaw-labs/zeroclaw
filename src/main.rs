@@ -799,9 +799,9 @@ an explicit IANA timezone.
 
 Examples:
   zeroclaw cron list
-  zeroclaw cron add '0 9 * * 1-5' 'Good morning' --tz America/New_York --agent
-  zeroclaw cron add '*/30 * * * *' 'Check system health' --agent
-  zeroclaw cron add '*/5 * * * *' 'echo ok'
+  zeroclaw cron add '0 9 * * 1-5' 'Good morning' --agent sentinel --prompt --tz America/New_York
+  zeroclaw cron add '*/30 * * * *' 'Check system health' --agent sentinel --prompt
+  zeroclaw cron add '*/5 * * * *' 'echo ok' --agent sentinel
   zeroclaw cron add-at 2025-01-15T14:00:00Z 'Send reminder' --agent
   zeroclaw cron add-every 60000 'Ping heartbeat'
   zeroclaw cron once 30m 'Run backup in 30 minutes' --agent
@@ -2555,6 +2555,19 @@ fn ensure_map_key_for_prop_path(config: &mut Config, prop_path: &str) -> Result<
         return Ok(false);
     };
 
+    // The alias already exists in the loaded config (e.g. a hyphenated cron
+    // alias the TOML loader accepts and `config get`/`config list` resolve):
+    // leave it alone. `create_map_key` applies the strict new-alias grammar,
+    // which would reject a valid loaded key. Mirror `Config::ensure_map_key_for_path`,
+    // which also skips creation for existing keys so alias validation runs only
+    // when auto-materializing a brand-new alias.
+    if config
+        .get_map_keys(section_path)
+        .is_some_and(|keys| keys.iter().any(|k| k == key))
+    {
+        return Ok(false);
+    }
+
     // Route through the shared `create_map_key_checked` (not raw
     // `create_map_key`) so this CLI path inherits the reserved `default`
     // agent guard from the one place it's defined, rather than re-deriving
@@ -3556,6 +3569,10 @@ async fn async_main(command: clap::Command) -> Result<()> {
     }
     #[cfg(feature = "agent-runtime")]
     observability::runtime_trace::init_from_config(&config.observability, &config.data_dir);
+    // Must follow the trace sink init above, or the record has no destination.
+    // The daemon reload arm calls the same helper against its reloaded config.
+    #[cfg(feature = "agent-runtime")]
+    warn_verifiable_intent_withheld(&config);
     #[cfg(feature = "agent-runtime")]
     if config.security.otp.enabled {
         let config_dir = config
@@ -4162,7 +4179,13 @@ async fn async_main(command: clap::Command) -> Result<()> {
             // config stops the warning and a freshly-degraded one starts it.
             let mut degraded_nag: Option<tokio::task::JoinHandle<()>> =
                 gate_security_posture(&current_config, allow_degraded_security)?;
+            let startup_feedback_enabled = !cli.verbose;
             loop {
+                if startup_feedback_enabled && daemon::stderr_is_interactive_foreground() {
+                    let mut stderr = std::io::stderr().lock();
+                    let _ = daemon::echo_daemon_starting_to_terminal(&mut stderr);
+                }
+
                 // Per-iteration clones so the subsystem closures (which
                 // `move`-capture) don't consume the outer bindings on the
                 // first iteration; reload would otherwise see a moved value.
@@ -4200,7 +4223,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 registry.register_gateway(Box::new({
                     let sop_e = sop_engine.clone();
                     let sop_a = sop_audit.clone();
-                    move |host, port, config, tx, reload_controls, tui_registry| {
+                    move |host, port, config, tx, reload_controls, tui_registry, ready_tx| {
                         let canvas_store = canvas_store_for_gateway.clone();
                         let sop_engine = sop_e.clone();
                         let sop_audit = sop_a.clone();
@@ -4215,6 +4238,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                                 Some(canvas_store),
                                 sop_engine,
                                 sop_audit,
+                                ready_tx,
                             ))
                             .await
                         })
@@ -4274,10 +4298,15 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     }
                 }));
 
-                registry.register_socket(Box::new(|ctx, cancel, client_count| {
+                registry.register_socket(Box::new(|ctx, cancel, client_count, ready_tx| {
                     Box::pin(async move {
-                        zeroclaw_runtime::rpc::local::run_local_listener(ctx, cancel, client_count)
-                            .await
+                        zeroclaw_runtime::rpc::local::run_local_listener(
+                            ctx,
+                            cancel,
+                            client_count,
+                            ready_tx,
+                        )
+                        .await
                     })
                 }));
 
@@ -4316,6 +4345,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     port,
                     registry,
                     ephemeral,
+                    startup_feedback_enabled,
                 ))
                 .await;
                 if let Some(handle) = sop_maintenance {
@@ -4339,6 +4369,11 @@ async fn async_main(command: clap::Command) -> Result<()> {
                             &current_config.observability,
                             &current_config.data_dir,
                         );
+                        // A reload applies config the process has not seen, so an
+                        // operator who just enabled the section learns why the tool
+                        // is still absent without having to restart.
+                        #[cfg(feature = "agent-runtime")]
+                        warn_verifiable_intent_withheld(&current_config);
                         if let Some(handle) = degraded_nag.take() {
                             handle.abort();
                         }
@@ -7619,6 +7654,27 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
     }
 }
 
+/// Tell the operator that `vi_verify` is withheld from the model-visible
+/// registry while no credential chain verifier exists.
+///
+/// Called once per config application: at process config load, and again when
+/// the daemon reload arm re-reads config from disk. Registry assembly is the
+/// wrong home for it, because that runs on ordinary gateway requests and on
+/// nested SOP and delegation rebuilds. Each call site must sit after its
+/// `runtime_trace::init_from_config`, or the record has no sink.
+#[cfg(feature = "agent-runtime")]
+fn warn_verifiable_intent_withheld(config: &Config) {
+    if !config.verifiable_intent.enabled {
+        return;
+    }
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+        "verifiable_intent: vi_verify is not registered as a model-callable tool because no credential chain verifier exists yet (see #9328)"
+    );
+}
+
 fn gate_security_posture(
     config: &zeroclaw::config::Config,
     allow_degraded: bool,
@@ -7973,7 +8029,7 @@ async fn run_gateway_if_enabled(
     // manually" message, None for tui_registry (no TUI socket), and None
     // for canvas_store so the gateway falls back to its own default.
     let result = Box::pin(gateway::run_gateway(
-        host, port, config, tx, None, None, None, None, None,
+        host, port, config, tx, None, None, None, None, None, None,
     ))
     .await;
     // Self-respawn after the listener is released, if an in-app upgrade
@@ -9408,6 +9464,33 @@ mod tests {
     }
 
     #[test]
+    fn config_set_materializes_agent_workspace_path() {
+        let mut config = Config::default();
+        let raw = "agents.assistant.workspace.path";
+
+        let known: Vec<String> = config.prop_fields().into_iter().map(|f| f.name).collect();
+        let mut path = zeroclaw_config::helpers::resolve_field_path(&known, raw);
+        let created = ensure_map_key_for_prop_path(&mut config, &path)
+            .expect("agent alias and workspace path should materialize");
+        assert!(created, "missing agent alias should be created");
+
+        let known: Vec<String> = config.prop_fields().into_iter().map(|f| f.name).collect();
+        path = zeroclaw_config::helpers::resolve_field_path(&known, &path);
+        config
+            .set_prop_persistent(&path, "/srv/zeroclaw/assistant")
+            .expect("agent workspace path should be writable");
+
+        assert_eq!(path, raw);
+        assert_eq!(
+            config
+                .agents
+                .get("assistant")
+                .and_then(|agent| agent.workspace.path.as_deref()),
+            Some(std::path::Path::new("/srv/zeroclaw/assistant"))
+        );
+    }
+
+    #[test]
     fn ensure_map_key_rolls_back_alias_on_unknown_tail_field() {
         let mut config = Config::default();
         let path = "risk_profiles.newprofile.not_a_real_field";
@@ -9424,6 +9507,39 @@ mod tests {
                 .unwrap_or_default()
                 .is_empty(),
             "the tentatively-created alias must be rolled back, not left dangling",
+        );
+    }
+
+    #[test]
+    fn ensure_map_key_for_prop_path_leaves_existing_hyphenated_alias_alone() {
+        let mut config = Config::default();
+        config.cron.insert(
+            "morning-brief".to_string(),
+            zeroclaw_config::schema::CronJobDecl::default(),
+        );
+
+        let created = ensure_map_key_for_prop_path(&mut config, "cron.morning-brief.name")
+            .expect("an existing loaded alias must never be rejected by the create grammar");
+        assert!(
+            !created,
+            "the existing `morning-brief` alias must not be reported as newly created"
+        );
+        assert!(
+            config
+                .set_prop("cron.morning-brief.name", "Morning brief")
+                .is_ok(),
+            "setting a field on an existing hyphenated cron alias must succeed"
+        );
+        assert_eq!(
+            config.get_prop("cron.morning-brief.name").ok(),
+            Some("Morning brief".to_string())
+        );
+
+        let err = ensure_map_key_for_prop_path(&mut config, "cron.bad-alias.name")
+            .expect_err("creating a NEW hyphenated alias must still be rejected");
+        assert!(
+            err.to_string().contains("invalid character"),
+            "new-alias grammar must be preserved: {err}"
         );
     }
 

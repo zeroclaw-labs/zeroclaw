@@ -381,6 +381,31 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_progress_strings_exist_in_every_builtin_locale() {
+        let keys = [
+            "channel-runtime-progress-received",
+            "channel-runtime-progress-planning",
+            "channel-runtime-progress-waiting-on-model",
+            "channel-runtime-progress-running-tool",
+            "channel-runtime-progress-compacting-context",
+            "channel-runtime-progress-finalizing-response",
+        ];
+        for (source, locale) in [
+            (include_str!("../locales/en/cli.ftl"), "en"),
+            (include_str!("../locales/es/cli.ftl"), "es"),
+            (include_str!("../locales/fr/cli.ftl"), "fr"),
+            (include_str!("../locales/ja/cli.ftl"), "ja"),
+            (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+        ] {
+            for key in keys {
+                let value = format_ftl_message(source, locale, key, &[])
+                    .unwrap_or_else(|| panic!("{key} should format in {locale}"));
+                assert!(!value.trim().is_empty(), "{key} is empty in {locale}");
+            }
+        }
+    }
+
+    #[test]
     fn zh_cn_wechat_translations_preserve_machine_facing_tokens() {
         let zh_cn = include_str!("../locales/zh-CN/cli.ftl");
         let bind = format_ftl_message(
@@ -569,6 +594,48 @@ mod tests {
                     value.contains("simulated write failure"),
                     "{key} in {locale} should inline error; got: {value:?}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn daemon_startup_cli_strings_format_in_all_locales() {
+        let url = "http://127.0.0.1:42617";
+        let path = "/tmp/zeroclaw-test/daemon.sock";
+        let cases = [
+            ("cli-daemon-starting-title", &[][..], &["ZeroClaw"][..]),
+            ("cli-daemon-starting-detail", &[][..], &[][..]),
+            ("cli-daemon-started-title", &[][..], &["ZeroClaw"][..]),
+            (
+                "cli-daemon-started-gateway",
+                &[("url", url)][..],
+                &[url][..],
+            ),
+            (
+                "cli-daemon-started-socket",
+                &[("path", path)][..],
+                &[path][..],
+            ),
+            ("cli-daemon-started-pairing", &[][..], &[][..]),
+            ("cli-daemon-started-stop", &[][..], &["Ctrl+C"][..]),
+        ];
+
+        for (source, locale) in [
+            (include_str!("../locales/en/cli.ftl"), "en"),
+            (include_str!("../locales/es/cli.ftl"), "es"),
+            (include_str!("../locales/fr/cli.ftl"), "fr"),
+            (include_str!("../locales/ja/cli.ftl"), "ja"),
+            (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+        ] {
+            for &(key, args, expected_parts) in &cases {
+                let value = format_ftl_message(source, locale, key, args)
+                    .unwrap_or_else(|| panic!("{key} should format in {locale}"));
+                for &expected in expected_parts {
+                    assert!(
+                        value.contains(expected),
+                        "{key} in {locale} should preserve {expected:?}; got: {value:?}"
+                    );
+                }
             }
         }
     }

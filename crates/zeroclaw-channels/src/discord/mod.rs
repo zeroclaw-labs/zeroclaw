@@ -3831,11 +3831,24 @@ impl Channel for DiscordChannel {
         Ok(())
     }
 
+    /// Delegates to [`Self::request_approval_attributed`] and drops the
+    /// provenance, so the prompt/timeout logic lives in exactly one place.
     async fn request_approval(
         &self,
         recipient: &str,
         request: &ChannelApprovalRequest,
     ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
+        Ok(self
+            .request_approval_attributed(recipient, request)
+            .await?
+            .map(|attributed| attributed.response))
+    }
+
+    async fn request_approval_attributed(
+        &self,
+        recipient: &str,
+        request: &ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
         // Approval prompts can't be delivered over a deferred interaction
         // reply (the sentinel is not a channel and the single @original
         // edit is reserved for the answer). Fail fast so the agent loop's
@@ -3868,15 +3881,28 @@ impl Channel for DiscordChannel {
 
         // Timeout → Deny, preserving the deny-by-default silence semantics. The
         // pending entry is dropped so a late click can't resolve a stale token.
-        let response =
+        // The synthesized deny carries a runtime source so the gate does not
+        // report it to the model as an operator's refusal.
+        let attributed =
             match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), rx).await {
-                Ok(Ok(resp)) => resp,
-                _ => {
+                Ok(Ok(resp)) => zeroclaw_api::channel::AttributedApprovalResponse::operator(resp),
+                Ok(Err(_)) => {
+                    // Sender dropped: the gateway task went away without a click.
                     self.pending_approvals.lock().await.remove(&token);
-                    ChannelApprovalResponse::Deny
+                    zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                        ChannelApprovalResponse::Deny,
+                        zeroclaw_api::channel::ApprovalSource::Unreachable,
+                    )
+                }
+                Err(_) => {
+                    self.pending_approvals.lock().await.remove(&token);
+                    zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                        ChannelApprovalResponse::Deny,
+                        zeroclaw_api::channel::ApprovalSource::TimedOut,
+                    )
                 }
             };
-        Ok(Some(response))
+        Ok(Some(attributed))
     }
 
     async fn send_gate_prompt(
@@ -4430,6 +4456,7 @@ mod tests {
             tools: vec![],
             prompts: vec![],
             slash_options: Vec::new(),
+            always: false,
             location: None,
         }
     }

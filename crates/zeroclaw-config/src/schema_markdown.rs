@@ -813,6 +813,22 @@ mod tests {
     }
 
     #[test]
+    fn docker_workspace_root_contract_appears_in_generated_reference() {
+        let schema = schemars::schema_for!(crate::schema::Config);
+        let md = generate(&schema.to_value());
+        let row = md
+            .lines()
+            .find(|line| line.contains("`allowed_workspace_roots`"))
+            .expect("generated config reference should include Docker workspace roots");
+
+        assert!(row.contains("fail-closed"));
+        assert!(row.contains("workspace must exist and canonicalize"));
+        assert!(row.contains("every configured root must also exist and canonicalize"));
+        assert!(row.contains("one invalid entry rejects the command"));
+        assert!(row.contains("empty list permits any canonical workspace"));
+    }
+
+    #[test]
     fn cron_section_exposes_uses_memory_field() {
         // Regression test: the generated config reference must expose
         // per-cron-job fields (including `uses_memory`) instead of only the
