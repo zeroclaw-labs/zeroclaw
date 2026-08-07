@@ -3396,6 +3396,18 @@ impl Channel for TelegramChannel {
         Ok(())
     }
 
+    async fn update_draft_progress(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        if self.stream_mode == StreamMode::Partial {
+            return self.update_draft(recipient, message_id, text).await;
+        }
+        Ok(())
+    }
+
     async fn finalize_draft(
         &self,
         recipient: &str,
@@ -4615,6 +4627,75 @@ mod tests {
         .with_streaming(StreamMode::Partial, 750);
         assert!(partial.supports_draft_updates());
         assert_eq!(partial.draft_update_interval_ms, 750);
+    }
+
+    #[tokio::test]
+    async fn update_draft_progress_only_edits_partial_streaming_drafts() {
+        use wiremock::matchers::{body_json, method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/editMessageText$"))
+            .and(body_json(serde_json::json!({
+                "chat_id": "123",
+                "message_id": 42,
+                "text": "Running tool",
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 42 }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        for stream_mode in [StreamMode::Off, StreamMode::MultiMessage] {
+            let channel = TelegramChannel::new(
+                "fake-token".into(),
+                "telegram_test_alias",
+                Arc::new(|| vec!["*".into()]),
+                false,
+            )
+            .with_streaming(stream_mode, 0)
+            .with_api_base(mock_server.uri());
+
+            channel
+                .update_draft_progress("123", "42", "Running tool")
+                .await
+                .unwrap();
+        }
+
+        let throttled = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_streaming(StreamMode::Partial, 60_000)
+        .with_api_base(mock_server.uri());
+        throttled
+            .last_draft_edit
+            .lock()
+            .insert("123".to_string(), std::time::Instant::now());
+        throttled
+            .update_draft_progress("123", "42", "Running tool")
+            .await
+            .unwrap();
+
+        let partial = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_streaming(StreamMode::Partial, 0)
+        .with_api_base(mock_server.uri());
+
+        partial
+            .update_draft_progress("123", "42", "Running tool")
+            .await
+            .unwrap();
     }
 
     #[test]
