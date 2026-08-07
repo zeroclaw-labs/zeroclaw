@@ -1132,6 +1132,113 @@ fn command_basename(raw: &str) -> &str {
     after_fwd.rsplit('\\').next().unwrap_or(after_fwd)
 }
 
+/// Drop single- and double-quoted spans so a pattern search sees only the
+/// text the shell would actually execute.
+fn strip_quoted_spans(command: &str) -> String {
+    let mut out = String::with_capacity(command.len());
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for ch in command.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Some(q) => {
+                if ch == '\\' && q == '"' {
+                    escaped = true;
+                } else if ch == q {
+                    quote = None;
+                }
+            }
+            None => match ch {
+                '\'' | '"' => quote = Some(ch),
+                '\\' => escaped = true,
+                _ => out.push(ch),
+            },
+        }
+    }
+    out
+}
+
+/// A self-replicating function that exhausts the process table. Matched on
+/// the unquoted text with whitespace removed, so spacing variants collapse
+/// onto one pattern.
+fn contains_fork_bomb(command: &str) -> bool {
+    let compact: String = strip_quoted_spans(command)
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    compact.contains(":(){:|:&};:")
+}
+
+/// Whether a `dd` operand names a raw block device rather than a file.
+/// `/dev/null` and `/dev/zero` are character devices and stay allowed.
+fn dd_writes_raw_block_device(arg: &str) -> bool {
+    let Some(target) = arg.strip_prefix("of=") else {
+        return false;
+    };
+    let target = strip_wrapping_quotes(target);
+    [
+        "/dev/sd",
+        "/dev/hd",
+        "/dev/vd",
+        "/dev/nvme",
+        "/dev/mmcblk",
+        "/dev/disk",
+    ]
+    .iter()
+    .any(|prefix| target.starts_with(prefix))
+}
+
+/// Whether an `rm` operand names the filesystem root itself.
+fn rm_targets_filesystem_root(args: &[String]) -> bool {
+    args.iter().any(|arg| {
+        let target = strip_wrapping_quotes(arg);
+        target == "/" || target == "/*"
+    })
+}
+
+/// Operations whose effect is immediate, irreversible, and never legitimate
+/// from an agent shell: they destroy a filesystem, overwrite a raw block
+/// device, exhaust the process table, or delete the filesystem root.
+///
+/// This tier is deliberately not configurable. `allowed_commands = ["*"]`
+/// with `block_high_risk_commands = false` is the documented way for an
+/// operator to opt out of command screening — it opts out of *screening*,
+/// not of the handful of operations that leave no system to recover on.
+fn is_irreversible_destructive_command(command: &str) -> bool {
+    if contains_fork_bomb(command) {
+        return true;
+    }
+
+    for segment in split_unquoted_segments(command) {
+        let cmd_part = skip_env_assignments(&segment);
+        let mut words = cmd_part.split_whitespace();
+        let Some(base_raw) = words.next() else {
+            continue;
+        };
+        let base_owned = command_basename(strip_wrapping_quotes(base_raw)).to_ascii_lowercase();
+        let base = strip_windows_exe_suffix(&base_owned);
+        let args: Vec<String> = words.map(|w| w.to_ascii_lowercase()).collect();
+
+        // `mkfs` and every `mkfs.<fstype>` variant format a device.
+        if base == "mkfs" || base.starts_with("mkfs.") {
+            return true;
+        }
+
+        if base == "dd" && args.iter().any(|arg| dd_writes_raw_block_device(arg)) {
+            return true;
+        }
+
+        if base == "rm" && rm_targets_filesystem_root(&args) {
+            return true;
+        }
+    }
+
+    false
+}
+
 /// Strip common Windows executable suffixes (.exe, .cmd, .bat) for uniform
 /// matching against allowlists and risk tables. On non-Windows platforms this
 /// is a no-op that returns the input unchanged.
@@ -1351,6 +1458,13 @@ impl SecurityPolicy {
         command: &str,
         approved: bool,
     ) -> Result<CommandRiskLevel, String> {
+        if is_irreversible_destructive_command(command) {
+            return Err(
+                "Command not allowed: irreversible destructive operation, denied in every posture"
+                    .into(),
+            );
+        }
+
         if !self.is_command_allowed(command) {
             return Err(format!("Command not allowed by security policy: {command}"));
         }
@@ -1428,6 +1542,11 @@ impl SecurityPolicy {
 
     pub fn is_command_allowed(&self, command: &str) -> bool {
         if self.autonomy == AutonomyLevel::ReadOnly {
+            return false;
+        }
+
+        // Denied in every posture, including the wildcard opt-out below.
+        if is_irreversible_destructive_command(command) {
             return false;
         }
 
@@ -3043,6 +3162,88 @@ mod tests {
         let result = p.validate_command_execution("rm -rf /tmp/test", true);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("high-risk"));
+    }
+
+    /// The most permissive posture an operator can configure: wildcard
+    /// allowlist, high-risk blocking off, full autonomy, pre-approved.
+    fn most_permissive_policy() -> SecurityPolicy {
+        SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        }
+    }
+
+    #[test]
+    fn catastrophic_commands_are_denied_in_the_most_permissive_posture() {
+        let p = most_permissive_policy();
+
+        for command in [
+            ":(){ :|:& };:",
+            ":(){:|:&};:",
+            "mkfs.ext4 /dev/sda1",
+            "mkfs -t ext4 /dev/sda1",
+            "dd if=/dev/zero of=/dev/sda",
+            "dd if=/dev/zero of=/dev/nvme0n1 bs=1M",
+            "rm -rf /",
+            "rm -rf /*",
+            "rm --recursive --force /",
+        ] {
+            assert!(
+                !p.is_command_allowed(command),
+                "{command:?} must stay denied even when the operator disables every other gate"
+            );
+            let err = p
+                .validate_command_execution(command, true)
+                .expect_err("catastrophic command must not validate");
+            assert!(
+                err.contains("irreversible"),
+                "{command:?} should report the unconditional deny, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn catastrophic_deny_does_not_capture_ordinary_work() {
+        let p = most_permissive_policy();
+
+        for command in [
+            "dd if=input.iso of=output.img bs=4M",
+            "dd if=/dev/zero of=./disk.img count=1",
+            "rm -rf ./build",
+            "rm -rf /tmp/scratch",
+            "rm -rf /home/agent/workspace/node_modules",
+            "echo ':(){ :|:& };:'",
+            "grep -r mkfs docs/",
+        ] {
+            assert!(
+                p.is_command_allowed(command),
+                "{command:?} is ordinary work and must remain allowed under a wildcard allowlist"
+            );
+        }
+    }
+
+    #[test]
+    fn catastrophic_deny_survives_a_high_risk_command_being_explicitly_listed() {
+        // Explicitly listing `dd` is the documented way to opt into a
+        // high-risk command. It must not also unlock writing to a raw device.
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            allowed_commands: vec!["dd".into()],
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        };
+
+        assert!(p.is_command_allowed("dd if=a.img of=b.img"));
+        assert!(!p.is_command_allowed("dd if=/dev/zero of=/dev/sda"));
+    }
+
+    #[test]
+    fn catastrophic_deny_applies_to_every_segment_of_a_chain() {
+        let p = most_permissive_policy();
+        assert!(!p.is_command_allowed("ls -la && mkfs.ext4 /dev/sdb1"));
+        assert!(!p.is_command_allowed("echo hi; rm -rf /"));
     }
 
     #[test]
