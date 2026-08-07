@@ -220,7 +220,7 @@ function RailNavItem({
             className="pointer-events-none fixed z-9999 whitespace-nowrap rounded-[var(--radius-sm)] px-2 py-1 text-xs"
             style={{
               top: tooltipTop,
-              left: tooltipLeft ?? 0, // set iff tooltipTop is set; see showTooltip
+              left: tooltipLeft ?? 0, // set alongside tooltipTop in the `update` closure
               transform: 'translateY(-50%)',
               background: 'var(--pc-bg-elevated)',
               color: 'var(--pc-text-primary)',

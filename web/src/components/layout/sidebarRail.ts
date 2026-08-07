@@ -14,8 +14,8 @@ export const railNavClassName = "flex-1 overflow-y-auto py-3 px-1.5";
 // evenly split so the icon, hover background, and active bar stay centered in
 // the rail, matching the original `w-10 mx-auto` on `master`. With a classic
 // gutter the content width drops to ~34px and the `w-full` links shrink instead
-// of overflowing horizontally and reintroducing the scrollbar that #8791
-// eliminates. The 22px icon stays centered in either case.
+// of overflowing horizontally, keeping the nav at `scrollWidth === clientWidth`
+// in both cases. The 22px icon stays centered in either case.
 export const railLinkClassName =
   "group relative flex h-10 w-full max-w-10 mx-auto items-center justify-center";
 

@@ -70,9 +70,9 @@ test('SidebarNavLink forwards a ref prop to the underlying NavLink', () => {
 test('desktop rail relies on the portal, not an overflow-x mask, for horizontal overflow', () => {
   // The rail tooltip is portaled out of the nav subtree, so `overflow-y:
   // auto` alone must keep the rail at `scrollWidth === clientWidth`. An
-  // `overflow-x` hidden/clip added here masks the symptom at the container
-  // instead of removing the overflowing content, and it reintroduces the
-  // band-aid that #8791 reviewers rejected.
+  // `overflow-x` hidden/clip added here would mask the symptom at the
+  // container instead of removing the overflowing content, so neither the
+  // nav class nor the aside style may carry one.
   assert.ok(railNavClassName.includes('overflow-y-auto'));
   assert.ok(
     !railNavClassName.includes('overflow-x'),
