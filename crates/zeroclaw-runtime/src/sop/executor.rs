@@ -312,6 +312,11 @@ async fn drive_headless_run(
                 // against no agent at all, so a refusal can never read as an
                 // agent having done the work.
                 let effective_agent = resolved_agent.as_ref().ok().map(|a| (*a).to_string());
+                // The audit sink the live path scopes around a delegated step.
+                // Without it a headless step records `tool_calls: []` — and an
+                // unattended run is precisely the one whose record of what it
+                // actually ran cannot be reconstructed from a conversation.
+                let call_sink = new_step_call_sink();
                 let run_result = match resolved_agent {
                     Ok(agent_alias) => {
                         let session_path =
@@ -322,9 +327,13 @@ async fn drive_headless_run(
                         // spawning) inherits the same boundary, so the child
                         // cannot regain tools this step denies — including the
                         // SOP control surface the step turn always drops.
-                        Box::pin(crate::sop::active_scope::with_active_headless_step_scope(
-                            scope.clone(),
-                            crate::agent::run(
+                        // Boxed innermost. The turn future is large, and in a
+                        // debug build composing it inline with both scope
+                        // wrappers overflows the worker stack while the value is
+                        // still being built on it — before `Box::pin` can move
+                        // it to the heap.
+                        let task_scope = scope.clone();
+                        let turn = Box::pin(crate::agent::run(
                                 config.clone(),
                                 agent_alias,
                                 Some(context),
@@ -342,12 +351,22 @@ async fn drive_headless_run(
                                     sop_step_scope: Some(scope),
                                     ..Default::default()
                                 },
+                        ));
+                        scope_step_call_sink(
+                            call_sink.clone(),
+                            crate::sop::active_scope::with_active_headless_step_scope(
+                                task_scope,
+                                turn,
                             ),
-                        ))
+                        )
                         .await
                     }
                     Err(e) => Err(e),
                 };
+                // Drained for the failure arm too: a step that failed partway
+                // through still ran the calls before it, and those are the ones
+                // an investigator needs.
+                let step_calls = drain_step_calls(&call_sink);
                 let completed_at = crate::sop::engine::now_iso8601();
                 let step_result = match run_result {
                     Ok(output) => SopStepResult {
@@ -357,7 +376,7 @@ async fn drive_headless_run(
                         started_at,
                         completed_at: Some(completed_at),
                         effective_agent,
-                        tool_calls: Vec::new(),
+                        tool_calls: step_calls,
                     },
                     Err(e) => SopStepResult {
                         step_number: step.number,
@@ -366,7 +385,7 @@ async fn drive_headless_run(
                         started_at,
                         completed_at: Some(completed_at),
                         effective_agent,
-                        tool_calls: Vec::new(),
+                        tool_calls: step_calls,
                     },
                 };
                 match advance_sop_step(&engine, &run_id, step_result.clone()) {
