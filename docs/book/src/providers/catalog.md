@@ -236,8 +236,13 @@ mode; tool/MCP configuration remains an operator-controlled capability.
 
 ACP stdout frames, aggregate stdout, assistant text, and stderr processing are
 bounded while the child is running. Stderr is drained but its content is never
-stored, logged, or returned. The process tree is terminated after every
-one-shot request, including success, timeout, cancellation, and protocol error.
+stored, logged, or returned. Public provider errors stay stable and do not echo
+child-controlled protocol free-text. After every one-shot request (success,
+timeout, cancellation, or protocol error), ZeroClaw terminates the child
+**process group** on Unix or the **Job Object** on Windows and reaps the direct
+child. That covers ordinary descendants; a process that creates a new session
+or process group can escape group kill on Unix. Windows Job Object coverage is
+compile-covered in CI and not fully executed on every Linux developer host.
 
 #### Recommended pattern: default channel chatbot
 

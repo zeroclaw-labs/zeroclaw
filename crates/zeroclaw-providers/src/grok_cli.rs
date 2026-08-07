@@ -39,8 +39,14 @@
 //! - rejects ACP permission requests unless the alias explicitly enables a
 //!   bypass mode, in which case it selects the request's allow-once option;
 //! - bounds ACP frames, configurable aggregate stdout, assistant output, and stderr;
-//! - kills the child process tree on success, failure, timeout, or cancellation;
-//! - never includes child stderr or raw ACP frames in public errors or logs.
+//! - on success, failure, timeout, or cancellation, terminates the child
+//!   process group (Unix) or Job Object (Windows) and reaps the direct child.
+//!   Descendants that create a new session/process group can escape group
+//!   kill on Unix; the public guarantee is process-group / Job Object scope,
+//!   not every possible detached process on the host;
+//! - never includes child stderr or raw ACP frames (or child-controlled
+//!   protocol free-text such as stopReason / protocolVersion / string error
+//!   codes) in public errors or logs.
 //!
 //! Operators can deliberately relax the CLI policy through `extra_args` (for
 //! example, `--tools=Read,Grep`, `--permission-mode=acceptEdits`, or

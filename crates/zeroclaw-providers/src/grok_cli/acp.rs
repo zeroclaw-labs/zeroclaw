@@ -116,18 +116,24 @@ pub(super) enum AcpError {
     AssistantLimit { limit: usize },
     #[error("Grok ACP returned invalid JSON during {phase}")]
     InvalidJson { phase: &'static str },
+    /// Remote JSON-RPC error. Public text stays phase-stable; only a sanitized
+    /// integer JSON-RPC code is retained when present (never child free-text).
     #[error("Grok ACP returned an error during {phase}{code}")]
-    Remote { phase: &'static str, code: String },
+    Remote {
+        phase: &'static str,
+        /// Empty, or `" (code N)"` for an integer JSON-RPC error code only.
+        code: &'static str,
+    },
     #[error("Grok ACP {phase} response was incomplete")]
     Incomplete { phase: &'static str },
     #[error("Grok ACP initialize returned no usable authentication method")]
     NoAuthenticationMethod,
-    #[error("Grok ACP initialize protocolVersion mismatch: expected {expected}, got {got}")]
-    ProtocolVersion { expected: u64, got: String },
+    #[error("Grok ACP initialize protocolVersion mismatch")]
+    ProtocolVersion,
     #[error("Grok ACP session/prompt completed without agent message text")]
     EmptyOutput,
-    #[error("Grok ACP session/prompt ended with stopReason={stop_reason}")]
-    StopReason { stop_reason: String },
+    #[error("Grok ACP session/prompt ended with a non-success stopReason")]
+    StopReason,
     #[error("Grok ACP could not encode an internal request")]
     Encode,
 }
@@ -145,42 +151,70 @@ impl AcpError {
             Self::Remote { .. } => "grok_cli_acp_remote_error",
             Self::Incomplete { .. } => "grok_cli_acp_incomplete_response",
             Self::NoAuthenticationMethod => "grok_cli_acp_auth_unavailable",
-            Self::ProtocolVersion { .. } => "grok_cli_acp_protocol_version",
+            Self::ProtocolVersion => "grok_cli_acp_protocol_version",
             Self::EmptyOutput => "grok_cli_acp_empty_output",
-            Self::StopReason { .. } => "grok_cli_acp_stop_reason",
+            Self::StopReason => "grok_cli_acp_stop_reason",
             Self::Encode => "grok_cli_acp_encode_failed",
         }
     }
 }
 
+/// Map a small set of well-known integer JSON-RPC codes to fixed public
+/// suffixes. Unknown or non-integer codes stay empty so hostile strings never
+/// escape into provider errors.
 fn remote_error(phase: &'static str, message: &Value) -> AcpError {
     let code = message
         .pointer("/error/code")
-        .and_then(|value| match value {
-            Value::Number(number) => Some(number.to_string()),
-            Value::String(text) => Some(text.clone()),
+        .and_then(Value::as_i64)
+        .and_then(|code| match code {
+            -32700 => Some(" (code -32700)"),
+            -32600 => Some(" (code -32600)"),
+            -32601 => Some(" (code -32601)"),
+            -32602 => Some(" (code -32602)"),
+            -32603 => Some(" (code -32603)"),
             _ => None,
         })
-        .map(|code| format!(" (code {code})"))
-        .unwrap_or_default();
+        .unwrap_or("");
     AcpError::Remote { phase, code }
 }
 
+/// Exact request/response ID equality for this client.
+///
+/// Accepts only integer JSON numbers equal to `expected`, or a string whose
+/// entire content is the decimal form of `expected`. Fractional numbers (e.g.
+/// `1.9`) must not match, per JSON-RPC 2.0's guidance against fractional IDs.
 fn json_rpc_id_matches(value: Option<&Value>, expected: u64) -> bool {
     let Some(value) = value else {
         return false;
     };
     match value {
         Value::Number(number) => {
-            number.as_u64() == Some(expected)
-                || number.as_i64() == Some(expected as i64)
-                || number
-                    .as_f64()
-                    .is_some_and(|float| float.is_finite() && float as u64 == expected)
+            if let Some(as_u64) = number.as_u64() {
+                return as_u64 == expected;
+            }
+            // Reject values that only fit as f64 (including 1.9 -> 1 casts).
+            false
         }
-        Value::String(text) => text.parse::<u64>().ok() == Some(expected),
+        Value::String(text) => text.as_str() == expected.to_string(),
         _ => false,
     }
+}
+
+fn message_session_id(message: &Value) -> Option<&str> {
+    message
+        .pointer("/params/sessionId")
+        .or_else(|| message.pointer("/params/session_id"))
+        .and_then(Value::as_str)
+}
+
+/// Drop notifications and server requests that do not target the one-shot
+/// session this client created. Missing sessionId is treated as non-matching
+/// once a session exists.
+fn session_matches(message: &Value, session_id: Option<&str>) -> bool {
+    let Some(expected) = session_id else {
+        return true;
+    };
+    message_session_id(message) == Some(expected)
 }
 
 /// Run one prompt against an already-spawned `grok agent stdio` child.
@@ -215,6 +249,7 @@ where
         }),
         &mut assistant,
         permission_policy,
+        None,
     )
     .await?;
     validate_protocol_version(&initialize)?;
@@ -231,6 +266,7 @@ where
         }),
         &mut assistant,
         permission_policy,
+        None,
     )
     .await?;
 
@@ -245,6 +281,7 @@ where
         }),
         &mut assistant,
         permission_policy,
+        None,
     )
     .await?;
     let session_id = new_session
@@ -268,11 +305,19 @@ where
         }),
         &mut assistant,
         permission_policy,
+        Some(session_id.as_str()),
     )
     .await?;
     reject_failed_stop_reason(&prompt_result)?;
 
-    settle_trailing_output(stdin, &mut reader, &mut assistant, permission_policy).await?;
+    settle_trailing_output(
+        stdin,
+        &mut reader,
+        &mut assistant,
+        permission_policy,
+        Some(session_id.as_str()),
+    )
+    .await?;
     let trimmed = assistant.trim();
     if trimmed.is_empty() {
         return Err(AcpError::EmptyOutput);
@@ -388,6 +433,7 @@ async fn rpc_request<W, R>(
     params: Value,
     assistant: &mut String,
     permission_policy: AcpPermissionPolicy,
+    session_id: Option<&str>,
 ) -> Result<Value, AcpError>
 where
     W: AsyncWrite + Unpin,
@@ -404,13 +450,21 @@ where
         };
 
         if message.get(field::METHOD).is_some() && message.get(field::ID).is_some() {
-            discard_non_final_output(&message, assistant);
-            handle_server_request(stdin, &message, permission_policy).await?;
+            if session_matches(&message, session_id) {
+                discard_non_final_output(&message, assistant);
+                handle_server_request(stdin, &message, permission_policy).await?;
+            } else {
+                // Wrong-session permission requests still need a terminal
+                // answer so the child does not wait forever.
+                handle_server_request_cancelled(stdin, &message).await?;
+            }
             continue;
         }
         if message.get(field::METHOD).is_some() && message.get(field::ID).is_none() {
-            discard_non_final_output(&message, assistant);
-            append_agent_message_chunk(&message, assistant)?;
+            if session_matches(&message, session_id) {
+                discard_non_final_output(&message, assistant);
+                append_agent_message_chunk(&message, assistant)?;
+            }
             continue;
         }
         // Bare error responses with null/missing id still fail the turn.
@@ -431,27 +485,24 @@ where
 
 fn validate_protocol_version(initialize: &Value) -> Result<(), AcpError> {
     let Some(version) = initialize.get("protocolVersion") else {
-        return Err(AcpError::ProtocolVersion {
-            expected: ACP_PROTOCOL_VERSION,
-            got: "missing".to_string(),
-        });
+        return Err(AcpError::ProtocolVersion);
     };
     let accepted = match version {
         Value::Number(number) => number.as_u64() == Some(ACP_PROTOCOL_VERSION),
-        Value::String(text) => text.parse::<u64>().ok() == Some(ACP_PROTOCOL_VERSION),
+        // Exact decimal string form only (no float-like "1.0").
+        Value::String(text) => text.as_str() == ACP_PROTOCOL_VERSION.to_string(),
         _ => false,
     };
     if accepted {
         Ok(())
     } else {
-        Err(AcpError::ProtocolVersion {
-            expected: ACP_PROTOCOL_VERSION,
-            got: version.to_string(),
-        })
+        Err(AcpError::ProtocolVersion)
     }
 }
 
 /// Fail closed on explicit non-success stop reasons from session/prompt.
+/// Known success tokens only; any other value (including hostile free text)
+/// becomes a stable StopReason error without echoing the child string.
 fn reject_failed_stop_reason(prompt_result: &Value) -> Result<(), AcpError> {
     let Some(stop_reason) = prompt_result
         .get("stopReason")
@@ -462,9 +513,7 @@ fn reject_failed_stop_reason(prompt_result: &Value) -> Result<(), AcpError> {
     };
     match stop_reason {
         "end_turn" | "end_turn_tool" | "max_tokens" | "" => Ok(()),
-        other => Err(AcpError::StopReason {
-            stop_reason: other.to_string(),
-        }),
+        _ => Err(AcpError::StopReason),
     }
 }
 
@@ -520,6 +569,39 @@ where
     write_line(stdin, &response, "unsupported server request response").await
 }
 
+/// Cancel a server request without selecting allow/reject options. Used when
+/// the request does not target the one-shot session this client owns.
+async fn handle_server_request_cancelled<W>(stdin: &mut W, message: &Value) -> Result<(), AcpError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let id = message.get(field::ID).cloned().unwrap_or(Value::Null);
+    let method = message
+        .get(field::METHOD)
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if method == "session/request_permission" || method.ends_with("/session/request_permission") {
+        let response = JsonRpcResponse {
+            jsonrpc: JSONRPC_VERSION,
+            result: Some(json!({ "outcome": { "outcome": "cancelled" } })),
+            error: None,
+            id,
+        };
+        return write_line(stdin, &response, "permission cancel response").await;
+    }
+    let response = JsonRpcResponse {
+        jsonrpc: JSONRPC_VERSION,
+        result: None,
+        error: Some(JsonRpcError {
+            code: METHOD_NOT_FOUND,
+            message: "Method not supported by the ZeroClaw ACP client".to_string(),
+            data: None,
+        }),
+        id,
+    };
+    write_line(stdin, &response, "unsupported server request response").await
+}
+
 fn permission_outcome(message: &Value, permission_policy: AcpPermissionPolicy) -> Value {
     if let Some(option_id) = message
         .pointer("/params/options")
@@ -542,6 +624,7 @@ async fn settle_trailing_output<W, R>(
     reader: &mut AcpReader<R>,
     assistant: &mut String,
     permission_policy: AcpPermissionPolicy,
+    session_id: Option<&str>,
 ) -> Result<(), AcpError>
 where
     W: AsyncWrite + Unpin,
@@ -556,11 +639,17 @@ where
             Ok(Ok(Some(message))) => {
                 quiet_intervals = 0;
                 if message.get(field::METHOD).is_some() && message.get(field::ID).is_some() {
-                    discard_non_final_output(&message, assistant);
-                    handle_server_request(stdin, &message, permission_policy).await?;
+                    if session_matches(&message, session_id) {
+                        discard_non_final_output(&message, assistant);
+                        handle_server_request(stdin, &message, permission_policy).await?;
+                    } else {
+                        handle_server_request_cancelled(stdin, &message).await?;
+                    }
                 } else if message.get(field::METHOD).is_some() {
-                    discard_non_final_output(&message, assistant);
-                    append_agent_message_chunk(&message, assistant)?;
+                    if session_matches(&message, session_id) {
+                        discard_non_final_output(&message, assistant);
+                        append_agent_message_chunk(&message, assistant)?;
+                    }
                 }
             }
         }
@@ -757,6 +846,68 @@ mod tests {
         });
         discard_non_final_output(&permission, &mut assistant);
         assert!(assistant.is_empty());
+    }
+
+    #[test]
+    fn json_rpc_id_matches_requires_exact_integer_or_decimal_string() {
+        assert!(json_rpc_id_matches(Some(&json!(1)), 1));
+        assert!(json_rpc_id_matches(Some(&json!("1")), 1));
+        assert!(!json_rpc_id_matches(Some(&json!(1.9)), 1));
+        assert!(!json_rpc_id_matches(Some(&json!(1.0)), 1));
+        assert!(!json_rpc_id_matches(Some(&json!("1.0")), 1));
+        assert!(!json_rpc_id_matches(Some(&json!("01")), 1));
+        assert!(!json_rpc_id_matches(Some(&json!(2)), 1));
+        assert!(!json_rpc_id_matches(None, 1));
+    }
+
+    #[test]
+    fn public_acp_errors_do_not_echo_child_controlled_strings() {
+        let hostile_code = remote_error(
+            "session/prompt",
+            &json!({ "error": { "code": "EVIL_STRING", "message": "leak me" } }),
+        );
+        let display = hostile_code.to_string();
+        assert!(!display.contains("EVIL_STRING"));
+        assert!(!display.contains("leak me"));
+        assert!(display.contains("session/prompt"));
+
+        let known_code = remote_error(
+            "initialize",
+            &json!({ "error": { "code": -32602, "message": "Invalid params" } }),
+        );
+        assert!(known_code.to_string().contains("(code -32602)"));
+        assert!(!known_code.to_string().contains("Invalid params"));
+
+        let version_err = AcpError::ProtocolVersion;
+        assert_eq!(
+            version_err.to_string(),
+            "Grok ACP initialize protocolVersion mismatch"
+        );
+        assert!(!version_err.to_string().contains("999"));
+
+        let stop_err = AcpError::StopReason;
+        assert_eq!(
+            stop_err.to_string(),
+            "Grok ACP session/prompt ended with a non-success stopReason"
+        );
+        assert!(!stop_err.to_string().contains("hostile"));
+    }
+
+    #[test]
+    fn session_matches_requires_created_session_id() {
+        let own = json!({
+            "method": "session/update",
+            "params": { "sessionId": "own-session", "update": {} }
+        });
+        let other = json!({
+            "method": "session/update",
+            "params": { "sessionId": "other-session", "update": {} }
+        });
+        let missing = json!({ "method": "session/update", "params": { "update": {} } });
+        assert!(session_matches(&own, Some("own-session")));
+        assert!(!session_matches(&other, Some("own-session")));
+        assert!(!session_matches(&missing, Some("own-session")));
+        assert!(session_matches(&other, None));
     }
 
     #[test]
