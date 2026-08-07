@@ -597,6 +597,20 @@ pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> 
     sanitize_session_key(&raw)
 }
 
+/// Debounce accumulates rapid messages into one combined turn, so its
+/// grouping must stay scoped to the actual sender even when conversation
+/// history is room-scoped (`ReplyTarget`): keying debounce on the shared
+/// history key would concatenate different members' messages into a single
+/// turn attributed to whoever sent last.
+fn message_debounce_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
+    match msg.conversation_scope {
+        zeroclaw_api::channel::ChannelConversationScope::Sender => conversation_history_key(msg),
+        zeroclaw_api::channel::ChannelConversationScope::ReplyTarget => {
+            sanitize_session_key(&format!("{}_{}", conversation_history_key(msg), msg.sender))
+        }
+    }
+}
+
 fn scope_override_key(
     scope: OverrideScope,
     msg: &zeroclaw_api::channel::ChannelMessage,
@@ -1147,16 +1161,31 @@ fn format_whatsapp_group_history_turn(label: &str, sender: &str, content: &str) 
     }
 }
 
-fn attributed_whatsapp_group_user_turn(
+fn format_shared_scope_history_turn(sender: &str, content: &str) -> String {
+    let sender = sender.trim();
+    if sender.is_empty() {
+        content.to_string()
+    } else {
+        format!("[Message from {sender}]\n{content}")
+    }
+}
+
+fn attributed_channel_user_turn(
     msg: &zeroclaw_api::channel::ChannelMessage,
     label: &str,
     content: &str,
 ) -> String {
     if msg.channel == "whatsapp" && is_group_reply_target(&msg.reply_target) {
-        format_whatsapp_group_history_turn(label, &msg.sender, content)
-    } else {
-        content.to_string()
+        return format_whatsapp_group_history_turn(label, &msg.sender, content);
     }
+    // `ReplyTarget` scope interleaves multiple senders in one persisted
+    // history, so each stored user turn must carry its speaker; without this,
+    // prior turns read as anonymous `user` messages once a second member
+    // writes in the shared session.
+    if msg.conversation_scope == zeroclaw_api::channel::ChannelConversationScope::ReplyTarget {
+        return format_shared_scope_history_turn(&msg.sender, content);
+    }
+    content.to_string()
 }
 
 fn timestamped_channel_user_history_content(
@@ -1164,7 +1193,7 @@ fn timestamped_channel_user_history_content(
     label: &str,
 ) -> String {
     let timestamped_content = timestamp_channel_user_content(&msg.content);
-    attributed_whatsapp_group_user_turn(msg, label, &timestamped_content)
+    attributed_channel_user_turn(msg, label, &timestamped_content)
 }
 
 /// Collapse only heavy inline `data:` image payloads in historical turns while
@@ -7170,7 +7199,7 @@ async fn run_message_dispatch_loop(
         // ── Debounce: accumulate rapid messages per sender ──────────
         // CLI messages bypass debouncing so the interactive loop stays responsive.
         let msg = if msg.channel != "cli" {
-            let debounce_key = conversation_history_key(&msg);
+            let debounce_key = message_debounce_key(&msg);
 
             // Resolve effective debounce window: per-channel override wins,
             // otherwise falls back to the global default from ChannelsConfig.
@@ -22104,6 +22133,113 @@ BTC is currently around $65,000 based on latest tool output."#
             "wecom_ws_work_group--room-1"
         );
         assert_eq!(interruption_scope_key(&msg), "wecom_ws_work_group--room-1");
+    }
+
+    fn shared_topic_message(sender: &str, id: &str, content: &str) -> ChannelMessage {
+        ChannelMessage {
+            id: id.into(),
+            sender: sender.into(),
+            reply_target: "-1001234:77".into(),
+            content: content.into(),
+            channel: "telegram".into(),
+            channel_alias: Some("default".into()),
+            timestamp: 1,
+            thread_ts: Some("77".into()),
+            conversation_scope: zeroclaw_api::channel::ChannelConversationScope::ReplyTarget,
+
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_session_debounce_never_collapses_distinct_senders() {
+        let alice = shared_topic_message("alice", "m1", "please deploy");
+        let bob = shared_topic_message("bob", "m2", "hold on, wait for QA");
+
+        // Shared history key is identical, but debounce must stay per sender.
+        assert_eq!(
+            conversation_history_key(&alice),
+            conversation_history_key(&bob)
+        );
+        assert_ne!(message_debounce_key(&alice), message_debounce_key(&bob));
+
+        // With a nonzero window, Bob's message must open its own debounce
+        // entry instead of being appended to Alice's pending accumulation.
+        let debouncer = MessageDebouncer::new(Duration::from_millis(30));
+        let window = Duration::from_millis(30);
+        let rx_alice = match debouncer
+            .debounce_with_window(&message_debounce_key(&alice), &alice.content, window)
+            .await
+        {
+            zeroclaw_infra::debounce::DebounceResult::Pending(rx) => rx,
+            zeroclaw_infra::debounce::DebounceResult::Passthrough(_) => {
+                panic!("nonzero window must debounce")
+            }
+        };
+        let rx_bob = match debouncer
+            .debounce_with_window(&message_debounce_key(&bob), &bob.content, window)
+            .await
+        {
+            zeroclaw_infra::debounce::DebounceResult::Pending(rx) => rx,
+            zeroclaw_infra::debounce::DebounceResult::Passthrough(_) => {
+                panic!("nonzero window must debounce")
+            }
+        };
+
+        assert_eq!(rx_alice.await.unwrap(), "please deploy");
+        assert_eq!(rx_bob.await.unwrap(), "hold on, wait for QA");
+    }
+
+    #[test]
+    fn sender_scope_debounce_key_matches_history_key() {
+        let mut msg = shared_topic_message("alice", "m1", "hi");
+        msg.conversation_scope = zeroclaw_api::channel::ChannelConversationScope::Sender;
+        assert_eq!(message_debounce_key(&msg), conversation_history_key(&msg));
+    }
+
+    #[test]
+    fn shared_session_history_preserves_alice_then_bob_attribution() {
+        let alice = shared_topic_message("alice", "m1", "the budget file is v3");
+        let bob = shared_topic_message("bob", "m2", "use v4 instead");
+
+        let alice_turn =
+            timestamped_channel_user_history_content(&alice, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL);
+        let bob_turn =
+            timestamped_channel_user_history_content(&bob, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL);
+
+        assert!(
+            alice_turn.starts_with("[Message from alice]\n"),
+            "persisted shared-scope turn must retain its speaker: {alice_turn}"
+        );
+        assert!(
+            bob_turn.starts_with("[Message from bob]\n"),
+            "persisted shared-scope turn must retain its speaker: {bob_turn}"
+        );
+        assert!(alice_turn.contains("the budget file is v3"));
+        assert!(bob_turn.contains("use v4 instead"));
+
+        // Default sender-scoped Telegram turns stay unlabelled (no behavior
+        // change when per_user_session = true).
+        let mut solo = shared_topic_message("alice", "m3", "just me here");
+        solo.conversation_scope = zeroclaw_api::channel::ChannelConversationScope::Sender;
+        let solo_turn =
+            timestamped_channel_user_history_content(&solo, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL);
+        assert!(
+            !solo_turn.contains("[Message from"),
+            "sender-scoped turns must stay unlabelled: {solo_turn}"
+        );
+
+        // WhatsApp groups keep their existing channel-specific label.
+        let mut wa = shared_topic_message("carol", "m4", "wa message");
+        wa.channel = "whatsapp".into();
+        wa.reply_target = "12036302@g.us".into();
+        wa.conversation_scope = zeroclaw_api::channel::ChannelConversationScope::Sender;
+        let wa_turn =
+            timestamped_channel_user_history_content(&wa, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL);
+        assert!(
+            wa_turn.starts_with("[Current WhatsApp group message from carol]\n"),
+            "whatsapp group label must be unchanged: {wa_turn}"
+        );
     }
 
     #[test]
