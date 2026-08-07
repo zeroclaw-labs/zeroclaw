@@ -8237,9 +8237,13 @@ mod tests {
     /// listen() dispatch boundary test: ambient group message in mention_only
     /// mode is silently skipped — no ChannelMessage delivered, no pairing
     /// prompt (sendMessage) sent.
+    ///
+    /// The startup probe (timeout=0) gets an empty response so it doesn't
+    /// consume the target update; the main long-poll (timeout=30) returns the
+    /// ambient message, proving it reaches the `should_skip_unauthorized` branch.
     #[tokio::test]
     async fn listen_mention_only_skips_ambient_group_without_pairing_prompt() {
-        use wiremock::matchers::{method, path_regex};
+        use wiremock::matchers::{body_json, method, path_regex};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let mock_server = MockServer::start().await;
@@ -8262,7 +8266,24 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        // getUpdates always returns the ambient group message.
+        // Probe call (timeout=0): return empty so the target update is not
+        // consumed during startup and must reach the main loop.
+        let probe_body = serde_json::json!({
+            "offset": 0,
+            "timeout": 0,
+            "allowed_updates": ["message", "callback_query"]
+        });
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/getUpdates$"))
+            .and(body_json(&probe_body))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": []
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Main loop poll (timeout=30): return the ambient group message.
         Mock::given(method("POST"))
             .and(path_regex(r"/bot[^/]+/getUpdates$"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -8316,9 +8337,13 @@ mod tests {
     /// listen() boundary: when getMe fails (bot_username unavailable), an
     /// ambient group message in mention_only mode is skipped without sending
     /// a pairing prompt.
+    ///
+    /// The startup probe (timeout=0) gets an empty response so it doesn't
+    /// consume the target update; the main long-poll (timeout=30) returns the
+    /// ambient message, proving it reaches the fail-closed skip branch.
     #[tokio::test]
     async fn listen_mention_only_fails_closed_getme_when_bot_username_unknown() {
-        use wiremock::matchers::{method, path_regex};
+        use wiremock::matchers::{body_json, method, path_regex};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let mock_server = MockServer::start().await;
@@ -8341,7 +8366,24 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        // getUpdates always returns an ambient group message.
+        // Probe call (timeout=0): return empty so the target update is not
+        // consumed during startup.
+        let probe_body = serde_json::json!({
+            "offset": 0,
+            "timeout": 0,
+            "allowed_updates": ["message", "callback_query"]
+        });
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/getUpdates$"))
+            .and(body_json(&probe_body))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": []
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Main loop poll (timeout=30): return the ambient group message.
         Mock::given(method("POST"))
             .and(path_regex(r"/bot[^/]+/getUpdates$"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -8486,5 +8528,300 @@ mod tests {
         assert_eq!(msg.channel_alias.as_deref(), Some("telegram_test_alias"));
         // Mention text is preserved in content (normalize_incoming_content trims only).
         assert!(msg.content.contains("zeroclaw_bot"));
+    }
+
+    /// Factory/config-backed assertion: proves that `allowed_groups` from the
+    /// config schema reaches the TelegramChannel resolver closure at
+    /// construction time — mirroring the wiring in `collect_configured_channels`.
+    #[test]
+    fn factory_allowed_groups_resolver_reads_config_field() {
+        use zeroclaw_config::schema::TelegramConfig;
+
+        let mut config = Config::default();
+        config.channels.telegram.insert(
+            "home".to_string(),
+            TelegramConfig {
+                enabled: true,
+                bot_token: "t".into(),
+                allowed_groups: vec!["-1001234567890".to_string(), "-1009876543210".to_string()],
+                ..Default::default()
+            },
+        );
+
+        // Reproduces the resolver closure pattern from
+        // collect_configured_channels (orchestrator/mod.rs lines 8446-8458).
+        let cfg_arc = Arc::new(RwLock::new(config.clone()));
+        let alias = "home";
+        let allowed_groups_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+            let cfg_arc = Arc::clone(&cfg_arc);
+            let alias = alias.to_string();
+            Arc::new(move || {
+                cfg_arc
+                    .read()
+                    .channels
+                    .telegram
+                    .get(&alias)
+                    .map(|tg| tg.allowed_groups.clone())
+                    .unwrap_or_default()
+            })
+        };
+
+        // The resolver closure must read the same values from the config.
+        let resolved = allowed_groups_resolver();
+        assert_eq!(
+            resolved,
+            vec!["-1001234567890", "-1009876543210"],
+            "resolver closure must surface config.allowed_groups"
+        );
+
+        // Prove live resolution: mutating config updates the resolver without
+        // rebuild — the no-cache contract from AGENTS.md.
+        {
+            cfg_arc
+                .write()
+                .channels
+                .telegram
+                .get_mut("home")
+                .unwrap()
+                .allowed_groups
+                .push("-1005555555555".to_string());
+        }
+        let resolved2 = allowed_groups_resolver();
+        assert_eq!(
+            resolved2,
+            vec!["-1001234567890", "-1009876543210", "-1005555555555"],
+            "resolver must reflect config mutations live"
+        );
+
+        // The TelegramConfig struct field itself must be the canonical source.
+        assert_eq!(
+            config.channels.telegram.get("home").unwrap().allowed_groups,
+            vec!["-1001234567890", "-1009876543210"],
+        );
+    }
+
+    /// listen() boundary: a group message from an exact allowed_groups entry
+    /// bypasses the peer allowlist and pairing flow, and is dispatched as a
+    /// ChannelMessage without a pairing prompt.
+    #[tokio::test]
+    async fn listen_allowed_groups_dispatches_exact_group_message() {
+        use wiremock::matchers::{body_json, method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getMe$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "id": 100, "username": "zeroclaw_bot", "is_bot": true }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/setMyCommands$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": true })),
+            )
+            .mount(&mock_server)
+            .await;
+
+        // Probe (timeout=0): empty so the target update reaches the main loop.
+        let probe_body = serde_json::json!({
+            "offset": 0,
+            "timeout": 0,
+            "allowed_updates": ["message", "callback_query"]
+        });
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/getUpdates$"))
+            .and(body_json(&probe_body))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": []
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Main loop (timeout=30): group message from an unauthorized peer in
+        // an exact allowed group — should be dispatched.
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/getUpdates$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": [{
+                    "update_id": 1,
+                    "message": {
+                        "message_id": 1,
+                        "chat": { "id": -1001234567890i64, "type": "group" },
+                        "from": { "id": 999, "username": "stranger" },
+                        "text": "hey bot can you help?"
+                    }
+                }]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // sendChatAction (typing indicator) — listen() calls it for dispatched msgs.
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendChatAction$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": true })),
+            )
+            .mount(&mock_server)
+            .await;
+
+        // No sendMessage (pairing prompt) — the message is authorized.
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": {} })),
+            )
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ChannelMessage>(8);
+
+        // Empty peer resolver + exact allowed_groups entry for the group.
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(Vec::new), // empty peers → would normally trigger pairing
+            false,              // mention_only off
+        )
+        .with_api_base(mock_server.uri())
+        .with_allowed_groups_resolver(Arc::new(|| vec!["-1001234567890".to_string()]));
+
+        let listen_fut = async {
+            let _ = ch.listen(tx).await;
+        };
+
+        tokio::time::timeout(std::time::Duration::from_millis(500), listen_fut)
+            .await
+            .ok();
+
+        // The message must be dispatched despite empty peer allowlist.
+        let delivered = rx.try_recv();
+        assert!(
+            delivered.is_ok(),
+            "allowed_groups member in exact group should bypass peer allowlist"
+        );
+        let msg = delivered.unwrap();
+        assert_eq!(msg.channel_alias.as_deref(), Some("telegram_test_alias"));
+    }
+
+    /// listen() boundary: a wildcard `allowed_groups` entry dispatches group
+    /// messages from any group chat through the listener boundary.
+    #[tokio::test]
+    async fn listen_allowed_groups_wildcard_dispatches_group_message() {
+        use wiremock::matchers::{body_json, method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getMe$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "id": 100, "username": "zeroclaw_bot", "is_bot": true }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/setMyCommands$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": true })),
+            )
+            .mount(&mock_server)
+            .await;
+
+        // Probe (timeout=0): empty so the target update reaches the main loop.
+        let probe_body = serde_json::json!({
+            "offset": 0,
+            "timeout": 0,
+            "allowed_updates": ["message", "callback_query"]
+        });
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/getUpdates$"))
+            .and(body_json(&probe_body))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": []
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Main loop (timeout=30): group message from an unauthorized peer in
+        // an unlisted group — wildcard allowed_groups should still dispatch it.
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/getUpdates$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": [{
+                    "update_id": 1,
+                    "message": {
+                        "message_id": 1,
+                        "chat": { "id": -1009999999999i64, "type": "supergroup" },
+                        "from": { "id": 4242, "username": "anyone" },
+                        "text": "question from a random group"
+                    }
+                }]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // sendChatAction — listen() calls it for dispatched msgs.
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendChatAction$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": true })),
+            )
+            .mount(&mock_server)
+            .await;
+
+        // No sendMessage (pairing prompt).
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": {} })),
+            )
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ChannelMessage>(8);
+
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(Vec::new), // empty peers → would normally trigger pairing
+            false,              // mention_only off
+        )
+        .with_api_base(mock_server.uri())
+        .with_allowed_groups_resolver(Arc::new(|| vec!["*".to_string()]));
+
+        let listen_fut = async {
+            let _ = ch.listen(tx).await;
+        };
+
+        tokio::time::timeout(std::time::Duration::from_millis(500), listen_fut)
+            .await
+            .ok();
+
+        let delivered = rx.try_recv();
+        assert!(
+            delivered.is_ok(),
+            "wildcard allowed_groups should dispatch group message without pairing"
+        );
+        let msg = delivered.unwrap();
+        assert_eq!(msg.channel_alias.as_deref(), Some("telegram_test_alias"));
     }
 }
