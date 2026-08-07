@@ -7,12 +7,14 @@ bot creation through the first authorized conversation.
 ## How the current implementation is wired
 
 Telegram setup has three separate sources of truth. The channel block owns the
-Telegram connection, the agent block owns routing, and peer groups own inbound
-authorization:
+Telegram connection, the agent block owns routing, and inbound authorization
+comes from two independent sources: matching [peer groups](./peer-groups.md)
+for per-identity authorization and the channel-level `allowed_groups` field
+for group-wide authorization.
 
 ```mermaid
 flowchart LR
-    T["channels.telegram.home<br/>token and channel behavior"] --> C["TelegramChannel<br/>alias = home"]
+    T["channels.telegram.home<br/>token and channel behavior<br/>allowed_groups"] --> C["TelegramChannel<br/>alias = home"]
     P["matching peer groups<br/>authorized Telegram identities"] --> C
     G["Telegram Bot API<br/>getUpdates long poll"] --> C
     C -->|"authorized ChannelMessage"| R["AgentRouter"]
@@ -22,13 +24,16 @@ flowchart LR
 
 `collect_configured_channels` constructs one `TelegramChannel` for every
 enabled, agent-owned alias. The channel resolves matching peer-group members
-from the shared `Config` when each message arrives. It accepts either the
-sender's numeric Telegram user ID or username, then hands an authorized
-`ChannelMessage` to the shared channel dispatch and agent-turn lifecycle.
+and `allowed_groups` from the shared `Config` when each message arrives. It
+accepts either the sender's numeric Telegram user ID or username, or any member
+of an allowed group, then hands an authorized `ChannelMessage` to the shared
+channel dispatch and agent-turn lifecycle.
 
-There is no `allowed_users` field under `[channels.telegram.<alias>]`.
-Authorization lives in [Peer Groups](./peer-groups.md); that page is the
-canonical reference for peer-group fields, matching, and multi-agent behavior.
+There is no `allowed_users` field under `[channels.telegram.<alias>]`. Per-identity
+authorization lives in [Peer Groups](./peer-groups.md); that page is the
+reference for peer-group fields, matching, and multi-agent behavior. The
+`allowed_groups` field provides a separate, channel-level group authorization
+source.
 
 ## 1. Create a Telegram bot
 
@@ -124,6 +129,54 @@ channel instance. This includes a wildcard peer group.
 > any tools its risk profile permits. Use a wildcard only for a deliberately
 > public bot with a suitably restricted agent; it is not a shortcut for private
 > setup.
+
+## Restricting which groups use the bot without pairing (`allowed_groups`)
+
+`allowed_groups` under `[channels.telegram.<alias>]` authorizes every member
+of a listed group to use the bot without individual pairing. Entries are
+Telegram chat IDs as numeric strings (e.g. `"-1001234567890"` for a
+supergroup). A wildcard `"*"` allows any group where the bot is present.
+
+```toml
+[channels.telegram.home]
+allowed_groups = ["-1001234567890", "-1009876543210"]
+```
+
+### Interaction with peer groups
+
+`allowed_groups` and peer-group `external_peers` are independent authorization
+sources. A sender passes the authorization check if they match either source.
+Any non-empty resolved external-peer set disables the one-time pairing flow for
+that channel instance.
+
+> [!CAUTION]
+> Each entry in `allowed_groups` grants every member of that group full access
+> to drive the agent and any tools its risk profile permits. The wildcard
+> `"*"` extends this grant to every group the bot is in. Use exact group IDs
+> or restrict the agent's tool set accordingly; this is not a shortcut for
+> private setup.
+
+### Interaction with `mention_only`
+
+When `mention_only` is true, the bot still requires a direct mention
+(`@bot_username`) or a reply to the bot's own message before responding,
+**even from authorized groups**. `allowed_groups` bypasses peer authorization
+and pairing, but not the mention gate. This keeps the bot quiet in busy
+shared group chats while still accepting authorized group members who
+explicitly address it.
+
+### Reload behavior
+
+`allowed_groups` is resolved live from the shared config on each message.
+Changes take effect immediately without restart: there is no construction-time
+snapshot.
+
+### Naming convention
+
+Telegram uses `allowed_groups`, matching the group-list field on the WhatsApp
+Web and WeCom WebSocket channels. (The webhook-based WeCom channel and
+Cloud-API WhatsApp channel do not expose an `allowed_groups` field.) All three
+group-list fields accept group chat IDs as a list of strings.
 
 ## 4. Start the channel and inspect it
 
@@ -264,7 +317,7 @@ The full Telegram field list is generated from the live configuration schema:
 
 ## See also
 
-- [Peer Groups](./peer-groups.md): canonical inbound authorization schema
+- [Peer Groups](./peer-groups.md): per-identity authorization reference
 - [Channel runtime lifecycle](../architecture/channel-runtime-lifecycle.md)
 - [Service management](../setup/service.md)
 - [Observability](../ops/observability.md)
