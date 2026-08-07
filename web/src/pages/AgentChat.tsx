@@ -19,6 +19,7 @@ import ChatWorkspace from '@/pages/ChatWorkspace';
 
 import ToolCallCard from '@/components/ToolCallCard';
 import ApprovalBanner from '@/components/ApprovalBanner';
+import SessionPicker from '@/components/SessionPicker';
 
 const DRAFT_KEY_PREFIX = 'agent-chat';
 
@@ -116,6 +117,9 @@ export function AgentChatInner({
     modelLoading,
     deleteMessage,
     clearAllMessages,
+    startNewSession,
+    sessionId,
+    hydrated,
     addLocalMessage,
     abortSession,
     pendingApproval,
@@ -124,7 +128,8 @@ export function AgentChatInner({
     contextInputTokens,
   } = useAgent();
 
-  const { draft, saveDraft, clearDraft } = useDraft(`${DRAFT_KEY_PREFIX}.${agentAlias}`);
+  const draftKey = `${DRAFT_KEY_PREFIX}.${agentAlias}.${sessionId}`;
+  const { draft, saveDraft, clearDraft } = useDraft(draftKey);
   const [input, setInput] = useState(draft);
   const [showModelDropdown, setShowModelDropdown] = useState(false);
   // Slash-command autocomplete popover (#7137). Shown while the input begins
@@ -148,10 +153,12 @@ export function AgentChatInner({
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const modelDropdownRef = useRef<HTMLDivElement>(null);
 
-  // Persist draft to in-memory store so it survives route changes
+  // AgentChatInner stays mounted while the selected conversation changes.
+  // Load that conversation's draft explicitly; useState's initializer only ran
+  // for the first session and cannot provide this synchronization by itself.
   useEffect(() => {
-    saveDraft(input);
-  }, [input, saveDraft]);
+    setInput(draft);
+  }, [draftKey, draft]);
 
   // Report live status (typing + message count) up to the host workspace so it
   // can render streaming / unread indicators in the tab bar. Fires on every
@@ -196,9 +203,17 @@ export function AgentChatInner({
         return true;
 
       case 'clear':
-      case 'new':
         clearAllMessages();
         addLocalMessage(t('agent.cmd_cleared'));
+        return true;
+
+      // Was an alias for /clear, which deleted the conversation. Now that an
+      // agent can hold several, "new" means what it says: start another one and
+      // leave this one on the gateway (issue #7543).
+      case 'new':
+        if (!startNewSession()) {
+          addLocalMessage(t('agent.sessions_unavailable'));
+        }
         return true;
 
       case 'model': {
@@ -245,7 +260,7 @@ export function AgentChatInner({
         addLocalMessage(t('agent.cmd_unknown').replace('{cmd}', `/${command}`));
         return true;
     }
-  }, [addLocalMessage, clearAllMessages, currentModel, availableModels, switchModel, modelLoading]);
+  }, [addLocalMessage, clearAllMessages, startNewSession, currentModel, availableModels, switchModel, modelLoading]);
 
   const handleSend = () => {
     const trimmed = input.trim();
@@ -288,6 +303,7 @@ export function AgentChatInner({
   const handleTextareaChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const value = e.target.value;
     setInput(value);
+    saveDraft(value);
     // Show the command popover while typing the command token (a single
     // leading '/' with no space yet). Hide once the user moves to arguments or
     // the token no longer matches any command.
@@ -303,9 +319,11 @@ export function AgentChatInner({
   const applyCommandHint = useCallback((spec: CommandSpec) => {
     setShowCommandHint(false);
     const takesArgs = spec.usage.includes('[');
-    setInput(`/${spec.name}${takesArgs ? ' ' : ''}`);
+    const value = `/${spec.name}${takesArgs ? ' ' : ''}`;
+    setInput(value);
+    saveDraft(value);
     inputRef.current?.focus();
-  }, []);
+  }, [saveDraft]);
 
   const matchedCommands: CommandSpec[] = /^\/[^/\s]*$/.test(input)
     ? matchCommands(input.slice(1))
@@ -422,42 +440,46 @@ export function AgentChatInner({
           </Link>
         </div>
 
-        <div className="relative" ref={modelDropdownRef}>
-          <button
-            type="button"
-            onClick={() => setShowModelDropdown((v) => !v)}
-            disabled={modelLoading || typing || (availableModels.length === 0 && currentModel === null)}
-            className="flex items-center gap-2 px-3 h-7 rounded-[var(--radius-md)] text-xs font-medium border border-pc-border bg-pc-elevated text-pc-text-secondary transition-colors hover:text-pc-text hover:border-pc-border-strong disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]"
-          >
-            <span className="max-w-[180px] truncate">
-              {modelLoading
-                ? t('agent.model_switching')
-                : (currentModel ?? (availableModels.length === 0 ? t('agent.model_loading') : t('agent.select_model')))}
-            </span>
-            <ChevronDown className="h-3 w-3" />
-          </button>
+        <div className="flex items-center gap-2">
+          <SessionPicker agentAlias={agentAlias} />
 
-          {showModelDropdown && availableModels.length > 0 && (
-            <div className="absolute right-0 mt-1.5 rounded-[var(--radius-md)] border border-pc-border bg-pc-elevated shadow-[var(--pc-shadow-md)] z-50 py-1 min-w-[200px] max-h-60 overflow-y-auto">
-              {availableModels.map((model) => {
-                const isActive = model === currentModel;
-                return (
-                  <button
-                    key={model}
-                    type="button"
-                    onClick={() => handleModelSwitch(model)}
-                    className={`w-full text-left px-3 py-2 text-xs transition-colors ${
-                      isActive
-                        ? 'text-pc-accent bg-pc-accent/10'
-                        : 'text-pc-text hover:bg-[var(--pc-hover)]'
-                    }`}
-                  >
-                    {model}
-                  </button>
-                );
-              })}
-            </div>
-          )}
+          <div className="relative" ref={modelDropdownRef}>
+            <button
+              type="button"
+              onClick={() => setShowModelDropdown((v) => !v)}
+              disabled={modelLoading || typing || (availableModels.length === 0 && currentModel === null)}
+              className="flex items-center gap-2 px-3 h-7 rounded-[var(--radius-md)] text-xs font-medium border border-pc-border bg-pc-elevated text-pc-text-secondary transition-colors hover:text-pc-text hover:border-pc-border-strong disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]"
+            >
+              <span className="max-w-[180px] truncate">
+                {modelLoading
+                  ? t('agent.model_switching')
+                  : (currentModel ?? (availableModels.length === 0 ? t('agent.model_loading') : t('agent.select_model')))}
+              </span>
+              <ChevronDown className="h-3 w-3" />
+            </button>
+
+            {showModelDropdown && availableModels.length > 0 && (
+              <div className="absolute right-0 mt-1.5 rounded-[var(--radius-md)] border border-pc-border bg-pc-elevated shadow-[var(--pc-shadow-md)] z-50 py-1 min-w-[200px] max-h-60 overflow-y-auto">
+                {availableModels.map((model) => {
+                  const isActive = model === currentModel;
+                  return (
+                    <button
+                      key={model}
+                      type="button"
+                      onClick={() => handleModelSwitch(model)}
+                      className={`w-full text-left px-3 py-2 text-xs transition-colors ${
+                        isActive
+                          ? 'text-pc-accent bg-pc-accent/10'
+                          : 'text-pc-text hover:bg-[var(--pc-hover)]'
+                      }`}
+                    >
+                      {model}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </div>
         </div>
       </div>
 
@@ -512,8 +534,18 @@ export function AgentChatInner({
             <div className="h-14 w-14 rounded-[var(--radius-lg)] flex items-center justify-center mb-4 bg-pc-accent/10">
               <Bot className="h-7 w-7 text-pc-accent" />
             </div>
-            <p className="text-base font-semibold mb-1 text-pc-text">{t('agentchat.empty_title')}</p>
-            <p className="text-sm text-pc-text-muted">{t('agent.start_conversation')}</p>
+            {/* Until the transcript lands, an empty list means "still loading",
+                not "empty conversation" — saying the latter misreports a
+                conversation the operator just picked precisely because it has
+                history in it. */}
+            {hydrated ? (
+              <>
+                <p className="text-base font-semibold mb-1 text-pc-text">{t('agentchat.empty_title')}</p>
+                <p className="text-sm text-pc-text-muted">{t('agent.start_conversation')}</p>
+              </>
+            ) : (
+              <p className="text-sm text-pc-text-muted">{t('agent.session_loading')}</p>
+            )}
           </div>
         )}
 
@@ -607,10 +639,12 @@ export function AgentChatInner({
             onCompositionEnd={() => { isComposingRef.current = false; }}
             placeholder={!connected
               ? t('agent.connecting')
-              : typing
-                ? t('agent.running')
-                : t('agent.type_message')}
-            disabled={!connected || typing}
+              : !hydrated
+                ? t('agent.session_loading')
+                : typing
+                  ? t('agent.running')
+                  : t('agent.type_message')}
+            disabled={!connected || typing || !hydrated}
             className="flex-1 px-4 text-sm resize-none rounded-[var(--radius-md)] border border-pc-border bg-pc-input text-pc-text placeholder:text-pc-text-muted transition-colors focus:outline-none focus:border-pc-accent focus:ring-2 focus:ring-pc-accent/30 disabled:opacity-40"
             style={{ minHeight: '40px', maxHeight: '200px', paddingTop: '9px', paddingBottom: '9px' }}
           />
@@ -630,7 +664,7 @@ export function AgentChatInner({
               variant="primary"
               size="md"
               onClick={handleSend}
-              disabled={!connected || !input.trim()}
+              disabled={!connected || !hydrated || !input.trim()}
               className="flex-shrink-0 w-10 px-0"
               aria-label={t('agent.send')}
             >
