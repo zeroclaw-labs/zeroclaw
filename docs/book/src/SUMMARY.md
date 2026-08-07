@@ -99,6 +99,7 @@
   - [MQTT](./channels/mqtt.md)
   - [AMQP](./channels/amqp.md)
   - [Filesystem](./channels/filesystem.md)
+  - [ZEGA AI (external prototype)](./integrations/zega-ai.md)
   - [Git (GitHub / Gitea / Forgejo)](./channels/git.md)
     - [Creating a GitHub App](./channels/git-github-app.md)
     - [Creating a Gitea / Forgejo token (Codeberg)](./channels/git-gitea-forgejo.md)

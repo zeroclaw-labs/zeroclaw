@@ -227,10 +227,14 @@ impl PromptSection for SkillsSection {
     }
 
     fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
+        let mode = crate::skills::skills_prompt_mode_with_loader_fallback(
+            ctx.skills_prompt_mode,
+            ctx.tools.iter().any(|tool| tool.name() == "read_skill"),
+        );
         Ok(crate::skills::skills_to_prompt_with_mode(
             ctx.skills,
             ctx.workspace_dir,
-            ctx.skills_prompt_mode,
+            mode,
         ))
     }
 }
@@ -307,8 +311,10 @@ mod tests {
     use zeroclaw_api::tool::Tool;
 
     zeroclaw_api::mock_tool_attribution!(TestTool);
+    zeroclaw_api::mock_tool_attribution!(ReadSkillTestTool);
 
     struct TestTool;
+    struct ReadSkillTestTool;
 
     #[async_trait]
     impl Tool for TestTool {
@@ -318,6 +324,32 @@ mod tests {
 
         fn description(&self) -> &str {
             "tool desc"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "ok".into(),
+                error: None,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl Tool for ReadSkillTestTool {
+        fn name(&self) -> &str {
+            "read_skill"
+        }
+
+        fn description(&self) -> &str {
+            "load skill instructions"
         }
 
         fn parameters_schema(&self) -> serde_json::Value {
@@ -460,7 +492,7 @@ mod tests {
     }
 
     #[test]
-    fn skills_section_includes_instructions_and_tools() {
+    fn skills_section_includes_instructions_and_tools_in_full_mode() {
         let tools: Vec<Box<dyn Tool>> = vec![];
         let skills = vec![crate::skills::Skill {
             name: "deploy".into(),
@@ -481,6 +513,7 @@ mod tests {
             }],
             prompts: vec!["Run smoke tests before deploy.".into()],
             slash_options: Vec::new(),
+            always: false,
             location: None,
         }];
 
@@ -510,7 +543,7 @@ mod tests {
 
     #[test]
     fn skills_section_compact_mode_omits_instructions_but_keeps_tools() {
-        let tools: Vec<Box<dyn Tool>> = vec![];
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(ReadSkillTestTool)];
         let skills = vec![crate::skills::Skill {
             name: "deploy".into(),
             description: "Release safely".into(),
@@ -530,6 +563,7 @@ mod tests {
             }],
             prompts: vec!["Run smoke tests before deploy.".into()],
             slash_options: Vec::new(),
+            always: false,
             location: Some(Path::new("/tmp/workspace/skills/deploy/SKILL.md").to_path_buf()),
         }];
 
@@ -558,6 +592,93 @@ mod tests {
         // Registered tools (shell kind) appear under <callable_tools> with prefixed names.
         assert!(output.contains("<callable_tools"));
         assert!(output.contains("<name>deploy__release_checklist</name>"));
+    }
+
+    #[test]
+    fn skills_section_preserves_instructions_when_compact_loader_is_unavailable() {
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let skills = vec![crate::skills::Skill {
+            name: "deploy".into(),
+            description: "Release safely".into(),
+            description_localizations: Default::default(),
+            version: "1.0.0".into(),
+            author: None,
+            tags: vec![],
+            tools: vec![],
+            prompts: vec!["Run smoke tests before deploy.".into()],
+            slash_options: Vec::new(),
+            always: false,
+            location: None,
+        }];
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp"),
+            agent_workspace_dir: Path::new("/tmp"),
+            model_name: "test-model",
+            tools: &tools,
+            skills: &skills,
+            skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Compact,
+            identity_config: None,
+            dispatcher_instructions: "",
+            sends_native_tool_specs: false,
+            security_summary: None,
+            autonomy_level: AutonomyLevel::Supervised,
+        };
+
+        let output = SkillsSection.build(&ctx).unwrap();
+        assert!(output.contains("<instruction>Run smoke tests before deploy.</instruction>"));
+        assert!(!output.contains("read_skill(name)"));
+    }
+
+    #[test]
+    fn skills_section_compact_mode_keeps_instructions_for_always_skill() {
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let skills = vec![crate::skills::Skill {
+            name: "security-policy".into(),
+            description: "Critical safety rules".into(),
+            description_localizations: Default::default(),
+            version: "1.0.0".into(),
+            author: None,
+            tags: vec![],
+            tools: vec![crate::skills::SkillTool {
+                name: "release_checklist".into(),
+                description: "Validate release readiness".into(),
+                kind: "shell".into(),
+                command: "echo ok".into(),
+                args: std::collections::HashMap::new(),
+                target: None,
+                locked_args: std::collections::HashMap::new(),
+                timeout_secs: None,
+            }],
+            prompts: vec!["Never skip the safety review.".into()],
+            slash_options: Vec::new(),
+            always: true,
+            location: Some(
+                Path::new("/tmp/workspace/skills/security-policy/SKILL.md").to_path_buf(),
+            ),
+        }];
+
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp/workspace"),
+            agent_workspace_dir: Path::new("/tmp/workspace"),
+            model_name: "test-model",
+            tools: &tools,
+            skills: &skills,
+            skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Compact,
+            identity_config: None,
+            dispatcher_instructions: "",
+            sends_native_tool_specs: false,
+            security_summary: None,
+            autonomy_level: AutonomyLevel::Supervised,
+        };
+
+        let output = SkillsSection.build(&ctx).unwrap();
+        assert!(output.contains("<available_skills>"));
+        assert!(output.contains("<name>security-policy</name>"));
+        // `always: true` forces instructions to stay inlined even in compact mode.
+        assert!(output.contains("<instruction>Never skip the safety review.</instruction>"));
+        // Tools are still listed as in any other skill.
+        assert!(output.contains("<callable_tools"));
+        assert!(output.contains("<name>security-policy__release_checklist</name>"));
     }
 
     #[test]
@@ -612,6 +733,7 @@ mod tests {
             }],
             prompts: vec!["Use <tool_call> and & keep output \"safe\"".into()],
             slash_options: Vec::new(),
+            always: false,
             location: None,
         }];
         let ctx = PromptContext {

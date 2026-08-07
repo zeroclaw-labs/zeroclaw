@@ -461,10 +461,11 @@ impl Chat {
         match result {
             Ok(session) => {
                 let resumed_sid = resume.as_deref().map(|_| session.session_id.clone());
-                let mut state = ChatState::new(
+                let mut state = ChatState::with_shared_commands(
                     session.session_id,
                     agent_alias.to_string(),
                     self.todo_settings,
+                    self.rpc.commands(),
                 );
                 state.cwd = session.workspace_dir;
                 Self::refresh_model_identity(&self.rpc, &mut state).await;
@@ -2623,6 +2624,20 @@ impl Chat {
                 }
                 // Command mode when input is empty; text mode when typing.
                 s.input_bar.wants_text_input()
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn claims_pane_navigation(&self, key: &KeyEvent) -> bool {
+        match &self.phase {
+            ChatPhase::Active(state) => {
+                !state.model_picker.is_open()
+                    && state.pending_elicitation().is_none()
+                    && state.pending_approval().is_none()
+                    && matches!(state.session_overlay, SessionOverlay::None)
+                    && !state.in_browse_mode()
+                    && state.input_bar.claims_pane_navigation(key)
             }
             _ => false,
         }
@@ -5268,10 +5283,20 @@ pub struct ChatState {
 }
 
 impl ChatState {
+    #[cfg(test)]
     pub fn new(
         session_id: String,
         agent_alias: String,
         todo_settings: crate::todo_tracker::TodoTrackerSettings,
+    ) -> Self {
+        Self::with_shared_commands(session_id, agent_alias, todo_settings, &[])
+    }
+
+    fn with_shared_commands(
+        session_id: String,
+        agent_alias: String,
+        todo_settings: crate::todo_tracker::TodoTrackerSettings,
+        commands: &[crate::wire::CommandDescriptor],
     ) -> Self {
         Self {
             session_id,
@@ -5284,7 +5309,7 @@ impl ChatState {
             first_message: None,
             git_hash: None,
             git_branch_last_fetch: None,
-            input_bar: InputBarState::new(),
+            input_bar: InputBarState::with_shared_commands(commands),
             entries: Vec::new(),
             streaming_text: String::new(),
             streaming_thought: String::new(),
@@ -6807,6 +6832,64 @@ mod tests {
             "myagent".to_string(),
             crate::todo_tracker::TodoTrackerSettings::default(),
         )
+    }
+
+    fn command_action_from_initialize(
+        response: serde_json::Value,
+        command: &str,
+    ) -> InputBarAction {
+        let commands = crate::client::parse_initialize_response(&response)
+            .expect("matching-version initialize response parses");
+        let mut state = ChatState::with_shared_commands(
+            "sess-1".to_string(),
+            "myagent".to_string(),
+            crate::todo_tracker::TodoTrackerSettings::default(),
+            &commands.commands,
+        );
+        state.input_bar.insert_text(command);
+        state.input_bar.submit_current_input_for_test()
+    }
+
+    #[test]
+    fn old_daemon_without_command_catalogue_preserves_shared_actions() {
+        let response = serde_json::json!({
+            "server_version": env!("CARGO_PKG_VERSION")
+        });
+
+        assert!(matches!(
+            command_action_from_initialize(response.clone(), "/help"),
+            InputBarAction::OpenHelp
+        ));
+        assert!(matches!(
+            command_action_from_initialize(response.clone(), "/model"),
+            InputBarAction::OpenModelPicker
+        ));
+        assert!(matches!(
+            command_action_from_initialize(response.clone(), "/new"),
+            InputBarAction::RestartSession
+        ));
+        assert!(matches!(
+            command_action_from_initialize(response, "/new-session"),
+            InputBarAction::RestartSession
+        ));
+    }
+
+    #[test]
+    fn present_empty_command_catalogue_remains_authoritative() {
+        let response = serde_json::json!({
+            "server_version": env!("CARGO_PKG_VERSION"),
+            "commands": []
+        });
+
+        for command in ["/help", "/model", "/new", "/new-session"] {
+            match command_action_from_initialize(response.clone(), command) {
+                InputBarAction::Submit { text, attachments } => {
+                    assert_eq!(text.as_deref(), Some(command));
+                    assert!(attachments.is_empty());
+                }
+                _ => panic!("present empty catalogue must submit {command} as ordinary input"),
+            }
+        }
     }
 
     fn transcript_snapshot(area: Rect, rows: &[&str]) -> TranscriptSnapshot {
@@ -10683,6 +10766,76 @@ mod tests {
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(rpc));
         (Chat::new(client, PaneKind::Chat), rx)
+    }
+
+    fn chat_with_active_input(kind: PaneKind) -> Chat {
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(rpc));
+        let mut chat = Chat::new(client, kind);
+        let mut active = state();
+        active.input_bar.insert_text("alpha beta");
+        chat.phase = ChatPhase::Active(Box::new(active));
+        chat
+    }
+
+    fn active_state(chat: &mut Chat) -> &mut ChatState {
+        let ChatPhase::Active(active) = &mut chat.phase else {
+            unreachable!();
+        };
+        active
+    }
+
+    #[tokio::test]
+    async fn pane_navigation_claims_only_unobstructed_active_input() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let word_left = KeyEvent::new(KeyCode::Left, KeyModifiers::ALT);
+
+        for kind in [PaneKind::Chat, PaneKind::Acp] {
+            let chat = chat_with_active_input(kind);
+            assert!(chat.claims_pane_navigation(&word_left));
+        }
+
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        active_state(&mut chat).input_bar.clear_input();
+        assert!(!chat.claims_pane_navigation(&word_left));
+
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        active_state(&mut chat).model_picker = ModelPickerOverlay::Loading;
+        assert!(!chat.claims_pane_navigation(&word_left));
+
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        active_state(&mut chat).pending_elicitation = Some(single_elicitation());
+        assert!(!chat.claims_pane_navigation(&word_left));
+
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        active_state(&mut chat).pending_approval = Some(PendingApproval {
+            request_id: "request-1".to_string(),
+            tool_name: "shell".to_string(),
+            arguments_summary: "pwd".to_string(),
+            timeout_secs: 30,
+        });
+        assert!(!chat.claims_pane_navigation(&word_left));
+
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        active_state(&mut chat).session_overlay = SessionOverlay::List {
+            sessions: Vec::new(),
+            list_state: ListState::default(),
+        };
+        assert!(!chat.claims_pane_navigation(&word_left));
+
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        active_state(&mut chat).browse_cursor = Some(0);
+        assert!(!chat.claims_pane_navigation(&word_left));
+
+        let (mut chat, _rx) = test_chat();
+        chat.phase = ChatPhase::PickSession {
+            sessions: Vec::new(),
+            list_state: ListState::default(),
+            agents: Vec::new(),
+        };
+        assert!(!chat.claims_pane_navigation(&word_left));
     }
 
     #[tokio::test]

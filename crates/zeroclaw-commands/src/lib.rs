@@ -40,6 +40,22 @@ pub enum BuiltinCommandId {
     Goal,
 }
 
+impl BuiltinCommandId {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Help => "help",
+            Self::Clear => "clear",
+            Self::New => "new",
+            Self::Stop => "stop",
+            Self::Model => "model",
+            Self::Models => "models",
+            Self::Config => "config",
+            Self::Thinking => "thinking",
+            Self::Goal => "goal",
+        }
+    }
+}
+
 /// Where command execution is owned today.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -99,6 +115,7 @@ pub struct ParsedCommandToken {
 }
 
 const CHANNEL_ONLY: &[CommandSurface] = &[CommandSurface::Channel];
+const CHANNEL_AND_TUI: &[CommandSurface] = &[CommandSurface::Channel, CommandSurface::Tui];
 
 static BUILTIN_COMMANDS: &[CommandSpec] = &[
     CommandSpec {
@@ -107,7 +124,7 @@ static BUILTIN_COMMANDS: &[CommandSpec] = &[
         aliases: &[],
         usage: "/help",
         description_key: "command-help-description",
-        surfaces: CHANNEL_ONLY,
+        surfaces: CHANNEL_AND_TUI,
         execution: CommandExecution::ClientLocal,
     },
     CommandSpec {
@@ -125,7 +142,7 @@ static BUILTIN_COMMANDS: &[CommandSpec] = &[
         aliases: &["new-session"],
         usage: "/new",
         description_key: "command-new-description",
-        surfaces: CHANNEL_ONLY,
+        surfaces: CHANNEL_AND_TUI,
         execution: CommandExecution::RuntimeCommand,
     },
     CommandSpec {
@@ -143,7 +160,7 @@ static BUILTIN_COMMANDS: &[CommandSpec] = &[
         aliases: &[],
         usage: "/model [--user|--agent] [model]",
         description_key: "command-model-description",
-        surfaces: CHANNEL_ONLY,
+        surfaces: CHANNEL_AND_TUI,
         execution: CommandExecution::RuntimeCommand,
     },
     CommandSpec {
@@ -293,6 +310,26 @@ mod tests {
     fn normalize_command_name_unicode_preserved() {
         assert_eq!(normalize_command_name("/新"), Some("新".to_string()));
         assert_eq!(normalize_command_name("/新@my_bot"), Some("新".to_string()));
+    }
+
+    #[test]
+    fn tui_surface_advertises_help_model_and_new_only() {
+        let tui_ids: Vec<BuiltinCommandId> = commands_for_surface(CommandSurface::Tui)
+            .map(|spec| spec.id)
+            .collect();
+        assert_eq!(
+            tui_ids,
+            vec![
+                BuiltinCommandId::Help,
+                BuiltinCommandId::New,
+                BuiltinCommandId::Model,
+            ]
+        );
+        assert!(parse_command_token("/help", CommandSurface::Tui).is_some());
+        assert!(parse_command_token("/model", CommandSurface::Tui).is_some());
+        assert!(parse_command_token("/new", CommandSurface::Tui).is_some());
+        assert!(parse_command_token("/new-session", CommandSurface::Tui).is_some());
+        assert!(parse_command_token("/clear", CommandSurface::Tui).is_none());
     }
 
     #[test]
