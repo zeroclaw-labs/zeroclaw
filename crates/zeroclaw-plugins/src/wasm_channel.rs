@@ -184,7 +184,6 @@ fn to_wit_media(a: &MediaAttachment) -> WitMediaAttachment {
         file_name: a.file_name.clone(),
         data: a.data.clone(),
         mime_type: a.mime_type.clone(),
-        marker_target: None,
     }
 }
 
@@ -193,6 +192,10 @@ fn from_wit_media(a: WitMediaAttachment) -> MediaAttachment {
         file_name: a.file_name,
         data: a.data,
         mime_type: a.mime_type,
+        // The plugin ABI carries bytes, not the host's text rendering, so a
+        // plugin-supplied attachment is unreferenced by definition. Widening
+        // the WIT record would be a breaking ABI change for no gain: a plugin
+        // channel has no marker for the pipeline to join against.
         marker_target: None,
     }
 }

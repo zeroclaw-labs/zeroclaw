@@ -130,6 +130,7 @@ fn send_message_with_attachments_builder() {
         file_name: "test.pdf".to_string(),
         data: vec![1, 2, 3],
         mime_type: Some("application/pdf".to_string()),
+        marker_target: None,
     }];
 
     let msg =
@@ -184,6 +185,7 @@ fn extract_attachments_with_limit(
             file_name,
             data,
             mime_type: mime_str,
+            marker_target: None,
         });
     }
     attachments
