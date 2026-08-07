@@ -52,6 +52,7 @@ pub use zeroclaw_tools::cloud_patterns::CloudPatternsTool;
 pub use zeroclaw_tools::codex_cli::CodexCliTool;
 pub use zeroclaw_tools::composio::ComposioTool;
 pub use zeroclaw_tools::content_search::ContentSearchTool;
+pub use zeroclaw_tools::dag_plan_execute::{ChildDispatchFn, DagPlanExecuteTool};
 pub use zeroclaw_tools::data_management::DataManagementTool;
 pub use zeroclaw_tools::discord_search::DiscordSearchTool;
 pub use zeroclaw_tools::email_read::EmailReadTool;
