@@ -2274,6 +2274,33 @@ pub struct CloudflareModelProviderConfig {
     pub base: ModelProviderConfig,
 }
 
+// ── Atlas Cloud ──
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AtlasCloudEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for AtlasCloudEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.atlascloud.ai/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.atlascloud"]
+pub struct AtlasCloudModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
 // ── OVH ──
 
 #[derive(
@@ -3288,6 +3315,7 @@ impl_default_family_endpoint! {
     TelnyxModelProviderConfig,
     VercelModelProviderConfig,
     CloudflareModelProviderConfig,
+    AtlasCloudModelProviderConfig,
     OvhModelProviderConfig,
     CopilotModelProviderConfig,
     DoubaoModelProviderConfig,
@@ -34057,7 +34085,7 @@ api_key = "op://zeroclaw/provider/openai-api-key"
             &bin_dir,
             r#"#!/bin/sh
 if [ "$1" = "read" ] && [ "$2" = "op://zeroclaw/provider/openai-api-key" ]; then
-  sleep 1
+  sleep 3
   printf '%s\n' 'sk-proj-from-onepassword'
   exit 0
 fi
@@ -34091,8 +34119,11 @@ api_key = "op://zeroclaw/provider/openai-api-key"
         let load_task = tokio::spawn(Config::load_or_init());
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
+        // Threshold sized against the 3s fake-op sleep: a blocked worker pins
+        // elapsed at >=3s, while scheduler latency under full-suite CI load
+        // stays well under 1.5s.
         assert!(
-            started.elapsed() < std::time::Duration::from_millis(500),
+            started.elapsed() < std::time::Duration::from_millis(1500),
             "op:// config load should not block the async runtime worker"
         );
 

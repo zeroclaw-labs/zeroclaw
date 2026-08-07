@@ -25,6 +25,7 @@ use zeroclaw_api::jsonrpc::{
 };
 use zeroclaw_api::model_provider::ChatMessage;
 use zeroclaw_api::runtime_status::RuntimeConfigKind;
+use zeroclaw_commands::{CommandSurface, commands_for_surface};
 
 /// Wire protocol version. Bump on breaking changes.
 pub const RPC_PROTOCOL_VERSION: u64 = 1;
@@ -910,6 +911,17 @@ impl RpcDispatcher {
             .iter()
             .map(|(_, name)| (*name).to_string())
             .collect();
+        let commands = commands_for_surface(CommandSurface::Tui)
+            .map(|spec| CommandDescriptor {
+                id: spec.id.as_str().to_string(),
+                name: spec.name.to_string(),
+                aliases: spec
+                    .aliases
+                    .iter()
+                    .map(|alias| (*alias).to_string())
+                    .collect(),
+            })
+            .collect();
 
         to_result(InitializeResult {
             protocol_version: RPC_PROTOCOL_VERSION,
@@ -918,6 +930,7 @@ impl RpcDispatcher {
             tui_id: Some(tui_id),
             tui_sig,
             capabilities,
+            commands,
         })
     }
 
@@ -6798,11 +6811,17 @@ mod tests {
             tui_id: None,
             tui_sig: None,
             capabilities: vec![],
+            commands: vec![],
         };
         let val = to_result(r).unwrap();
         assert_eq!(val["protocol_version"], 1);
         assert_eq!(val["server_version"], "0.1.0");
         assert_eq!(val["server_pid"], 42);
+        assert_eq!(
+            val["commands"],
+            json!([]),
+            "new daemons must serialize an authoritative empty catalogue"
+        );
     }
 
     #[test]
@@ -6882,6 +6901,27 @@ mod tests {
         assert!(result.is_ok(), "initialize should succeed; got {result:?}");
         assert!(dispatcher.client_elicitation_caps.form);
         assert!(!dispatcher.client_elicitation_caps.url);
+    }
+
+    #[tokio::test]
+    async fn initialize_advertises_canonical_tui_command_descriptors() {
+        let (mut dispatcher, _sessions) =
+            make_acp_test_dispatcher(zeroclaw_config::schema::Config::default());
+        let result = dispatcher
+            .handle_initialize(&serde_json::json!({
+                "protocol_version": RPC_PROTOCOL_VERSION
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result["commands"],
+            serde_json::json!([
+                {"id": "help", "name": "help"},
+                {"id": "new", "name": "new", "aliases": ["new-session"]},
+                {"id": "model", "name": "model"}
+            ])
+        );
     }
 
     #[tokio::test]
