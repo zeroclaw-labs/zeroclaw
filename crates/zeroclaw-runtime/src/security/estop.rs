@@ -81,9 +81,6 @@ impl EstopState {
     /// silently disable the stop.
     pub fn load_for_enforcement(config: &EstopConfig, config_dir: &Path) -> Self {
         let path = resolve_state_file_path(config_dir, &config.state_file);
-        if !path.exists() {
-            return Self::default();
-        }
         match fs::read_to_string(&path) {
             Ok(raw) => match serde_json::from_str::<EstopState>(&raw) {
                 Ok(mut parsed) => {
@@ -92,6 +89,12 @@ impl EstopState {
                 }
                 Err(_) => Self::fail_closed(),
             },
+            // A genuinely absent file means "never engaged". Any other read
+            // error (permission denied, partial/interrupted read, …) must fail
+            // closed instead of being collapsed by a prior `Path::exists()`
+            // check into a disengaged default, which a truncated or tampered
+            // state could exploit to silently disable the stop.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
             Err(_) => Self::fail_closed(),
         }
     }
@@ -101,17 +104,6 @@ impl EstopState {
     pub fn is_tool_frozen(&self, tool_name: &str) -> bool {
         let normalized = tool_name.trim().to_ascii_lowercase();
         self.frozen_tools.iter().any(|frozen| frozen == &normalized)
-    }
-
-    /// Whether a domain is blocked by the current estop state. Fails closed
-    /// (blocked) if the stored patterns cannot be compiled.
-    pub fn is_domain_blocked(&self, domain: &str) -> bool {
-        if self.blocked_domains.is_empty() {
-            return false;
-        }
-        DomainMatcher::new(&self.blocked_domains, &[])
-            .map(|matcher| matcher.is_gated(domain))
-            .unwrap_or(true)
     }
 
     /// The reason a tool call must be refused right now, or `None` to allow it.
@@ -157,7 +149,12 @@ impl<'a> EstopEnforcement<'a> {
 
     /// Return the reason to refuse `tool_name`, or `None` to allow it, consulting
     /// the live state file merged with the process latch (see [`Self::enforced_state`]).
-    pub fn block_reason(&self, tool_name: &str) -> Option<String> {
+    ///
+    /// Test-only single-name convenience; production always routes through
+    /// [`Self::block_reason_any`] so a tool's advertised and delegated canonical
+    /// names are both checked in one read.
+    #[cfg(test)]
+    pub(crate) fn block_reason(&self, tool_name: &str) -> Option<String> {
         self.enforced_state().tool_block_reason(tool_name)
     }
 
@@ -212,27 +209,26 @@ impl EstopManager {
     pub fn load(config: &EstopConfig, config_dir: &Path) -> Result<Self> {
         let state_path = resolve_state_file_path(config_dir, &config.state_file);
         let mut should_fail_closed = false;
-        let mut state = if state_path.exists() {
-            match fs::read_to_string(&state_path) {
-                Ok(raw) => match serde_json::from_str::<EstopState>(&raw) {
-                    Ok(mut parsed) => {
-                        parsed.normalize();
-                        parsed
-                    }
-                    Err(error) => {
-                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"path": state_path.display().to_string(), "error": format!("{}", error)})), "Failed to parse estop state file; entering fail-closed mode: ");
-                        should_fail_closed = true;
-                        EstopState::fail_closed()
-                    }
-                },
+        let mut state = match fs::read_to_string(&state_path) {
+            Ok(raw) => match serde_json::from_str::<EstopState>(&raw) {
+                Ok(mut parsed) => {
+                    parsed.normalize();
+                    parsed
+                }
                 Err(error) => {
-                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"path": state_path.display().to_string(), "error": format!("{}", error)})), "Failed to read estop state file; entering fail-closed mode: ");
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"path": state_path.display().to_string(), "error": format!("{}", error)})), "Failed to parse estop state file; entering fail-closed mode: ");
                     should_fail_closed = true;
                     EstopState::fail_closed()
                 }
+            },
+            // Only a genuinely absent file is treated as "never engaged". Any
+            // other read error fails closed rather than defaulting to disengaged.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => EstopState::default(),
+            Err(error) => {
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"path": state_path.display().to_string(), "error": format!("{}", error)})), "Failed to read estop state file; entering fail-closed mode: ");
+                should_fail_closed = true;
+                EstopState::fail_closed()
             }
-        } else {
-            EstopState::default()
         };
 
         state.normalize();
@@ -586,6 +582,30 @@ mod tests {
     }
 
     #[test]
+    fn load_for_enforcement_fails_closed_when_state_path_is_unreadable() {
+        // A parent path component that is a regular file makes the state path
+        // unreadable with a non-`NotFound` error. `Path::exists()` reports
+        // false here, so the old exists()-then-read shortcut would have
+        // defaulted to *disengaged*; the fail-closed read must instead halt.
+        let dir = tempdir().unwrap();
+        let blocker = dir.path().join("not-a-dir");
+        fs::write(&blocker, b"x").unwrap();
+        let state_path = blocker.join("estop-state.json");
+        assert!(
+            !state_path.exists(),
+            "precondition: exists() is false for a path under a file component"
+        );
+        let cfg = estop_config(&state_path);
+
+        let state = EstopState::load_for_enforcement(&cfg, dir.path());
+        assert!(
+            state.kill_all,
+            "an unreadable (non-NotFound) state path must fail closed, not default to disengaged"
+        );
+        assert!(state.tool_block_reason("anything").is_some());
+    }
+
+    #[test]
     fn enforcement_latch_survives_state_file_deletion() {
         let dir = tempdir().unwrap();
         let state_path = dir.path().join("estop-state.json");
@@ -681,15 +701,6 @@ mod tests {
                 .is_some(),
             "a skill alias delegating to a frozen builtin must be refused"
         );
-    }
-
-    #[test]
-    fn is_domain_blocked_matches_wildcards() {
-        let mut state = EstopState::default();
-        assert!(!state.is_domain_blocked("chase.com"));
-        state.blocked_domains = vec!["*.chase.com".into()];
-        assert!(state.is_domain_blocked("login.chase.com"));
-        assert!(!state.is_domain_blocked("example.com"));
     }
 
     #[test]
