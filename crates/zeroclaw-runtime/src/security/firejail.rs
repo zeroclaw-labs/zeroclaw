@@ -140,6 +140,7 @@ impl FirejailSandbox {
         firejail_cmd.args(&args);
 
         // Replace the command
+        crate::security::traits::adopt_command_context(cmd, &mut firejail_cmd);
         *cmd = firejail_cmd;
         Ok(())
     }
@@ -182,6 +183,20 @@ mod tests {
     fn firejail_description_mentions_dependency() {
         let desc = FirejailSandbox.description();
         assert!(desc.contains("firejail"));
+    }
+
+    #[test]
+    fn firejail_wrap_command_keeps_the_working_directory() {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("pwd").current_dir("/workspace");
+
+        FirejailSandbox.wrap_command(&mut cmd).unwrap();
+
+        assert_eq!(
+            cmd.get_current_dir(),
+            Some(std::path::Path::new("/workspace")),
+            "wrapping must not silently move the child to the daemon's cwd"
+        );
     }
 
     #[test]

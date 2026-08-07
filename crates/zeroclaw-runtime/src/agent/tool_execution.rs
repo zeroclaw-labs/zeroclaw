@@ -46,6 +46,31 @@ pub(crate) struct ToolDispatchContext<'a> {
     pub model_switch_callback: Option<&'a ModelSwitchCallback>,
 }
 
+/// Whether the runtime, not the model, decides this call's `approved` argument.
+///
+/// A union, never a replacement: the built-in names stay host-owned whatever is
+/// registered under them, and resolving the tool *adds* the ones named at
+/// runtime — a skill shell tool is `skill__tool`, unknowable at compile time.
+/// Deciding on the schema alone would let a tool registered as `shell` opt out
+/// of host ownership by not declaring the argument.
+pub(crate) fn host_owns_approved_arg(dispatch: ToolDispatchContext<'_>, name: &str) -> bool {
+    if crate::agent::is_runtime_approved_arg_tool(name) {
+        return true;
+    }
+    if let Some(tool) = find_tool(dispatch.tools_registry, name) {
+        return crate::agent::schema_declares_approved_arg(&tool.parameters_schema());
+    }
+    if let Some(activated) = dispatch.activated_tools {
+        let tools = activated
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(tool) = tools.get_resolved(name) {
+            return crate::agent::schema_declares_approved_arg(&tool.parameters_schema());
+        }
+    }
+    false
+}
+
 fn is_excluded_tool(name: &str, excluded_tools: &[String]) -> bool {
     let name = name.trim();
     excluded_tools
@@ -891,6 +916,93 @@ mod tests {
             should_execute_tools_in_parallel(&batch, None),
             "no approval manager + non-tool_search batch must run in parallel"
         );
+    }
+
+    fn approval_dispatch_registry() -> Vec<Box<dyn Tool>> {
+        let security = Arc::new(crate::security::SecurityPolicy::default());
+        let runtime = Arc::new(crate::platform::NativeRuntime::new());
+        let skill = crate::skills::SkillTool {
+            name: "make_dir".to_string(),
+            description: "Create a directory".to_string(),
+            kind: "shell".to_string(),
+            command: "mkdir {{dir}}".to_string(),
+            args: std::collections::HashMap::new(),
+            target: None,
+            locked_args: std::collections::HashMap::new(),
+            timeout_secs: None,
+        };
+        vec![
+            Box::new(crate::tools::ShellTool::new(
+                security.clone(),
+                runtime.clone(),
+            )),
+            Box::new(crate::skills::skill_tool::SkillShellTool::new(
+                "s", &skill, security,
+            )),
+            Box::new(CountingTool::new(
+                "counting_no_approved",
+                Arc::new(AtomicUsize::new(0)),
+            )),
+        ]
+    }
+
+    #[test]
+    fn host_owns_the_approved_arg_of_a_dynamically_named_skill_tool() {
+        let registry = approval_dispatch_registry();
+        let dispatch = ToolDispatchContext {
+            tools_registry: &registry,
+            activated_tools: None,
+            excluded_tools: &[],
+            model_switch_callback: None,
+        };
+
+        assert!(
+            super::host_owns_approved_arg(dispatch, "shell"),
+            "the built-in shell tool declares `approved`"
+        );
+        assert!(
+            super::host_owns_approved_arg(dispatch, "s__make_dir"),
+            "a skill shell tool is unknowable by name, so the schema must answer"
+        );
+        assert!(
+            !super::host_owns_approved_arg(dispatch, "counting_no_approved"),
+            "a tool that declares no `approved` must not have one injected"
+        );
+    }
+
+    #[test]
+    fn built_in_names_stay_host_owned_whatever_is_registered_under_them() {
+        // Empty registry: nothing resolves, so only the name list can answer.
+        // A tool registered under one of these names that declares no
+        // `approved` must not be able to opt out of host ownership either.
+        let registry: Vec<Box<dyn Tool>> = Vec::new();
+        let dispatch = ToolDispatchContext {
+            tools_registry: &registry,
+            activated_tools: None,
+            excluded_tools: &[],
+            model_switch_callback: None,
+        };
+
+        for name in ["shell", "schedule", "cron_add", "cron_update", "cron_run"] {
+            assert!(
+                super::host_owns_approved_arg(dispatch, name),
+                "{name} must stay host-owned when it cannot be resolved"
+            );
+        }
+        assert!(!super::host_owns_approved_arg(dispatch, "file_read"));
+    }
+
+    #[test]
+    fn every_built_in_on_the_fallback_list_actually_declares_the_arg() {
+        // The fallback list and the schema rule must not drift apart: a name on
+        // the list whose tool stopped declaring `approved` would get the key
+        // injected only on the fallback path.
+        let registry = approval_dispatch_registry();
+        let shell = super::find_tool(&registry, "shell").expect("shell tool in registry");
+        assert!(crate::agent::is_runtime_approved_arg_tool("shell"));
+        assert!(crate::agent::schema_declares_approved_arg(
+            &shell.parameters_schema()
+        ));
     }
 
     // ── Plan emission tests ────────────────────────────────────────────────

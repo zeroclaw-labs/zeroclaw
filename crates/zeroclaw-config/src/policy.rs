@@ -1983,6 +1983,28 @@ impl SecurityPolicy {
         self.autonomy != AutonomyLevel::ReadOnly
     }
 
+    /// Rebuild the sandbox configuration this policy was derived from.
+    ///
+    /// [`crate::schema::RiskProfileConfig::sandbox_config`] answers the same
+    /// question from the profile. Tool constructors are handed a resolved
+    /// `SecurityPolicy` rather than the profile, so without this they cannot
+    /// build the sandbox their commands should run inside and quietly run
+    /// unsandboxed instead.
+    #[must_use]
+    pub fn sandbox_config(&self) -> crate::schema::SandboxConfig {
+        crate::schema::SandboxConfig {
+            enabled: self.sandbox_enabled,
+            backend: self
+                .sandbox_backend
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(crate::schema::parse_sandbox_backend)
+                .unwrap_or_default(),
+            firejail_args: self.firejail_args.clone(),
+        }
+    }
+
     // ── Tool Operation Gating ──────────────────────────────────────────────
     // Read operations bypass autonomy and rate checks because they have
     // no side effects. Act operations must pass both the autonomy gate

@@ -115,6 +115,7 @@ impl Sandbox for DockerSandbox {
         docker_cmd.arg(&program);
         docker_cmd.args(&args);
 
+        crate::security::traits::adopt_command_context(cmd, &mut docker_cmd);
         *cmd = docker_cmd;
         Ok(())
     }
@@ -155,6 +156,21 @@ mod tests {
             Ok(sandbox) => assert_eq!(sandbox.image, "ubuntu:latest"),
             Err(_) => assert!(!DockerSandbox::is_installed()),
         }
+    }
+
+    #[test]
+    fn docker_wrap_command_keeps_the_client_working_directory() {
+        let sandbox = DockerSandbox::default();
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("pwd").current_dir("/workspace");
+
+        sandbox.wrap_command(&mut cmd).unwrap();
+
+        assert_eq!(
+            cmd.get_current_dir(),
+            Some(std::path::Path::new("/workspace")),
+            "the docker client keeps the caller's cwd; --workdir governs inside"
+        );
     }
 
     // ── §1.1 Sandbox isolation flag tests ──────────────────────

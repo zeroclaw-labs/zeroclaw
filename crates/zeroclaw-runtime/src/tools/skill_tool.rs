@@ -1,6 +1,7 @@
 //! Shell-based tool derived from a skill's `[[tools]]` section.
 
 use crate::platform::{NativeRuntime, RuntimeAdapter};
+use crate::security::Sandbox;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -40,6 +41,10 @@ const SAFE_ENV_VARS: &[&str] = &[
 ];
 
 const MAX_TOOL_NAME_LEN: usize = 64;
+
+/// Reserved argument name carrying the host's approval verdict. A skill cannot
+/// use it for a template placeholder.
+const APPROVED_ARG: &str = "approved";
 
 fn is_name_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_' || c == '-'
@@ -103,6 +108,12 @@ pub struct SkillShellTool {
     args: HashMap<String, String>,
     security: Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
+    /// Sandbox applied to every spawned command.
+    ///
+    /// Skill tools run shell commands exactly as the shell tool does, so they
+    /// need the same OS-level confinement. Before this they spawned bare:
+    /// `wrap_command` had a single production call site, in the shell tool.
+    sandbox: Arc<dyn Sandbox>,
     /// Resolved per-command timeout in seconds (manifest `timeout_secs`, or the
     /// `SKILL_SHELL_TIMEOUT_SECS` default), clamped to a minimum of 1.
     timeout_secs: u64,
@@ -126,6 +137,25 @@ impl SkillShellTool {
         security: Arc<SecurityPolicy>,
         runtime: Arc<dyn RuntimeAdapter>,
     ) -> Self {
+        Self::new_with_sandbox(
+            skill_name,
+            tool,
+            security,
+            runtime,
+            Arc::new(crate::security::NoopSandbox),
+        )
+    }
+
+    /// Construct with an explicit sandbox. Production builds pass the same
+    /// sandbox the shell tool receives; the no-sandbox constructors above exist
+    /// for tests and mirror `ShellTool::new`.
+    pub fn new_with_sandbox(
+        skill_name: &str,
+        tool: &crate::skills::SkillTool,
+        security: Arc<SecurityPolicy>,
+        runtime: Arc<dyn RuntimeAdapter>,
+        sandbox: Arc<dyn Sandbox>,
+    ) -> Self {
         Self {
             tool_name: composed_tool_name(skill_name, &tool.name),
             tool_description: tool.description.clone(),
@@ -133,6 +163,7 @@ impl SkillShellTool {
             args: tool.args.clone(),
             security,
             runtime,
+            sandbox,
             timeout_secs: tool.timeout_secs.unwrap_or(SKILL_SHELL_TIMEOUT_SECS).max(1),
         }
     }
@@ -142,6 +173,9 @@ impl SkillShellTool {
         let mut required = Vec::new();
 
         for (name, description) in &self.args {
+            if name == APPROVED_ARG {
+                continue;
+            }
             properties.insert(
                 name.clone(),
                 serde_json::json!({
@@ -152,6 +186,19 @@ impl SkillShellTool {
             required.push(serde_json::Value::String(name.clone()));
         }
 
+        // Declaring this is what puts the decision in the host's hands: the
+        // runtime overwrites whatever the model sends with the approval gate's
+        // verdict. Optional, so a skill that never hits a gated command is
+        // unaffected. `approved` is therefore a reserved argument name.
+        properties.insert(
+            APPROVED_ARG.to_string(),
+            serde_json::json!({
+                "type": "boolean",
+                "description": "Set true to explicitly approve medium/high-risk commands in supervised mode",
+                "default": false
+            }),
+        );
+
         serde_json::json!({
             "type": "object",
             "properties": properties,
@@ -161,14 +208,22 @@ impl SkillShellTool {
 
     /// Substitute `{{arg_name}}` placeholders in the command template with
     /// the provided argument values. Unknown placeholders are left as-is.
+    ///
+    /// Driven by the *declared* arguments, so an extra key the model invents —
+    /// including the reserved `approved` — cannot reach the command string.
     fn substitute_args(&self, args: &serde_json::Value) -> String {
         let mut command = self.command_template.clone();
-        if let Some(obj) = args.as_object() {
-            for (key, value) in obj {
-                let placeholder = format!("{{{{{}}}}}", key);
-                let replacement = value.as_str().unwrap_or_default();
-                command = command.replace(&placeholder, replacement);
+        let Some(obj) = args.as_object() else {
+            return command;
+        };
+        for name in self.args.keys() {
+            if name == APPROVED_ARG {
+                continue;
             }
+            let Some(value) = obj.get(name).and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            command = command.replace(&format!("{{{{{name}}}}}"), value);
         }
         command
     }
@@ -191,9 +246,20 @@ impl Tool for SkillShellTool {
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let command = self.substitute_args(&args);
 
-        // Security validation — always requires explicit approval (approved=true)
-        // since skill tools are user-defined and should be treated as medium-risk.
-        match self.security.validate_command_execution(&command, true) {
+        // `approved` GRANTS approval, it does not request it. The runtime
+        // overwrites it with the approval gate's verdict before this runs, so
+        // the value here is the host's, never the model's. This used to be
+        // hardcoded `true` on the theory that a skill's command template is
+        // operator-authored at install time — but skills load from the agent's
+        // own workspace, and on a surface with no approval manager (a delegated
+        // subagent) that let a `locked_down` agent run a medium-risk command
+        // through a skill that `shell` would have refused.
+        let approved = args
+            .get(APPROVED_ARG)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+
+        match self.security.validate_command_execution(&command, approved) {
             Ok(_) => {}
             Err(reason) => {
                 return Ok(ToolResult {
@@ -227,6 +293,24 @@ impl Tool for SkillShellTool {
                 });
             }
         };
+        // Same confinement the shell tool applies, for the same reason: a
+        // static scan of a command string cannot bound what the spawned
+        // process touches, so the OS has to.
+        if let Err(e) = self.sandbox.wrap_command(cmd.as_std_mut()) {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+                "skill tool: sandbox wrap_command failed"
+            );
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!("Sandbox error: {e}")),
+            });
+        }
+
         cmd.env_clear();
 
         // Only pass safe environment variables
@@ -427,12 +511,151 @@ mod tests {
     use crate::skills::SkillTool;
     use zeroclaw_config::schema::DockerRuntimeConfig;
 
+    /// Records whether the tool asked the sandbox to wrap its command.
+    ///
+    /// A `NoopSandbox` cannot distinguish "wrapped with a no-op" from "never
+    /// wrapped at all", which is precisely the bug this guards: skill commands
+    /// previously spawned bare, and `wrap_command` had a single production
+    /// call site in the shell tool.
+    #[derive(Default)]
+    struct RecordingSandbox {
+        wrapped: std::sync::atomic::AtomicBool,
+    }
+
+    impl crate::security::traits::Sandbox for RecordingSandbox {
+        fn wrap_command(&self, _cmd: &mut std::process::Command) -> std::io::Result<()> {
+            self.wrapped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn name(&self) -> &str {
+            "recording"
+        }
+        fn description(&self) -> &str {
+            "test double that records wrap_command calls"
+        }
+    }
+
+    #[tokio::test]
+    async fn skill_command_is_sandbox_wrapped_before_execution() {
+        // Permissive allowlist so the call reaches execution: this test is
+        // about whether the spawn is wrapped, not about command filtering.
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec!["*".to_string()],
+            ..SecurityPolicy::default()
+        });
+        let sandbox = Arc::new(RecordingSandbox::default());
+        let tool = SkillShellTool::new_with_sandbox(
+            "my_skill",
+            &sample_skill_tool(),
+            security,
+            Arc::new(crate::platform::NativeRuntime::new()),
+            sandbox.clone(),
+        );
+
+        let _ = tool
+            .execute(serde_json::json!({"file": "x.rs", "format": "json"}))
+            .await;
+
+        assert!(
+            sandbox.wrapped.load(std::sync::atomic::Ordering::SeqCst),
+            "skill commands must be sandbox-wrapped, as shell commands are"
+        );
+    }
+
     fn test_security() -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Full,
             workspace_dir: std::env::temp_dir(),
             ..SecurityPolicy::default()
         })
+    }
+
+    /// Supervised, medium-risk gated: the posture where `shell` prompts.
+    fn supervised_security() -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec!["mkdir".to_string()],
+            require_approval_for_medium_risk: true,
+            ..SecurityPolicy::default()
+        })
+    }
+
+    fn medium_risk_skill_tool() -> SkillTool {
+        SkillTool {
+            name: "make_dir".to_string(),
+            description: "Create a directory".to_string(),
+            kind: "shell".to_string(),
+            command: "mkdir {{dir}}".to_string(),
+            args: HashMap::from([("dir".to_string(), "directory to create".to_string())]),
+            target: None,
+            locked_args: HashMap::new(),
+            timeout_secs: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn skill_shell_tool_refuses_a_gated_command_without_host_approval() {
+        let tool = SkillShellTool::new("s", &medium_risk_skill_tool(), supervised_security());
+
+        let result = tool
+            .execute(serde_json::json!({"dir": "some-new-dir"}))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("requires explicit approval"),
+            "an unapproved medium-risk command must be refused, as `shell` refuses it: {:?}",
+            result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_shell_tool_runs_a_gated_command_once_the_host_approves() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: workspace.path().to_path_buf(),
+            ..(*supervised_security()).clone()
+        });
+        let tool = SkillShellTool::new("s", &medium_risk_skill_tool(), security);
+
+        let result = tool
+            .execute(serde_json::json!({"dir": "some-new-dir", "approved": true}))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "the host's approval must carry through: {:?}",
+            result.error
+        );
+        assert!(workspace.path().join("some-new-dir").is_dir());
+    }
+
+    #[test]
+    fn skill_shell_tool_does_not_substitute_undeclared_arguments() {
+        let mut st = medium_risk_skill_tool();
+        st.command = "mkdir {{dir}} {{approved}} {{injected}}".to_string();
+        let tool = SkillShellTool::new("s", &st, supervised_security());
+
+        let command = tool.substitute_args(&serde_json::json!({
+            "dir": "ok",
+            "approved": true,
+            "injected": "; rm -rf /",
+        }));
+
+        assert_eq!(command, "mkdir ok {{approved}} {{injected}}");
     }
 
     #[tokio::test]
@@ -612,7 +835,17 @@ mod tests {
         let tool = SkillShellTool::new("s", &st, test_security());
         let schema = tool.parameters_schema();
         assert_eq!(schema["type"], "object");
-        assert!(schema["properties"].as_object().unwrap().is_empty());
+        // `approved` is always declared — it is how the runtime takes ownership
+        // of the approval decision — and is never required.
+        assert_eq!(
+            schema["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            vec!["approved"]
+        );
+        assert_eq!(schema["properties"]["approved"]["type"], "boolean");
         assert!(schema["required"].as_array().unwrap().is_empty());
     }
 

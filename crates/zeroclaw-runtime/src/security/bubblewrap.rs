@@ -140,6 +140,7 @@ impl BubblewrapSandbox {
         bwrap_cmd.arg(&program);
         bwrap_cmd.args(&args);
 
+        crate::security::traits::adopt_command_context(cmd, &mut bwrap_cmd);
         *cmd = bwrap_cmd;
         Ok(())
     }
@@ -217,6 +218,21 @@ mod tests {
         assert!(
             !args.contains(&"--share-net".to_string()),
             "must NOT include --share-net (network should be blocked)"
+        );
+    }
+
+    #[test]
+    fn bubblewrap_wrap_command_keeps_the_working_directory() {
+        let sandbox = BubblewrapSandbox;
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("pwd").current_dir("/workspace");
+
+        sandbox.wrap_command(&mut cmd).unwrap();
+
+        assert_eq!(
+            cmd.get_current_dir(),
+            Some(std::path::Path::new("/workspace")),
+            "wrapping must not silently move the child to the daemon's cwd"
         );
     }
 

@@ -977,12 +977,19 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // tool executions concurrently for lower wall-clock latency.
         let allow_parallel_execution =
             parallel_tools && should_execute_tools_in_parallel(&tool_calls, approval);
+        let prep_dispatch = ToolDispatchContext {
+            tools_registry,
+            activated_tools,
+            excluded_tools,
+            model_switch_callback: model_switch_callback.as_ref(),
+        };
         let PreparedToolCalls {
             mut ordered_results,
             executable_indices,
             executable_calls,
         } = prepare_tool_calls(
             &ctx,
+            prep_dispatch,
             &tool_calls,
             &mut seen_tool_signatures,
             &mut prompt_approval_tool_signatures,

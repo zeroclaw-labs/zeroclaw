@@ -1817,6 +1817,15 @@ pub fn skills_to_tools_with_context_and_runtime(
     unfiltered_registry: &[std::sync::Arc<dyn zeroclaw_api::tool::Tool>],
     runtime: std::sync::Arc<dyn crate::platform::RuntimeAdapter>,
 ) -> Vec<Box<dyn zeroclaw_api::tool::Tool>> {
+    // Skill shell commands get the same OS confinement as the shell tool.
+    // Derived from the resolved policy rather than threaded in, so every
+    // caller of this builder is covered without a signature change.
+    let sandbox = crate::security::create_sandbox(
+        &security.sandbox_config(),
+        runtime.name(),
+        Some(&security.workspace_dir),
+    );
+
     let mut tools: Vec<Box<dyn zeroclaw_api::tool::Tool>> = Vec::new();
     for skill in skills {
         for tool in &skill.tools {
@@ -1834,11 +1843,12 @@ pub fn skills_to_tools_with_context_and_runtime(
             }
             match tool.kind.as_str() {
                 "shell" | "script" => {
-                    let inner = crate::skills::skill_tool::SkillShellTool::new_with_runtime(
+                    let inner = crate::skills::skill_tool::SkillShellTool::new_with_sandbox(
                         &skill.name,
                         tool,
                         security.clone(),
                         runtime.clone(),
+                        sandbox.clone(),
                     );
                     tools.push(Box::new(zeroclaw_tools::wrappers::RateLimitedTool::new(
                         inner,

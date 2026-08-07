@@ -25,6 +25,11 @@ pub(crate) mod turn;
 
 pub use turn::context::TurnMeta;
 
+/// The built-in tools whose `approved` argument the runtime owns.
+///
+/// Only a fallback for when a call cannot be resolved to a tool in this turn's
+/// registry. [`schema_declares_approved_arg`] is the real answer, and covers
+/// tools whose names are not known at compile time.
 pub(crate) fn is_runtime_approved_arg_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
@@ -32,14 +37,28 @@ pub(crate) fn is_runtime_approved_arg_tool(tool_name: &str) -> bool {
     )
 }
 
-pub(crate) fn set_runtime_approved_arg(
-    tool_name: &str,
-    args: &mut serde_json::Value,
-    approved: bool,
-) {
-    if is_runtime_approved_arg_tool(tool_name)
-        && let Some(args) = args.as_object_mut()
-    {
+/// Whether a tool's parameter schema declares an `approved` boolean.
+///
+/// Declaring one is a tool saying its approval decision comes from the host.
+/// Deriving it from the schema rather than a name list is what lets skill shell
+/// tools — named `skill__tool`, so unknowable at compile time — take part: they
+/// would otherwise have to self-approve, which is how a `locked_down` agent
+/// could run a medium-risk command through a skill that the shell tool refuses.
+pub(crate) fn schema_declares_approved_arg(schema: &serde_json::Value) -> bool {
+    schema
+        .get("properties")
+        .and_then(|properties| properties.get("approved"))
+        .and_then(|approved| approved.get("type"))
+        .is_some_and(|kind| kind == "boolean")
+}
+
+/// Overwrite the model's `approved` argument with the host's decision.
+///
+/// `host_owned` comes from [`crate::agent::tool_execution::host_owns_approved_arg`].
+/// Unconditionally inserting would put an `approved` key into tools that never
+/// declared one, which strict-schema surfaces (MCP) reject.
+pub(crate) fn set_approved_arg(host_owned: bool, args: &mut serde_json::Value, approved: bool) {
+    if host_owned && let Some(args) = args.as_object_mut() {
         args.insert("approved".to_string(), serde_json::Value::Bool(approved));
     }
 }

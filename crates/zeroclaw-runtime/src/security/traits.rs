@@ -20,6 +20,39 @@ pub trait Sandbox: Send + Sync {
     fn description(&self) -> &str;
 }
 
+/// Carry over the settings a replacing wrapper would otherwise silently drop.
+///
+/// Backends that isolate by *replacing* the command (`sandbox-exec ...`,
+/// `firejail ...`, `bwrap ...`, `docker run ...`) build a fresh [`Command`] and
+/// assign it over the caller's. A fresh `Command` has no working directory and
+/// no explicit environment, so without this the child inherits the daemon's
+/// cwd — not the workspace the policy resolved the command's relative paths
+/// against. The more isolation is configured, the further the child drifts from
+/// the directory it was validated for.
+///
+/// Only what `Command` exposes a getter for can be carried: the working
+/// directory and the explicit environment. Stdio has no getter, so callers
+/// configure it after wrapping.
+///
+/// For container backends the *in-container* directory comes from the
+/// backend's own flag (`docker run --workdir`); what is carried here is the cwd
+/// of the client process that launches the container.
+pub(crate) fn adopt_command_context(source: &Command, wrapper: &mut Command) {
+    if let Some(dir) = source.get_current_dir() {
+        wrapper.current_dir(dir);
+    }
+    for (key, value) in source.get_envs() {
+        match value {
+            Some(value) => {
+                wrapper.env(key, value);
+            }
+            None => {
+                wrapper.env_remove(key);
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct NoopSandbox;
 
@@ -54,6 +87,58 @@ mod tests {
     #[test]
     fn noop_sandbox_is_always_available() {
         assert!(NoopSandbox.is_available());
+    }
+
+    #[test]
+    fn adopt_command_context_carries_the_working_directory() {
+        let mut source = Command::new("sh");
+        source.current_dir("/workspace");
+        let mut wrapper = Command::new("sandbox-exec");
+
+        adopt_command_context(&source, &mut wrapper);
+
+        assert_eq!(
+            wrapper.get_current_dir(),
+            Some(std::path::Path::new("/workspace")),
+            "a replacing wrapper must run in the directory the caller chose"
+        );
+    }
+
+    #[test]
+    fn adopt_command_context_carries_set_and_removed_env_vars() {
+        let mut source = Command::new("sh");
+        source.env("KEEP", "yes");
+        source.env_remove("DROP");
+        let mut wrapper = Command::new("sandbox-exec");
+
+        adopt_command_context(&source, &mut wrapper);
+
+        let envs: Vec<(String, Option<String>)> = wrapper
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().to_string(),
+                    v.map(|v| v.to_string_lossy().to_string()),
+                )
+            })
+            .collect();
+        assert!(envs.contains(&("KEEP".to_string(), Some("yes".to_string()))));
+        assert!(envs.contains(&("DROP".to_string(), None)));
+    }
+
+    #[test]
+    fn adopt_command_context_leaves_an_unset_working_directory_alone() {
+        let source = Command::new("sh");
+        let mut wrapper = Command::new("sandbox-exec");
+        wrapper.current_dir("/preset");
+
+        adopt_command_context(&source, &mut wrapper);
+
+        assert_eq!(
+            wrapper.get_current_dir(),
+            Some(std::path::Path::new("/preset")),
+            "an unset source cwd must not clear one the backend set itself"
+        );
     }
 
     #[test]
