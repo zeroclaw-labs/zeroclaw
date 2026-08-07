@@ -265,6 +265,7 @@ async fn enforce_reported_budget(
         taken,
         context_token_budget,
         reported_input_tokens,
+        reported_population_estimated,
         tool_schema_tokens,
     );
     if result.trimmed {
