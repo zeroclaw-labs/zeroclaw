@@ -7928,9 +7928,27 @@ fn spawn_sop_maintenance(
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({"orphaned": orphaned})),
                 "SOP cron driver(s) from a previous generation are still running, but this \
-                 configuration runs no SOP maintenance to own them; re-aborted and left \
-                 untracked"
+                 configuration runs no SOP maintenance to own them; re-aborted and handed to a \
+                 reaper that joins them"
             );
+            // Ownership, not detachment. `abort` only *requests* cancellation, so
+            // a driver that reaches no await point keeps running under the
+            // superseded config; dropping its `JoinHandle` here would detach that
+            // task and lose the re-check this type exists to provide. A reaper
+            // owns the handles instead and joins them, so the process still has
+            // something that ends when they do.
+            drop(::zeroclaw_spawn::spawn!(async move {
+                for driver in carried {
+                    let _ = driver.await;
+                }
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                        .with_attrs(::serde_json::json!({"orphaned": orphaned})),
+                    "orphaned SOP cron driver(s) from a superseded generation have stopped"
+                );
+            }));
         }
     };
     if interval_secs == 0 {
@@ -8103,9 +8121,17 @@ impl SopMaintenance {
         if pending.is_empty() {
             return still_running;
         }
+        // A cursor, not an iterator: when the drain deadline fires mid-loop the
+        // abort arm below has to resume where this one stopped. Awaiting a
+        // `JoinHandle` that already resolved panics ("polled after
+        // completion"), so a second pass over the whole vector would turn a
+        // mixed batch — one driver that finished in time, one that did not —
+        // into a shutdown panic instead of a carried-forward straggler.
+        let mut joined_upto = 0usize;
         let drained = tokio::time::timeout(drain_timeout, async {
-            for driver in &mut pending {
-                let _ = driver.await;
+            while joined_upto < pending.len() {
+                let _ = (&mut pending[joined_upto]).await;
+                joined_upto += 1;
             }
         })
         .await;
@@ -8119,12 +8145,16 @@ impl SopMaintenance {
         // call under the superseded config. The join is bounded in turn, so a
         // task that reaches no await point cannot wedge the reload; it is
         // carried forward instead, still aborted and still tracked.
-        for driver in &pending {
+        // Only the handles the drain did not consume: the ones before the
+        // cursor already resolved, and both aborting and re-awaiting them is
+        // either a no-op or a panic.
+        for driver in &pending[joined_upto..] {
             driver.abort();
         }
         let joined = tokio::time::timeout(abort_join_timeout, async {
-            for driver in &mut pending {
-                let _ = driver.await;
+            while joined_upto < pending.len() {
+                let _ = (&mut pending[joined_upto]).await;
+                joined_upto += 1;
             }
         })
         .await;
@@ -10308,6 +10338,51 @@ mod tests {
         assert!(
             carried.is_empty(),
             "a driver that stopped on abort has nothing to carry forward"
+        );
+    }
+
+    /// The drain and the post-abort join are two passes over the SAME handles.
+    /// When the drain deadline lands mid-batch — one driver already joined, one
+    /// still running — the second pass must resume at the cursor rather than
+    /// re-await a handle that already resolved: polling a completed
+    /// `JoinHandle` panics, which would turn an ordinary slow driver into a
+    /// shutdown panic whenever a sibling finished in time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "agent-runtime")]
+    async fn sop_maintenance_shutdown_survives_a_mixed_completion_batch() {
+        // Ordered deliberately: the first resolves at once, so the drain
+        // consumes its handle before the deadline; the second reaches no await
+        // point and outlives both deadlines.
+        let quick = ::zeroclaw_spawn::spawn!(async {});
+        let stuck = ::zeroclaw_spawn::spawn!(async {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        });
+        let drivers = SopDriverSet::default();
+        {
+            let mut guard = drivers.lock().unwrap();
+            guard.push(quick);
+            guard.push(stuck);
+        }
+        let ticker = ::zeroclaw_spawn::spawn!(async {
+            tokio::time::sleep(std::time::Duration::from_hours(24)).await;
+        });
+
+        let carried = SopMaintenance {
+            ticker,
+            drivers,
+            carried: Vec::new(),
+        }
+        .shutdown_with_deadlines(
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+
+        assert_eq!(
+            carried.len(),
+            1,
+            "only the driver that outlived the grace is carried; the one the drain \
+             already joined must not be awaited a second time"
         );
     }
 
