@@ -17,7 +17,7 @@ use zeroclaw_api::jsonrpc::error_codes::*;
 use zeroclaw_api::jsonrpc::{
     ACP_PROTOCOL_VERSION, JsonRpcError, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
 };
-use zeroclaw_api::model_provider::ConversationMessage;
+use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage, ToolCall};
 use zeroclaw_api::plan::PlanEntry;
 use zeroclaw_config::schema::Config;
 use zeroclaw_infra::acp_session_store::AcpSessionStore;
@@ -26,6 +26,24 @@ use zeroclaw_runtime::tools::CanvasStore;
 
 use super::acp_embedded;
 use crate::acp_channel::AcpChannel;
+
+/// Tool name of the structured, replay-only cancellation event a client-cancel
+/// leaves in a persisted transcript. It is a sentinel — recognised structurally
+/// by this name (never by localized text) so `session/load` can exclude it from
+/// provider history and replay it as the live client-cancel update.
+const CANCELLATION_EVENT_TOOL_NAME: &str = "turn-cancelled";
+/// Stable tool-call id for the cancellation sentinel.
+const CANCELLATION_EVENT_TOOL_ID: &str = "turn-cancelled";
+
+/// Terminal result of a `session/prompt` turn, returned by the per-session turn
+/// task after it has already persisted the outcome's transcript while holding
+/// the session lock. The outer handler only needs to render the client-facing
+/// response, notifications, and logs from it — persistence is done.
+enum TerminalOutcome {
+    Success { response: String },
+    Cancelled,
+    Failed { error: String },
+}
 
 // ── Configuration ────────────────────────────────────────────────
 
@@ -88,6 +106,15 @@ pub struct AcpServer {
     /// concurrent restores of the same session and to count in-flight slots
     /// against `max_sessions`.
     loading_sessions: Arc<tokio::sync::Mutex<HashSet<String>>>,
+    /// Per-session finalization gate. A `session/prompt` turn holds its session's
+    /// gate from the moment it starts until its terminal transcript is committed;
+    /// `session/load`/`session/resume` acquire the same gate before reading the
+    /// store. This keeps a session non-loadable while a prompt is starting or
+    /// persisting — even in the window after `session/close`/`session/stop` have
+    /// removed the live map entry — so a concurrent restore cannot seed a
+    /// replacement agent from pre-append rows. Keyed by session id; entries are
+    /// tiny and bounded by the distinct sessions seen.
+    session_gates: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     store: Option<Arc<AcpSessionStore>>,
     /// Shared canvas store from the gateway / daemon supervisor.  When set,
     /// agents created by this server write canvas frames to the same store
@@ -215,6 +242,7 @@ impl AcpServer {
             writer_rx: std::sync::Mutex::new(writer_rx),
             cancel_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
             loading_sessions: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            session_gates: Arc::new(std::sync::Mutex::new(HashMap::new())),
             store,
             canvas_store: None,
             sop_engine: None,
@@ -913,6 +941,14 @@ impl AcpServer {
             data: None,
         })?;
 
+        // Wait out any in-flight prompt on this session before reading the store,
+        // so a restore cannot seed a replacement agent from pre-append rows while
+        // a terminal transcript is still being committed — including the window
+        // after `session/close`/`session/stop` remove the live map entry (see
+        // `session_gates`). Held across the store read and the map insert below.
+        let finalize_gate = self.session_gate(&session_id);
+        let _finalize_guard = finalize_gate.lock().await;
+
         // Atomically check and reserve the session slot
         {
             let sessions = self.sessions.lock().await;
@@ -1018,22 +1054,33 @@ impl AcpServer {
             }
         };
 
-        let stored_messages: Vec<_> = data
-            .messages
-            .into_iter()
-            .filter(|message| {
-                !matches!(message, ConversationMessage::Chat(chat) if chat.role == "system")
-            })
-            .collect();
-        let restore_trim_event =
-            agent.seed_conversation_history_with_event(stored_messages.clone());
+        // Repair an interrupted native-tool exchange left by a failed/cancelled
+        // turn and drop the replay-only cancellation sentinel before seeding, on
+        // the same typed-restore path `session/resume` uses. `stored_messages`
+        // retains the repaired transcript (incl. the sentinel) for client replay
+        // below; `seed_messages` is the sentinel-free provider history.
+        let (stored_messages, seed_messages, repaired_tool_calls) =
+            Self::sanitize_restored_history(data.messages);
+        if repaired_tool_calls > 0 {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Delete)
+                    .with_category(::zeroclaw_log::EventCategory::Channel)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "session_id": session_id,
+                        "assistant_messages_repaired": repaired_tool_calls,
+                    })),
+                "ACP session/load repaired interrupted tool calls in restored transcript"
+            );
+        }
+        let restore_trim_event = agent.seed_conversation_history_with_event(seed_messages);
         let dropped_messages = match &restore_trim_event {
             Some(TurnEvent::HistoryTrimmed {
                 dropped_messages, ..
             }) => *dropped_messages,
             _ => 0,
         };
-        let restored_messages = stored_messages.into_iter().skip(dropped_messages);
 
         let acp_channel = Arc::new(AcpChannel::new(
             "acp",
@@ -1079,11 +1126,27 @@ impl AcpServer {
 
         // Replay exactly the history retained by the agent. Replaying the
         // stored pre-trim rows would make the client display context that the
-        // restored agent has already discarded.
+        // restored agent has already discarded. Cancellation events are not
+        // part of the seeded set, so they don't count against the trim; one that
+        // falls inside the dropped prefix is dropped from replay too, and each
+        // surviving one replays as the live client-cancel update rather than a
+        // verbatim assistant message.
         let mut replayed_messages = 0;
-        for msg in restored_messages {
+        let mut seed_prefix_to_skip = dropped_messages;
+        for msg in &stored_messages {
+            if seed_prefix_to_skip > 0 {
+                if !Self::is_cancellation_event(msg) {
+                    seed_prefix_to_skip -= 1;
+                }
+                continue;
+            }
             replayed_messages += 1;
-            for notification in history_notifications_for_message(&session_id, &msg) {
+            if Self::is_cancellation_event(msg) {
+                self.write_notification(&Self::turn_cancelled_notification(&session_id))
+                    .await;
+                continue;
+            }
+            for notification in history_notifications_for_message(&session_id, msg) {
                 self.write_notification(&notification).await;
             }
         }
@@ -1130,6 +1193,11 @@ impl AcpServer {
             message: format!("Session not found: {session_id}"),
             data: None,
         })?;
+
+        // Wait out any in-flight prompt on this session before reading the store
+        // (same finalization barrier as `session/load`; see `session_gates`).
+        let finalize_gate = self.session_gate(&session_id);
+        let _finalize_guard = finalize_gate.lock().await;
 
         // Atomically check and reserve the session slot
         {
@@ -1233,7 +1301,27 @@ impl AcpServer {
             }
         };
 
-        let restore_trim_event = agent.seed_conversation_history_with_event(data.messages);
+        // `session/resume` seeds provider history but emits no client replay, so
+        // it needs the same typed sanitization `session/load` applies: repair an
+        // interrupted native-tool exchange and drop the replay-only cancellation
+        // sentinel, otherwise the next native-provider prompt would receive the
+        // unmatched tool call / re-entered cancellation the repair prevents.
+        let (_stored_messages, seed_messages, repaired_tool_calls) =
+            Self::sanitize_restored_history(data.messages);
+        if repaired_tool_calls > 0 {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Delete)
+                    .with_category(::zeroclaw_log::EventCategory::Channel)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "session_id": session_id,
+                        "assistant_messages_repaired": repaired_tool_calls,
+                    })),
+                "ACP session/resume repaired interrupted tool calls in restored transcript"
+            );
+        }
+        let restore_trim_event = agent.seed_conversation_history_with_event(seed_messages);
 
         let acp_channel = Arc::new(AcpChannel::new(
             "acp",
@@ -1434,6 +1522,18 @@ impl AcpServer {
         let cancel_token = tokio_util::sync::CancellationToken::new();
         self.register_cancel_token(&session_id, cancel_token.clone())?;
 
+        // Hold the per-session finalization gate for the rest of the prompt,
+        // including the terminal transcript persistence that runs inside the
+        // spawned turn task (awaited below). `session/load`/`session/resume`
+        // acquire the same gate before reading the store, so a concurrent restore
+        // waits for this turn to commit instead of seeding a replacement agent
+        // from pre-append rows — closing the window that persists even after
+        // `session/close`/`session/stop` remove the live map entry. Acquired
+        // after the `register_cancel_token` busy-check so only the single active
+        // prompt holds it (a concurrent prompt is already rejected above).
+        let finalize_gate = self.session_gate(&session_id);
+        let _finalize_guard = finalize_gate.lock().await;
+
         let prompt = match Self::materialize_prompt(
             params,
             if workspace_dir.is_empty() {
@@ -1487,8 +1587,13 @@ impl AcpServer {
         // Move the Arc into the spawned task and lock inside it.  The inner
         // Mutex stays locked for the duration of the turn, preventing
         // concurrent stop/reap from touching the agent mid-turn. The outer
-        // map entry remains in place.
+        // map entry remains in place. Terminal persistence also runs inside the
+        // task, under the same lock, so `session/close`/`session/stop` (which
+        // await this lock) cannot expose the session for reload before the
+        // terminal transcript is committed.
         let session_id_for_task = session_id.clone();
+        let persist_store = self.store.clone();
+        let persist_session_id = session_id.clone();
         let turn_handle = zeroclaw_spawn::spawn!(async move {
             let mut session = session_arc.lock().await;
             let (turn_alias, turn_provider, turn_model) = session.agent.attribution_fields();
@@ -1519,15 +1624,74 @@ impl AcpServer {
                         cost_context,
                         session
                             .agent
-                            .turn_streamed(&prompt, event_tx, Some(cancel_token))
+                            .turn_streamed_with_steering_state(
+                                &prompt,
+                                event_tx,
+                                Some(cancel_token),
+                                None,
+                            )
                             .instrument(span),
                     ),
                 )
                 .await
             };
             session.last_active = Instant::now();
-            result
-            // guard drops here, releasing the inner lock
+
+            // Per ACP spec a cancelled turn is a terminal outcome, not an error.
+            // Detect via ToolLoopCancelled propagated through anyhow.
+            let was_cancelled = match &result {
+                Err(e) => zeroclaw_runtime::agent::loop_::is_tool_loop_cancelled(&e.error),
+                Ok(_) => false,
+            };
+
+            // A failed or cancelled turn still leaves a user-visible transcript
+            // (prompt, completed tool activity, partial assistant text) on
+            // `StreamedTurnError::new_messages`; persisting only successful turns
+            // dropped it on the next `session/load`. Persist every terminal
+            // outcome here, still holding the session lock, so a racing
+            // close/stop/load observes the committed rows.
+            // The match is the task's return value; its guard (`session`) drops
+            // only after this — i.e. after terminal persistence has committed.
+            match result {
+                Ok(success) => {
+                    Self::append_transcript(
+                        persist_store,
+                        persist_session_id,
+                        success.new_messages,
+                    )
+                    .await;
+                    TerminalOutcome::Success {
+                        response: success.response,
+                    }
+                }
+                Err(failure) if was_cancelled => {
+                    Self::append_transcript(
+                        persist_store,
+                        persist_session_id,
+                        Self::cancelled_turn_transcript(failure.new_messages),
+                    )
+                    .await;
+                    TerminalOutcome::Cancelled
+                }
+                Err(failure) => {
+                    let error = failure.error.to_string();
+                    // A rejected prompt (e.g. empty/whitespace) fails before
+                    // producing any transcript, leaving `new_messages` empty.
+                    // Keep the old no-write behavior there so repeating an
+                    // invalid request doesn't accrete assistant-only failure
+                    // markers into `session/load`. Only persist — with the
+                    // marker — when the turn produced visible work.
+                    if !failure.new_messages.is_empty() {
+                        Self::append_transcript(
+                            persist_store,
+                            persist_session_id,
+                            Self::failed_turn_transcript(failure.new_messages),
+                        )
+                        .await;
+                    }
+                    TerminalOutcome::Failed { error }
+                }
+            }
         });
 
         let mut accumulated_text = String::new();
@@ -1619,78 +1783,49 @@ impl AcpServer {
         // Lock poisoned invariant: same as the insert site above.
         self.remove_cancel_token(&session_id);
 
-        let turn_result = turn_handle.await.map_err(|e| RpcError {
+        let outcome = turn_handle.await.map_err(|e| RpcError {
             code: INTERNAL_ERROR,
             message: format!("Agent task panicked: {e}"),
             data: None,
         })?;
 
-        // Per ACP spec: a cancelled turn must respond with stopReason "cancelled",
-        // not an error. Detect via ToolLoopCancelled propagated through anyhow.
-        let was_cancelled = match &turn_result {
-            Err(e) => zeroclaw_runtime::agent::loop_::is_tool_loop_cancelled(e),
-            Ok(_) => false,
-        };
-
-        if was_cancelled {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete).with_category(::zeroclaw_log::EventCategory::Channel)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({
-                        "tool_calls": tool_call_count,
-                        "stop_reason": "cancelled",
-                    })),
-                "ACP session/prompt turn cancelled"
-            );
-            self.write_notification(&Self::turn_cancelled_notification(&session_id))
-                .await;
-            return Ok(Self::cancelled_prompt_result(session_id, &accumulated_text));
-        }
-
-        let (result_text, new_turn_msgs) = turn_result.map_err(|e| {
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_category(::zeroclaw_log::EventCategory::Channel)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "error": e.to_string(),
-                    })),
-                "ACP session/prompt turn failed"
-            );
-            RpcError {
-                code: INTERNAL_ERROR,
-                message: format!("Agent turn failed: {e}"),
-                data: None,
-            }
-        })?;
-
-        // Persist new messages on successful, non-cancelled turns.
-        if let Some(store) = &self.store
-            && !new_turn_msgs.is_empty()
-        {
-            let store = store.clone();
-            let sid = session_id.clone();
-            let msgs = new_turn_msgs;
-            let persisted =
-                tokio::task::spawn_blocking(move || store.append_turn(&sid, &msgs)).await;
-            let error = match persisted {
-                Ok(Ok(())) => None,
-                Ok(Err(e)) => Some(e.to_string()),
-                Err(join) => Some(join.to_string()),
-            };
-            if let Some(detail) = error {
+        // The terminal transcript was already persisted inside the turn task,
+        // under the session lock. Here we only render the client-facing result,
+        // notifications, and logs for each outcome.
+        let result_text = match outcome {
+            TerminalOutcome::Success { response } => response,
+            TerminalOutcome::Cancelled => {
                 ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_category(::zeroclaw_log::EventCategory::Channel)
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete).with_category(::zeroclaw_log::EventCategory::Channel)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                         .with_attrs(::serde_json::json!({
-                            "error": detail,
+                            "tool_calls": tool_call_count,
+                            "stop_reason": "cancelled",
                         })),
-                    "Failed to persist turn; session continues in memory"
+                    "ACP session/prompt turn cancelled"
                 );
+                self.write_notification(&Self::turn_cancelled_notification(&session_id))
+                    .await;
+                return Ok(Self::cancelled_prompt_result(session_id, &accumulated_text));
             }
-        }
+            TerminalOutcome::Failed { error } => {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_category(::zeroclaw_log::EventCategory::Channel)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "error": error,
+                        })),
+                    "ACP session/prompt turn failed"
+                );
+                return Err(RpcError {
+                    code: INTERNAL_ERROR,
+                    message: format!("Agent turn failed: {error}"),
+                    data: None,
+                });
+            }
+        };
 
         // Durably persist the latest TodoWrite plan for this turn so it
         // replays on session/resume (best-effort; the live emission above
@@ -1770,6 +1905,231 @@ impl AcpServer {
             .lock()
             .expect("cancel_tokens lock poisoned — invariant: all guarded critical sections are short, infallible HashMap ops")
             .remove(session_id);
+    }
+
+    /// The per-session finalization gate (see [`Self::session_gates`]). A
+    /// `session/prompt` turn holds it for its whole duration, including terminal
+    /// persistence; `session/load`/`session/resume` acquire it before reading the
+    /// store so a restore waits for an in-flight prompt to commit rather than
+    /// seeding a replacement agent from pre-append rows.
+    fn session_gate(&self, session_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.session_gates
+            .lock()
+            .expect("session_gates lock poisoned — invariant: all guarded critical sections are short, infallible HashMap ops")
+            .entry(session_id.to_string())
+            .or_default()
+            .clone()
+    }
+
+    /// Assemble the persisted transcript for a failed turn: the messages the
+    /// turn produced before the error (user prompt, completed tool activity,
+    /// any partial assistant text) plus a trailing assistant failure marker so
+    /// the reloaded transcript explains why the turn stopped.
+    fn failed_turn_transcript(mut messages: Vec<ConversationMessage>) -> Vec<ConversationMessage> {
+        messages.push(ConversationMessage::Chat(ChatMessage::assistant(
+            zeroclaw_runtime::i18n::get_required_cli_string("turn-failed"),
+        )));
+        messages
+    }
+
+    /// Build the persisted transcript for a client-cancelled turn. The runtime
+    /// tags a cancelled turn with a generic `turn-interrupted-by-user` assistant
+    /// marker, but on ACP the actor is unverified and live cancellation reports
+    /// the distinct client-channel event instead. So drop that generic marker
+    /// (it must never seed provider history or replay as a user interruption)
+    /// and append a structured, replay-only cancellation event that
+    /// `session/load` renders through the same client-cancel update shape the
+    /// live turn produced (see `turn_cancelled_notification` /
+    /// `is_cancellation_event`). The visible transcript — prompt, completed tool
+    /// activity, partial assistant text — is preserved.
+    fn cancelled_turn_transcript(
+        mut messages: Vec<ConversationMessage>,
+    ) -> Vec<ConversationMessage> {
+        let interrupted =
+            zeroclaw_runtime::i18n::get_required_cli_string("turn-interrupted-by-user");
+        if let Some(ConversationMessage::Chat(chat)) = messages.last_mut()
+            && chat.role == "assistant"
+        {
+            if chat.content == interrupted {
+                messages.pop();
+            } else if let Some(prefix) = chat.content.strip_suffix(&format!("\n\n{interrupted}")) {
+                chat.content = prefix.to_string();
+            }
+        }
+        messages.push(Self::cancellation_event());
+        messages
+    }
+
+    /// Structured ACP cancellation event. Carried inside the existing
+    /// `AssistantToolCalls` variant as a single sentinel tool call so it
+    /// round-trips through the store without a new schema, is recognisable by
+    /// tool name (not by localized text), is excluded from provider history at
+    /// the `session/load` seed boundary, and replays as the client-cancel
+    /// `turn-cancelled` update.
+    fn cancellation_event() -> ConversationMessage {
+        ConversationMessage::AssistantToolCalls {
+            text: None,
+            tool_calls: vec![ToolCall {
+                id: CANCELLATION_EVENT_TOOL_ID.to_string(),
+                name: CANCELLATION_EVENT_TOOL_NAME.to_string(),
+                arguments: "{}".to_string(),
+                extra_content: None,
+            }],
+            reasoning_content: None,
+        }
+    }
+
+    /// A restored message is the structured ACP cancellation event when it is an
+    /// `AssistantToolCalls` carrying exactly the sentinel `turn-cancelled` call.
+    fn is_cancellation_event(message: &ConversationMessage) -> bool {
+        matches!(
+            message,
+            ConversationMessage::AssistantToolCalls { tool_calls, .. }
+                if tool_calls.len() == 1 && tool_calls[0].name == CANCELLATION_EVENT_TOOL_NAME
+        )
+    }
+
+    /// Prepare a restored transcript (loaded from the store) for provider
+    /// seeding. Shared by `session/load` and `session/resume` so both live
+    /// restore paths get the same typed sanitization: drop system messages,
+    /// repair an interrupted native-tool exchange while the transcript is still
+    /// typed (see [`Self::repair_incomplete_tool_calls`]), and exclude the
+    /// replay-only cancellation sentinel so an unverified client-cancel never
+    /// re-enters the model's context. Returns the repaired transcript (which
+    /// `session/load` also replays to the client), the sentinel-free seed
+    /// messages for `seed_conversation_history_with_event`, and the count of
+    /// repaired assistant tool-call messages for logging.
+    fn sanitize_restored_history(
+        messages: Vec<ConversationMessage>,
+    ) -> (Vec<ConversationMessage>, Vec<ConversationMessage>, usize) {
+        let mut stored: Vec<ConversationMessage> = messages
+            .into_iter()
+            .filter(|message| {
+                !matches!(message, ConversationMessage::Chat(chat) if chat.role == "system")
+            })
+            .collect();
+        let repaired = Self::repair_incomplete_tool_calls(&mut stored);
+        let seed = stored
+            .iter()
+            .filter(|message| !Self::is_cancellation_event(message))
+            .cloned()
+            .collect();
+        (stored, seed, repaired)
+    }
+
+    /// Repair an interrupted native-tool exchange in a restored ACP transcript
+    /// while it is still typed `ConversationMessage` data. A turn that failed or
+    /// was cancelled after the model emitted a tool call but before its result
+    /// existed leaves an `AssistantToolCalls` whose call id no `ToolResults`
+    /// ever answered; seeding it into provider history (and replaying it to the
+    /// client) would carry an unmatched tool call into the next request.
+    ///
+    /// The repair runs here, on typed data, precisely because the shared flat
+    /// preflight cannot: a genuine native call is the `AssistantToolCalls`
+    /// variant, so an ordinary assistant `Chat` message whose text merely
+    /// contains a `tool_calls` array is never mistaken for one. Only unpaired
+    /// calls are dropped, preserving any accompanying assistant text as a plain
+    /// assistant message. Orphaned `ToolResults` (a result whose call was
+    /// dropped) are intentionally left to the provider adapters and
+    /// `remove_orphaned_tool_messages`, which keep their id-recovery contracts.
+    fn repair_incomplete_tool_calls(messages: &mut Vec<ConversationMessage>) -> usize {
+        let resolved: std::collections::HashSet<String> = messages
+            .iter()
+            .filter_map(|message| match message {
+                ConversationMessage::ToolResults(results) => Some(results),
+                _ => None,
+            })
+            .flat_map(|results| results.iter().map(|result| result.tool_call_id.clone()))
+            .collect();
+
+        let mut repaired = 0usize;
+        let mut i = 0;
+        while i < messages.len() {
+            if Self::is_cancellation_event(&messages[i]) {
+                // The structured cancellation sentinel is intentionally an
+                // unpaired call; it is replay-only and excluded from provider
+                // history elsewhere, so leave it intact here.
+                i += 1;
+                continue;
+            }
+            let ConversationMessage::AssistantToolCalls {
+                text, tool_calls, ..
+            } = &mut messages[i]
+            else {
+                i += 1;
+                continue;
+            };
+            let before = tool_calls.len();
+            tool_calls.retain(|call| resolved.contains(&call.id));
+            if tool_calls.len() == before {
+                i += 1;
+                continue;
+            }
+            repaired += 1;
+            if !tool_calls.is_empty() {
+                i += 1;
+                continue;
+            }
+            // Every call was unpaired. Keep any salvageable assistant text as a
+            // plain message; otherwise drop the now-empty tool-call turn.
+            let salvaged = text
+                .as_deref()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(ToString::to_string);
+            match salvaged {
+                Some(text) => {
+                    messages[i] = ConversationMessage::Chat(ChatMessage::assistant(text));
+                    i += 1;
+                }
+                None => {
+                    messages.remove(i);
+                }
+            }
+        }
+        repaired
+    }
+
+    /// Durably append a turn's new messages to the ACP session store. Takes an
+    /// owned store handle rather than `&self` so terminal persistence can run
+    /// inside the per-session turn task while it still holds the session lock.
+    /// That ordering is what lets `session/close` and `session/stop` — which
+    /// await the same lock — observe the committed terminal transcript before
+    /// they return and before the session can be reloaded from stale rows.
+    /// Best-effort: an empty slice is a no-op, and a store error is logged while
+    /// the live session continues in memory. Shared by the successful, failed,
+    /// and cancelled turn paths so every terminal outcome preserves its
+    /// user-visible transcript across `session/load`.
+    async fn append_transcript(
+        store: Option<Arc<AcpSessionStore>>,
+        session_id: String,
+        messages: Vec<ConversationMessage>,
+    ) {
+        let Some(store) = store else {
+            return;
+        };
+        if messages.is_empty() {
+            return;
+        }
+        let persisted =
+            tokio::task::spawn_blocking(move || store.append_turn(&session_id, &messages)).await;
+        let error = match persisted {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => Some(e.to_string()),
+            Err(join) => Some(join.to_string()),
+        };
+        if let Some(detail) = error {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Channel)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "error": detail,
+                    })),
+                "Failed to persist turn; session continues in memory"
+            );
+        }
     }
 
     fn prompt_result(session_id: String, stop_reason: &'static str, text: String) -> Value {
@@ -2562,6 +2922,60 @@ type RpcResult = std::result::Result<Value, RpcError>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+
+    struct RecordingNativeProvider {
+        requests: Arc<parking_lot::Mutex<Vec<Vec<ChatMessage>>>>,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for RecordingNativeProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "RecordingNativeProvider"
+        }
+    }
+
+    #[async_trait]
+    impl zeroclaw_api::model_provider::ModelProvider for RecordingNativeProvider {
+        fn capabilities(&self) -> zeroclaw_api::model_provider::ProviderCapabilities {
+            zeroclaw_api::model_provider::ProviderCapabilities {
+                native_tool_calling: true,
+                ..Default::default()
+            }
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("recovered".to_string())
+        }
+
+        async fn chat(
+            &self,
+            request: zeroclaw_api::model_provider::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_api::model_provider::ChatResponse> {
+            self.requests.lock().push(request.messages.to_vec());
+            Ok(zeroclaw_api::model_provider::ChatResponse {
+                text: Some("recovered".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
 
     /// Upper bound for "this must not deadlock" waits in these tests.
     ///
@@ -4981,6 +5395,962 @@ mod tests {
                 text == "old request" || text == "old answer"
             }),
             "trimmed messages must not be replayed to the client"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_turn_transcript_persists_visible_work_and_reloads() {
+        use zeroclaw_api::model_provider::{
+            ChatMessage, ConversationMessage, ToolCall, ToolResultMessage,
+        };
+
+        // A non-retryable provider failure after visible tool activity used to
+        // discard the whole turn (success-only persistence). The handler
+        // now routes the failed turn's `new_messages` through the same store
+        // path as a success, plus a trailing failure marker. Simulate that
+        // failed-turn transcript and confirm it survives `load_session`.
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let session_id = "sess-failed-turn-persist";
+        store
+            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .unwrap();
+
+        // User prompt + a completed tool call/result that was already shown to
+        // the user before the turn errored out — exactly what the streaming
+        // loop leaves on `StreamedTurnError::new_messages`.
+        let failed_turn = vec![
+            ConversationMessage::Chat(ChatMessage::user("read the config file")),
+            ConversationMessage::AssistantToolCalls {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: "toolu_read_1".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: "{\"path\":\"config.toml\"}".to_string(),
+                    extra_content: None,
+                }],
+                reasoning_content: None,
+            },
+            ConversationMessage::ToolResults(vec![ToolResultMessage {
+                tool_call_id: "toolu_read_1".to_string(),
+                content: "port = 8080".to_string(),
+                tool_name: "read_file".to_string(),
+            }]),
+        ];
+
+        AcpServer::append_transcript(
+            Some(Arc::clone(&store)),
+            session_id.to_string(),
+            AcpServer::failed_turn_transcript(failed_turn),
+        )
+        .await;
+
+        let data = store
+            .load_session(session_id)
+            .unwrap()
+            .expect("session record must exist after a failed turn");
+
+        // User prompt preserved.
+        assert!(
+            data.messages.iter().any(|m| matches!(
+                m,
+                ConversationMessage::Chat(chat)
+                    if chat.role == "user" && chat.content == "read the config file"
+            )),
+            "failed turn must retain the user prompt: {:?}",
+            data.messages
+        );
+        // Completed tool activity preserved.
+        assert!(
+            data.messages
+                .iter()
+                .any(|m| matches!(m, ConversationMessage::AssistantToolCalls { .. })),
+            "failed turn must retain the assistant tool call"
+        );
+        assert!(
+            data.messages
+                .iter()
+                .any(|m| matches!(m, ConversationMessage::ToolResults(_))),
+            "failed turn must retain the tool result"
+        );
+        // Failure marker appended as the final message.
+        let marker = zeroclaw_runtime::i18n::get_required_cli_string("turn-failed");
+        match data.messages.last() {
+            Some(ConversationMessage::Chat(chat)) => {
+                assert_eq!(chat.role, "assistant");
+                assert_eq!(
+                    chat.content, marker,
+                    "trailing message must be the failure marker"
+                );
+            }
+            other => panic!("expected trailing failure marker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn repair_incomplete_tool_calls_strips_unpaired_native_calls_only() {
+        use zeroclaw_api::model_provider::{ConversationMessage, ToolCall, ToolResultMessage};
+
+        fn call(id: &str) -> ToolCall {
+            ToolCall {
+                id: id.to_string(),
+                name: "shell".to_string(),
+                arguments: "{}".to_string(),
+                extra_content: None,
+            }
+        }
+
+        // Paired call + its result: left untouched.
+        let mut paired = vec![
+            ConversationMessage::AssistantToolCalls {
+                text: None,
+                tool_calls: vec![call("toolu_ok")],
+                reasoning_content: None,
+            },
+            ConversationMessage::ToolResults(vec![ToolResultMessage {
+                tool_call_id: "toolu_ok".to_string(),
+                content: "done".to_string(),
+                tool_name: "shell".to_string(),
+            }]),
+        ];
+        assert_eq!(AcpServer::repair_incomplete_tool_calls(&mut paired), 0);
+        assert_eq!(paired.len(), 2);
+
+        // Partial: keep the paired call, drop the unpaired one.
+        let mut partial = vec![
+            ConversationMessage::AssistantToolCalls {
+                text: Some("working".to_string()),
+                tool_calls: vec![call("toolu_ok"), call("toolu_orphan")],
+                reasoning_content: None,
+            },
+            ConversationMessage::ToolResults(vec![ToolResultMessage {
+                tool_call_id: "toolu_ok".to_string(),
+                content: "done".to_string(),
+                tool_name: "shell".to_string(),
+            }]),
+        ];
+        assert_eq!(AcpServer::repair_incomplete_tool_calls(&mut partial), 1);
+        match &partial[0] {
+            ConversationMessage::AssistantToolCalls { tool_calls, .. } => {
+                assert_eq!(tool_calls.len(), 1);
+                assert_eq!(tool_calls[0].id, "toolu_ok");
+            }
+            other => panic!("expected surviving paired call, got {other:?}"),
+        }
+
+        // Fully unpaired with salvageable text: becomes a plain assistant message.
+        let mut salvage = vec![ConversationMessage::AssistantToolCalls {
+            text: Some("let me check".to_string()),
+            tool_calls: vec![call("toolu_orphan")],
+            reasoning_content: None,
+        }];
+        assert_eq!(AcpServer::repair_incomplete_tool_calls(&mut salvage), 1);
+        match &salvage[0] {
+            ConversationMessage::Chat(chat) => {
+                assert_eq!(chat.role, "assistant");
+                assert_eq!(chat.content, "let me check");
+            }
+            other => panic!("expected salvaged assistant text, got {other:?}"),
+        }
+
+        // Fully unpaired with no text: message dropped entirely.
+        let mut dropped = vec![
+            ConversationMessage::Chat(ChatMessage::user("q")),
+            ConversationMessage::AssistantToolCalls {
+                text: None,
+                tool_calls: vec![call("toolu_orphan")],
+                reasoning_content: None,
+            },
+        ];
+        assert_eq!(AcpServer::repair_incomplete_tool_calls(&mut dropped), 1);
+        assert_eq!(dropped.len(), 1);
+        assert!(matches!(&dropped[0], ConversationMessage::Chat(c) if c.role == "user"));
+    }
+
+    #[tokio::test]
+    async fn restored_failed_turn_repairs_incomplete_tool_call_before_next_prompt() {
+        use zeroclaw_api::model_provider::{ConversationMessage, ToolCall};
+
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let session_id = "sess-failed-turn-incomplete-tool";
+        store
+            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .unwrap();
+
+        // This is the durable shape left by a failure after the model emitted
+        // a native tool call but before its result existed.
+        store
+            .append_turn(
+                session_id,
+                &AcpServer::failed_turn_transcript(vec![
+                    ConversationMessage::Chat(ChatMessage::user("inspect the workspace")),
+                    ConversationMessage::AssistantToolCalls {
+                        text: None,
+                        tool_calls: vec![ToolCall {
+                            id: "toolu_incomplete".to_string(),
+                            name: "shell".to_string(),
+                            arguments: "{\"command\":\"pwd\"}".to_string(),
+                            extra_content: None,
+                        }],
+                        reasoning_content: None,
+                    },
+                ]),
+            )
+            .unwrap();
+
+        let server = Arc::new(AcpServer::new_with_store(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+            Arc::clone(&store),
+        ));
+        server
+            .handle_session_load(&serde_json::json!({ "sessionId": session_id }))
+            .await
+            .expect("failed transcript must reload");
+
+        let requests = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let session = server
+            .sessions
+            .lock()
+            .await
+            .get(session_id)
+            .cloned()
+            .expect("loaded session must be active");
+        session
+            .lock()
+            .await
+            .agent
+            .set_model_provider(Box::new(RecordingNativeProvider {
+                requests: Arc::clone(&requests),
+            }));
+
+        let result = server
+            .handle_session_prompt(
+                &serde_json::json!({
+                    "sessionId": session_id,
+                    "prompt": "continue safely"
+                }),
+                &serde_json::json!(2),
+            )
+            .await
+            .expect("the next prompt must reach the provider");
+        assert_eq!(result["stopReason"], "end_turn");
+
+        let requests = requests.lock();
+        assert_eq!(requests.len(), 1, "expected exactly one provider request");
+        assert!(
+            !requests[0]
+                .iter()
+                .any(|message| message.content.contains("toolu_incomplete")),
+            "provider request retained an unmatched tool call: {:?}",
+            requests[0]
+        );
+        assert!(
+            requests[0].iter().any(
+                |message| message.role == "user" && message.content.contains("continue safely")
+            ),
+            "provider request must include the post-reload prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_failure_persists_transcript_through_the_handler() {
+        use zeroclaw_api::model_provider::ConversationMessage;
+
+        // Drive a populated, non-retryable provider failure through the real
+        // `session/prompt` handler (not the `append_transcript`/
+        // `failed_turn_transcript` helpers directly), so the `TerminalOutcome`
+        // routing and the production append path are exercised: a regression in
+        // the handler match would surface here.
+        struct FailingProvider;
+        impl zeroclaw_api::attribution::Attributable for FailingProvider {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Provider(
+                    zeroclaw_api::attribution::ProviderKind::Model(
+                        zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "FailingProvider"
+            }
+        }
+        #[async_trait::async_trait]
+        impl zeroclaw_api::model_provider::ModelProvider for FailingProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                anyhow::bail!("provider rejected the request")
+            }
+            async fn chat(
+                &self,
+                _request: zeroclaw_api::model_provider::ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<zeroclaw_api::model_provider::ChatResponse> {
+                anyhow::bail!("provider rejected the request")
+            }
+        }
+
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let server = Arc::new(AcpServer::new_with_store(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+            Arc::clone(&store),
+        ));
+        let session_id = server
+            .handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy(),
+                "agentAlias": "test-agent"
+            }))
+            .await
+            .expect("session/new must succeed")["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        {
+            let session = server
+                .sessions
+                .lock()
+                .await
+                .get(&session_id)
+                .cloned()
+                .expect("new session must be active");
+            session
+                .lock()
+                .await
+                .agent
+                .set_model_provider(Box::new(FailingProvider));
+        }
+
+        server
+            .handle_session_prompt(
+                &serde_json::json!({ "sessionId": session_id, "prompt": "summarize the repo" }),
+                &serde_json::json!(1),
+            )
+            .await
+            .expect_err("a non-retryable provider failure must surface as an RPC error");
+
+        // The failed turn's visible transcript (the user prompt) plus a trailing
+        // failure marker must have been persisted via the production path.
+        let data = store
+            .load_session(&session_id)
+            .unwrap()
+            .expect("session record exists");
+        assert!(
+            data.messages.iter().any(|message| matches!(
+                message,
+                ConversationMessage::Chat(chat)
+                    if chat.role == "user" && chat.content.contains("summarize the repo")
+            )),
+            "failed turn must persist the user prompt: {:?}",
+            data.messages
+        );
+        let marker = zeroclaw_runtime::i18n::get_required_cli_string("turn-failed");
+        assert!(
+            matches!(data.messages.last(), Some(ConversationMessage::Chat(chat)) if chat.content == marker),
+            "failed turn must end with the turn-failed marker: {:?}",
+            data.messages
+        );
+    }
+
+    #[tokio::test]
+    async fn resumed_session_sanitizes_incomplete_call_and_cancellation_sentinel() {
+        use zeroclaw_api::model_provider::{ConversationMessage, ToolCall};
+
+        // `session/resume` seeds provider history without client replay, so it
+        // must apply the same typed restore sanitization as `session/load`: an
+        // incomplete native call and a cancellation sentinel restored here must
+        // not reach the next provider request.
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let session_id = "sess-resume-sanitize";
+        store
+            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .unwrap();
+        // A failed turn left an unmatched native call...
+        store
+            .append_turn(
+                session_id,
+                &AcpServer::failed_turn_transcript(vec![
+                    ConversationMessage::Chat(ChatMessage::user("inspect the workspace")),
+                    ConversationMessage::AssistantToolCalls {
+                        text: None,
+                        tool_calls: vec![ToolCall {
+                            id: "toolu_incomplete".to_string(),
+                            name: "shell".to_string(),
+                            arguments: "{}".to_string(),
+                            extra_content: None,
+                        }],
+                        reasoning_content: None,
+                    },
+                ]),
+            )
+            .unwrap();
+        // ...and a later turn was client-cancelled (structured sentinel stored).
+        let interrupted =
+            zeroclaw_runtime::i18n::get_required_cli_string("turn-interrupted-by-user");
+        store
+            .append_turn(
+                session_id,
+                &AcpServer::cancelled_turn_transcript(vec![
+                    ConversationMessage::Chat(ChatMessage::user("do a thing")),
+                    ConversationMessage::Chat(ChatMessage::assistant(interrupted.clone())),
+                ]),
+            )
+            .unwrap();
+
+        let server = Arc::new(AcpServer::new_with_store(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+            Arc::clone(&store),
+        ));
+        server
+            .handle_session_resume(&serde_json::json!({
+                "sessionId": session_id,
+                "cwd": cwd.path().to_string_lossy()
+            }))
+            .await
+            .expect("session/resume must succeed");
+
+        let requests = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let session = server
+            .sessions
+            .lock()
+            .await
+            .get(session_id)
+            .cloned()
+            .expect("resumed session must be active");
+        session
+            .lock()
+            .await
+            .agent
+            .set_model_provider(Box::new(RecordingNativeProvider {
+                requests: Arc::clone(&requests),
+            }));
+
+        server
+            .handle_session_prompt(
+                &serde_json::json!({ "sessionId": session_id, "prompt": "continue" }),
+                &serde_json::json!(2),
+            )
+            .await
+            .expect("the next prompt must reach the provider");
+
+        let requests = requests.lock();
+        assert_eq!(requests.len(), 1, "expected exactly one provider request");
+        for message in &requests[0] {
+            assert!(
+                !message.content.contains("toolu_incomplete")
+                    && !message.content.contains(&interrupted)
+                    && !message.content.contains(CANCELLATION_EVENT_TOOL_NAME),
+                "resumed provider history leaked an unmatched call / cancellation: {message:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cancelled_turn_transcript_swaps_generic_marker_for_structured_event() {
+        use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
+
+        let interrupted =
+            zeroclaw_runtime::i18n::get_required_cli_string("turn-interrupted-by-user");
+
+        // The runtime tags a cancelled turn with a standalone generic marker.
+        let standalone = AcpServer::cancelled_turn_transcript(vec![
+            ConversationMessage::Chat(ChatMessage::user("do the thing")),
+            ConversationMessage::Chat(ChatMessage::assistant(interrupted.clone())),
+        ]);
+        // Generic marker gone; a structured cancellation event took its place.
+        assert!(
+            !standalone.iter().any(|m| matches!(
+                m,
+                ConversationMessage::Chat(c) if c.content == interrupted
+            )),
+            "generic interruption marker must not be persisted: {standalone:?}"
+        );
+        assert!(
+            AcpServer::is_cancellation_event(standalone.last().unwrap()),
+            "transcript must end with the structured cancellation event"
+        );
+
+        // When the marker is folded onto partial assistant text, only the marker
+        // suffix is stripped; the partial text is preserved.
+        let folded = AcpServer::cancelled_turn_transcript(vec![ConversationMessage::Chat(
+            ChatMessage::assistant(format!("partial answer\n\n{interrupted}")),
+        )]);
+        match &folded[0] {
+            ConversationMessage::Chat(chat) => assert_eq!(chat.content, "partial answer"),
+            other => panic!("expected preserved partial text, got {other:?}"),
+        }
+        assert!(AcpServer::is_cancellation_event(folded.last().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn restored_cancelled_turn_replays_client_cancel_and_hides_marker_from_provider() {
+        use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
+
+        let interrupted =
+            zeroclaw_runtime::i18n::get_required_cli_string("turn-interrupted-by-user");
+        let client_cancel =
+            zeroclaw_runtime::i18n::get_required_cli_string("turn-cancelled-client-rpc");
+
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let session_id = "sess-cancelled-turn";
+        store
+            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .unwrap();
+        store
+            .append_turn(
+                session_id,
+                &AcpServer::cancelled_turn_transcript(vec![
+                    ConversationMessage::Chat(ChatMessage::user("summarize the repo")),
+                    ConversationMessage::Chat(ChatMessage::assistant(interrupted.clone())),
+                ]),
+            )
+            .unwrap();
+
+        let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<String>(64);
+        let server = Arc::new(AcpServer::new_with_writer_and_store(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+            writer_tx,
+            Arc::clone(&store),
+        ));
+        server
+            .handle_session_load(&serde_json::json!({ "sessionId": session_id }))
+            .await
+            .expect("cancelled transcript must reload");
+
+        let mut notifications = Vec::new();
+        while let Ok(message) = writer_rx.try_recv() {
+            notifications.push(serde_json::from_str::<serde_json::Value>(&message).unwrap());
+        }
+        // The cancellation replays as the live client-cancel tool_call update...
+        assert!(
+            notifications.iter().any(|n| {
+                n["params"]["update"]["sessionUpdate"] == "tool_call"
+                    && n["params"]["update"]["name"] == "turn-cancelled"
+            }),
+            "load must replay the client-cancel update: {notifications:?}"
+        );
+        // ...never as a verbatim assistant interruption message.
+        assert!(
+            !notifications.iter().any(|n| {
+                let text = &n["params"]["update"]["content"]["text"];
+                text == &serde_json::Value::String(interrupted.clone())
+            }),
+            "the generic interruption marker must not replay as an assistant message: {notifications:?}"
+        );
+
+        // The next prompt must not carry any transport marker or the sentinel
+        // into provider history.
+        let requests = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let session = server
+            .sessions
+            .lock()
+            .await
+            .get(session_id)
+            .cloned()
+            .expect("loaded session must be active");
+        session
+            .lock()
+            .await
+            .agent
+            .set_model_provider(Box::new(RecordingNativeProvider {
+                requests: Arc::clone(&requests),
+            }));
+
+        server
+            .handle_session_prompt(
+                &serde_json::json!({ "sessionId": session_id, "prompt": "now continue" }),
+                &serde_json::json!(2),
+            )
+            .await
+            .expect("the next prompt must reach the provider");
+
+        let requests = requests.lock();
+        assert_eq!(requests.len(), 1, "expected exactly one provider request");
+        for message in &requests[0] {
+            assert!(
+                !message.content.contains(&interrupted)
+                    && !message.content.contains(&client_cancel)
+                    && !message.content.contains(CANCELLATION_EVENT_TOOL_NAME),
+                "provider history leaked a cancellation marker/sentinel: {message:?}"
+            );
+        }
+        assert!(
+            requests[0]
+                .iter()
+                .any(|m| m.role == "user" && m.content.contains("summarize the repo")),
+            "the pre-cancellation transcript must survive for the provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_waits_for_terminal_persistence_before_returning() {
+        use std::sync::Arc as StdArc;
+
+        use tokio::sync::Notify;
+
+        // A provider that parks inside `chat` — while parked, the turn task holds
+        // the session lock, so a racing `session/close` cannot proceed and the
+        // terminal transcript is not yet committed.
+        struct BarrierProvider {
+            entered: StdArc<Notify>,
+            release: StdArc<Notify>,
+        }
+
+        impl zeroclaw_api::attribution::Attributable for BarrierProvider {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Provider(
+                    zeroclaw_api::attribution::ProviderKind::Model(
+                        zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "BarrierProvider"
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl zeroclaw_api::model_provider::ModelProvider for BarrierProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                Ok("done".to_string())
+            }
+
+            async fn chat(
+                &self,
+                _request: zeroclaw_api::model_provider::ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<zeroclaw_api::model_provider::ChatResponse> {
+                self.entered.notify_one();
+                self.release.notified().await;
+                Ok(zeroclaw_api::model_provider::ChatResponse {
+                    text: Some("done".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let server = Arc::new(AcpServer::new_with_store(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+            Arc::clone(&store),
+        ));
+        let session_id = server
+            .handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy(),
+                "agentAlias": "test-agent"
+            }))
+            .await
+            .expect("session/new must succeed")["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let entered = StdArc::new(Notify::new());
+        let release = StdArc::new(Notify::new());
+        {
+            let session = server
+                .sessions
+                .lock()
+                .await
+                .get(&session_id)
+                .cloned()
+                .expect("new session must be active");
+            session
+                .lock()
+                .await
+                .agent
+                .set_model_provider(Box::new(BarrierProvider {
+                    entered: StdArc::clone(&entered),
+                    release: StdArc::clone(&release),
+                }));
+        }
+
+        let messages_before = store
+            .load_session(&session_id)
+            .unwrap()
+            .expect("session record exists")
+            .messages
+            .len();
+
+        let prompt_server = Arc::clone(&server);
+        let prompt_sid = session_id.clone();
+        let prompt = zeroclaw_spawn::spawn!(async move {
+            prompt_server
+                .handle_session_prompt(
+                    &serde_json::json!({ "sessionId": prompt_sid, "prompt": "hi" }),
+                    &serde_json::json!(1),
+                )
+                .await
+        });
+
+        // Turn is now parked inside the provider, holding the session lock.
+        entered.notified().await;
+
+        // session/close cancels the in-flight turn and then waits on the session
+        // lock. The turn task persists its terminal (cancelled) transcript while
+        // still holding that lock, so close can only acquire it — and return —
+        // after the transcript is committed. Release the barrier too so the turn
+        // also unwinds cleanly if cancellation did not abort the parked call.
+        release.notify_one();
+        server
+            .handle_session_close(&serde_json::json!({ "sessionId": session_id }))
+            .await
+            .expect("close resolves");
+
+        // Before this fix persistence ran after the lock was released, so close
+        // could return first and expose the session for reload with stale rows.
+        assert!(
+            store
+                .load_session(&session_id)
+                .unwrap()
+                .expect("session record exists")
+                .messages
+                .len()
+                > messages_before,
+            "close returned before the terminal transcript was committed"
+        );
+        prompt.await.unwrap().expect("prompt turn resolves");
+    }
+
+    #[tokio::test]
+    async fn close_then_immediate_load_waits_for_terminal_persistence() {
+        use std::sync::Arc as StdArc;
+
+        use tokio::sync::Notify;
+
+        // A provider that parks inside `chat` so the prompt turn stays in flight
+        // (holding both the session lock and the per-session finalization gate).
+        struct BarrierProvider {
+            entered: StdArc<Notify>,
+            release: StdArc<Notify>,
+        }
+        impl zeroclaw_api::attribution::Attributable for BarrierProvider {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Provider(
+                    zeroclaw_api::attribution::ProviderKind::Model(
+                        zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "BarrierProvider"
+            }
+        }
+        #[async_trait::async_trait]
+        impl zeroclaw_api::model_provider::ModelProvider for BarrierProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                Ok("done".to_string())
+            }
+            async fn chat(
+                &self,
+                _request: zeroclaw_api::model_provider::ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<zeroclaw_api::model_provider::ChatResponse> {
+                self.entered.notify_one();
+                self.release.notified().await;
+                Ok(zeroclaw_api::model_provider::ChatResponse {
+                    text: Some("done".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let server = Arc::new(AcpServer::new_with_store(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+            Arc::clone(&store),
+        ));
+        let session_id = server
+            .handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy(),
+                "agentAlias": "test-agent"
+            }))
+            .await
+            .expect("session/new must succeed")["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let entered = StdArc::new(Notify::new());
+        let release = StdArc::new(Notify::new());
+        {
+            let session = server
+                .sessions
+                .lock()
+                .await
+                .get(&session_id)
+                .cloned()
+                .expect("new session must be active");
+            session
+                .lock()
+                .await
+                .agent
+                .set_model_provider(Box::new(BarrierProvider {
+                    entered: StdArc::clone(&entered),
+                    release: StdArc::clone(&release),
+                }));
+        }
+
+        let before = store
+            .load_session(&session_id)
+            .unwrap()
+            .expect("session record exists")
+            .messages
+            .len();
+
+        // Prompt is parked in the provider, holding the session lock + the gate.
+        let prompt_server = Arc::clone(&server);
+        let prompt_sid = session_id.clone();
+        let prompt = zeroclaw_spawn::spawn!(async move {
+            prompt_server
+                .handle_session_prompt(
+                    &serde_json::json!({ "sessionId": prompt_sid, "prompt": "hi" }),
+                    &serde_json::json!(1),
+                )
+                .await
+        });
+        entered.notified().await;
+
+        // A `session/load` spawned while the prompt is in flight must block on the
+        // finalization gate — it cannot reach the store read. (The prompt is still
+        // parked here; nothing has cancelled it yet.)
+        let load_server = Arc::clone(&server);
+        let load_sid = session_id.clone();
+        let mut load = zeroclaw_spawn::spawn!(async move {
+            load_server
+                .handle_session_load(&serde_json::json!({ "sessionId": load_sid }))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_millis(150), &mut load)
+            .await
+            .expect_err("load must block on the finalization gate while the prompt is in flight");
+
+        // `session/close` removes the live map entry (opening the window the gate
+        // protects), cancels the parked turn, and waits on the session lock. The
+        // turn commits its terminal transcript under the gate; only then does the
+        // load acquire the gate and read the committed rows.
+        let close_server = Arc::clone(&server);
+        let close_sid = session_id.clone();
+        let close = zeroclaw_spawn::spawn!(async move {
+            close_server
+                .handle_session_close(&serde_json::json!({ "sessionId": close_sid }))
+                .await
+        });
+        // Belt-and-suspenders in case cancellation did not abort the parked call.
+        release.notify_one();
+        prompt.await.unwrap().expect("prompt resolves");
+        close.await.unwrap().expect("close resolves");
+        load.await
+            .unwrap()
+            .expect("load resolves against committed rows");
+
+        assert!(
+            store
+                .load_session(&session_id)
+                .unwrap()
+                .expect("session record exists")
+                .messages
+                .len()
+                > before,
+            "the terminal transcript must be committed before the load reads the store"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_prompt_leaves_stored_messages_unchanged() {
+        // A blank/whitespace prompt clears `parse_prompt` (it is a non-empty
+        // JSON string) but `turn_streamed_with_steering_state` rejects it
+        // before any provider work, returning `StreamedTurnError` with an empty
+        // `new_messages`. This drives the real failed-turn branch in
+        // `handle_session_prompt` — no mock provider needed — and must NOT
+        // append an assistant-only `turn-failed` marker, otherwise repeating an
+        // invalid request would pollute `session/load`.
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let server = Arc::new(AcpServer::new_with_store(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+            Arc::clone(&store),
+        ));
+
+        let new_result = server
+            .handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy(),
+                "agentAlias": "test-agent"
+            }))
+            .await
+            .expect("session/new must succeed");
+        let session_id = new_result["sessionId"].as_str().unwrap().to_string();
+
+        let before = store
+            .load_session(&session_id)
+            .unwrap()
+            .expect("session record must exist after session/new")
+            .messages;
+
+        let err = server
+            .handle_session_prompt(
+                &serde_json::json!({
+                    "sessionId": session_id.clone(),
+                    "prompt": "   "
+                }),
+                &serde_json::json!(1),
+            )
+            .await
+            .expect_err("a blank turn must surface an RPC error");
+        assert_eq!(err.code, INTERNAL_ERROR);
+
+        let after = store
+            .load_session(&session_id)
+            .unwrap()
+            .expect("session record must still exist")
+            .messages;
+        assert_eq!(
+            before.len(),
+            after.len(),
+            "a rejected blank turn must not persist any messages: {after:?}"
         );
     }
 
