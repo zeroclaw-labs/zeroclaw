@@ -1,38 +1,7 @@
 //! Voice duplex event dispatch for WebSocket sessions.
 #![cfg(feature = "gateway-voice-duplex")]
 
-use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum VoiceEvent {
-    /// Client signals that speech has started.
-    #[serde(rename = "speech_start")]
-    SpeechStart,
-
-    /// Client signals that speech has ended, with optional transcript.
-    #[serde(rename = "speech_end")]
-    SpeechEnd {
-        #[serde(default)]
-        transcript: Option<String>,
-    },
-
-    /// Client requests cancellation of in-progress TTS.
-    #[serde(rename = "barge_in")]
-    BargeIn,
-
-    /// Server cancels in-progress TTS.
-    #[serde(rename = "tts_cancel")]
-    TtsCancel,
-
-    /// Server sends a chunk of base64-encoded audio.
-    #[serde(rename = "tts_chunk")]
-    TtsChunk {
-        audio_b64: String,
-        #[serde(default)]
-        format: Option<String>,
-    },
-}
+use zeroclaw_api::channel::VoiceEvent;
 
 /// Attempt to parse a text frame as a voice event.
 /// Returns `Some(VoiceEvent)` if the JSON parses as a known voice event type,
@@ -69,7 +38,7 @@ pub fn handle_voice_event(event: VoiceEvent) -> Option<serde_json::Value> {
             // TODO: wire into session abort mechanism (ref upstream
             None
         }
-        VoiceEvent::TtsCancel | VoiceEvent::TtsChunk { .. } => {
+        VoiceEvent::TtsCancel | VoiceEvent::TtsChunk { .. } | VoiceEvent::Say { .. } => {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)

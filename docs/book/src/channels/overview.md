@@ -78,6 +78,7 @@ See [Email](./email.md).
 | ClawdTalk | `channel-clawdtalk` | Telnyx SIP real-time voice |
 | Voice Call | `channel-voice-call` | Twilio / Telnyx / Plivo |
 | Voice Wake | `voice-wake` | Local wake-word detection |
+| VoiceHost | `channel-voicehost` | External ASR/VAD/TTS host over WebSocket (Native or Wyoming) |
 | TTS | always compiled with channel support | Outbound speech synthesis (OpenAI, ElevenLabs, Google Cloud, Edge, Piper) |
 
 See [Voice & telephony](./voice.md).

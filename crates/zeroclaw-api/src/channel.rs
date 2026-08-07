@@ -316,6 +316,41 @@ pub enum GateChoiceEmphasis {
     Neutral,
 }
 
+/// JSON events shared by voice-capable gateways and channel adapters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum VoiceEvent {
+    /// The voice host detected the start of user speech.
+    #[serde(rename = "speech_start")]
+    SpeechStart,
+    /// The voice host detected the end of user speech.
+    #[serde(rename = "speech_end")]
+    SpeechEnd {
+        #[serde(default)]
+        transcript: Option<String>,
+    },
+    /// The user interrupted an in-progress response.
+    #[serde(rename = "barge_in")]
+    BargeIn,
+    /// Cancel in-progress text-to-speech output.
+    #[serde(rename = "tts_cancel")]
+    TtsCancel,
+    /// A base64-encoded text-to-speech audio chunk.
+    #[serde(rename = "tts_chunk")]
+    TtsChunk {
+        audio_b64: String,
+        #[serde(default)]
+        format: Option<String>,
+    },
+    /// Ask the voice host to synthesize and play a text response.
+    #[serde(rename = "say")]
+    Say {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        voice: Option<String>,
+    },
+}
+
 /// Conversation history scope for an inbound channel message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ChannelConversationScope {
@@ -349,6 +384,9 @@ pub struct ChannelMessage {
     /// is genuinely inside a reply thread and should be isolated from other threads.
     /// `None` means top-level — scope is sender+channel only.
     pub interruption_scope_id: Option<String>,
+    /// When true, cancel the in-flight turn for this conversation without
+    /// starting a replacement turn or emitting a channel acknowledgement.
+    pub interrupt_only: bool,
     /// Media attachments (audio, images, video) for the media pipeline.
     /// Channels populate this when they receive media alongside a text message.
     /// Defaults to empty — existing channels are unaffected.
@@ -609,6 +647,11 @@ pub struct ForgeApiResponse {
 pub trait Channel: Send + Sync + crate::attribution::Attributable {
     /// Human-readable channel name
     fn name(&self) -> &str;
+
+    /// Tools that must not be exposed while handling turns from this channel.
+    fn excluded_tools(&self) -> &[String] {
+        &[]
+    }
 
     /// Send a message through this channel
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()>;
@@ -1092,8 +1135,28 @@ mod tests {
         assert!(msg.attachments.is_empty());
         assert!(msg.subject.is_none());
         assert!(!msg.passive_context);
+        assert!(!msg.interrupt_only);
         assert!(!msg.explicitly_addressed);
         assert_eq!(msg.conversation_scope, ChannelConversationScope::Sender);
+    }
+
+    #[test]
+    fn voice_event_say_roundtrip() {
+        let event = VoiceEvent::Say {
+            text: "Hello from ZeroClaw".into(),
+            voice: Some("en-US".into()),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"say","text":"Hello from ZeroClaw","voice":"en-US"}"#
+        );
+        let decoded: VoiceEvent = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            VoiceEvent::Say { text, voice }
+                if text == "Hello from ZeroClaw" && voice.as_deref() == Some("en-US")
+        ));
     }
 
     #[test]

@@ -174,6 +174,11 @@ const CHANNEL_COMPILE_SPECS: &[ChannelCompileSpec] = &[
         compiled: cfg!(feature = "channel-voice-call"),
     },
     ChannelCompileSpec {
+        schema_name: Some("VoiceHost"),
+        type_keys: &["voicehost", "voice-host"],
+        compiled: cfg!(feature = "channel-voicehost"),
+    },
+    ChannelCompileSpec {
         schema_name: Some("VoiceWake"),
         type_keys: &["voice-wake", "voice_wake"],
         compiled: cfg!(feature = "voice-wake"),
@@ -414,6 +419,18 @@ mod tests {
         assert_eq!(super::qr_pairing_channel("telegram"), None);
         assert_eq!(super::qr_pairing_channel("whatsapp"), None);
         assert_eq!(super::qr_pairing_channel("not-a-channel"), None);
+    }
+
+    #[test]
+    fn voicehost_keys_stay_registered_in_compile_specs() {
+        let spec = CHANNEL_COMPILE_SPECS
+            .iter()
+            .find(|spec| spec.type_keys.contains(&"voicehost"))
+            .expect("voicehost must be present in CHANNEL_COMPILE_SPECS");
+
+        assert_eq!(spec.schema_name, Some("VoiceHost"));
+        assert!(spec.type_keys.contains(&"voice-host"));
+        assert_eq!(spec.compiled, cfg!(feature = "channel-voicehost"));
     }
 
     #[test]

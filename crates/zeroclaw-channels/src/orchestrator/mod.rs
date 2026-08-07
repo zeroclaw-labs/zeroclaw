@@ -65,6 +65,8 @@ pub use crate::twitter::TwitterChannel;
 pub use crate::voice_call::VoiceCallChannel;
 #[cfg(feature = "voice-wake")]
 pub use crate::voice_wake::VoiceWakeChannel;
+#[cfg(feature = "channel-voicehost")]
+pub use crate::voicehost::VoiceHostChannel;
 #[cfg(feature = "channel-wati")]
 pub use crate::wati::WatiChannel;
 #[cfg(feature = "channel-webhook")]
@@ -5014,17 +5016,17 @@ async fn process_channel_message_body(
         memory_sessions.push(Some(history_key.clone()));
     }
 
-    let per_turn_excluded_tools: &[String] =
-        if msg.channel == "cli" || ctx.autonomy_level == AutonomyLevel::Full {
-            &[]
-        } else {
-            ctx.non_cli_excluded_tools.as_ref()
-        };
+    let per_turn_excluded_tools = effective_excluded_tools(
+        &msg,
+        ctx.autonomy_level,
+        ctx.non_cli_excluded_tools.as_ref(),
+        target_channel.as_deref(),
+    );
     let read_skill_available = read_skill_available_for_channel_turn(
         active_model_provider.as_ref(),
         ctx.agent_cfg.resolved.strict_tool_parsing,
         ctx.tools_registry.as_ref(),
-        per_turn_excluded_tools,
+        per_turn_excluded_tools.as_slice(),
         ctx.system_prompt.as_str(),
     );
     let base_system_prompt = system_prompt_for_channel_turn(
@@ -5037,7 +5039,7 @@ async fn process_channel_message_body(
         ::zeroclaw_runtime::agent::loop_::native_tool_specs_present_for_turn(
             active_model_provider.as_ref(),
             ctx.tools_registry.as_ref(),
-            per_turn_excluded_tools,
+            per_turn_excluded_tools.as_slice(),
             ctx.activated_tools.as_ref(),
         )
         .unwrap_or(false);
@@ -5047,7 +5049,7 @@ async fn process_channel_message_body(
         target_channel.as_ref(),
         per_turn_native_tool_specs_present,
     );
-    if send_message_to_peer_tool_available(ctx.as_ref(), &msg)
+    if send_message_to_peer_tool_available(ctx.as_ref(), per_turn_excluded_tools.as_slice())
         && let Some(current_channel_ref) = peer_prompt_channel_ref(ctx.as_ref(), &msg)
     {
         let peer_map =
@@ -5576,12 +5578,6 @@ async fn process_channel_message_body(
                 .clone()
                 .or_else(|| msg.thread_ts.clone())
                 .or_else(|| Some(msg.id.clone()));
-            let excluded_tools: &[String] =
-                if msg.channel == "cli" || ctx.autonomy_level == AutonomyLevel::Full {
-                    &[]
-                } else {
-                    ctx.non_cli_excluded_tools.as_ref()
-                };
             let tool_loop = Box::pin(run_tool_call_loop(ToolLoop {
                 exec: ResolvedAgentExecution::resolve(
                     ResolvedModelAccess {
@@ -5608,7 +5604,7 @@ async fn process_channel_message_body(
                     },
                     ResolvedRuntimeKnobs {
                         max_tool_iterations: ctx.max_tool_iterations,
-                        excluded_tools,
+                        excluded_tools: per_turn_excluded_tools.as_slice(),
                         dedup_exempt_tools: ctx.tool_call_dedup_exempt.as_ref(),
                         pacing: &ctx.pacing,
                         strict_tool_parsing: ctx.agent_cfg.resolved.strict_tool_parsing,
@@ -5761,7 +5757,7 @@ async fn process_channel_message_body(
                             active_model_provider.as_ref(),
                             ctx.agent_cfg.resolved.strict_tool_parsing,
                             ctx.tools_registry.as_ref(),
-                            excluded_tools,
+                            per_turn_excluded_tools.as_slice(),
                             history
                                 .first()
                                 .map_or("", |message| message.content.as_str()),
@@ -7076,6 +7072,42 @@ async fn run_message_dispatch_loop(
     let task_sequence = Arc::new(AtomicU64::new(1));
 
     while let Some(msg) = rx.recv().await {
+        // Transport-level interruption controls are consumed before ownership,
+        // hooks, debounce, acknowledgements, and worker creation. They cancel
+        // only the matching conversation and never become model input.
+        if msg.interrupt_only {
+            let debounce_cancelled = if let Some(ctx) = router.resolve(&msg) {
+                let debounce_key = conversation_history_key(&msg);
+                ctx.debouncer.cancel(&debounce_key).await
+            } else {
+                false
+            };
+            let scope_key = interruption_scope_key(&msg);
+            let previous = {
+                let mut active = in_flight_by_sender.lock().await;
+                active.remove(&scope_key)
+            };
+            let in_flight_cancelled = previous.is_some();
+            if let Some(state) = previous {
+                state.cancellation.cancel();
+            }
+            if in_flight_cancelled || debounce_cancelled {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "channel": msg.channel,
+                            "channel_alias": msg.channel_alias,
+                            "sender": msg.sender,
+                            "debounce_cancelled": debounce_cancelled,
+                            "in_flight_cancelled": in_flight_cancelled,
+                        })),
+                    "cancelled in-flight request from channel control event"
+                );
+            }
+            continue;
+        }
+
         // Gate answers (button-click markers / `approve <ref>` text replies)
         // resolve a PARKED run and must never start one, so they are consumed
         // BEFORE agent ownership lookup. A configured approval route may be
@@ -7537,7 +7569,8 @@ impl std::fmt::Display for UnknownChannelId {
             f,
             "Unknown channel '{channel_id}'. Supported: telegram, discord, slack, mattermost, \
             signal, matrix, whatsapp, qq, lark, feishu, dingtalk, wecom, wecom_ws, nextcloud_talk, \
-            wati, linq, email, gmail_push, git, irc, twitter, mochat, imessage, line, voice-call"
+            wati, linq, email, gmail_push, git, irc, twitter, mochat, imessage, line, voice-call, \
+            voicehost"
         )
     }
 }
@@ -8356,6 +8389,24 @@ fn build_channel_by_id(
                 anyhow::bail!("Voice Call channel requires the `channel-voice-call` feature");
             }
         }
+        #[cfg(feature = "channel-voicehost")]
+        channel_id if channel_id == "voicehost" || channel_id.starts_with("voicehost.") => {
+            let alias = channel_id
+                .split_once('.')
+                .map(|(_, alias)| alias)
+                .unwrap_or("default")
+                .to_string();
+            let voicehost = config
+                .channels
+                .voicehost
+                .get(&alias)
+                .with_context(|| format!("VoiceHost channel '{alias}' is not configured"))?;
+            Ok(Arc::new(VoiceHostChannel::new(alias, voicehost.clone())?))
+        }
+        #[cfg(not(feature = "channel-voicehost"))]
+        channel_id if channel_id == "voicehost" || channel_id.starts_with("voicehost.") => {
+            anyhow::bail!("VoiceHost channel requires the `channel-voicehost` feature");
+        }
         other => Err(anyhow::Error::new(UnknownChannelId(other.to_string()))),
     }
 }
@@ -8467,14 +8518,11 @@ fn find_channel_for_message<'a>(
 
 fn send_message_to_peer_tool_available(
     ctx: &ChannelRuntimeContext,
-    msg: &zeroclaw_api::channel::ChannelMessage,
+    excluded_tools: &[String],
 ) -> bool {
-    let excluded_for_turn = msg.channel != "cli" && ctx.autonomy_level != AutonomyLevel::Full;
-    if excluded_for_turn
-        && ctx
-            .non_cli_excluded_tools
-            .iter()
-            .any(|tool_name| tool_name == "send_message_to_peer")
+    if excluded_tools
+        .iter()
+        .any(|tool_name| tool_name == "send_message_to_peer")
     {
         return false;
     }
@@ -8482,6 +8530,24 @@ fn send_message_to_peer_tool_available(
     ctx.tools_registry
         .iter()
         .any(|tool| tool.name() == "send_message_to_peer")
+}
+
+fn effective_excluded_tools(
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    autonomy_level: AutonomyLevel,
+    non_cli_excluded_tools: &[String],
+    target_channel: Option<&dyn Channel>,
+) -> Vec<String> {
+    let mut excluded_tools = Vec::new();
+    if msg.channel != "cli" && autonomy_level != AutonomyLevel::Full {
+        excluded_tools.extend_from_slice(non_cli_excluded_tools);
+    }
+    if let Some(channel) = target_channel {
+        excluded_tools.extend_from_slice(channel.excluded_tools());
+    }
+    excluded_tools.sort_unstable();
+    excluded_tools.dedup();
+    excluded_tools
 }
 
 fn peer_prompt_channel_ref(
@@ -10216,6 +10282,43 @@ fn collect_configured_channels(
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
             "VoiceWake channel is configured but this build was compiled without \
              `voice-wake`; skipping VoiceWake."
+        );
+    }
+
+    #[cfg(feature = "channel-voicehost")]
+    for (alias, voicehost) in &config.channels.voicehost {
+        if !active_channel_aliases.contains(&format!("voicehost.{alias}")) {
+            continue;
+        }
+        if !voicehost.enabled {
+            continue;
+        }
+        match VoiceHostChannel::new(alias.clone(), voicehost.clone()) {
+            Ok(channel) => channels.push(ConfiguredChannel {
+                display_name: "VoiceHost",
+                alias: Some(alias.clone()),
+                channel: Arc::new(channel),
+            }),
+            Err(_) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"alias": alias})),
+                    "VoiceHost channel configuration is invalid; skipping VoiceHost"
+                );
+            }
+        }
+    }
+
+    #[cfg(not(feature = "channel-voicehost"))]
+    if !config.channels.voicehost.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "VoiceHost channel is configured but this build was compiled without \
+             `channel-voicehost`; skipping VoiceHost."
         );
     }
 
@@ -14634,6 +14737,7 @@ api_key = "anthropic-key"
         observer: Arc<dyn Observer>,
         tools: Vec<Box<dyn Tool>>,
     ) -> Arc<ChannelRuntimeContext> {
+        let debounce_window = Duration::from_millis(prompt_config.channels.debounce_ms);
         // Auto-approve the registered tools so the turn actually executes them
         // instead of short-circuiting on a denial, which would skip the
         // tool-phase lifecycle emissions entirely.
@@ -14708,7 +14812,7 @@ api_key = "anthropic-key"
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
+                debounce_window,
             )),
             receipt_generator: None,
             show_receipts_in_response: false,
@@ -16286,6 +16390,37 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             names.contains(&"aa_mcp__find_npcs"),
             "allowed MCP tool missing from the channel registry; got {names:?}"
+        );
+    }
+
+    #[cfg(feature = "channel-voicehost")]
+    #[test]
+    fn voicehost_excluded_tools_join_non_cli_risk_policy() {
+        let channel = VoiceHostChannel::new(
+            "office".into(),
+            zeroclaw_config::schema::VoiceHostConfig {
+                enabled: true,
+                url: "ws://127.0.0.1:8765/ws".into(),
+                excluded_tools: vec!["shell".into(), "send_message_to_peer".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let msg = ChannelMessage {
+            channel: "voicehost".into(),
+            channel_alias: Some("office".into()),
+            ..Default::default()
+        };
+        let risk_exclusions = vec!["filesystem".into(), "shell".into()];
+
+        assert_eq!(
+            effective_excluded_tools(
+                &msg,
+                AutonomyLevel::default(),
+                &risk_exclusions,
+                Some(&channel),
+            ),
+            ["filesystem", "send_message_to_peer", "shell"]
         );
     }
 
@@ -19494,6 +19629,123 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let sent_messages = channel_impl.sent_messages.lock().await;
         assert_eq!(sent_messages.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn interrupt_only_cancels_in_flight_turn_without_starting_another() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let provider_impl = Arc::new(DelayedHistoryCaptureModelProvider {
+            delay: Duration::from_millis(250),
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            provider_impl.clone(),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<ChannelMessage>(4);
+        let send_task = zeroclaw_spawn::spawn!(async move {
+            tx.send(ChannelMessage {
+                id: "voice-1".into(),
+                sender: "voice-user".into(),
+                reply_target: "office".into(),
+                content: "tell me the weather".into(),
+                channel: "test-channel".into(),
+                timestamp: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            tx.send(ChannelMessage {
+                id: "voice-interrupt".into(),
+                sender: "voice-user".into(),
+                reply_target: "office".into(),
+                channel: "test-channel".into(),
+                timestamp: 2,
+                interrupt_only: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        });
+
+        run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 2).await;
+        send_task.await.unwrap();
+
+        let call_count = provider_impl
+            .calls
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .len();
+        assert_eq!(call_count, 1, "interrupt event must not start a model turn");
+        assert!(
+            channel_impl.sent_messages.lock().await.is_empty(),
+            "interrupt event must not emit a reply or acknowledgement"
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupt_only_cancels_pending_debounce_before_model_work() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let provider_impl = Arc::new(DelayedHistoryCaptureModelProvider {
+            delay: Duration::from_millis(20),
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut prompt_config = zeroclaw_config::schema::Config::default();
+        prompt_config.channels.debounce_ms = 200;
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            provider_impl.clone(),
+            prompt_config,
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<ChannelMessage>(4);
+        let send_task = zeroclaw_spawn::spawn!(async move {
+            tx.send(ChannelMessage {
+                id: "voice-pending".into(),
+                sender: "voice-user".into(),
+                reply_target: "office".into(),
+                content: "discard this utterance".into(),
+                channel: "test-channel".into(),
+                timestamp: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            tx.send(ChannelMessage {
+                id: "voice-pending-interrupt".into(),
+                sender: "voice-user".into(),
+                reply_target: "office".into(),
+                channel: "test-channel".into(),
+                timestamp: 2,
+                interrupt_only: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        });
+
+        run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 2).await;
+        send_task.await.unwrap();
+
+        let call_count = provider_impl
+            .calls
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .len();
+        assert_eq!(call_count, 0, "cancelled debounce must not reach the model");
+        assert!(channel_impl.sent_messages.lock().await.is_empty());
     }
 
     #[tokio::test]
@@ -24651,6 +24903,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 conversation_scope: zeroclaw_api::channel::ChannelConversationScope::Sender,
                 thread_ts: None,
                 interruption_scope_id: None,
+                interrupt_only: false,
                 attachments: vec![zeroclaw_api::media::MediaAttachment {
                     file_name: "sticker.png".to_string(),
                     data: vec![1, 2, 3, 4],
@@ -25789,6 +26042,70 @@ This is an example JSON object for profile settings."#;
         );
     }
 
+    #[cfg(feature = "channel-voicehost")]
+    #[test]
+    fn collect_configured_channels_skips_unreferenced_voicehost() {
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "owner".into(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["telegram.default".into()],
+                ..Default::default()
+            },
+        );
+        config.channels.voicehost.insert(
+            "office".into(),
+            zeroclaw_config::schema::VoiceHostConfig {
+                enabled: true,
+                url: "ws://127.0.0.1:8765/ws".into(),
+                ..Default::default()
+            },
+        );
+
+        let config_arc = Arc::new(RwLock::new(config));
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        assert!(
+            !channels
+                .iter()
+                .any(|entry| entry.display_name == "VoiceHost"),
+            "voicehost with no owning agent reference should not be collected"
+        );
+    }
+
+    #[cfg(feature = "channel-voicehost")]
+    #[test]
+    fn collect_configured_channels_builds_enabled_voicehost() {
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "owner".into(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["voicehost.office".into()],
+                ..Default::default()
+            },
+        );
+        config.channels.voicehost.insert(
+            "office".into(),
+            zeroclaw_config::schema::VoiceHostConfig {
+                enabled: true,
+                url: "ws://127.0.0.1:8765/ws".into(),
+                ..Default::default()
+            },
+        );
+
+        let config_arc = Arc::new(RwLock::new(config));
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let voicehost = channels
+            .iter()
+            .find(|entry| entry.display_name == "VoiceHost")
+            .expect("enabled, agent-owned voicehost should be collected");
+        assert_eq!(voicehost.alias.as_deref(), Some("office"));
+        assert_eq!(voicehost.channel.name(), "voicehost");
+    }
+
     // Regression: an enabled Signal or Voice Call channel with
     // empty required credentials was built anyway, then its listener
     // failed to connect and the per-channel supervisor restarted it
@@ -26497,6 +26814,7 @@ This is an example JSON object for profile settings."#;
                 conversation_scope: zeroclaw_api::channel::ChannelConversationScope::Sender,
                 thread_ts: None,
                 interruption_scope_id: None,
+                interrupt_only: false,
                 attachments: vec![zeroclaw_api::media::MediaAttachment {
                     file_name: "route.png".to_string(),
                     data: vec![1, 2, 3, 4],
@@ -27928,6 +28246,36 @@ This is an example JSON object for profile settings."#;
             Ok(channel) => assert_eq!(channel.name(), "voice_call"),
             Err(e) => panic!("should succeed when voice-call is configured: {e}"),
         }
+    }
+
+    #[cfg(feature = "channel-voicehost")]
+    #[test]
+    fn build_channel_by_id_unconfigured_voicehost_returns_error() {
+        let config_arc = Arc::new(RwLock::new(Config::default()));
+        let error = match build_channel_by_id(&config_arc, "voicehost") {
+            Err(error) => error,
+            Ok(_) => panic!("should fail when voicehost is not configured"),
+        };
+        assert!(error.to_string().contains("not configured"));
+    }
+
+    #[cfg(feature = "channel-voicehost")]
+    #[test]
+    fn build_channel_by_id_configured_voicehost_alias_succeeds() {
+        let mut config = Config::default();
+        config.channels.voicehost.insert(
+            "office".into(),
+            zeroclaw_config::schema::VoiceHostConfig {
+                enabled: true,
+                url: "ws://127.0.0.1:8765/ws".into(),
+                ..Default::default()
+            },
+        );
+        let config_arc = Arc::new(RwLock::new(config));
+        let channel = build_channel_by_id(&config_arc, "voicehost.office")
+            .expect("configured voicehost alias should build");
+        assert_eq!(channel.name(), "voicehost");
+        assert_eq!(channel.alias(), "office");
     }
 
     // ── is_stop_command tests ─────────────────────────────────────────────

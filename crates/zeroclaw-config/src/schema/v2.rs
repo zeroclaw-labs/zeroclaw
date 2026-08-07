@@ -98,6 +98,7 @@ pub const V3_CHANNEL_TYPES: &[&str] = &[
     "bluesky",
     "git",
     "voice_call",
+    "voicehost",
     "voice_wake",
     "voice_duplex",
     "mqtt",

@@ -319,7 +319,7 @@ channels-full = [
     "channel-twitch", "channel-twitter", "channel-reddit", "channel-notion", "channel-mqtt", "channel-amqp",
     "channel-linq", "channel-wati", "channel-nextcloud",
     "channel-mochat", "channel-wecom", "channel-wecom-ws", "channel-clawdtalk",
-    "channel-whatsapp-cloud", "channel-voice-call",
+    "channel-whatsapp-cloud", "channel-voice-call", "channel-voicehost",
 ]
 
 # Major subsystems — each forwards to exactly ONE crate
@@ -368,6 +368,7 @@ channel-webhook = ["zeroclaw-channels/channel-webhook"]
 channel-acp-server = ["zeroclaw-channels/channel-acp-server", "zeroclaw-gateway?/channel-acp-server"]
 channel-whatsapp-cloud = ["zeroclaw-channels/channel-whatsapp-cloud", "zeroclaw-gateway?/channel-whatsapp-cloud"]
 channel-voice-call = ["zeroclaw-channels/channel-voice-call"]
+channel-voicehost = ["zeroclaw-channels/channel-voicehost"]
 channel-line = ["zeroclaw-channels/channel-line"]
 # Feishu uses the same channel implementation as Lark; `use_feishu = true`
 # selects Feishu endpoints at runtime.

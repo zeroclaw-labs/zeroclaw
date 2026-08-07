@@ -203,6 +203,7 @@ channels-full = [
   "channel-twitch",
   "channel-twitter",
   "channel-voice-call",
+  "channel-voicehost",
   "channel-wati",
   "channel-wecom",
   "channel-wecom-ws",
@@ -273,6 +274,7 @@ channel-clawdtalk = []
 channel-webhook = []
 channel-whatsapp-cloud = []
 channel-voice-call = []
+channel-voicehost = []
 channel-acp-server = []
 channel-matrix = ["dep:matrix-sdk", "dep:mime_guess"]
 voice-wake = ["dep:cpal"]
