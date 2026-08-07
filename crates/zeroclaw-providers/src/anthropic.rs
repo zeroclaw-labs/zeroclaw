@@ -1603,52 +1603,51 @@ impl AnthropicModelProvider {
     /// user message, which changes no roles, or inserts a user message between the
     /// assistant turn that made the call and a message that is not user-role, so
     /// it cannot create an adjacent pair.
-    /// Merging two assistant turns concatenates their blocks, so the later
-    /// turn's `thinking` lands behind the earlier turn's `tool_use`. Anthropic
-    /// requires an assistant message to *start* with `thinking` when extended
-    /// thinking is on — see [`Self::parse_assistant_tool_call_message`] — and
-    /// rejects the request otherwise, so a merge that fixed the role alternation
-    /// would have traded one 400 for another. [`Self::move_thinking_first`]
-    /// restores the ordering on the message that was actually merged into.
+    ///
+    /// Two adjacent assistant messages are left alone when the earlier one holds
+    /// `tool_use` blocks, because the backfill separates that pair anyway and does
+    /// it better. Merging there would concatenate the two turns' blocks, which
+    /// both flattens two sequential rounds of calls into one apparently parallel
+    /// round and leaves the later turn's `thinking` behind the earlier turn's
+    /// `tool_use` — and Anthropic requires an assistant message to *start* with
+    /// `thinking` when extended thinking is on, see
+    /// [`Self::parse_assistant_tool_call_message`], so the merge would have traded
+    /// one 400 for another.
+    ///
+    /// Skipping cannot leave the pair adjacent on the wire. The next message is an
+    /// assistant one, so it carries no `tool_result`; every `tool_use` in the
+    /// earlier message is therefore unanswered, and
+    /// [`Self::backfill_orphaned_tool_uses`] inserts a user message of stubs
+    /// between them. The condition here is the same one that makes its `pending`
+    /// list non-empty, so wherever this declines to merge, that insert happens.
+    ///
+    /// This is why the case the merge does have to cover is the one in the
+    /// paragraph above: plain assistant messages, with no `tool_use` for the
+    /// backfill to answer and no `thinking` to put out of order.
     fn merge_adjacent_same_role(messages: &mut Vec<NativeMessage>) {
         let mut idx = 1;
         while idx < messages.len() {
-            if messages[idx].role != messages[idx - 1].role {
+            if messages[idx].role != messages[idx - 1].role
+                || Self::backfill_will_separate(&messages[idx - 1])
+            {
                 idx += 1;
                 continue;
             }
             let merged = messages.remove(idx);
             messages[idx - 1].content.extend(merged.content);
-            if messages[idx - 1].role == "assistant" {
-                Self::move_thinking_first(&mut messages[idx - 1]);
-            }
         }
     }
 
-    /// Hoist one message's `thinking` blocks ahead of every other block,
-    /// preserving relative order within each group. A no-op when they already
-    /// are, which is every message this converter builds without merging.
+    /// Whether [`Self::backfill_orphaned_tool_uses`] will insert a user message
+    /// after `message`, given that the message following it is not user-role.
     ///
-    /// Reordering keeps each block's `signature` with its own `thinking` text,
-    /// which is what Anthropic verifies; it does not rewrite either. The reasoning
-    /// of two turns does end up adjacent, and the second turn's reasoning no
-    /// longer sits directly before the calls it produced. That ordering is already
-    /// lost the moment two assistant turns become one message, and the merge only
-    /// happens where the alternative is a request the API refuses outright.
-    fn move_thinking_first(message: &mut NativeMessage) {
-        let out_of_order = message
+    /// True exactly when the message holds a `tool_use`, which is what fills the
+    /// backfill's `pending` list.
+    fn backfill_will_separate(message: &NativeMessage) -> bool {
+        message
             .content
             .iter()
-            .skip_while(|block| matches!(block, NativeContentOut::Thinking { .. }))
-            .any(|block| matches!(block, NativeContentOut::Thinking { .. }));
-        if !out_of_order {
-            return;
-        }
-        let (thinking, others): (Vec<NativeContentOut>, Vec<NativeContentOut>) =
-            std::mem::take(&mut message.content)
-                .into_iter()
-                .partition(|block| matches!(block, NativeContentOut::Thinking { .. }));
-        message.content = thinking.into_iter().chain(others).collect();
+            .any(|block| matches!(block, NativeContentOut::ToolUse { .. }))
     }
 
     /// Pair any orphaned `tool_use` with a stub `tool_result` so interrupted
@@ -4724,16 +4723,23 @@ data: {\"type\":\"message_stop\"}\n\n";
         );
     }
 
-    /// Merging two assistant turns must not leave `thinking` behind `tool_use`.
+    /// A dropped tool message between two assistant turns must not leave
+    /// `thinking` behind `tool_use`.
     ///
     /// Anthropic requires an assistant message to start with `thinking` when
-    /// extended thinking is on. Concatenating the two turns' blocks put the second
-    /// turn's reasoning after the first turn's calls — `[thinking, tool_use,
-    /// tool_use, thinking, tool_use]` — so the merge that fixed the role
-    /// alternation drew a 400 of its own.
+    /// extended thinking is on. Merging the two turns concatenated their blocks
+    /// and produced `[thinking, tool_use, tool_use, thinking, tool_use]`, so the
+    /// merge that fixed the role alternation drew a 400 of its own. The merge now
+    /// declines the pair and the backfill separates it instead, which also keeps
+    /// the two rounds of calls in two messages rather than flattening them into
+    /// one apparently parallel round.
+    ///
+    /// Asserted as the invariant — every assistant message starts with its
+    /// thinking — not as the mechanism, so it holds whether the ordering is
+    /// preserved or repaired.
     ///
     /// Two open calls are what forces the drop: with one, the stray carrier's id
-    /// is recovered from history and no merge happens at all.
+    /// is recovered from history and no merge is even considered.
     #[test]
     fn merging_assistant_turns_keeps_thinking_blocks_first() {
         let thinking = |text: &str, sig: &str| {
@@ -4800,6 +4806,22 @@ data: {\"type\":\"message_stop\"}\n\n";
             "the merge must still do its own job: {:?}",
             roles_on_the_wire(&native_msgs)
         );
+
+        // The two rounds stay two messages. Merging them would say the three calls
+        // were issued together, when in fact `toolu_c` was decided after `toolu_a`
+        // and `toolu_b` had been issued.
+        for message in wire.as_array().expect("messages") {
+            let ids: Vec<&str> = message["content"]
+                .as_array()
+                .expect("content blocks")
+                .iter()
+                .filter_map(|block| block["id"].as_str())
+                .collect();
+            assert!(
+                !(ids.contains(&"toolu_a") && ids.contains(&"toolu_c")),
+                "calls from two rounds must not share one message: {ids:?}"
+            );
+        }
     }
 
     #[tokio::test]
