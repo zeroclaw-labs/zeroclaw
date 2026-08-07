@@ -990,11 +990,10 @@ impl BrowserTool {
                 // Absent: empty string → inline PNG return
                 Ok(args)
             }
-            Some(Value::String(_)) => {
+            Some(Value::String(path_str)) => {
                 // String: validate against workspace through the one canonical
                 // validator shared with the local backends.
                 let mut args = args;
-                let path_str = path.as_ref().unwrap().as_str().unwrap();
                 let resolved_target = self.validate_screenshot_target(path_str).await?;
 
                 // Store the validated path for local write after sidecar returns PNG.
@@ -1124,10 +1123,11 @@ impl BrowserTool {
 
         if let Ok(parsed) = serde_json::from_str::<ComputerUseResponse>(&body) {
             if status.is_success() && parsed.success.unwrap_or(true) {
-                // If this was a screenshot with a validated non-empty path, write the PNG locally
-                if is_path_bearing_screenshot {
-                    let path_str = validated_path.as_deref().unwrap();
-
+                // If this was a screenshot with a validated non-empty path, write the PNG
+                // locally. Bind the validated path structurally (the path-bearing flag
+                // above guarantees a non-empty Some here) instead of unwrapping a latent
+                // panic site.
+                if let Some(path_str) = validated_path.as_deref().filter(|p| !p.is_empty()) {
                     // Extract PNG data from the response
                     let png_data = parsed
                         .data
@@ -3993,33 +3993,58 @@ mod tests {
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let not_a_png_b64 = base64::engine::general_purpose::STANDARD.encode(b"not a png");
-        let cases: Vec<(&str, serde_json::Value)> = vec![
-            ("non-json-2xx", json!("this is not json")),
-            ("success-false", json!({"success": false, "error": "boom"})),
+        // Each case is (name, wire body, expected error fragment). The
+        // non-JSON case sends genuinely non-JSON bytes via `set_body_raw`
+        // (a `set_body_json(json!("..."))` would transmit a *valid* JSON
+        // string, exercising a different branch). Every case is a 200 so the
+        // failure must come from response handling, not the HTTP layer.
+        let cases: Vec<(&str, ResponseTemplate, &str)> = vec![
+            (
+                "non-json-2xx",
+                ResponseTemplate::new(200)
+                    .set_body_raw(b"this is not json {{{".to_vec(), "text/plain"),
+                "non-JSON",
+            ),
+            (
+                "success-false",
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"success": false, "error": "boom"})),
+                "boom",
+            ),
             (
                 "empty-base64",
-                json!({"success": true, "data": {"png_base64": ""}}),
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"success": true, "data": {"png_base64": ""}})),
+                "empty screenshot payload",
             ),
             (
                 "non-png-bytes",
-                json!({"success": true, "data": {"png_base64": not_a_png_b64}}),
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"success": true, "data": {"png_base64": not_a_png_b64}})),
+                "non-PNG screenshot payload",
             ),
         ];
 
-        for (name, response_body) in cases {
+        for (name, response_template, expected_error_fragment) in cases {
             let server = MockServer::start().await;
             let tmp = tempfile::TempDir::new().unwrap();
             let ws = tmp.path().join("ws");
             tokio::fs::create_dir_all(&ws).await.unwrap();
 
+            // Reachability probe (GET) so the action POST is actually issued.
             Mock::given(method("GET"))
                 .and(path("/"))
                 .respond_with(ResponseTemplate::new(200))
                 .mount(&server)
                 .await;
+            // The action POST must happen exactly once. If a pre-dispatch
+            // failure short-circuits before the sidecar request, the POST
+            // never fires and the test would otherwise pass on an unwritten
+            // file alone — so the exact-once expectation makes that impossible.
             Mock::given(method("POST"))
                 .and(path("/"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+                .respond_with(response_template)
+                .expect(1)
                 .mount(&server)
                 .await;
 
@@ -4055,14 +4080,23 @@ mod tests {
 
             // A malformed/unsuccessful sidecar response must fail the tool:
             // either as an Ok(success=false) ToolResult or as an Err — never a
-            // success. And the destination must remain unwritten.
-            if let Ok(r) = result {
-                assert!(
-                    !r.success,
-                    "{name}: must fail closed, got success with output {:?}",
-                    r.output
-                );
-            }
+            // success. Each shape must surface its own expected error, and the
+            // destination must remain unwritten.
+            let error_text = match &result {
+                Ok(r) => {
+                    assert!(
+                        !r.success,
+                        "{name}: must fail closed, got success with output {:?}",
+                        r.output
+                    );
+                    r.error.clone().unwrap_or_default()
+                }
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                error_text.contains(expected_error_fragment),
+                "{name}: expected error containing {expected_error_fragment:?}, got: {error_text}"
+            );
             assert!(
                 !tokio::fs::try_exists(&target)
                     .await
