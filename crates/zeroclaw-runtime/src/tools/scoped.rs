@@ -785,6 +785,9 @@ mod tests {
             slash_options: Vec::new(),
             always: false,
             location: None,
+            provider: None,
+            triggers: Vec::new(),
+            blocked_tools_with_image: Vec::new(),
         };
         let security = Arc::new(SecurityPolicy {
             allowed_tools: Some(vec!["ops__chain".to_string()]),
@@ -998,6 +1001,9 @@ mod tests {
             slash_options: Vec::new(),
             always: false,
             location: None,
+            provider: None,
+            triggers: Vec::new(),
+            blocked_tools_with_image: Vec::new(),
         };
         let security = Arc::new(SecurityPolicy {
             allowed_tools: Some(vec!["ops__restricted".to_string()]),

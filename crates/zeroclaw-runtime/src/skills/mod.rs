@@ -576,36 +576,75 @@ fn dir_stem(path: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// Match a message against skill auto-activation rules and return the first
+/// What a turn presents to skill auto-activation.
+///
+/// The fields are separate because they differ in provenance, and activation
+/// applies *policy* — a provider switch that persists for the sender, and a
+/// tool restriction — so it must not be decided by text that neither the
+/// sender nor the channel authored.
+pub struct ActivationContext<'a> {
+    /// The skill a native channel command resolved to, when the channel
+    /// resolved one.
+    ///
+    /// Channels that register skills as first-class commands know which skill
+    /// was invoked before they render anything, and some render prose rather
+    /// than the `/name` form this matcher would recognize. Passing the
+    /// resolved identity keeps a registered command activating its skill —
+    /// with its provider and image-turn policy — regardless of how the channel
+    /// chose to phrase it.
+    pub invoked_skill: Option<&'a str>,
+    /// Text the sender wrote, captured at admission.
+    ///
+    /// Must be pre-enrichment. Media annotations, transcripts, fetched link
+    /// summaries and similar generated text are model-visible by design, but
+    /// they are not the sender speaking: matching a trigger inside them would
+    /// let a fetched page persist a provider switch for a sender who never
+    /// typed the phrase.
+    pub sender_text: &'a str,
+    /// Whether the turn carries an image, resolved from the typed attachment
+    /// envelope rather than from message text, so a literal `[IMAGE:` string
+    /// cannot impersonate an attachment.
+    ///
+    /// Deliberately permissive: any signal saying "image" counts, because the
+    /// restriction this drives only ever removes capability, and a false
+    /// negative would leave a real photo unrestricted.
+    pub has_image: bool,
+}
+
+/// Match a turn against skill auto-activation rules and return the first
 /// matching skill.
 ///
 /// Match priority per skill, scanning skills in order:
-/// 1. Slash command: `/skill_name` (hyphen/underscore-insensitive, optional
-///    `@botname` suffix).
-/// 2. Trigger phrases from SKILL.toml `triggers = [...]`, matched
+/// 1. A native command identity resolved by the channel
+///    ([`ActivationContext::invoked_skill`]), which activates unconditionally.
+/// 2. Slash command typed by the sender: `/skill_name`
+///    (hyphen/underscore-insensitive, optional `@botname` suffix).
+/// 3. Trigger phrases from SKILL.toml `triggers = [...]`, matched
 ///    case-insensitively on word boundaries so short triggers like "i had"
 ///    cannot fire inside unrelated words.
-/// 3. The `__image__` sentinel trigger, which matches any message that
-///    carries an image attachment (`has_image`).
-///
-/// Callers decide what counts as an image attachment; channel surfaces derive
-/// `has_image` from the typed attachment envelope
-/// (`MediaAttachment::kind() == MediaKind::Image`), never from message text,
-/// so literal `[IMAGE:` content cannot impersonate an attachment.
+/// 4. The `__image__` sentinel trigger, which matches any turn that carries an
+///    image attachment.
 ///
 /// Skills are scanned in the order the caller provides; discovery sorts
 /// directory entries lexically, so overlapping triggers resolve to the
 /// lexically-first skill deterministically.
 pub fn match_skill_activation<'a>(
     skills: &'a [Skill],
-    message: &str,
-    has_image: bool,
-) -> Option<&'a Skill> {
-    let trimmed = message.trim();
+    ctx: &ActivationContext<'_>,
+) -> Option<(&'a Skill, ActivationMatch)> {
+    let trimmed = ctx.sender_text.trim();
     let lower = trimmed.to_ascii_lowercase();
+    let invoked = ctx.invoked_skill.map(normalize_skill_name);
 
     for skill in skills {
-        // 1. Slash command match: /food_logger or /food-logger.
+        let norm_skill = normalize_skill_name(&skill.name);
+
+        // 1. The channel already resolved which skill this is.
+        if invoked.as_deref() == Some(norm_skill.as_str()) {
+            return Some((skill, ActivationMatch::NativeCommand));
+        }
+
+        // 2. Slash command match: /food_logger or /food-logger.
         if trimmed.starts_with('/') {
             let cmd = trimmed
                 .split_whitespace()
@@ -615,39 +654,69 @@ pub fn match_skill_activation<'a>(
                 .unwrap_or("")
                 .split('@')
                 .next()
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            let norm_cmd: String = cmd
-                .chars()
-                .map(|c| if c == '-' { '_' } else { c })
-                .collect();
-            let norm_skill: String = skill
-                .name
-                .to_ascii_lowercase()
-                .chars()
-                .map(|c| if c == '-' { '_' } else { c })
-                .collect();
-            if norm_cmd == norm_skill {
-                return Some(skill);
+                .unwrap_or("");
+            if normalize_skill_name(cmd) == norm_skill {
+                return Some((skill, ActivationMatch::SlashCommand));
             }
         }
 
-        // 2. Trigger phrases, word-boundary matched. 3. `__image__` sentinel.
+        // 3. Trigger phrases, word-boundary matched. 4. `__image__` sentinel.
         for trigger in &skill.triggers {
-            let matches = if trigger == "__image__" {
-                has_image
-            } else {
-                let pat = format!(r"\b{}\b", regex::escape(&trigger.to_ascii_lowercase()));
-                regex::Regex::new(&pat)
-                    .map(|re| re.is_match(&lower))
-                    .unwrap_or(false)
-            };
-            if matches {
-                return Some(skill);
+            if trigger == "__image__" {
+                if ctx.has_image {
+                    return Some((skill, ActivationMatch::ImageSentinel));
+                }
+                continue;
+            }
+            let pat = format!(r"\b{}\b", regex::escape(&trigger.to_ascii_lowercase()));
+            if regex::Regex::new(&pat)
+                .map(|re| re.is_match(&lower))
+                .unwrap_or(false)
+            {
+                return Some((skill, ActivationMatch::TriggerPhrase));
             }
         }
     }
     None
+}
+
+/// Which rule activated a skill.
+///
+/// Callers need this because the rules do not carry equal confidence, and
+/// activation drives two very different consequences. Removing a capability is
+/// safe to over-apply; persisting a provider switch for the sender is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivationMatch {
+    /// The channel resolved a registered command to this skill.
+    NativeCommand,
+    /// The sender typed `/skill-name`.
+    SlashCommand,
+    /// The sender's text contained one of the skill's trigger phrases.
+    TriggerPhrase,
+    /// The turn carried an image and the skill declares the `__image__`
+    /// sentinel. The weakest signal of the four: it is not an expression of
+    /// intent at all, and the image verdict behind it is deliberately
+    /// permissive.
+    ImageSentinel,
+}
+
+impl ActivationMatch {
+    /// Whether this match is a deliberate act by the sender or the channel,
+    /// as opposed to an inference from what the turn happened to carry.
+    ///
+    /// Only a deliberate match should persist state beyond the turn.
+    pub fn is_explicit_invocation(self) -> bool {
+        !matches!(self, ActivationMatch::ImageSentinel)
+    }
+}
+
+/// Fold a skill name or command token to the form both are compared in:
+/// lowercase, with hyphens and underscores treated as the same separator.
+fn normalize_skill_name(name: &str) -> String {
+    name.to_ascii_lowercase()
+        .chars()
+        .map(|c| if c == '-' { '_' } else { c })
+        .collect()
 }
 
 /// Load all skills from the workspace skills directory
@@ -3952,6 +4021,16 @@ prompts = ["from-skill-section"]
 mod skill_manifest_tests {
     use super::*;
 
+    /// A turn as a sender wrote it: no native command identity, so activation
+    /// must be earned by the text or the image.
+    fn sender_turn(sender_text: &str, has_image: bool) -> ActivationContext<'_> {
+        ActivationContext {
+            invoked_skill: None,
+            sender_text,
+            has_image,
+        }
+    }
+
     #[test]
     fn parses_valid_skill_manifest() {
         let toml_str = r#"
@@ -4019,6 +4098,7 @@ blocked_tools_with_image = ["sparky__sparky_manage_food"]
             prompts: vec![],
             slash_options: vec![],
             location: None,
+            always: false,
             provider: Some("openai-codex".to_string()),
             triggers: triggers.iter().map(|s| (*s).to_string()).collect(),
             blocked_tools_with_image: vec![],
@@ -4033,32 +4113,41 @@ blocked_tools_with_image = ["sparky__sparky_manage_food"]
             "/food-logger log this",
             "/food_logger@mybot hi",
         ] {
-            let hit = match_skill_activation(&skills, msg, false);
-            assert_eq!(hit.map(|s| s.name.as_str()), Some("food-logger"), "{msg}");
+            let hit = match_skill_activation(&skills, &sender_turn(msg, false));
+            assert_eq!(
+                hit.map(|(skill, _)| skill.name.as_str()),
+                Some("food-logger"),
+                "{msg}"
+            );
         }
-        assert!(match_skill_activation(&skills, "/other", false).is_none());
+        assert!(match_skill_activation(&skills, &sender_turn("/other", false)).is_none());
     }
 
     #[test]
     fn activation_matches_trigger_on_word_boundary_only() {
         let skills = vec![activation_skill("food-logger", &["i had"])];
-        assert!(match_skill_activation(&skills, "I had a burger", false).is_some());
+        assert!(match_skill_activation(&skills, &sender_turn("I had a burger", false)).is_some());
         // "i had" inside other words must not fire.
-        assert!(match_skill_activation(&skills, "trinidad semihadron", false).is_none());
+        assert!(
+            match_skill_activation(&skills, &sender_turn("trinidad semihadron", false)).is_none()
+        );
     }
 
     #[test]
     fn activation_matches_image_sentinel_only_with_image() {
         let skills = vec![activation_skill("food-logger", &["__image__"])];
-        assert!(match_skill_activation(&skills, "[IMAGE:data:...] what is this", true).is_some());
-        assert!(match_skill_activation(&skills, "what is this", false).is_none());
+        assert!(
+            match_skill_activation(&skills, &sender_turn("[IMAGE:data:...] what is this", true))
+                .is_some()
+        );
+        assert!(match_skill_activation(&skills, &sender_turn("what is this", false)).is_none());
     }
 
     #[test]
     fn activation_returns_none_without_triggers_or_slash() {
         let skills = vec![activation_skill("food-logger", &[])];
-        assert!(match_skill_activation(&skills, "hello there", false).is_none());
-        assert!(match_skill_activation(&skills, "hello there", true).is_none());
+        assert!(match_skill_activation(&skills, &sender_turn("hello there", false)).is_none());
+        assert!(match_skill_activation(&skills, &sender_turn("hello there", true)).is_none());
     }
 
     #[test]
@@ -4067,8 +4156,8 @@ blocked_tools_with_image = ["sparky__sparky_manage_food"]
             activation_skill("first", &["log food"]),
             activation_skill("second", &["log food"]),
         ];
-        let hit = match_skill_activation(&skills, "please log food now", false);
-        assert_eq!(hit.map(|s| s.name.as_str()), Some("first"));
+        let hit = match_skill_activation(&skills, &sender_turn("please log food now", false));
+        assert_eq!(hit.map(|(skill, _)| skill.name.as_str()), Some("first"));
     }
 
     /// Deterministic regression for the discovery ordering seam: a
@@ -4156,9 +4245,9 @@ triggers = ["__image__"]
             "loader must return skills in lexical directory order"
         );
 
-        let hit = match_skill_activation(&skills, "what is this", true);
+        let hit = match_skill_activation(&skills, &sender_turn("what is this", true));
         assert_eq!(
-            hit.map(|s| s.name.as_str()),
+            hit.map(|(skill, _)| skill.name.as_str()),
             Some("alpha-skill"),
             "overlapping __image__ trigger must resolve to the lexically-first skill"
         );

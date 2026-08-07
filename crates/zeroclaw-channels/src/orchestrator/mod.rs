@@ -4798,6 +4798,24 @@ async fn process_channel_message_body(
     // rather than `kind() == Image` so a sender-spoofed MIME or a stripped
     // extension cannot dodge image-turn restrictions.
     let msg_has_image_attachment = msg.attachments.iter().any(|a| a.looks_like_image());
+    // The stricter companion: an image the multimodal loader will actually
+    // accept. Decisions that GRANT rather than restrict — routing the sender
+    // to a vision provider for the rest of the session — resolve against this
+    // one, so a false positive in the permissive verdict above cannot outlive
+    // the turn that produced it.
+    let msg_has_loadable_image = msg
+        .attachments
+        .iter()
+        .any(|a| a.provider_loadable_image_mime().is_some());
+
+    // ── Sender-authored text, captured at admission ──
+    // Everything below this line may rewrite `msg.content`: media annotations,
+    // transcripts, and fetched link summaries are all model-visible by design.
+    // None of them are the sender speaking, so skill auto-activation — which
+    // persists a provider switch and removes a tool capability — matches
+    // against this snapshot rather than the enriched rendering. A fetched page
+    // containing a trigger phrase must not switch a sender's provider.
+    let sender_authored_content = msg.content.clone();
 
     // ── Media pipeline: enrich inbound message with media annotations ──
     if ctx.media_pipeline.enabled && !msg.attachments.is_empty() {
@@ -4895,10 +4913,14 @@ async fn process_channel_message_body(
         // Image presence comes from the typed attachment envelope captured
         // before media enrichment, never from message-text matching.
         let has_image = msg_has_image_attachment;
-        if let Some(skill) = zeroclaw_runtime::skills::match_skill_activation(
-            &activation_candidates,
-            &msg.content,
+        let activation_ctx = zeroclaw_runtime::skills::ActivationContext {
+            invoked_skill: msg.invoked_skill.as_deref(),
+            sender_text: &sender_authored_content,
             has_image,
+        };
+        if let Some((skill, activation_match)) = zeroclaw_runtime::skills::match_skill_activation(
+            &activation_candidates,
+            &activation_ctx,
         ) {
             // 1. Switch the session provider if the skill declares one.
             //    Mirrors the model-switch contract: resolve the manifest's
@@ -4907,7 +4929,22 @@ async fn process_channel_message_body(
             //    a successful build, so an unknown, ambiguous, or
             //    unbuildable manifest value leaves the sender's existing
             //    route untouched.
-            if let Some(ref provider_name) = skill.provider {
+            //
+            //    An `__image__` match is held to a stricter image verdict than
+            //    the restriction below. `looks_like_image()` accepts any single
+            //    signal, which is right for removing a capability — a spoofed
+            //    MIME or a stripped extension must not dodge the block — and
+            //    wrong for persisting a route, because that same false positive
+            //    would outlive the turn. A switch earned by an image therefore
+            //    requires an image the provider can actually load; a
+            //    mislabelled attachment still gets the restriction and nothing
+            //    else. Explicit invocations are unaffected: the sender or the
+            //    channel named the skill, so no inference is involved.
+            let image_routing_permitted =
+                activation_match.is_explicit_invocation() || msg_has_loadable_image;
+            if let Some(ref provider_name) = skill.provider
+                && image_routing_permitted
+            {
                 match resolve_provider_ref_for_runtime_switch(
                     runtime_defaults.config.as_ref(),
                     provider_name,
@@ -18804,6 +18841,7 @@ blocked_tools_with_image = ["test_blocked_tool"]
             file_name: "photo.jpg".to_string(),
             data: vec![0xFF, 0xD8, 0xFF, 0xE0],
             mime_type: Some("image/jpeg".to_string()),
+            marker_target: None,
         }
     }
 
@@ -18959,6 +18997,188 @@ blocked_tools_with_image = ["mock_price"]
         );
         assert_eq!(persisted.model, "default");
         assert_eq!(persisted.api_key, None);
+    }
+
+    /// Write a skill that activates on a natural-language phrase only, so the
+    /// two provenance regressions below can distinguish "the sender said it"
+    /// from "something else in the turn said it".
+    fn write_phrase_activation_skill(workspace: &Path, provider: &str) {
+        let dir = workspace.join("skills").join("food-logger");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.toml"),
+            format!(
+                r#"[skill]
+name = "food-logger"
+description = "auto-activation regression skill"
+provider = "{provider}"
+triggers = ["log food"]
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Activation policy must follow what the SENDER wrote, not what the turn
+    /// grew on the way in. Media annotations are model-visible by design, but
+    /// they are generated text: a filename carrying a trigger phrase must not
+    /// persist a provider switch for a sender who never typed it.
+    #[tokio::test]
+    async fn skill_activation_ignores_triggers_introduced_by_enrichment() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        write_phrase_activation_skill(workspace.path(), "openrouter");
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config
+            .providers
+            .models
+            .ensure("openrouter", "default")
+            .unwrap();
+
+        let switched: Arc<dyn ModelProvider> = Arc::new(ModelCaptureModelProvider::default());
+        let mut seed: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
+        seed.insert(provider_cache_key("openrouter.default", None, 0), switched);
+
+        let base =
+            skill_activation_test_ctx(Arc::new(config), workspace.path().to_path_buf(), seed);
+        // Enrichment on: the pipeline renders `[Image: <name> attached]`, and
+        // this attachment's name is the trigger phrase.
+        let ctx = Arc::new(ChannelRuntimeContext {
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig {
+                enabled: true,
+                describe_images: true,
+                ..Default::default()
+            },
+            ..(*base).clone()
+        });
+
+        let mut attachment = jpeg_attachment();
+        attachment.file_name = "log food.jpg".to_string();
+
+        process_channel_message(
+            ctx.clone(),
+            skill_activation_message("what is this?", vec![attachment]),
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert!(
+            ctx.route_overrides
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty(),
+            "a trigger phrase that only appears in generated annotation text \
+             must not activate the skill or persist a provider switch"
+        );
+    }
+
+    /// The opposite failure. A channel that registers skills as first-class
+    /// commands resolves the skill itself and may render the invocation as
+    /// prose that carries no trigger phrase and no leading slash. The resolved
+    /// identity travels on the message, so the skill's policy still applies.
+    #[tokio::test]
+    async fn skill_activation_honors_a_native_command_identity_without_a_trigger() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        write_phrase_activation_skill(workspace.path(), "openrouter");
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config
+            .providers
+            .models
+            .ensure("openrouter", "default")
+            .unwrap();
+
+        let switched: Arc<dyn ModelProvider> = Arc::new(ModelCaptureModelProvider::default());
+        let mut seed: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
+        seed.insert(provider_cache_key("openrouter.default", None, 0), switched);
+
+        let ctx = skill_activation_test_ctx(Arc::new(config), workspace.path().to_path_buf(), seed);
+
+        // Exactly what Discord enqueues for a registered skill command: prose
+        // naming the skill, which neither the slash rule nor the phrase
+        // triggers recognize.
+        let mut msg = skill_activation_message(
+            "Use the 'food-logger' skill for this request: two eggs",
+            vec![],
+        );
+        msg.invoked_skill = Some("food-logger".to_string());
+
+        process_channel_message(ctx.clone(), msg, CancellationToken::new()).await;
+
+        let persisted = ctx
+            .route_overrides
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get("telegram_chat-1_alice")
+            .cloned()
+            .expect(
+                "a registered native command must activate its skill and apply \
+                 the declared provider switch",
+            );
+        assert_eq!(persisted.model_provider, "openrouter.default");
+    }
+
+    /// The two halves of an `__image__` activation are not equally safe, and
+    /// this pins the split.
+    ///
+    /// `looks_like_image()` accepts any single signal — MIME, extension, or
+    /// magic bytes — so a spoofed type cannot dodge the tool restriction. That
+    /// is the right trade while the consequence is only removing capability.
+    /// Persisting a provider switch off the same verdict is not, and this
+    /// attachment is the case that separates them: every signal says image,
+    /// and the multimodal loader still cannot send it, so routing the sender
+    /// to a vision provider for the rest of the session would be a lasting
+    /// change bought with an image the provider will never see. The
+    /// restriction applies — it keys on the permissive verdict and is covered
+    /// by `skill_activation_image_turn_blocks_declared_tool_end_to_end` — while
+    /// the route does not move.
+    #[tokio::test]
+    async fn image_only_activation_does_not_persist_a_switch_for_an_unloadable_image() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        write_image_activation_skill(workspace.path(), "openrouter");
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config
+            .providers
+            .models
+            .ensure("openrouter", "default")
+            .unwrap();
+
+        let switched: Arc<dyn ModelProvider> = Arc::new(ModelCaptureModelProvider::default());
+        let mut seed: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
+        seed.insert(provider_cache_key("openrouter.default", None, 0), switched);
+
+        let ctx = skill_activation_test_ctx(Arc::new(config), workspace.path().to_path_buf(), seed);
+
+        let mislabelled = zeroclaw_api::media::MediaAttachment {
+            file_name: "holiday.heic".to_string(),
+            data: b"\x00\x00\x00\x18ftypheic".to_vec(),
+            mime_type: Some("image/heic".to_string()),
+            marker_target: None,
+        };
+        assert!(
+            mislabelled.looks_like_image(),
+            "the conservative verdict must still treat this as an image turn"
+        );
+        assert!(
+            mislabelled.provider_loadable_image_mime().is_none(),
+            "this test is only meaningful while the loader still rejects the format"
+        );
+
+        process_channel_message(
+            ctx.clone(),
+            skill_activation_message("here you go", vec![mislabelled]),
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert!(
+            ctx.route_overrides
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty(),
+            "an image-only activation must not persist a provider switch for the sender"
+        );
     }
 
     /// Build-before-persist, failure paths: unknown, ambiguous,
@@ -25460,6 +25680,7 @@ blocked_tools_with_image = ["mock_price"]
                 }],
                 subject: None,
                 internal_sop_event: None,
+                invoked_skill: None,
             },
             CancellationToken::new(),
         )
@@ -27307,6 +27528,7 @@ This is an example JSON object for profile settings."#;
                 }],
                 subject: None,
                 internal_sop_event: None,
+                invoked_skill: None,
             },
             CancellationToken::new(),
         )
