@@ -8799,6 +8799,20 @@ pub struct ImageGenConfig {
     #[serde(default = "default_image_gen_api_key_env")]
     #[credential_class = "legacy_env_path"]
     pub api_key_env: String,
+
+    /// Hosts (or host suffixes) that the image-download stage is allowed to
+    /// reach even when they are private/local. Mirrors the same field on
+    /// `[file_download]`, `[http_request]`, `[web_fetch]`, and the browser
+    /// tools. Use for internal CDNs that proxy fal.ai artifacts in air-gapped
+    /// deployments.
+    ///
+    /// Entries are normalized per use by the image tool via
+    /// `domain_guard::normalize_allowed_domains`: once at tool construction
+    /// and again from the live config on every request, so an operator edit
+    /// to this field takes effect without a restart. A bare `"*"`
+    /// blanket-tolerates any private/local host (use only for dev).
+    #[serde(default)]
+    pub allowed_private_hosts: Vec<String>,
 }
 
 fn default_image_gen_model() -> String {
@@ -8815,6 +8829,7 @@ impl Default for ImageGenConfig {
             enabled: false,
             default_model: default_image_gen_model(),
             api_key_env: default_image_gen_api_key_env(),
+            allowed_private_hosts: Vec::new(),
         }
     }
 }

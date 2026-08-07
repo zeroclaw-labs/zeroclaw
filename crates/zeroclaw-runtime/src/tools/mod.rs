@@ -1153,15 +1153,38 @@ pub fn all_tools_with_runtime(
         )));
     }
 
-    // Standalone image generation tool (config-gated)
+    // Standalone image generation tool (config-gated). The allowlist is
+    // resolved from canonical config at use time (live handle when present,
+    // snapshot fallback otherwise) — the same seam `AgentPeerGroupResolver`
+    // uses below — so the tool never retains a second policy copy.
     if root_config.image_gen.enabled {
-        tool_arcs.push(Arc::new(ImageGenTool::new_with_persistence(
+        let allowlist_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
+            if let Some(live) = live_config.clone() {
+                Arc::new(move || live.read().image_gen.allowed_private_hosts.clone())
+            } else {
+                let snapshot = root_config.image_gen.allowed_private_hosts.clone();
+                Arc::new(move || snapshot.clone())
+            };
+        match ImageGenTool::new_with_config_resolver(
             security.clone(),
             workspace_dir.to_path_buf(),
             root_config.image_gen.default_model.clone(),
             root_config.image_gen.api_key_env.clone(),
             persistent_writes,
-        )));
+            move || allowlist_resolver(),
+        ) {
+            Ok(tool) => tool_arcs.push(Arc::new(tool)),
+            Err(err) => ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "tool": "image_gen",
+                        "err": err.to_string(),
+                    })),
+                "image_gen: invalid allowed_private_hosts in config; tool disabled"
+            ),
+        }
     }
 
     // File upload tool — enabled iff [file_upload].url is set
@@ -1934,6 +1957,106 @@ mod tests {
         assert!(
             names.contains(&"sop_workshop"),
             "sop_workshop must be registered when procedural memory is enabled"
+        );
+    }
+
+    #[test]
+    fn image_gen_allowlist_registration_follows_live_config_handle() {
+        // The `image_gen` registration in `all_tools_with_runtime` resolves
+        // `allowed_private_hosts` from the live config handle when one is
+        // present (mirroring `AgentPeerGroupResolver` at the same call site),
+        // with a snapshot of `root_config` as fallback. This test pins that
+        // production wiring: `new_with_config_resolver` validates the
+        // allowlist at construction, so a malformed live entry makes the
+        // registration fail and the tool is dropped. Which allowlist source is
+        // live is therefore observable through whether the tool registers —
+        // no downcast of the registered tool is needed.
+        //
+        // If the `live_config.clone()` forwarding line were reverted to the
+        // snapshot fallback, `root_config`'s legal entry would always allow
+        // registration and the malformed-live-handle case would wrongly
+        // register — so this test fails under that regression.
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let browser = BrowserConfig {
+            enabled: false,
+            allowed_domains: vec![],
+            session_name: None,
+            ..BrowserConfig::default()
+        };
+        let http = zeroclaw_config::schema::HttpRequestConfig::default();
+
+        // `root_config` carries a legal allowlist, so the snapshot fallback
+        // would always register the tool regardless of the live handle.
+        let mut root = test_config(&tmp);
+        root.image_gen = zeroclaw_config::schema::ImageGenConfig {
+            enabled: true,
+            default_model: "fal-ai/flux/schnell".into(),
+            api_key_env: "FAL_API_KEY".into(),
+            allowed_private_hosts: vec!["127.0.0.1".into()],
+        };
+
+        let agents = HashMap::new();
+        let register =
+            |live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>| {
+                let arcs = all_tools_with_runtime(
+                    Arc::new(Config::default()),
+                    &security,
+                    &zeroclaw_config::schema::RiskProfileConfig::default(),
+                    "test-agent",
+                    Arc::new(NativeRuntime::new()),
+                    mem.clone(),
+                    None,
+                    None,
+                    &browser,
+                    &http,
+                    &zeroclaw_config::schema::WebFetchConfig::default(),
+                    tmp.path(),
+                    &agents,
+                    None,
+                    &root,
+                    None,
+                    false,
+                    None,
+                    None,
+                    None,
+                    live_config,
+                )
+                .unfiltered_tool_arcs;
+                arcs.iter().any(|t| t.name() == "image_gen")
+            };
+
+        // Legal live allowlist → the tool registers.
+        let mut legal = root.clone();
+        legal.image_gen.allowed_private_hosts = vec!["127.0.0.1".into()];
+        assert!(
+            register(Some(Arc::new(parking_lot::RwLock::new(legal)))),
+            "image_gen must register when the live allowlist is legal"
+        );
+
+        // Malformed live allowlist → construction fails and the tool is
+        // dropped. With the live handle threaded through, the invalid entry
+        // is read at construction and registration is refused; a reverted
+        // wiring would read root's legal entry and wrongly register.
+        let mut invalid = root.clone();
+        invalid.image_gen.allowed_private_hosts = vec!["bad entry with space".into()];
+        assert!(
+            !register(Some(Arc::new(parking_lot::RwLock::new(invalid)))),
+            "image_gen must be disabled when the live allowlist is malformed — \
+             this pins that the live config handle reaches the resolver"
+        );
+
+        // No live handle → snapshot fallback registers (root's entry is legal).
+        assert!(
+            register(None),
+            "image_gen must register via the snapshot fallback without a live handle"
         );
     }
 
