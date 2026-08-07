@@ -1,7 +1,8 @@
 use super::ModelProvider;
 use super::dispatch::ProviderDispatch;
 use super::traits::{
-    ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamEvent, StreamOptions, StreamResult,
+    ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamEvent, StreamOptions,
+    StreamProviderAttempt, StreamResult,
 };
 use async_trait::async_trait;
 use futures_util::stream::BoxStream;
@@ -247,6 +248,20 @@ impl ModelProvider for RouterModelProvider {
             .await
     }
 
+    async fn chat_after_stream_failure(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        failed_candidate: Option<&StreamProviderAttempt>,
+    ) -> anyhow::Result<ChatResponse> {
+        let (provider_idx, resolved_model) = self.resolve(model);
+        let (_, model_provider) = &self.model_providers[provider_idx];
+        ProviderDispatch::from_ref(&**model_provider)
+            .chat_after_stream_failure(request, &resolved_model, temperature, failed_candidate)
+            .await
+    }
+
     async fn chat_with_tools(
         &self,
         messages: &[ChatMessage],
@@ -405,6 +420,71 @@ mod tests {
         response: &'static str,
         last_model: parking_lot::Mutex<String>,
         vision: bool,
+    }
+
+    struct TerminalStreamModelProvider {
+        stream_calls: Arc<AtomicUsize>,
+        chat_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for TerminalStreamModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.chat_calls.fetch_add(1, Ordering::SeqCst);
+            Ok("primary replay".to_string())
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            // Test-only stand-in for an edge provider such as Anthropic: the
+            // policy is published while terminal-aware dispatch constructs the
+            // stream, then consumed when its terminal error is polled.
+            let terminal_policy_slot = crate::terminal::capture_terminal_policy_slot();
+            crate::terminal::publish_terminal_policy(
+                &terminal_policy_slot,
+                zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit,
+                crate::terminal::TerminalCompletionPolicy::new(
+                    crate::terminal::TerminalRecoveryDisposition::NextCandidate,
+                    crate::terminal::TerminalUsageChargeability::Billable,
+                ),
+            );
+            futures_util::stream::iter(vec![Err(
+                zeroclaw_api::model_provider::StreamError::TerminalCompletion(
+                    zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit.into(),
+                ),
+            )])
+            .boxed()
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for TerminalStreamModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "TerminalStreamModelProvider"
+        }
     }
 
     impl MockModelProvider {
@@ -678,6 +758,185 @@ mod tests {
         assert_eq!(mocks[1].call_count(), 1);
         assert_eq!(mocks[1].last_model(), "claude-opus");
         assert_eq!(mocks[0].call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn router_preserves_failed_reliable_candidate_for_stream_fallback() {
+        let primary_stream_calls = Arc::new(AtomicUsize::new(0));
+        let primary_chat_calls = Arc::new(AtomicUsize::new(0));
+        let fallback = Arc::new(MockModelProvider::new("fallback response"));
+        let reliable = crate::reliable::ReliableModelProvider::new(
+            "reliable",
+            vec![
+                (
+                    "primary".to_string(),
+                    Box::new(TerminalStreamModelProvider {
+                        stream_calls: Arc::clone(&primary_stream_calls),
+                        chat_calls: Arc::clone(&primary_chat_calls),
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "fallback".to_string(),
+                    Box::new(Arc::clone(&fallback)) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            1,
+        );
+        let router = RouterModelProvider::new(
+            "router",
+            vec![(
+                "reliable".to_string(),
+                Box::new(reliable) as Box<dyn ModelProvider>,
+            )],
+            vec![(
+                "terminal".to_string(),
+                Route {
+                    provider_name: "reliable".to_string(),
+                    model: "served-model".to_string(),
+                },
+            )],
+            "default-model".to_string(),
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let mut stream = router.stream_chat(
+            ChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: None,
+            },
+            "hint:terminal",
+            Some(0.0),
+            StreamOptions::new(true),
+        );
+        let error = stream
+            .next()
+            .await
+            .expect("terminal stream emits an error")
+            .expect_err("terminal stream must not complete successfully");
+        let failed_candidate = error
+            .failed_candidate()
+            .cloned()
+            .expect("Reliable identifies the failed stream candidate");
+
+        let response = router
+            .chat_after_stream_failure(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "hint:terminal",
+                Some(0.0),
+                Some(&failed_candidate),
+            )
+            .await
+            .expect("Router forwards Reliable fallback context");
+
+        assert_eq!(response.text.as_deref(), Some("fallback response"));
+        assert_eq!(primary_stream_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            primary_chat_calls.load(Ordering::SeqCst),
+            0,
+            "Router must not restart the failed Reliable candidate"
+        );
+        assert_eq!(fallback.call_count(), 1);
+        assert_eq!(fallback.last_model(), "served-model");
+    }
+
+    #[tokio::test]
+    async fn terminal_aware_router_stream_preserves_reliable_candidate_for_fallback() {
+        let skipped = Arc::new(MockModelProvider::new("skipped response"));
+        let primary_stream_calls = Arc::new(AtomicUsize::new(0));
+        let primary_chat_calls = Arc::new(AtomicUsize::new(0));
+        let fallback = Arc::new(MockModelProvider::new("fallback response"));
+        let reliable = crate::reliable::ReliableModelProvider::new(
+            "reliable",
+            vec![
+                (
+                    // Production pinned entries may share a provider-family
+                    // display name. The first is intentionally not streamable
+                    // so the terminal stream comes from the later duplicate.
+                    "anthropic".to_string(),
+                    Box::new(Arc::clone(&skipped)) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "anthropic".to_string(),
+                    Box::new(TerminalStreamModelProvider {
+                        stream_calls: Arc::clone(&primary_stream_calls),
+                        chat_calls: Arc::clone(&primary_chat_calls),
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "anthropic".to_string(),
+                    Box::new(Arc::clone(&fallback)) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            1,
+        );
+        let router = RouterModelProvider::new(
+            "router",
+            vec![(
+                "reliable".to_string(),
+                Box::new(reliable) as Box<dyn ModelProvider>,
+            )],
+            vec![(
+                "terminal".to_string(),
+                Route {
+                    provider_name: "reliable".to_string(),
+                    model: "served-model".to_string(),
+                },
+            )],
+            "default-model".to_string(),
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ChatRequest {
+            messages: &messages,
+            tools: None,
+            thinking: None,
+        };
+        let dispatcher = ProviderDispatch::from_ref(&router);
+        let mut stream = dispatcher.stream_chat_terminal_aware(
+            request,
+            "hint:terminal",
+            Some(0.0),
+            StreamOptions::new(true),
+        );
+        let error = stream
+            .next()
+            .await
+            .expect("terminal stream emits an error")
+            .expect_err("terminal stream must not complete successfully");
+        let terminal = crate::terminal_completion_context(&error)
+            .expect("terminal-aware dispatch preserves the provider outcome");
+        let failed_candidate = terminal
+            .failed_candidate()
+            .expect("Reliable candidate identity survives Router and dispatch");
+
+        let response = dispatcher
+            .chat_after_stream_failure(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "hint:terminal",
+                Some(0.0),
+                Some(failed_candidate),
+            )
+            .await
+            .expect("fallback after the exact candidate succeeds");
+
+        assert_eq!(response.text.as_deref(), Some("fallback response"));
+        assert_eq!(
+            skipped.call_count(),
+            0,
+            "fallback must not restart at an earlier duplicate display name"
+        );
+        assert_eq!(primary_stream_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(primary_chat_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fallback.call_count(), 1);
     }
 
     #[tokio::test]

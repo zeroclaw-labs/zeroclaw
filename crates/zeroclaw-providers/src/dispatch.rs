@@ -6,8 +6,19 @@ use std::sync::Arc;
 use futures_util::stream::{self, StreamExt as _};
 use zeroclaw_api::model_provider::{
     ChatMessage, ChatRequest, ChatResponse, ModelInfo, ModelProvider, StreamEvent, StreamOptions,
-    StreamResult,
+    StreamProviderAttempt, StreamResult,
 };
+
+/// A successful response plus billed usage from Reliable attempts that were
+/// rejected before that response was accepted.
+///
+/// `response.usage` always describes the accepted attempt. The sidecar is for
+/// cost accounting only; it must not be used as context-window usage or
+/// successful-response telemetry.
+pub struct AccountedChatResponse {
+    pub response: ChatResponse,
+    pub rejected_attempt_usage: Option<crate::traits::TokenUsage>,
+}
 
 /// Wraps a model provider so every call opens the correct
 /// `attribution_span!` automatically. See the module docs for the
@@ -57,6 +68,68 @@ impl ProviderDispatch {
         .await
     }
 
+    /// Like [`Self::chat`], while retaining rejected Reliable-attempt usage in
+    /// a separate accounting sidecar.
+    pub async fn chat_accounted(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<AccountedChatResponse> {
+        let (response, rejected_attempt_usage) =
+            crate::reliable::scope_reliable_rejected_usage(self.chat(request, model, temperature))
+                .await;
+        response.map(|response| AccountedChatResponse {
+            response,
+            rejected_attempt_usage,
+        })
+    }
+
+    /// Wrap the inner provider's candidate-aware stream fallback chat call.
+    pub async fn chat_after_stream_failure(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        failed_candidate: Option<&StreamProviderAttempt>,
+    ) -> anyhow::Result<ChatResponse> {
+        use zeroclaw_log::Instrument;
+        let span = zeroclaw_log::attribution_span!(&*self.inner);
+        async move {
+            zeroclaw_log::scope!(
+                model: model,
+                => self.inner.chat_after_stream_failure(
+                    request,
+                    model,
+                    temperature,
+                    failed_candidate,
+                )
+            )
+            .await
+        }
+        .instrument(span)
+        .await
+    }
+
+    /// Like [`Self::chat_after_stream_failure`], while retaining rejected
+    /// Reliable-attempt usage in a separate accounting sidecar.
+    pub async fn chat_after_stream_failure_accounted(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        failed_candidate: Option<&StreamProviderAttempt>,
+    ) -> anyhow::Result<AccountedChatResponse> {
+        let (response, rejected_attempt_usage) = crate::reliable::scope_reliable_rejected_usage(
+            self.chat_after_stream_failure(request, model, temperature, failed_candidate),
+        )
+        .await;
+        response.map(|response| AccountedChatResponse {
+            response,
+            rejected_attempt_usage,
+        })
+    }
+
     pub fn stream_chat(
         &self,
         request: ChatRequest<'_>,
@@ -81,6 +154,39 @@ impl ProviderDispatch {
         stream::poll_fn(move |cx| {
             let _enter = model_scope.enter();
             inner_stream.as_mut().poll_next(cx)
+        })
+        .boxed()
+    }
+
+    /// Stream chat while preserving provider-owned terminal policy internally.
+    pub fn stream_chat_terminal_aware(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, anyhow::Result<StreamEvent>> {
+        let (slot, scope) = crate::terminal::enter_terminal_policy_scope();
+        let attribution = zeroclaw_log::attribution_span!(&*self.inner);
+        let _attribution_enter = attribution.enter();
+        let model_scope = zeroclaw_log::info_span!(
+            target: "zeroclaw_log_internal_scope",
+            "zeroclaw_scope",
+            model = %model,
+        );
+        let inner_stream = self.inner.stream_chat(request, model, temperature, options);
+        drop(scope);
+        drop(_attribution_enter);
+        let mut inner_stream = inner_stream;
+        stream::poll_fn(move |cx| {
+            let _enter = model_scope.enter();
+            inner_stream.as_mut().poll_next(cx).map(|item| {
+                item.map(|result| {
+                    result.map_err(|error| {
+                        crate::terminal::contextualize_terminal_stream_error(&slot, error)
+                    })
+                })
+            })
         })
         .boxed()
     }
@@ -166,6 +272,25 @@ impl ProviderDispatch {
         .await
     }
 
+    /// Like [`Self::chat_with_tools`], while retaining rejected
+    /// Reliable-attempt usage in a separate accounting sidecar.
+    pub async fn chat_with_tools_accounted(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[serde_json::Value],
+        model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<AccountedChatResponse> {
+        let (response, rejected_attempt_usage) = crate::reliable::scope_reliable_rejected_usage(
+            self.chat_with_tools(messages, tools, model, temperature),
+        )
+        .await;
+        response.map(|response| AccountedChatResponse {
+            response,
+            rejected_attempt_usage,
+        })
+    }
+
     pub async fn list_models(&self) -> anyhow::Result<Vec<String>> {
         use zeroclaw_log::Instrument;
         let span = zeroclaw_log::attribution_span!(&*self.inner);
@@ -214,6 +339,68 @@ impl<'a> ProviderDispatchRef<'a> {
         .await
     }
 
+    /// Like [`Self::chat`], while retaining rejected Reliable-attempt usage in
+    /// a separate accounting sidecar.
+    pub async fn chat_accounted(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<AccountedChatResponse> {
+        let (response, rejected_attempt_usage) =
+            crate::reliable::scope_reliable_rejected_usage(self.chat(request, model, temperature))
+                .await;
+        response.map(|response| AccountedChatResponse {
+            response,
+            rejected_attempt_usage,
+        })
+    }
+
+    /// Wrap the inner provider's candidate-aware stream fallback chat call.
+    pub async fn chat_after_stream_failure(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        failed_candidate: Option<&StreamProviderAttempt>,
+    ) -> anyhow::Result<ChatResponse> {
+        use zeroclaw_log::Instrument;
+        let span = zeroclaw_log::attribution_span!(self.inner);
+        async move {
+            zeroclaw_log::scope!(
+                model: model,
+                => self.inner.chat_after_stream_failure(
+                    request,
+                    model,
+                    temperature,
+                    failed_candidate,
+                )
+            )
+            .await
+        }
+        .instrument(span)
+        .await
+    }
+
+    /// Like [`Self::chat_after_stream_failure`], while retaining rejected
+    /// Reliable-attempt usage in a separate accounting sidecar.
+    pub async fn chat_after_stream_failure_accounted(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        failed_candidate: Option<&StreamProviderAttempt>,
+    ) -> anyhow::Result<AccountedChatResponse> {
+        let (response, rejected_attempt_usage) = crate::reliable::scope_reliable_rejected_usage(
+            self.chat_after_stream_failure(request, model, temperature, failed_candidate),
+        )
+        .await;
+        response.map(|response| AccountedChatResponse {
+            response,
+            rejected_attempt_usage,
+        })
+    }
+
     pub fn stream_chat(
         &self,
         request: ChatRequest<'_>,
@@ -234,6 +421,39 @@ impl<'a> ProviderDispatchRef<'a> {
         stream::poll_fn(move |cx| {
             let _enter = model_scope.enter();
             inner_stream.as_mut().poll_next(cx)
+        })
+        .boxed()
+    }
+
+    /// Stream chat while preserving provider-owned terminal policy internally.
+    pub fn stream_chat_terminal_aware(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, anyhow::Result<StreamEvent>> {
+        let (slot, scope) = crate::terminal::enter_terminal_policy_scope();
+        let attribution = zeroclaw_log::attribution_span!(self.inner);
+        let _attribution_enter = attribution.enter();
+        let model_scope = zeroclaw_log::info_span!(
+            target: "zeroclaw_log_internal_scope",
+            "zeroclaw_scope",
+            model = %model,
+        );
+        let inner_stream = self.inner.stream_chat(request, model, temperature, options);
+        drop(scope);
+        drop(_attribution_enter);
+        let mut inner_stream = inner_stream;
+        stream::poll_fn(move |cx| {
+            let _enter = model_scope.enter();
+            inner_stream.as_mut().poll_next(cx).map(|item| {
+                item.map(|result| {
+                    result.map_err(|error| {
+                        crate::terminal::contextualize_terminal_stream_error(&slot, error)
+                    })
+                })
+            })
         })
         .boxed()
     }
@@ -321,6 +541,25 @@ impl<'a> ProviderDispatchRef<'a> {
         }
         .instrument(span)
         .await
+    }
+
+    /// Like [`Self::chat_with_tools`], while retaining rejected
+    /// Reliable-attempt usage in a separate accounting sidecar.
+    pub async fn chat_with_tools_accounted(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[serde_json::Value],
+        model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<AccountedChatResponse> {
+        let (response, rejected_attempt_usage) = crate::reliable::scope_reliable_rejected_usage(
+            self.chat_with_tools(messages, tools, model, temperature),
+        )
+        .await;
+        response.map(|response| AccountedChatResponse {
+            response,
+            rejected_attempt_usage,
+        })
     }
 
     /// Wrap the inner provider's `list_models`. No `model` parameter,

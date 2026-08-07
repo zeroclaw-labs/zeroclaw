@@ -1074,6 +1074,20 @@ cli-daemon-started-pairing = Pairing:    enabled (see gateway output above for c
 cli-daemon-started-stop = Ctrl+C or SIGTERM to stop
 
 # ── Context window (doctor update-context-windows, agent interactive) ──
+cli-delegate-error-invalid-semantic-completion = Agent '{$agent_name}' failed: model provider returned an invalid semantic completion.
+cli-agent-error-invalid-semantic-completion = The model provider returned an invalid semantic completion.
+cli-delegate-error-incomplete-after-provider-tools = Agent '{$agent_name}' failed: the model provider ended after provider-executed tools without a final response.
+cli-agent-error-incomplete-after-provider-tools = The model provider ended after provider-executed tools without a final response.
+cli-delegate-error-output-token-limit = Agent '{$agent_name}' failed: the provider reached its output token limit before completing the response.
+cli-delegate-error-context-window = Agent '{$agent_name}' failed: the provider reached its context window before completing the response.
+cli-delegate-error-paused-turn = Agent '{$agent_name}' failed: the provider paused the turn before completing the response.
+cli-delegate-error-refusal = Agent '{$agent_name}' failed: the provider refused before completing the response.
+cli-agent-error-output-token-limit = The provider reached its output token limit before completing the response.
+cli-agent-error-context-window = The provider reached its context window before completing the response.
+cli-agent-error-paused-turn = The provider paused the turn before completing the response.
+cli-agent-error-refusal = The provider refused before completing the response.
+cli-delegate-error-invalid-terminal-reason = Agent '{$agent_name}' failed: the provider ended with an invalid terminal response state.
+cli-agent-error-invalid-terminal-reason = The provider ended with an invalid terminal response state.
 cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%
 cli-agent-context-bar-unknown = ctx: unknown / {$max}
 cli-doctor-ctxwin-already-set = {$provider_ref}: already has context_window = {$ctx}

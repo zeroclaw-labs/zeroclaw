@@ -35,14 +35,12 @@ impl ChatMessage {
             content: content.into(),
         }
     }
-
     pub fn user(content: impl Into<String>) -> Self {
         Self {
             role: "user".into(),
             content: content.into(),
         }
     }
-
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
             role: "assistant".into(),
@@ -166,6 +164,40 @@ impl ChatResponse {
     pub fn text_or_empty(&self) -> &str {
         self.text.as_deref().unwrap_or("")
     }
+
+    /// True when this response cannot make progress or complete a turn.
+    ///
+    /// Reasoning content is intentionally excluded: it may need to be
+    /// round-tripped to a provider, but it is not a user-visible final answer.
+    /// A response containing one or more tool calls remains valid even when
+    /// its text is empty.
+    pub fn is_semantically_empty_terminal(&self) -> bool {
+        strip_think_tags(self.text_or_empty()).is_empty() && self.tool_calls.is_empty()
+    }
+}
+
+/// Remove inline `<think>...</think>` reasoning before terminal-response
+/// classification or user-visible parsing.
+///
+/// An unclosed opening tag suppresses the remainder so partial reasoning never
+/// becomes final output.
+pub fn strip_think_tags(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut remaining = text;
+    loop {
+        if let Some(start) = remaining.find("<think>") {
+            result.push_str(&remaining[..start]);
+            if let Some(end) = remaining[start..].find("</think>") {
+                remaining = &remaining[start + end + "</think>".len()..];
+            } else {
+                break;
+            }
+        } else {
+            result.push_str(remaining);
+            break;
+        }
+    }
+    result.trim().to_string()
 }
 
 /// Request payload for model_provider chat calls.
@@ -326,6 +358,100 @@ impl StreamOptions {
 /// Result type for streaming operations.
 pub type StreamResult<T> = std::result::Result<T, StreamError>;
 
+/// Reason a provider completed a response that must not be treated as a final answer.
+///
+/// These are successful provider protocol terminal states, not transport failures. They
+/// intentionally stay distinct from [`StreamError::Http`] so callers can avoid retrying
+/// a request that has already exhausted its output budget or reached a policy terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum TerminalCompletionError {
+    /// The provider exhausted the configured output-token budget.
+    #[error("response incomplete: output token limit reached")]
+    OutputTokenLimit,
+    /// The provider stopped because its context window was exhausted while generating.
+    #[error("response incomplete: model context window reached")]
+    ContextWindow,
+    /// The provider paused a long-running turn that requires an explicit continuation.
+    #[error("response incomplete: provider paused the turn")]
+    PausedTurn,
+    /// The provider stopped generation with a refusal rather than a usable completion.
+    #[error("response incomplete: provider refused the request")]
+    Refusal,
+    /// The provider ended a response without a recognized terminal reason.
+    #[error("response incomplete: provider returned an invalid terminal reason")]
+    InvalidTerminalReason,
+}
+
+/// A terminal provider outcome together with the usage billed before that
+/// outcome was rejected.
+///
+/// [`TerminalCompletionError`] classifies why the response is incomplete;
+/// this type preserves the provider-reported usage across the error boundary
+/// so runtime accounting does not lose a billed attempt.
+#[derive(Debug, Clone)]
+pub struct TerminalCompletionFailure {
+    pub reason: TerminalCompletionError,
+    pub usage: Option<TokenUsage>,
+}
+
+impl TerminalCompletionFailure {
+    pub fn new(reason: TerminalCompletionError, usage: Option<TokenUsage>) -> Self {
+        Self { reason, usage }
+    }
+}
+
+impl From<TerminalCompletionError> for TerminalCompletionFailure {
+    fn from(reason: TerminalCompletionError) -> Self {
+        Self::new(reason, None)
+    }
+}
+
+impl std::fmt::Display for TerminalCompletionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.reason.fmt(f)
+    }
+}
+
+impl std::error::Error for TerminalCompletionFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.reason)
+    }
+}
+
+/// Identifies the candidate that a composite provider selected for one stream.
+///
+/// The value is transient failure context: it is created by the composite
+/// provider when it wraps an inner stream error and lets that provider resume
+/// from the next candidate without persisting route state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamProviderAttempt {
+    pub provider_name: String,
+    pub model: String,
+    /// Exact candidate position within the composite provider that emitted this
+    /// transient failure context. Display names are diagnostic and need not be
+    /// unique, so the owning composite uses this position for continuation.
+    pub candidate_index: usize,
+}
+
+/// Wraps an inner stream error with the composite candidate that produced it.
+#[derive(Debug)]
+pub struct StreamCandidateFailure {
+    pub attempt: StreamProviderAttempt,
+    pub source: Box<StreamError>,
+}
+
+impl std::fmt::Display for StreamCandidateFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(f)
+    }
+}
+
+impl std::error::Error for StreamCandidateFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
 /// Errors that can occur during streaming.
 #[derive(Debug, thiserror::Error)]
 pub enum StreamError {
@@ -341,8 +467,66 @@ pub enum StreamError {
     #[error("ModelProvider error: {0}")]
     ModelProvider(String),
 
+    /// The provider reached a terminal state that does not yield a complete answer.
+    #[error(transparent)]
+    TerminalCompletion(#[from] TerminalCompletionFailure),
+
+    /// A composite provider records which candidate produced the inner error.
+    #[error(transparent)]
+    CandidateFailure(#[from] StreamCandidateFailure),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+/// Returns the structured terminal-completion failure carried by an error.
+///
+/// Both streaming and non-streaming provider paths use this helper so retry,
+/// fallback, and delivery layers do not infer terminal state from error text.
+pub fn terminal_completion_failure(error: &anyhow::Error) -> Option<&TerminalCompletionFailure> {
+    error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<TerminalCompletionFailure>()
+            .or_else(|| {
+                cause
+                    .downcast_ref::<StreamError>()?
+                    .terminal_completion_failure()
+            })
+    })
+}
+
+pub fn terminal_completion_error(error: &anyhow::Error) -> Option<TerminalCompletionError> {
+    terminal_completion_failure(error)
+        .map(|failure| failure.reason)
+        .or_else(|| error.downcast_ref::<TerminalCompletionError>().copied())
+}
+
+impl StreamError {
+    /// Returns the terminal-delivery failure nested in this stream error, if any.
+    pub fn terminal_completion_failure(&self) -> Option<&TerminalCompletionFailure> {
+        match self {
+            Self::TerminalCompletion(failure) => Some(failure),
+            Self::CandidateFailure(candidate) => candidate.source.terminal_completion_failure(),
+            Self::Http(_)
+            | Self::Json(_)
+            | Self::InvalidSse(_)
+            | Self::ModelProvider(_)
+            | Self::Io(_) => None,
+        }
+    }
+
+    /// Returns the composite candidate that produced this stream error, if any.
+    pub fn failed_candidate(&self) -> Option<&StreamProviderAttempt> {
+        match self {
+            Self::CandidateFailure(candidate) => Some(&candidate.attempt),
+            Self::Http(_)
+            | Self::Json(_)
+            | Self::InvalidSse(_)
+            | Self::ModelProvider(_)
+            | Self::TerminalCompletion(_)
+            | Self::Io(_) => None,
+        }
+    }
 }
 
 /// Structured error returned when a requested capability is not supported.
@@ -616,6 +800,21 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
         })
     }
 
+    /// Continue a no-output streaming failure with a non-streaming request.
+    ///
+    /// Only composite providers that can authenticate `failed_candidate` may
+    /// continue. The default fails closed so a terminal response is never
+    /// replayed against the same provider.
+    async fn chat_after_stream_failure(
+        &self,
+        _request: ChatRequest<'_>,
+        _model: &str,
+        _temperature: Option<f64>,
+        _failed_candidate: Option<&StreamProviderAttempt>,
+    ) -> anyhow::Result<ChatResponse> {
+        anyhow::bail!("cannot continue terminal stream failure without an exact candidate chain")
+    }
+
     /// Whether model_provider supports native tool calls over API.
     fn supports_native_tools(&self) -> bool {
         self.capabilities().native_tool_calling
@@ -785,6 +984,18 @@ impl<T: ModelProvider + ?Sized> ModelProvider for Arc<T> {
         self.as_ref().chat(request, model, temperature).await
     }
 
+    async fn chat_after_stream_failure(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        failed_candidate: Option<&StreamProviderAttempt>,
+    ) -> anyhow::Result<ChatResponse> {
+        self.as_ref()
+            .chat_after_stream_failure(request, model, temperature, failed_candidate)
+            .await
+    }
+
     async fn warmup(&self) -> anyhow::Result<()> {
         self.as_ref().warmup().await
     }
@@ -875,7 +1086,73 @@ pub fn build_tool_instructions_text(tools: &[ToolSpec]) -> String {
 
 #[cfg(test)]
 mod turn_order_tests {
-    use super::ChatMessage;
+    use super::{
+        ChatMessage, ChatResponse, TerminalCompletionError, TerminalCompletionFailure, ToolCall,
+    };
+
+    #[test]
+    fn terminal_completion_failure_retains_two_field_literal_contract() {
+        let TerminalCompletionFailure { reason, usage } = TerminalCompletionFailure {
+            reason: TerminalCompletionError::OutputTokenLimit,
+            usage: None,
+        };
+
+        assert_eq!(reason, TerminalCompletionError::OutputTokenLimit);
+        assert!(usage.is_none());
+    }
+
+    #[test]
+    fn semantic_empty_terminal_ignores_reasoning_content() {
+        let response = ChatResponse {
+            text: Some("  \n".to_string()),
+            tool_calls: Vec::new(),
+            usage: None,
+            reasoning_content: Some("internal reasoning".to_string()),
+        };
+
+        assert!(response.is_semantically_empty_terminal());
+    }
+
+    #[test]
+    fn semantic_empty_terminal_uses_display_text_after_think_tag_stripping() {
+        let response = ChatResponse {
+            text: Some("<think>internal reasoning</think>".to_string()),
+            tool_calls: Vec::new(),
+            usage: None,
+            reasoning_content: None,
+        };
+
+        assert!(response.is_semantically_empty_terminal());
+    }
+
+    #[test]
+    fn text_response_is_not_semantically_empty() {
+        let response = ChatResponse {
+            text: Some("done".to_string()),
+            tool_calls: Vec::new(),
+            usage: None,
+            reasoning_content: None,
+        };
+
+        assert!(!response.is_semantically_empty_terminal());
+    }
+
+    #[test]
+    fn tool_only_response_is_not_semantically_empty() {
+        let response = ChatResponse {
+            text: None,
+            tool_calls: vec![ToolCall {
+                id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                arguments: "{}".to_string(),
+                extra_content: None,
+            }],
+            usage: None,
+            reasoning_content: None,
+        };
+
+        assert!(!response.is_semantically_empty_terminal());
+    }
 
     #[test]
     fn drops_leading_assistant_tool_call_before_first_user() {

@@ -3,19 +3,26 @@
 
 use super::context::TurnCtx;
 use super::events::{ProgressEvent, StreamDelta, send_progress};
-use super::outcome::{StreamInterruptedAfterOutput, ToolLoopCancelled, is_tool_loop_cancelled};
+use super::outcome::{
+    StreamFailureWithoutOutput, StreamInterruptedAfterOutput,
+    StreamPreExecutedToolsWithoutFinalResponse, StreamSemanticEmptyCompletion,
+    StreamTerminalCompletion, ToolLoopCancelled, is_tool_loop_cancelled,
+};
 use super::redact::scrub_credentials;
 use super::stream_consume::consume_provider_streaming_response;
-use crate::agent::cost::check_tool_loop_budget;
+use crate::agent::cost::{check_tool_loop_budget, record_rejected_tool_loop_cost_usage};
 use crate::cost::types::BudgetCheck;
 use crate::observability::ObserverEvent;
 use crate::tools::ToolSpec;
 use anyhow::Result;
 use std::time::{Duration, Instant};
-use zeroclaw_providers::{ChatMessage, ChatRequest, ChatResponse, ModelProvider, ProviderDispatch};
+use zeroclaw_providers::{
+    AccountedChatResponse, ChatMessage, ChatRequest, ChatResponse, ModelProvider, ProviderDispatch,
+};
 
 pub(crate) struct ProviderCallOutcome {
     pub(crate) chat_result: Result<ChatResponse>,
+    pub(crate) rejected_attempt_usage: Option<zeroclaw_providers::traits::TokenUsage>,
     pub(crate) streamed_live_deltas: bool,
     pub(crate) streamed_protocol_suppressed: bool,
     pub(crate) streamed_visible_text: String,
@@ -179,38 +186,155 @@ pub(crate) async fn call_provider(
                 } else {
                     Some(streamed.reasoning_content)
                 };
-                Ok(zeroclaw_providers::ChatResponse {
-                    text: Some(streamed.response_text),
-                    tool_calls: streamed.tool_calls,
-                    usage: streamed.usage,
-                    reasoning_content,
+                Ok(AccountedChatResponse {
+                    response: zeroclaw_providers::ChatResponse {
+                        text: Some(streamed.response_text),
+                        tool_calls: streamed.tool_calls,
+                        usage: streamed.usage,
+                        reasoning_content,
+                    },
+                    rejected_attempt_usage: None,
                 })
             }
             Err(stream_err)
-                if is_tool_loop_cancelled(&stream_err)
-                    || stream_err
-                        .downcast_ref::<StreamInterruptedAfterOutput>()
-                        .is_some() =>
+                if stream_err
+                    .downcast_ref::<StreamPreExecutedToolsWithoutFinalResponse>()
+                    .is_some() =>
             {
+                if let Some(usage) = stream_err
+                    .downcast_ref::<StreamPreExecutedToolsWithoutFinalResponse>()
+                    .and_then(|error| error.usage.as_ref())
+                {
+                    record_rejected_tool_loop_cost_usage(ctx.provider_name, ctx.model, usage);
+                }
+                Err(stream_err)
+            }
+            Err(stream_err) if is_tool_loop_cancelled(&stream_err) => Err(stream_err),
+            Err(stream_err)
+                if stream_err
+                    .downcast_ref::<StreamInterruptedAfterOutput>()
+                    .is_some() =>
+            {
+                if let Some(usage) = stream_err
+                    .downcast_ref::<StreamInterruptedAfterOutput>()
+                    .and_then(|error| error.usage.as_ref())
+                {
+                    // The caller already received a partial response, but the
+                    // provider attempt is still incomplete. Bill it once
+                    // without treating its prompt size as accepted context
+                    // fill for the next turn.
+                    record_rejected_tool_loop_cost_usage(ctx.provider_name, ctx.model, usage);
+                }
                 Err(stream_err)
             }
             Err(stream_err) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_category(::zeroclaw_log::EventCategory::Provider)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "model": active_model,
-                            "iteration": iteration + 1,
-                            "error": scrub_credentials(&stream_err.to_string()),
-                            "trace_id": ctx.turn_id,
-                        })),
-                    "llm_stream_fallback: provider stream failed, falling back to non-streaming chat"
-                );
-                {
+                if let Some(terminal) = stream_err.downcast_ref::<StreamTerminalCompletion>() {
+                    if terminal.policy.recovery()
+                        == zeroclaw_providers::TerminalRecoveryDisposition::NoReplay
+                    {
+                        // This error short-circuits `run_tool_call_loop`
+                        // before its response-error branch. Charge the
+                        // rejected attempt here, exactly once, rather than
+                        // losing provider-reported billable usage.
+                        if terminal.policy.usage_chargeability()
+                            == zeroclaw_providers::TerminalUsageChargeability::Billable
+                            && let Some(usage) = terminal.failure.usage.as_ref()
+                        {
+                            record_rejected_tool_loop_cost_usage(
+                                ctx.provider_name,
+                                ctx.model,
+                                usage,
+                            );
+                        }
+                        return Err(stream_err);
+                    }
+                    let Some(failed_candidate) = terminal.failed_candidate.clone() else {
+                        // A terminal recovery must advance from the exact
+                        // streamed candidate. This error likewise bypasses
+                        // the outer response-error branch, so preserve its
+                        // billable rejected usage before returning it.
+                        if terminal.policy.usage_chargeability()
+                            == zeroclaw_providers::TerminalUsageChargeability::Billable
+                            && let Some(usage) = terminal.failure.usage.as_ref()
+                        {
+                            record_rejected_tool_loop_cost_usage(
+                                ctx.provider_name,
+                                ctx.model,
+                                usage,
+                            );
+                        }
+                        return Err(stream_err);
+                    };
+                    if terminal.policy.usage_chargeability()
+                        == zeroclaw_providers::TerminalUsageChargeability::Billable
+                        && let Some(usage) = terminal.failure.usage.as_ref()
+                    {
+                        // Recovery hides the terminal error from the turn
+                        // loop, so this layer owns its rejected usage.
+                        record_rejected_tool_loop_cost_usage(ctx.provider_name, ctx.model, usage);
+                    }
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_category(::zeroclaw_log::EventCategory::Provider)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "model": active_model,
+                                "iteration": iteration + 1,
+                                "error": scrub_credentials(&stream_err.to_string()),
+                                "trace_id": ctx.turn_id,
+                            })),
+                        "llm_stream_fallback: incomplete provider stream, continuing after failed candidate"
+                    );
                     let dispatcher = ProviderDispatch::from_ref(active_model_provider);
-                    let chat_future = dispatcher.chat(
+                    let chat_future = dispatcher.chat_after_stream_failure_accounted(
+                        ChatRequest {
+                            messages: prepared_messages,
+                            tools: request_tools,
+                            thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                                .try_with(Clone::clone)
+                                .ok()
+                                .flatten(),
+                        },
+                        active_model,
+                        ctx.temperature,
+                        Some(&failed_candidate),
+                    );
+                    if let Some(token) = ctx.cancellation_token {
+                        tokio::select! {
+                            () = token.cancelled() => Err(ToolLoopCancelled.into()),
+                            result = chat_future => result,
+                        }
+                    } else {
+                        chat_future.await
+                    }
+                } else {
+                    let discarded_usage = stream_err
+                        .downcast_ref::<StreamSemanticEmptyCompletion>()
+                        .and_then(|error| error.usage.as_ref())
+                        .or_else(|| {
+                            stream_err
+                                .downcast_ref::<StreamFailureWithoutOutput>()
+                                .and_then(|error| error.usage.as_ref())
+                        });
+                    if let Some(usage) = discarded_usage {
+                        record_rejected_tool_loop_cost_usage(ctx.provider_name, ctx.model, usage);
+                    }
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_category(::zeroclaw_log::EventCategory::Provider)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "model": active_model,
+                                "iteration": iteration + 1,
+                                "error": scrub_credentials(&stream_err.to_string()),
+                                "trace_id": ctx.turn_id,
+                            })),
+                        "llm_stream_fallback: provider stream failed, falling back to non-streaming chat"
+                    );
+                    let dispatcher = ProviderDispatch::from_ref(active_model_provider);
+                    let chat_future = dispatcher.chat_accounted(
                         ChatRequest {
                             messages: prepared_messages,
                             tools: request_tools,
@@ -237,7 +361,7 @@ pub(crate) async fn call_provider(
         // Non-streaming path: wrap with optional per-step timeout from
         // pacing config to catch hung model responses.
         let dispatcher = ProviderDispatch::from_ref(active_model_provider);
-        let chat_future = dispatcher.chat(
+        let chat_future = dispatcher.chat_accounted(
             ChatRequest {
                 messages: prepared_messages,
                 tools: request_tools,
@@ -287,8 +411,14 @@ pub(crate) async fn call_provider(
         }
     };
 
+    let (chat_result, rejected_attempt_usage) = match chat_result {
+        Ok(accounted) => (Ok(accounted.response), accounted.rejected_attempt_usage),
+        Err(error) => (Err(error), None),
+    };
+
     Ok(ProviderCallOutcome {
         chat_result,
+        rejected_attempt_usage,
         streamed_live_deltas,
         streamed_protocol_suppressed,
         streamed_visible_text,
@@ -483,5 +613,724 @@ mod payload_capture_tests {
         );
 
         zeroclaw_log::clear_broadcast_hook();
+    }
+}
+
+#[cfg(test)]
+mod streaming_fallback_tests {
+    use super::super::context::TurnCtx;
+    use super::*;
+    use crate::agent::cost::{
+        TOOL_LOOP_COST_TRACKING_CONTEXT, TOOL_LOOP_TURN_USAGE, ToolLoopCostTrackingContext,
+        TurnUsage,
+    };
+    use crate::observability::NoopObserver;
+    use async_trait::async_trait;
+    use futures_util::stream::BoxStream;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
+    use zeroclaw_api::model_provider::{
+        StreamChunk, StreamError, StreamEvent, TerminalCompletionError, TerminalCompletionFailure,
+    };
+    use zeroclaw_config::schema::PacingConfig;
+    use zeroclaw_providers::ModelProvider;
+    use zeroclaw_providers::traits::{StreamOptions, StreamResult, TokenUsage};
+
+    struct EmptyStreamThenTextProvider {
+        non_stream_calls: Arc<AtomicUsize>,
+        terminal_incomplete: bool,
+        ordinary_stream_error: bool,
+        terminal_reason: TerminalCompletionError,
+    }
+
+    struct PreExecutedToolThenEmptyProvider {
+        non_stream_calls: AtomicUsize,
+        terminal_incomplete: bool,
+        ordinary_stream_error: bool,
+    }
+
+    struct PartialStreamProvider;
+
+    impl Attributable for EmptyStreamThenTextProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "EmptyStreamThenTextProvider"
+        }
+    }
+
+    impl Attributable for PreExecutedToolThenEmptyProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "PreExecutedToolThenEmptyProvider"
+        }
+    }
+
+    impl Attributable for PartialStreamProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "PartialStreamProvider"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for EmptyStreamThenTextProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            self.non_stream_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(ChatResponse {
+                text: Some("fallback response".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            if self.terminal_incomplete {
+                Box::pin(futures_util::stream::iter(vec![Err(
+                    StreamError::TerminalCompletion(TerminalCompletionFailure::new(
+                        self.terminal_reason,
+                        Some(TokenUsage {
+                            input_tokens: Some(10),
+                            output_tokens: Some(5),
+                            cached_input_tokens: None,
+                        }),
+                    )),
+                )]))
+            } else if self.ordinary_stream_error {
+                Box::pin(futures_util::stream::iter(vec![
+                    Ok(StreamEvent::Usage(TokenUsage {
+                        input_tokens: Some(10),
+                        output_tokens: Some(5),
+                        cached_input_tokens: None,
+                    })),
+                    Err(StreamError::Http("connection interrupted".to_string())),
+                ]))
+            } else {
+                Box::pin(futures_util::stream::iter(vec![
+                    Ok(StreamEvent::Usage(TokenUsage {
+                        input_tokens: Some(10),
+                        output_tokens: Some(5),
+                        cached_input_tokens: None,
+                    })),
+                    Ok(StreamEvent::Final),
+                ]))
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for PreExecutedToolThenEmptyProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            self.non_stream_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(ChatResponse {
+                text: Some("must not be requested".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            let mut events = vec![
+                Ok(StreamEvent::PreExecutedToolCall {
+                    name: "provider_tool".to_string(),
+                    args: "{}".to_string(),
+                }),
+                Ok(StreamEvent::PreExecutedToolResult {
+                    name: "provider_tool".to_string(),
+                    output: "completed".to_string(),
+                }),
+            ];
+            if self.terminal_incomplete {
+                events.push(Err(StreamError::TerminalCompletion(
+                    TerminalCompletionFailure::new(TerminalCompletionError::OutputTokenLimit, None),
+                )));
+            } else if self.ordinary_stream_error {
+                events.push(Err(StreamError::ModelProvider(
+                    "stream connection interrupted".to_string(),
+                )));
+            } else {
+                events.push(Ok(StreamEvent::Final));
+            }
+            Box::pin(futures_util::stream::iter(events))
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for PartialStreamProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            anyhow::bail!("a visible partial stream must not be replayed")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamEvent::Usage(TokenUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(5),
+                    cached_input_tokens: None,
+                })),
+                Ok(StreamEvent::TextDelta(StreamChunk::delta(
+                    "partial response",
+                ))),
+                Err(StreamError::Http("connection interrupted".to_string())),
+            ]))
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_empty_stream_uses_one_non_streaming_fallback() {
+        let provider = EmptyStreamThenTextProvider {
+            non_stream_calls: Arc::new(AtomicUsize::new(0)),
+            terminal_incomplete: false,
+            ordinary_stream_error: false,
+            terminal_reason: TerminalCompletionError::OutputTokenLimit,
+        };
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let cost_context = ToolLoopCostTrackingContext::usage_only();
+        let turn_usage = std::sync::Arc::new(parking_lot::Mutex::new(TurnUsage::default()));
+        let ctx = TurnCtx {
+            observer: &observer,
+            provider_name: "test-provider",
+            model: "test-model",
+            temperature: Some(0.0),
+            approval: None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            turn_id: "test-turn",
+            agent_alias: None,
+            parent_agent_alias: None,
+        };
+
+        let outcome = TOOL_LOOP_TURN_USAGE
+            .scope(
+                Some(std::sync::Arc::clone(&turn_usage)),
+                TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                    Some(cost_context),
+                    call_provider(
+                        &ctx,
+                        &provider,
+                        "test-model",
+                        &[ChatMessage::user("go")],
+                        None,
+                        true,
+                        0,
+                    ),
+                ),
+            )
+            .await
+            .expect("stream failure is recovered by one non-streaming request");
+        let response = outcome.chat_result.expect("fallback response succeeds");
+
+        assert_eq!(response.text.as_deref(), Some("fallback response"));
+        assert_eq!(provider.non_stream_calls.load(Ordering::Relaxed), 1);
+        let recorded = *turn_usage.lock();
+        assert_eq!(recorded.input_tokens, 10);
+        assert_eq!(recorded.output_tokens, 5);
+    }
+
+    #[tokio::test]
+    async fn generic_no_output_stream_error_records_usage_before_fallback() {
+        let provider = EmptyStreamThenTextProvider {
+            non_stream_calls: Arc::new(AtomicUsize::new(0)),
+            terminal_incomplete: false,
+            ordinary_stream_error: true,
+            terminal_reason: TerminalCompletionError::OutputTokenLimit,
+        };
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let cost_context = ToolLoopCostTrackingContext::usage_only();
+        let turn_usage = Arc::new(parking_lot::Mutex::new(TurnUsage::default()));
+        let ctx = TurnCtx {
+            observer: &observer,
+            provider_name: "test-provider",
+            model: "test-model",
+            temperature: Some(0.0),
+            approval: None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            turn_id: "test-turn",
+            agent_alias: None,
+            parent_agent_alias: None,
+        };
+
+        let outcome = TOOL_LOOP_TURN_USAGE
+            .scope(
+                Some(Arc::clone(&turn_usage)),
+                TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                    Some(cost_context),
+                    call_provider(
+                        &ctx,
+                        &provider,
+                        "test-model",
+                        &[ChatMessage::user("go")],
+                        None,
+                        true,
+                        0,
+                    ),
+                ),
+            )
+            .await
+            .expect("generic stream failure is recovered by one non-streaming request");
+
+        assert_eq!(
+            outcome
+                .chat_result
+                .expect("fallback response succeeds")
+                .text
+                .as_deref(),
+            Some("fallback response")
+        );
+        assert_eq!(provider.non_stream_calls.load(Ordering::Relaxed), 1);
+        let recorded = *turn_usage.lock();
+        assert_eq!(recorded.input_tokens, 10);
+        assert_eq!(recorded.output_tokens, 5);
+        assert_eq!(
+            recorded.last_input_tokens, 0,
+            "rejected usage must not become accepted context fill"
+        );
+    }
+
+    #[tokio::test]
+    async fn visible_partial_stream_error_records_rejected_usage_without_context_fill() {
+        let provider = PartialStreamProvider;
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let cost_context = ToolLoopCostTrackingContext::usage_only();
+        let turn_usage = Arc::new(parking_lot::Mutex::new(TurnUsage::default()));
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(4);
+        let ctx = TurnCtx {
+            observer: &observer,
+            provider_name: "test-provider",
+            model: "test-model",
+            temperature: Some(0.0),
+            approval: None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: Some(&event_tx),
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            turn_id: "test-turn",
+            agent_alias: None,
+            parent_agent_alias: None,
+        };
+
+        let outcome = TOOL_LOOP_TURN_USAGE
+            .scope(
+                Some(Arc::clone(&turn_usage)),
+                TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                    Some(cost_context),
+                    call_provider(
+                        &ctx,
+                        &provider,
+                        "test-model",
+                        &[ChatMessage::user("go")],
+                        None,
+                        true,
+                        0,
+                    ),
+                ),
+            )
+            .await
+            .expect("dispatch returns the interrupted provider outcome");
+        let error = outcome
+            .chat_result
+            .expect_err("visible partial stream must not become a completed response");
+        assert!(
+            error
+                .downcast_ref::<StreamInterruptedAfterOutput>()
+                .is_some()
+        );
+
+        let recorded = *turn_usage.lock();
+        assert_eq!(recorded.input_tokens, 10);
+        assert_eq!(recorded.output_tokens, 5);
+        assert_eq!(
+            recorded.last_input_tokens, 0,
+            "an incomplete visible partial must not become accepted context fill"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_executed_tool_empty_stream_never_replays_request() {
+        let provider = PreExecutedToolThenEmptyProvider {
+            non_stream_calls: AtomicUsize::new(0),
+            terminal_incomplete: false,
+            ordinary_stream_error: false,
+        };
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let ctx = TurnCtx {
+            observer: &observer,
+            provider_name: "test-provider",
+            model: "test-model",
+            temperature: Some(0.0),
+            approval: None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            turn_id: "test-turn",
+            agent_alias: None,
+            parent_agent_alias: None,
+        };
+
+        let error = call_provider(
+            &ctx,
+            &provider,
+            "test-model",
+            &[ChatMessage::user("go")],
+            None,
+            true,
+            0,
+        )
+        .await
+        .expect("dispatch returns the provider outcome")
+        .chat_result
+        .expect_err("provider-executed tool work without final text must fail");
+
+        assert!(error.to_string().contains("provider-executed tools"));
+        assert_eq!(
+            provider.non_stream_calls.load(Ordering::Relaxed),
+            0,
+            "replaying after provider-executed tool work could repeat side effects"
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_stream_without_candidate_identity_never_replays() {
+        let provider = EmptyStreamThenTextProvider {
+            non_stream_calls: Arc::new(AtomicUsize::new(0)),
+            terminal_incomplete: true,
+            ordinary_stream_error: false,
+            terminal_reason: TerminalCompletionError::OutputTokenLimit,
+        };
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let cost_context = ToolLoopCostTrackingContext::usage_only();
+        let turn_usage = Arc::new(parking_lot::Mutex::new(TurnUsage::default()));
+        let ctx = TurnCtx {
+            observer: &observer,
+            provider_name: "test-provider",
+            model: "test-model",
+            temperature: Some(0.0),
+            approval: None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            turn_id: "test-turn",
+            agent_alias: None,
+            parent_agent_alias: None,
+        };
+
+        let result = TOOL_LOOP_TURN_USAGE
+            .scope(
+                Some(Arc::clone(&turn_usage)),
+                TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                    Some(cost_context),
+                    call_provider(
+                        &ctx,
+                        &provider,
+                        "test-model",
+                        &[ChatMessage::user("go")],
+                        None,
+                        true,
+                        0,
+                    ),
+                ),
+            )
+            .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("a terminal stream without candidate identity must fail"),
+        };
+        assert_eq!(
+            zeroclaw_api::model_provider::terminal_completion_error(&error),
+            Some(TerminalCompletionError::OutputTokenLimit)
+        );
+        assert_eq!(
+            provider.non_stream_calls.load(Ordering::Relaxed),
+            0,
+            "missing identity must not replay the same provider"
+        );
+        let recorded = *turn_usage.lock();
+        assert_eq!(recorded.input_tokens, 10);
+        assert_eq!(recorded.output_tokens, 5);
+        assert_eq!(
+            recorded.last_input_tokens, 0,
+            "a rejected terminal attempt must not become accepted context fill"
+        );
+    }
+
+    #[tokio::test]
+    async fn paused_stream_without_visible_output_never_replays_request() {
+        let provider = EmptyStreamThenTextProvider {
+            non_stream_calls: Arc::new(AtomicUsize::new(0)),
+            terminal_incomplete: true,
+            ordinary_stream_error: false,
+            terminal_reason: TerminalCompletionError::PausedTurn,
+        };
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let ctx = TurnCtx {
+            observer: &observer,
+            provider_name: "test-provider",
+            model: "test-model",
+            temperature: Some(0.0),
+            approval: None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            turn_id: "test-turn",
+            agent_alias: None,
+            parent_agent_alias: None,
+        };
+
+        let result = call_provider(
+            &ctx,
+            &provider,
+            "test-model",
+            &[ChatMessage::user("go")],
+            None,
+            true,
+            0,
+        )
+        .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("paused streams require an explicit continuation"),
+        };
+
+        assert_eq!(
+            zeroclaw_api::model_provider::terminal_completion_error(&error),
+            Some(TerminalCompletionError::PausedTurn)
+        );
+        assert_eq!(provider.non_stream_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn pre_executed_tool_incomplete_stream_never_replays_request() {
+        let provider = PreExecutedToolThenEmptyProvider {
+            non_stream_calls: AtomicUsize::new(0),
+            terminal_incomplete: true,
+            ordinary_stream_error: false,
+        };
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let ctx = TurnCtx {
+            observer: &observer,
+            provider_name: "test-provider",
+            model: "test-model",
+            temperature: Some(0.0),
+            approval: None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            turn_id: "test-turn",
+            agent_alias: None,
+            parent_agent_alias: None,
+        };
+
+        let error = call_provider(
+            &ctx,
+            &provider,
+            "test-model",
+            &[ChatMessage::user("go")],
+            None,
+            true,
+            0,
+        )
+        .await
+        .expect("dispatch returns the provider outcome")
+        .chat_result
+        .expect_err("provider-executed tool work without a final response must fail");
+
+        assert!(error.to_string().contains("provider-executed tools"));
+        assert_eq!(provider.non_stream_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn pre_executed_tool_stream_error_never_replays_request() {
+        let provider = PreExecutedToolThenEmptyProvider {
+            non_stream_calls: AtomicUsize::new(0),
+            terminal_incomplete: false,
+            ordinary_stream_error: true,
+        };
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let ctx = TurnCtx {
+            observer: &observer,
+            provider_name: "test-provider",
+            model: "test-model",
+            temperature: Some(0.0),
+            approval: None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            turn_id: "test-turn",
+            agent_alias: None,
+            parent_agent_alias: None,
+        };
+
+        let error = call_provider(
+            &ctx,
+            &provider,
+            "test-model",
+            &[ChatMessage::user("go")],
+            None,
+            true,
+            0,
+        )
+        .await
+        .expect("dispatch returns the provider outcome")
+        .chat_result
+        .expect_err("provider-executed tool work followed by a stream error must fail");
+
+        assert!(error.to_string().contains("provider-executed tools"));
+        assert_eq!(
+            provider.non_stream_calls.load(Ordering::Relaxed),
+            0,
+            "ordinary stream failures after provider-executed work must not replay side effects"
+        );
     }
 }

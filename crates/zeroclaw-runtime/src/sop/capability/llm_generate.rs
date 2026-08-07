@@ -26,6 +26,9 @@ use anyhow::Result;
 use serde_json::{Map, Value, json};
 use zeroclaw_api::model_provider::ModelProvider;
 
+use crate::agent::cost::{TOOL_LOOP_COST_TRACKING_CONTEXT, TOOL_LOOP_TURN_USAGE};
+use crate::agent::loop_::ResolvedModelAccess;
+
 use super::types::{CapabilityContext, CapabilityInfo, CapabilityResult, SopCapability};
 
 /// Upper bound on one generation call. The capability blocks the engine lock
@@ -180,32 +183,79 @@ impl SopCapability for LlmGenerateCapability {
     }
 }
 
-/// [`LlmGenerateAdapter`] over a configured [`ModelProvider`]: one
-/// `chat_with_system` call, run on a dedicated bridge thread (see
+/// [`LlmGenerateAdapter`] over a configured [`ModelProvider`]: one text-only
+/// query through the runtime accounting seam, run on a dedicated bridge thread (see
 /// `super::bridge::run_bridged` for why the host runtime must not be used).
 pub struct ProviderLlmAdapter {
     provider: Arc<dyn ModelProvider>,
+    provider_name: String,
     model: String,
 }
 
 impl ProviderLlmAdapter {
-    pub fn new(provider: Arc<dyn ModelProvider>, model: String) -> Self {
-        Self { provider, model }
+    pub fn new(provider: Arc<dyn ModelProvider>, provider_name: String, model: String) -> Self {
+        Self {
+            provider,
+            provider_name,
+            model,
+        }
     }
 }
 
 impl LlmGenerateAdapter for ProviderLlmAdapter {
     fn generate(&self, system: Option<&str>, prompt: &str) -> Result<String, String> {
         let provider = Arc::clone(&self.provider);
+        let provider_name = self.provider_name.clone();
         let model = self.model.clone();
         let system = system.map(str::to_string);
         let prompt = prompt.to_string();
+        let cost_tracking_context = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .try_with(Clone::clone)
+            .ok()
+            .flatten();
+        let turn_usage = TOOL_LOOP_TURN_USAGE.try_with(Clone::clone).ok().flatten();
         super::bridge::run_bridged(
             async move {
-                provider
-                    .chat_with_system(system.as_deref(), &prompt, &model, None)
+                TOOL_LOOP_TURN_USAGE
+                    .scope(
+                        turn_usage,
+                        TOOL_LOOP_COST_TRACKING_CONTEXT.scope(cost_tracking_context, async {
+                            ResolvedModelAccess {
+                                model_provider: provider.as_ref(),
+                                provider_name: &provider_name,
+                                model: &model,
+                                temperature: None,
+                            }
+                            .run_text_query(system.as_deref(), &prompt)
+                            .await
+                            .map_err(|error| {
+                                let diagnostic = error.to_string();
+                                if let Some(message) =
+                                    crate::agent::terminal_completion_error_message(&error, None)
+                                {
+                                    ::zeroclaw_log::record!(
+                                        WARN,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Fail,
+                                        )
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                        .with_attrs(
+                                            ::serde_json::json!({
+                                                "error_key": "terminal_completion",
+                                                "error": diagnostic,
+                                            })
+                                        ),
+                                        "SOP llm.generate terminal completion failure"
+                                    );
+                                    message
+                                } else {
+                                    diagnostic
+                                }
+                            })
+                        }),
+                    )
                     .await
-                    .map_err(|e| e.to_string())
             },
             GENERATE_TIMEOUT,
             "model call",
@@ -216,7 +266,10 @@ impl LlmGenerateAdapter for ProviderLlmAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use std::sync::Mutex;
+    use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
+    use zeroclaw_api::model_provider::{ChatRequest, ChatResponse};
 
     struct RecordingLlm {
         calls: Mutex<Vec<(Option<String>, String)>>,
@@ -443,5 +496,65 @@ mod tests {
         let out = cap.execute(ctx(), json!({"instruction": "x"})).unwrap();
         assert!(!out.success);
         assert!(out.error.unwrap().contains("provider down"));
+    }
+
+    struct SemanticEmptyProvider;
+
+    #[async_trait]
+    impl ModelProvider for SemanticEmptyProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            Ok(ChatResponse {
+                text: Some("   ".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl Attributable for SemanticEmptyProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "semantic-empty"
+        }
+    }
+
+    #[test]
+    fn provider_adapter_projects_semantic_empty_as_fluent_terminal_failure() {
+        let adapter = ProviderLlmAdapter::new(
+            Arc::new(SemanticEmptyProvider),
+            "custom".to_string(),
+            "test-model".to_string(),
+        );
+
+        let error = adapter
+            .generate(None, "summarize")
+            .expect_err("semantic-empty provider response must fail");
+        let expected = crate::agent::terminal_completion_error_message(
+            &anyhow::Error::new(crate::agent::turn::outcome::SemanticEmptyTerminalCompletion),
+            None,
+        )
+        .expect("semantic-empty failure has a Fluent projection");
+
+        assert_eq!(error, expected);
+        assert!(!error.contains("provider completed without final text"));
     }
 }

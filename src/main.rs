@@ -7779,6 +7779,7 @@ fn build_sop_adapters(config: &Config) -> zeroclaw_runtime::sop::SopEngineAdapte
                 Some(std::sync::Arc::new(
                     zeroclaw_runtime::sop::capability::ProviderLlmAdapter::new(
                         std::sync::Arc::from(provider),
+                        provider_type.to_string(),
                         model,
                     ),
                 ) as _)
