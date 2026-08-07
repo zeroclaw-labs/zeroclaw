@@ -16,7 +16,7 @@ use ratatui::{
 };
 
 use crate::config;
-use crate::config::WssSection;
+use crate::config::{TodoTrackerSection, WssSection};
 use crate::keymap::{Chord, overrides, reserved_reason};
 use crate::theme;
 
@@ -29,15 +29,18 @@ enum Focus {
     Bindings,
     Locale,
     Connection,
+    // ── UI heading ─────────────────────────────────────────────────
+    TodoTracker,
 }
 
-const FOCI: [Focus; 6] = [
+const FOCI: [Focus; 7] = [
     Focus::Theme,
     Focus::AgentTheme,
     Focus::Presets,
     Focus::Bindings,
     Focus::Locale,
     Focus::Connection,
+    Focus::TodoTracker,
 ];
 
 /// Which side of the split holds the live cursor. `Sections` is the left list
@@ -59,6 +62,7 @@ impl Focus {
             Self::Bindings => "zc-zerocode-tab-bindings",
             Self::Locale => "zc-zerocode-tab-locale",
             Self::Connection => "zc-zerocode-tab-connection",
+            Self::TodoTracker => "zc-zerocode-tab-todo-tracker",
         }
     }
 }
@@ -90,6 +94,37 @@ impl ConnField {
             Self::Uri => "uri",
             Self::SkipVerify => "tls.skip_verify",
             Self::SkipVerifyRoutes => "tls.skip_verify_routes",
+        }
+    }
+}
+
+// ── Todo tracker fields (Task 7) ────────────────────────────────────────
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TrackerField {
+    Enabled,
+    EnabledAtStart,
+    Location,
+    Width,
+    MaxHeight,
+}
+
+const TRACKER_FIELDS: [TrackerField; 5] = [
+    TrackerField::Enabled,
+    TrackerField::EnabledAtStart,
+    TrackerField::Location,
+    TrackerField::Width,
+    TrackerField::MaxHeight,
+];
+
+impl TrackerField {
+    fn fluent_key(self) -> &'static str {
+        match self {
+            Self::Enabled => "zc-zerocode-tracker-enabled",
+            Self::EnabledAtStart => "zc-zerocode-tracker-enabled-at-start",
+            Self::Location => "zc-zerocode-tracker-location",
+            Self::Width => "zc-zerocode-tracker-width",
+            Self::MaxHeight => "zc-zerocode-tracker-max-height",
         }
     }
 }
@@ -167,10 +202,19 @@ pub(crate) struct ZerocodePane {
     conn: WssSection,
     conn_cursor: usize,
     conn_edit: Option<ConnEdit>,
+    // ── UI heading (Task 7) ────────────────────────────────────────
+    tracker: TodoTrackerSection,
+    tracker_cursor: usize,
+    tracker_edit: Option<TrackerEdit>,
 }
 
 struct ConnEdit {
     field: ConnField,
+    buf: String,
+}
+
+struct TrackerEdit {
+    field: TrackerField,
     buf: String,
 }
 
@@ -232,6 +276,15 @@ impl ZerocodePane {
                 .unwrap_or_default(),
             conn_cursor: 0,
             conn_edit: None,
+            // The editable copy is the *persisted* section: env overrides are
+            // transient, and saving one field rewrites the whole section, so an
+            // env-injected value must never become the on-disk value.
+            tracker: config::load_persisted(config_dir)
+                .ok()
+                .map(|c| c.todotracker)
+                .unwrap_or_default(),
+            tracker_cursor: 0,
+            tracker_edit: None,
         };
         pane.rebuild_rows();
         pane
@@ -247,7 +300,7 @@ impl ZerocodePane {
     }
 
     pub(crate) fn wants_text_input(&self) -> bool {
-        self.conn_edit.is_some()
+        self.conn_edit.is_some() || self.tracker_edit.is_some()
     }
 
     // ── Draw ─────────────────────────────────────────────────────
@@ -275,6 +328,7 @@ impl ZerocodePane {
             Focus::Bindings => self.draw_bindings(frame, cols[1]),
             Focus::Locale => self.draw_locale(frame, cols[1]),
             Focus::Connection => self.draw_connection(frame, cols[1]),
+            Focus::TodoTracker => self.draw_todo_tracker(frame, cols[1]),
         }
 
         if self.capture.is_some() {
@@ -692,6 +746,103 @@ impl ZerocodePane {
         );
     }
 
+    // ── Todo tracker section (Task 7) ───────────────────────────────
+
+    fn tracker_field_value(&self, field: TrackerField) -> String {
+        match field {
+            TrackerField::Enabled => if self.tracker.enabled {
+                "true"
+            } else {
+                "false"
+            }
+            .to_string(),
+            TrackerField::EnabledAtStart => if self.tracker.enabled_at_start {
+                "true"
+            } else {
+                "false"
+            }
+            .to_string(),
+            TrackerField::Location => match self.tracker.location {
+                config::TodoTrackerLocation::Bottom => "bottom",
+                config::TodoTrackerLocation::Left => "left",
+                config::TodoTrackerLocation::Right => "right",
+            }
+            .to_string(),
+            TrackerField::Width => self.tracker.width.to_string(),
+            TrackerField::MaxHeight => self.tracker.max_height.to_string(),
+        }
+    }
+
+    fn draw_todo_tracker(&self, frame: &mut Frame, area: Rect) {
+        if let Some(edit) = &self.tracker_edit {
+            use ratatui::layout::{Constraint, Direction, Layout};
+            let title = format!(" {} ", crate::i18n::t(edit.field.fluent_key()));
+            let hint = match edit.field {
+                TrackerField::Enabled | TrackerField::EnabledAtStart => {
+                    crate::i18n::t("zc-zerocode-tracker-edit-bool")
+                }
+                TrackerField::Location => crate::i18n::t("zc-zerocode-tracker-edit-location"),
+                TrackerField::Width | TrackerField::MaxHeight => {
+                    crate::i18n::t("zc-zerocode-tracker-edit-number")
+                }
+            };
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(0), Constraint::Length(1)])
+                .split(area);
+
+            let buf_lines: Vec<&str> = edit.buf.split('\n').collect();
+            let lines: Vec<Line> = buf_lines
+                .iter()
+                .enumerate()
+                .map(|(i, l)| {
+                    let text = if i + 1 == buf_lines.len() {
+                        format!("{l}█")
+                    } else {
+                        (*l).to_string()
+                    };
+                    Line::from(Span::styled(text, theme::input_style()))
+                })
+                .collect();
+            frame.render_widget(
+                Paragraph::new(lines)
+                    .block(theme::panel_block(&title))
+                    .wrap(Wrap { trim: false }),
+                rows[0],
+            );
+            frame.render_widget(
+                Paragraph::new(Span::styled(hint, theme::dim_style())),
+                rows[1],
+            );
+            return;
+        }
+
+        let items: Vec<ListItem> = TRACKER_FIELDS
+            .iter()
+            .map(|f| {
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("{:<22}", crate::i18n::t(f.fluent_key())),
+                        theme::dim_style(),
+                    ),
+                    Span::styled(self.tracker_field_value(*f), theme::body_style()),
+                ]))
+            })
+            .collect();
+        let mut state = ListState::default();
+        state.select(Some(self.tracker_cursor.min(TRACKER_FIELDS.len() - 1)));
+        frame.render_stateful_widget(
+            List::new(items)
+                .block(theme::panel_block(&crate::i18n::t(
+                    "zc-zerocode-tracker-title",
+                )))
+                .highlight_style(self.detail_highlight().0)
+                .highlight_symbol(self.detail_highlight().1),
+            area,
+            &mut state,
+        );
+    }
+
     // ── RPC bridge (config_manager holds the RpcClient) ──────────
 
     /// Feed the locale registry fetched via `locales/list`.
@@ -898,6 +1049,10 @@ impl ZerocodePane {
             self.handle_conn_edit_key(key);
             return true;
         }
+        if self.tracker_edit.is_some() {
+            self.handle_tracker_edit_key(key);
+            return true;
+        }
         use crate::keymap::ConfigTabAction;
         match ConfigTabAction::from_chord(&key) {
             // Up/Down move within whichever side holds the cursor: the section
@@ -1030,6 +1185,7 @@ impl ZerocodePane {
                 Focus::Bindings => self.rows.len(),
                 Focus::Locale => self.locales.len() + 1,
                 Focus::Connection => CONN_FIELDS.len(),
+                Focus::TodoTracker => TRACKER_FIELDS.len(),
             }
         };
         if len == 0 {
@@ -1045,6 +1201,7 @@ impl ZerocodePane {
                 Focus::Bindings => &mut self.binding_cursor,
                 Focus::Locale => &mut self.locale_cursor,
                 Focus::Connection => &mut self.conn_cursor,
+                Focus::TodoTracker => &mut self.tracker_cursor,
             }
         };
         let next = (*cursor as isize + delta).clamp(0, len as isize - 1);
@@ -1070,6 +1227,7 @@ impl ZerocodePane {
             }
             Focus::Locale => self.select_locale_row(),
             Focus::Connection => self.activate_connection(),
+            Focus::TodoTracker => self.activate_tracker(),
         }
     }
 
@@ -1168,6 +1326,162 @@ impl ZerocodePane {
                 if let KeyCode::Char(c) = key.code
                     && !key.modifiers.contains(KeyModifiers::CONTROL)
                     && let Some(e) = self.conn_edit.as_mut()
+                {
+                    e.buf.push(c);
+                }
+            }
+        }
+    }
+
+    // ── Todo tracker activate / edit (Task 7) ───────────────────────
+
+    fn activate_tracker(&mut self) {
+        let Some(field) = TRACKER_FIELDS.get(self.tracker_cursor).copied() else {
+            return;
+        };
+        // Booleans toggle on Enter without opening the editor.
+        if field == TrackerField::Enabled || field == TrackerField::EnabledAtStart {
+            let mut candidate = self.tracker.clone();
+            match field {
+                TrackerField::Enabled => candidate.enabled = !candidate.enabled,
+                TrackerField::EnabledAtStart => {
+                    candidate.enabled_at_start = !candidate.enabled_at_start
+                }
+                _ => {}
+            }
+            self.persist_tracker_candidate(candidate);
+            return;
+        }
+        // Location cycles on Enter.
+        if field == TrackerField::Location {
+            let mut candidate = self.tracker.clone();
+            candidate.location = match candidate.location {
+                config::TodoTrackerLocation::Bottom => config::TodoTrackerLocation::Left,
+                config::TodoTrackerLocation::Left => config::TodoTrackerLocation::Right,
+                config::TodoTrackerLocation::Right => config::TodoTrackerLocation::Bottom,
+            };
+            self.persist_tracker_candidate(candidate);
+            return;
+        }
+        // Numbers and text open the editor.
+        let buf = match field {
+            TrackerField::Width => self.tracker.width.to_string(),
+            TrackerField::MaxHeight => self.tracker.max_height.to_string(),
+            _ => String::new(),
+        };
+        self.tracker_edit = Some(TrackerEdit { field, buf });
+    }
+
+    fn set_ui_validation_error(&mut self, error: config::UiSectionValidationError) {
+        let key = match error {
+            config::UiSectionValidationError::PositiveRequired => {
+                "zc-zerocode-config-positive-required"
+            }
+        };
+        self.status = Some(crate::i18n::t(key));
+    }
+
+    fn set_ui_save_error(&mut self, error: &anyhow::Error) {
+        self.status = Some(crate::i18n::t_args(
+            "zc-zerocode-config-save-failed",
+            &[("error", &error.to_string())],
+        ));
+    }
+
+    fn persist_tracker_candidate(&mut self, candidate: TodoTrackerSection) {
+        if let Err(error) = candidate.validate() {
+            self.set_ui_validation_error(error);
+            return;
+        }
+        if let Err(error) = config::persist_todotracker(&self.config_dir, &candidate) {
+            self.set_ui_save_error(&error);
+            return;
+        }
+        // Verify against the persisted file (not the env-overridden view) so
+        // the success status reflects what was actually written to disk.
+        match config::load_persisted(&self.config_dir) {
+            Ok(loaded) => {
+                let persisted_resolved = loaded.resolve_todo_tracker();
+                if loaded.todotracker != candidate || persisted_resolved != candidate.resolve() {
+                    self.tracker = loaded.todotracker;
+                    self.status = Some(crate::i18n::t("zc-zerocode-config-save-mismatch"));
+                    return;
+                }
+                self.tracker = candidate;
+                // The write to disk is correct, but new sessions resolve
+                // through `ensure_and_load`, which layers `ZEROCODE_todotracker__*`
+                // environment overrides on top. Report what the next session
+                // will actually see:
+                //   - resolves to the saved value  -> plain success
+                //   - resolves to a different value -> an override shadows it
+                //   - resolution fails              -> the value may not apply
+                // so the ordinary "sessions will use this" is never shown when
+                // the effective outcome does not match the saved value.
+                let key = match config::ensure_and_load(&self.config_dir) {
+                    // An effective section that a session boundary would
+                    // reject (e.g. `ZEROCODE_todotracker__width=0`) must not
+                    // be reported as a mere shadowing override — the next
+                    // session keeps its current settings instead.
+                    Ok(effective) if effective.validate_todo_tracker().is_err() => {
+                        "zc-zerocode-tracker-saved-resolve-error"
+                    }
+                    Ok(effective) if effective.resolve_todo_tracker() != persisted_resolved => {
+                        "zc-zerocode-tracker-saved-env-override"
+                    }
+                    Ok(_) => "zc-zerocode-tracker-saved",
+                    Err(_) => "zc-zerocode-tracker-saved-resolve-error",
+                };
+                self.status = Some(crate::i18n::t(key));
+            }
+            Err(error) => self.set_ui_save_error(&error),
+        }
+    }
+
+    fn commit_tracker_edit(&mut self) {
+        let Some(edit) = self.tracker_edit.take() else {
+            return;
+        };
+        let parsed = match edit.buf.trim().parse::<u16>() {
+            Ok(value) => value,
+            Err(_) => {
+                self.status = Some(crate::i18n::t("zc-zerocode-config-invalid-number"));
+                return;
+            }
+        };
+        let mut candidate = self.tracker.clone();
+        match edit.field {
+            TrackerField::Width => {
+                candidate.width = parsed;
+            }
+            TrackerField::MaxHeight => {
+                candidate.max_height = parsed;
+            }
+            _ => return,
+        }
+        self.persist_tracker_candidate(candidate);
+    }
+
+    fn handle_tracker_edit_key(&mut self, key: KeyEvent) {
+        use crate::keymap::ConfigEditorAction;
+        match ConfigEditorAction::from_chord(&key) {
+            Some(ConfigEditorAction::Cancel) => {
+                self.tracker_edit = None;
+            }
+            Some(ConfigEditorAction::Save) => {
+                self.commit_tracker_edit();
+            }
+            Some(ConfigEditorAction::Confirm) => {
+                self.commit_tracker_edit();
+            }
+            Some(ConfigEditorAction::Backspace) => {
+                if let Some(e) = self.tracker_edit.as_mut() {
+                    e.buf.pop();
+                }
+            }
+            _ => {
+                if let KeyCode::Char(c) = key.code
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && let Some(e) = self.tracker_edit.as_mut()
                 {
                     e.buf.push(c);
                 }
@@ -1397,6 +1711,12 @@ impl ZerocodePane {
                     crate::i18n::t("zc-zerocode-help-conn"),
                 ));
             }
+            Focus::TodoTracker => {
+                entries.push(E::new(
+                    keys(A::Enter),
+                    crate::i18n::t("zc-zerocode-help-todo-tracker"),
+                ));
+            }
         }
         entries.push(E::new(
             [keys(A::TabLeft), keys(A::Back)].concat(),
@@ -1485,6 +1805,7 @@ impl ZerocodePane {
             Focus::Bindings => self.rows.len(),
             Focus::Locale => self.locales.len() + 1,
             Focus::Connection => CONN_FIELDS.len(),
+            Focus::TodoTracker => TRACKER_FIELDS.len(),
         }
     }
 
@@ -1505,6 +1826,7 @@ impl ZerocodePane {
             Focus::Bindings => self.binding_cursor = idx,
             Focus::Locale => self.locale_cursor = idx,
             Focus::Connection => self.conn_cursor = idx,
+            Focus::TodoTracker => self.tracker_cursor = idx,
         }
     }
 }
@@ -1643,9 +1965,307 @@ mod tests {
         }
     }
 
-    // The Locale tab is a pick-from-list surface with no free-entry, so the
-    // pane never claims text input — typing a locale code by hand was removed
-    // because it implied users could conjure locales the build does not ship.
+    fn edit_tracker_number(pane: &mut ZerocodePane, field: TrackerField, value: &str) {
+        pane.tracker_cursor = TRACKER_FIELDS
+            .iter()
+            .position(|candidate| *candidate == field)
+            .expect("tracker field is registered");
+        pane.activate_tracker();
+        pane.tracker_edit
+            .as_mut()
+            .expect("numeric tracker field opens an editor")
+            .buf = value.to_string();
+        pane.handle_tracker_edit_key(key(KeyCode::Enter));
+    }
+
+    // Current-head smoke of the Config-pane Todo-tracker save path, driven
+    // through the real edit/persist/resolve functions (no interactive TUI is
+    // available in CI). Run with:
+    //   cargo test -p zerocode --bin zerocode -- --ignored --nocapture smoke_config_pane_save
+    // Prints the observable status/disk/effective values for each scenario so
+    // the user-facing contract can be eyeballed. Serializes on the env lock
+    // because it mutates process env.
+    #[test]
+    #[ignore = "current-head smoke; run explicitly with --ignored --nocapture"]
+    fn smoke_config_pane_save_tracker_flow() {
+        let _guard = crate::test_support::env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        config::persist_todotracker(dir.path(), &TodoTrackerSection::default()).unwrap();
+
+        let disk = |d: &std::path::Path| config::load_persisted(d).unwrap().todotracker.width;
+        let effective = |d: &std::path::Path| {
+            config::ensure_and_load(d)
+                .unwrap()
+                .resolve_todo_tracker()
+                .width
+        };
+
+        eprintln!("── SMOKE: Config-pane Todo-tracker save (current head) ──");
+
+        // Scenario A: no override — a saved value is exactly what sessions use.
+        {
+            let mut pane = ZerocodePane::new(dir.path());
+            edit_tracker_number(&mut pane, TrackerField::Width, "48");
+            eprintln!(
+                "A. no override      -> saved width 48 | disk={} | effective={} | status={:?}",
+                disk(dir.path()),
+                effective(dir.path()),
+                pane.status.as_deref(),
+            );
+            assert_eq!(disk(dir.path()), 48);
+            assert_eq!(effective(dir.path()), 48);
+            assert_eq!(
+                pane.status.as_deref(),
+                Some(crate::i18n::t("zc-zerocode-tracker-saved").as_str())
+            );
+        }
+
+        // Scenario B: an active ZEROCODE_todotracker__width override shadows the
+        // save — the pane must not claim sessions will use the saved value.
+        {
+            let _v = crate::test_support::EnvVarGuard::set("ZEROCODE_todotracker__width", "77");
+            let mut pane = ZerocodePane::new(dir.path());
+            edit_tracker_number(&mut pane, TrackerField::Width, "52");
+            eprintln!(
+                "B. width override=77 -> saved width 52 | disk={} | effective={} | status={:?}",
+                disk(dir.path()),
+                effective(dir.path()),
+                pane.status.as_deref(),
+            );
+            assert_eq!(
+                disk(dir.path()),
+                52,
+                "the edit still lands on disk verbatim"
+            );
+            assert_eq!(effective(dir.path()), 77, "sessions still see the override");
+            assert_eq!(
+                pane.status.as_deref(),
+                Some(crate::i18n::t("zc-zerocode-tracker-saved-env-override").as_str())
+            );
+        }
+
+        // Scenario C: a malformed edit is rejected, not silently saved.
+        {
+            let mut pane = ZerocodePane::new(dir.path());
+            let before = disk(dir.path());
+            edit_tracker_number(&mut pane, TrackerField::Width, "not-a-number");
+            eprintln!(
+                "C. malformed edit    -> disk unchanged ({}={}) | status={:?}",
+                before,
+                disk(dir.path()),
+                pane.status.as_deref(),
+            );
+            assert_eq!(disk(dir.path()), before, "malformed edit must not persist");
+            assert_eq!(
+                pane.status.as_deref(),
+                Some(crate::i18n::t("zc-zerocode-config-invalid-number").as_str())
+            );
+        }
+
+        // Scenario D: an invalid override makes the effective resolution fail —
+        // the disk write succeeds but the pane must not promise sessions will
+        // use it; it reports the resolve-error status.
+        {
+            let _v = crate::test_support::EnvVarGuard::set("ZEROCODE_todotracker__nope", "1");
+            let mut pane = ZerocodePane::new(dir.path());
+            edit_tracker_number(&mut pane, TrackerField::Width, "40");
+            eprintln!(
+                "D. resolve error     -> saved width 40 | disk={} | ensure_and_load=Err | status={:?}",
+                disk(dir.path()),
+                pane.status.as_deref(),
+            );
+            assert_eq!(disk(dir.path()), 40, "the edit still lands on disk");
+            assert!(config::ensure_and_load(dir.path()).is_err());
+            assert_eq!(
+                pane.status.as_deref(),
+                Some(crate::i18n::t("zc-zerocode-tracker-saved-resolve-error").as_str())
+            );
+        }
+
+        eprintln!("── SMOKE OK ──");
+    }
+
+    #[test]
+    fn tracker_malformed_edit_does_not_persist_or_report_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = TodoTrackerSection {
+            width: 40,
+            ..TodoTrackerSection::default()
+        };
+        config::persist_todotracker(dir.path(), &original).unwrap();
+        let mut pane = ZerocodePane::new(dir.path());
+
+        edit_tracker_number(&mut pane, TrackerField::Width, "not-a-number");
+
+        let reloaded = config::ensure_and_load(dir.path()).unwrap();
+        assert_eq!(reloaded.todotracker, original);
+        assert_eq!(reloaded.resolve_todo_tracker().width, 40);
+        assert_eq!(
+            pane.status.as_deref(),
+            Some(crate::i18n::t("zc-zerocode-config-invalid-number").as_str())
+        );
+        assert_ne!(
+            pane.status.as_deref(),
+            Some(crate::i18n::t("zc-zerocode-tracker-saved").as_str())
+        );
+    }
+
+    // A zero is parseable but not a usable panel dimension. The pane must
+    // reject it at the edit boundary rather than persisting a value the
+    // resolver would silently floor to `1`, so a reported save always matches
+    // what the next session resolves.
+    #[test]
+    fn tracker_zero_edit_does_not_persist_or_report_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = TodoTrackerSection {
+            width: 40,
+            ..TodoTrackerSection::default()
+        };
+        config::persist_todotracker(dir.path(), &original).unwrap();
+        let mut pane = ZerocodePane::new(dir.path());
+
+        edit_tracker_number(&mut pane, TrackerField::Width, "0");
+
+        let reloaded = config::ensure_and_load(dir.path()).unwrap();
+        assert_eq!(reloaded.todotracker, original);
+        assert_eq!(reloaded.resolve_todo_tracker().width, 40);
+        assert_eq!(
+            pane.status.as_deref(),
+            Some(crate::i18n::t("zc-zerocode-config-positive-required").as_str())
+        );
+        assert_ne!(
+            pane.status.as_deref(),
+            Some(crate::i18n::t("zc-zerocode-tracker-saved").as_str())
+        );
+    }
+
+    // A valid edit must land on disk verbatim and resolve to the same value,
+    // so the success status is only shown when the stored value is exactly
+    // what the next session will consume.
+    #[test]
+    fn valid_tracker_edit_persists_exact_session_consumed_value() {
+        let dir = tempfile::tempdir().unwrap();
+        config::persist_todotracker(dir.path(), &TodoTrackerSection::default()).unwrap();
+        let mut pane = ZerocodePane::new(dir.path());
+
+        edit_tracker_number(&mut pane, TrackerField::Width, "52");
+
+        let reloaded = config::ensure_and_load(dir.path()).unwrap();
+        assert_eq!(reloaded.todotracker.width, 52);
+        assert_eq!(reloaded.resolve_todo_tracker().width, 52);
+        assert_eq!(pane.tracker.width, 52);
+        assert_eq!(
+            pane.status.as_deref(),
+            Some(crate::i18n::t("zc-zerocode-tracker-saved").as_str())
+        );
+    }
+
+    // A save writes to disk correctly, but runtime sessions resolve through
+    // `ensure_and_load`, which layers `ZEROCODE_todotracker__*` overrides on
+    // top. When such an override shadows the saved field, the pane must not
+    // promise that new sessions will use the just-saved value — it reports the
+    // env-override status instead so the feedback stays truthful.
+    #[test]
+    fn tracker_save_reports_env_override_when_active() {
+        let _guard = crate::test_support::env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        config::persist_todotracker(dir.path(), &TodoTrackerSection::default()).unwrap();
+        let mut pane = ZerocodePane::new(dir.path());
+
+        // An override pins width to 77 for every resolved session.
+        let _v = crate::test_support::EnvVarGuard::set("ZEROCODE_todotracker__width", "77");
+
+        // The user saves width 52. It lands on disk verbatim...
+        edit_tracker_number(&mut pane, TrackerField::Width, "52");
+        assert_eq!(
+            config::load_persisted(dir.path())
+                .unwrap()
+                .todotracker
+                .width,
+            52
+        );
+        // ...but the next session still resolves 77 via the override, so the
+        // feedback must say so rather than claim sessions will use 52.
+        assert_eq!(
+            config::ensure_and_load(dir.path())
+                .unwrap()
+                .resolve_todo_tracker()
+                .width,
+            77
+        );
+        assert_eq!(
+            pane.status.as_deref(),
+            Some(crate::i18n::t("zc-zerocode-tracker-saved-env-override").as_str())
+        );
+        assert_ne!(
+            pane.status.as_deref(),
+            Some(crate::i18n::t("zc-zerocode-tracker-saved").as_str())
+        );
+    }
+
+    // Without an active override the ordinary success message stands: the
+    // saved value is exactly what the next session resolves.
+    #[test]
+    fn tracker_save_reports_plain_success_without_override() {
+        let _guard = crate::test_support::env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        config::persist_todotracker(dir.path(), &TodoTrackerSection::default()).unwrap();
+        let mut pane = ZerocodePane::new(dir.path());
+
+        edit_tracker_number(&mut pane, TrackerField::Width, "52");
+
+        assert_eq!(
+            config::ensure_and_load(dir.path())
+                .unwrap()
+                .resolve_todo_tracker()
+                .width,
+            52
+        );
+        assert_eq!(
+            pane.status.as_deref(),
+            Some(crate::i18n::t("zc-zerocode-tracker-saved").as_str())
+        );
+    }
+
+    // When the effective resolution itself fails (here: a bogus, hard-erroring
+    // ZEROCODE_todotracker__* override), a disk write still succeeds — but the
+    // pane must not claim "New Code sessions will use this", because the next
+    // session's resolution errors. It reports the distinct resolve-error status.
+    #[test]
+    fn tracker_save_reports_resolve_error_when_effective_resolution_fails() {
+        let _guard = crate::test_support::env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        config::persist_todotracker(dir.path(), &TodoTrackerSection::default()).unwrap();
+        let mut pane = ZerocodePane::new(dir.path());
+
+        // An unknown override makes ensure_and_load hard-error.
+        let _v = crate::test_support::EnvVarGuard::set("ZEROCODE_todotracker__nope", "1");
+        assert!(
+            config::ensure_and_load(dir.path()).is_err(),
+            "precondition: the bogus override should make effective resolution fail"
+        );
+
+        edit_tracker_number(&mut pane, TrackerField::Width, "52");
+
+        // The edit still lands on disk...
+        assert_eq!(
+            config::load_persisted(dir.path())
+                .unwrap()
+                .todotracker
+                .width,
+            52
+        );
+        // ...but the status reflects the resolution failure, not plain success.
+        assert_eq!(
+            pane.status.as_deref(),
+            Some(crate::i18n::t("zc-zerocode-tracker-saved-resolve-error").as_str())
+        );
+        assert_ne!(
+            pane.status.as_deref(),
+            Some(crate::i18n::t("zc-zerocode-tracker-saved").as_str())
+        );
+    }
+
     #[test]
     fn locale_tab_never_claims_text_input() {
         let dir = tempfile::tempdir().unwrap();
