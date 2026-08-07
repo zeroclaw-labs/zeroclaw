@@ -24,6 +24,23 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
 
+# ── Runner selection: closed Blacksmith toggle (compile-heavy jobs) ─────────
+# The seven Rust-compiling jobs below (lint, build, check, check-plugin-backends,
+# check-32bit, bench, test) and the Linux `build` matrix entry pick their runner
+# from a single boolean Actions variable, mapped here to two pinned choices only:
+#   • CI_USE_BLACKSMITH == 'true'        → blacksmith-8vcpu-ubuntu-2404 (pinned in-workflow)
+#   • any other value / unset (default)  → GitHub-hosted ubuntu-latest (today's behavior)
+# The label is hard-coded in this reviewed workflow, so a mutable repo variable can only
+# flip between these two vetted runners — it can never redirect a required check to an
+# arbitrary runner without a `.github/**` review. An unexpected value fails safe to
+# ubuntu-latest. Only the boolean toggle is operator-controlled.
+#
+# PRECONDITION before setting CI_USE_BLACKSMITH=true: an org admin must DISABLE Blacksmith
+# triggerer SSH (Blacksmith → Settings → Features → SSH Access) so a green required check
+# attests only the reviewed commit, and that control must be attested in review. Requires
+# the Blacksmith GitHub App installed on the org; never set the toggle while the App is
+# uninstalled or these jobs queue with no runner (~24h) instead of failing fast.
+
 jobs:
   # ── Fast serial gate: fail formatting errors before burning compute ───────
 
@@ -89,7 +106,7 @@ jobs:
   lint:
     name: Lint
     needs: [fmt]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -271,7 +288,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
             target: x86_64-unknown-linux-gnu
             cmd: build
             label: Build
@@ -341,7 +358,7 @@ jobs:
   check:
     name: Check (${{ matrix.name }})
     needs: [fmt]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 20
     env:
       RUSTFLAGS: ${{ matrix.rustflags }}
@@ -378,7 +395,7 @@ jobs:
   check-plugin-backends:
     name: Check (${{ matrix.name }})
     needs: [fmt]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -470,7 +487,7 @@ jobs:
   check-32bit:
     name: Check (32-bit)
     needs: [fmt]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -493,7 +510,7 @@ jobs:
   bench:
     name: Benchmarks Compile
     needs: [fmt]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -547,7 +564,7 @@ jobs:
   test:
     name: Test
     needs: [fmt]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
