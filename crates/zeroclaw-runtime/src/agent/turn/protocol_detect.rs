@@ -3,7 +3,8 @@
 use std::collections::HashSet;
 use zeroclaw_tool_call_parser::{
     ParsedToolCall, ToolProtocolEnvelopeKind, classify_tool_protocol_envelope,
-    contains_tool_protocol_tag_call, looks_like_malformed_tool_protocol_envelope,
+    contains_tool_protocol_tag_call, contains_truncated_fullwidth_dsml_envelope,
+    looks_like_malformed_tool_protocol_envelope,
     looks_like_malformed_tool_protocol_envelope_for_known_tools, looks_like_tool_protocol_envelope,
     looks_like_tool_protocol_example, tool_protocol_envelope_mentions_known_tool,
 };
@@ -260,6 +261,35 @@ pub(crate) fn protocol_envelope_end(text: &str, start: usize) -> Option<usize> {
     None
 }
 
+pub(crate) fn trailing_partial_close_fragment(chunk: &str) -> Option<&str> {
+    let rel = chunk.rfind("</")?;
+    let fragment = &chunk[rel..];
+    if fragment.contains('>') {
+        return None;
+    }
+    let lower = fragment.to_ascii_lowercase();
+    [
+        "</|dsml|",
+        "</|tool_call|",
+        "</tool_call",
+        "</tool_calls",
+        "</toolcall",
+        "</tool-call",
+        "</invoke",
+        "</function",
+        "</minimax:tool_call",
+        "</minimax:toolcall",
+        "</｜dsml｜",
+        "</＼dsml＼",
+        "</｜",
+        "</＼",
+        "</|",
+    ]
+    .iter()
+    .any(|prefix| lower.starts_with(prefix))
+    .then_some(fragment)
+}
+
 pub(crate) fn suppressed_continuation_trailing(chunk: &str) -> Option<&str> {
     let lead = chunk.len() - chunk.trim_start().len();
     let body = &chunk[lead..];
@@ -389,6 +419,7 @@ pub(crate) fn detect_tool_call_parse_issue_for_known_tools(
 
     if looks_like_malformed_tool_protocol_envelope_for_known_tools(trimmed, known_tool_names)
         || contains_tool_protocol_tag_call(trimmed)
+        || contains_truncated_fullwidth_dsml_envelope(trimmed)
     {
         return Some(message.into());
     }

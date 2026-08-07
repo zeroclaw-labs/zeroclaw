@@ -5,6 +5,7 @@ use super::protocol_detect::{
     find_embedded_protocol_candidate_start, find_incomplete_protocol_candidate_start,
     longest_suffix_matching_prefix, protocol_envelope_end, starts_suspicious_protocol_prefix,
     starts_suspicious_tag_or_fence_prefix, suppressed_continuation_trailing,
+    trailing_partial_close_fragment,
 };
 use std::collections::HashSet;
 use zeroclaw_tool_call_parser::{
@@ -19,6 +20,7 @@ pub(crate) struct StreamTextGuard {
     // deltas. Buffer just that prefix until it is clearly protocol or normal JSON.
     pending: String,
     pending_candidate_start: Option<usize>,
+    pending_partial_close: String,
     known_tool_names: HashSet<String>,
     has_active_tools: bool,
     pub(crate) suppress_forwarding: bool,
@@ -40,6 +42,26 @@ impl StreamTextGuard {
     }
 
     pub(crate) fn push(&mut self, chunk: &str) -> Option<String> {
+        let mut chunk = chunk.to_string();
+        if !self.pending_partial_close.is_empty() {
+            self.pending_partial_close.push_str(&chunk);
+            chunk = std::mem::take(&mut self.pending_partial_close);
+        }
+        if let Some(fragment) = trailing_partial_close_fragment(&chunk) {
+            let (head, tail) = chunk.split_at(chunk.len() - fragment.len());
+            self.pending_partial_close = tail.to_string();
+            let release = if head.is_empty() {
+                None
+            } else {
+                self.push_impl(head)
+            };
+            self.suppress_forwarding = true;
+            return release;
+        }
+        self.push_impl(&chunk)
+    }
+
+    fn push_impl(&mut self, chunk: &str) -> Option<String> {
         if self.suppress_forwarding {
             if self.pending.is_empty() && self.continuation_of_suppressed_protocol(chunk) {
                 return suppressed_continuation_trailing(chunk).map(str::to_string);
@@ -56,6 +78,17 @@ impl StreamTextGuard {
                 self.pending.push_str(&chunk[start..]);
                 return if self.should_suppress_protocol_candidate(&self.pending) {
                     self.suppress_protocol(&chunk[..start])
+                } else if self.suppressed_protocol {
+                    // A prior complete envelope was already suppressed; any
+                    // narration before a new (still incomplete) protocol
+                    // candidate is user-visible text and must be released now
+                    // rather than buffered until that candidate resolves.
+                    let narration = chunk[..start].trim();
+                    if narration.is_empty() {
+                        None
+                    } else {
+                        Some(narration.to_string())
+                    }
                 } else {
                     self.pending.insert_str(0, &chunk[..start]);
                     self.pending_candidate_start = Some(start);
@@ -75,6 +108,7 @@ impl StreamTextGuard {
     }
 
     pub(crate) fn finish(&mut self) -> Option<String> {
+        self.pending_partial_close.clear();
         self.suppress_forwarding = false;
         if self.pending.is_empty() {
             return None;
@@ -480,6 +514,38 @@ mod tests {
     }
 
     #[test]
+    fn sequential_envelopes_release_narration_when_next_envelope_starts() {
+        let mut guard = shell_guard();
+
+        assert_eq!(
+            guard.push(
+                "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"shell\"><｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter></｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+            ),
+            None,
+            "first envelope must be suppressed"
+        );
+        assert_eq!(
+            guard.push("\nDone step one.\n<｜DSML｜tool_calls>\n"),
+            Some("Done step one.".to_string()),
+            "narration after a suppressed envelope is released as soon as the next envelope starts"
+        );
+        assert_eq!(
+            guard.push(
+                "<｜DSML｜invoke name=\"shell\"><｜DSML｜parameter name=\"command\" string=\"true\">pwd</｜DSML｜parameter></｜DSML｜invoke>\n"
+            ),
+            None,
+            "second envelope body must be buffered"
+        );
+        assert_eq!(
+            guard.push("</｜DSML｜tool_calls>"),
+            None,
+            "second envelope must be suppressed"
+        );
+        assert_eq!(guard.push("\nAll done."), Some("\nAll done.".to_string()));
+        assert_eq!(guard.finish(), None);
+    }
+
+    #[test]
     fn forwards_plain_text_with_fullwidth_dsml_prefixes() {
         let mut guard = shell_guard();
 
@@ -720,6 +786,54 @@ mod tests {
             guard.push("</＼DSML＼invoke>\n</＼DSML＼tool_calls>"),
             Some("I will run it.".to_string())
         );
+        assert_eq!(guard.finish(), None);
+        assert!(guard.suppressed_protocol);
+    }
+
+    #[test]
+    fn split_fullwidth_close_tag_across_chunks_suppresses_fragment() {
+        let mut guard = shell_guard();
+
+        assert_eq!(guard.push("<｜DSML｜tool_calls>\n"), None);
+        assert_eq!(guard.push("<｜DSML｜invoke name=\"shell\">\n"), None);
+        assert_eq!(
+            guard.push(
+                "<｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter>\n</｜DSML｜invoke>\n"
+            ),
+            None
+        );
+        // The wrapper close tag is split mid-token: `</｜DSML｜tool_cal` alone.
+        assert_eq!(guard.push("</｜DSML｜tool_cal"), None);
+        assert_eq!(
+            guard.push("ls> Done!"),
+            Some("Done!".to_string()),
+            "the completing chunk must forward only the trailing text, never the split tag tail"
+        );
+
+        assert_eq!(guard.finish(), None);
+        assert!(
+            guard.suppressed_protocol,
+            "fullwidth DSML envelope must be suppressed when its close tag splits across chunks"
+        );
+    }
+
+    #[test]
+    fn split_ascii_close_tag_across_chunks_suppresses_fragment() {
+        let mut guard = shell_guard();
+
+        assert_eq!(guard.push("<|DSML|>"), None);
+        assert_eq!(guard.push("\n{\"name\":\"shell\""), None);
+        assert_eq!(guard.push(",\"arguments\":{\"cmd\":\"ls\"}}"), None);
+        assert_eq!(guard.push("\n</|DSML|>"), None);
+
+        // A fresh close-tag fragment after suppression must not forward its tail.
+        assert_eq!(guard.push("</|DSML|"), None);
+        assert_eq!(
+            guard.push("> Done!"),
+            Some("Done!".to_string()),
+            "only the trailing text after the completed close tag may be forwarded"
+        );
+
         assert_eq!(guard.finish(), None);
         assert!(guard.suppressed_protocol);
     }
