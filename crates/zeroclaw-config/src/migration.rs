@@ -1379,6 +1379,84 @@ vision_model_provider = "openai-codex"
     }
 
     #[test]
+    fn v2_globals_created_vision_target_with_second_family_stays_bare() {
+        // The maintainer's exact repro: global credentials, two migrated
+        // canonical families (`openai` via openai-codex, `opencode` via
+        // opencode-go), no `default_provider`, and a bare `openai` vision
+        // reference. The fold must NOT claim whichever `keys().next()` family
+        // iteration selects as the producer of a globals-created `default`
+        // alias — nothing ties the unowned credential to it. The target stays
+        // ambiguous so the bare reference is not rewritten to a slot holding a
+        // credential with no stated owner.
+        let raw = r#"
+schema_version = 2
+
+[providers]
+api_key = "global-key"
+default_model = "vision-model"
+
+[providers.models.openai-codex]
+
+[providers.models.opencode-go]
+
+[multimodal]
+vision_model_provider = "openai"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("openai"),
+            "a globals-created target across multiple families must stay bare"
+        );
+        let alias = cfg
+            .providers
+            .models
+            .find("openai", "default")
+            .expect("globals still fold into the first family's default alias");
+        assert_eq!(alias.api_key.as_deref(), Some("global-key"));
+        assert_eq!(alias.model.as_deref(), Some("vision-model"));
+    }
+
+    #[test]
+    fn v2_globals_augmented_vision_target_with_second_family_stays_bare() {
+        // The sibling overlay case: an existing `openai.default` producer
+        // lacks a key, a second canonical family (`opencode`) exists, and no
+        // `default_provider` says the global credential belongs to `openai`.
+        // The globals fill the alias's key, but the slot must not be treated
+        // as single-owner: a bare `openai` reference would consume a global
+        // credential that has no stated owner, so the target stays ambiguous
+        // and the reference stays bare.
+        let raw = r#"
+schema_version = 2
+
+[providers]
+api_key = "global-key"
+default_model = "vision-model"
+
+[providers.models.openai]
+model = "m"
+
+[providers.models.opencode-go]
+api_key = "sk-opencode-test"
+
+[multimodal]
+vision_model_provider = "openai"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("openai"),
+            "a globals-augmented target across multiple families must stay bare"
+        );
+        let alias = cfg
+            .providers
+            .models
+            .find("openai", "default")
+            .expect("openai.default must exist");
+        assert_eq!(alias.api_key.as_deref(), Some("global-key"));
+    }
+
+    #[test]
     fn v2_dot_bearing_legacy_vision_reference_migrates() {
         // `llama.cpp` carries a dot but is a legacy synonym for the llamacpp
         // family; the rewrite must not early-return on the dot.
