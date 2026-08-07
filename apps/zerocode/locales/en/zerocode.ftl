@@ -35,6 +35,7 @@ zc-app-reload-status-signalled = Daemon reload signalled — reconnecting…
 zc-app-reload-confirm-row = { $confirm_chord } = reload   { $cancel_chord } = cancel
 zc-error-daemon-version-mismatch = Version mismatch: zerocode is { $client_version } but the daemon is { $server_version }. Rebuild and restart the daemon from the same checkout as zerocode.
 zc-error-daemon-initialize-timeout = zerocode connected to the daemon, but initialization did not finish within { $seconds }s. Restart the daemon and try again.
+zc-error-spawned-daemon-startup = zerocode started an ephemeral daemon, but it failed to become ready: { $details }
 
 zc-zerocode-tab-theme = Theme
 zc-zerocode-tab-agent-theme = Agent Themes
@@ -109,6 +110,10 @@ zc-input-attach-error = Attach error: { $error }
 zc-input-detached = Detached: { $name }
 zc-input-invalid-index = Invalid index: { $index }
 zc-input-pending-attachments-header = Pending attachments:
+zc-input-attachment-manager-title = Pending attachments ({ $count })
+zc-input-attachment-manager-hint = { $navigate } select · { $remove } remove · { $close } close · /detach N
+zc-input-help-attachment-remove = Remove attachment
+zc-input-help-attachment-detach = Remove by index
 zc-input-clipboard-error = Clipboard error: { $error }
 
 zc-queue-empty = Nothing to send.

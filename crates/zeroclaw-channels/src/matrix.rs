@@ -230,9 +230,13 @@ mod approval {
             return None;
         }
         let response = match verb.as_str() {
-            "approve" | "yes" | "y" => ChannelApprovalResponse::Approve,
-            "deny" | "no" | "n" => ChannelApprovalResponse::Deny,
-            "always" => ChannelApprovalResponse::AlwaysApprove,
+            crate::util::APPROVAL_REPLY_APPROVE
+            | crate::util::APPROVAL_REPLY_YES
+            | crate::util::APPROVAL_REPLY_YES_SHORT => ChannelApprovalResponse::Approve,
+            crate::util::APPROVAL_REPLY_DENY
+            | crate::util::APPROVAL_REPLY_NO
+            | crate::util::APPROVAL_REPLY_NO_SHORT => ChannelApprovalResponse::Deny,
+            crate::util::APPROVAL_REPLY_ALWAYS => ChannelApprovalResponse::AlwaysApprove,
             _ => return None,
         };
         Some((token.to_uppercase(), response))
@@ -1467,7 +1471,15 @@ mod inbound {
         pub undecryptable_seen: Arc<TokioMutex<HashSet<OwnedEventId>>>,
     }
 
-    pub(super) async fn run_sync_loop(client: Client, ctx: HandlerCtx) -> anyhow::Result<()> {
+    /// Register the inbound event handlers on `client`. The returned guards
+    /// keep the handlers alive; drop them to deregister.
+    pub(super) fn register_event_handlers(
+        client: &Client,
+        ctx: &HandlerCtx,
+    ) -> (
+        matrix_sdk::event_handler::EventHandlerDropGuard,
+        matrix_sdk::event_handler::EventHandlerDropGuard,
+    ) {
         let handler_ctx = ctx.clone();
         let message_handler = client.add_event_handler(
             move |ev: OriginalSyncRoomMessageEvent, room: Room, raw: RawEvent| {
@@ -1488,7 +1500,7 @@ mod inbound {
                 }
             },
         );
-        let _message_handler_guard = client.event_handler_drop_guard(message_handler);
+        let message_guard = client.event_handler_drop_guard(message_handler);
 
         // Surface inbound events the SDK couldn't decrypt by reacting ❓ on
         // the encrypted event so the operator notices a key gap in chat
@@ -1502,7 +1514,14 @@ mod inbound {
                     handle_undecryptable(ctx, ev, room).await;
                 }
             });
-        let _encrypted_handler_guard = client.event_handler_drop_guard(encrypted_handler);
+        let encrypted_guard = client.event_handler_drop_guard(encrypted_handler);
+
+        (message_guard, encrypted_guard)
+    }
+
+    pub(super) async fn run_sync_loop(client: Client, ctx: HandlerCtx) -> anyhow::Result<()> {
+        let (_message_handler_guard, _encrypted_handler_guard) =
+            register_event_handlers(&client, &ctx);
 
         ::zeroclaw_log::record!(
             INFO,
@@ -1701,12 +1720,14 @@ mod inbound {
                 } else {
                     MediaCategory::Audio
                 };
-                Some(MediaInfo::new(
-                    m.source.clone(),
-                    m.body.clone(),
-                    m.info.as_ref().and_then(|i| i.mimetype.clone()),
-                    kind,
-                ))
+                let mime = m.info.as_ref().and_then(|i| i.mimetype.clone());
+                let file_name = m
+                    .filename
+                    .as_deref()
+                    .filter(|f| !f.is_empty())
+                    .unwrap_or(&m.body)
+                    .to_string();
+                Some(MediaInfo::new(m.source.clone(), file_name, mime, kind))
             }
             _ => None,
         };
@@ -1909,7 +1930,9 @@ mod inbound {
 
                 if should_transcribe(&info.kind, transcription) {
                     let t = transcription.expect("should_transcribe guarantees Some");
-                    match transcribe_from_disk(t, &path, &info.file_name).await {
+                    let transcribe_name =
+                        transcription_safe_filename(&info.file_name, info.mime.as_deref());
+                    match transcribe_from_disk(t, &path, &transcribe_name).await {
                         Ok(text) if !text.trim().is_empty() => {
                             content = format!("[voice transcript]: {text}\n\n{content}");
                         }
@@ -1956,27 +1979,30 @@ mod inbound {
             "m.file" => MediaCategory::File,
             _ => return None,
         };
-        let file_name = content
+        let body_str = content
             .get("body")
             .and_then(|b| b.as_str())
-            .unwrap_or("attachment")
-            .to_string();
+            .unwrap_or("attachment");
+        let filename_field = content.get("filename").and_then(|f| f.as_str());
         let mime = content
             .get("info")
             .and_then(|i| i.get("mimetype"))
-            .and_then(|m| m.as_str())
-            .map(String::from);
+            .and_then(|m| m.as_str());
+        let file_name = filename_field
+            .filter(|f| !f.is_empty())
+            .unwrap_or(body_str)
+            .to_string();
+        let mime = mime.map(String::from);
         let source = if let Some(file) = content.get("file") {
             // Encrypted media: rebuild MediaSource::Encrypted from JSON.
             let encrypted: matrix_sdk::ruma::events::room::EncryptedFile =
                 serde_json::from_value(file.clone()).ok()?;
             matrix_sdk::ruma::events::room::MediaSource::Encrypted(Box::new(encrypted))
-        } else if let Some(url) = content.get("url").and_then(|u| u.as_str()) {
+        } else {
+            let url = content.get("url").and_then(|u| u.as_str())?;
             matrix_sdk::ruma::events::room::MediaSource::Plain(matrix_sdk::ruma::OwnedMxcUri::from(
                 url,
             ))
-        } else {
-            return None;
         };
         Some(MediaInfo::new(source, file_name, mime, kind))
     }
@@ -2117,15 +2143,17 @@ mod inbound {
 
     fn default_extension(kind: &MediaCategory, mime: Option<&str>) -> &'static str {
         if let Some(m) = mime {
-            match m {
+            // Audio MIMEs resolve through the canonical transcription-side
+            // mapping; non-audio types are display/on-disk naming only.
+            if let Some(ext) = crate::transcription::extension_for_audio_mime(m) {
+                return ext;
+            }
+            match m.split(';').next().unwrap_or(m).trim() {
                 "image/png" => return "png",
                 "image/jpeg" | "image/jpg" => return "jpg",
                 "image/gif" => return "gif",
                 "image/webp" => return "webp",
                 "video/mp4" => return "mp4",
-                "audio/ogg" => return "ogg",
-                "audio/mpeg" | "audio/mp3" => return "mp3",
-                "audio/wav" => return "wav",
                 "application/pdf" => return "pdf",
                 _ => {}
             }
@@ -2135,6 +2163,24 @@ mod inbound {
             MediaCategory::Video => "mp4",
             MediaCategory::Audio | MediaCategory::Voice => "ogg",
             MediaCategory::File => "bin",
+        }
+    }
+
+    /// Internal name for `transcribe()` only — never stored or shown.
+    /// Preserves a name whose extension the resolver accepts; substitutes a
+    /// MIME-derived stand-in only when the MIME maps to an accepted format;
+    /// otherwise passes the unsupported name through so the resolver rejects
+    /// it locally before any request is sent.
+    pub(super) fn transcription_safe_filename(file_name: &str, mime: Option<&str>) -> String {
+        let ext_accepted = file_name
+            .rsplit_once('.')
+            .is_some_and(|(_, ext)| crate::transcription::mime_for_audio(ext).is_some());
+        if ext_accepted {
+            return file_name.to_string();
+        }
+        match mime.and_then(crate::transcription::extension_for_audio_mime) {
+            Some(ext) => format!("attachment.{ext}"),
+            None => file_name.to_string(),
         }
     }
 
@@ -2174,8 +2220,24 @@ mod inbound {
             );
             anyhow::Error::msg(format!("read {}: {e}", path.display()))
         })?;
-        let manager = TranscriptionManager::new(config)?;
+        let manager = build_transcription_manager(config)?;
         manager.transcribe(&bytes, file_name).await
+    }
+
+    /// Binds the sole registered provider as the agent alias when exactly one
+    /// is configured; multi-provider setups keep the alias empty (unsupported).
+    pub(super) fn build_transcription_manager(
+        config: &TranscriptionConfig,
+    ) -> anyhow::Result<TranscriptionManager> {
+        let manager = TranscriptionManager::new(config)?;
+        let sole_provider = match manager.available_providers().as_slice() {
+            [only] => Some((*only).to_string()),
+            _ => None,
+        };
+        Ok(match sole_provider {
+            Some(alias) => manager.with_agent_transcription_provider(alias),
+            None => manager,
+        })
     }
 }
 
@@ -3730,15 +3792,29 @@ impl Channel for MatrixChannel {
         Ok(())
     }
 
+    /// Delegates to [`Self::request_approval_attributed`] and drops the
+    /// provenance, so the prompt/timeout logic lives in exactly one place.
     async fn request_approval(
         &self,
         recipient: &str,
         request: &ChannelApprovalRequest,
     ) -> Result<Option<ChannelApprovalResponse>> {
+        Ok(self
+            .request_approval_attributed(recipient, request)
+            .await?
+            .map(|attributed| attributed.response))
+    }
+
+    async fn request_approval_attributed(
+        &self,
+        recipient: &str,
+        request: &ChannelApprovalRequest,
+    ) -> Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
         let token = approval::generate_token_default();
-        let prompt = format!(
-            "APPROVAL REQUIRED [{token}]\nTool: {}\nArgs: {}\n\nReply `{token} approve` / `{token} deny` / `{token} always`.",
-            request.tool_name, request.arguments_summary
+        let prompt = crate::util::build_approve_deny_approval_prompt(
+            &token,
+            &request.tool_name,
+            &request.arguments_summary,
         );
 
         let (tx, rx) = oneshot::channel();
@@ -3758,10 +3834,24 @@ impl Channel for MatrixChannel {
         if result.is_err() {
             self.pending_approvals.lock().await.remove(&token);
         }
+        // Only the first arm is an operator decision; the other two are the
+        // runtime denying because nobody replied, and must say so.
         match result {
-            Ok(Ok(resp)) => Ok(Some(resp)),
-            Ok(Err(_)) => Ok(Some(ChannelApprovalResponse::Deny)),
-            Err(_) => Ok(Some(ChannelApprovalResponse::Deny)),
+            Ok(Ok(resp)) => Ok(Some(
+                zeroclaw_api::channel::AttributedApprovalResponse::operator(resp),
+            )),
+            Ok(Err(_)) => Ok(Some(
+                zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                    ChannelApprovalResponse::Deny,
+                    zeroclaw_api::channel::ApprovalSource::Unreachable,
+                ),
+            )),
+            Err(_) => Ok(Some(
+                zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                    ChannelApprovalResponse::Deny,
+                    zeroclaw_api::channel::ApprovalSource::TimedOut,
+                ),
+            )),
         }
     }
 }
@@ -3779,6 +3869,698 @@ fn streaming_key(recipient: &str, message_id: &str) -> Result<streaming::DraftKe
 // ─── tests ─────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
+    mod transcription_provider_resolution {
+        use super::super::inbound::build_transcription_manager;
+        use zeroclaw_config::schema::TranscriptionConfig;
+
+        fn local_whisper_config(url: &str) -> zeroclaw_config::schema::LocalWhisperConfig {
+            zeroclaw_config::schema::LocalWhisperConfig {
+                url: url.to_string(),
+                bearer_token: Some("test-token".to_string()),
+                max_audio_bytes: 10 * 1024 * 1024,
+                timeout_secs: 30,
+            }
+        }
+
+        #[tokio::test]
+        async fn binds_alias_when_exactly_one_provider_is_configured() {
+            let config = TranscriptionConfig {
+                enabled: true,
+                local_whisper: Some(local_whisper_config("http://127.0.0.1:9999/v1/transcribe")),
+                ..TranscriptionConfig::default()
+            };
+
+            let manager = build_transcription_manager(&config).unwrap();
+            assert_eq!(
+                manager.available_providers(),
+                vec!["local_whisper"],
+                "fixture must register exactly one provider"
+            );
+
+            let err = manager
+                .transcribe(b"not-real-audio", "voice.aiff")
+                .await
+                .expect_err("an unsupported format must be rejected");
+            assert!(
+                !err.to_string()
+                    .contains("Agent has no transcription_provider configured"),
+                "expected dispatch to the sole provider, got the empty-alias bail: {err}"
+            );
+            assert!(
+                err.to_string().contains("Unsupported audio format"),
+                "expected the dispatched provider to reject the format, got: {err}"
+            );
+        }
+
+        #[tokio::test]
+        async fn leaves_alias_unbound_when_multiple_providers_are_configured() {
+            let config = TranscriptionConfig {
+                enabled: true,
+                api_key: Some("test-groq-key".to_string()),
+                local_whisper: Some(local_whisper_config("http://127.0.0.1:9999/v1/transcribe")),
+                ..TranscriptionConfig::default()
+            };
+
+            let manager = build_transcription_manager(&config).unwrap();
+            assert!(
+                manager.available_providers().len() > 1,
+                "fixture must register more than one provider, got {:?}",
+                manager.available_providers()
+            );
+
+            let err = manager
+                .transcribe(b"not-real-audio", "voice.ogg")
+                .await
+                .expect_err("an unbound alias must fail");
+            assert!(
+                err.to_string()
+                    .contains("Agent has no transcription_provider configured"),
+                "expected the empty-alias bail, got: {err}"
+            );
+        }
+    }
+
+    mod media_filename_resolution {
+        use super::super::inbound::{build_transcription_manager, transcription_safe_filename};
+        use zeroclaw_config::schema::TranscriptionConfig;
+
+        fn local_whisper_config(url: &str) -> zeroclaw_config::schema::LocalWhisperConfig {
+            zeroclaw_config::schema::LocalWhisperConfig {
+                url: url.to_string(),
+                bearer_token: Some("test-token".to_string()),
+                max_audio_bytes: 10 * 1024 * 1024,
+                timeout_secs: 30,
+            }
+        }
+
+        #[test]
+        fn unaccepted_extension_with_supported_mime_uses_mime_derived_name() {
+            let resolved = transcription_safe_filename("recording.bin", Some("audio/ogg"));
+            assert_eq!(resolved, "attachment.ogg");
+        }
+
+        #[test]
+        fn accepted_extension_is_preserved_even_when_mime_differs() {
+            let resolved = transcription_safe_filename("recording.mp3", Some("audio/ogg"));
+            assert_eq!(resolved, "recording.mp3");
+        }
+
+        #[test]
+        fn accepted_extension_matching_mime_is_passed_through_unchanged() {
+            let resolved = transcription_safe_filename("recording.ogg", Some("audio/ogg"));
+            assert_eq!(resolved, "recording.ogg");
+        }
+
+        #[test]
+        fn accepted_extension_is_matched_case_insensitively() {
+            let resolved = transcription_safe_filename("recording.OGG", Some("audio/ogg"));
+            assert_eq!(resolved, "recording.OGG");
+        }
+
+        #[test]
+        fn oga_extension_is_accepted_and_preserved() {
+            let resolved = transcription_safe_filename("note.oga", Some("audio/ogg"));
+            assert_eq!(resolved, "note.oga");
+        }
+
+        #[test]
+        fn no_mime_with_an_accepted_extension_is_passed_through() {
+            let resolved = transcription_safe_filename("recording.mp3", None);
+            assert_eq!(resolved, "recording.mp3");
+        }
+
+        #[test]
+        fn unaccepted_extension_with_no_mime_is_preserved_for_local_rejection() {
+            let resolved = transcription_safe_filename("recording.bin", None);
+            assert_eq!(resolved, "recording.bin");
+        }
+
+        #[test]
+        fn no_mime_and_no_extension_is_preserved_for_local_rejection() {
+            let resolved = transcription_safe_filename("Meeting recap", None);
+            assert_eq!(resolved, "Meeting recap");
+        }
+
+        #[test]
+        fn unsupported_mime_and_extension_are_preserved() {
+            let resolved = transcription_safe_filename("recording.aac", Some("audio/aac"));
+            assert_eq!(resolved, "recording.aac");
+        }
+
+        #[test]
+        fn synthesizes_extension_from_mime_when_no_extension_at_all() {
+            let resolved = transcription_safe_filename("Voice message", Some("audio/ogg"));
+            assert_eq!(resolved, "attachment.ogg");
+        }
+
+        #[tokio::test]
+        async fn caption_only_body_reaches_provider_dispatch_not_format_rejection() {
+            let config = TranscriptionConfig {
+                enabled: true,
+                local_whisper: Some(local_whisper_config("http://127.0.0.1:9999/v1/transcribe")),
+                ..TranscriptionConfig::default()
+            };
+            let manager = build_transcription_manager(&config).unwrap();
+
+            let file_name = transcription_safe_filename("Voice message", Some("audio/ogg"));
+
+            let err = manager
+                .transcribe(b"not-real-audio", &file_name)
+                .await
+                .expect_err("fixture audio bytes are not real, dispatch must still fail");
+            assert!(
+                !err.to_string()
+                    .contains("Agent has no transcription_provider configured"),
+                "expected dispatch to the sole provider, got the empty-alias bail: {err}"
+            );
+            assert!(
+                !err.to_string().contains("Unsupported audio format"),
+                "expected a resolved .ogg filename to pass format validation, got: {err}"
+            );
+        }
+
+        #[tokio::test]
+        async fn unaccepted_extension_reaches_provider_dispatch_not_format_rejection() {
+            let config = TranscriptionConfig {
+                enabled: true,
+                local_whisper: Some(local_whisper_config("http://127.0.0.1:9999/v1/transcribe")),
+                ..TranscriptionConfig::default()
+            };
+            let manager = build_transcription_manager(&config).unwrap();
+
+            let file_name = transcription_safe_filename("recording.bin", Some("audio/ogg"));
+
+            let err = manager
+                .transcribe(b"not-real-audio", &file_name)
+                .await
+                .expect_err("fixture audio bytes are not real, dispatch must still fail");
+            assert!(
+                !err.to_string()
+                    .contains("Agent has no transcription_provider configured"),
+                "expected dispatch to the sole provider, got the empty-alias bail: {err}"
+            );
+            assert!(
+                !err.to_string().contains("Unsupported audio format"),
+                "expected the unaccepted .bin extension to be replaced with the MIME-derived .ogg, got: {err}"
+            );
+        }
+
+        // An unsupported format must be rejected locally by the resolver —
+        // the provider endpoint must see zero requests.
+        #[tokio::test]
+        async fn unsupported_mime_sends_no_request() {
+            use wiremock::matchers::{method, path};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/transcribe"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(0)
+                .mount(&server)
+                .await;
+
+            let config = TranscriptionConfig {
+                enabled: true,
+                local_whisper: Some(local_whisper_config(&format!(
+                    "{}/v1/transcribe",
+                    server.uri()
+                ))),
+                ..TranscriptionConfig::default()
+            };
+            let manager = build_transcription_manager(&config).unwrap();
+
+            let file_name = transcription_safe_filename("recording.aac", Some("audio/aac"));
+            assert_eq!(file_name, "recording.aac");
+
+            let err = manager
+                .transcribe(b"not-real-audio", &file_name)
+                .await
+                .expect_err("unsupported format must be rejected before dispatch");
+            assert!(
+                err.to_string().contains("Unsupported audio format"),
+                "expected local format rejection, got: {err}"
+            );
+            server.verify().await;
+        }
+
+        #[tokio::test]
+        async fn missing_mime_and_extension_sends_no_request() {
+            use wiremock::matchers::{method, path};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/transcribe"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(0)
+                .mount(&server)
+                .await;
+
+            let config = TranscriptionConfig {
+                enabled: true,
+                local_whisper: Some(local_whisper_config(&format!(
+                    "{}/v1/transcribe",
+                    server.uri()
+                ))),
+                ..TranscriptionConfig::default()
+            };
+            let manager = build_transcription_manager(&config).unwrap();
+
+            let file_name = transcription_safe_filename("Voice message", None);
+            assert_eq!(file_name, "Voice message");
+
+            let err = manager
+                .transcribe(b"not-real-audio", &file_name)
+                .await
+                .expect_err("missing format must be rejected before dispatch");
+            assert!(
+                err.to_string().contains("Unsupported audio format"),
+                "expected local format rejection, got: {err}"
+            );
+            server.verify().await;
+        }
+
+        // attach_media only inserts non-empty transcripts.
+        #[tokio::test]
+        async fn caption_only_body_transcript_is_produced_for_insertion() {
+            use wiremock::matchers::{method, path};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            let server = MockServer::start().await;
+
+            Mock::given(method("POST"))
+                .and(path("/v1/transcribe"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"text": "this is the transcribed voice message"}),
+                ))
+                .mount(&server)
+                .await;
+
+            let config = TranscriptionConfig {
+                enabled: true,
+                local_whisper: Some(local_whisper_config(&format!(
+                    "{}/v1/transcribe",
+                    server.uri()
+                ))),
+                ..TranscriptionConfig::default()
+            };
+            let manager = build_transcription_manager(&config).unwrap();
+
+            let file_name = transcription_safe_filename("Voice message", Some("audio/ogg"));
+
+            let text = manager.transcribe(b"fake-audio", &file_name).await.unwrap();
+            assert_eq!(text, "this is the transcribed voice message");
+            assert!(!text.trim().is_empty());
+        }
+
+        #[test]
+        fn transcription_only_name_may_diverge_from_the_real_filename() {
+            let real_filename = "recording.bin";
+            let transcribe_name = transcription_safe_filename(real_filename, Some("audio/ogg"));
+            assert_ne!(transcribe_name, real_filename);
+            assert_eq!(transcribe_name, "attachment.ogg");
+        }
+    }
+
+    // Route-level hermetic coverage: a real (constructed) WAV file travels
+    // event parsing → media download/save → attach_media → transcript
+    // insertion, with only the homeserver and STT provider mocked at HTTP.
+    mod inbound_route {
+        use std::collections::{HashMap, HashSet};
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+
+        use matrix_sdk::ruma::events::AnySyncTimelineEvent;
+        use matrix_sdk::ruma::serde::Raw;
+        use matrix_sdk::ruma::{RoomId, room_id, user_id};
+        use matrix_sdk::test_utils::mocks::MatrixMockServer;
+        use matrix_sdk_test::JoinedRoomBuilder;
+        use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock, mpsc};
+        use wiremock::matchers::{method, path, path_regex};
+        use wiremock::{Mock, ResponseTemplate};
+        use zeroclaw_config::schema::{MatrixConfig, TranscriptionConfig};
+
+        use super::super::inbound::{HandlerCtx, register_event_handlers};
+
+        const TRANSCRIPT: &str = "route level transcript of the voice note";
+
+        fn test_room() -> &'static RoomId {
+            room_id!("!room:localhost")
+        }
+
+        fn timeline_raw(json: &serde_json::Value) -> Raw<AnySyncTimelineEvent> {
+            Raw::new(json).expect("event json").cast_unchecked()
+        }
+
+        async fn recv_forwarded(
+            rx: &mut mpsc::Receiver<zeroclaw_api::channel::ChannelMessage>,
+        ) -> zeroclaw_api::channel::ChannelMessage {
+            tokio::time::timeout(Duration::from_secs(15), rx.recv())
+                .await
+                .expect("inbound message must be forwarded before timeout")
+                .expect("channel must stay open")
+        }
+
+        // 0.1 s of a 440 Hz sine at 16 kHz mono 16-bit PCM: a genuinely
+        // valid, decodable WAV file, generated in-test.
+        fn build_wav() -> Vec<u8> {
+            let sample_rate: u32 = 16_000;
+            let samples: Vec<i16> = (0..(sample_rate / 10))
+                .map(|i| {
+                    let t = i as f32 / sample_rate as f32;
+                    ((t * 440.0 * std::f32::consts::TAU).sin() * f32::from(i16::MAX) * 0.5) as i16
+                })
+                .collect();
+            let data_len = (samples.len() * 2) as u32;
+            let mut wav = Vec::with_capacity(44 + data_len as usize);
+            wav.extend_from_slice(b"RIFF");
+            wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+            wav.extend_from_slice(b"WAVEfmt ");
+            wav.extend_from_slice(&16u32.to_le_bytes());
+            wav.extend_from_slice(&1u16.to_le_bytes());
+            wav.extend_from_slice(&1u16.to_le_bytes());
+            wav.extend_from_slice(&sample_rate.to_le_bytes());
+            wav.extend_from_slice(&(sample_rate * 2).to_le_bytes());
+            wav.extend_from_slice(&2u16.to_le_bytes());
+            wav.extend_from_slice(&16u16.to_le_bytes());
+            wav.extend_from_slice(b"data");
+            wav.extend_from_slice(&data_len.to_le_bytes());
+            for s in &samples {
+                wav.extend_from_slice(&s.to_le_bytes());
+            }
+            wav
+        }
+
+        fn handler_ctx(
+            stt_url: &str,
+            workspace: &std::path::Path,
+            tx: mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> HandlerCtx {
+            HandlerCtx {
+                config: Arc::new(MatrixConfig::default()),
+                alias: "test".to_string(),
+                peer_resolver: Arc::new(|| vec!["*".to_string()]),
+                transcription: Some(Arc::new(TranscriptionConfig {
+                    enabled: true,
+                    local_whisper: Some(zeroclaw_config::schema::LocalWhisperConfig {
+                        url: stt_url.to_string(),
+                        bearer_token: Some("test-token".to_string()),
+                        max_audio_bytes: 10 * 1024 * 1024,
+                        timeout_secs: 30,
+                    }),
+                    ..TranscriptionConfig::default()
+                })),
+                workspace_dir: Some(Arc::new(workspace.to_path_buf())),
+                tx,
+                pending_approvals: Arc::new(TokioMutex::new(HashMap::new())),
+                threads_seen: Arc::new(TokioRwLock::new(HashSet::new())),
+                bot_user_id: user_id!("@bot:localhost").to_owned(),
+                bot_display_name: Arc::new(TokioRwLock::new(None)),
+                initial_sync_done: Arc::new(AtomicBool::new(true)),
+                undecryptable_seen: Arc::new(TokioMutex::new(HashSet::new())),
+            }
+        }
+
+        fn voice_event_json(event_id: &str) -> serde_json::Value {
+            serde_json::json!({
+                "type": "m.room.message",
+                "event_id": event_id,
+                "sender": "@alice:localhost",
+                "origin_server_ts": 1_000_000u64,
+                "content": {
+                    "msgtype": "m.audio",
+                    "body": "Voice message",
+                    "filename": "voice.wav",
+                    "url": "mxc://localhost/audioblob",
+                    "org.matrix.msc3245.voice": {},
+                    "info": { "mimetype": "audio/wav" }
+                }
+            })
+        }
+
+        async fn stt_server() -> wiremock::MockServer {
+            let stt = wiremock::MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/transcribe"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({ "text": TRANSCRIPT })),
+                )
+                .expect(1)
+                .mount(&stt)
+                .await;
+            stt
+        }
+
+        async fn mount_media_download(matrix: &MatrixMockServer, wav: &[u8]) {
+            matrix
+                .mock_media_download()
+                .respond_with(ResponseTemplate::new(200).set_body_raw(wav.to_vec(), "audio/wav"))
+                .mount()
+                .await;
+            matrix
+                .mock_authed_media_download()
+                .ok_bytes(wav.to_vec())
+                .mount()
+                .await;
+        }
+
+        fn assert_stt_received_the_wav(reqs: &[wiremock::Request], wav: &[u8]) {
+            assert_eq!(reqs.len(), 1, "exactly one transcription request");
+            let body = &reqs[0].body;
+            assert!(
+                body.windows(wav.len()).any(|w| w == wav),
+                "request must carry the constructed WAV bytes verbatim"
+            );
+            let text = String::from_utf8_lossy(body);
+            assert!(
+                text.contains("filename=\"voice.wav\""),
+                "part filename: {text}"
+            );
+            assert!(text.contains("audio/wav"), "part content-type: {text}");
+            assert_eq!(&wav[..4], b"RIFF");
+            assert_eq!(&wav[8..12], b"WAVE");
+        }
+
+        #[tokio::test]
+        async fn direct_voice_note_inserts_transcript_and_keeps_real_filename() {
+            let wav = build_wav();
+
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.sync_joined_room(&client, test_room()).await;
+            mount_media_download(&matrix, &wav).await;
+
+            let stt = stt_server().await;
+            let workspace = tempfile::tempdir().unwrap();
+            let (tx, mut rx) = mpsc::channel(4);
+            let ctx = handler_ctx(
+                &format!("{}/v1/transcribe", stt.uri()),
+                workspace.path(),
+                tx,
+            );
+
+            // The production handlers, registered exactly as `run_sync_loop`
+            // does; the event arrives through the real sync-dispatch pipeline.
+            let _guards = register_event_handlers(&client, &ctx);
+            let json = voice_event_json("$audio1:localhost");
+            matrix
+                .sync_room(
+                    &client,
+                    JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(&json)),
+                )
+                .await;
+
+            let msg = recv_forwarded(&mut rx).await;
+            assert!(
+                msg.content
+                    .contains(&format!("[voice transcript]: {TRANSCRIPT}")),
+                "transcript must be inserted into the inbound content: {}",
+                msg.content
+            );
+            assert!(
+                msg.content.contains("voice.wav"),
+                "marker must keep the real filename: {}",
+                msg.content
+            );
+
+            let media_dir = workspace.path().join("matrix_files");
+            let saved: Vec<_> = std::fs::read_dir(&media_dir)
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(saved.len(), 1, "exactly one saved media file");
+            let saved_path = saved[0].path();
+            assert!(
+                saved_path
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .ends_with("voice.wav"),
+                "saved file keeps the real-name-derived filename: {saved_path:?}"
+            );
+            assert_eq!(std::fs::read(&saved_path).unwrap(), wav);
+
+            assert_stt_received_the_wav(&stt.received_requests().await.unwrap(), &wav);
+        }
+
+        #[tokio::test]
+        async fn reply_to_voice_note_inserts_parent_transcript() {
+            let wav = build_wav();
+
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.sync_joined_room(&client, test_room()).await;
+            mount_media_download(&matrix, &wav).await;
+
+            // Parent-event fetch: /rooms/{roomId}/event/{eventId} returns the
+            // parent m.audio event verbatim.
+            let parent = voice_event_json("$parentaudio:localhost");
+            Mock::given(method("GET"))
+                .and(path_regex(
+                    r"^/_matrix/client/v3/rooms/.*/event/\$parentaudio:localhost$",
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(parent))
+                .mount(matrix.server())
+                .await;
+
+            let stt = stt_server().await;
+            let workspace = tempfile::tempdir().unwrap();
+            let (tx, mut rx) = mpsc::channel(4);
+            let ctx = handler_ctx(
+                &format!("{}/v1/transcribe", stt.uri()),
+                workspace.path(),
+                tx,
+            );
+
+            let _guards = register_event_handlers(&client, &ctx);
+            let json = serde_json::json!({
+                "type": "m.room.message",
+                "event_id": "$reply1:localhost",
+                "sender": "@alice:localhost",
+                "origin_server_ts": 1_000_001u64,
+                "content": {
+                    "msgtype": "m.text",
+                    "body": "what does this say?",
+                    "m.relates_to": {
+                        "m.in_reply_to": { "event_id": "$parentaudio:localhost" }
+                    }
+                }
+            });
+            matrix
+                .sync_room(
+                    &client,
+                    JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(&json)),
+                )
+                .await;
+
+            let msg = recv_forwarded(&mut rx).await;
+            assert!(
+                msg.content
+                    .contains(&format!("[voice transcript]: {TRANSCRIPT}")),
+                "parent transcript must be inserted: {}",
+                msg.content
+            );
+            assert!(
+                msg.content.contains("voice.wav"),
+                "marker must keep the parent's real filename: {}",
+                msg.content
+            );
+            assert_stt_received_the_wav(&stt.received_requests().await.unwrap(), &wav);
+        }
+
+        // Encrypted-media variant: the event carries an E2EE `file` source;
+        // the homeserver serves ciphertext and the client decrypts during
+        // download, so the saved copy and the STT request must contain the
+        // original plaintext WAV.
+        #[tokio::test]
+        async fn encrypted_voice_note_decrypts_and_inserts_transcript() {
+            use std::io::Read as _;
+
+            use matrix_sdk::ruma::OwnedMxcUri;
+            use matrix_sdk::ruma::events::room::EncryptedFile;
+            use matrix_sdk_base::crypto::AttachmentEncryptor;
+
+            let wav = build_wav();
+            let mut reader = wav.as_slice();
+            let mut encryptor = AttachmentEncryptor::new(&mut reader);
+            let mut ciphertext = Vec::new();
+            encryptor.read_to_end(&mut ciphertext).unwrap();
+            let keys = encryptor.finish();
+            let file = EncryptedFile::new(
+                OwnedMxcUri::from("mxc://localhost/encryptedaudioblob"),
+                keys.encryption_info,
+                keys.hashes,
+            );
+
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.sync_joined_room(&client, test_room()).await;
+            mount_media_download(&matrix, &ciphertext).await;
+
+            let stt = stt_server().await;
+            let workspace = tempfile::tempdir().unwrap();
+            let (tx, mut rx) = mpsc::channel(4);
+            let ctx = handler_ctx(
+                &format!("{}/v1/transcribe", stt.uri()),
+                workspace.path(),
+                tx,
+            );
+
+            let _guards = register_event_handlers(&client, &ctx);
+            let json = serde_json::json!({
+                "type": "m.room.message",
+                "event_id": "$encaudio1:localhost",
+                "sender": "@alice:localhost",
+                "origin_server_ts": 1_000_002u64,
+                "content": {
+                    "msgtype": "m.audio",
+                    "body": "Voice message",
+                    "filename": "voice.wav",
+                    "file": serde_json::to_value(&file).unwrap(),
+                    "org.matrix.msc3245.voice": {},
+                    "info": { "mimetype": "audio/wav" }
+                }
+            });
+            matrix
+                .sync_room(
+                    &client,
+                    JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(&json)),
+                )
+                .await;
+
+            let msg = recv_forwarded(&mut rx).await;
+            assert!(
+                msg.content
+                    .contains(&format!("[voice transcript]: {TRANSCRIPT}")),
+                "transcript must be inserted for encrypted media: {}",
+                msg.content
+            );
+            assert!(
+                msg.content.contains("voice.wav"),
+                "marker must keep the real filename: {}",
+                msg.content
+            );
+
+            let media_dir = workspace.path().join("matrix_files");
+            let saved: Vec<_> = std::fs::read_dir(&media_dir)
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(saved.len(), 1, "exactly one saved media file");
+            assert_eq!(
+                std::fs::read(saved[0].path()).unwrap(),
+                wav,
+                "saved copy must be the decrypted plaintext"
+            );
+
+            assert_stt_received_the_wav(&stt.received_requests().await.unwrap(), &wav);
+        }
+    }
+
     mod markers {
         use super::super::markers::{MarkerKind, parse};
 
@@ -3933,6 +4715,36 @@ mod tests {
         #[test]
         fn rejects_trailing_garbage() {
             assert!(parse_reply("ABCDEFGH approve please").is_none());
+        }
+
+        #[test]
+        fn localized_request_approval_prompt_still_parses_via_matrix_own_parser() {
+            // Localization must not desync the (possibly translated) prompt
+            // prose from Matrix's own approve/deny/always parser: the
+            // keywords the prompt shows must remain the literal ASCII words
+            // `parse_reply` expects, whatever locale is active.
+            let token = generate_token_default();
+            let prompt = crate::util::build_approve_deny_approval_prompt(&token, "shell", "ls -la");
+            assert!(
+                prompt.contains(&token),
+                "prompt should echo the token verbatim; got {prompt:?}"
+            );
+
+            for (word, expected) in [
+                ("approve", ChannelApprovalResponse::Approve),
+                ("deny", ChannelApprovalResponse::Deny),
+                ("always", ChannelApprovalResponse::AlwaysApprove),
+            ] {
+                let reply = format!("{token} {word}");
+                assert!(
+                    prompt.contains(&reply),
+                    "prompt should show the exact reply {reply:?}; got {prompt:?}"
+                );
+                let (parsed_token, response) =
+                    parse_reply(&reply).unwrap_or_else(|| panic!("{reply:?} should parse"));
+                assert_eq!(parsed_token, token);
+                assert_eq!(response, expected);
+            }
         }
     }
 
@@ -5358,6 +6170,37 @@ mod tests {
                 info.kind,
                 super::super::inbound::MediaCategory::Audio
             ));
+        }
+
+        #[test]
+        fn parent_audio_real_filename_survives_even_with_unrecognized_extension() {
+            let p = parent_raw(serde_json::json!({
+                "content": {
+                    "msgtype": "m.audio",
+                    "body": "Meeting recap.",
+                    "filename": "recording.bin",
+                    "url": "mxc://example.org/m",
+                    "info": { "mimetype": "audio/ogg" }
+                }
+            }));
+            let info = parent_media_info(p).expect("media info");
+            assert_eq!(info.file_name, "recording.bin");
+        }
+
+        #[test]
+        fn parent_voice_filename_preferred_over_caption_body() {
+            let p = parent_raw(serde_json::json!({
+                "content": {
+                    "msgtype": "m.audio",
+                    "body": "Voice message",
+                    "filename": "voice.ogg",
+                    "url": "mxc://example.org/v",
+                    "org.matrix.msc3245.voice": {},
+                    "info": { "mimetype": "audio/ogg" }
+                }
+            }));
+            let info = parent_media_info(p).expect("media info");
+            assert_eq!(info.file_name, "voice.ogg");
         }
 
         #[test]

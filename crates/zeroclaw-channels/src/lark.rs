@@ -983,8 +983,12 @@ impl LarkChannel {
         format!("{}/bot/v3/info", self.api_base())
     }
 
-    fn send_message_url(&self) -> String {
-        format!("{}/im/v1/messages?receive_id_type=chat_id", self.api_base())
+    fn send_message_url(&self, receive_id: &str) -> String {
+        format!(
+            "{}/im/v1/messages?receive_id_type={}",
+            self.api_base(),
+            lark_receive_id_type_for(receive_id)
+        )
     }
 
     /// PATCH endpoint for updating the content of a previously-sent message
@@ -2299,7 +2303,7 @@ impl LarkChannel {
             "msg_type": media.msg_type,
             "content": media.content.to_string(),
         });
-        let url = self.send_message_url();
+        let url = self.send_message_url(recipient);
         self.send_json_with_token_refresh(&url, token, &body, "media send")
             .await
     }
@@ -2571,7 +2575,7 @@ impl Channel for LarkChannel {
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let mut token = self.get_tenant_access_token().await?;
-        let url = self.send_message_url();
+        let url = self.send_message_url(&message.recipient);
         let (text_content, raw_markers) = super::util::parse_attachment_markers(&message.content);
         let markers = raw_markers
             .into_iter()
@@ -2846,20 +2850,33 @@ impl Channel for LarkChannel {
         }
     }
 
+    /// Delegates to [`Self::request_approval_attributed`] and drops the
+    /// provenance, so the prompt/timeout logic lives in exactly one place.
     async fn request_approval(
         &self,
         recipient: &str,
         request: &zeroclaw_api::channel::ChannelApprovalRequest,
     ) -> anyhow::Result<Option<zeroclaw_api::channel::ChannelApprovalResponse>> {
+        Ok(self
+            .request_approval_attributed(recipient, request)
+            .await?
+            .map(|attributed| attributed.response))
+    }
+
+    async fn request_approval_attributed(
+        &self,
+        recipient: &str,
+        request: &zeroclaw_api::channel::ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
         let approval_id = Uuid::new_v4().to_string();
         let card =
             build_approval_card(&approval_id, &request.tool_name, &request.arguments_summary);
 
         let token = self.get_tenant_access_token().await?;
-        let url = self.send_message_url();
+        let url = self.send_message_url(recipient);
         let body = serde_json::json!({
             "receive_id": recipient,
-            "receive_id_type": "chat_id",
+            "receive_id_type": lark_receive_id_type_for(recipient),
             "msg_type": "interactive",
             "content": serde_json::to_string(&card)?,
         });
@@ -2929,7 +2946,7 @@ impl Channel for LarkChannel {
             LARK_CARD_MARKDOWN_MAX_BYTES,
         );
         let body = build_interactive_card_body(&message.recipient, &placeholder);
-        let url = self.send_message_url();
+        let url = self.send_message_url(&message.recipient);
 
         let (status, response) = match self.patch_or_send_once(&url, &body, false).await {
             Ok(r) => r,
@@ -3041,7 +3058,7 @@ impl Channel for LarkChannel {
         self.patch_card_content(message_id, first).await?;
 
         if chunks.len() > 1 {
-            let url = self.send_message_url();
+            let url = self.send_message_url(recipient);
             for chunk in &chunks[1..] {
                 let body = build_interactive_card_body(recipient, chunk);
                 self.send_json_with_token_refresh(&url, &mut token, &body, "finalize_draft chunk")
@@ -3171,17 +3188,32 @@ impl LarkChannel {
 impl LarkChannel {
     /// Wait for the user's approval click; on timeout, evict the pending entry
     /// and synthesize a `Deny` response. Never panics.
+    ///
+    /// The returned provenance separates a real click from the synthesized
+    /// deny, so the caller does not report an operator refusal nobody made.
     async fn wait_for_decision(
         &self,
         rx: tokio::sync::oneshot::Receiver<zeroclaw_api::channel::ChannelApprovalResponse>,
         approval_id: &str,
-    ) -> zeroclaw_api::channel::ChannelApprovalResponse {
-        use zeroclaw_api::channel::ChannelApprovalResponse;
+    ) -> zeroclaw_api::channel::AttributedApprovalResponse {
+        use zeroclaw_api::channel::{
+            ApprovalSource, AttributedApprovalResponse, ChannelApprovalResponse,
+        };
         match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), rx).await {
-            Ok(Ok(response)) => response,
-            _ => {
+            Ok(Ok(response)) => AttributedApprovalResponse::operator(response),
+            Ok(Err(_)) => {
                 self.pending_approvals.lock().await.remove(approval_id);
-                ChannelApprovalResponse::Deny
+                AttributedApprovalResponse::from_runtime(
+                    ChannelApprovalResponse::Deny,
+                    ApprovalSource::Unreachable,
+                )
+            }
+            Err(_) => {
+                self.pending_approvals.lock().await.remove(approval_id);
+                AttributedApprovalResponse::from_runtime(
+                    ChannelApprovalResponse::Deny,
+                    ApprovalSource::TimedOut,
+                )
             }
         }
     }
@@ -3401,14 +3433,23 @@ impl LarkChannel {
             "deny" => ChannelApprovalResponse::Deny,
             "always" => ChannelApprovalResponse::AlwaysApprove,
             other => {
+                // Do NOT resolve the pending approval. `wait_for_decision`
+                // stamps every value received on the oneshot as
+                // `ApprovalSource::Operator`, so synthesizing a Deny here would
+                // reach the gate as "Denied by user." for a card action no
+                // operator ever took -- the exact false attribution this change
+                // exists to remove. Leaving the approval pending lets it resolve
+                // through the timeout path, which carries runtime provenance.
                 ::zeroclaw_log::record!(
                     WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                         .with_attrs(::serde_json::json!({"decision_str": other})),
-                    "Lark: unknown approval decision — treating as deny"
+                    "Lark: unknown approval decision — rejecting the callback without resolving the approval"
                 );
-                ChannelApprovalResponse::Deny
+                return Err(anyhow::Error::msg(
+                    "card.action.trigger: unknown decision value",
+                ));
             }
         };
 
@@ -3649,6 +3690,27 @@ fn lark_detect_image_mime(content_type: Option<&str>, bytes: &[u8]) -> Option<St
         .and_then(|ct| ct.split(';').next())
         .map(|ct| ct.trim().to_lowercase())
         .filter(|ct| ct.starts_with("image/"))
+}
+
+/// Pick the Lark `receive_id_type` query value from a recipient id's prefix.
+/// Lark's send API requires `receive_id_type` to match the id kind, else it
+/// rejects with error 230001 `invalid receive_id`. `oc_`→chat_id (group/DM
+/// chat), `ou_`→open_id (per-app user id), `on_`→union_id, an id containing
+/// `@`→email; anything else defaults to chat_id for back-compat with callers
+/// that pass a bare chat id. Lets the agent direct-send a member by open_id
+/// (from the roster) without first knowing their chat_id.
+fn lark_receive_id_type_for(receive_id: &str) -> &'static str {
+    if receive_id.starts_with("ou_") {
+        "open_id"
+    } else if receive_id.starts_with("on_") {
+        "union_id"
+    } else if receive_id.starts_with("oc_") {
+        "chat_id"
+    } else if receive_id.contains('@') {
+        "email"
+    } else {
+        "chat_id"
+    }
 }
 
 /// Check if a filename looks like a text file based on extension.
@@ -5759,6 +5821,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unknown_lark_decision_cannot_become_an_operator_denial() {
+        // An unrecognized `decision` value used to be mapped to Deny and sent
+        // through the pending-approval oneshot. `wait_for_decision` stamps
+        // everything it receives from that oneshot as `ApprovalSource::Operator`,
+        // so a malformed card action arrived at the gate as "Denied by user."
+        // even though no operator decided anything.
+        //
+        // The approval must be left PENDING so it resolves through the timeout
+        // path, which carries runtime provenance.
+        let ch = make_channel();
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let approval_id = "test-unknown-decision".to_string();
+        ch.pending_approvals.lock().await.insert(
+            approval_id.clone(),
+            PendingApproval {
+                sender: tx,
+                message_id: String::new(),
+                tool_name: String::new(),
+                arguments_summary: String::new(),
+            },
+        );
+
+        let event = serde_json::json!({
+            "action": {
+                "tag": "button",
+                "value": { "approval_id": approval_id, "decision": "sudo-make-me-a-sandwich" }
+            }
+        });
+        let outcome = ch.handle_card_action_event(&event).await;
+        assert!(
+            outcome.is_err(),
+            "an unknown decision must be rejected, not silently accepted"
+        );
+
+        // Nothing was sent: the receiver is still empty and still open, so the
+        // gate will see a runtime-sourced timeout rather than an operator Deny.
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "no decision may be delivered for an unrecognized card action"
+        );
+        assert!(
+            ch.pending_approvals.lock().await.contains_key(&approval_id),
+            "the approval must stay pending so it resolves with runtime provenance"
+        );
+    }
+
+    #[tokio::test]
     async fn handle_card_action_event_for_unknown_approval_is_not_an_error() {
         let ch = make_channel();
         let event = serde_json::json!({
@@ -5773,7 +5885,10 @@ mod tests {
             .await
             .expect("unknown approval id should not error");
     }
-    async fn mount_lark_token_and_send_mocks(mock_server: &wiremock::MockServer) {
+    async fn mount_lark_token_and_send_mocks(
+        mock_server: &wiremock::MockServer,
+        receive_id_type: &'static str,
+    ) {
         use wiremock::matchers::{method, path, query_param};
         use wiremock::{Mock, ResponseTemplate};
 
@@ -5789,7 +5904,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/im/v1/messages"))
-            .and(query_param("receive_id_type", "chat_id"))
+            .and(query_param("receive_id_type", receive_id_type))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "code": 0,
                 "data": { "message_id": "om_test_message_id" }
@@ -5801,6 +5916,7 @@ mod tests {
 
     async fn assert_send_body_matches_recipient_and_text(
         mock_server: &wiremock::MockServer,
+        expected_receive_id_type: &str,
         expected_recipient: &str,
         expected_text: &str,
     ) {
@@ -5814,8 +5930,8 @@ mod tests {
             .expect("expected at least one POST /im/v1/messages");
         assert_eq!(
             send_request.url.query(),
-            Some("receive_id_type=chat_id"),
-            "send URL must carry receive_id_type=chat_id query param"
+            Some(format!("receive_id_type={expected_receive_id_type}").as_str()),
+            "send URL must carry the expected receive_id_type query param"
         );
         let body: serde_json::Value =
             serde_json::from_slice(&send_request.body).expect("send body should be valid JSON");
@@ -5841,7 +5957,7 @@ mod tests {
     #[tokio::test]
     async fn lark_send_via_from_config_emits_post_to_messages_endpoint() {
         let mock_server = wiremock::MockServer::start().await;
-        mount_lark_token_and_send_mocks(&mock_server).await;
+        mount_lark_token_and_send_mocks(&mock_server, "chat_id").await;
 
         let config = zeroclaw_config::schema::LarkConfig {
             enabled: true,
@@ -5867,6 +5983,7 @@ mod tests {
 
         assert_send_body_matches_recipient_and_text(
             &mock_server,
+            "chat_id",
             "oc_test_chat_id",
             "hi from cron",
         )
@@ -5876,7 +5993,7 @@ mod tests {
     #[tokio::test]
     async fn feishu_send_via_from_config_emits_post_to_messages_endpoint() {
         let mock_server = wiremock::MockServer::start().await;
-        mount_lark_token_and_send_mocks(&mock_server).await;
+        mount_lark_token_and_send_mocks(&mock_server, "chat_id").await;
 
         let config = zeroclaw_config::schema::LarkConfig {
             enabled: true,
@@ -5903,7 +6020,38 @@ mod tests {
 
         assert_send_body_matches_recipient_and_text(
             &mock_server,
+            "chat_id",
             "oc_test_chat_id",
+            "hi from cron",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn lark_send_uses_open_id_for_open_id_recipient() {
+        let mock_server = wiremock::MockServer::start().await;
+        mount_lark_token_and_send_mocks(&mock_server, "open_id").await;
+
+        let config = zeroclaw_config::schema::LarkConfig {
+            enabled: true,
+            use_feishu: false,
+            app_id: "cli_test_app_id".to_string(),
+            app_secret: "test_app_secret".to_string(),
+            approval_timeout_secs: 300,
+            ..Default::default()
+        };
+        let mut ch = LarkChannel::from_config(&config, "test_alias", resolver_from(vec![]));
+        ch.api_base_override = Some(mock_server.uri());
+
+        let message = SendMessage::new("hi from cron", "ou_test_user_id");
+        Channel::send(&ch, &message)
+            .await
+            .expect("Channel::send should succeed for an open_id recipient");
+
+        assert_send_body_matches_recipient_and_text(
+            &mock_server,
+            "open_id",
+            "ou_test_user_id",
             "hi from cron",
         )
         .await;
@@ -6678,5 +6826,17 @@ mod tests {
 
         drop(post_glance_mock);
         drop(delete_glance_mock);
+    }
+
+    #[test]
+    fn lark_receive_id_type_for_maps_by_prefix() {
+        // The bug this fixes: sending to an ou_ open_id under a hardcoded
+        // chat_id type made Lark reject with 230001 invalid receive_id.
+        assert_eq!(lark_receive_id_type_for("ou_89a84151d20fe403"), "open_id");
+        assert_eq!(lark_receive_id_type_for("oc_4b82b8d4c677107c"), "chat_id");
+        assert_eq!(lark_receive_id_type_for("on_uniontestid"), "union_id");
+        assert_eq!(lark_receive_id_type_for("alice@example.com"), "email");
+        // Bare/unknown ids keep the historical chat_id default.
+        assert_eq!(lark_receive_id_type_for("bare_chat_id"), "chat_id");
     }
 }

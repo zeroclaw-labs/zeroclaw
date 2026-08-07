@@ -3,6 +3,8 @@ mod config_dir_locale_regression;
 mod config_patch_cli;
 mod config_persistence;
 mod config_schema;
+mod cron_help_examples;
+mod daemon_startup_feedback;
 mod dockerignore_test;
 mod gateway;
 mod gemini_capabilities;

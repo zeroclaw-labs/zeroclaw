@@ -614,7 +614,10 @@ pub struct ModelProviderRuntimeOptions {
     /// model served by a vision-capable family as non-vision. Mapped from
     /// `ModelProviderConfig::vision`.
     pub vision: Option<bool>,
-    /// Passed verbatim as `chat_template_kwargs` to the llamacpp provider.
+    /// Forwarded verbatim as a top-level `chat_template_kwargs` object in the
+    /// request body for OpenAI-compatible providers (folded into `extra_body`
+    /// by `apply_compat_options`). Consumed by chat-template-aware backends
+    /// such as vLLM, SGLang, and llama.cpp.
     pub chat_template_kwargs: Option<serde_json::Value>,
     /// Path to a custom CA certificate file for TLS connections.
     pub tls_ca_cert_path: Option<String>,
@@ -924,9 +927,10 @@ pub async fn api_error(model_provider: &str, response: reqwest::Response) -> any
     ))
 }
 
-/// Resolve API key for a model_provider from config and environment variables.
-/// Return the typed-alias `api_key` field, trimmed. Env-var overrides land on
-/// the field at config-load via the `ZEROCLAW_*` schema-mirror grammar.
+/// Resolve API key for a model_provider from the typed alias config/override.
+/// Env-var bridges land on the alias field at config-load via the
+/// `ZEROCLAW_*` schema-mirror grammar; this constructor boundary deliberately
+/// does not read provider-specific global variables.
 fn resolve_model_provider_credential(
     _name: &str,
     credential_override: Option<&str>,
@@ -1931,6 +1935,7 @@ pub fn list_model_providers() -> Vec<ModelProviderInfo> {
             ("nearai", "NEAR AI Cloud", false),
             ("vercel", "Vercel AI Gateway", false),
             ("cloudflare", "Cloudflare AI", false),
+            ("atlascloud", "Atlas Cloud", false),
             ("moonshot", "Moonshot", false),
             ("synthetic", "Synthetic", false),
             ("opencode", "OpenCode", false),
@@ -2160,6 +2165,43 @@ mod tests {
     fn resolve_provider_credential_filters_empty_override() {
         assert!(resolve_model_provider_credential("openrouter", Some("   ")).is_none());
         assert!(resolve_model_provider_credential("openrouter", None).is_none());
+    }
+
+    #[test]
+    fn resolve_atlascloud_credential_stays_on_typed_alias_boundary() {
+        let _env_lock = env_lock();
+        let _guard = EnvGuard::set("ATLASCLOUD_API_KEY", Some("  atlas-env-key  "));
+        assert!(resolve_model_provider_credential("atlascloud", None).is_none());
+        assert_eq!(
+            resolve_model_provider_credential("atlascloud", Some("  explicit-key  ")).as_deref(),
+            Some("explicit-key")
+        );
+        assert!(resolve_model_provider_credential("openrouter", None).is_none());
+    }
+
+    #[test]
+    fn atlascloud_uses_canonical_provider_id_only() {
+        assert_eq!(
+            canonicalize_v2_model_provider_name("atlascloud"),
+            "atlascloud"
+        );
+        for alias in ["atlas", "atlas-cloud", "atlas_cloud"] {
+            assert_eq!(canonicalize_v2_model_provider_name(alias), alias);
+        }
+    }
+
+    #[test]
+    fn atlascloud_provider_is_listed_and_constructible() {
+        let providers = list_model_providers();
+        let atlascloud = providers
+            .iter()
+            .find(|provider| provider.name == "atlascloud")
+            .expect("Atlas Cloud provider should be listed");
+        assert_eq!(atlascloud.display_name, "Atlas Cloud");
+        assert!(
+            create_model_provider("atlascloud", Some("provider-test-credential")).is_ok(),
+            "Atlas Cloud should construct through the OpenAI-compatible family factory"
+        );
     }
 
     #[test]

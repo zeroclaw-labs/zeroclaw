@@ -472,13 +472,49 @@ impl fmt::Display for DaemonInitializeTimeout {
 impl std::error::Error for DaemonInitializeTimeout {}
 
 #[derive(Debug)]
-struct InitializeResponse {
+pub(crate) struct InitializeResponse {
     server_version: String,
+    server_pid: Option<u32>,
     tui_id: Option<String>,
     tui_sig: Option<String>,
+    pub(crate) commands: Vec<crate::wire::CommandDescriptor>,
 }
 
-fn parse_initialize_response(resp: &Value) -> Result<InitializeResponse> {
+/// One-release fallback for daemons from the pre-catalogue 0.8.x line, which
+/// share the current package and protocol versions but omit `commands`.
+///
+/// These descriptors preserve the shared tokens ZeroCode accepted before the
+/// RPC catalogue existed. New daemons remain authoritative, including when
+/// they explicitly advertise an empty catalogue.
+fn legacy_tui_command_descriptors() -> Vec<crate::wire::CommandDescriptor> {
+    vec![
+        crate::wire::CommandDescriptor {
+            id: "help".into(),
+            name: "help".into(),
+            aliases: Vec::new(),
+        },
+        crate::wire::CommandDescriptor {
+            id: "new".into(),
+            name: "new".into(),
+            aliases: vec!["new-session".into()],
+        },
+        crate::wire::CommandDescriptor {
+            id: "model".into(),
+            name: "model".into(),
+            aliases: Vec::new(),
+        },
+    ]
+}
+
+fn parse_initialize_commands(resp: &Value) -> Result<Vec<crate::wire::CommandDescriptor>> {
+    match resp.get("commands") {
+        Some(commands) => serde_json::from_value(commands.clone())
+            .context("invalid command descriptors in initialize response"),
+        None => Ok(legacy_tui_command_descriptors()),
+    }
+}
+
+pub(crate) fn parse_initialize_response(resp: &Value) -> Result<InitializeResponse> {
     let server_version = resp
         .get("server_version")
         .and_then(Value::as_str)
@@ -490,11 +526,16 @@ fn parse_initialize_response(resp: &Value) -> Result<InitializeResponse> {
 
     Ok(InitializeResponse {
         server_version,
+        server_pid: resp
+            .get("server_pid")
+            .and_then(Value::as_u64)
+            .and_then(|pid| u32::try_from(pid).ok()),
         tui_id: resp.get("tui_id").and_then(Value::as_str).map(String::from),
         tui_sig: resp
             .get("tui_sig")
             .and_then(Value::as_str)
             .map(String::from),
+        commands: parse_initialize_commands(resp)?,
     })
 }
 
@@ -574,6 +615,8 @@ pub struct RpcClient {
     _read_task: tokio::task::JoinHandle<()>,
     _router_task: tokio::task::JoinHandle<()>,
     pub server_version: String,
+    /// OS process ID reported by the daemon during initialize.
+    pub server_pid: Option<u32>,
     notifications_bcast: broadcast::Sender<RpcNotification>,
     /// Broadcast channel for server-initiated requests that expect a
     /// response (today: `elicitation/create`). The Chat widget for the
@@ -587,6 +630,9 @@ pub struct RpcClient {
     pub tui_sig: Option<String>,
     /// Transport protocol of this connection.
     transport: Transport,
+    /// Shared TUI command metadata received from the daemon's canonical
+    /// command catalogue during initialization.
+    commands: Vec<crate::wire::CommandDescriptor>,
 }
 
 impl RpcClient {
@@ -702,7 +748,6 @@ impl RpcClient {
                 return Err(e);
             }
         };
-
         let bcast_rx = notif_tx.subscribe();
         let (update_tx, _update_rx) = mpsc::channel::<SessionUpdate>(64);
         let router_task = spawn_notification_router(bcast_rx, update_tx);
@@ -712,12 +757,14 @@ impl RpcClient {
             _read_task: read_task,
             _router_task: router_task,
             server_version: init.server_version,
+            server_pid: init.server_pid,
             notifications_bcast: notif_tx,
             inbound_requests_bcast: inbound_tx,
             connection_state: conn_state,
             tui_id: init.tui_id,
             tui_sig: init.tui_sig,
             transport: Transport::Local,
+            commands: init.commands,
         })
     }
 
@@ -850,7 +897,6 @@ impl RpcClient {
                 return Err(e);
             }
         };
-
         let bcast_rx = notif_tx.subscribe();
         let (update_tx, _update_rx) = mpsc::channel::<SessionUpdate>(64);
         let router_task = spawn_notification_router(bcast_rx, update_tx);
@@ -860,12 +906,14 @@ impl RpcClient {
             _read_task: read_task,
             _router_task: router_task,
             server_version: init.server_version,
+            server_pid: init.server_pid,
             notifications_bcast: notif_tx,
             inbound_requests_bcast: inbound_tx,
             connection_state: conn_state,
             tui_id: init.tui_id,
             tui_sig: init.tui_sig,
             transport: Transport::Wss,
+            commands: init.commands,
         })
     }
 
@@ -1655,6 +1703,10 @@ impl RpcClient {
         self.tui_sig.as_deref()
     }
 
+    pub fn commands(&self) -> &[crate::wire::CommandDescriptor] {
+        &self.commands
+    }
+
     /// List all connected TUI sessions from the daemon registry.
     pub async fn tui_list(&self) -> Result<TuiListResult> {
         self.call(method::TUI_LIST, serde_json::json!({})).await
@@ -1689,12 +1741,14 @@ impl RpcClient {
             _read_task: tokio::spawn(async {}),
             _router_task: tokio::spawn(async {}),
             server_version: "test".to_string(),
+            server_pid: None,
             notifications_bcast: notif_tx,
             inbound_requests_bcast: inbound_tx,
             connection_state: Arc::new(Mutex::new(ConnectionState::Connected)),
             tui_id: None,
             tui_sig: None,
             transport: Transport::Local,
+            commands: Vec::new(),
         }
     }
 
@@ -1725,14 +1779,60 @@ mod initialize_version_tests {
     fn initialize_response_accepts_matching_server_version() {
         let parsed = parse_initialize_response(&json!({
             "server_version": env!("CARGO_PKG_VERSION"),
+            "server_pid": 42,
             "tui_id": "tui_1",
             "tui_sig": "sig_1"
         }))
         .unwrap();
 
         assert_eq!(parsed.server_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(parsed.server_pid, Some(42));
         assert_eq!(parsed.tui_id.as_deref(), Some("tui_1"));
         assert_eq!(parsed.tui_sig.as_deref(), Some("sig_1"));
+        assert_eq!(parsed.commands, legacy_tui_command_descriptors());
+    }
+
+    #[test]
+    fn initialize_response_parses_command_descriptors() {
+        let parsed = parse_initialize_response(&json!({
+            "server_version": env!("CARGO_PKG_VERSION"),
+            "commands": [{
+                "id": "new",
+                "name": "new",
+                "aliases": ["new-session"]
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            parsed.commands,
+            vec![crate::wire::CommandDescriptor {
+                id: "new".into(),
+                name: "new".into(),
+                aliases: vec!["new-session".into()],
+            }]
+        );
+    }
+
+    #[test]
+    fn initialize_response_preserves_present_empty_command_catalogue() {
+        let parsed = parse_initialize_response(&json!({
+            "server_version": env!("CARGO_PKG_VERSION"),
+            "commands": []
+        }))
+        .unwrap();
+
+        assert!(parsed.commands.is_empty());
+    }
+
+    #[test]
+    fn initialize_response_allows_missing_server_pid_for_compatibility() {
+        let parsed = parse_initialize_response(&json!({
+            "server_version": env!("CARGO_PKG_VERSION")
+        }))
+        .unwrap();
+
+        assert_eq!(parsed.server_pid, None);
     }
 
     #[test]
@@ -1957,6 +2057,12 @@ pub struct SkillFrontmatter {
     pub version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub category: Option<String>,
+    /// Keeps this skill's instructions inlined in the system prompt even in
+    /// compact skill-prompt mode. Not editable from this TUI mirror, but must
+    /// be carried through the load→edit→save round-trip so editing a skill
+    /// here doesn't silently reset it to `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub always: bool,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -1980,6 +2086,34 @@ pub struct SkillsWriteResult {}
 
 #[derive(Debug, serde::Deserialize)]
 pub struct SkillsDeleteResult {}
+
+#[cfg(test)]
+mod skill_frontmatter_tests {
+    use super::*;
+
+    #[test]
+    fn always_true_survives_deserialize_then_serialize_round_trip() {
+        let value = serde_json::json!({
+            "name": "security-policy",
+            "description": "Critical safety rules",
+            "always": true,
+        });
+
+        let frontmatter: SkillFrontmatter = serde_json::from_value(value).unwrap();
+        assert!(
+            frontmatter.always,
+            "always: true in the wire payload must deserialize into the mirror struct"
+        );
+
+        let reserialized = serde_json::to_value(&frontmatter).unwrap();
+        assert_eq!(
+            reserialized.get("always"),
+            Some(&serde_json::Value::Bool(true)),
+            "always must round-trip through re-serialization, not be silently dropped \
+             on the TUI's load -> edit -> save path"
+        );
+    }
+}
 
 // ── Quickstart types ─────────────────────────────────────────────
 //
