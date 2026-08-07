@@ -212,12 +212,22 @@ pub fn drive_resumed_broker_action(
 fn headless_step_agent<'a>(
     config: &zeroclaw_config::schema::Config,
     step: &'a SopStep,
+    run_initiator: Option<&'a str>,
 ) -> Result<&'a str> {
     let alias = step
         .agent
         .as_deref()
         .map(str::trim)
         .filter(|alias| !alias.is_empty())
+        // A run started inside an agent turn carries that agent. The turn is
+        // gone by the time an approval resumes the step, but the identity it
+        // supplied is not arbitrary — it is the agent that started this run, and
+        // it still has to pass the configured-and-enabled checks below.
+        .or_else(|| {
+            run_initiator
+                .map(str::trim)
+                .filter(|alias| !alias.is_empty())
+        })
         .ok_or_else(|| {
             anyhow::Error::msg(format!(
                 "SOP step {} has no owning agent: headless execution requires `agent` on the SOP \
@@ -283,7 +293,20 @@ async fn drive_headless_run(
                 context,
             } => {
                 let started_at = crate::sop::engine::now_iso8601();
-                let resolved_agent = headless_step_agent(&config, &step);
+                // Read per action, not once per driver: the run is the durable
+                // record of who started it, and it survives the daemon
+                // generation the initiating turn belonged to.
+                let run_initiator = {
+                    let guard = match engine.lock() {
+                        Ok(guard) => guard,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    guard
+                        .get_run(&run_id)
+                        .and_then(|run| run.initiating_agent.clone())
+                };
+                let resolved_agent =
+                    headless_step_agent(&config, &step, run_initiator.as_deref());
                 // Attribution follows execution: a step that never ran — no
                 // owner, or an owner naming an unconfigured agent — is recorded
                 // against no agent at all, so a refusal can never read as an
@@ -793,6 +816,52 @@ mod tests {
         }
     }
 
+    /// A run started inside an agent turn borrows that agent as its owner. The
+    /// turn is gone by the time an approval resumes the step — the whole reason
+    /// the identity is recorded on the run — so the resume has to be able to use
+    /// it, or an approved step fails for want of an owner the run already knows.
+    #[test]
+    fn an_unowned_step_falls_back_to_the_runs_initiating_agent() {
+        let config = config_with_agent("ops", true);
+
+        let step = owned_step(None);
+        let resolved = headless_step_agent(&config, &step, Some("ops"))
+            .expect("the run's initiating agent owns a step that declares none");
+
+        assert_eq!(resolved, "ops");
+    }
+
+    /// The fallback supplies an identity, not an exemption: an initiator the
+    /// operator has withdrawn from service refuses exactly like a declared owner
+    /// would. Otherwise disabling an agent would stop it running new procedures
+    /// while leaving it running parked ones.
+    #[test]
+    fn an_initiating_agent_must_still_be_enabled() {
+        let config = config_with_agent("ops", false);
+
+        let err = headless_step_agent(&config, &owned_step(None), Some("ops"))
+            .expect_err("a disabled initiator must not run an unattended step");
+
+        assert!(
+            format!("{err}").contains("disabled"),
+            "the refusal must name the disabled owner: {err}"
+        );
+    }
+
+    /// Precedence: a declared owner is the author's explicit choice and a run
+    /// initiator never overrides it — the initiator here is not even configured,
+    /// so resolving it at all would be visible as an error.
+    #[test]
+    fn a_declared_owner_wins_over_the_run_initiator() {
+        let config = config_with_agent("ops", true);
+
+        let step = owned_step(Some("ops"));
+        let resolved = headless_step_agent(&config, &step, Some("unconfigured"))
+            .expect("the step's declared owner resolves");
+
+        assert_eq!(resolved, "ops");
+    }
+
     /// An operator who disables an agent has withdrawn it from service. The
     /// agent lookup behind this alias does not filter on `enabled`, so without
     /// this check an unattended SOP would keep running under it.
@@ -800,7 +869,7 @@ mod tests {
     fn headless_step_agent_refuses_a_disabled_owner() {
         let config = config_with_agent("ops", false);
 
-        let err = headless_step_agent(&config, &owned_step(Some("ops")))
+        let err = headless_step_agent(&config, &owned_step(Some("ops")), None)
             .expect_err("a disabled owner must not run an unattended step");
 
         let message = err.to_string();
@@ -815,7 +884,7 @@ mod tests {
         let config = config_with_agent("ops", true);
 
         assert_eq!(
-            headless_step_agent(&config, &owned_step(Some("ops"))).expect("enabled owner resolves"),
+            headless_step_agent(&config, &owned_step(Some("ops")), None).expect("enabled owner resolves"),
             "ops"
         );
     }
@@ -824,11 +893,11 @@ mod tests {
     fn headless_step_agent_refuses_missing_and_unconfigured_owners() {
         let config = config_with_agent("ops", true);
 
-        let unowned = headless_step_agent(&config, &owned_step(None))
+        let unowned = headless_step_agent(&config, &owned_step(None), None)
             .expect_err("an unowned step must be refused");
         assert!(unowned.to_string().contains("no owning agent"));
 
-        let unknown = headless_step_agent(&config, &owned_step(Some("ghost")))
+        let unknown = headless_step_agent(&config, &owned_step(Some("ghost")), None)
             .expect_err("an unconfigured owner must be refused");
         assert!(unknown.to_string().contains("not a configured agent"));
     }

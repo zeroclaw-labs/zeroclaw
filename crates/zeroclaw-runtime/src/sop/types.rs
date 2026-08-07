@@ -803,6 +803,17 @@ pub struct SopStepResult {
 pub struct SopRun {
     pub run_id: String,
     pub sop_name: String,
+    /// The agent whose turn started this run, for runs that began inside one
+    /// (`sop_execute`). A headless trigger has no initiating turn and leaves it
+    /// `None`.
+    ///
+    /// Persisted because it has to outlive the thing it came from: an unowned
+    /// at an approval resumes on the headless driver — possibly in a later
+    /// daemon generation — with that turn long gone. `#[serde(default)]` so runs
+    /// persisted before this field restore as `None` rather than failing to
+    /// load.
+    #[serde(default)]
+    pub initiating_agent: Option<String>,
     pub trigger_event: SopEvent,
     /// Stable per-run boundary marker for untrusted trigger framing.
     #[serde(default)]
@@ -842,7 +853,6 @@ impl ::zeroclaw_api::attribution::Attributable for SopRun {
         &self.sop_name
     }
 }
-
 /// Lightweight projection of a run for list surfaces (Runs page). Carries
 /// just enough to render a row and open the per-run overlay, without the
 /// full step-result payload.
@@ -1425,6 +1435,7 @@ path = "/sop/test"
         let run = SopRun {
             run_id: "run-001".into(),
             sop_name: "test-sop".into(),
+            initiating_agent: None,
             trigger_event: SopEvent {
                 source: SopTriggerSource::Manual,
                 topic: None,

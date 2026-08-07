@@ -1636,13 +1636,31 @@ impl SopEngine {
     }
 
     pub fn start_run(&mut self, sop_name: &str, event: SopEvent) -> Result<SopRunAction> {
+        self.start_run_owned(sop_name, event, None)
+    }
+
+    /// [`Self::start_run`] for a run started INSIDE an agent turn, recording that
+    /// agent on the run.
+    ///
+    /// An unowned procedure borrows its owner from the calling turn, which is
+    /// enough right up until the run parks at an approval: the approved step
+    /// resumes on the headless driver, with no turn to borrow from. Recording
+    /// the initiator here is what lets that resume still run as the agent that
+    /// started it. `None` for every headless trigger, which has no initiating
+    /// turn to record.
+    pub fn start_run_owned(
+        &mut self,
+        sop_name: &str,
+        event: SopEvent,
+        initiator: Option<&str>,
+    ) -> Result<SopRunAction> {
         // A start is a two-phase operation: reserve the exec slot through the
         // authoritative store CAS (no side effect yet), then activate the reserved
         // slot into a live run and dispatch its first step. The phases are split so the
         // AMQP multi-match path can reserve the WHOLE matched batch before activating
         // any of it (see `dispatch`). A single start runs both phases back-to-back.
         let reservation = self.reserve_run_slot(sop_name)?;
-        self.activate_reserved_run(reservation, event)
+        self.activate_reserved_run(reservation, event, initiator)
     }
 
     /// Phase 1 of a start: reserve `sop_name`'s exec slot through the authoritative
@@ -1714,6 +1732,7 @@ impl SopEngine {
         &mut self,
         reservation: StartReservation,
         event: SopEvent,
+        initiator: Option<&str>,
     ) -> Result<SopRunAction> {
         let StartReservation {
             run_id,
@@ -1725,6 +1744,7 @@ impl SopEngine {
         let run = SopRun {
             run_id: run_id.clone(),
             sop_name: sop.name.clone(),
+            initiating_agent: initiator.map(str::to_string),
             trigger_event: event,
             frame_marker_id: new_marker_id(),
             status: SopRunStatus::Running,
@@ -3688,7 +3708,7 @@ impl SopEngine {
         // Reserve + activate through the shared two-phase start path (identical run_id
         // prefix, logging, and dispatch to the pre-refactor inline body).
         let reservation = self.reserve_run_slot(sop_name)?;
-        self.activate_reserved_run(reservation, event)
+        self.activate_reserved_run(reservation, event, None)
     }
 
     pub fn drive_headless_deterministic(
@@ -7356,6 +7376,7 @@ mod tests {
             SopRun {
                 run_id: "r1".to_string(),
                 sop_name: "s1".to_string(),
+                initiating_agent: None,
                 trigger_event: manual_event(),
                 frame_marker_id: "m".to_string(),
                 status: SopRunStatus::WaitingApproval,
@@ -7406,6 +7427,7 @@ mod tests {
                 SopRun {
                     run_id: run_id.to_string(),
                     sop_name: "s1".to_string(),
+                    initiating_agent: None,
                     trigger_event: manual_event(),
                     frame_marker_id: "m".to_string(),
                     status: SopRunStatus::WaitingApproval,
@@ -7449,6 +7471,7 @@ mod tests {
             SopRun {
                 run_id: "r1".to_string(),
                 sop_name: "s1".to_string(),
+                initiating_agent: None,
                 trigger_event: manual_event(),
                 frame_marker_id: "m".to_string(),
                 status: SopRunStatus::Running,
@@ -8129,6 +8152,7 @@ mod tests {
             let run = SopRun {
                 run_id: format!("restore-{i}"),
                 sop_name: "s1".to_string(),
+                initiating_agent: None,
                 trigger_event: manual_event(),
                 frame_marker_id: format!("marker-{i}"),
                 status: SopRunStatus::Running,
@@ -8660,6 +8684,7 @@ mod tests {
         let run = SopRun {
             run_id: "run-001".into(),
             sop_name: "pump-shutdown".into(),
+            initiating_agent: None,
             trigger_event: manual_event(),
             frame_marker_id: "marker-001".into(),
             status: SopRunStatus::Running,
@@ -9544,6 +9569,7 @@ mod tests {
         let parked = SopRun {
             run_id: "parked-1".to_string(),
             sop_name: "s1".to_string(),
+            initiating_agent: None,
             trigger_event: manual_event(),
             frame_marker_id: "marker".to_string(),
             status: SopRunStatus::WaitingApproval,
@@ -9597,6 +9623,7 @@ mod tests {
         let parked = SopRun {
             run_id: "parked-1".to_string(),
             sop_name: "s1".to_string(),
+            initiating_agent: None,
             trigger_event: manual_event(),
             frame_marker_id: "marker".to_string(),
             status: SopRunStatus::WaitingApproval,
@@ -9665,6 +9692,7 @@ mod tests {
         let parked = SopRun {
             run_id: "parked-1".to_string(),
             sop_name: "s1".to_string(),
+            initiating_agent: None,
             trigger_event: manual_event(),
             frame_marker_id: "marker".to_string(),
             status: SopRunStatus::WaitingApproval,
@@ -11429,6 +11457,7 @@ mod tests {
             SopRun {
                 run_id: "r1".to_string(),
                 sop_name: "s1".to_string(),
+                initiating_agent: None,
                 trigger_event: manual_event(),
                 frame_marker_id: "m".to_string(),
                 status: SopRunStatus::WaitingApproval,
@@ -14263,6 +14292,7 @@ type = "manual"
         let run = SopRun {
             run_id: "r-restore".to_string(),
             sop_name: "deploy".to_string(),
+            initiating_agent: None,
             trigger_event: SopEvent {
                 source: SopTriggerSource::Manual,
                 topic: None,
@@ -14307,6 +14337,7 @@ type = "manual"
         let mut run = SopRun {
             run_id: "r-persist".to_string(),
             sop_name: "deploy".to_string(),
+            initiating_agent: None,
             trigger_event: SopEvent {
                 source: SopTriggerSource::Manual,
                 topic: None,
@@ -14903,6 +14934,7 @@ type = "manual"
         let base = SopRun {
             run_id: "r-done".to_string(),
             sop_name: "deploy".to_string(),
+            initiating_agent: None,
             trigger_event: SopEvent {
                 source: SopTriggerSource::Manual,
                 topic: None,
