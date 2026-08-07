@@ -517,11 +517,37 @@ pub(crate) async fn execute_tools_sequential(
         if cancellation_token.is_some_and(CancellationToken::is_cancelled) {
             break;
         }
+        // Re-derive the active SOP step's tool scope against the CURRENT
+        // callable set, per call rather than per response. `dispatch` carries
+        // the exclusion snapshot taken before the batch; a `tool_search` earlier
+        // in this same response can activate a deferred tool the step denies,
+        // and that snapshot does not know about it. Without this, the denied
+        // tool executes and the step's boundary is only re-derived in time for
+        // the NEXT provider request — one call too late.
+        let rescoped_exclusions: Option<Vec<String>> =
+            crate::sop::active_scope::active_headless_step_scope().map(|scope| {
+                let mut merged = dispatch.excluded_tools.to_vec();
+                crate::agent::loop_::merge_sop_step_exclusions(
+                    &mut merged,
+                    dispatch.tools_registry,
+                    dispatch.activated_tools,
+                    Some(&scope),
+                );
+                merged
+            });
+        let call_dispatch = ToolDispatchContext {
+            tools_registry: dispatch.tools_registry,
+            activated_tools: dispatch.activated_tools,
+            excluded_tools: rescoped_exclusions
+                .as_deref()
+                .unwrap_or(dispatch.excluded_tools),
+            model_switch_callback: dispatch.model_switch_callback,
+        };
         let outcome = match execute_one_tool(
             &call.name,
             call.arguments.clone(),
             call.tool_call_id.as_deref(),
-            dispatch,
+            call_dispatch,
             meta,
             observer,
             cancellation_token,
