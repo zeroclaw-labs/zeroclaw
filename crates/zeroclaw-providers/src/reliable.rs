@@ -406,6 +406,74 @@ struct ProviderErrorDiagnostic {
     endpoint: Option<String>,
 }
 
+/// A structured, locale-neutral failure lead for the owning presentation layer
+/// to render. The provider edge crate intentionally does not format
+/// product text: it exposes the cause `kind`, the provider name, and the
+/// sanitized endpoint, leaving each consuming surface (CLI/runtime/ZeroCode)
+/// to render through its own Fluent catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderFailureLead {
+    pub provider: String,
+    pub kind: &'static str,
+    pub endpoint: Option<String>,
+}
+
+impl ProviderFailureLead {
+    /// Stable machine-readable encoding used as the concise lead of the
+    /// `bail!` message, so downstream surfaces can re-parse it without the
+    /// retry envelope. Format: `provider-failure|kind=..|provider=..|endpoint=..`
+    fn encode(&self) -> String {
+        let mut s = format!(
+            "provider-failure|kind={}|provider={}",
+            self.kind, self.provider
+        );
+        if let Some(endpoint) = &self.endpoint {
+            s.push_str(&format!("|endpoint={endpoint}"));
+        }
+        s
+    }
+
+    /// Parse the encoded lead out of a larger error message. Returns `None`
+    /// when the message does not carry a provider-failure lead (e.g. a
+    /// non-provider error), so callers can fall back to a generic message.
+    pub fn extract_from(message: &str) -> Option<ProviderFailureLeadView> {
+        let marker = "provider-failure|";
+        let start = message.find(marker)?;
+        let tail = &message[start + marker.len()..];
+        // Stop at the first newline; the retry envelope follows.
+        let segment = tail.split('\n').next()?;
+        let mut kind = None;
+        let mut provider = None;
+        let mut endpoint = None;
+        for part in segment.split('|') {
+            let Some((k, v)) = part.split_once('=') else {
+                continue;
+            };
+            match k {
+                "kind" => kind = Some(v),
+                "provider" => provider = Some(v),
+                "endpoint" => endpoint = Some(v.to_string()),
+                _ => {}
+            }
+        }
+        Some(ProviderFailureLeadView {
+            kind: kind.unwrap_or("provider_error").to_string(),
+            provider: provider.unwrap_or("unknown").to_string(),
+            endpoint,
+        })
+    }
+}
+
+/// Owned, locale-neutral view of a provider-failure lead, returned by
+/// [`ProviderFailureLead::extract_from`] for downstream surfaces to render
+/// through their own Fluent catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderFailureLeadView {
+    pub kind: String,
+    pub provider: String,
+    pub endpoint: Option<String>,
+}
+
 fn sanitized_url_endpoint(mut url: reqwest::Url) -> String {
     let _ = url.set_username("");
     let _ = url.set_password(None);
@@ -424,6 +492,110 @@ fn endpoint_from_error_text(text: &str) -> Option<String> {
         .or_else(|_| reqwest::Url::parse(raw.trim_end_matches([':', '.'])))
         .ok()?;
     Some(sanitized_url_endpoint(url))
+}
+
+/// A display-only auth classifier that distinguishes `auth_missing` (no
+/// credential configured) from `auth_rejected` (a credential was sent and
+/// refused), falling back to the ambiguous `auth`.
+///
+/// This is intentionally separate from the public `is_auth_error` predicate,
+/// which keeps its existing semantics (rejections / real 401-403) so the
+/// orchestrator's cache-eviction control flow is unchanged. Missing-key
+/// detection here is best-effort: providers phrase their pre-flight "no key
+/// configured" check differently, and some (local / OpenAI-compatible) never
+/// emit one, so we only claim it on a positive match.
+fn classify_auth_kind(err: &anyhow::Error, lower: &str) -> &'static str {
+    // A real 401/403 is authoritative: the request reached the provider and
+    // was refused, so this is a rejection regardless of any other wording.
+    if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>()
+        && let Some(status) = reqwest_err.status()
+        && (status.as_u16() == 401 || status.as_u16() == 403)
+    {
+        return "auth_rejected";
+    }
+
+    let missing = [
+        "not set",
+        "not configured",
+        "no api key",
+        "no credentials",
+        "missing api key",
+        "credentials not found",
+        "credentials required",
+    ];
+    if missing.iter().any(|hint| lower.contains(hint)) {
+        return "auth_missing";
+    }
+
+    let rejected = [
+        "401",
+        "403",
+        "unauthorized",
+        "forbidden",
+        "invalid api key",
+        "incorrect api key",
+        "invalid token",
+        "token expired",
+        "expired",
+        "rejected",
+        "access denied",
+        "permission denied",
+    ];
+    if rejected.iter().any(|hint| lower.contains(hint)) {
+        return "auth_rejected";
+    }
+
+    "auth"
+}
+
+/// Whether a sanitized endpoint refers to a loopback / local address, so the
+/// owning catalog can choose "start its local server" guidance only when it is
+/// actually local. Remote endpoints must not be told to start a local
+/// server.
+pub fn is_localhost_endpoint(endpoint: Option<&str>) -> bool {
+    let Some(endpoint) = endpoint else {
+        return false;
+    };
+    let Some(host) = endpoint
+        .strip_prefix("http://")
+        .or_else(|| endpoint.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    // Strip the path first, then the port, so IPv6 literals like `[::1]` keep
+    // their brackets until the final comparison.
+    let host = host.split('/').next().unwrap_or(host);
+    let host = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host);
+    let host = host.to_lowercase();
+    matches!(
+        host.as_str(),
+        "localhost" | "127.0.0.1" | "0.0.0.0" | "[::1]"
+    ) || host.ends_with(".localhost")
+}
+
+/// Rank a diagnostic `kind` by how actionable it is as a user-facing lead.
+/// Clear configuration/process causes (auth, unreachable endpoint, unknown
+/// model, oversized context) outrank transient/ambiguous ones so that, across
+/// several failing providers, the most useful cause leads the message.
+fn lead_priority(kind: &str) -> u8 {
+    match kind {
+        "auth" | "auth_missing" | "auth_rejected" | "connect" | "dns" | "model_not_found"
+        | "context_window" => 3,
+        "rate_limited" | "timeout" | "connect_timeout" | "provider_server" => 2,
+        _ => 1,
+    }
+}
+
+/// Decide whether `candidate` should become the user-facing lead diagnostic,
+/// keeping the first-seen one on ties.
+fn should_replace_lead(
+    current: Option<&ProviderFailureLead>,
+    candidate: &ProviderErrorDiagnostic,
+) -> bool {
+    match current {
+        None => true,
+        Some(existing) => lead_priority(candidate.kind) > lead_priority(existing.kind),
+    }
 }
 
 fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
@@ -445,7 +617,30 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
 
     if is_auth_error(err) {
         return ProviderErrorDiagnostic {
-            kind: "auth",
+            kind: classify_auth_kind(err, &lower),
+            phase: "http_response",
+            hint: "check provider credentials",
+            endpoint,
+        };
+    }
+
+    // Missing/unconfigured credentials do not always surface as a typed
+    // reqwest 401/403 — some providers emit a pre-flight "no key" error that
+    // `is_auth_error` does not cover. Recognize it here as a display-only
+    // `auth_missing` classification without widening the public predicate's
+    // semantics; the public predicate is unchanged so cache-eviction control
+    // flow is not widened.
+    if lower.contains("credentials not set")
+        || lower.contains("credentials not found")
+        || lower.contains("credentials required")
+        || lower.contains("no credentials")
+        || lower.contains("missing api key")
+        || lower.contains("api key not set")
+        || lower.contains("no api key")
+        || lower.contains("api key is not configured")
+    {
+        return ProviderErrorDiagnostic {
+            kind: "auth_missing",
             phase: "http_response",
             hint: "check provider credentials",
             endpoint,
@@ -544,6 +739,24 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
             kind: "dns",
             phase: "dns",
             hint: "DNS resolution failed; check network or provider host",
+            endpoint,
+        };
+    }
+
+    // Stringified connection failures (e.g. a local LM Studio/Ollama server
+    // not running) do not always survive as a typed `reqwest::Error`, so
+    // recognize them by text too.
+    if lower.contains("connection refused")
+        || lower.contains("connection reset")
+        || lower.contains("failed to connect")
+        || lower.contains("could not connect")
+        || lower.contains("couldn't connect")
+        || lower.contains("client error (connect)")
+    {
+        return ProviderErrorDiagnostic {
+            kind: "connect",
+            phase: "connect",
+            hint: "could not open provider connection; check network, VPN, or firewall",
             endpoint,
         };
     }
@@ -1039,6 +1252,7 @@ impl ModelProvider for ReliableModelProvider {
     ) -> anyhow::Result<String> {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
+        let mut lead: Option<ProviderFailureLead> = None;
 
         // Outer: model fallback chain. Middle: model_provider priority. Inner: retries.
         // Each iteration: attempt one (model_provider, model) call. On success, return
@@ -1129,6 +1343,13 @@ impl ModelProvider for ReliableModelProvider {
                             let diagnostic = provider_error_diagnostic(&e);
                             last_error_detail = Some(error_detail.clone());
                             last_diagnostic = Some(diagnostic.clone());
+                            if should_replace_lead(lead.as_ref(), &diagnostic) {
+                                lead = Some(ProviderFailureLead {
+                                    provider: provider_name.to_string(),
+                                    kind: diagnostic.kind,
+                                    endpoint: diagnostic.endpoint.clone(),
+                                });
+                            }
 
                             push_failure(
                                 &mut failures,
@@ -1227,7 +1448,10 @@ impl ModelProvider for ReliableModelProvider {
         }
 
         anyhow::bail!(
-            "All model_providers/models failed. Attempts:\n{}",
+            "{}\nAll model_providers/models failed. Attempts:\n{}",
+            lead.as_ref().map(|l| l.encode()).unwrap_or_else(|| {
+                "provider-failure|kind=provider_error|provider=unknown".to_string()
+            }),
             failures.join("\n")
         )
     }
@@ -1240,6 +1464,7 @@ impl ModelProvider for ReliableModelProvider {
     ) -> anyhow::Result<String> {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
+        let mut lead: Option<ProviderFailureLead> = None;
         let mut effective_messages = messages.to_vec();
         let mut context_truncated = false;
 
@@ -1340,6 +1565,13 @@ impl ModelProvider for ReliableModelProvider {
                             let diagnostic = provider_error_diagnostic(&e);
                             last_error_detail = Some(error_detail.clone());
                             last_diagnostic = Some(diagnostic.clone());
+                            if should_replace_lead(lead.as_ref(), &diagnostic) {
+                                lead = Some(ProviderFailureLead {
+                                    provider: provider_name.to_string(),
+                                    kind: diagnostic.kind,
+                                    endpoint: diagnostic.endpoint.clone(),
+                                });
+                            }
 
                             push_failure(
                                 &mut failures,
@@ -1432,7 +1664,10 @@ impl ModelProvider for ReliableModelProvider {
         }
 
         anyhow::bail!(
-            "All model_providers/models failed. Attempts:\n{}",
+            "{}\nAll model_providers/models failed. Attempts:\n{}",
+            lead.as_ref().map(|l| l.encode()).unwrap_or_else(|| {
+                "provider-failure|kind=provider_error|provider=unknown".to_string()
+            }),
             failures.join("\n")
         )
     }
@@ -1489,6 +1724,7 @@ impl ModelProvider for ReliableModelProvider {
     ) -> anyhow::Result<ChatResponse> {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
+        let mut lead: Option<ProviderFailureLead> = None;
         let mut effective_messages = messages.to_vec();
         let mut context_truncated = false;
 
@@ -1590,6 +1826,13 @@ impl ModelProvider for ReliableModelProvider {
                             let diagnostic = provider_error_diagnostic(&e);
                             last_error_detail = Some(error_detail.clone());
                             last_diagnostic = Some(diagnostic.clone());
+                            if should_replace_lead(lead.as_ref(), &diagnostic) {
+                                lead = Some(ProviderFailureLead {
+                                    provider: provider_name.to_string(),
+                                    kind: diagnostic.kind,
+                                    endpoint: diagnostic.endpoint.clone(),
+                                });
+                            }
 
                             push_failure(
                                 &mut failures,
@@ -1682,7 +1925,10 @@ impl ModelProvider for ReliableModelProvider {
         }
 
         anyhow::bail!(
-            "All model_providers/models failed. Attempts:\n{}",
+            "{}\nAll model_providers/models failed. Attempts:\n{}",
+            lead.as_ref().map(|l| l.encode()).unwrap_or_else(|| {
+                "provider-failure|kind=provider_error|provider=unknown".to_string()
+            }),
             failures.join("\n")
         )
     }
@@ -1695,6 +1941,7 @@ impl ModelProvider for ReliableModelProvider {
     ) -> anyhow::Result<ChatResponse> {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
+        let mut lead: Option<ProviderFailureLead> = None;
         let mut effective_messages = request.messages.to_vec();
         let mut context_truncated = false;
 
@@ -1801,6 +2048,13 @@ impl ModelProvider for ReliableModelProvider {
                             let diagnostic = provider_error_diagnostic(&e);
                             last_error_detail = Some(error_detail.clone());
                             last_diagnostic = Some(diagnostic.clone());
+                            if should_replace_lead(lead.as_ref(), &diagnostic) {
+                                lead = Some(ProviderFailureLead {
+                                    provider: provider_name.to_string(),
+                                    kind: diagnostic.kind,
+                                    endpoint: diagnostic.endpoint.clone(),
+                                });
+                            }
 
                             push_failure(
                                 &mut failures,
@@ -1897,7 +2151,10 @@ impl ModelProvider for ReliableModelProvider {
         }
 
         anyhow::bail!(
-            "All model_providers/models failed. Attempts:\n{}",
+            "{}\nAll model_providers/models failed. Attempts:\n{}",
+            lead.as_ref().map(|l| l.encode()).unwrap_or_else(|| {
+                "provider-failure|kind=provider_error|provider=unknown".to_string()
+            }),
             failures.join("\n")
         )
     }
@@ -2165,7 +2422,7 @@ impl ::zeroclaw_api::attribution::Attributable for ReliableModelProvider {
 
     fn alias(&self) -> &str {
         // Delegate to the primary inner provider for the same reason
-        // as `role()`. Falls back to the wrapper's own configured alias
+        // as `role`. Falls back to the wrapper's own configured alias
         // when no inner provider is registered.
         match self.model_providers.first() {
             Some(entry) => ::zeroclaw_api::attribution::Attributable::alias(entry.provider()),
@@ -2842,7 +3099,7 @@ mod tests {
             ),
             (
                 "401 Unauthorized: invalid api key",
-                "auth",
+                "auth_rejected",
                 "http_response",
                 "credentials",
             ),
@@ -2886,6 +3143,135 @@ mod tests {
             assert_eq!(diagnostic.phase, expected_phase, "{message}");
             assert!(diagnostic.hint.contains(expected_hint), "{message}");
         }
+    }
+
+    // --- cause-specific provider diagnostics ---------------------------
+
+    #[test]
+    fn missing_key_is_classified_as_auth_missing_without_widening_is_auth_error() {
+        // A missing/unconfigured key must read as `auth_missing` for display,
+        // but the public `is_auth_error` predicate must NOT widen to it (W1:
+        // that predicate drives orchestrator cache eviction).
+        for msg in [
+            "missing api key",
+            "api key not set",
+            "no api key",
+            "api key is not configured",
+            // Anthropic's real missing-credential wording.
+            "Anthropic credentials not set. Set ANTHROPIC_API_KEY or ANTHROPIC_OAUTH_TOKEN.",
+            "credentials not found",
+            "credentials required",
+            "no credentials",
+        ] {
+            let err = anyhow::Error::msg(msg);
+            // Display classification is cause-specific:
+            assert_eq!(
+                provider_error_diagnostic(&err).kind,
+                "auth_missing",
+                "kind for: {msg}"
+            );
+            // But the control-flow predicate is unchanged (no eviction side effect):
+            assert!(
+                !is_auth_error(&err),
+                "is_auth_error must not match missing-key wording: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejected_credentials_classified_as_auth_rejected() {
+        for msg in [
+            "401 Unauthorized",
+            "403 Forbidden",
+            "invalid api key provided",
+            "token expired",
+        ] {
+            let err = anyhow::Error::msg(msg);
+            assert_eq!(
+                provider_error_diagnostic(&err).kind,
+                "auth_rejected",
+                "kind for: {msg}"
+            );
+            assert!(is_auth_error(&err), "is_auth_error should match: {msg}");
+        }
+    }
+
+    #[test]
+    fn text_connection_failure_is_classified_as_connect() {
+        // Stringified connection failures do not always survive as a typed
+        // reqwest::Error, so recognize them by text too.
+        for msg in [
+            "error sending request: client error (Connect): tcp connect error: connection refused",
+            "connection reset by peer",
+            "failed to connect to host",
+            "could not connect",
+        ] {
+            let err = anyhow::Error::msg(msg);
+            assert_eq!(provider_error_diagnostic(&err).kind, "connect", "{msg}");
+        }
+    }
+
+    #[test]
+    fn lead_priority_prefers_actionable_cause() {
+        let auth = ProviderErrorDiagnostic {
+            kind: "auth_missing",
+            phase: "http_response",
+            hint: "",
+            endpoint: None,
+        };
+        let generic = ProviderErrorDiagnostic {
+            kind: "provider_error",
+            phase: "unknown",
+            hint: "",
+            endpoint: None,
+        };
+        // A generic cause never displaces an already-recorded actionable one.
+        assert!(should_replace_lead(None, &generic));
+        assert!(should_replace_lead(
+            Some(&ProviderFailureLead {
+                provider: "p".into(),
+                kind: "provider_error",
+                endpoint: None,
+            }),
+            &auth
+        ));
+        assert!(!should_replace_lead(
+            Some(&ProviderFailureLead {
+                provider: "p".into(),
+                kind: "auth_missing",
+                endpoint: None,
+            }),
+            &generic
+        ));
+    }
+
+    #[test]
+    fn failure_lead_round_trips_through_encode_extract() {
+        let lead = ProviderFailureLead {
+            provider: "anthropic".into(),
+            kind: "auth_missing",
+            endpoint: Some("https://api.anthropic.com/v1/messages".into()),
+        };
+        let encoded = lead.encode();
+        let message = format!("{encoded}\nAll model_providers/models failed. Attempts:\n...");
+        let view = ProviderFailureLead::extract_from(&message).expect("should parse");
+        assert_eq!(view.kind, "auth_missing");
+        assert_eq!(view.provider, "anthropic");
+        assert_eq!(
+            view.endpoint.as_deref(),
+            Some("https://api.anthropic.com/v1/messages")
+        );
+    }
+
+    #[test]
+    fn is_localhost_endpoint_distinguishes_loopback() {
+        assert!(is_localhost_endpoint(Some("http://127.0.0.1:8080/v1")));
+        assert!(is_localhost_endpoint(Some("http://localhost:8080/v1")));
+        assert!(is_localhost_endpoint(Some("http://[::1]:8080/v1")));
+        assert!(!is_localhost_endpoint(Some(
+            "https://api.openai.com/v1/chat/completions"
+        )));
+        assert!(!is_localhost_endpoint(None));
     }
 
     #[test]
@@ -3656,7 +4042,7 @@ mod tests {
 
     // Arc<ModelAwareMock> ModelProvider impl provided by blanket impl in zeroclaw-types.
 
-    /// Mock model_provider that implements `chat()` with native tool support.
+    /// Mock model_provider that implements `chat` with native tool support.
     struct NativeToolMock {
         calls: Arc<AtomicUsize>,
         fail_until_attempt: usize,
@@ -3822,7 +4208,7 @@ mod tests {
         );
     }
 
-    // ── Gap 2-4: Parity tests for chat() ────────────────────────
+    // ── Gap 2-4: Parity tests for chat ────────────────────────
 
     #[tokio::test]
     async fn chat_returns_aggregated_error_when_all_providers_fail() {
@@ -3874,7 +4260,7 @@ mod tests {
     }
 
     /// Mock that records model names and can fail specific models,
-    /// implementing `chat()` for native tool calling parity tests.
+    /// implementing `chat` for native tool calling parity tests.
     struct NativeModelAwareMock {
         calls: Arc<AtomicUsize>,
         models_seen: parking_lot::Mutex<Vec<String>>,
@@ -5399,11 +5785,11 @@ mod tests {
     #[test]
     fn capabilities_vision_matches_supports_vision_on_final_wrapped_reliable() {
         // Regression: the final wrapped ReliableModelProvider must report the SAME
-        // `vision` on `capabilities().vision` and `supports_vision()`. Wrap the
+        // `vision` on `capabilities.vision` and `supports_vision`. Wrap the
         // config `vision` decorator forcing vision ON over a non-vision inner; the
-        // outer surface must reflect it on BOTH accessors. Before `capabilities()`
+        // outer surface must reflect it on BOTH accessors. Before `capabilities`
         // delegated to the primary, the outer returned the trait default
-        // (vision=false) and disagreed with the delegated `supports_vision()`.
+        // (vision=false) and disagreed with the delegated `supports_vision`.
         struct PlainMock;
         #[async_trait]
         impl ModelProvider for PlainMock {
