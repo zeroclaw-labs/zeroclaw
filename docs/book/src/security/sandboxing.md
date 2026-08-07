@@ -21,7 +21,7 @@ To force a specific backend, set `sandbox_backend` to one of the literal values 
 
 ## What the sandbox confines
 
-### Filesystem
+### File access
 
 - **Read access**: restricted to the workspace, `/usr`, `/lib`, `/etc` (read-only), and explicitly-listed extra paths.
 - **Write access**: restricted to the workspace and `/tmp`.

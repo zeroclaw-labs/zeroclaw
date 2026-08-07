@@ -311,7 +311,7 @@ fn truncate_output(s: &str, max: usize) -> String {
         // inside a multi-byte UTF-8 char (non-ASCII skill output). Round down
         // to the nearest char boundary first (matches skills/review.rs).
         let end = trimmed.floor_char_boundary(max);
-        format!("{}...", &trimmed[..end].replace('\n', " "))
+        format!("{}...", trimmed[..end].replace('\n', " "))
     }
 }
 

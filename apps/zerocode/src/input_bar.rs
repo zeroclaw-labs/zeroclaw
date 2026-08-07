@@ -14,7 +14,6 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
 };
-use unicode_segmentation::UnicodeSegmentation;
 
 use crate::attachment::PendingAttachment;
 use crate::clipboard;
@@ -28,21 +27,172 @@ use crate::turn_status::TurnStatus;
 /// Maximum number of visible content rows before the input bar scrolls.
 const MAX_INPUT_ROWS: u16 = 5;
 
-/// Slash commands available for auto-complete.
-const SLASH_COMMANDS: &[&str] = &[
-    "/attach",
-    "/attachments",
-    "/browse",
-    "/clear-queue",
-    "/detach",
-    "/help",
-    "/model",
-    "/model-provider",
-    "/new",
-    "/new-session",
-    "/restart-session",
-    "/toggle-thinking",
+/// Maximum number of attachment rows visible in the manager before it scrolls.
+const MAX_ATTACHMENT_MANAGER_ROWS: usize = 8;
+
+const ATTACHMENT_REMOVE_LABEL: &str = "[×]";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlashCommandId {
+    Attach,
+    ListAttachments,
+    Detach,
+    ClearQueue,
+    Browse,
+    Help,
+    Model,
+    ModelProvider,
+    RestartSession,
+    ToggleThinking,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LocalCommandDescriptor {
+    id: SlashCommandId,
+    name: &'static str,
+    aliases: &'static [&'static str],
+}
+
+/// Commands whose identity and execution are owned entirely by ZeroCode.
+/// Shared command names and aliases are intentionally absent: the daemon
+/// supplies those from `zeroclaw-commands` during the RPC handshake.
+const LOCAL_COMMANDS: &[LocalCommandDescriptor] = &[
+    LocalCommandDescriptor {
+        id: SlashCommandId::Attach,
+        name: "attach",
+        aliases: &[],
+    },
+    LocalCommandDescriptor {
+        id: SlashCommandId::ListAttachments,
+        name: "attachments",
+        aliases: &[],
+    },
+    LocalCommandDescriptor {
+        id: SlashCommandId::Browse,
+        name: "browse",
+        aliases: &[],
+    },
+    LocalCommandDescriptor {
+        id: SlashCommandId::ClearQueue,
+        name: "clear-queue",
+        aliases: &[],
+    },
+    LocalCommandDescriptor {
+        id: SlashCommandId::Detach,
+        name: "detach",
+        aliases: &[],
+    },
+    LocalCommandDescriptor {
+        id: SlashCommandId::ModelProvider,
+        name: "model-provider",
+        aliases: &[],
+    },
+    LocalCommandDescriptor {
+        id: SlashCommandId::RestartSession,
+        name: "restart-session",
+        aliases: &[],
+    },
+    LocalCommandDescriptor {
+        id: SlashCommandId::ToggleThinking,
+        name: "toggle-thinking",
+        aliases: &[],
+    },
 ];
+
+#[derive(Debug, Clone)]
+struct CommandToken {
+    id: SlashCommandId,
+    token: String,
+}
+
+#[derive(Debug, Clone)]
+struct SlashCommandRegistry {
+    tokens: Vec<CommandToken>,
+}
+
+impl SlashCommandRegistry {
+    fn new(shared: &[crate::wire::CommandDescriptor]) -> Self {
+        let mut tokens = std::collections::BTreeMap::new();
+
+        for descriptor in shared {
+            let Some(id) = shared_command_id(&descriptor.id) else {
+                continue;
+            };
+            for name in std::iter::once(descriptor.name.as_str())
+                .chain(descriptor.aliases.iter().map(String::as_str))
+            {
+                tokens.insert(format!("/{name}"), id);
+            }
+        }
+
+        // Local commands own their tokens if a future shared descriptor
+        // collides with one of them.
+        for descriptor in LOCAL_COMMANDS {
+            for name in std::iter::once(descriptor.name).chain(descriptor.aliases.iter().copied()) {
+                tokens.insert(format!("/{name}"), descriptor.id);
+            }
+        }
+
+        Self {
+            tokens: tokens
+                .into_iter()
+                .map(|(token, id)| CommandToken { id, token })
+                .collect(),
+        }
+    }
+
+    fn command_names(&self) -> impl Iterator<Item = &str> {
+        self.tokens.iter().map(|entry| entry.token.as_str())
+    }
+
+    fn parse<'a>(&self, input: &'a str) -> SlashCommand<'a> {
+        let trimmed = input.trim();
+        let (head, argument) = trimmed
+            .split_once(' ')
+            .map_or((trimmed, None), |(head, rest)| (head, Some(rest.trim())));
+        let Some(id) = self
+            .tokens
+            .iter()
+            .find(|entry| entry.token == head)
+            .map(|entry| entry.id)
+        else {
+            return SlashCommand::NotACommand;
+        };
+
+        match (id, argument) {
+            (SlashCommandId::Attach, argument) => {
+                SlashCommand::Attach(argument.unwrap_or_default())
+            }
+            (SlashCommandId::Detach, None) => SlashCommand::Detach(None),
+            (SlashCommandId::Detach, Some(argument)) => SlashCommand::Detach(argument.parse().ok()),
+            (SlashCommandId::ListAttachments, None) => SlashCommand::ListAttachments,
+            (SlashCommandId::ClearQueue, None) => SlashCommand::ClearQueue(None),
+            (SlashCommandId::ClearQueue, Some(argument)) => {
+                // Malformed index -> Some(0): an invalid index, never a
+                // clear-all, so a typo cannot wipe the whole queue.
+                SlashCommand::ClearQueue(Some(argument.parse().unwrap_or(0)))
+            }
+            (SlashCommandId::RestartSession, None) => SlashCommand::RestartSession,
+            (SlashCommandId::ToggleThinking, None) => SlashCommand::ToggleThinking,
+            (SlashCommandId::Browse, None) => SlashCommand::EnterBrowseMode,
+            (SlashCommandId::Help, None) => SlashCommand::OpenHelp,
+            (SlashCommandId::ModelProvider, None | Some("")) => SlashCommand::ModelProviderPicker,
+            (SlashCommandId::ModelProvider, Some(name)) => SlashCommand::ModelProvider(name),
+            (SlashCommandId::Model, None | Some("")) => SlashCommand::ModelPicker,
+            (SlashCommandId::Model, Some(name)) => SlashCommand::Model(name),
+            _ => SlashCommand::NotACommand,
+        }
+    }
+}
+
+fn shared_command_id(id: &str) -> Option<SlashCommandId> {
+    match id {
+        "help" => Some(SlashCommandId::Help),
+        "model" => Some(SlashCommandId::Model),
+        "new" => Some(SlashCommandId::RestartSession),
+        _ => None,
+    }
+}
 
 // ── Action type ──────────────────────────────────────────────────
 
@@ -118,55 +268,6 @@ enum SlashCommand<'a> {
     EnterBrowseMode,
     OpenHelp,
     NotACommand,
-}
-
-fn parse_slash_command(input: &str) -> SlashCommand<'_> {
-    let trimmed = input.trim();
-    if let Some(path) = trimmed.strip_prefix("/attach ") {
-        SlashCommand::Attach(path.trim())
-    } else if trimmed == "/attach" {
-        SlashCommand::Attach("")
-    } else if let Some(idx) = trimmed.strip_prefix("/detach ") {
-        SlashCommand::Detach(idx.trim().parse().ok())
-    } else if trimmed == "/detach" {
-        SlashCommand::Detach(None)
-    } else if let Some(arg) = trimmed.strip_prefix("/clear-queue ") {
-        // Malformed index -> Some(0): an invalid index, never a clear-all, so a
-        // typo cannot wipe the whole queue. Only the bare form clears all.
-        SlashCommand::ClearQueue(Some(arg.trim().parse().unwrap_or(0)))
-    } else if trimmed == "/clear-queue" {
-        SlashCommand::ClearQueue(None)
-    } else if trimmed == "/attachments" {
-        SlashCommand::ListAttachments
-    } else if trimmed == "/restart-session" || trimmed == "/new-session" || trimmed == "/new" {
-        SlashCommand::RestartSession
-    } else if trimmed == "/toggle-thinking" {
-        SlashCommand::ToggleThinking
-    } else if trimmed == "/browse" {
-        SlashCommand::EnterBrowseMode
-    } else if trimmed == "/help" {
-        SlashCommand::OpenHelp
-    } else if let Some(name) = trimmed.strip_prefix("/model-provider ") {
-        let name = name.trim();
-        if name.is_empty() {
-            SlashCommand::ModelProviderPicker
-        } else {
-            SlashCommand::ModelProvider(name)
-        }
-    } else if trimmed == "/model-provider" {
-        SlashCommand::ModelProviderPicker
-    } else if let Some(name) = trimmed.strip_prefix("/model ") {
-        let name = name.trim();
-        if name.is_empty() {
-            SlashCommand::ModelPicker
-        } else {
-            SlashCommand::Model(name)
-        }
-    } else if trimmed == "/model" {
-        SlashCommand::ModelPicker
-    } else {
-        SlashCommand::NotACommand
-    }
 }
 
 // ── Wrap geometry helpers ────────────────────────────────────────
@@ -404,35 +505,6 @@ fn wrapped_line_count(text: &str, width: u16) -> u16 {
         .unwrap_or(u16::MAX)
 }
 
-fn is_word_character(character: char) -> bool {
-    character == '_' || character.is_alphanumeric()
-}
-
-fn previous_word_boundary(text: &str, cursor: usize) -> Option<usize> {
-    let mut chars = text[..cursor].char_indices().rev();
-
-    let mut target_is_word = None;
-    for (_, character) in chars.by_ref() {
-        if character.is_whitespace() {
-            continue;
-        }
-        target_is_word = Some(is_word_character(character));
-        break;
-    }
-
-    let Some(target_is_word) = target_is_word else {
-        return (cursor > 0).then_some(0);
-    };
-
-    for (index, character) in chars {
-        if character.is_whitespace() || is_word_character(character) != target_is_word {
-            return Some(index + character.len_utf8());
-        }
-    }
-
-    Some(0)
-}
-
 /// Decide which overflow arrows to show for `(up, down)` given the total
 /// content rows, the visible window, and the current scroll offset. Arrows
 /// only appear when content exceeds the window.
@@ -503,15 +575,105 @@ fn visual_to_cursor(text: &str, target_row: u16, target_col: u16, width: u16) ->
     }
 }
 
+fn attachment_row_at(
+    area: Option<Rect>,
+    first_index: usize,
+    column: u16,
+    row: u16,
+) -> Option<usize> {
+    let area = area?;
+    if !mouse::in_rect(column, row, area) {
+        return None;
+    }
+    Some(first_index + usize::from(row - area.y))
+}
+
+fn attachment_remove_at(
+    area: Option<Rect>,
+    first_index: usize,
+    attachments: &[PendingAttachment],
+    column: u16,
+    row: u16,
+) -> Option<usize> {
+    let area = area?;
+    let index = attachment_row_at(Some(area), first_index, column, row)?;
+    let attachment = attachments.get(index)?;
+    let (_, remove_col) = attachment_line(index, &attachment.label(), area.width);
+    let remove_col = remove_col?;
+    let remove_width = crate::display_width::display_width(ATTACHMENT_REMOVE_LABEL) as u16;
+    let relative_col = column - area.x;
+    if relative_col < remove_col || relative_col >= remove_col + remove_width {
+        return None;
+    }
+    Some(index)
+}
+
+fn attachment_line(index: usize, label: &str, width: u16) -> (String, Option<u16>) {
+    let remove_width = crate::display_width::display_width(ATTACHMENT_REMOVE_LABEL) as u16;
+    if width < remove_width {
+        return (truncate_to_cells(label, width as usize), None);
+    }
+
+    let main_width = width - remove_width;
+    if main_width == 0 {
+        return (String::new(), Some(0));
+    }
+
+    let raw = format!(" [{index}] {label}");
+    let mut main = truncate_to_cells(&raw, main_width.saturating_sub(1) as usize);
+    main.push(' ');
+    let remove_col = crate::display_width::display_width(&main) as u16;
+    (main, Some(remove_col))
+}
+
+fn truncate_to_cells(text: &str, max_width: usize) -> String {
+    if crate::display_width::display_width(text) <= max_width {
+        return text.to_string();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+
+    let mut out = String::new();
+    let budget = max_width - 1;
+    let mut used = 0;
+    for (_, grapheme, width) in crate::display_width::grapheme_widths(text) {
+        if used + width > budget {
+            break;
+        }
+        out.push_str(grapheme);
+        used += width;
+    }
+    out.push('…');
+    out
+}
+
+fn attachment_manager_key_labels() -> (Vec<String>, Vec<String>, Vec<String>) {
+    use crate::keymap::{InputBarAction as Ib, ModalAction as M, action_key_labels};
+
+    let mut navigate = action_key_labels(M::Up);
+    navigate.extend(action_key_labels(M::Down));
+    let mut remove = action_key_labels(Ib::Backspace);
+    remove.push("Del".to_string());
+    let close = action_key_labels(M::Cancel);
+    (navigate, remove, close)
+}
+
 // ── State ────────────────────────────────────────────────────────
 
 /// Input bar state. Each pane (Chat, ACP) owns its own instance.
 #[derive(Debug)]
 pub(crate) struct InputBarState {
+    command_registry: SlashCommandRegistry,
     input: String,
-    /// Byte offset of the editing cursor within `input`. Always on a char boundary.
+    /// Byte offset of the editing cursor within `input`.
+    /// Kept on a grapheme boundary after each completed edit operation.
     cursor: usize,
     pending_attachments: Vec<PendingAttachment>,
+    attachment_manager: Option<AttachmentManagerState>,
+    /// Latest composer and modal list geometry for mouse hit-testing.
+    last_attachment_area: Option<Rect>,
+    last_attachment_manager_area: Option<Rect>,
     file_explorer: Option<FileExplorerState>,
     clipboard_temps: Vec<PathBuf>,
 
@@ -566,12 +728,22 @@ enum AutocompleteTarget {
     ModelProviderArg,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct AttachmentManagerState {
+    selected: usize,
+    scroll: usize,
+}
+
 impl InputBarState {
-    pub fn new() -> Self {
+    pub fn with_shared_commands(shared: &[crate::wire::CommandDescriptor]) -> Self {
         Self {
+            command_registry: SlashCommandRegistry::new(shared),
             input: String::new(),
             cursor: 0,
             pending_attachments: Vec::new(),
+            attachment_manager: None,
+            last_attachment_area: None,
+            last_attachment_manager_area: None,
             file_explorer: None,
             clipboard_temps: Vec::new(),
             scroll_offset: 0,
@@ -614,14 +786,23 @@ impl InputBarState {
         &self.clipboard_temps
     }
 
+    #[cfg(test)]
+    pub fn attachment_area(&self) -> Option<Rect> {
+        self.last_attachment_area
+    }
+
     pub fn has_file_explorer(&self) -> bool {
         self.file_explorer.is_some()
     }
 
-    /// Whether the input bar is in text-input mode (input non-empty
-    /// or file explorer open). Used to suppress single-char keybindings.
+    pub fn has_attachment_manager(&self) -> bool {
+        self.attachment_manager.is_some()
+    }
+
+    /// Whether the input bar is in text-input mode (input non-empty or an
+    /// input-owned modal open). Used to suppress single-char keybindings.
     pub fn wants_text_input(&self) -> bool {
-        !self.input.is_empty() || self.file_explorer.is_some()
+        !self.input.is_empty() || self.file_explorer.is_some() || self.attachment_manager.is_some()
     }
 
     // ── Selection helpers ────────────────────────────────────
@@ -656,10 +837,11 @@ impl InputBarState {
         if text.starts_with('/') && !text.contains(' ') {
             let prefix = text.as_str();
             self.autocomplete_target = AutocompleteTarget::Command;
-            self.autocomplete_matches = SLASH_COMMANDS
-                .iter()
-                .filter(|cmd| cmd.starts_with(prefix) && **cmd != prefix)
-                .map(|c| (*c).to_string())
+            self.autocomplete_matches = self
+                .command_registry
+                .command_names()
+                .filter(|cmd| cmd.starts_with(prefix) && *cmd != prefix)
+                .map(str::to_string)
                 .collect();
             self.finalize_autocomplete();
             return;
@@ -796,6 +978,7 @@ impl InputBarState {
         self.delete_selection();
         self.input.insert(self.cursor, c);
         self.cursor += c.len_utf8();
+        self.cursor = crate::text_navigation::normalize_grapheme_cursor(&self.input, self.cursor);
         self.update_autocomplete();
     }
 
@@ -803,17 +986,17 @@ impl InputBarState {
     pub fn pop_input_char(&mut self) {
         if self.selection.is_some() {
             self.delete_selection();
+            self.cursor =
+                crate::text_navigation::normalize_grapheme_cursor(&self.input, self.cursor);
             self.update_autocomplete();
             return;
         }
         if self.cursor > 0 {
-            let prev_grapheme = self.input[..self.cursor]
-                .graphemes(true)
-                .next_back()
-                .unwrap_or("");
-            let prev_start = self.cursor - prev_grapheme.len();
+            let prev_start =
+                crate::text_navigation::previous_grapheme_boundary(&self.input, self.cursor);
             self.input.replace_range(prev_start..self.cursor, "");
-            self.cursor = prev_start;
+            self.cursor =
+                crate::text_navigation::normalize_grapheme_cursor(&self.input, prev_start);
             self.update_autocomplete();
         }
     }
@@ -821,37 +1004,38 @@ impl InputBarState {
     pub fn delete_previous_word(&mut self) {
         if self.selection.is_some() {
             self.delete_selection();
+            self.cursor =
+                crate::text_navigation::normalize_grapheme_cursor(&self.input, self.cursor);
             self.update_autocomplete();
             return;
         }
-        let Some(delete_from) = previous_word_boundary(&self.input, self.cursor) else {
+        if self.cursor == 0 {
             return;
-        };
+        }
+        let delete_from = crate::text_navigation::previous_word_boundary(&self.input, self.cursor);
         self.input.replace_range(delete_from..self.cursor, "");
-        self.cursor = delete_from;
+        self.cursor = crate::text_navigation::normalize_grapheme_cursor(&self.input, delete_from);
         self.update_autocomplete();
     }
 
     pub fn move_cursor_left(&mut self) {
         self.clear_selection();
-        if self.cursor > 0 {
-            let prev_grapheme = self.input[..self.cursor]
-                .graphemes(true)
-                .next_back()
-                .unwrap_or("");
-            self.cursor -= prev_grapheme.len();
-        }
+        self.cursor = crate::text_navigation::previous_grapheme_boundary(&self.input, self.cursor);
     }
 
     pub fn move_cursor_right(&mut self) {
         self.clear_selection();
-        if self.cursor < self.input.len() {
-            let next_grapheme = self.input[self.cursor..]
-                .graphemes(true)
-                .next()
-                .unwrap_or("");
-            self.cursor += next_grapheme.len();
-        }
+        self.cursor = crate::text_navigation::next_grapheme_boundary(&self.input, self.cursor);
+    }
+
+    pub fn move_cursor_word_left(&mut self) {
+        self.clear_selection();
+        self.cursor = crate::text_navigation::previous_word_boundary(&self.input, self.cursor);
+    }
+
+    pub fn move_cursor_word_right(&mut self) {
+        self.clear_selection();
+        self.cursor = crate::text_navigation::next_word_boundary(&self.input, self.cursor);
     }
 
     /// Move cursor up one visual row. Returns false if already on row 0.
@@ -899,7 +1083,14 @@ impl InputBarState {
         self.delete_selection();
         self.input.insert_str(self.cursor, text);
         self.cursor += text.len();
+        self.cursor = crate::text_navigation::normalize_grapheme_cursor(&self.input, self.cursor);
         self.update_autocomplete();
+    }
+
+    pub fn claims_pane_navigation(&self, key: &KeyEvent) -> bool {
+        self.file_explorer.is_none()
+            && !self.input.is_empty()
+            && crate::keymap::input_bar_claims_pane_navigation(key)
     }
 
     // ── Attachment management ────────────────────────────────
@@ -912,6 +1103,7 @@ impl InputBarState {
         self.input = text;
         self.cursor = self.input.len();
         self.scroll_offset = 0;
+        self.attachment_manager = None;
         self.clear_selection();
         self.dismiss_autocomplete();
         for att in &attachments {
@@ -925,12 +1117,37 @@ impl InputBarState {
     }
 
     pub fn remove_attachment(&mut self, index: usize) {
-        if index < self.pending_attachments.len() {
-            self.pending_attachments.remove(index);
+        if index >= self.pending_attachments.len() {
+            return;
+        }
+
+        let removed = self.pending_attachments.remove(index);
+        if removed.source == crate::attachment::AttachmentSource::Clipboard {
+            self.clipboard_temps.retain(|path| path != &removed.path);
+            let _ = std::fs::remove_file(removed.path);
+        }
+
+        if self.pending_attachments.is_empty() {
+            self.attachment_manager = None;
+        } else if let Some(manager) = &mut self.attachment_manager {
+            manager.selected = manager.selected.min(self.pending_attachments.len() - 1);
+            manager.scroll = manager.scroll.min(manager.selected);
         }
     }
 
+    fn open_attachment_manager(&mut self) {
+        if self.pending_attachments.is_empty() {
+            return;
+        }
+        self.dismiss_autocomplete();
+        self.attachment_manager = Some(AttachmentManagerState {
+            selected: 0,
+            scroll: 0,
+        });
+    }
+
     pub fn take_attachments(&mut self) -> Vec<PendingAttachment> {
+        self.attachment_manager = None;
         let taken = std::mem::take(&mut self.pending_attachments);
         for att in &taken {
             if att.source == crate::attachment::AttachmentSource::Clipboard {
@@ -948,6 +1165,9 @@ impl InputBarState {
         self.cursor = 0;
         self.scroll_offset = 0;
         self.pending_attachments.clear();
+        self.attachment_manager = None;
+        self.last_attachment_area = None;
+        self.last_attachment_manager_area = None;
         self.file_explorer = None;
         self.clear_selection();
         self.dismiss_autocomplete();
@@ -1009,6 +1229,10 @@ impl InputBarState {
                 ExplorerAction::None => {}
             }
             return InputBarAction::Consumed;
+        }
+
+        if self.attachment_manager.is_some() {
+            return self.handle_attachment_manager_key(key);
         }
 
         use crate::keymap::{GlobalAction, InputBarAction as IbWidgetAction};
@@ -1115,6 +1339,14 @@ impl InputBarState {
                 self.move_cursor_right();
                 return InputBarAction::Consumed;
             }
+            Some(IbWidgetAction::CursorWordLeft) => {
+                self.move_cursor_word_left();
+                return InputBarAction::Consumed;
+            }
+            Some(IbWidgetAction::CursorWordRight) => {
+                self.move_cursor_word_right();
+                return InputBarAction::Consumed;
+            }
             Some(IbWidgetAction::Backspace) => {
                 self.pop_input_char();
                 return InputBarAction::Consumed;
@@ -1183,6 +1415,53 @@ impl InputBarState {
             return true;
         }
 
+        if self.attachment_manager.is_some() {
+            let first_index = self
+                .attachment_manager
+                .map(|manager| manager.scroll)
+                .unwrap_or(0);
+            match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if let Some(index) = attachment_remove_at(
+                        self.last_attachment_manager_area,
+                        first_index,
+                        &self.pending_attachments,
+                        mouse.column,
+                        mouse.row,
+                    ) {
+                        self.remove_attachment(index);
+                    } else if let Some(index) = attachment_row_at(
+                        self.last_attachment_manager_area,
+                        first_index,
+                        mouse.column,
+                        mouse.row,
+                    ) && let Some(manager) = &mut self.attachment_manager
+                    {
+                        manager.selected = index;
+                    } else {
+                        self.attachment_manager = None;
+                    }
+                }
+                MouseEventKind::ScrollUp => self.move_attachment_selection(-1),
+                MouseEventKind::ScrollDown => self.move_attachment_selection(1),
+                _ => {}
+            }
+            return true;
+        }
+
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && let Some(index) = attachment_remove_at(
+                self.last_attachment_area,
+                0,
+                &self.pending_attachments,
+                mouse.column,
+                mouse.row,
+            )
+        {
+            self.remove_attachment(index);
+            return true;
+        }
+
         // Input bar interactions.
         if !mouse::in_rect(mouse.column, mouse.row, self.last_input_area) {
             return false;
@@ -1243,7 +1522,7 @@ impl InputBarState {
     fn handle_enter(&mut self) -> InputBarAction {
         let msg = self.take_input();
         if !msg.is_empty() {
-            match parse_slash_command(&msg) {
+            match self.command_registry.parse(&msg) {
                 SlashCommand::Attach(path) => {
                     if path.is_empty() {
                         let start = UserDirs::new()
@@ -1298,22 +1577,13 @@ impl InputBarState {
                     }
                 }
                 SlashCommand::ListAttachments => {
-                    let atts = &self.pending_attachments;
-                    if atts.is_empty() {
+                    if self.pending_attachments.is_empty() {
                         InputBarAction::StatusMessage(crate::i18n::t(
                             "zc-input-no-pending-attachments",
                         ))
                     } else {
-                        let list = atts
-                            .iter()
-                            .enumerate()
-                            .map(|(i, a)| format!("  [{i}] {}", a.label()))
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        InputBarAction::StatusMessage(format!(
-                            "{}\n{list}",
-                            crate::i18n::t("zc-input-pending-attachments-header")
-                        ))
+                        self.open_attachment_manager();
+                        InputBarAction::Consumed
                     }
                 }
                 SlashCommand::ClearQueue(idx) => InputBarAction::ClearQueue(idx),
@@ -1347,10 +1617,15 @@ impl InputBarState {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn submit_current_input_for_test(&mut self) -> InputBarAction {
+        self.handle_enter()
+    }
+
     fn handle_inject(&mut self) -> InputBarAction {
         let msg = self.take_input();
         if !msg.is_empty() {
-            if matches!(parse_slash_command(&msg), SlashCommand::NotACommand) {
+            if matches!(self.command_registry.parse(&msg), SlashCommand::NotACommand) {
                 let attachments = self.take_attachments();
                 InputBarAction::Inject {
                     text: Some(msg),
@@ -1404,6 +1679,48 @@ impl InputBarState {
             }
             None => self.paste_clipboard_text(),
         }
+    }
+
+    fn handle_attachment_manager_key(&mut self, key: KeyEvent) -> InputBarAction {
+        use crate::keymap::{InputBarAction as Ib, ModalAction};
+
+        match ModalAction::from_chord(&key) {
+            Some(ModalAction::Up) => self.move_attachment_selection(-1),
+            Some(ModalAction::Down) => self.move_attachment_selection(1),
+            Some(ModalAction::Cancel) => self.attachment_manager = None,
+            _ if Ib::from_chord(&key) == Some(Ib::Backspace) || key.code == KeyCode::Delete => {
+                if let Some(index) = self.attachment_manager.map(|manager| manager.selected) {
+                    self.remove_attachment(index);
+                }
+            }
+            _ => match key.code {
+                KeyCode::Home => {
+                    if let Some(manager) = &mut self.attachment_manager {
+                        manager.selected = 0;
+                        manager.scroll = 0;
+                    }
+                }
+                KeyCode::End => {
+                    if let Some(manager) = &mut self.attachment_manager {
+                        manager.selected = self.pending_attachments.len().saturating_sub(1);
+                    }
+                }
+                _ => {}
+            },
+        };
+        InputBarAction::Consumed
+    }
+
+    fn move_attachment_selection(&mut self, delta: isize) {
+        let Some(manager) = &mut self.attachment_manager else {
+            return;
+        };
+        let last = self.pending_attachments.len().saturating_sub(1);
+        manager.selected = if delta < 0 {
+            manager.selected.saturating_sub(delta.unsigned_abs())
+        } else {
+            manager.selected.saturating_add(delta as usize).min(last)
+        };
     }
 
     fn paste_clipboard_text(&mut self) -> InputBarAction {
@@ -1486,6 +1803,8 @@ impl InputBarState {
         queue_paused_hint: Option<&str>,
     ) -> Rect {
         let has_attachments = !self.pending_attachments.is_empty();
+        self.last_attachment_area = None;
+        self.last_attachment_manager_area = None;
 
         // Compute dynamic input height.
         let inner_width = area.width.saturating_sub(2);
@@ -1507,7 +1826,12 @@ impl InputBarState {
 
         let mut constraints = vec![Constraint::Min(3)];
         if has_attachments {
-            constraints.push(Constraint::Length(1));
+            let available = area.height.saturating_sub(input_height + 3).max(1);
+            constraints.push(Constraint::Length(
+                u16::try_from(self.pending_attachments.len())
+                    .unwrap_or(u16::MAX)
+                    .min(available),
+            ));
         }
         constraints.push(Constraint::Length(input_height));
         let chunks = Layout::default()
@@ -1525,13 +1849,27 @@ impl InputBarState {
 
         // Attachment bar.
         if let Some(att_rect) = att_area {
-            let labels: Vec<String> = self.pending_attachments.iter().map(|a| a.label()).collect();
-            let text = format!(" Attachments: {}", labels.join(", "));
-            let bar = Paragraph::new(Span::styled(
-                text,
-                theme::accent_style().add_modifier(Modifier::ITALIC),
-            ));
-            f.render_widget(bar, att_rect);
+            self.last_attachment_area = Some(att_rect);
+            for (row, (index, attachment)) in self
+                .pending_attachments
+                .iter()
+                .enumerate()
+                .take(att_rect.height as usize)
+                .enumerate()
+            {
+                let row_rect = Rect::new(att_rect.x, att_rect.y + row as u16, att_rect.width, 1);
+                let (main, remove_col) =
+                    attachment_line(index, &attachment.label(), row_rect.width);
+                let mut spans = vec![Span::styled(
+                    main,
+                    theme::accent_style().add_modifier(Modifier::ITALIC),
+                )];
+                if remove_col.is_some() {
+                    spans.push(Span::styled(ATTACHMENT_REMOVE_LABEL, theme::warn_style()));
+                }
+                let line = Line::from(spans);
+                f.render_widget(Paragraph::new(line), row_rect);
+            }
         }
 
         let label_owned = turn_status.label(turn_started_at);
@@ -1569,7 +1907,11 @@ impl InputBarState {
             f.render_widget(p, input_area);
         }
 
-        if show_cursor && inner_width > 0 && self.file_explorer.is_none() {
+        if show_cursor
+            && inner_width > 0
+            && self.file_explorer.is_none()
+            && self.attachment_manager.is_none()
+        {
             let (cursor_row, cursor_col) = cursor_to_visual(&self.input, self.cursor, inner_width);
 
             if cursor_row < self.scroll_offset {
@@ -1608,6 +1950,117 @@ impl InputBarState {
         }
 
         conv_area
+    }
+
+    pub fn render_attachment_manager(&mut self, f: &mut Frame, area: Rect) {
+        self.last_attachment_manager_area = None;
+        let Some(manager) = &mut self.attachment_manager else {
+            return;
+        };
+        if self.pending_attachments.is_empty() || area.width < 8 || area.height < 3 {
+            return;
+        }
+
+        let visible_rows = self
+            .pending_attachments
+            .len()
+            .min(MAX_ATTACHMENT_MANAGER_ROWS)
+            .min(area.height.saturating_sub(2) as usize)
+            .max(1);
+        if manager.selected < manager.scroll {
+            manager.scroll = manager.selected;
+        } else if manager.selected >= manager.scroll + visible_rows {
+            manager.scroll = manager.selected + 1 - visible_rows;
+        }
+
+        let title = crate::i18n::t_args(
+            "zc-input-attachment-manager-title",
+            &[("count", &self.pending_attachments.len().to_string())],
+        );
+        let (navigate_keys, remove_keys, close_keys) = attachment_manager_key_labels();
+        let hint = crate::i18n::t_args(
+            "zc-input-attachment-manager-hint",
+            &[
+                ("navigate", &navigate_keys.join("/")),
+                ("remove", &remove_keys.join("/")),
+                ("close", &close_keys.join("/")),
+            ],
+        );
+        let labels = self
+            .pending_attachments
+            .iter()
+            .map(PendingAttachment::label)
+            .collect::<Vec<_>>();
+        let desired_width = labels
+            .iter()
+            .enumerate()
+            .map(|(index, label)| {
+                crate::display_width::display_width(label) + index.to_string().len() + 10
+            })
+            .chain([
+                crate::display_width::display_width(&title) + 4,
+                crate::display_width::display_width(&hint) + 4,
+            ])
+            .max()
+            .unwrap_or(24);
+        let box_width = u16::try_from(desired_width)
+            .unwrap_or(u16::MAX)
+            .clamp(24.min(area.width), area.width);
+        let box_height = visible_rows as u16 + 2;
+        let modal = Rect::new(
+            area.x + area.width.saturating_sub(box_width) / 2,
+            area.y + area.height.saturating_sub(box_height) / 2,
+            box_width,
+            box_height,
+        );
+        let inner_width = modal.width.saturating_sub(2);
+
+        let items = labels
+            .iter()
+            .enumerate()
+            .skip(manager.scroll)
+            .take(visible_rows)
+            .map(|(index, label)| {
+                let (main, remove_col) = attachment_line(index, label, inner_width);
+                let style = if index == manager.selected {
+                    theme::selected_style()
+                } else {
+                    theme::body_style()
+                };
+                let mut spans = vec![Span::styled(main, style)];
+                if remove_col.is_some() {
+                    spans.push(Span::styled(ATTACHMENT_REMOVE_LABEL, theme::warn_style()));
+                }
+                ListItem::new(Line::from(spans))
+            })
+            .collect::<Vec<_>>();
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(theme::overlay_border_style())
+            .style(theme::fill_style())
+            .title(Span::styled(format!(" {title} "), theme::heading_style()))
+            .title_bottom(Span::styled(format!(" {hint} "), theme::dim_style()));
+        f.render_widget(Clear, modal);
+        f.render_widget(List::new(items).block(block), modal);
+        self.last_attachment_manager_area = Some(Rect::new(
+            modal.x + 1,
+            modal.y + 1,
+            inner_width,
+            visible_rows as u16,
+        ));
+
+        let buf = f.buffer_mut();
+        if manager.scroll > 0 {
+            buf[(modal.x + modal.width - 1, modal.y)]
+                .set_char('▲')
+                .set_style(theme::accent_style());
+        }
+        if manager.scroll + visible_rows < self.pending_attachments.len() {
+            buf[(modal.x + modal.width - 1, modal.y + modal.height - 1)]
+                .set_char('▼')
+                .set_style(theme::accent_style());
+        }
     }
 
     /// Render the auto-complete popup above the input bar if active.
@@ -1680,6 +2133,18 @@ impl crate::widgets::HelpContext for InputBarState {
         if let Some(explorer) = &self.file_explorer {
             return explorer.help_context();
         }
+        if self.attachment_manager.is_some() {
+            let (navigate, remove, close) = attachment_manager_key_labels();
+            return HelpNode::entries(vec![
+                E::new(navigate, crate::i18n::t("zc-chat-help-navigate")),
+                E::new(remove, crate::i18n::t("zc-input-help-attachment-remove")),
+                E::new(close, crate::i18n::t("zc-chat-help-close")),
+                E::new(
+                    vec!["/detach N"],
+                    crate::i18n::t("zc-input-help-attachment-detach"),
+                ),
+            ]);
+        }
         if self.autocomplete_active {
             use crate::keymap::{InputBarAction as Ib, action_key_labels};
             // Both Enter (Submit, contextual) and the dedicated accept
@@ -1711,10 +2176,90 @@ impl crate::widgets::HelpContext for InputBarState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    fn test_attachment(name: &str) -> PendingAttachment {
+        PendingAttachment {
+            path: PathBuf::from(name),
+            mime_type: "image/png".into(),
+            filename: name.into(),
+            size_bytes: 1,
+            source: crate::attachment::AttachmentSource::File,
+        }
+    }
+
+    fn render_input_bar(bar: &mut InputBarState, width: u16, height: u16) {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                bar.render(
+                    frame,
+                    area,
+                    false,
+                    false,
+                    &TurnStatus::Idle,
+                    Instant::now(),
+                    None,
+                );
+                bar.render_attachment_manager(frame, area);
+            })
+            .expect("draw input bar");
+    }
+
+    #[test]
+    fn attachment_line_preserves_visible_remove_control_when_truncated() {
+        let (main, remove_col) = attachment_line(12, "a-very-long-filename.png", 20);
+
+        assert_eq!(remove_col, Some(17));
+        assert_eq!(crate::display_width::display_width(&main), 17);
+        assert!(main.trim_end().ends_with('…'));
+    }
+
+    #[test]
+    fn attachment_line_places_remove_control_next_to_short_label() {
+        let (main, remove_col) = attachment_line(0, "one.png", 40);
+
+        assert_eq!(main, " [0] one.png ");
+        assert_eq!(remove_col, Some(13));
+    }
+
+    fn shared_commands() -> Vec<crate::wire::CommandDescriptor> {
+        vec![
+            crate::wire::CommandDescriptor {
+                id: "help".into(),
+                name: "help".into(),
+                aliases: vec![],
+            },
+            crate::wire::CommandDescriptor {
+                id: "new".into(),
+                name: "new".into(),
+                aliases: vec!["new-session".into()],
+            },
+            crate::wire::CommandDescriptor {
+                id: "model".into(),
+                name: "model".into(),
+                aliases: vec![],
+            },
+        ]
+    }
+
+    fn command_registry() -> SlashCommandRegistry {
+        SlashCommandRegistry::new(&shared_commands())
+    }
+
+    fn parse_slash_command(input: &str) -> SlashCommand<'_> {
+        command_registry().parse(input)
+    }
+
+    fn input_bar_with_shared_commands() -> InputBarState {
+        InputBarState::with_shared_commands(&shared_commands())
+    }
 
     #[test]
     fn input_append_and_take() {
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.push_input_char('h');
         bar.push_input_char('i');
         assert_eq!(bar.input(), "hi");
@@ -1726,7 +2271,7 @@ mod tests {
 
     #[test]
     fn clear_input_empties_text_and_resets_cursor() {
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.insert_text("hello world");
         assert_eq!(bar.cursor(), 11);
         bar.clear_input();
@@ -1737,7 +2282,7 @@ mod tests {
     #[test]
     fn ctrl_u_clears_input() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.insert_text("scratch this");
         let act = bar.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
         assert!(matches!(act, InputBarAction::Consumed));
@@ -1747,7 +2292,7 @@ mod tests {
     #[test]
     fn ctrl_w_deletes_previous_word() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.insert_text("hello world");
         let action = bar.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
         assert!(matches!(action, InputBarAction::Consumed));
@@ -1756,9 +2301,126 @@ mod tests {
     }
 
     #[test]
+    fn alt_arrows_move_by_word_without_changing_input() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("alpha  beta");
+
+        assert!(matches!(
+            bar.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT)),
+            InputBarAction::Consumed
+        ));
+        assert_eq!(bar.input(), "alpha  beta");
+        assert_eq!(bar.cursor(), 7);
+
+        assert!(matches!(
+            bar.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT)),
+            InputBarAction::Consumed
+        ));
+        assert_eq!(bar.cursor(), bar.input().len());
+    }
+
+    #[test]
+    fn alt_b_and_f_move_by_unicode_word() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("hello 世界");
+
+        bar.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT));
+        assert_eq!(bar.cursor(), "hello ".len());
+        bar.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT));
+        assert_eq!(bar.cursor(), bar.input().len());
+        assert_eq!(bar.input(), "hello 世界");
+    }
+
+    #[test]
+    fn insertion_normalizes_cursor_after_joining_emoji_graphemes() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("👩👩");
+        bar.move_cursor_left();
+        bar.push_input_char('\u{200d}');
+
+        assert_eq!(bar.input(), "👩\u{200d}👩");
+        assert_eq!(bar.cursor(), bar.input().len());
+        bar.pop_input_char();
+        assert_eq!(bar.input(), "");
+        assert_eq!(bar.cursor(), 0);
+    }
+
+    #[test]
+    fn backspace_normalizes_cursor_after_joining_emoji_graphemes() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("🇺x🇸");
+        bar.move_cursor_left();
+
+        let action = bar.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+
+        assert!(matches!(action, InputBarAction::Consumed));
+        assert_eq!(bar.input(), "🇺🇸");
+        assert_eq!(bar.cursor(), bar.input().len());
+    }
+
+    #[test]
+    fn delete_previous_word_normalizes_cursor_after_joining_emoji_graphemes() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("🇺x🇸");
+        bar.move_cursor_left();
+
+        let action = bar.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+
+        assert!(matches!(action, InputBarAction::Consumed));
+        assert_eq!(bar.input(), "🇺🇸");
+        assert_eq!(bar.cursor(), bar.input().len());
+    }
+
+    #[test]
+    fn backspace_normalizes_cursor_after_joining_emoji_graphemes_with_selection() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("🇺x🇸");
+        let selection_start = "🇺".len();
+        bar.selection = Some((selection_start, selection_start + 1));
+
+        let action = bar.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+
+        assert!(matches!(action, InputBarAction::Consumed));
+        assert_eq!(bar.input(), "🇺🇸");
+        assert_eq!(bar.cursor(), bar.input().len());
+    }
+
+    #[test]
+    fn delete_previous_word_normalizes_cursor_after_joining_emoji_graphemes_with_selection() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("🇺x🇸");
+        let selection_start = "🇺".len();
+        bar.selection = Some((selection_start, selection_start + 1));
+
+        let action = bar.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+
+        assert!(matches!(action, InputBarAction::Consumed));
+        assert_eq!(bar.input(), "🇺🇸");
+        assert_eq!(bar.cursor(), bar.input().len());
+    }
+
+    #[test]
+    fn file_explorer_does_not_claim_word_navigation_chords() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("alpha beta");
+        let word_left = KeyEvent::new(KeyCode::Left, KeyModifiers::ALT);
+        assert!(bar.claims_pane_navigation(&word_left));
+
+        bar.file_explorer = Some(FileExplorerState::new(std::path::PathBuf::from("/tmp")));
+        assert!(!bar.claims_pane_navigation(&word_left));
+    }
+
+    #[test]
     fn ctrl_w_deletes_trailing_space_and_word() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.insert_text("hello world   ");
         bar.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
         assert_eq!(bar.input(), "hello ");
@@ -1768,7 +2430,7 @@ mod tests {
     #[test]
     fn ctrl_w_deletes_word_before_cursor() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.insert_text("hello brave world");
         for _ in 0..5 {
             bar.move_cursor_left();
@@ -1781,7 +2443,7 @@ mod tests {
     #[test]
     fn ctrl_w_deletes_selection() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.insert_text("hello world");
         bar.selection = Some((6, 11));
         bar.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
@@ -1792,7 +2454,7 @@ mod tests {
     #[test]
     fn ctrl_w_deletes_punctuation_run_like_vim() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.insert_text("hello world...");
         bar.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
         assert_eq!(bar.input(), "hello world");
@@ -1802,7 +2464,7 @@ mod tests {
     #[test]
     fn ctrl_w_deletes_word_after_punctuation_like_vim() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.insert_text("hello-world");
         bar.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
         assert_eq!(bar.input(), "hello-");
@@ -1812,7 +2474,7 @@ mod tests {
     #[test]
     fn ctrl_w_deletes_only_whitespace_before_cursor() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.insert_text("   ");
         bar.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
         assert_eq!(bar.input(), "");
@@ -1821,14 +2483,14 @@ mod tests {
 
     #[test]
     fn backspace_at_start_is_noop() {
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.pop_input_char();
         assert_eq!(bar.input(), "");
     }
 
     #[test]
     fn cursor_movement() {
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.insert_text("abc");
         assert_eq!(bar.cursor(), 3);
         bar.move_cursor_left();
@@ -1841,7 +2503,7 @@ mod tests {
 
     #[test]
     fn insert_text_at_cursor() {
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.insert_text("hello");
         bar.move_cursor_left();
         bar.move_cursor_left();
@@ -1851,7 +2513,7 @@ mod tests {
 
     #[test]
     fn wants_text_input_when_typing() {
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         assert!(!bar.wants_text_input());
         bar.push_input_char('a');
         assert!(bar.wants_text_input());
@@ -1859,7 +2521,7 @@ mod tests {
 
     #[test]
     fn reset_clears_everything() {
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.push_input_char('x');
         bar.reset();
         assert_eq!(bar.input(), "");
@@ -1870,7 +2532,7 @@ mod tests {
 
     #[test]
     fn taking_attachments_releases_clipboard_temp_ownership() {
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         let tmp = std::env::temp_dir().join("zc_test_clip_release.png");
         std::fs::write(&tmp, b"x").unwrap();
         bar.clipboard_temps.push(tmp.clone());
@@ -1892,8 +2554,185 @@ mod tests {
     }
 
     #[test]
+    fn removing_clipboard_attachment_deletes_owned_temp() {
+        let mut bar = input_bar_with_shared_commands();
+        let tmp = std::env::temp_dir().join("zc_test_clip_remove.png");
+        std::fs::write(&tmp, b"x").unwrap();
+        bar.clipboard_temps.push(tmp.clone());
+        bar.add_attachment(PendingAttachment {
+            path: tmp.clone(),
+            mime_type: "image/png".into(),
+            filename: "clip.png".into(),
+            size_bytes: 1,
+            source: crate::attachment::AttachmentSource::Clipboard,
+        });
+
+        bar.remove_attachment(0);
+
+        assert!(bar.pending_attachments().is_empty());
+        assert!(bar.clipboard_temps().is_empty());
+        assert!(!tmp.exists());
+    }
+
+    #[test]
+    fn removing_file_attachment_preserves_user_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("user-file.png");
+        std::fs::write(&path, b"x").expect("write user file");
+        let mut bar = input_bar_with_shared_commands();
+        bar.add_attachment(PendingAttachment {
+            path: path.clone(),
+            mime_type: "image/png".into(),
+            filename: "user-file.png".into(),
+            size_bytes: 1,
+            source: crate::attachment::AttachmentSource::File,
+        });
+
+        bar.remove_attachment(0);
+
+        assert!(bar.pending_attachments().is_empty());
+        assert!(
+            path.exists(),
+            "removal must not delete a user-selected file"
+        );
+    }
+
+    #[test]
+    fn slash_attachments_opens_indexed_manager() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.add_attachment(test_attachment("one.png"));
+        bar.add_attachment(test_attachment("two.png"));
+        bar.insert_text("/attachments");
+
+        let action = bar.handle_enter();
+
+        assert!(matches!(action, InputBarAction::Consumed));
+        assert_eq!(bar.input(), "");
+        assert_eq!(bar.attachment_manager.as_ref().map(|m| m.selected), Some(0));
+    }
+
+    #[test]
+    fn attachment_manager_delete_removes_selected_item() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.add_attachment(test_attachment("one.png"));
+        bar.add_attachment(test_attachment("two.png"));
+        bar.open_attachment_manager();
+
+        bar.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        let action = bar.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+
+        assert!(matches!(action, InputBarAction::Consumed));
+        assert_eq!(bar.pending_attachments().len(), 1);
+        assert_eq!(bar.pending_attachments()[0].filename, "one.png");
+        assert_eq!(bar.attachment_manager.as_ref().map(|m| m.selected), Some(0));
+    }
+
+    #[test]
+    fn attachment_manager_backspace_removes_last_item_and_closes() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.add_attachment(test_attachment("one.png"));
+        bar.open_attachment_manager();
+
+        let action = bar.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+
+        assert!(matches!(action, InputBarAction::Consumed));
+        assert!(bar.pending_attachments().is_empty());
+        assert!(bar.attachment_manager.is_none());
+    }
+
+    #[test]
+    fn attachment_manager_escape_closes_without_removing() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.add_attachment(test_attachment("one.png"));
+        bar.open_attachment_manager();
+
+        let action = bar.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(matches!(action, InputBarAction::Consumed));
+        assert_eq!(bar.pending_attachments().len(), 1);
+        assert!(bar.attachment_manager.is_none());
+    }
+
+    #[test]
+    fn attachment_manager_claims_text_input() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.add_attachment(test_attachment("one.png"));
+        bar.open_attachment_manager();
+
+        assert!(bar.wants_text_input());
+    }
+
+    #[test]
+    fn attachment_remove_control_click_removes_target_item() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.add_attachment(test_attachment("one.png"));
+        bar.add_attachment(test_attachment("two.png"));
+        render_input_bar(&mut bar, 40, 12);
+        let area = bar.last_attachment_area.expect("attachment rows rendered");
+
+        let consumed = bar.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.x + area.width - 2,
+            row: area.y + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert!(!consumed);
+        assert_eq!(bar.pending_attachments().len(), 2);
+
+        let (_, remove_col) = attachment_line(1, &bar.pending_attachments()[1].label(), area.width);
+
+        let consumed = bar.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.x + remove_col.expect("remove control rendered"),
+            row: area.y + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert!(consumed);
+        assert_eq!(bar.pending_attachments().len(), 1);
+        assert_eq!(bar.pending_attachments()[0].filename, "one.png");
+    }
+
+    #[test]
+    fn attachment_manager_scrolled_remove_control_removes_visible_item() {
+        let mut bar = input_bar_with_shared_commands();
+        for index in 0..10 {
+            bar.add_attachment(test_attachment(&format!("item-{index}.png")));
+        }
+        bar.open_attachment_manager();
+        for _ in 0..9 {
+            bar.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        render_input_bar(&mut bar, 60, 16);
+
+        let manager = bar.attachment_manager.as_ref().expect("manager open");
+        assert_eq!(manager.selected, 9);
+        assert_eq!(manager.scroll, 2);
+        let area = bar
+            .last_attachment_manager_area
+            .expect("attachment manager rendered");
+        let (_, remove_col) = attachment_line(9, &bar.pending_attachments()[9].label(), area.width);
+
+        let consumed = bar.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.x + remove_col.expect("remove control rendered"),
+            row: area.y + 7,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert!(consumed);
+        assert_eq!(bar.pending_attachments().len(), 9);
+        assert!(
+            bar.pending_attachments()
+                .iter()
+                .all(|attachment| attachment.filename != "item-9.png")
+        );
+    }
+
+    #[test]
     fn loading_for_edit_retakes_clipboard_temp_ownership() {
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         let tmp = std::env::temp_dir().join("zc_test_clip_retake.png");
         let att = PendingAttachment {
             path: tmp.clone(),
@@ -1908,7 +2747,7 @@ mod tests {
 
     #[test]
     fn slash_attach_empty_opens_explorer() {
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.insert_text("/attach");
         let action = bar.handle_enter();
         assert!(bar.has_file_explorer());
@@ -1917,7 +2756,7 @@ mod tests {
 
     #[test]
     fn slash_detach_no_attachments() {
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.insert_text("/detach");
         let action = bar.handle_enter();
         let expected = crate::i18n::t("zc-input-no-pending-attachments");
@@ -1926,7 +2765,7 @@ mod tests {
 
     #[test]
     fn empty_enter_resumes_queue() {
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         // Empty input, no attachments -> ResumeQueue: a deliberate Enter must
         // never be silently swallowed; the parent uses it to unpause.
         assert!(matches!(bar.handle_enter(), InputBarAction::ResumeQueue));
@@ -1934,7 +2773,7 @@ mod tests {
 
     #[test]
     fn submit_with_text() {
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.insert_text("hello world");
         let action = bar.handle_enter();
         match action {
@@ -2040,8 +2879,119 @@ mod tests {
     }
 
     #[test]
+    fn derived_slash_command_set_matches_expected_twelve_entries() {
+        let expected: Vec<&str> = vec![
+            "/attach",
+            "/attachments",
+            "/browse",
+            "/clear-queue",
+            "/detach",
+            "/help",
+            "/model",
+            "/model-provider",
+            "/new",
+            "/new-session",
+            "/restart-session",
+            "/toggle-thinking",
+        ];
+        let registry = command_registry();
+        let derived: Vec<&str> = registry.command_names().collect();
+        assert_eq!(derived, expected);
+    }
+
+    /// Parity guard: every command the derived descriptor set advertises
+    /// must be recognized by `parse_slash_command` (advertise ⊆ recognize).
+    #[test]
+    fn every_advertised_command_is_recognized_by_parser() {
+        let registry = command_registry();
+        for command in registry.command_names() {
+            assert!(
+                !matches!(registry.parse(command), SlashCommand::NotACommand),
+                "{command} is advertised but not recognized by parse_slash_command"
+            );
+        }
+    }
+
+    /// Parity guard: unknown leading tokens are rejected (recognize ⊆
+    /// advertise), and each real token maps to its specific expected
+    /// variant — a silently dropped descriptor entry breaks this test.
+    #[test]
+    fn parser_rejects_unknown_tokens_and_matches_specific_variants() {
+        assert!(matches!(
+            parse_slash_command("/definitely-not-a-command"),
+            SlashCommand::NotACommand
+        ));
+        assert!(matches!(
+            parse_slash_command("/helper"),
+            SlashCommand::NotACommand
+        ));
+        assert!(matches!(
+            parse_slash_command("/attach"),
+            SlashCommand::Attach("")
+        ));
+        assert!(matches!(
+            parse_slash_command("/attachments"),
+            SlashCommand::ListAttachments
+        ));
+        assert!(matches!(
+            parse_slash_command("/browse"),
+            SlashCommand::EnterBrowseMode
+        ));
+        assert!(matches!(
+            parse_slash_command("/clear-queue"),
+            SlashCommand::ClearQueue(None)
+        ));
+        assert!(matches!(
+            parse_slash_command("/detach"),
+            SlashCommand::Detach(None)
+        ));
+        assert!(matches!(
+            parse_slash_command("/help"),
+            SlashCommand::OpenHelp
+        ));
+        assert!(matches!(
+            parse_slash_command("/model"),
+            SlashCommand::ModelPicker
+        ));
+        assert!(matches!(
+            parse_slash_command("/model-provider"),
+            SlashCommand::ModelProviderPicker
+        ));
+        assert!(matches!(
+            parse_slash_command("/new"),
+            SlashCommand::RestartSession
+        ));
+        assert!(matches!(
+            parse_slash_command("/new-session"),
+            SlashCommand::RestartSession
+        ));
+        assert!(matches!(
+            parse_slash_command("/restart-session"),
+            SlashCommand::RestartSession
+        ));
+        assert!(matches!(
+            parse_slash_command("/toggle-thinking"),
+            SlashCommand::ToggleThinking
+        ));
+    }
+
+    #[test]
+    fn autocomplete_for_bare_slash_returns_exactly_the_derived_set() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("/");
+        assert!(bar.autocomplete_active);
+        let mut matches = bar.autocomplete_matches.clone();
+        matches.sort();
+        let expected: Vec<String> = command_registry()
+            .command_names()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(matches, expected);
+    }
+
+    #[test]
     fn model_arg_autocomplete_filters_cached_catalog() {
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.set_model_catalog(
             "anthropic.default".into(),
             vec![
@@ -2063,7 +3013,7 @@ mod tests {
 
     #[test]
     fn model_arg_empty_lists_whole_catalog() {
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.set_model_catalog("anthropic.default".into(), vec!["a".into(), "b".into()]);
         bar.insert_text("/model ");
         assert!(bar.autocomplete_active);
@@ -2072,7 +3022,7 @@ mod tests {
 
     #[test]
     fn provider_arg_autocomplete_filters_cached_catalog() {
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.set_provider_catalog(vec![
             "anthropic".into(),
             "openai".into(),
@@ -2091,14 +3041,14 @@ mod tests {
 
     #[test]
     fn model_command_autocomplete_appends_space() {
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.apply_autocomplete_choice("/model");
         assert_eq!(bar.input(), "/model ");
     }
 
     #[test]
     fn model_arg_autocomplete_rewrites_only_arg() {
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.autocomplete_target = AutocompleteTarget::ModelArg;
         bar.apply_autocomplete_choice("claude-opus-4");
         assert_eq!(bar.input(), "/model claude-opus-4");
@@ -2106,7 +3056,7 @@ mod tests {
 
     #[test]
     fn model_picker_command_returns_open_action() {
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.insert_text("/model");
         assert!(matches!(
             bar.handle_enter(),
@@ -2116,7 +3066,7 @@ mod tests {
 
     #[test]
     fn enter_accepts_highlighted_model_arg_and_submits() {
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.set_model_catalog(
             "anthropic.default".into(),
             vec!["claude-opus-4-8".into(), "claude-sonnet-4-6".into()],
@@ -2132,7 +3082,7 @@ mod tests {
 
     #[test]
     fn enter_on_model_command_completion_fills_without_submitting() {
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.insert_text("/mod");
         assert!(bar.autocomplete_active);
         let action = bar.handle_key(KeyEvent::from(KeyCode::Enter));
@@ -2144,7 +3094,7 @@ mod tests {
 
     #[test]
     fn enter_accepts_highlighted_provider_arg_and_submits() {
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.set_provider_catalog(vec!["openai".into(), "openrouter".into()]);
         bar.insert_text("/model-provider open");
         assert!(bar.autocomplete_active);
@@ -2157,7 +3107,7 @@ mod tests {
     fn completion_help_keys_come_from_keymap_registry() {
         use crate::keymap::{Chord, InputBarAction as Ib, action_key_labels};
         use crate::widgets::HelpContext;
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.insert_text("/mod");
         assert!(bar.autocomplete_active);
         let node = bar.help_context();
@@ -2177,7 +3127,7 @@ mod tests {
     #[test]
     fn help_context_keeps_slash_commands_out_of_general_help() {
         use crate::widgets::HelpContext;
-        let bar = InputBarState::new();
+        let bar = input_bar_with_shared_commands();
         let node = bar.help_context();
         let listed = node
             .entries
@@ -2185,7 +3135,7 @@ mod tests {
             .chain(node.children.iter().flat_map(|child| child.entries.iter()))
             .map(|entry| entry.key_str())
             .collect::<Vec<_>>();
-        for command in SLASH_COMMANDS {
+        for command in bar.command_registry.command_names() {
             assert!(
                 !listed.iter().any(|key| key == command),
                 "{command} stays in autocomplete, not the general Help modal"
@@ -2195,7 +3145,7 @@ mod tests {
 
     #[test]
     fn model_provider_picker_command_returns_open_action() {
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.insert_text("/model-provider");
         assert!(matches!(
             bar.handle_enter(),
@@ -2205,7 +3155,7 @@ mod tests {
 
     #[test]
     fn browse_command_returns_enter_browse_action() {
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.insert_text("/browse");
         assert!(matches!(
             bar.handle_enter(),
@@ -2215,14 +3165,14 @@ mod tests {
 
     #[test]
     fn help_command_returns_open_help_action() {
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.insert_text("/help");
         assert!(matches!(bar.handle_enter(), InputBarAction::OpenHelp));
     }
 
     #[test]
     fn model_command_with_arg_returns_set_action() {
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.insert_text("/model gpt-4o");
         match bar.handle_enter() {
             InputBarAction::SetModel(m) => assert_eq!(m, "gpt-4o"),
@@ -2232,7 +3182,7 @@ mod tests {
 
     #[test]
     fn paste_text_inserts() {
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         let action = bar.handle_paste("some pasted text");
         assert!(matches!(action, InputBarAction::Consumed));
         assert_eq!(bar.input(), "some pasted text");
@@ -2461,7 +3411,7 @@ mod tests {
 
     #[test]
     fn autocomplete_triggers_on_slash() {
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.insert_text("/a");
         assert!(bar.autocomplete_active);
         assert!(!bar.autocomplete_matches.is_empty());
@@ -2469,7 +3419,7 @@ mod tests {
 
     #[test]
     fn autocomplete_partial_prefix_matches() {
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.insert_text("/attach");
         // "/attach" is a prefix of "/attachments", so popup shows.
         assert!(bar.autocomplete_active);
@@ -2480,7 +3430,7 @@ mod tests {
 
     #[test]
     fn autocomplete_exact_no_popup() {
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.insert_text("/attachments");
         // Exact match with no further completions — no popup.
         assert!(!bar.autocomplete_active);
@@ -2488,7 +3438,7 @@ mod tests {
 
     #[test]
     fn autocomplete_off_with_space() {
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.insert_text("/attach foo");
         // Space present — autocomplete disabled.
         assert!(!bar.autocomplete_active);
@@ -2496,14 +3446,14 @@ mod tests {
 
     #[test]
     fn autocomplete_off_for_non_slash() {
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.insert_text("hello");
         assert!(!bar.autocomplete_active);
     }
 
     #[test]
     fn autocomplete_toggle_thinking_prefix() {
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.insert_text("/toggle");
         assert!(bar.autocomplete_active);
         assert!(
@@ -2515,7 +3465,7 @@ mod tests {
 
     #[test]
     fn autocomplete_restart_session_prefix() {
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.insert_text("/restart");
         assert!(bar.autocomplete_active);
         assert!(
@@ -2527,7 +3477,7 @@ mod tests {
 
     #[test]
     fn autocomplete_new_session_alias() {
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.insert_text("/ne");
         assert!(bar.autocomplete_active);
         assert!(bar.autocomplete_matches.iter().any(|s| s == "/new"));
@@ -2536,7 +3486,7 @@ mod tests {
 
     #[test]
     fn slash_toggle_thinking_returns_action() {
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.insert_text("/toggle-thinking");
         let action = bar.handle_enter();
         assert!(matches!(action, InputBarAction::ToggleThinking));
@@ -2546,7 +3496,7 @@ mod tests {
 
     #[test]
     fn slash_restart_session_returns_action() {
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.insert_text("/restart-session");
         let action = bar.handle_enter();
         assert!(matches!(action, InputBarAction::RestartSession));
@@ -2555,7 +3505,7 @@ mod tests {
 
     #[test]
     fn slash_new_alias_returns_restart_session_action() {
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.insert_text("/new");
         let action = bar.handle_enter();
         assert!(matches!(action, InputBarAction::RestartSession));
@@ -2566,7 +3516,7 @@ mod tests {
 
     #[test]
     fn build_input_lines_no_selection() {
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.insert_text("hello");
         let lines = bar.build_input_lines(80);
         assert_eq!(lines.len(), 1);
@@ -2574,7 +3524,7 @@ mod tests {
 
     #[test]
     fn build_input_lines_with_newlines() {
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.insert_text("hello\nworld\nfoo");
         let lines = bar.build_input_lines(80);
         assert_eq!(lines.len(), 3);
@@ -2582,7 +3532,7 @@ mod tests {
 
     #[test]
     fn build_input_lines_with_selection() {
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.insert_text("hello world");
         bar.selection = Some((2, 7));
         let lines = bar.build_input_lines(80);
@@ -2593,7 +3543,7 @@ mod tests {
 
     #[test]
     fn delete_selection_removes_range() {
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.insert_text("hello world");
         bar.selection = Some((2, 7));
         bar.delete_selection();
@@ -2603,7 +3553,7 @@ mod tests {
 
     #[test]
     fn backspace_with_selection_deletes_selection() {
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.insert_text("hello");
         bar.selection = Some((1, 4));
         bar.pop_input_char();
@@ -2613,12 +3563,27 @@ mod tests {
 
     #[test]
     fn typing_with_selection_replaces() {
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.insert_text("hello");
         bar.selection = Some((1, 4));
         bar.push_input_char('X');
         assert_eq!(bar.input(), "hXo");
         assert_eq!(bar.cursor(), 2);
+    }
+
+    #[test]
+    fn typing_over_unicode_selection_preserves_replacement_position() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("🇺x🇸");
+        let selection_start = "🇺".len();
+        bar.selection = Some((selection_start, selection_start + 1));
+
+        let action = bar.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+
+        assert!(matches!(action, InputBarAction::Consumed));
+        assert_eq!(bar.input(), "🇺y🇸");
+        assert_eq!(bar.cursor(), selection_start + 1);
     }
 
     // ── Dynamic height tests ─────────────────────────────────

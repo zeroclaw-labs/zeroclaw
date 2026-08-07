@@ -133,4 +133,17 @@ mod tests {
         assert!(resp.data.is_null());
         assert!(resp.error.is_none());
     }
+
+    #[test]
+    fn success_response_omits_error_field_in_serialized_json() {
+        // ZcResponse::error is `skip_serializing_if = "Option::is_none"` — a
+        // success response must not emit the "error" key so the firmware wire
+        // format stays minimal and won't confuse strict JSON parsers.
+        let resp = ZcResponse::success(json!({"pin": 25}));
+        let json_str = serde_json::to_string(&resp).unwrap();
+        assert!(
+            !json_str.contains("\"error\""),
+            "success response must not serialize the error field: {json_str}"
+        );
+    }
 }

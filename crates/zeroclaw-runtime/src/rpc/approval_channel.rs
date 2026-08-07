@@ -73,6 +73,15 @@ impl Channel for RpcApprovalChannel {
         Ok(())
     }
 
+    /// `send` above is a deliberate no-op: the Code tab renders agent output
+    /// from the RPC turn stream, not from generic channel sends. Declaring it
+    /// here lets surfaces that must genuinely deliver (`poll`'s text fallback,
+    /// `escalate_to_human`) refuse this channel instead of reporting success
+    /// for a message the user never saw.
+    fn supports_outbound_send(&self) -> bool {
+        false
+    }
+
     async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         anyhow::bail!("RpcApprovalChannel.listen is not supported")
     }
@@ -91,6 +100,15 @@ impl Channel for RpcApprovalChannel {
         request: &ChannelApprovalRequest,
     ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
         self.request_approval_with_timeout(recipient, request, self.approval_timeout)
+            .await
+    }
+
+    async fn request_approval_attributed(
+        &self,
+        recipient: &str,
+        request: &ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
+        self.request_approval_attributed_with_timeout(recipient, request, self.approval_timeout)
             .await
     }
 
@@ -133,12 +151,26 @@ impl Channel for RpcApprovalChannel {
 }
 
 impl RpcApprovalChannel {
+    /// Kept as-is for callers that do not need provenance; delegates to
+    /// [`Self::request_approval_attributed_with_timeout`].
     pub async fn request_approval_with_timeout(
+        &self,
+        recipient: &str,
+        request: &ChannelApprovalRequest,
+        timeout: Duration,
+    ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
+        Ok(self
+            .request_approval_attributed_with_timeout(recipient, request, timeout)
+            .await?
+            .map(|attributed| attributed.response))
+    }
+
+    pub async fn request_approval_attributed_with_timeout(
         &self,
         _recipient: &str,
         request: &ChannelApprovalRequest,
         timeout: Duration,
-    ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
+    ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
         let request_id = Uuid::new_v4().to_string();
         let (tx, rx) = tokio::sync::oneshot::channel::<ChannelApprovalResponse>();
         let mut pending_request = self.pending.register(request_id.clone(), tx);
@@ -157,12 +189,27 @@ impl RpcApprovalChannel {
             )
             .await;
 
+        // Only the answered arm is an operator decision. The other two deny
+        // because the client went away or never answered, and say so.
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(response)) => {
                 pending_request.disarm();
-                Ok(Some(response))
+                Ok(Some(
+                    zeroclaw_api::channel::AttributedApprovalResponse::operator(response),
+                ))
             }
-            Ok(Err(_)) | Err(_) => Ok(Some(ChannelApprovalResponse::Deny)),
+            Ok(Err(_)) => Ok(Some(
+                zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                    ChannelApprovalResponse::Deny,
+                    zeroclaw_api::channel::ApprovalSource::Unreachable,
+                ),
+            )),
+            Err(_) => Ok(Some(
+                zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                    ChannelApprovalResponse::Deny,
+                    zeroclaw_api::channel::ApprovalSource::TimedOut,
+                ),
+            )),
         }
     }
 

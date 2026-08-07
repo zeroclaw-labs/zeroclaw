@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 use zeroclaw_config::schema::{Config, StreamMode, TELEGRAM_OFFICIAL_API_BASE_URL};
+use zeroclaw_runtime::i18n;
 use zeroclaw_runtime::security::pairing::PairingGuard;
 
 /// Telegram's maximum message length for text messages
@@ -1063,7 +1064,21 @@ impl TelegramChannel {
         let total_before_cap = commands.len();
         commands.truncate(TELEGRAM_MAX_BOT_COMMANDS);
         if total_before_cap > TELEGRAM_MAX_BOT_COMMANDS {
-            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"TELEGRAM_MAX_BOT_COMMANDS": TELEGRAM_MAX_BOT_COMMANDS, "total_before_cap": total_before_cap})), "Telegram limits bots to commands; configured, registering first . Reduce installed skills to expose more commands.");
+            let registered = commands.len();
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "TELEGRAM_MAX_BOT_COMMANDS": TELEGRAM_MAX_BOT_COMMANDS,
+                        "total_before_cap": total_before_cap,
+                        "registered": registered,
+                    })),
+                // Stable literal per the logging contract: per-event
+                // measurements (limit, configured, registered) ride solely in
+                // `attributes` above, never in the message.
+                "Telegram command registration truncated to the platform limit"
+            );
         }
 
         let url = self.api_url("setMyCommands");
@@ -3927,10 +3942,30 @@ Ensure only one `zeroclaw` process is using this bot token."
 
                             // Answer the callback query to dismiss the spinner.
                             let answer_text = match action {
-                                "approve" => "✅ Approved",
-                                "always" => "✅✅ Always approved",
-                                "deny" => "❌ Denied",
-                                _ => "⚠️ Unknown action",
+                                "approve" => format!(
+                                    "✅ {}",
+                                    i18n::get_required_cli_string(
+                                        "channel-telegram-approval-ack-approved"
+                                    )
+                                ),
+                                "always" => format!(
+                                    "✅✅ {}",
+                                    i18n::get_required_cli_string(
+                                        "channel-telegram-approval-ack-always-approved"
+                                    )
+                                ),
+                                "deny" => format!(
+                                    "❌ {}",
+                                    i18n::get_required_cli_string(
+                                        "channel-telegram-approval-ack-denied"
+                                    )
+                                ),
+                                _ => format!(
+                                    "⚠️ {}",
+                                    i18n::get_required_cli_string(
+                                        "channel-telegram-approval-ack-unknown"
+                                    )
+                                ),
                             };
                             let answer_body = serde_json::json!({
                                 "callback_query_id": cb_id,
@@ -4063,11 +4098,24 @@ Ensure only one `zeroclaw` process is using this bot token."
         Ok(())
     }
 
+    /// Delegates to [`Self::request_approval_attributed`] and drops the
+    /// provenance, so the prompt/timeout logic lives in exactly one place.
     async fn request_approval(
         &self,
         recipient: &str,
         request: &zeroclaw_api::channel::ChannelApprovalRequest,
     ) -> anyhow::Result<Option<zeroclaw_api::channel::ChannelApprovalResponse>> {
+        Ok(self
+            .request_approval_attributed(recipient, request)
+            .await?
+            .map(|attributed| attributed.response))
+    }
+
+    async fn request_approval_attributed(
+        &self,
+        recipient: &str,
+        request: &zeroclaw_api::channel::ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
         use zeroclaw_api::channel::ChannelApprovalResponse;
 
         // Parse recipient for chat_id + optional thread_id ("chat_id:thread_id" format).
@@ -4078,20 +4126,27 @@ Ensure only one `zeroclaw` process is using this bot token."
         // Unique key embedded in callback_data so listen() can route the tap.
         let approval_id = uuid::Uuid::new_v4().to_string();
 
+        let heading = i18n::get_required_cli_string("channel-approval-heading");
+        let tool_label = i18n::get_required_cli_string("channel-approval-tool-label");
+        let tap_instruction = i18n::get_required_cli_string("channel-approval-tap-instruction");
+        let btn_approve = i18n::get_required_cli_string("channel-approval-btn-approve");
+        let btn_deny = i18n::get_required_cli_string("channel-approval-btn-deny");
+        let btn_always = i18n::get_required_cli_string("channel-approval-btn-always");
+
         let tool = Self::escape_html(&request.tool_name);
         let args = Self::escape_html(&request.arguments_summary);
         let text = format!(
-            "\u{1f527} <b>Tool approval required</b>\n\n\
-             Tool: <code>{tool}</code>\n\
+            "\u{1f527} <b>{heading}</b>\n\n\
+             {tool_label}: <code>{tool}</code>\n\
              {args}\n\n\
-             Tap a button below:",
+             {tap_instruction}",
         );
 
         let reply_markup = serde_json::json!({
             "inline_keyboard": [[
-                { "text": "✅ Approve",  "callback_data": format!("approval:{}:approve", approval_id) },
-                { "text": "❌ Deny",     "callback_data": format!("approval:{}:deny", approval_id) },
-                { "text": "✅✅ Always", "callback_data": format!("approval:{}:always", approval_id) },
+                { "text": format!("✅ {btn_approve}"),  "callback_data": format!("approval:{}:approve", approval_id) },
+                { "text": format!("❌ {btn_deny}"),     "callback_data": format!("approval:{}:deny", approval_id) },
+                { "text": format!("✅✅ {btn_always}"), "callback_data": format!("approval:{}:always", approval_id) },
             ]]
         });
 
@@ -4137,7 +4192,7 @@ Ensure only one `zeroclaw` process is using this bot token."
 
                 // Fallback: plain text, no parse_mode, keep the buttons
                 let plain_text = format!(
-                    "🔧 Tool approval required\n\nTool: {}\n{}\n\nTap a button below:",
+                    "🔧 {heading}\n\n{tool_label}: {}\n{}\n\n{tap_instruction}",
                     request.tool_name, request.arguments_summary
                 );
                 let mut plain_body = serde_json::json!({
@@ -4185,11 +4240,29 @@ Ensure only one `zeroclaw` process is using this bot token."
         // `channels.telegram.approval_timeout_secs` (default 120s).
         let result =
             match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), rx).await {
-                Ok(Ok(response)) => Some(response),
-                _ => {
-                    // Timeout or sender dropped — clean up and deny.
+                Ok(Ok(response)) => Some(
+                    zeroclaw_api::channel::AttributedApprovalResponse::operator(response),
+                ),
+                Ok(Err(_)) => {
+                    // Sender dropped — clean up and deny. Nobody tapped.
                     self.pending_approvals.lock().await.remove(&approval_id);
-                    Some(ChannelApprovalResponse::Deny)
+                    Some(
+                        zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                            ChannelApprovalResponse::Deny,
+                            zeroclaw_api::channel::ApprovalSource::Unreachable,
+                        ),
+                    )
+                }
+                Err(_) => {
+                    // Timeout — clean up and deny. This is the runtime's deny,
+                    // not the operator's.
+                    self.pending_approvals.lock().await.remove(&approval_id);
+                    Some(
+                        zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                            ChannelApprovalResponse::Deny,
+                            zeroclaw_api::channel::ApprovalSource::TimedOut,
+                        ),
+                    )
                 }
             };
 
@@ -7844,6 +7917,283 @@ mod tests {
         ch.register_bot_commands().await;
     }
 
+    /// Scoped cleanup for the process-wide broadcast hook: clears the hook on
+    /// drop so a panicking assertion cannot leak the installed hook into later
+    /// tests. Declare after `__private_test_hook_lock()` so the clear runs
+    /// while the hook lock is still held (guards drop in reverse declaration
+    /// order).
+    struct BroadcastHookGuard;
+
+    impl Drop for BroadcastHookGuard {
+        fn drop(&mut self) {
+            zeroclaw_log::clear_broadcast_hook();
+        }
+    }
+
+    #[tokio::test]
+    async fn register_bot_commands_truncates_to_telegram_max() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        // Build enough tool specs to exceed the 100-command cap: 6 built-ins + 101 tools = 107.
+        let specs: Vec<(String, String)> = (0..101)
+            .map(|i| {
+                (
+                    format!("tool_{i:02}"),
+                    format!("Description for tool {i:02}"),
+                )
+            })
+            .collect();
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_for_respond = captured.clone();
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/setMyCommands$"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body = req.body_json::<serde_json::Value>().unwrap_or_default();
+                *captured_for_respond.lock().unwrap() = Some(body);
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": true }))
+            })
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let mention_only = false;
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        )
+        .with_api_base(mock_server.uri())
+        .with_tool_command_specs(specs);
+
+        // Install a broadcast hook so we can capture the WARN log event.
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        let _hook_cleanup = BroadcastHookGuard;
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        ch.register_bot_commands().await;
+
+        let body = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("setMyCommands body captured");
+        let commands = body
+            .get("commands")
+            .and_then(|v| v.as_array())
+            .expect("commands array");
+        assert_eq!(
+            commands.len(),
+            TELEGRAM_MAX_BOT_COMMANDS,
+            "must cap commands at {TELEGRAM_MAX_BOT_COMMANDS}, got {}",
+            commands.len()
+        );
+        // Built-ins are registered first, followed by tools in input order.
+        assert_eq!(commands[0]["command"], "new");
+        assert_eq!(commands[5]["command"], "config");
+        assert_eq!(commands[6]["command"], "tool_00");
+        assert_eq!(
+            commands[TELEGRAM_MAX_BOT_COMMANDS - 1]["command"],
+            "tool_93",
+            "last registered command must be the 94th tool (built-ins + 94 tools = 100)"
+        );
+
+        // Verify the WARN event: stable literal message identifies the event,
+        // and the per-event counts ride solely in structured attributes.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut found_warn = false;
+        while !found_warn && std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let step = remaining.min(std::time::Duration::from_millis(50));
+            match tokio::time::timeout(step, rx.recv()).await {
+                Ok(Ok(value)) => {
+                    if value
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .map(|s| {
+                            s.contains(
+                                "Telegram command registration truncated to the platform limit",
+                            )
+                        })
+                        .unwrap_or(false)
+                    {
+                        found_warn = true;
+                        // Pin the structured attribute keys and values so that
+                        // a silent rename or schema drift is caught.
+                        let attrs = value.get("attributes");
+                        assert!(
+                            attrs.is_some(),
+                            "WARN event must carry structured attributes"
+                        );
+                        let attrs = attrs.unwrap();
+                        assert_eq!(
+                            attrs
+                                .get("TELEGRAM_MAX_BOT_COMMANDS")
+                                .and_then(|v| v.as_u64()),
+                            Some(TELEGRAM_MAX_BOT_COMMANDS as u64),
+                            "structured attribute TELEGRAM_MAX_BOT_COMMANDS"
+                        );
+                        assert_eq!(
+                            attrs.get("total_before_cap").and_then(|v| v.as_u64()),
+                            Some(107),
+                            "structured attribute total_before_cap"
+                        );
+                        assert_eq!(
+                            attrs.get("registered").and_then(|v| v.as_u64()),
+                            Some(100),
+                            "structured attribute registered"
+                        );
+                    }
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+                Err(_timeout) => break,
+            }
+        }
+        assert!(
+            found_warn,
+            "truncation WARN must be captured with the stable literal message"
+        );
+    }
+
+    /// The truncation WARN must carry channel attribution (`zeroclaw.channel`
+    /// composite) when `register_bot_commands` runs under the attribution span
+    /// the orchestrator opens around the supervised listener in
+    /// `crates/zeroclaw-channels/src/orchestrator/mod.rs`.
+    ///
+    /// The event-level counters (`TELEGRAM_MAX_BOT_COMMANDS`, `total_before_cap`,
+    /// `registered`) correctly live in `attributes`; the "who/where" identity
+    /// (`channel = telegram.<alias>`) must ride in from the span, never from the
+    /// call site. This pins the attribution/attrs split the logging contract
+    /// requires: operators see the WARN attributed to the emitting Telegram
+    /// channel, while the numeric counts remain in `attributes`.
+    #[tokio::test]
+    async fn register_bot_commands_truncation_warn_carries_channel_attribution() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_log::Instrument;
+
+        let mock_server = MockServer::start().await;
+
+        // 6 built-ins + 101 tools = 107, exceeding the 100-command cap.
+        let specs: Vec<(String, String)> = (0..101)
+            .map(|i| {
+                (
+                    format!("tool_{i:02}"),
+                    format!("Description for tool {i:02}"),
+                )
+            })
+            .collect();
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/setMyCommands$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": true })),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let mention_only = false;
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "clamps",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        )
+        .with_api_base(mock_server.uri())
+        .with_tool_command_specs(specs);
+
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        let _hook_cleanup = BroadcastHookGuard;
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        // Run under the same attribution span the orchestrator opens around
+        // `listen()` — this is what carries the channel identity into the WARN.
+        async {
+            ch.register_bot_commands().await;
+        }
+        .instrument(zeroclaw_log::attribution_span!(&ch))
+        .await;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut found_warn = false;
+        while !found_warn && std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let step = remaining.min(std::time::Duration::from_millis(50));
+            match tokio::time::timeout(step, rx.recv()).await {
+                Ok(Ok(value)) => {
+                    if value
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .map(|s| {
+                            s.contains(
+                                "Telegram command registration truncated to the platform limit",
+                            )
+                        })
+                        .unwrap_or(false)
+                    {
+                        found_warn = true;
+
+                        // Attribution ("who/where") rides in from the span.
+                        let zc = value
+                            .get("zeroclaw")
+                            .expect("WARN event must carry the zeroclaw attribution block");
+                        assert_eq!(
+                            zc.get("channel").and_then(|v| v.as_str()),
+                            Some("telegram.clamps"),
+                            "truncation WARN must be attributed to the emitting channel, got: {zc:?}"
+                        );
+                        assert_eq!(
+                            zc.get("channel_type").and_then(|v| v.as_str()),
+                            Some("telegram"),
+                        );
+                        assert_eq!(
+                            zc.get("channel_alias").and_then(|v| v.as_str()),
+                            Some("clamps"),
+                        );
+
+                        // Event-level counters stay in attrs, not attribution.
+                        let attrs = value
+                            .get("attributes")
+                            .expect("WARN event must carry structured attributes");
+                        assert_eq!(
+                            attrs
+                                .get("TELEGRAM_MAX_BOT_COMMANDS")
+                                .and_then(|v| v.as_u64()),
+                            Some(TELEGRAM_MAX_BOT_COMMANDS as u64),
+                        );
+                        assert_eq!(
+                            attrs.get("total_before_cap").and_then(|v| v.as_u64()),
+                            Some(107),
+                        );
+                        assert_eq!(attrs.get("registered").and_then(|v| v.as_u64()), Some(100),);
+                    }
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+                Err(_timeout) => break,
+            }
+        }
+        assert!(
+            found_warn,
+            "truncation WARN must be captured with channel attribution",
+        );
+    }
+
     // ── Approval inline keyboard tests ────────────────────────
 
     #[test]
@@ -7905,6 +8255,79 @@ mod tests {
 
         let result = rx.await.unwrap();
         assert_eq!(result, ChannelApprovalResponse::Approve);
+    }
+
+    #[tokio::test]
+    async fn request_approval_localizes_heading_and_keeps_callback_data_exact() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 1 }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let mention_only = false;
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        )
+        .with_api_base(mock_server.uri())
+        .with_approval_timeout_secs(1);
+
+        let request = zeroclaw_api::channel::ChannelApprovalRequest {
+            tool_name: "shell".to_string(),
+            arguments_summary: "ls -la".to_string(),
+            raw_arguments: None,
+        };
+
+        // No one resolves the pending oneshot — the short timeout above lets
+        // this return (as a timeout Deny) instead of hanging the test.
+        let _ = ch.request_approval("12345", &request).await;
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+
+        // Rebuild the expected text via the SAME Fluent keys the
+        // implementation uses (locale-agnostic: this holds whatever locale
+        // the test process resolves to) — a wiring regression that stops
+        // calling i18n, or a typo'd key, changes this and fails the test.
+        let heading = i18n::get_required_cli_string("channel-approval-heading");
+        let tool_label = i18n::get_required_cli_string("channel-approval-tool-label");
+        let tap_instruction = i18n::get_required_cli_string("channel-approval-tap-instruction");
+        let expected_text = format!(
+            "\u{1f527} <b>{heading}</b>\n\n{tool_label}: <code>shell</code>\nls -la\n\n{tap_instruction}",
+        );
+        assert_eq!(body["text"], expected_text);
+
+        // Protocol-exact: callback_data must stay `approval:<id>:approve|deny|always`
+        // regardless of locale, and all three buttons must share one id.
+        let buttons = body["reply_markup"]["inline_keyboard"][0]
+            .as_array()
+            .unwrap();
+        assert_eq!(buttons.len(), 3);
+        let mut ids = std::collections::HashSet::new();
+        let mut actions = Vec::new();
+        for btn in buttons {
+            let cb = btn["callback_data"].as_str().unwrap();
+            let rest = cb.strip_prefix("approval:").expect("callback_data prefix");
+            let (id, action) = rest
+                .rsplit_once(':')
+                .expect("callback_data has an action suffix");
+            ids.insert(id.to_string());
+            actions.push(action.to_string());
+        }
+        assert_eq!(ids.len(), 1, "all three buttons share one approval id");
+        assert_eq!(actions, vec!["approve", "deny", "always"]);
     }
 
     #[test]
