@@ -197,9 +197,9 @@ cli-cron-long-about =
 
     Exemples :
     zeroclaw cron list
-    zeroclaw cron add '0 9 * * 1-5' 'Bonjour' --tz America/New_York --agent
-    zeroclaw cron add '*/30 * * * *' 'Vérifier la santé du système' --agent
-    zeroclaw cron add '*/5 * * * *' 'echo ok'
+    zeroclaw cron add '0 9 * * 1-5' 'Bonjour' --agent sentinel --prompt --tz America/New_York
+    zeroclaw cron add '*/30 * * * *' 'Vérifier la santé du système' --agent sentinel --prompt
+    zeroclaw cron add '*/5 * * * *' 'echo ok' --agent sentinel
     zeroclaw cron add-at 2025-01-15T14:00:00Z 'Envoyer un rappel' --agent
     zeroclaw cron add-every 60000 'Ping de santé'
     zeroclaw cron once 30m 'Lancer une sauvegarde dans 30 minutes' --agent
