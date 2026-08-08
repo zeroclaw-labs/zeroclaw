@@ -14,6 +14,13 @@ import {
   type TurnStreamState,
 } from '@/contexts/turnStream.logic';
 import {
+  bannerForErrorFrame,
+  contextExhaustedBubblePresentation,
+  initialTerminalExplanationState,
+  reduceTerminalFrame,
+  type TerminalExplanationState,
+} from '@/contexts/terminalExplanation.logic';
+import {
   loadChatHistory,
   mapServerMessagesToPersisted,
   persistedToUiMessages,
@@ -144,6 +151,12 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
   const switchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wsVersionRef = useRef(0);
   const localMessageMutationVersionRef = useRef(0);
+  /** Which terminal explanation the in-flight turn has already rendered, so a
+   *  context-exhaustion notice and the error frame that follows it do not both
+   *  describe the same stop. Folded by `reduceTerminalFrame`. */
+  const terminalExplanationRef = useRef<TerminalExplanationState>(
+    initialTerminalExplanationState(),
+  );
 
   // Prime the model-provider catalog once so error formatting can resolve
   // display names from the backend registry rather than a local shadow list.
@@ -456,22 +469,68 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
         break;
       }
 
-      case 'error':
-        const friendlyMessage = friendlyAgentError(msg.message);
+      case 'context_exhausted': {
+        // The turn died on context exhaustion the runtime could not trim away.
+        // The runtime already appended this localized notice to persisted
+        // history, but the dashboard hydrates on mount only, so without this
+        // frame the reason stays invisible until the next reload (#8758).
+        //
+        // Flagged `ephemeral` like `history_trimmed`: the server copy is the
+        // persisted one, so keeping this bubble out of localStorage is what
+        // makes a reload show exactly one notice instead of two.
+        const outcome = reduceTerminalFrame(terminalExplanationRef.current, {
+          type: 'context_exhausted',
+          notice: msg.notice,
+        });
+        terminalExplanationRef.current = outcome.state;
+        if (outcome.render.kind !== 'notice') break;
+        const noticeContent = outcome.render.content;
+        if (outcome.clearBanner) setError(null);
         localMessageMutationVersionRef.current += 1;
         setMessages((prev) => [
           ...prev,
           {
             id: generateUUID(),
-            role: 'agent',
-            content: `${t('agent.error_prefix')} ${friendlyMessage}`,
+            role: 'agent' as const,
+            content: noticeContent,
             timestamp: new Date(),
+            notice: true,
+            ...contextExhaustedBubblePresentation(msg.persisted),
           },
         ]);
-        if (msg.code === 'AGENT_INIT_FAILED' || msg.code === 'AUTH_ERROR' || msg.code === 'PROVIDER_ERROR') {
-          setError(`${t('agent.configuration_error')}: ${friendlyMessage}`);
-        } else if (msg.code === 'INVALID_JSON' || msg.code === 'UNKNOWN_MESSAGE_TYPE' || msg.code === 'EMPTY_CONTENT') {
-          setError(`${t('agent.message_error')}: ${msg.message}`);
+        break;
+      }
+
+      case 'error':
+        const friendlyMessage = friendlyAgentError(msg.message);
+        // A context-exhaustion notice already explained this turn, so the
+        // generic error bubble would restate the same stop in provider
+        // wording. `reduceTerminalFrame` owns that arbitration.
+        const errorOutcome = reduceTerminalFrame(terminalExplanationRef.current, { type: 'error' });
+        terminalExplanationRef.current = errorOutcome.state;
+        // `render.kind !== 'error'` means a context-exhaustion notice already
+        // explained this turn. That verdict has to govern *every* surface, not
+        // just the bubble: context exhaustion arrives as `PROVIDER_ERROR`, so
+        // an unguarded banner would restate the stop in raw provider wording
+        // AND mislabel it "Configuration error" — nothing is misconfigured,
+        // the conversation simply outgrew the window (#8758).
+        if (errorOutcome.render.kind === 'error') {
+          localMessageMutationVersionRef.current += 1;
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: generateUUID(),
+              role: 'agent',
+              content: `${t('agent.error_prefix')} ${friendlyMessage}`,
+              timestamp: new Date(),
+            },
+          ]);
+          const banner = bannerForErrorFrame(errorOutcome.render, msg.code);
+          if (banner.kind === 'configuration') {
+            setError(`${t('agent.configuration_error')}: ${friendlyMessage}`);
+          } else if (banner.kind === 'message') {
+            setError(`${t('agent.message_error')}: ${msg.message}`);
+          }
         }
         setTyping(false);
         foldTurnStream({ type: 'error' });
@@ -632,6 +691,12 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
       wsRef.current.sendMessage(content);
       setTyping(true);
       foldTurnStream({ type: 'turn_start' });
+      // Never let a previous turn's notice suppress this turn's error bubble.
+      const turnStart = reduceTerminalFrame(terminalExplanationRef.current, {
+        type: 'turn_start',
+      });
+      terminalExplanationRef.current = turnStart.state;
+      if (turnStart.clearBanner) setError(null);
       localMessageMutationVersionRef.current += 1;
       setMessages((prev) => [
         ...prev,

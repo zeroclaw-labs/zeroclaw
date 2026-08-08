@@ -420,6 +420,12 @@ pub struct StreamedTurnError {
     pub error: anyhow::Error,
     pub committed_response: String,
     pub new_messages: Vec<ConversationMessage>,
+    pub terminal_reason: Option<TurnTerminalReason>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnTerminalReason {
+    ContextExhausted,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2575,6 +2581,7 @@ impl Agent {
                 error: anyhow::Error::msg("empty user message: refusing to dispatch a blank turn"),
                 committed_response: String::new(),
                 new_messages: Vec::new(),
+                terminal_reason: None,
             });
         }
 
@@ -2586,6 +2593,7 @@ impl Agent {
                     error,
                     committed_response: String::new(),
                     new_messages: Vec::new(),
+                    terminal_reason: None,
                 })?;
             self.history
                 .push(ConversationMessage::Chat(ChatMessage::system(
@@ -2637,6 +2645,7 @@ impl Agent {
                             error,
                             committed_response: String::new(),
                             new_messages: new_msgs,
+                            terminal_reason: None,
                         });
                     }
                 };
@@ -2654,6 +2663,7 @@ impl Agent {
                 error,
                 committed_response: String::new(),
                 new_messages: new_msgs,
+                terminal_reason: None,
             });
         }
 
@@ -2742,6 +2752,7 @@ impl Agent {
                     error: crate::agent::loop_::ToolLoopCancelled.into(),
                     committed_response,
                     new_messages: new_msgs,
+                    terminal_reason: None,
                 });
             }
 
@@ -2990,6 +3001,10 @@ impl Agent {
                                 error,
                                 committed_response,
                                 new_messages: new_msgs,
+                                // A failed system-prompt rebuild after a model
+                                // switch is a configuration/build failure, not a
+                                // context-window terminal condition.
+                                terminal_reason: None,
                             });
                         }
                         let notice = self.trim_history(Some(&turn_id));
@@ -3057,6 +3072,10 @@ impl Agent {
                     let notice = self.trim_history(Some(&turn_id));
                     forward_history_trim_notice(&event_tx, notice).await;
                     return Err(StreamedTurnError {
+                        terminal_reason: crate::agent::turn::is_context_exhausted_after_recovery(
+                            &error,
+                        )
+                        .then_some(TurnTerminalReason::ContextExhausted),
                         error,
                         committed_response,
                         new_messages: new_msgs,
@@ -3074,6 +3093,7 @@ impl Agent {
             )),
             committed_response,
             new_messages: new_msgs,
+            terminal_reason: None,
         })
     }
 

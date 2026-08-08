@@ -1852,6 +1852,11 @@ impl RpcDispatcher {
                         .to_string(),
                     ),
                 ),
+                Ok(crate::rpc::turn::TurnOutcome::ContextExhausted { .. }) => (
+                    ::zeroclaw_log::Action::Fail,
+                    ::zeroclaw_log::EventOutcome::Failure,
+                    Some(::serde_json::json!({ "reason": "context_exhausted" }).to_string()),
+                ),
                 Err(e) => (
                     ::zeroclaw_log::Action::Fail,
                     ::zeroclaw_log::EventOutcome::Failure,
@@ -1925,6 +1930,9 @@ impl RpcDispatcher {
                         {
                             let _ = backend.append(&key, &ChatMessage::assistant(partial_text));
                         }
+                        Ok(TurnOutcome::ContextExhausted { text, .. }) => {
+                            let _ = backend.append(&key, &ChatMessage::assistant(text));
+                        }
                         _ => {}
                     }
                 }
@@ -1986,6 +1994,19 @@ impl RpcDispatcher {
                     session_id: req.session_id,
                     stop_reason: "cancelled".to_string(),
                     content: partial_text,
+                })
+            }
+            Ok(TurnOutcome::ContextExhausted { text, .. }) => {
+                self.emit_turn_complete(
+                    &req.session_id,
+                    crate::rpc::types::TurnCompletionOutcome::Failed,
+                    text.clone(),
+                )
+                .await;
+                to_result(SessionPromptResult {
+                    session_id: req.session_id,
+                    stop_reason: "context_exhausted".to_string(),
+                    content: text,
                 })
             }
             Err(e) => {
@@ -4661,6 +4682,7 @@ async fn persist_acp_turn(
     let messages = match outcome {
         Ok(TurnOutcome::Completed { messages, .. })
         | Ok(TurnOutcome::Cancelled { messages, .. })
+        | Ok(TurnOutcome::ContextExhausted { messages, .. })
             if !messages.is_empty() =>
         {
             messages.clone()
@@ -7459,6 +7481,35 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&restored.messages[50..]).unwrap(),
             serde_json::to_value(&new_messages).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_persistence_keeps_context_exhaustion_notice_for_resume() {
+        use zeroclaw_api::model_provider::ConversationMessage;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap());
+        let sid = "context-exhausted";
+        store.create_session(sid, "agent", "/tmp").unwrap();
+        let notice = crate::i18n::get_required_cli_string("turn-context-exhausted");
+        let messages = vec![
+            ConversationMessage::Chat(ChatMessage::user("large request")),
+            ConversationMessage::Chat(ChatMessage::assistant(notice.clone())),
+        ];
+        let outcome = Ok(TurnOutcome::ContextExhausted {
+            text: notice.clone(),
+            messages: messages.clone(),
+        });
+
+        assert_eq!(persist_acp_turn(&store, sid, &outcome).await, None);
+
+        let restored = store.load_session(sid).unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&restored.messages).unwrap(),
+            serde_json::to_value(&messages).unwrap(),
+            "session resume must retain the terminal explanation"
         );
     }
 

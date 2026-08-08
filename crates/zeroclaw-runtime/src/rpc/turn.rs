@@ -17,6 +17,10 @@ pub enum TurnOutcome {
         partial_text: String,
         messages: Vec<ConversationMessage>,
     },
+    ContextExhausted {
+        text: String,
+        messages: Vec<ConversationMessage>,
+    },
 }
 
 #[derive(Debug)]
@@ -131,9 +135,10 @@ where
 /// history before the dispatch path falls back to a hard abort.
 const CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Map a finished turn task into a [`TurnOutcome`]. A successful turn yields
-/// `Completed`; a cooperative cancel yields `Cancelled` carrying the messages
-/// the task committed so persistence never depends on the abort/commit race.
+/// Map a finished turn task into a [`TurnOutcome`]. Successful and cooperative
+/// cancellation outcomes retain their normal semantics; an exhausted context
+/// remains a typed terminal outcome so non-WebSocket callers can persist and
+/// display the runtime-authored notice instead of discarding its messages.
 fn outcome_from_task_result(
     joined: Result<StreamedTurnSuccess, StreamedTurnError>,
     accumulated_text: String,
@@ -150,6 +155,7 @@ fn outcome_from_task_result(
             error,
             committed_response,
             new_messages,
+            terminal_reason: _,
         }) if is_tool_loop_cancelled(&error) => Ok(TurnOutcome::Cancelled {
             partial_text: if committed_response.is_empty() {
                 accumulated_text
@@ -158,6 +164,27 @@ fn outcome_from_task_result(
             },
             messages: new_messages,
         }),
+        Err(StreamedTurnError {
+            terminal_reason: Some(crate::agent::TurnTerminalReason::ContextExhausted),
+            error,
+            new_messages,
+            ..
+        }) => {
+            let text = new_messages
+                .iter()
+                .rev()
+                .find_map(|message| match message {
+                    ConversationMessage::Chat(message) if message.role == "assistant" => {
+                        Some(message.content.clone())
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| format!("{error}"));
+            Ok(TurnOutcome::ContextExhausted {
+                text,
+                messages: new_messages,
+            })
+        }
         Err(StreamedTurnError { error, .. }) => Err(TurnError::AgentError(format!("{error}"))),
     }
 }
@@ -321,6 +348,7 @@ mod tests {
             error: crate::agent::loop_::ToolLoopCancelled.into(),
             committed_response: "partial".to_string(),
             new_messages: msgs.clone(),
+            terminal_reason: None,
         };
 
         let outcome = outcome_from_task_result(Err(err), "accumulated".to_string())
@@ -345,6 +373,37 @@ mod tests {
             TurnOutcome::Completed { .. } => {
                 panic!("a tool-loop cancel must not map to Completed")
             }
+            TurnOutcome::ContextExhausted { .. } => {
+                panic!("a tool-loop cancel must not map to ContextExhausted")
+            }
+        }
+    }
+
+    #[test]
+    fn context_exhaustion_outcome_carries_terminal_notice_and_messages() {
+        let notice = crate::i18n::get_required_cli_string("turn-context-exhausted");
+        let messages = vec![ConversationMessage::Chat(
+            zeroclaw_providers::ChatMessage::assistant(notice.clone()),
+        )];
+        let err = StreamedTurnError {
+            error: anyhow::Error::msg("provider context overflow"),
+            committed_response: String::new(),
+            new_messages: messages.clone(),
+            terminal_reason: Some(crate::agent::TurnTerminalReason::ContextExhausted),
+        };
+
+        let outcome = outcome_from_task_result(Err(err), String::new())
+            .expect("context exhaustion is a typed terminal outcome");
+
+        match outcome {
+            TurnOutcome::ContextExhausted {
+                text,
+                messages: actual_messages,
+            } => {
+                assert_eq!(text, notice);
+                assert_eq!(actual_messages.len(), messages.len());
+            }
+            _ => panic!("context exhaustion lost its typed outcome"),
         }
     }
 
@@ -354,6 +413,7 @@ mod tests {
             error: anyhow::Error::msg("provider exploded"),
             committed_response: String::new(),
             new_messages: Vec::new(),
+            terminal_reason: None,
         };
         let outcome = outcome_from_task_result(Err(err), String::new());
         assert!(

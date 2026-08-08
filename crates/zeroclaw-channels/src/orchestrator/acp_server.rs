@@ -1519,7 +1519,12 @@ impl AcpServer {
                         cost_context,
                         session
                             .agent
-                            .turn_streamed(&prompt, event_tx, Some(cancel_token))
+                            .turn_streamed_with_steering_state(
+                                &prompt,
+                                event_tx,
+                                Some(cancel_token),
+                                None,
+                            )
                             .instrument(span),
                     ),
                 )
@@ -1628,7 +1633,7 @@ impl AcpServer {
         // Per ACP spec: a cancelled turn must respond with stopReason "cancelled",
         // not an error. Detect via ToolLoopCancelled propagated through anyhow.
         let was_cancelled = match &turn_result {
-            Err(e) => zeroclaw_runtime::agent::loop_::is_tool_loop_cancelled(e),
+            Err(e) => zeroclaw_runtime::agent::loop_::is_tool_loop_cancelled(&e.error),
             Ok(_) => false,
         };
 
@@ -1648,49 +1653,36 @@ impl AcpServer {
             return Ok(Self::cancelled_prompt_result(session_id, &accumulated_text));
         }
 
-        let (result_text, new_turn_msgs) = turn_result.map_err(|e| {
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_category(::zeroclaw_log::EventCategory::Channel)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "error": e.to_string(),
-                    })),
-                "ACP session/prompt turn failed"
-            );
-            RpcError {
-                code: INTERNAL_ERROR,
-                message: format!("Agent turn failed: {e}"),
-                data: None,
+        let (result_text, new_turn_msgs) = match turn_result {
+            Ok(outcome) => (outcome.response, outcome.new_messages),
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_category(::zeroclaw_log::EventCategory::Channel)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "error": e.error.to_string(),
+                            "terminal": e.terminal_reason.is_some(),
+                        })),
+                    "ACP session/prompt turn failed"
+                );
+                // Persist the terminal delta BEFORE returning the transport
+                // error. The failed user turn, any partial/tool history and the
+                // terminal notice are all in `new_messages`; returning first
+                // (the old `?`) skipped the success-only persistence path below
+                // and left the durable session unable to recover the turn on
+                // resume, even though the live in-memory agent still had it.
+                self.persist_turn_messages(&session_id, e.new_messages).await;
+                return Err(RpcError {
+                    code: INTERNAL_ERROR,
+                    message: format!("Agent turn failed: {}", e.error),
+                    data: None,
+                });
             }
-        })?;
+        };
 
         // Persist new messages on successful, non-cancelled turns.
-        if let Some(store) = &self.store
-            && !new_turn_msgs.is_empty()
-        {
-            let store = store.clone();
-            let sid = session_id.clone();
-            let msgs = new_turn_msgs;
-            let persisted =
-                tokio::task::spawn_blocking(move || store.append_turn(&sid, &msgs)).await;
-            let error = match persisted {
-                Ok(Ok(())) => None,
-                Ok(Err(e)) => Some(e.to_string()),
-                Err(join) => Some(join.to_string()),
-            };
-            if let Some(detail) = error {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_category(::zeroclaw_log::EventCategory::Channel)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({
-                            "error": detail,
-                        })),
-                    "Failed to persist turn; session continues in memory"
-                );
-            }
-        }
+        self.persist_turn_messages(&session_id, new_turn_msgs).await;
 
         // Durably persist the latest TodoWrite plan for this turn so it
         // replays on session/resume (best-effort; the live emission above
@@ -1770,6 +1762,46 @@ impl AcpServer {
             .lock()
             .expect("cancel_tokens lock poisoned — invariant: all guarded critical sections are short, infallible HashMap ops")
             .remove(session_id);
+    }
+
+    /// Best-effort durable persistence of a turn's message delta.
+    ///
+    /// Shared by the success and failure paths so a failed turn keeps the same
+    /// durability guarantee as a successful one: the user turn, any partial or
+    /// tool history and a terminal notice must survive close/restart/resume.
+    /// Persistence failures are logged, never propagated — the live session
+    /// continues in memory and the transport response is unaffected.
+    async fn persist_turn_messages(
+        &self,
+        session_id: &str,
+        msgs: Vec<zeroclaw_providers::ConversationMessage>,
+    ) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        if msgs.is_empty() {
+            return;
+        }
+        let store = store.clone();
+        let sid = session_id.to_string();
+        let persisted = tokio::task::spawn_blocking(move || store.append_turn(&sid, &msgs)).await;
+        let error = match persisted {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => Some(e.to_string()),
+            Err(join) => Some(join.to_string()),
+        };
+        if let Some(detail) = error {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Channel)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "error": detail,
+                    })),
+                "Failed to persist turn; session continues in memory"
+            );
+        }
     }
 
     fn prompt_result(session_id: String, stop_reason: &'static str, text: String) -> Value {
@@ -4905,6 +4937,85 @@ mod tests {
             "agent_message_chunk"
         );
         assert_eq!(n1["params"]["update"]["content"]["text"], "hi there");
+    }
+
+    /// A failed turn must persist its terminal delta before returning the
+    /// transport error, so the durable session can recover the turn.
+    ///
+    /// Covers the reviewer's close/restart/resume path: the delta is written
+    /// through `persist_turn_messages` (the same helper the failure arm of
+    /// `handle_session_prompt` calls), then a NEW server instance built over
+    /// the same on-disk store replays it via `session/load`. Before the fix the
+    /// failure arm returned `INTERNAL_ERROR` via `?` and never reached
+    /// persistence, so this replay came back empty.
+    #[tokio::test]
+    async fn failed_turn_delta_survives_restart_and_resume() {
+        use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
+
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let session_id = "sess-failed-turn-persist";
+        store
+            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .unwrap();
+
+        // The delta a context-exhausted turn carries: the user turn that
+        // failed plus the localized terminal notice.
+        let notice = zeroclaw_runtime::i18n::get_required_cli_string("turn-context-exhausted");
+        let delta = vec![
+            ConversationMessage::Chat(ChatMessage::user("please summarize everything")),
+            ConversationMessage::Chat(ChatMessage::assistant(notice.clone())),
+        ];
+
+        {
+            let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<String>(64);
+            let server = Arc::new(AcpServer::new_with_writer_and_store(
+                make_test_config(cwd.path()),
+                AcpServerConfig::default(),
+                writer_tx,
+                Arc::clone(&store),
+            ));
+            server.persist_turn_messages(session_id, delta).await;
+            // server (and its in-memory session map) drops here == client close
+        }
+
+        // Restart: a brand-new server over the same on-disk store.
+        let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<String>(64);
+        let restarted = Arc::new(AcpServer::new_with_writer_and_store(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+            writer_tx,
+            Arc::clone(&store),
+        ));
+
+        restarted
+            .handle_session_load(&serde_json::json!({
+                "sessionId": session_id,
+                "cwd": cwd.path().to_string_lossy()
+            }))
+            .await
+            .expect("session/load must succeed after restart");
+
+        let mut replayed = Vec::new();
+        while let Ok(msg) = writer_rx.try_recv() {
+            let value: serde_json::Value = serde_json::from_str(&msg).unwrap();
+            replayed.push(
+                value["params"]["update"]["content"]["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+        }
+
+        assert!(
+            replayed.iter().any(|t| t == "please summarize everything"),
+            "the failed user turn must survive restart/resume, got: {replayed:?}"
+        );
+        assert!(
+            replayed.contains(&notice),
+            "the terminal notice must survive restart/resume, got: {replayed:?}"
+        );
     }
 
     #[tokio::test]
