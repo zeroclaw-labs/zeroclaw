@@ -25,6 +25,7 @@ use std::time::Duration;
 use anyhow::Result;
 use serde_json::{Map, Value, json};
 use zeroclaw_api::model_provider::ModelProvider;
+use zeroclaw_providers::ProviderDispatch;
 
 use super::types::{CapabilityContext, CapabilityInfo, CapabilityResult, SopCapability};
 
@@ -202,7 +203,7 @@ impl LlmGenerateAdapter for ProviderLlmAdapter {
         let prompt = prompt.to_string();
         super::bridge::run_bridged(
             async move {
-                provider
+                ProviderDispatch::new(provider)
                     .chat_with_system(system.as_deref(), &prompt, &model, None)
                     .await
                     .map_err(|e| e.to_string())

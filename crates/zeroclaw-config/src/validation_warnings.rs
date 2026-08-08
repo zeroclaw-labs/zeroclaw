@@ -1,13 +1,18 @@
 //! Non-fatal validation warnings for config that loads and validates
 //! successfully (i.e. `Config::validate()` returns `Ok(())`) but needs user
 //! attention. Warnings may identify a runtime inconsistency, an inert setting,
-//! or a supported configuration that is being deprecated.
+//! a risky trust-boundary choice, or a supported configuration that is being
+//! deprecated.
 
 use serde::{Deserialize, Serialize};
 
 /// One non-fatal validation issue surfaced after a successful save.
 ///
 /// Stable codes (extend as new warnings are added):
+/// - `codex_cli_extra_args_security_boundary`: `codex_cli.extra_args` contains
+///   a known Codex CLI argument that can change sandbox, approval, policy,
+///   workspace, feature, trust, or executable-integration boundaries. The
+///   argument remains allowed.
 /// - `memory_semantic_search_without_embedder`: `memory.search_mode` requests
 ///   vector search on sqlite memory, but no effective embedder is configured.
 /// - `whatsapp_chat_policy_inert`: a WhatsApp Web `dm_policy` / `group_policy` /
