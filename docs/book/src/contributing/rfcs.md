@@ -2,7 +2,7 @@
 
 Substantial changes to ZeroClaw's architecture, user-facing surface, or core policies go through an RFC before implementation. The process exists to surface design trade-offs, give maintainers and contributors a chance to push back early, and leave a searchable record of *why* a decision was made.
 
-Governance, RFC ratification rules, and voting thresholds are defined in RFC #5577.
+[FND-003](../foundations/fnd-003-governance.md#8-the-rfc-governance-loop) is the authoritative source for RFC governance, ratification, and voting thresholds. This page summarizes the contributor-facing process without replacing those rules.
 
 ## When to file an RFC vs. just a PR
 
@@ -39,15 +39,19 @@ Body structure: adapt to the size of the proposal:
 6. **Risks and mitigations**: what could go wrong, and what's the rollback story
 7. **Rollout**: feature-flagged? schema-versioned? breaking change window?
 
-Filed RFCs go through a discussion window (default 7 days, longer for larger proposals). Anyone can comment. Maintainers weigh in. The RFC author iterates on the body in response.
+Filed RFCs go through a discussion period of at least seven days, and larger proposals may remain in discussion longer. Anyone can comment, maintainers weigh in, and the RFC author iterates on the body in response. Ordinary author revisions are expected during this window and do not automatically extend or restart it. A material revision establishes a new stable snapshot and restarts the minimum seven-day discussion period before voting.
 
 ## Ratification
 
-Per RFC #5577, RFCs are ratified by a two-thirds maintainer majority. The outcomes:
+Voting starts after the minimum discussion period when the proposal is stable. The required threshold depends on the change type: a simple majority for low-stakes documentation, tooling, and non-breaking features; a two-thirds majority for moderate-stakes API, subsystem, behavioral, release-process, and contribution-process changes; and unanimous agreement for architecture, security-model, breaking, governance-authority, team-organization, and ratification-rule changes. See [FND-003 §8.2](../foundations/fnd-003-governance.md#82-vote-thresholds) for the authoritative classifications, overlap rule, thresholds, electorate, and outcome precedence.
+
+A formal **REVISE** ballot closes the current vote without acceptance and returns the RFC to discussion under FND-003. It does not automatically require another seven-day period; only a resulting material revision restarts that minimum discussion period.
+
+The outcomes:
 
 - **Accepted**: issue carries `status:accepted`, and a maintainer comment records the final shape and links its durable disposition. Implementation PRs can proceed once that governance handoff is visible.
-- **Rejected**: issue closed with a maintainer comment giving the rationale. The record lives; re-proposing requires a materially different take.
-- **Deferred**: issue stays open with a maintainer comment noting it's parked; revisit later. Add `status:blocked` when it's waiting on a specific prerequisite.
+- **Rejected**: issue closed with a maintainer comment giving the rationale. This rejects the current proposal, not necessarily its underlying problem; the closing summary links any issue or tracker where that problem continues. The record lives; re-proposing requires a materially different take.
+- **Deferred**: issue stays open with a maintainer comment noting why it's parked and the condition for another vote. An unchanged proposal may return to a new vote without repeating the minimum discussion period; a material change restarts the seven-day minimum. Add `status:blocked` when it's waiting on a specific prerequisite.
 - **Withdrawn**: the author pulls it. Closed without prejudice.
 
 ## Implementing an accepted RFC
@@ -101,7 +105,7 @@ RFC authorship by AI assistants (with a human sponsor) is explicitly permitted p
 
 - Mark it clearly in the body ("drafted with Claude, reviewed by @maintainer")
 - The sponsoring human is responsible for accuracy and for responding to review
-- The human takes the ratification vote, not the AI
+- Only current Core Team members cast binding ratification ballots; activity and the vote denominator are determined dynamically under FND-003, and human sponsorship does not create voting authority
 
 This has worked well so far. Treat AI drafts as first-class but remember the sponsor is accountable.
 

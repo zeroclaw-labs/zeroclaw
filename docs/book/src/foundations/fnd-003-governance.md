@@ -1,8 +1,8 @@
 # FND-003: Team Organization, Project Governance, and Contribution Pipeline
 
-> Starting v0.7.0 · Type: Governance · Rev. 7
+> Starting v0.7.0 · Type: Governance · Rev. 9
 >
-> **Canonical reference** · Ratified by the team · Rev. 7
+> **Canonical reference** · Ratified through Rev. 8 · Rev. 9 proposed
 > Original governance discussion: [#5577](https://github.com/zeroclaw-labs/zeroclaw/issues/5577)
 > Follow-up work-lane and label-governance policy: [#6808](https://github.com/zeroclaw-labs/zeroclaw/issues/6808)
 
@@ -26,6 +26,7 @@
 | 6 | 2026-07-12 | Revised issue stale timing and qualifying-activity policy; made the maintainer label guide the sole operational source (#8989) |
 | 7 | 2026-07-18 | Replaced the universal ADR requirement with an explicit durable-disposition rule for accepted RFCs; reserved ADRs for significant architecture decisions |
 | 8 | 2026-07-25 | Retired the `CONTRIBUTORS.md` membership record and the `zeroclaw-core`/`zeroclaw-contributors` team names, none of which were ever created; §5.3 now names the `core-contributors` GitHub team, CODEOWNERS, and the Communication maintainer table as the real records |
+| 9 | 2026-07-29 | Proposed: reconcile RFC discussion timing, the 72-hour voting window, two-voter quorum, change-type thresholds, blocking vote outcomes, active-Core vote records, and live RFC state handling; retire the nonexistent parallel `rfc:*` label family |
 
 ---
 
@@ -538,6 +539,8 @@ The RFC process was established in the documentation RFC and the architecture RF
 
 ### 8.1 The Full RFC Lifecycle
 
+Ordinary author revisions are expected during the initial discussion period and do not automatically extend or restart the minimum seven days. A revision that materially changes the proposal establishes a new stable snapshot and restarts the minimum seven-day discussion period before a vote may open.
+
 ```
 1. AUTHOR opens an RFC issue using the RFC issue template
    with the proposal and any supporting PR or document links
@@ -546,46 +549,57 @@ The RFC process was established in the documentation RFC and the architecture RF
    Anyone can comment. Core Team members engage substantively.
    Discussions happen on the issue.
            ↓
-3. CORE TEAM VOTE on the issue
-   Format: comment with one of:
+3. CORE TEAM VOTE on the stable proposal
+   Vote-opening comment records:
+     - proposal revision or stable issue-body snapshot
+     - change type and required threshold from §8.2
+     - initial active Core Team set and denominator
+     - exact UTC closing time, 72 hours after opening
+   Core Team ballots use one of:
      ✅ APPROVE — with brief rationale
      ❌ REJECT — with specific objections
      🔄 REVISE — with specific requests
            ↓
-   ┌── Majority APPROVE ──────────────────────────────────────┐
-   │  RFC is accepted                                          │
-   │  Final accepted shape is recorded on the issue           │
-   │  Issue labeled status:accepted                           │
-   │  Durable follow-through is classified and linked        │
-   │  Implementation proceeds within the accepted shape       │
-   └──────────────────────────────────────────────────────────┘
-           ↓
-   ┌── Any REJECT ────────────────────────────────────────────┐
-   │  RFC is rejected                                          │
-   │  PR is closed (not merged)                               │
-   │  Issue labeled rfc:rejected                              │
-   │  Rejecting members document specific objections          │
-   │  RFC issue closed with rejection summary comment         │
-   └──────────────────────────────────────────────────────────┘
-           ↓
-   ┌── REVISE requested ──────────────────────────────────────┐
-   │  RFC is not voted on until revisions are complete        │
-   │  Issue labeled rfc:revision-requested                    │
-   │  Author revises proposal document                        │
-   │  Author re-requests review via issue comment             │
-   │  Process returns to step 2                               │
-   └──────────────────────────────────────────────────────────┘
+4. OUTCOME is recorded under the precedence rules in §8.2
+   The closing summary records the final electorate, ballots,
+   threshold calculation, result, and next action.
 ```
+
+The vote-opening snapshot is the immutable ballot target for that vote. The opening record identifies it through an immutable public artifact or commit, or through a recorded issue-body digest and concise decision summary when the issue body is the proposal source. Later issue-body edits do not alter that vote's target. An `APPROVE` ballot accepts the snapshot as written. A voter may attach nonbinding implementation guidance to an approval, but when acceptance depends on changing the proposal, the voter must use `REVISE`. Clarifications may be discussed while voting is open, but they do not alter the snapshot. A material proposal change cancels the vote and returns the RFC to a new minimum seven-day discussion period. A `REVISE` outcome does not itself restart that period; the same reset applies only when the resulting revision materially changes the proposal.
+
+An author may withdraw an RFC at any point. The Core Team may defer an RFC instead of concluding ratification when timing or a prerequisite prevents a decision. Withdrawal and deferral are recorded on the issue; use `status:blocked` for deferral only when a specific unresolved prerequisite is named.
 
 ### 8.2 Vote Thresholds
 
 | Change Type | Vote Required | Rationale |
 |---|---|---|
 | Documentation, tooling, non-breaking features | Simple majority of active Core Team members | Low stakes, fast iteration |
-| API changes, new subsystems, behavioral changes | Two-thirds majority of Core Team | Moderate stakes, needs real consensus |
-| Architecture changes, security model changes, breaking changes | Unanimous agreement of all Core Team members | High stakes, affects everyone |
+| API changes, new subsystems, behavioral changes, release-process changes, contribution-process changes | Two-thirds majority of active Core Team members | Moderate stakes, needs real consensus |
+| Architecture changes, security-model changes, breaking changes, governance-authority changes, team-organization changes, ratification-rule changes | Unanimous agreement of active Core Team members | High stakes, affects everyone |
 
-"Active" Core Team members are those who have participated in at least one vote in the past 90 days. Inactive members do not count against majority thresholds but are notified of votes.
+Classification follows the proposal's substantive effect rather than the file it edits. When more than one category applies, use the strictest applicable threshold.
+
+**Active electorate.** Determine current Core Team membership from the public admission and removal decisions described in [section 5.3](#53-recording-team-membership), not from GitHub team membership, repository access, or CODEOWNERS. "Active" Core Team members are those who have participated in at least one vote in the past 90 days. Qualifying participation is an explicit `APPROVE`, `REJECT`, or `REVISE` ballot cast by a current Core Team member in a formally opened vote; issue comments, reviews, reactions, and nonbinding guidance do not count. A validly cast ballot counts even if it is later superseded or the vote ends in revision, rejection, deferral, or cancellation. Inactive members do not count in the opening denominator but are notified of votes. Any current Core Team member may cast a ballot and thereby become active. Each vote's final denominator is its recorded opening active set plus any other current Core Team member who casts a ballot in that same vote. Activity gained in another concurrent vote does not change an already-open vote's denominator, but it does count when later votes establish their opening active set.
+
+**Required vote record.** Each vote remains open for 72 hours from its recorded UTC opening time. The opening comment records the stable proposal snapshot, change classification, required threshold, opening active set with supporting recent-vote evidence, and exact UTC deadline. Each member's latest explicit ballot before the deadline supersedes that member's earlier ballots. The closing summary records the final electorate, each member's final ballot, the threshold calculation, the result, and the next action.
+
+A vote has quorum when at least two current Core Team members cast ballots. Simple majority means more than half of the final active denominator. Two-thirds means at least two-thirds of that denominator, rounded up to a whole voter. These thresholds determine how many `APPROVE` ballots are required while permitting some active members not to vote. They do not override blocking ballots: after quorum, any final `REJECT` or `REVISE` ballot takes precedence even when the numerical approval threshold would otherwise be met.
+
+Apply the following outcomes in order when the vote closes:
+
+| Order | Condition | Outcome |
+|---|---|---|
+| 1 | Fewer than two current Core Team members cast ballots | Defer the decision; keep the issue open and record the next voting condition |
+| 2 | Quorum is met and any final ballot is `REJECT` | Reject the current RFC; close the issue, record the result and objections, and state whether its underlying problem remains tracked elsewhere |
+| 3 | Quorum is met, no final ballot is `REJECT`, and any final ballot is `REVISE` | Close the current vote without acceptance, return the RFC to discussion, and route the next action to the author |
+| 4 | Quorum is met, there is no blocking ballot, and the required `APPROVE` threshold is met | Accept the RFC; record its final shape and durable follow-through, then apply `status:accepted` |
+| 5 | No preceding condition applies | Defer the decision; keep the issue open and record the next voting condition |
+
+A rejection disposes of the current proposal, not necessarily the problem that motivated it. When that problem remains valid, the closing summary links the issue or tracker where work continues. After a `REVISE` outcome, use `needs-author-action` while the author prepares the revision; restore `needs-maintainer-review` when a revised stable proposal is ready for Core action.
+
+When a decision is deferred and the proposal remains unchanged, a later vote may open against the same snapshot without repeating the minimum seven-day discussion period. The new vote receives a full 72-hour window and recomputes its opening electorate. A material change still establishes a new stable snapshot and restarts the minimum discussion period.
+
+Rev. 9 applies to votes opened after its ratification and does not automatically invalidate earlier RFC decisions. Any historical process audit or correction remains separate work.
 
 ### 8.3 Durable Follow-Through and the ADR Connection
 
@@ -687,9 +701,9 @@ The live community-pickup labels are the unprefixed `good first issue` and `help
 
 Terminal closure labels are operational policy, not part of the historical `status:*` taxonomy in this foundation document. Use the [maintainer label guide](../maintainers/labels.md#resolution-labels) for current resolution labels and the [superseding guide](../maintainers/superseding.md) for replacement-process rules.
 
-### `rfc:` RFC-specific status
+### RFC state
 
-`rfc:accepted` · `rfc:rejected` · `rfc:revision-requested`
+Use `type:rfc` to identify an RFC issue and apply `status:accepted` only after the required vote threshold is met. Discussion, revision, rejection, withdrawal, and deferral remain visible through issue comments, open or closed state, and the current generic routing labels defined in the [maintainer label guide](../maintainers/labels.md). The live namespace does not use a parallel `rfc:*` status family.
 
 ---
 
