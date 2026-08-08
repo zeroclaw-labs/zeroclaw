@@ -135,7 +135,7 @@ This diagnosis should not obscure what is genuinely well-designed:
 
 - **The trait layer is excellent.** `Provider`, `Channel`, `Tool`, `Memory`, `Observer`, `RuntimeAdapter`, and `Peripheral` are clean, well-documented Rust traits. These are the right seams. The problem is they do not correspond to crate boundaries, so the compiler cannot enforce the layering.
 - **The WASM plugin system is partially built.** `PluginHost`, `WasmTool`, `WasmChannel`, `PluginManifest`, and Ed25519 signature verification all exist in `src/plugins/`. The execution bridge is a stub, but the structure is correct.
-- **The observability system is mature.** OpenTelemetry, Prometheus, and DORA metrics are all implemented against a clean `Observer` trait. This is production-quality work.
+- **The observability system has strong foundations.** OpenTelemetry and Prometheus are implemented against a clean `Observer` trait. The remaining work is to standardize how production paths emit through that interface.
 - **The security model is thoughtful.** Pairing codes, autonomy levels, sandboxing, and policy enforcement show real design intent.
 
 We are not rewriting ZeroClaw. We are giving its existing good ideas a structure they can grow in.
@@ -426,7 +426,7 @@ Standards are agreements that have been made by many smart people over many year
 
 **What it is:** OpenTelemetry (OTel) is the industry standard for collecting traces, metrics, and logs from software systems. It is maintained by the Cloud Native Computing Foundation and supported by every major cloud provider and monitoring tool.
 
-**Why it matters for ZeroClaw:** We have already implemented `OtelObserver` against our `Observer` trait. We have Prometheus metrics and DORA metrics. The issue is that these are not yet standardized across the codebase: some modules log with `tracing::info!`, others emit `ObserverEvent`s, and the two are not connected.
+**Why it matters for ZeroClaw:** We have already implemented `OtelObserver` against our `Observer` trait and expose Prometheus metrics. The issue is that these are not yet standardized across the codebase: some modules log with `tracing::info!`, others emit `ObserverEvent`s, and the two are not connected.
 
 **What we should do:**
 - Adopt OpenTelemetry as the single observability interface for all components
