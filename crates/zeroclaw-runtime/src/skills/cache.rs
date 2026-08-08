@@ -177,6 +177,13 @@ fn cached_load_in(
 /// Drop every cached entry. Call after any out-of-band mutation of a skills
 /// directory (e.g. [`super::SkillsService`] writes/removes) so the change is
 /// reflected on the next load even before mtimes are re-examined.
+///
+/// This is an optimization, not the freshness mechanism: entries are keyed by
+/// a content digest of the directory, so an out-of-band edit is already
+/// noticed on the next load without any invalidate call. Skill-derived
+/// decisions — including [`super::load_activation_candidates`], which gates a
+/// capability restriction — therefore never serve a verdict computed against
+/// content that has since changed.
 pub fn invalidate() {
     cache().write().unwrap_or_else(|e| e.into_inner()).clear();
 }
@@ -216,6 +223,9 @@ mod tests {
                     slash_options: vec![],
                     always: false,
                     location: None,
+                    provider: None,
+                    triggers: vec![],
+                    blocked_tools_with_image: vec![],
                 }],
                 dropped: vec![],
             }

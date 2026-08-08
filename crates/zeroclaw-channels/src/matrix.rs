@@ -2720,6 +2720,7 @@ mod outbound {
                 file_name,
                 data: bytes,
                 mime_type: Some(mime),
+                marker_target: None,
             };
             match upload_attachment(room, &att, kind, thread_anchor).await {
                 Ok(id) => last_attachment_id = Some(id),
@@ -6730,6 +6731,7 @@ mod tests {
                 file_name: file_name.to_string(),
                 data: vec![0; len],
                 mime_type: Some(mime_type.to_string()),
+                marker_target: None,
             }
         }
 

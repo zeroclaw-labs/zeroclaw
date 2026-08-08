@@ -1111,6 +1111,7 @@ impl WhatsAppWebChannel {
             file_name,
             data,
             mime_type,
+            marker_target: None,
         });
     }
 
@@ -1296,6 +1297,9 @@ impl WhatsAppWebChannel {
                 passive_context,
                 explicitly_addressed: false,
                 conversation_scope,
+                // WhatsApp has no registered-skill command surface, so nothing
+                // here resolves a skill identity ahead of the text.
+                invoked_skill: None,
             })
             .await
         {

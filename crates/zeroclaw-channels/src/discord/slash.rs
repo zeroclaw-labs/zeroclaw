@@ -987,6 +987,9 @@ Write it.
             ],
             always: false,
             location: None,
+            provider: None,
+            triggers: Vec::new(),
+            blocked_tools_with_image: Vec::new(),
         };
         let mapped = map_skill_slash_options(&skill);
         assert_eq!(mapped.len(), 2, "the unknown-kind option is dropped");
@@ -1025,6 +1028,9 @@ Write it.
             slash_options,
             always: false,
             location: None,
+            provider: None,
+            triggers: Vec::new(),
+            blocked_tools_with_image: Vec::new(),
         }
     }
 
