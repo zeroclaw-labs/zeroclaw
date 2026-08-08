@@ -475,7 +475,7 @@ impl Chat {
                 if let Some(sid) = resumed_sid
                     && let Ok(msgs) = self.rpc.session_messages(&sid).await
                 {
-                    state.load_history(msgs.messages);
+                    state.load_history(msgs.messages, self.pane_kind == PaneKind::Acp);
                 }
                 self.phase = ChatPhase::Active(Box::new(state));
             }
@@ -1828,7 +1828,7 @@ impl Chat {
 
         Self::refresh_model_identity(rpc, state).await;
         if let Ok(msgs) = rpc.session_messages(&new_sid).await {
-            state.load_history(msgs.messages);
+            state.load_history(msgs.messages, pane_kind == PaneKind::Acp);
         }
     }
 
@@ -6659,12 +6659,21 @@ impl ChatState {
         self.queue_sel = None;
     }
 
-    fn load_history(&mut self, messages: Vec<crate::client::MessageEntry>) {
+    fn load_history(
+        &mut self,
+        messages: Vec<crate::client::MessageEntry>,
+        strip_runtime_enrichment: bool,
+    ) {
         for m in messages {
             match m.role() {
                 crate::client::MessageRole::User => {
-                    if self.first_message.is_none() {
-                        self.first_message = Some(m.content.clone());
+                    let display = if strip_runtime_enrichment {
+                        strip_enrichment_prefix(&m.content)
+                    } else {
+                        &m.content
+                    };
+                    if self.first_message.is_none() && !display.trim().is_empty() {
+                        self.first_message = Some(display.to_string());
                     }
                     self.entries.push(ChatEntry::UserMessage {
                         text: Some(Arc::<str>::from(m.content)),
@@ -6721,6 +6730,20 @@ impl ChatState {
         self.context_max_tokens = None;
         self.clear_queue();
     }
+}
+
+/// Strip the runtime's date/time enrichment prefix from an ACP-persisted user
+/// message. ACP stores the Agent's provider-visible history, while normal Chat
+/// sessions store raw prompts and must preserve an identical user-authored
+/// prefix. Content without the runtime envelope passes through unchanged.
+fn strip_enrichment_prefix(content: &str) -> &str {
+    let Some(rest) = content.strip_prefix("[CURRENT DATE & TIME:") else {
+        return content;
+    };
+    let Some(bracket_end) = rest.find(']') else {
+        return content;
+    };
+    rest[bracket_end + 1..].trim_start()
 }
 
 /// Body-only clipboard text.
@@ -10591,28 +10614,96 @@ mod tests {
         let mut s = state();
         s.reset_for_session("sess-resume".to_string(), None);
         let before = s.entries.len();
-        s.load_history(vec![
-            MessageEntry {
-                role: "user".to_string(),
-                content: "first ask".to_string(),
-            },
-            MessageEntry {
-                role: "assistant".to_string(),
-                content: "reply".to_string(),
-            },
-            MessageEntry {
-                role: "system".to_string(),
-                content: "ignored".to_string(),
-            },
-            MessageEntry {
-                role: "user".to_string(),
-                content: "second ask".to_string(),
-            },
-        ]);
+        s.load_history(
+            vec![
+                MessageEntry {
+                    role: "user".to_string(),
+                    content: "first ask".to_string(),
+                },
+                MessageEntry {
+                    role: "assistant".to_string(),
+                    content: "reply".to_string(),
+                },
+                MessageEntry {
+                    role: "system".to_string(),
+                    content: "ignored".to_string(),
+                },
+                MessageEntry {
+                    role: "user".to_string(),
+                    content: "second ask".to_string(),
+                },
+            ],
+            false,
+        );
         // User + assistant + user replayed; system dropped.
         assert_eq!(s.entries.len(), before + 3);
         // First user message seeds the pinned recovery row.
         assert_eq!(s.first_message.as_deref(), Some("first ask"));
+    }
+
+    #[test]
+    fn load_history_strips_enrichment_prefix_from_first_message() {
+        use crate::client::MessageEntry;
+        let mut s = state();
+        s.reset_for_session("sess-resume".to_string(), None);
+        s.load_history(
+            vec![MessageEntry {
+                role: "user".to_string(),
+                content: "[CURRENT DATE & TIME: 2026-03-14 09:30:00 UTC]\n\nfirst ask".to_string(),
+            }],
+            true,
+        );
+        // The pinned row renders a single line; it must show the message
+        // text, not the runtime's timestamp prefix.
+        assert_eq!(s.first_message.as_deref(), Some("first ask"));
+        // The transcript entry keeps the persisted content untouched.
+        assert!(matches!(
+            &s.entries[s.entries.len() - 1],
+            ChatEntry::UserMessage { text: Some(t), .. }
+                if t.starts_with("[CURRENT DATE & TIME:") && t.ends_with("first ask")
+        ));
+    }
+
+    #[test]
+    fn load_history_skips_prefix_only_content_when_seeding_first_message() {
+        use crate::client::MessageEntry;
+        let mut s = state();
+        s.reset_for_session("sess-resume".to_string(), None);
+        s.load_history(
+            vec![MessageEntry {
+                role: "user".to_string(),
+                content: "[CURRENT DATE & TIME: 2026-03-14 09:30:00 UTC]\n\n".to_string(),
+            }],
+            true,
+        );
+        // A message that strips to nothing must not claim the pinned row —
+        // Some("") would block a later real message from ever seeding it.
+        assert!(s.first_message.is_none());
+        s.load_history(
+            vec![MessageEntry {
+                role: "user".to_string(),
+                content: "[CURRENT DATE & TIME: 2026-03-14 09:31:00 UTC]\n\nreal ask".to_string(),
+            }],
+            true,
+        );
+        assert_eq!(s.first_message.as_deref(), Some("real ask"));
+    }
+
+    #[test]
+    fn load_history_preserves_literal_timestamp_example_for_chat_sessions() {
+        use crate::client::MessageEntry;
+        let mut s = state();
+        let literal = "[CURRENT DATE & TIME: 2026-03-14 09:30:00 UTC]\n\nthis is user-authored";
+
+        s.load_history(
+            vec![MessageEntry {
+                role: "user".to_string(),
+                content: literal.to_string(),
+            }],
+            false,
+        );
+
+        assert_eq!(s.first_message.as_deref(), Some(literal));
     }
 
     // ── Elicitation modal ────────────────────────────────────────

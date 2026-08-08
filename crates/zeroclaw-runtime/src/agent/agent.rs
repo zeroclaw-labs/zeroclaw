@@ -1,6 +1,6 @@
 use crate::agent::dispatcher::{NativeToolDispatcher, ToolDispatcher, XmlToolDispatcher};
 use crate::agent::eval::AutoClassifyExt;
-use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
+use crate::agent::prompt::{PromptContext, SystemPromptBuilder, append_timestamp_orientation};
 use crate::approval::ApprovalManager;
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::platform;
@@ -976,6 +976,21 @@ impl Agent {
         chrono::Local::now()
     }
 
+    /// Prefixes a user message with the current date/time in the labeled
+    /// shape both embedded Agent turn paths store in history, including the
+    /// streamed path used by RPC and ACP. Other runtime owners format their
+    /// own user-message envelopes independently.
+    fn enrich_user_message(&self, user_message: &str) -> String {
+        let now = self.current_turn_datetime();
+        let (year, month, day) = (now.year(), now.month(), now.day());
+        let (hour, minute, second) = (now.hour(), now.minute(), now.second());
+        let tz = now.format("%Z");
+        let date_str =
+            format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} {tz}");
+
+        format!("[CURRENT DATE & TIME: {date_str}]\n\n{user_message}")
+    }
+
     pub fn set_channel_name(&mut self, name: String) {
         self.channel_name = name;
     }
@@ -1124,8 +1139,7 @@ impl Agent {
             });
         }
 
-        let now = self.current_turn_datetime().format("%Y-%m-%d %H:%M:%S %Z");
-        let enriched = format!("[{now}] {user_message}");
+        let enriched = self.enrich_user_message(user_message);
 
         let user_msg = ConversationMessage::Chat(ChatMessage::user(enriched));
         new_msgs.push(user_msg.clone());
@@ -1939,6 +1953,7 @@ impl Agent {
             autonomy_level: self.autonomy_level,
         };
         let mut prompt = self.prompt_builder.build(&ctx)?;
+        append_timestamp_orientation(&mut prompt);
         let receipts = &self.config.resolved.tool_receipts;
         if receipts.enabled && receipts.inject_system_prompt {
             prompt.push_str(crate::agent::tool_receipts::SYSTEM_PROMPT_ADDENDUM);
@@ -2284,14 +2299,7 @@ impl Agent {
             });
         }
 
-        let now = self.current_turn_datetime();
-        let (year, month, day) = (now.year(), now.month(), now.day());
-        let (hour, minute, second) = (now.hour(), now.minute(), now.second());
-        let tz = now.format("%Z");
-        let date_str =
-            format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} {tz}");
-
-        let enriched = format!("[CURRENT DATE & TIME: {date_str}]\n\n{user_message}");
+        let enriched = self.enrich_user_message(user_message);
 
         self.history
             .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
@@ -4511,6 +4519,42 @@ mod tests {
                 builder = builder.multimodal_config(mm);
             }
             builder.build().expect("agent builder should succeed")
+        }
+
+        #[tokio::test]
+        async fn streamed_agent_request_pairs_timestamp_orientation_with_labeled_user_text() {
+            let (provider, captured) = capturing_provider(true);
+            let mut agent = test_agent_with_provider(provider, Vec::new());
+            let (event_tx, _event_rx) = tokio::sync::mpsc::channel(64);
+
+            agent
+                .turn_streamed_with_steering_state("hi from zerocode", event_tx, None, None)
+                .await
+                .expect("streamed Agent turn should succeed");
+
+            let captured = captured.lock();
+            let first_request = captured.first().expect("provider request captured");
+            let system = first_request
+                .iter()
+                .find(|message| message.role == "system")
+                .expect("system prompt");
+            let user = first_request
+                .iter()
+                .find(|message| message.role == "user")
+                .expect("user message");
+
+            assert!(
+                system
+                    .content
+                    .contains("timestamp metadata added by the runtime"),
+                "Agent prompt must explain its runtime-owned user envelope"
+            );
+            assert!(
+                user.content.starts_with("[CURRENT DATE & TIME:")
+                    && user.content.ends_with("\n\nhi from zerocode"),
+                "provider must receive the labeled envelope and original text: {}",
+                user.content
+            );
         }
 
         #[test]
@@ -9620,6 +9664,112 @@ mod tests {
              provider/model (ollama/llama3); captured events: {events:?}"
         );
         drop(events);
+    }
+
+    fn turn_datetime_agent(
+        model_provider: Box<dyn ModelProvider>,
+        fixed: chrono::DateTime<chrono::Local>,
+    ) -> Agent {
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        Agent::builder()
+            .model_provider(model_provider)
+            .tools(Vec::new())
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .turn_datetime(move || fixed)
+            .build()
+            .expect("agent builder should succeed with valid config")
+    }
+
+    fn stored_user_message(agent: &Agent) -> String {
+        agent
+            .history()
+            .iter()
+            .find_map(|m| match m {
+                ConversationMessage::Chat(chat) if chat.role == "user" => {
+                    Some(chat.content.clone())
+                }
+                _ => None,
+            })
+            .expect("a user message must be stored in history")
+    }
+
+    #[tokio::test]
+    async fn streamed_history_uses_labeled_shape_not_bare_timestamp() {
+        let fixed = chrono::Local
+            .with_ymd_and_hms(2026, 3, 14, 9, 30, 0)
+            .single()
+            .expect("fixed local test timestamp");
+        let model_provider = Box::new(MockModelProvider {
+            responses: Mutex::new(Vec::new()),
+        });
+        let mut agent = turn_datetime_agent(model_provider, fixed);
+
+        let mut new_msgs = Vec::new();
+        agent
+            .append_streamed_user_message_to_history("hello there", &mut new_msgs, "test-turn")
+            .await;
+
+        let stored = stored_user_message(&agent);
+        assert!(
+            stored.starts_with("[CURRENT DATE & TIME: 2026-03-14 09:30:00"),
+            "streamed history must use the labeled shape, got: {stored}"
+        );
+        assert!(
+            stored.contains("hello there"),
+            "stored message must retain the original text: {stored}"
+        );
+        assert!(
+            !stored.starts_with("[2026-03-14 09:30:00"),
+            "streamed history must not fall back to the bare `[{{ts}}] {{msg}}` shape: {stored}"
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_and_non_streamed_enrichment_match_for_same_clock_and_message() {
+        let fixed = chrono::Local
+            .with_ymd_and_hms(2026, 3, 14, 9, 30, 0)
+            .single()
+            .expect("fixed local test timestamp");
+
+        let mut streamed_agent = turn_datetime_agent(
+            Box::new(MockModelProvider {
+                responses: Mutex::new(Vec::new()),
+            }),
+            fixed,
+        );
+        let mut new_msgs = Vec::new();
+        streamed_agent
+            .append_streamed_user_message_to_history("same message", &mut new_msgs, "turn-a")
+            .await;
+        let streamed_content = stored_user_message(&streamed_agent);
+
+        let mut non_streamed_agent = turn_datetime_agent(
+            Box::new(MockModelProvider {
+                responses: Mutex::new(Vec::new()),
+            }),
+            fixed,
+        );
+        non_streamed_agent
+            .turn("same message")
+            .await
+            .expect("turn should succeed");
+        let non_streamed_content = stored_user_message(&non_streamed_agent);
+
+        assert_eq!(
+            streamed_content, non_streamed_content,
+            "streamed and non-streamed enrichment must be byte-identical for the same clock and message"
+        );
     }
 }
 
