@@ -7,35 +7,56 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
 use zeroclaw_api::model_provider::{
-    ChatRequest, ChatResponse, ModelProvider, TokenUsage, ToolCall,
+    ChatRequest, ChatResponse, ModelProvider, ProviderCapabilities, TokenUsage, ToolCall,
 };
 
 use crate::case::{LlmTrace, TraceResponse};
 
 /// One FIFO queue of scripted steps per conversation turn, plus a cursor marking
-/// the turn currently being replayed.
+/// the turn currently being replayed. Keeping steps per-turn (rather than one
+/// flattened queue) means a turn can only ever consume its own scripted steps:
+/// it cannot under-run into the next turn's responses, and leftover steps at
+/// turn end are a detectable authoring error (see `ReplayHandle::finish_turn`).
 struct ReplayState {
     turns: Vec<VecDeque<TraceResponse>>,
     current: usize,
 }
 
+/// Replays a trace's scripted steps in FIFO order, one queue per conversation turn.
+///
+/// The provider is opaque to the runner (it is injected as a boxed `ModelProvider`
+/// through `RunDeps`), so turn boundaries are enforced via the companion
+/// [`ReplayHandle`] rather than by the provider alone: the runner calls
+/// `ReplayHandle::finish_turn` after each `Agent::turn` completes to assert the
+/// turn's scripted steps were fully consumed and advance the cursor. Requesting
+/// more responses than a turn scripts is an error (per-turn exhaustion guard).
 pub struct TraceLlmProvider {
     state: Arc<Mutex<ReplayState>>,
     trace_name: String,
 }
 
 impl TraceLlmProvider {
-    /// Build a replay provider from a trace, keeping each turn's steps in its own queue.
-    pub fn from_trace(trace: &LlmTrace) -> Self {
-        let turns = trace
-            .turns
-            .iter()
-            .map(|turn| turn.steps.iter().map(|s| s.response.clone()).collect())
-            .collect();
-        Self {
+    /// Build a replay provider from a trace, keeping each turn's steps in its own
+    /// queue. Fails if any turn has no scripted steps: replay requires every LLM
+    /// round-trip to be scripted, so an empty turn is an authoring error rather
+    /// than a live case.
+    pub fn try_from_trace(trace: &LlmTrace) -> anyhow::Result<Self> {
+        let mut turns = Vec::with_capacity(trace.turns.len());
+        for (turn_index, turn) in trace.turns.iter().enumerate() {
+            let turn_steps = turn.steps.as_deref().unwrap_or_default();
+            if turn_steps.is_empty() {
+                anyhow::bail!(
+                    "replay case '{}' turn {} has no scripted steps",
+                    trace.model_name,
+                    turn_index
+                );
+            }
+            turns.push(turn_steps.iter().map(|s| s.response.clone()).collect());
+        }
+        Ok(Self {
             state: Arc::new(Mutex::new(ReplayState { turns, current: 0 })),
             trace_name: trace.model_name.clone(),
-        }
+        })
     }
 
     /// A handle the runner uses to advance turn boundaries while it drives the agent.
@@ -60,10 +81,20 @@ impl ReplayHandle {
     /// the cursor to the next turn. Errors if any steps were left unconsumed.
     pub fn finish_turn(&self, turn_index: usize) -> anyhow::Result<()> {
         let mut state = self.state.lock().unwrap();
+        // The error message below is labeled with the caller-supplied
+        // `turn_index`, but the leftover check itself reads `state.current`.
+        // These must always agree (the runner calls `finish_turn` once per
+        // turn, in order): harden against a future out-of-order or
+        // skipped-turn caller silently mislabeling the error.
+        debug_assert_eq!(
+            turn_index, state.current,
+            "finish_turn called out of order: caller says turn {turn_index}, replay cursor is at turn {}",
+            state.current
+        );
         let leftover = state.turns.get(state.current).map_or(0, |q| q.len());
         if leftover > 0 {
             anyhow::bail!(
-                "TraceLlmProvider({}): turn {turn_index} scripted {leftover} step(s) the agent never requested — the trace over-specifies this turn's LLM round-trips",
+                "TraceLlmProvider({}): turn {turn_index} scripted {leftover} step(s) the agent never requested - the trace over-specifies this turn's LLM round-trips",
                 self.trace_name
             );
         }
@@ -84,6 +115,16 @@ impl Attributable for TraceLlmProvider {
 
 #[async_trait]
 impl ModelProvider for TraceLlmProvider {
+    /// Truthful capabilities so the provider stays correct if ever routed through
+    /// dispatcher resolution (`tool_dispatcher_for_provider`): the scripted tool
+    /// calls are native tool calls.
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            native_tool_calling: true,
+            ..ProviderCapabilities::default()
+        }
+    }
+
     async fn chat_with_system(
         &self,
         _system_prompt: Option<&str>,

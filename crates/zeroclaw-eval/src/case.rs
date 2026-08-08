@@ -9,18 +9,41 @@ use std::path::{Path, PathBuf};
 pub struct LlmTrace {
     /// Identifier for the trace (surfaced in reports).
     pub model_name: String,
+    /// Optional stable report identity. When set, reports and receipts use this
+    /// instead of `model_name`; readers should go through [`LlmTrace::display_id`].
+    #[serde(default)]
+    pub id: Option<String>,
     /// Conversation turns, replayed in order.
     pub turns: Vec<TraceTurn>,
     /// Declarative expectations graded against the run.
     #[serde(default)]
     pub expects: TraceExpects,
+    /// Pre-run environment preparation for the case (live mode).
+    #[serde(default)]
+    pub setup: Option<CaseSetup>,
+    /// Tool names this case requests. Live mode only; ignored in replay.
+    #[serde(default)]
+    pub tools: Option<Vec<String>>,
+}
+
+/// Pre-run environment preparation for a case.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CaseSetup {
+    /// Files written into the case's temp workspace before the run.
+    /// Keys are workspace-relative paths; absolute paths and `..` are rejected.
+    #[serde(default)]
+    pub workspace_files: std::collections::BTreeMap<String, String>,
 }
 
 /// A single conversation turn (user input + scripted LLM response steps).
+///
+/// `steps` is optional: replay cases script every LLM round-trip, while live
+/// cases must omit them (the real provider produces the responses).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraceTurn {
     pub user_input: String,
-    pub steps: Vec<TraceStep>,
+    #[serde(default)]
+    pub steps: Option<Vec<TraceStep>>,
 }
 
 /// A single LLM response step within a turn.
@@ -86,6 +109,12 @@ pub struct TraceExpects {
 }
 
 impl LlmTrace {
+    /// The identity used in reports and receipts: the explicit `id` when set,
+    /// otherwise `model_name`.
+    pub fn display_id(&self) -> &str {
+        self.id.as_deref().unwrap_or(&self.model_name)
+    }
+
     /// Load a trace from a JSON file.
     pub fn from_file(path: &Path) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)
@@ -94,6 +123,27 @@ impl LlmTrace {
             .with_context(|| format!("parsing trace fixture {}", path.display()))?;
         Ok(trace)
     }
+}
+
+/// Validate that `path` is a safe workspace-relative path: non-empty, not absolute,
+/// and free of any `..` component. Used before writing setup files or grading
+/// workspace paths, so a case cannot read or write outside its sandbox.
+pub fn validate_workspace_rel_path(path: &str) -> anyhow::Result<()> {
+    if path.is_empty() {
+        anyhow::bail!("workspace path must not be empty");
+    }
+    for component in Path::new(path).components() {
+        match component {
+            std::path::Component::ParentDir => {
+                anyhow::bail!("workspace path {path:?} must not contain a `..` component");
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                anyhow::bail!("workspace path {path:?} must be relative, not absolute");
+            }
+            std::path::Component::CurDir | std::path::Component::Normal(_) => {}
+        }
+    }
+    Ok(())
 }
 
 /// Load every `*.json` trace fixture in `dir`, sorted by path for stable ordering.
@@ -173,6 +223,44 @@ mod tests {
         let t = LlmTrace::from_file(&path).unwrap();
         assert_eq!(t.model_name, "demo");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn display_id_prefers_id_then_falls_back_to_model_name() {
+        let with_id: LlmTrace =
+            serde_json::from_str(r#"{"model_name":"m","id":"case-7","turns":[]}"#).unwrap();
+        assert_eq!(with_id.display_id(), "case-7");
+        let without_id: LlmTrace =
+            serde_json::from_str(r#"{"model_name":"m","turns":[]}"#).unwrap();
+        assert_eq!(without_id.display_id(), "m");
+    }
+
+    #[test]
+    fn turn_steps_default_to_none_when_omitted() {
+        let t: LlmTrace =
+            serde_json::from_str(r#"{"model_name":"m","turns":[{"user_input":"hi"}]}"#).unwrap();
+        assert!(t.turns[0].steps.is_none());
+    }
+
+    #[test]
+    fn validate_workspace_rel_path_rejects_absolute() {
+        assert!(validate_workspace_rel_path("/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn validate_workspace_rel_path_rejects_empty() {
+        assert!(validate_workspace_rel_path("").is_err());
+    }
+
+    #[test]
+    fn validate_workspace_rel_path_rejects_parent_component() {
+        assert!(validate_workspace_rel_path("../secret").is_err());
+        assert!(validate_workspace_rel_path("sub/../../secret").is_err());
+    }
+
+    #[test]
+    fn validate_workspace_rel_path_accepts_nested_relative() {
+        assert!(validate_workspace_rel_path("sub/dir/file.txt").is_ok());
     }
 
     #[test]
