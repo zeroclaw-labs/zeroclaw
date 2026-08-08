@@ -135,7 +135,8 @@ pub async fn run_local_listener(
     platform::prepare_parent(&path).await?;
     platform::remove_stale(&path).await?;
 
-    let mut listener = platform::bind(&path).context("binding local IPC endpoint")?;
+    let (mut listener, _endpoint_guard) =
+        platform::bind(&path).context("binding local IPC endpoint")?;
 
     platform::secure_endpoint(&path).await;
 
@@ -221,7 +222,6 @@ pub async fn run_local_listener(
         }
     }
 
-    platform::cleanup(&path).await;
     Ok(())
 }
 
@@ -230,11 +230,51 @@ pub async fn run_local_listener(
 #[cfg(unix)]
 mod platform {
     use anyhow::{Context, Result};
+    use std::fs::Metadata;
+    use std::io::ErrorKind;
+    use std::os::unix::fs::MetadataExt;
     use std::path::{Path, PathBuf};
     use tokio::net::{UnixListener, UnixStream};
 
     pub type LocalListener = UnixListener;
     pub type LocalStream = UnixStream;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct SocketIdentity {
+        device: u64,
+        inode: u64,
+    }
+
+    impl SocketIdentity {
+        fn from_metadata(metadata: &Metadata) -> Self {
+            Self {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            }
+        }
+
+        fn read(path: &Path) -> std::io::Result<Self> {
+            std::fs::symlink_metadata(path).map(|metadata| Self::from_metadata(&metadata))
+        }
+    }
+
+    /// Removes the bound socket only while the path still names this listener.
+    ///
+    /// A path can be unlinked and rebound while the original listener remains
+    /// alive. Comparing device and inode prevents the old listener from
+    /// deleting the replacement endpoint when it shuts down.
+    pub struct EndpointGuard {
+        path: PathBuf,
+        identity: SocketIdentity,
+    }
+
+    impl Drop for EndpointGuard {
+        fn drop(&mut self) {
+            if SocketIdentity::read(&self.path).ok() == Some(self.identity) {
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
+    }
 
     pub fn default_endpoint(data_dir: &Path) -> PathBuf {
         data_dir.join("daemon.sock")
@@ -252,16 +292,62 @@ mod platform {
     }
 
     pub async fn remove_stale(path: &Path) -> Result<()> {
-        if path.exists() {
-            tokio::fs::remove_file(path)
-                .await
-                .context("removing stale socket")?;
+        let observed = match tokio::fs::symlink_metadata(path).await {
+            Ok(metadata) => SocketIdentity::from_metadata(&metadata),
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error).context("inspecting local IPC endpoint"),
+        };
+
+        match UnixStream::connect(path).await {
+            Ok(_) => Err(std::io::Error::new(
+                ErrorKind::AddrInUse,
+                format!(
+                    "local IPC endpoint is already serving at {}",
+                    path.display()
+                ),
+            )
+            .into()),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+            Err(error) if error.kind() != ErrorKind::ConnectionRefused => {
+                Err(error).context("probing existing local IPC endpoint")
+            }
+            Err(_) => {
+                let current = match tokio::fs::symlink_metadata(path).await {
+                    Ok(metadata) => SocketIdentity::from_metadata(&metadata),
+                    Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+                    Err(error) => {
+                        return Err(error).context("rechecking stale local IPC endpoint");
+                    }
+                };
+
+                if current != observed {
+                    return Err(std::io::Error::new(
+                        ErrorKind::AddrInUse,
+                        format!(
+                            "local IPC endpoint changed while being probed at {}",
+                            path.display()
+                        ),
+                    )
+                    .into());
+                }
+
+                tokio::fs::remove_file(path)
+                    .await
+                    .context("removing stale socket")
+            }
         }
-        Ok(())
     }
 
-    pub fn bind(path: &Path) -> Result<LocalListener> {
-        UnixListener::bind(path).context("binding unix socket")
+    pub fn bind(path: &Path) -> Result<(LocalListener, EndpointGuard)> {
+        let listener = UnixListener::bind(path).context("binding unix socket")?;
+        let identity = SocketIdentity::read(path).context("identifying bound unix socket")?;
+        Ok((
+            listener,
+            EndpointGuard {
+                path: path.to_path_buf(),
+                identity,
+            },
+        ))
     }
 
     pub async fn secure_endpoint(path: &Path) {
@@ -277,10 +363,6 @@ mod platform {
             .await
             .context("accepting local connection")?;
         Ok(stream)
-    }
-
-    pub async fn cleanup(path: &Path) {
-        tokio::fs::remove_file(path).await.ok();
     }
 
     pub fn peer_label_from(stream: &LocalStream) -> String {
@@ -306,6 +388,7 @@ mod platform {
     /// client; see `accept`.
     pub type LocalListener = NamedPipeServer;
     pub type LocalStream = NamedPipeServer;
+    pub struct EndpointGuard;
 
     pub fn default_endpoint(data_dir: &Path) -> PathBuf {
         use std::collections::hash_map::DefaultHasher;
@@ -327,12 +410,13 @@ mod platform {
         Ok(())
     }
 
-    pub fn bind(path: &Path) -> Result<LocalListener> {
+    pub fn bind(path: &Path) -> Result<(LocalListener, EndpointGuard)> {
         let name = path_to_pipe_name(path);
-        ServerOptions::new()
+        let listener = ServerOptions::new()
             .first_pipe_instance(true)
             .create(&name)
-            .with_context(|| format!("creating named pipe {name}"))
+            .with_context(|| format!("creating named pipe {name}"))?;
+        Ok((listener, EndpointGuard))
     }
 
     pub async fn secure_endpoint(_path: &Path) {
@@ -353,10 +437,6 @@ mod platform {
             .context("creating next named-pipe instance")?;
         let connected = std::mem::replace(listener, next);
         Ok(connected)
-    }
-
-    pub async fn cleanup(_path: &Path) {
-        // Pipe handles drop with the server instance; nothing to remove.
     }
 
     pub fn peer_label_from(_stream: &LocalStream) -> String {
@@ -614,20 +694,67 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn active_socket_is_not_stolen_by_second_listener() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+        let sock_path = ctx.config.read().data_dir.join("daemon.sock");
+        let cancel = CancellationToken::new();
+
+        let server_cancel = cancel.clone();
+        let server_ctx = ctx.clone();
+        let first = zeroclaw_spawn::spawn!(async move {
+            run_local_listener(server_ctx, server_cancel, test_client_count(), None).await
+        });
+
+        wait_for_socket(&sock_path).await;
+
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            run_local_listener(
+                ctx.clone(),
+                CancellationToken::new(),
+                test_client_count(),
+                None,
+            ),
+        )
+        .await
+        .expect("the incumbent probe should complete")
+        .expect_err("a second listener must not replace a live endpoint");
+        assert_eq!(
+            second
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(ErrorKind::AddrInUse)
+        );
+        assert!(
+            tokio::net::UnixStream::connect(&sock_path).await.is_ok(),
+            "the incumbent listener should remain reachable"
+        );
+
+        cancel.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(2), first)
+            .await
+            .expect("the incumbent listener should stop after cancellation")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn stale_socket_cleanup() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = test_ctx(tmp.path());
         let sock_path = ctx.config.read().data_dir.join("daemon.sock");
 
-        std::fs::create_dir_all(tmp.path()).unwrap();
-        std::fs::write(&sock_path, b"stale").unwrap();
+        let stale_listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
+        drop(stale_listener);
         assert!(sock_path.exists());
 
         let cancel = CancellationToken::new();
         let server_cancel = cancel.clone();
         let server_ctx = ctx.clone();
-        zeroclaw_spawn::spawn!(async move {
-            let _ = run_local_listener(server_ctx, server_cancel, test_client_count(), None).await;
+        let handle = zeroclaw_spawn::spawn!(async move {
+            run_local_listener(server_ctx, server_cancel, test_client_count(), None).await
         });
 
         for _ in 0..50 {
@@ -644,6 +771,43 @@ mod tests {
         );
 
         cancel.cancel();
+        handle.await.unwrap().unwrap();
+        assert!(
+            !sock_path.exists(),
+            "the listener should remove its own socket"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_does_not_unlink_replacement_socket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+        let sock_path = ctx.config.read().data_dir.join("daemon.sock");
+        let cancel = CancellationToken::new();
+
+        let server_cancel = cancel.clone();
+        let server_ctx = ctx.clone();
+        let handle = zeroclaw_spawn::spawn!(async move {
+            run_local_listener(server_ctx, server_cancel, test_client_count(), None).await
+        });
+
+        wait_for_socket(&sock_path).await;
+        std::fs::remove_file(&sock_path).unwrap();
+        let replacement = tokio::net::UnixListener::bind(&sock_path).unwrap();
+
+        cancel.cancel();
+        handle.await.unwrap().unwrap();
+
+        assert!(
+            sock_path.exists(),
+            "shutdown must preserve a replacement socket"
+        );
+        assert!(
+            tokio::net::UnixStream::connect(&sock_path).await.is_ok(),
+            "the replacement listener should remain reachable"
+        );
+        drop(replacement);
     }
 
     #[cfg(unix)]
