@@ -26,7 +26,7 @@ cli-config-about = Gérer la configuration de ZeroClaw
 cli-update-about = Vérifier et appliquer les mises à jour de ZeroClaw
 cli-self-test-about = Exécuter les tests d'autodiagnostic
 cli-completions-about = Générer des scripts d'achèvement de shell
-cli-desktop-about = Lancer l'application de bureau companion ZeroClaw
+cli-desktop-about = Lancer l'application de bureau compagnon, ou ouvrir sa page de téléchargement
 cli-config-schema-about = Afficher le schéma JSON complet de la configuration sur stdout
 cli-config-list-about = Lister toutes les propriétés de configuration avec leurs valeurs actuelles
 cli-config-get-about = Obtenir la valeur d'une propriété de configuration
@@ -319,11 +319,11 @@ cli-desktop-long-about =
 
     L'application compagnon est une application légère pour la barre de menu / zone de dénombrement du système qui se connecte au même pont que la CLI. Elle fournit un accès rapide au tableau de bord, à la supervision de l'état et à l'appairage des appareils.
 
-    Utilisez --install pour télécharger l'application compagnon pré-construite pour votre plateforme.
+    Utilisez --install pour ouvrir la page de téléchargement pour votre plateforme. Cela n'installe rien en soi.
 
     Exemples :
     zeroclaw desktop              # lancer l'application compagnon
-    zeroclaw desktop --install    # télécharger et l'installer
+    zeroclaw desktop --install    # ouvrir la page de téléchargement
 channel-needs-quickstart-reply = Cet agent n'est pas encore entièrement configuré. L'opérateur doit exécuter Quickstart avant que je puisse répondre.
 channel-whatsapp-web-feature-missing-warning = ⚠ WhatsApp Web est configuré mais la fonctionnalité 'whatsapp-web' n'est pas compilée.
 channel-whatsapp-web-feature-missing-build = Compilez/exécutez avec : cargo build --features whatsapp-web

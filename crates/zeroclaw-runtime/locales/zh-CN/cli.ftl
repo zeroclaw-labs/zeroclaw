@@ -26,7 +26,7 @@ cli-config-about = 管理 ZeroClaw 配置
 cli-update-about = 检查并应用 ZeroClaw 更新
 cli-self-test-about = 运行诊断自检
 cli-completions-about = 生成 shell 补全脚本
-cli-desktop-about = 启动 ZeroClaw 伴侣桌面应用
+cli-desktop-about = 启动配套桌面应用，或打开其下载页面
 cli-config-schema-about = 将完整的配置 JSON Schema 输出到 stdout
 cli-config-list-about = 列出所有配置属性及其当前值
 cli-config-get-about = 获取配置属性值
@@ -315,11 +315,11 @@ cli-desktop-long-about =
 
     配套应用是一个轻量级的菜单栏 / 系统托盘应用程序，它连接到与 CLI 相同的网关。它提供对仪表板、状态监控和设备配对的快速访问。
 
-    使用 --install 下载适用于您平台的预构建配套应用。
+    使用 --install 打开适用于您平台的下载页面。它本身不会安装任何东西。
 
     示例：
     zeroclaw desktop              # 启动配套应用
-    zeroclaw desktop --install    # 下载并安装
+    zeroclaw desktop --install    # 打开下载页面
 channel-needs-quickstart-reply = 此代理尚未完全设置。操作员需要先运行 Quickstart，然后我才能回复。
 channel-whatsapp-web-feature-missing-warning = ⚠ WhatsApp Web 已配置，但未编译 'whatsapp-web' 功能。
 channel-whatsapp-web-feature-missing-build = 使用以下命令构建/运行：cargo build --features whatsapp-web

@@ -26,7 +26,7 @@ cli-config-about = ZeroClaw設定を管理
 cli-update-about = ZeroClaw更新を確認・適用
 cli-self-test-about = 診断自己テストを実行
 cli-completions-about = シェル補完スクリプトを生成
-cli-desktop-about = ZeroClawコンパニオンデスクトップアプリを起動
+cli-desktop-about = コンパニオンデスクトップアプリを起動、またはダウンロードページを開く
 cli-config-schema-about = 完全な設定JSONスキーマをstdoutにダンプ
 cli-config-list-about = すべての設定プロパティを現在の値とともにリスト表示
 cli-config-get-about = 設定プロパティ値を取得
@@ -316,11 +316,11 @@ cli-desktop-long-about =
 
     コンパニオンアプリは、CLI と同じゲートウェイに接続する軽量のメニューバー/システムトレイアプリケーションです。ダッシュボードへのクイックアクセス、ステータス監視、およびデバイスペアリングを提供します。
 
-    --install を使用して、プラットフォーム用の事前ビルドコンパニオンアプリをダウンロードしてください。
+    --install を使用すると、プラットフォーム用のダウンロードページが開きます。それ自体は何もインストールしません。
 
     例:
     zeroclaw desktop              # コンパニオンアプリを起動
-    zeroclaw desktop --install    # ダウンロードしてインストール
+    zeroclaw desktop --install    # ダウンロードページを開く
 channel-needs-quickstart-reply = このエージェントはまだ完全にセットアップされていません。返信する前に、オペレーターがQuickstartを実行する必要があります。
 channel-whatsapp-web-feature-missing-warning = ⚠ WhatsApp Web は設定されていますが、'whatsapp-web' 機能がコンパイルされていません。
 channel-whatsapp-web-feature-missing-build = ビルド/実行: cargo build --features whatsapp-web
