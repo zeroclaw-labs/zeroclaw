@@ -117,6 +117,74 @@ uri = "http://host.docker.internal:11434"
 
 Ollama-specific optional fields are `num_ctx`, `num_predict`, and `temperature_override`.
 
+### Hailo-Ollama
+
+Hailo-Ollama uses a separate `hailo_ollama` slot because its native API needs
+stricter request shaping than ordinary Ollama. A local instance defaults to
+`http://localhost:8000`; model discovery reads its live `/api/tags` response.
+
+```toml
+[providers.models.hailo_ollama.edge]
+model = "qwen3:1.7b"
+context_window = 2048
+max_tokens = 256
+timeout_secs = 90
+queue_timeout_secs = 30
+```
+
+Set `uri` to the Hailo-Ollama base URL when it runs on another host. The URL
+must use `http` or `https` and must not contain credentials, a query, or a
+fragment. Do not set an API key: this provider supports unauthenticated
+endpoints only. It serializes generation to one active request per normalized
+endpoint, even when multiple aliases target that endpoint, and rejects queued
+work after `queue_timeout_secs`.
+
+For a non-loopback endpoint, plain `http` sends prompts and responses without
+transport encryption or authentication; use `https` when the network is not a
+trusted isolated link. The provider accepts plain HTTP for local and explicitly
+trusted LAN deployments because Hailo-Ollama's native endpoint has no
+authentication contract.
+
+Hailo-Ollama rejects transport options it cannot honor rather than silently
+ignoring them. In particular, `extra_headers`, `tls_ca_cert_path`, `think=true`,
+`vision=true`, call-level native `thinking`, `provider_extra`, `api_path`,
+`wire_api`, and `chat_template_kwargs` are not supported. Set
+`native_tools = false` (or leave it unset).
+
+If an accepted request reaches its HTTP timeout or ends with another post-connect
+transport failure, ZeroClaw quarantines that endpoint for the rest of the process
+because Hailo may still be generating after the client disconnects. Confirm the
+backend is idle (restart it if necessary), then restart ZeroClaw to clear the
+quarantine. A connection-establishment failure does not quarantine the endpoint.
+
+For native-backend compatibility, ZeroClaw omits unsupported `think` and
+`num_ctx` wire fields rather than claiming to control them. The native service
+parses each decoded message as structured-prompt JSON a second time, so ZeroClaw
+escapes both literal backslashes and CR/LF/tab controls in the API value to
+preserve their original meaning through that parse. `context_window`
+controls ZeroClaw's best-effort local history budgeting; it is deliberately not
+sent to Hailo-Ollama. Call-level native thinking requests are rejected before
+any backend request. Responses must be a completed non-streaming response
+(`done=true`), and an empty completed response is treated as an error. A low
+`context_window` actively trims older history; together with the 12-message cap,
+the two local budgets keep the retained history bounded. System instructions are
+folded into plain user prose, and each normalized message is bounded to 2,000
+Unicode characters.
+
+If the native response has no visible content but does contain non-empty
+internal reasoning, the provider uses that field as a last-resort ordinary-text
+fallback for compatibility with models that put their only output there. It
+does not expose a separate reasoning channel, and callers should not treat this
+fallback as evidence that extended thinking is supported.
+
+Native tool calling, streaming, and vision are not advertised. Because the
+Hailo-Ollama 0.5.1 chat DTO has no image field, `vision=true` is rejected rather
+than overriding that text-only capability; configure a separate vision-capable
+provider instead.
+Prompt-guided tool calls and results remain available as plain text history when
+the complete injected tool protocol fits in the bounded first message; ZeroClaw
+rejects an oversized protocol instead of sending truncated tool instructions.
+
 ### Azure OpenAI
 
 Azure OpenAI computes its endpoint from the typed Azure fields:
