@@ -671,6 +671,24 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             image_cache.as_deref_mut(),
         )
         .await?;
+        let mut provider_request_messages = prepared_messages.messages;
+        let mut hook_selected_model = None;
+
+        if let Some(hooks) = ctx.hooks.filter(|hooks| !hooks.is_empty()) {
+            let mut candidate_model = active_model.to_string();
+            match hooks
+                .run_before_llm_call(&mut provider_request_messages, &mut candidate_model)
+                .await
+            {
+                crate::hooks::HookResult::Continue(()) => {
+                    hook_selected_model = Some(candidate_model);
+                }
+                crate::hooks::HookResult::Cancel(reason) => {
+                    anyhow::bail!("LLM call cancelled by hook: {reason}");
+                }
+            }
+        }
+        let provider_request_model = hook_selected_model.as_deref().unwrap_or(active_model);
 
         // Fail closed on the local budget BEFORE announcing the request.
         // `announce_llm_request` emits the user-visible `WaitingOnModel`
@@ -681,10 +699,10 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
 
         let llm_started_at = announce_llm_request(
             &ctx,
-            turn_state.history,
+            &provider_request_messages,
             active_model_provider,
             active_model_provider_name,
-            active_model,
+            provider_request_model,
             iteration,
         )
         .await;
@@ -734,8 +752,8 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         } = call_provider(
             &ctx,
             active_model_provider,
-            active_model,
-            &prepared_messages.messages,
+            provider_request_model,
+            &provider_request_messages,
             request_tools,
             should_consume_provider_stream,
             iteration,
@@ -756,8 +774,9 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             Ok(resp) => {
                 let interpreted = interpret_chat_response(
                     &ctx,
+                    provider_request_model,
                     resp,
-                    &prepared_messages.messages,
+                    &provider_request_messages,
                     &iteration_tool_specs,
                     streamed_protocol_suppressed,
                     llm_started_at,
@@ -778,7 +797,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 )
             }
             Err(e) => {
-                record_llm_failure(&ctx, llm_started_at, iteration, &e);
+                record_llm_failure(&ctx, provider_request_model, llm_started_at, iteration, &e);
                 let recovered = try_recover_context_overflow(
                     turn_state.history,
                     &e,
