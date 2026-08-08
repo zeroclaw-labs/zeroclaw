@@ -766,36 +766,45 @@ fn trim_old_images(messages: &[ChatMessage], max_images: usize) -> Vec<ChatMessa
     let total: usize = image_positions.iter().map(|(_, c)| c).sum();
     let mut to_drop = total.saturating_sub(max_images);
 
-    // Collect indices of messages whose images should be stripped.
-    let mut strip_indices = std::collections::HashSet::new();
+    // How many images each message must give up. Dropping is per IMAGE, not
+    // per message: a message that straddles the budget gives up only its
+    // oldest images and keeps the rest. Stripping it whole would send fewer
+    // images than `max_images` allows — one image over budget used to cost
+    // every image of that message, so the model answered about pictures it
+    // had never received.
+    let mut drop_counts: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     for &(idx, count) in &image_positions {
         if to_drop == 0 {
             break;
         }
-        strip_indices.insert(idx);
-        to_drop = to_drop.saturating_sub(count);
+        let dropped_here = to_drop.min(count);
+        drop_counts.insert(idx, dropped_here);
+        to_drop -= dropped_here;
     }
 
     messages
         .iter()
         .enumerate()
-        .map(|(i, m)| {
-            if strip_indices.contains(&i) {
-                let (cleaned, _) = parse_image_markers(&m.content);
-                let text = if cleaned.trim().is_empty() {
-                    "[image removed from history]".to_string()
-                } else {
-                    cleaned
-                };
-                ChatMessage {
-                    role: m.role.clone(),
-                    content: text,
-                }
-            } else {
-                replay_message_without_stale_tool_images(i, m, &latest_tool_indices)
-            }
+        .map(|(i, m)| match drop_counts.get(&i) {
+            Some(&drop_here) => ChatMessage {
+                role: m.role.clone(),
+                content: drop_oldest_image_markers(&m.content, drop_here),
+            },
+            None => replay_message_without_stale_tool_images(i, m, &latest_tool_indices),
         })
         .collect()
+}
+
+/// Rebuild `content` without its `count` oldest image markers, keeping the
+/// surrounding text. When no image survives and there was no caption, fall
+/// back to the placeholder so the turn keeps its shape.
+fn drop_oldest_image_markers(content: &str, count: usize) -> String {
+    let (cleaned, refs) = parse_image_markers(content);
+    let kept: Vec<String> = refs.into_iter().skip(count).collect();
+    if kept.is_empty() && cleaned.trim().is_empty() {
+        return "[image removed from history]".to_string();
+    }
+    compose_multimodal_message(&cleaned, &kept)
 }
 
 fn compose_multimodal_message(text: &str, data_uris: &[String]) -> String {
@@ -2053,11 +2062,14 @@ mod tests {
     }
 
     #[test]
-    fn trim_old_images_multi_image_message_stripped_as_unit() {
-        // A single message has 3 images. We need to drop 2 to reach max=1.
-        // But trimming works at message granularity — the entire message gets
-        // stripped (all 3 images removed), which over-trims to 0. The newest
-        // message (text-only) is untouched.
+    fn trim_old_images_keeps_the_budget_inside_a_multi_image_message() {
+        // A single message carries 3 images and the budget is 1. Trimming must
+        // drop the 2 oldest images and KEEP the newest one: dropping the whole
+        // message would send zero images for a request that was allowed one.
+        //
+        // This is the common shape when a user attaches several files at once:
+        // one image over budget used to cost every image of that message, so
+        // the model answered about pictures it had never received.
         let messages = vec![
             ChatMessage::user(
                 "[IMAGE:/tmp/a.png]\n[IMAGE:/tmp/b.png]\n[IMAGE:/tmp/c.png]\nThree pics"
@@ -2068,12 +2080,45 @@ mod tests {
 
         let trimmed = trim_old_images(&messages, 1);
         assert_eq!(trimmed.len(), 2);
-        // All images in the first message are gone, but text remains
         let (_, refs0) = parse_image_markers(&trimmed[0].content);
-        assert!(refs0.is_empty());
-        assert!(trimmed[0].content.contains("Three pics"));
-        // Second message unchanged
+        assert_eq!(refs0, vec!["/tmp/c.png".to_string()], "keeps the newest image");
+        assert!(trimmed[0].content.contains("Three pics"), "caption survives");
         assert_eq!(trimmed[1].content, "Just text, no images");
+    }
+
+    #[test]
+    fn trim_old_images_spends_the_whole_budget_across_messages() {
+        // Budget 2 spread over two messages of 2 images each: the oldest
+        // message gives up both, the newest keeps both. Exactly `max_images`
+        // survive — never fewer.
+        let messages = vec![
+            ChatMessage::user("[IMAGE:/tmp/a.png]\n[IMAGE:/tmp/b.png]\nOld".to_string()),
+            ChatMessage::user("[IMAGE:/tmp/c.png]\n[IMAGE:/tmp/d.png]\nNew".to_string()),
+        ];
+
+        let trimmed = trim_old_images(&messages, 2);
+        assert_eq!(count_image_markers(&trimmed), 2);
+        let (_, refs0) = parse_image_markers(&trimmed[0].content);
+        assert!(refs0.is_empty(), "oldest message gives up its images first");
+        let (_, refs1) = parse_image_markers(&trimmed[1].content);
+        assert_eq!(refs1.len(), 2, "newest message keeps both");
+    }
+
+    #[test]
+    fn trim_old_images_partially_trims_only_the_message_that_straddles_the_budget() {
+        // Budget 3, four images spread 2 + 2. The oldest message must give up
+        // exactly one image and keep the other — the straddling message is the
+        // only one trimmed in part.
+        let messages = vec![
+            ChatMessage::user("[IMAGE:/tmp/a.png]\n[IMAGE:/tmp/b.png]\nOld".to_string()),
+            ChatMessage::user("[IMAGE:/tmp/c.png]\n[IMAGE:/tmp/d.png]\nNew".to_string()),
+        ];
+
+        let trimmed = trim_old_images(&messages, 3);
+        assert_eq!(count_image_markers(&trimmed), 3);
+        let (_, refs0) = parse_image_markers(&trimmed[0].content);
+        assert_eq!(refs0, vec!["/tmp/b.png".to_string()], "drops the oldest of the two");
+        assert!(trimmed[0].content.contains("Old"));
     }
 
     #[test]
