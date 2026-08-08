@@ -621,6 +621,17 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         true
     }
 
+    /// True when this channel IS an authenticated operator surface — a
+    /// client that proved operator identity to connect (e.g. the gateway's
+    /// paired websocket client), as opposed to a remote chat account.
+    /// Tools whose approval is operator-only (`Tool::approval_requires_operator`)
+    /// are offered for approval only on such channels; everywhere else the
+    /// channel is notified and the call is denied. Default: `false` — a new
+    /// channel type must opt in to granting authority, never inherit it.
+    fn is_operator_approval_surface(&self) -> bool {
+        false
+    }
+
     /// Send a discrete-choice prompt with options.
     ///
     /// Each `(callback_id, label)` pair represents one choice. Whether

@@ -461,6 +461,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         turn_id,
         agent_alias,
         parent_agent_alias,
+        tools: tools_registry,
     };
 
     // Cross-agent SOP step contexts memoized for the WHOLE turn (see the
