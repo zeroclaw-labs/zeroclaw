@@ -52,8 +52,6 @@ impl Default for AcpServerConfig {
 
 struct Session {
     agent: Agent,
-    #[allow(dead_code)] // WIP: intended for session expiry logic
-    created_at: Instant,
     last_active: Instant,
     /// Agent alias (e.g. `"clamps"`) for attributable span logs.
     agent_alias: String,
@@ -509,7 +507,6 @@ impl AcpServer {
                 Err(RpcError {
                     code: METHOD_NOT_FOUND,
                     message: format!("Method not found: {}", request.method),
-                    data: None,
                 })
             }
         };
@@ -617,12 +614,10 @@ impl AcpServer {
                 message: format!(
                     "Unknown agent `{agent_alias}` — no [agents.{agent_alias}] entry configured"
                 ),
-                data: None,
             }),
             Some(agent) if !agent.is_dispatchable() => Err(RpcError {
                 code: INVALID_PARAMS,
                 message: format!("Agent `{agent_alias}` is not enabled for dispatch"),
-                data: None,
             }),
             Some(_) => Ok(()),
         }
@@ -668,7 +663,6 @@ impl AcpServer {
                     "cwd is not a usable directory ({}): {e}",
                     requested_cwd.display()
                 ),
-                data: None,
             })?
             .to_string_lossy()
             .into_owned();
@@ -702,7 +696,6 @@ impl AcpServer {
                 message: "session/new requires `agentAlias` (alias of a configured \
                           [agents.<alias>] entry)"
                     .to_string(),
-                data: None,
             })?;
         Self::validate_dispatchable_agent_alias(&config, &agent_alias)?;
 
@@ -730,7 +723,6 @@ impl AcpServer {
                         "Maximum session limit reached ({})",
                         self.acp_config.max_sessions
                     ),
-                    data: None,
                 });
             }
             loading.insert(session_id.clone());
@@ -795,7 +787,6 @@ impl AcpServer {
                 return Err(RpcError {
                     code: INTERNAL_ERROR,
                     message: format!("Failed to create agent: {error}"),
-                    data: None,
                 });
             }
         };
@@ -835,7 +826,6 @@ impl AcpServer {
                 return Err(RpcError {
                     code: INTERNAL_ERROR,
                     message: format!("Failed to persist session: {detail}"),
-                    data: None,
                 });
             }
         }
@@ -850,7 +840,6 @@ impl AcpServer {
                 session_id.clone(),
                 Arc::new(Mutex::new(Session {
                     agent,
-                    created_at: now,
                     last_active: now,
                     agent_alias: agent_alias.clone(),
                     model_provider: config
@@ -903,14 +892,12 @@ impl AcpServer {
             .ok_or_else(|| RpcError {
                 code: INVALID_PARAMS,
                 message: "Missing required parameter: sessionId".to_string(),
-                data: None,
             })?
             .to_string();
 
         let store = self.store.as_ref().ok_or_else(|| RpcError {
             code: SESSION_NOT_FOUND,
             message: format!("Session not found: {session_id}"),
-            data: None,
         })?;
 
         // Atomically check and reserve the session slot
@@ -937,7 +924,6 @@ impl AcpServer {
                         "Maximum session limit reached ({})",
                         self.acp_config.max_sessions
                     ),
-                    data: None,
                 });
             }
             if sessions.contains_key(&session_id) || loading.contains(&session_id) {
@@ -954,7 +940,6 @@ impl AcpServer {
                     message: format!(
                         "Session already active: {session_id}. Call session/close first."
                     ),
-                    data: None,
                 });
             }
             loading.insert(session_id.clone());
@@ -968,13 +953,11 @@ impl AcpServer {
             .map_err(|e| RpcError {
                 code: INTERNAL_ERROR,
                 message: format!("Failed to load session: {e}"),
-                data: None,
             })
             .and_then(|opt| {
                 opt.ok_or_else(|| RpcError {
                     code: SESSION_NOT_FOUND,
                     message: format!("Session not found: {session_id}"),
-                    data: None,
                 })
             });
 
@@ -1007,7 +990,6 @@ impl AcpServer {
             .map_err(|e| RpcError {
                 code: INTERNAL_ERROR,
                 message: format!("Failed to create agent: {e}"),
-                data: None,
             });
 
         let mut agent = match agent_result {
@@ -1055,7 +1037,6 @@ impl AcpServer {
                 session_id.clone(),
                 Arc::new(Mutex::new(Session {
                     agent,
-                    created_at: now,
                     last_active: now,
                     agent_alias: restore_alias.clone(),
                     model_provider: config
@@ -1121,14 +1102,12 @@ impl AcpServer {
             .ok_or_else(|| RpcError {
                 code: INVALID_PARAMS,
                 message: "Missing required parameter: sessionId".to_string(),
-                data: None,
             })?
             .to_string();
 
         let store = self.store.as_ref().ok_or_else(|| RpcError {
             code: SESSION_NOT_FOUND,
             message: format!("Session not found: {session_id}"),
-            data: None,
         })?;
 
         // Atomically check and reserve the session slot
@@ -1155,7 +1134,6 @@ impl AcpServer {
                         "Maximum session limit reached ({})",
                         self.acp_config.max_sessions
                     ),
-                    data: None,
                 });
             }
             if sessions.contains_key(&session_id) || loading.contains(&session_id) {
@@ -1172,7 +1150,6 @@ impl AcpServer {
                     message: format!(
                         "Session already active: {session_id}. Call session/close first."
                     ),
-                    data: None,
                 });
             }
             loading.insert(session_id.clone());
@@ -1183,13 +1160,11 @@ impl AcpServer {
             .map_err(|e| RpcError {
                 code: INTERNAL_ERROR,
                 message: format!("Failed to load session: {e}"),
-                data: None,
             })
             .and_then(|opt| {
                 opt.ok_or_else(|| RpcError {
                     code: SESSION_NOT_FOUND,
                     message: format!("Session not found: {session_id}"),
-                    data: None,
                 })
             });
 
@@ -1222,7 +1197,6 @@ impl AcpServer {
             .map_err(|e| RpcError {
                 code: INTERNAL_ERROR,
                 message: format!("Failed to create agent: {e}"),
-                data: None,
             });
 
         let mut agent = match agent_result {
@@ -1255,7 +1229,6 @@ impl AcpServer {
                 session_id.clone(),
                 Arc::new(Mutex::new(Session {
                     agent,
-                    created_at: now,
                     last_active: now,
                     agent_alias: restore_alias.clone(),
                     model_provider: config
@@ -1322,7 +1295,6 @@ impl AcpServer {
             .ok_or_else(|| RpcError {
                 code: INVALID_PARAMS,
                 message: "Missing required parameter: sessionId".to_string(),
-                data: None,
             })?;
 
         // Fire the cancel token for any in-flight turn before acquiring the session lock.
@@ -1348,7 +1320,6 @@ impl AcpServer {
             sessions.remove(session_id).ok_or_else(|| RpcError {
                 code: SESSION_NOT_FOUND,
                 message: format!("Session not found: {session_id}"),
-                data: None,
             })?
         };
 
@@ -1393,7 +1364,6 @@ impl AcpServer {
             .ok_or_else(|| RpcError {
                 code: INVALID_PARAMS,
                 message: "Missing required parameter: sessionId".to_string(),
-                data: None,
             })?
             .to_string();
 
@@ -1405,7 +1375,6 @@ impl AcpServer {
             sessions.get(&session_id).cloned().ok_or_else(|| RpcError {
                 code: SESSION_NOT_FOUND,
                 message: format!("Session not found: {session_id}"),
-                data: None,
             })?
         };
 
@@ -1622,7 +1591,6 @@ impl AcpServer {
         let turn_result = turn_handle.await.map_err(|e| RpcError {
             code: INTERNAL_ERROR,
             message: format!("Agent task panicked: {e}"),
-            data: None,
         })?;
 
         // Per ACP spec: a cancelled turn must respond with stopReason "cancelled",
@@ -1661,7 +1629,6 @@ impl AcpServer {
             RpcError {
                 code: INTERNAL_ERROR,
                 message: format!("Agent turn failed: {e}"),
-                data: None,
             }
         })?;
 
@@ -1758,7 +1725,6 @@ impl AcpServer {
             return Err(RpcError {
                 code: SESSION_BUSY,
                 message: format!("Session already has an active prompt turn: {session_id}"),
-                data: None,
             });
         }
         tokens.insert(session_id.to_string(), cancel_token);
@@ -1836,13 +1802,11 @@ impl AcpServer {
                                 code: INVALID_PARAMS,
                                 message: "resource.blob requires an active session workspace"
                                     .to_string(),
-                                data: None,
                             });
                         }
                         acp_embedded::decode_embedded_blob(blob).map_err(|e| RpcError {
                             code: INVALID_PARAMS,
                             message: e.0,
-                            data: None,
                         })?;
                     }
                 }
@@ -1874,7 +1838,6 @@ impl AcpServer {
                                     code: INVALID_PARAMS,
                                     message: "resource.blob requires an active session workspace"
                                         .to_string(),
-                                    data: None,
                                 });
                             };
                             let uri = res.get("uri").and_then(|v| v.as_str());
@@ -1884,7 +1847,6 @@ impl AcpServer {
                                     .map_err(|e| RpcError {
                                         code: INVALID_PARAMS,
                                         message: e.0,
-                                        data: None,
                                     })?;
                             if added || !joined.is_empty() {
                                 joined.push_str("\n\n");
@@ -1898,7 +1860,6 @@ impl AcpServer {
                         code: INVALID_PARAMS,
                         message: "Parameter 'prompt' array must contain at least one text part"
                             .to_string(),
-                        data: None,
                     });
                 }
                 Ok(joined)
@@ -1907,7 +1868,6 @@ impl AcpServer {
                 code: INVALID_PARAMS,
                 message: "Missing required parameter: prompt (must be string or array of parts)"
                     .to_string(),
-                data: None,
             }),
         }
     }
@@ -1920,7 +1880,6 @@ impl AcpServer {
             .ok_or_else(|| RpcError {
                 code: INVALID_PARAMS,
                 message: "Missing required parameter: sessionId".to_string(),
-                data: None,
             })?;
 
         let session_arc = {
@@ -1928,7 +1887,6 @@ impl AcpServer {
             sessions.remove(session_id).ok_or_else(|| RpcError {
                 code: SESSION_NOT_FOUND,
                 message: format!("Session not found: {session_id}"),
-                data: None,
             })?
         };
 
@@ -1968,7 +1926,6 @@ impl AcpServer {
             .ok_or_else(|| RpcError {
                 code: INVALID_PARAMS,
                 message: "Missing required parameter: sessionId".to_string(),
-                data: None,
             })?;
 
         let token = self
@@ -2000,7 +1957,6 @@ impl AcpServer {
             .ok_or_else(|| RpcError {
                 code: INVALID_PARAMS,
                 message: "Missing required parameter: sessionId".to_string(),
-                data: None,
             })?
             .to_string();
 
@@ -2041,7 +1997,6 @@ impl AcpServer {
             Err(RpcError {
                 code: SESSION_NOT_FOUND,
                 message: format!("Session not found: {session_id}"),
-                data: None,
             })
         }
     }
@@ -2553,8 +2508,6 @@ fn history_notifications_for_message(
 struct RpcError {
     code: i32,
     message: String,
-    #[allow(dead_code)] // JSON-RPC spec field, used for structured error data
-    data: Option<Value>,
 }
 
 type RpcResult = std::result::Result<Value, RpcError>;
