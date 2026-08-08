@@ -1201,6 +1201,7 @@ fn build_cron_shell_command(
     cmd.arg("-c")
         .arg(command)
         .current_dir(workspace_dir)
+        .env(zeroclaw_api::AGENT_SHELL_ENV_VAR, "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

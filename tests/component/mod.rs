@@ -1,3 +1,4 @@
+mod agent_shell_cli_refusal;
 #[cfg(feature = "agent-runtime")]
 mod config_dir_locale_regression;
 mod config_patch_cli;

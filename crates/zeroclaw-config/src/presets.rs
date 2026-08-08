@@ -801,4 +801,46 @@ mod tests {
 
         assert!(channel.fields.is_empty());
     }
+
+    /// Why the CLI needs a guard of its own against agent callers.
+    ///
+    /// The risk profile does not stop an agent from invoking `zeroclaw`. On
+    /// `balanced` -- the *default* preset -- every check passes: the command
+    /// name matches the `["*"]` allowlist, `zeroclaw` is in neither the high-
+    /// nor the medium-risk table so the risk gate is inert, and a dotted config
+    /// path is not `looks_like_path`, so no forbidden path argument is found.
+    ///
+    /// The process it reaches carries operator authority with no agent policy
+    /// anywhere in it, so that one call escalates. `locked_down` blocks it only
+    /// incidentally, by having a real allowlist that happens to omit the name.
+    ///
+    /// If `balanced` ever starts refusing, the profile got stricter and this
+    /// test should be re-read rather than the guard deleted: the guard also
+    /// covers hand-rolled wildcard profiles, which no preset change reaches.
+    #[test]
+    fn the_risk_profile_alone_does_not_stop_an_agent_invoking_the_cli() {
+        let escalation = "zeroclaw config set agents.helper.risk_profile yolo";
+        let reaches_cli = |preset: &str| {
+            let profile = (risk_preset(preset).expect("preset in table").values)();
+            let policy = crate::policy::SecurityPolicy::from_risk_profile(
+                &profile,
+                std::path::Path::new("/tmp/zeroclaw-preset-probe"),
+            );
+            policy.validate_command_execution(escalation, false).is_ok()
+        };
+
+        assert!(
+            !reaches_cli("locked_down"),
+            "locked_down has a real allowlist that omits `zeroclaw`"
+        );
+        assert!(
+            reaches_cli("balanced"),
+            "balanced allows any command name, so policy alone cannot stop this \
+             -- the CLI-side guard is what does"
+        );
+        assert!(
+            reaches_cli("yolo"),
+            "yolo may configure things; it already holds that authority"
+        );
+    }
 }

@@ -22,6 +22,28 @@ pub mod session_keys;
 pub mod tool;
 pub mod vad;
 
+/// Marks a process spawned by an agent's shell.
+///
+/// Set on every command a tool spawns on a model's behalf; read by the
+/// `zeroclaw` CLI, which refuses to run when it sees it.
+///
+/// The CLI carries the *operator's* authority — it loads and rewrites
+/// `config.toml` with no agent policy anywhere in the process. So an agent that
+/// can execute it does not act with its own privileges, it acts with yours.
+/// `balanced`, the default preset, allows any command name (`allowed_commands =
+/// ["*"]`) and `zeroclaw` is classified low-risk, so nothing else in the policy
+/// stops the call.
+///
+/// Set unconditionally. [`TOOL_LOOP_SESSION_KEY`] looks like the same signal but
+/// is absent on unscoped turns, which would leave exactly the one-shot and
+/// webhook paths unmarked.
+///
+/// This binds the *caller*, not the command name, so copying or renaming the
+/// binary does not shake it off. An agent under a wildcard policy can still
+/// clear the variable deliberately (`env -u`); that is a bar to clear and a
+/// thing to alarm on, not a proof.
+pub const AGENT_SHELL_ENV_VAR: &str = "ZEROCLAW_AGENT_SHELL";
+
 tokio::task_local! {
     /// Current thread/sender ID for per-sender rate limiting.
     /// Set by the agent loop, read by SecurityPolicy.

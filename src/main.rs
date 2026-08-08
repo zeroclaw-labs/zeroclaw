@@ -282,6 +282,40 @@ fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
     config::schema::validate_temperature(t)
 }
 
+/// Refusal message when this process was spawned by an agent's shell, or `None`
+/// when it was not.
+///
+/// The CLI holds the operator's authority: it loads, decrypts and rewrites
+/// `config.toml`, and no agent policy exists anywhere in the process. An agent
+/// that shells out to it therefore does not act with its own privileges, it
+/// acts with the operator's — `zeroclaw config set agents.x.risk_profile yolo`
+/// escalates in one call. Nothing in the risk profile prevents it: `balanced`,
+/// the default preset, sets `allowed_commands = ["*"]`, and `zeroclaw` is
+/// neither high- nor medium-risk, so the command validates cleanly.
+///
+/// Refuses *every* subcommand rather than the mutating ones. Reads leak too —
+/// `config get` on a secret field decrypts it — and an allowlist that has to
+/// stay correct as subcommands are added is the kind that silently stops being
+/// correct.
+///
+/// Only the value's presence is consulted; an empty value reads as absent so a
+/// stray `export ZEROCLAW_AGENT_SHELL=` does not lock an operator out of their
+/// own CLI. That is not a weakening: an agent that can set the variable empty
+/// can equally `env -u` it, which this never claimed to stop.
+fn agent_shell_refusal(marker: Option<std::ffi::OsString>) -> Option<String> {
+    let marker = marker?;
+    if marker.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "refusing to run: the `zeroclaw` CLI carries operator authority and was invoked from an \
+         agent's shell ({} is set).\n\nAn agent cannot reconfigure ZeroClaw through this command — \
+         doing so would run with your privileges, not the agent's. Run the command yourself in \
+         your own terminal.",
+        zeroclaw_api::AGENT_SHELL_ENV_VAR
+    ))
+}
+
 fn print_no_command_help(cmd: clap::Command) -> Result<()> {
     #[cfg(feature = "agent-runtime")]
     {
@@ -3428,6 +3462,13 @@ async fn async_main(command: clap::Command) -> Result<()> {
     }
 
     let cli = Cli::from_arg_matches(&cmd.get_matches()).map_err(|e| e.exit())?;
+
+    // Before anything reads config or touches disk: this process carries the
+    // operator's authority, so it must not run for an agent.
+    if let Some(refusal) = agent_shell_refusal(std::env::var_os(zeroclaw_api::AGENT_SHELL_ENV_VAR))
+    {
+        bail!(refusal);
+    }
 
     if let Some(config_dir) = &cli.config_dir
         && config_dir.trim().is_empty()
