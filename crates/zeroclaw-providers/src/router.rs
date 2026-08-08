@@ -84,6 +84,43 @@ impl RouterModelProvider {
             default_model,
         }
     }
+
+    pub(crate) fn new_with_indexed_routes(
+        alias: &str,
+        model_providers: Vec<(String, Box<dyn ModelProvider>)>,
+        routes: Vec<(String, usize, String)>,
+        default_model: String,
+    ) -> Self {
+        let provider_count = model_providers.len();
+        let routes = routes
+            .into_iter()
+            .filter_map(|(hint, provider_index, model)| {
+                if provider_index < provider_count {
+                    Some((hint, (provider_index, model)))
+                } else {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "hint": hint,
+                                "provider_index": provider_index,
+                            })),
+                        "Route references unknown model_provider index, skipping"
+                    );
+                    None
+                }
+            })
+            .collect();
+
+        Self {
+            alias: alias.to_string(),
+            routes,
+            model_providers,
+            default_index: 0,
+            default_model,
+        }
+    }
     pub fn resolve_cost_optimized(
         &self,
         model: &str,

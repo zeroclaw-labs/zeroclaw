@@ -425,6 +425,7 @@ pub struct StreamedTurnError {
 #[derive(Clone, Debug, Default)]
 pub struct ProviderSwitchConfig {
     pub config: Option<std::sync::Arc<zeroclaw_config::schema::Config>>,
+    pub live_config: Option<std::sync::Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
 }
 
 /// Bundle of late-bound channel-map handles owned by an Agent. Cloning is
@@ -944,17 +945,16 @@ impl Agent {
         AgentBuilder::new()
     }
 
-    /// The full `Config` the agent was constructed from, when available. Sourced
-    /// from `provider_switch_config` - the single canonical config snapshot the
-    /// agent already carries for provider-alias resolution. `None` only on
-    /// configless (test-builder) agents; every production construction path
-    /// (`from_config` / `from_config_with_tui_env`) populates it. Used by the
-    /// vision route to resolve the configured `vision_model_provider`'s
-    /// alias-specific options (the `vision` override, endpoint URI, credentials).
-    fn full_config(&self) -> Option<&zeroclaw_config::schema::Config> {
-        self.provider_switch_config
-            .as_ref()
-            .and_then(|cfg| cfg.config.as_deref())
+    /// Resolve one immutable config snapshot for alias-aware per-turn policy.
+    /// Live agents read the canonical handle at use time; static agents reuse
+    /// their construction snapshot. `None` is reserved for configless test
+    /// builders.
+    fn full_config_snapshot(&self) -> Option<Arc<zeroclaw_config::schema::Config>> {
+        let switch_config = self.provider_switch_config.as_ref()?;
+        match switch_config.live_config.as_ref() {
+            Some(live_config) => Some(Arc::new(live_config.read().clone())),
+            None => switch_config.config.clone(),
+        }
     }
 
     fn tool_loop_cost_tracking_context(&self) -> crate::agent::loop_::ToolLoopCostTrackingContext {
@@ -1632,23 +1632,33 @@ impl Agent {
         };
 
         let provider_ref = format!("{provider_name}.{provider_alias}");
-        let provider_runtime_options = zeroclaw_providers::provider_runtime_options_for_alias(
-            config,
-            provider_name,
-            provider_alias,
-        );
-
-        let model_provider: Box<dyn ModelProvider> =
-            zeroclaw_providers::create_routed_model_provider_with_options(
-                config,
-                &provider_ref,
-                agent_model_provider.and_then(|e| e.api_key.as_deref()),
-                agent_model_provider.and_then(|e| e.uri.as_deref()),
-                &config.reliability,
-                &config.model_routes,
-                &model_name,
-                &provider_runtime_options,
-            )?;
+        let model_provider: Box<dyn ModelProvider> = match live_config.as_ref() {
+            Some(live_config) => {
+                zeroclaw_providers::create_routed_model_provider_with_live_config_options(
+                    Arc::clone(live_config),
+                    &provider_ref,
+                    &model_name,
+                )?
+            }
+            None => {
+                let provider_runtime_options =
+                    zeroclaw_providers::provider_runtime_options_for_alias(
+                        config,
+                        provider_name,
+                        provider_alias,
+                    );
+                zeroclaw_providers::create_routed_model_provider_with_options(
+                    config,
+                    &provider_ref,
+                    agent_model_provider.and_then(|e| e.api_key.as_deref()),
+                    agent_model_provider.and_then(|e| e.uri.as_deref()),
+                    &config.reliability,
+                    &config.model_routes,
+                    &model_name,
+                    &provider_runtime_options,
+                )?
+            }
+        };
 
         let tool_dispatcher = tool_dispatcher_for_provider(agent_cfg, model_provider.as_ref());
 
@@ -1679,7 +1689,8 @@ impl Agent {
         };
 
         let structured_history_cap_resolver: Arc<dyn Fn() -> usize + Send + Sync> =
-            if let Some(cap_config) = live_config {
+            if let Some(cap_config) = live_config.as_ref() {
+                let cap_config = Arc::clone(cap_config);
                 let cap_agent_alias = agent_alias.to_string();
                 Arc::new(move || {
                     cap_config
@@ -1741,7 +1752,10 @@ impl Agent {
             })
             .approval_manager(Some(Arc::new(approval_manager)))
             .provider_switch_config(ProviderSwitchConfig {
-                config: Some(std::sync::Arc::new(config.clone())),
+                config: live_config
+                    .is_none()
+                    .then(|| std::sync::Arc::new(config.clone())),
+                live_config: live_config.clone(),
             })
             .build()?;
 
@@ -2010,58 +2024,34 @@ impl Agent {
             )
         );
 
-        let switch_outcome: anyhow::Result<Box<dyn ModelProvider>> = match self
-            .provider_switch_config
-            .as_ref()
-            .and_then(|cfg| cfg.config.as_ref())
-        {
-            Some(full_config) => {
-                let agent_entry = full_config
-                    .resolved_model_provider_for_agent(&self.agent_alias)
-                    .map(|(_ty, _alias, entry)| entry);
-                let default_api_key = agent_entry.and_then(|e| e.api_key.as_deref());
-                let default_base_url = agent_entry.and_then(|e| e.uri.as_deref());
-
-                // Prefer a route-specific api_key when the switched
-                // provider/model matches a configured model_route entry.
-                let route_api_key = full_config
-                    .model_routes
-                    .iter()
-                    .find(|r| {
-                        r.model_provider.eq_ignore_ascii_case(&new_model_provider)
-                            && (r.model.eq_ignore_ascii_case(&new_model)
-                                || r.hint.eq_ignore_ascii_case(&new_model))
-                    })
-                    .and_then(|r| r.api_key.as_deref());
-                let api_key = route_api_key.or(default_api_key);
-
-                let runtime_options = new_model_provider
-                    .split_once('.')
-                    .map(|(family, alias)| {
-                        zeroclaw_providers::provider_runtime_options_for_alias(
-                            full_config.as_ref(),
-                            family,
-                            alias,
-                        )
-                    })
-                    .unwrap_or_default();
-
-                zeroclaw_providers::create_routed_model_provider_with_options(
-                    full_config.as_ref(),
-                    &new_model_provider,
-                    api_key,
-                    default_base_url,
-                    &full_config.reliability,
-                    &full_config.model_routes,
-                    &new_model,
-                    &runtime_options,
-                )
-            }
-            None => Err(anyhow::Error::msg(
-                "model_switch requested but agent has no provider_switch_config; \
+        let switch_outcome: anyhow::Result<Box<dyn ModelProvider>> =
+            match self.provider_switch_config.as_ref() {
+                Some(switch_config)
+                    if switch_config.live_config.is_some() || switch_config.config.is_some() =>
+                {
+                    match switch_config.live_config.as_ref() {
+                        Some(live_config) => {
+                            zeroclaw_providers::create_model_switch_provider_with_live_config(
+                                Arc::clone(live_config),
+                                &new_model_provider,
+                                &new_model,
+                            )
+                        }
+                        None => zeroclaw_providers::create_model_switch_provider(
+                            switch_config
+                                .config
+                                .as_deref()
+                                .expect("guarded by match condition"),
+                            &new_model_provider,
+                            &new_model,
+                        ),
+                    }
+                }
+                _ => Err(anyhow::Error::msg(
+                    "model_switch requested but agent has no provider_switch_config; \
                  cannot rebuild provider safely",
-            )),
-        };
+                )),
+            };
 
         match switch_outcome {
             Ok(new_prov) => {
@@ -2298,9 +2288,10 @@ impl Agent {
 
         let active_dispatcher = {
             let base_provider_messages = self.tool_dispatcher.to_provider_messages(&self.history);
+            let full_config = self.full_config_snapshot();
             let (vision_provider_box, _degrade_strip_images) =
                 match crate::agent::turn::resolve_vision_provider(
-                    self.full_config(),
+                    full_config.as_deref(),
                     self.model_provider.as_ref(),
                     &base_provider_messages,
                     &self.multimodal_config,
@@ -2378,6 +2369,7 @@ impl Agent {
             &self.config.resolved.tool_receipts,
         );
         let agent_alias_for_loop = self.observer_agent_alias();
+        let full_config = self.full_config_snapshot();
         let loop_result = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT
             .scope(
                 Some(cost_context.clone()),
@@ -2397,12 +2389,7 @@ impl Agent {
                                 silent: false,
                                 approval: self.approval_manager.as_deref(),
                                 multimodal_config: &self.multimodal_config,
-                                // Inlined `full_config()` (per-field borrow) so it coexists with
-                                // the `&mut self.image_cache` in this same ToolLoop expression.
-                                config: self
-                                    .provider_switch_config
-                                    .as_ref()
-                                    .and_then(|c| c.config.as_deref()),
+                                config: full_config.as_deref(),
                                 hooks: self.hook_runner.as_deref(),
                                 activated_tools: self.activated_tools.as_ref(),
                                 model_switch_callback: None,
@@ -2620,9 +2607,10 @@ impl Agent {
 
         let active_dispatcher = {
             let base_provider_messages = self.tool_dispatcher.to_provider_messages(&self.history);
+            let full_config = self.full_config_snapshot();
             let (vision_provider_box, _degrade_strip_images) =
                 match crate::agent::turn::resolve_vision_provider(
-                    self.full_config(),
+                    full_config.as_deref(),
                     self.model_provider.as_ref(),
                     &base_provider_messages,
                     &self.multimodal_config,
@@ -2781,6 +2769,7 @@ impl Agent {
                 let enriched = format!("[{now}] {steering_message}");
                 round_added.push(ChatMessage::user(enriched));
             }
+            let full_config = self.full_config_snapshot();
             let round_loop = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                 Some(cost_context.clone()),
                 crate::agent::tool_receipts::scope_receipts(
@@ -2799,12 +2788,7 @@ impl Agent {
                                 silent: true,
                                 approval: self.approval_manager.as_deref(),
                                 multimodal_config: &self.multimodal_config,
-                                // Inlined `full_config()` (per-field borrow) so it coexists with
-                                // the `&mut self.image_cache` in this same ToolLoop expression.
-                                config: self
-                                    .provider_switch_config
-                                    .as_ref()
-                                    .and_then(|c| c.config.as_deref()),
+                                config: full_config.as_deref(),
                                 hooks: self.hook_runner.as_deref(),
                                 activated_tools: self.activated_tools.as_ref(),
                                 // `None` here (rather than a shared global) is
@@ -4812,6 +4796,131 @@ mod tests {
                 !system.content.contains(XML_TOOLS_MARKER),
                 "provider-visible transcript must advertise native tools for vision provider"
             );
+        }
+
+        #[tokio::test]
+        async fn live_agent_direct_and_streamed_turns_resolve_vision_alias() {
+            use axum::{
+                Json, Router,
+                extract::State,
+                http::{HeaderMap, StatusCode},
+                response::{IntoResponse, Response},
+                routing::post,
+            };
+            use serde_json::{Value, json};
+
+            type Capture = Arc<Mutex<Vec<(String, String)>>>;
+
+            async fn capture_vision_request(
+                State(capture): State<Capture>,
+                headers: HeaderMap,
+                Json(body): Json<Value>,
+            ) -> Response {
+                let auth = headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string();
+                let model = body
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                capture.lock().push((auth, model));
+
+                if body.get("stream").and_then(Value::as_bool) == Some(true) {
+                    return (
+                        StatusCode::OK,
+                        [("content-type", "text/event-stream")],
+                        concat!(
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+                            "data: [DONE]\n\n"
+                        ),
+                    )
+                        .into_response();
+                }
+
+                Json(json!({
+                    "choices": [{"message": {"content": "ok"}}]
+                }))
+                .into_response()
+            }
+
+            fn live_vision_agent(
+                live_config: Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>,
+            ) -> Agent {
+                let (base_provider, _) = capturing_provider(true);
+                let multimodal = zeroclaw_config::schema::MultimodalConfig {
+                    vision_model_provider: Some("custom.myvision".to_string()),
+                    ..Default::default()
+                };
+                let mut agent = test_agent_with_provider_and_multimodal(
+                    base_provider,
+                    vec![Box::new(MockTool)],
+                    Some(Box::new(NativeToolDispatcher)),
+                    Some(multimodal),
+                );
+                agent.provider_switch_config = Some(ProviderSwitchConfig {
+                    config: None,
+                    live_config: Some(live_config),
+                });
+                agent
+            }
+
+            let capture: Capture = Arc::new(Mutex::new(Vec::new()));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind vision test server");
+            let addr = listener.local_addr().expect("vision test server addr");
+            let app = Router::new()
+                .route("/v1/chat/completions", post(capture_vision_request))
+                .with_state(Arc::clone(&capture));
+            let server = zeroclaw_spawn::spawn!(async move {
+                axum::serve(listener, app)
+                    .await
+                    .expect("serve vision test endpoint");
+            });
+
+            let config: zeroclaw_config::schema::Config = toml::from_str(&format!(
+                r#"
+schema_version = 3
+[providers.models.custom.myvision]
+kind = "openai-compatible"
+uri = "http://{addr}/v1"
+api_key = "sk-live-vision"
+model = "vision-model"
+vision = true
+"#
+            ))
+            .expect("live vision config parses");
+            let live_config = Arc::new(parking_lot::RwLock::new(config));
+            let message = "describe [IMAGE:data:image/png;base64,iVBORw0KGgo=]";
+
+            let mut direct_agent = live_vision_agent(Arc::clone(&live_config));
+            assert_eq!(direct_agent.turn(message).await.unwrap(), "ok");
+
+            let mut streamed_agent = live_vision_agent(Arc::clone(&live_config));
+            let (event_tx, _event_rx) = tokio::sync::mpsc::channel(16);
+            streamed_agent
+                .turn_streamed(message, event_tx, None)
+                .await
+                .expect("streamed live-agent vision turn succeeds");
+
+            assert_eq!(
+                &*capture.lock(),
+                &[
+                    (
+                        "Bearer sk-live-vision".to_string(),
+                        "vision-model".to_string()
+                    ),
+                    (
+                        "Bearer sk-live-vision".to_string(),
+                        "vision-model".to_string()
+                    ),
+                ],
+                "both live-agent entry points must use the alias endpoint, credential, and model"
+            );
+            server.abort();
         }
     }
 
@@ -9260,6 +9369,7 @@ mod tests {
             config: Some(std::sync::Arc::new(
                 zeroclaw_config::schema::Config::default(),
             )),
+            live_config: None,
         };
 
         let mut agent = build_test_agent("openai", "gpt-4o-mini", Some(switch_cfg));
@@ -9282,11 +9392,44 @@ mod tests {
     }
 
     #[test]
+    fn try_apply_model_switch_reads_the_live_config_handle() {
+        use zeroclaw_config::schema::{ModelProviderConfig, OpenAIModelProviderConfig};
+
+        let startup = zeroclaw_config::schema::Config::default();
+        let live_config = Arc::new(parking_lot::RwLock::new(startup.clone()));
+        let switch_cfg = ProviderSwitchConfig {
+            config: Some(Arc::new(startup)),
+            live_config: Some(Arc::clone(&live_config)),
+        };
+        live_config.write().providers.models.openai.insert(
+            "live".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    api_key: Some("sk-live-config".to_string()),
+                    uri: Some("http://127.0.0.1:1/v1".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let mut agent = build_test_agent("openai", "gpt-4o-mini", Some(switch_cfg));
+        let result = agent.try_apply_model_switch(
+            "gpt-4o-mini",
+            "openai.live".to_string(),
+            "gpt-live".to_string(),
+        );
+
+        assert_eq!(result.as_deref(), Some("gpt-live"));
+        assert_eq!(agent.model_provider_name, "openai.live");
+    }
+
+    #[test]
     fn try_apply_model_switch_succeeds_on_provider_only_change() {
         let switch_cfg = ProviderSwitchConfig {
             config: Some(std::sync::Arc::new(
                 zeroclaw_config::schema::Config::default(),
             )),
+            live_config: None,
         };
 
         let mut agent = build_test_agent("openai", "shared-name", Some(switch_cfg));
@@ -9323,6 +9466,7 @@ mod tests {
         };
         let switch_cfg = ProviderSwitchConfig {
             config: Some(std::sync::Arc::new(route_config)),
+            live_config: None,
         };
 
         let mut agent = build_test_agent("openai", "gpt-4o-mini", Some(switch_cfg));
@@ -9338,6 +9482,258 @@ mod tests {
             "switch must succeed when a model_routes entry matches the target"
         );
         assert_eq!(agent.model_provider_name, "ollama");
+    }
+
+    #[tokio::test]
+    async fn try_apply_model_switch_preserves_exact_route_credential_identity() {
+        use axum::{
+            Json, Router,
+            extract::State,
+            http::{HeaderMap, StatusCode},
+            routing::post,
+        };
+        use serde_json::{Value, json};
+        use zeroclaw_config::schema::{
+            ModelProviderConfig, ModelRouteConfig, OpenAIModelProviderConfig,
+        };
+
+        type Capture = Arc<Mutex<Vec<(String, String)>>>;
+
+        async fn capture_chat_request(
+            State(capture): State<Capture>,
+            headers: HeaderMap,
+            Json(body): Json<Value>,
+        ) -> (StatusCode, Json<Value>) {
+            let auth = headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            let model = body
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            capture.lock().push((auth, model));
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "choices": [{"message": {"content": "ok"}}]
+                })),
+            )
+        }
+
+        let capture: Capture = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("test server addr");
+        let app = Router::new()
+            .route("/v1/chat/completions", post(capture_chat_request))
+            .with_state(Arc::clone(&capture));
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.expect("serve test server");
+        });
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.providers.models.openai.insert(
+            "route".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    kind: Some("openai-compatible".to_string()),
+                    uri: Some(format!("http://{addr}/v1")),
+                    ..Default::default()
+                },
+            },
+        );
+        config.model_routes = vec![
+            ModelRouteConfig {
+                hint: "fast".to_string(),
+                model_provider: "openai.route".to_string(),
+                model: "fast-model".to_string(),
+                api_key: Some("sk-fast".to_string()),
+            },
+            ModelRouteConfig {
+                hint: "deep".to_string(),
+                model_provider: "openai.route".to_string(),
+                model: "deep-model".to_string(),
+                api_key: Some("sk-deep".to_string()),
+            },
+        ];
+        let live_config = Arc::new(parking_lot::RwLock::new(config));
+        let switch_cfg = ProviderSwitchConfig {
+            config: None,
+            live_config: Some(Arc::clone(&live_config)),
+        };
+        let mut agent = build_test_agent("openai", "gpt-4o-mini", Some(switch_cfg));
+
+        let result = agent.try_apply_model_switch(
+            "gpt-4o-mini",
+            "openai.route".to_string(),
+            "deep-model".to_string(),
+        );
+        assert_eq!(result.as_deref(), Some("deep-model"));
+        assert_eq!(
+            agent
+                .model_provider
+                .simple_chat("hello", "deep-model", None)
+                .await
+                .unwrap(),
+            "ok"
+        );
+        assert_eq!(
+            &*capture.lock(),
+            &[("Bearer sk-deep".to_string(), "deep-model".to_string())]
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn try_apply_model_switch_uses_only_the_live_target_profile_snapshot() {
+        use axum::{
+            Json, Router,
+            extract::State,
+            http::{HeaderMap, StatusCode},
+            routing::post,
+        };
+        use serde_json::{Value, json};
+        use zeroclaw_config::{
+            providers::ModelProviderRef,
+            schema::{AliasedAgentConfig, ModelProviderConfig, OpenAIModelProviderConfig},
+        };
+
+        type Capture = Arc<Mutex<Vec<String>>>;
+
+        async fn capture_chat_request(
+            State(capture): State<Capture>,
+            headers: HeaderMap,
+        ) -> (StatusCode, Json<Value>) {
+            let auth = headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            capture.lock().push(auth);
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "choices": [{"message": {"content": "ok"}}]
+                })),
+            )
+        }
+
+        async fn start_server(capture: Capture) -> (String, tokio::task::JoinHandle<()>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind test server");
+            let addr = listener.local_addr().expect("test server addr");
+            let app = Router::new()
+                .route("/v1/chat/completions", post(capture_chat_request))
+                .with_state(capture);
+            let server = ::zeroclaw_spawn::spawn!(async move {
+                axum::serve(listener, app).await.expect("serve test server");
+            });
+            (format!("http://{addr}/v1"), server)
+        }
+
+        let source_capture: Capture = Arc::new(Mutex::new(Vec::new()));
+        let target_capture: Capture = Arc::new(Mutex::new(Vec::new()));
+        let (source_uri, source_server) = start_server(Arc::clone(&source_capture)).await;
+        let (target_uri, target_server) = start_server(Arc::clone(&target_capture)).await;
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        for (alias, key, uri) in [
+            ("source", "sk-source", source_uri),
+            ("target", "sk-target", target_uri),
+        ] {
+            config.providers.models.openai.insert(
+                alias.to_string(),
+                OpenAIModelProviderConfig {
+                    base: ModelProviderConfig {
+                        kind: Some("openai-compatible".to_string()),
+                        api_key: Some(key.to_string()),
+                        uri: Some(uri),
+                        ..Default::default()
+                    },
+                },
+            );
+        }
+        config.agents.insert(
+            "current".to_string(),
+            AliasedAgentConfig {
+                model_provider: ModelProviderRef::new("openai.source"),
+                ..Default::default()
+            },
+        );
+        let live_config = Arc::new(parking_lot::RwLock::new(config));
+        let switch_cfg = ProviderSwitchConfig {
+            config: None,
+            live_config: Some(Arc::clone(&live_config)),
+        };
+        let mut agent = build_test_agent("openai.source", "source-model", Some(switch_cfg));
+        agent.agent_alias = "current".to_string();
+
+        let result = agent.try_apply_model_switch(
+            "source-model",
+            "openai.target".to_string(),
+            "target-model".to_string(),
+        );
+        assert_eq!(result.as_deref(), Some("target-model"));
+        assert_eq!(
+            agent
+                .model_provider
+                .simple_chat("hello", "target-model", None)
+                .await
+                .unwrap(),
+            "ok"
+        );
+
+        live_config
+            .write()
+            .providers
+            .models
+            .openai
+            .get_mut("target")
+            .expect("target profile")
+            .base
+            .api_key = Some("sk-target-replaced".to_string());
+        assert_eq!(
+            agent
+                .model_provider
+                .simple_chat("hello again", "target-model", None)
+                .await
+                .unwrap(),
+            "ok"
+        );
+
+        live_config
+            .write()
+            .providers
+            .models
+            .openai
+            .get_mut("target")
+            .expect("target profile")
+            .base
+            .api_key = None;
+        agent
+            .model_provider
+            .simple_chat("must not send", "target-model", None)
+            .await
+            .expect_err("removing the target credential must revoke it");
+
+        assert!(
+            source_capture.lock().is_empty(),
+            "the source credential and endpoint must not be reused for the target"
+        );
+        assert_eq!(
+            &*target_capture.lock(),
+            &[
+                "Bearer sk-target".to_string(),
+                "Bearer sk-target-replaced".to_string(),
+            ]
+        );
+        source_server.abort();
+        target_server.abort();
     }
 
     /// Streamed mock whose first call emits a tool call (queuing a model
@@ -9517,6 +9913,7 @@ mod tests {
                 },
                 ..zeroclaw_config::schema::Config::default()
             })),
+            live_config: None,
         };
         let agent_config = zeroclaw_config::schema::AliasedAgentConfig {
             resolved: zeroclaw_config::schema::ResolvedRuntime {

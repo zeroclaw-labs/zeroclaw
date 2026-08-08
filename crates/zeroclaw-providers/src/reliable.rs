@@ -6,11 +6,168 @@ use super::traits::{
 };
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
+use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::Mutex;
+#[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+pub(crate) type CredentialProviderFactory =
+    Arc<dyn Fn(&str) -> anyhow::Result<Box<dyn ModelProvider>> + Send + Sync>;
+pub(crate) type CredentialResolver = Arc<dyn Fn() -> Vec<CredentialAttempt> + Send + Sync>;
+
+pub(crate) struct CredentialAttempt {
+    key: String,
+    build: CredentialProviderFactory,
+}
+
+impl CredentialAttempt {
+    pub(crate) fn new(key: String, build: CredentialProviderFactory) -> Self {
+        Self {
+            key: key.trim().to_string(),
+            build,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn build_for_test(&self) -> anyhow::Result<Box<dyn ModelProvider>> {
+        (self.build)(&self.key)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct CredentialId([u8; 32]);
+
+impl CredentialId {
+    fn of(key: &str) -> Self {
+        Self(Sha256::digest(key.as_bytes()).into())
+    }
+}
+
+struct SelectedCredential {
+    key: String,
+    build: CredentialProviderFactory,
+}
+
+struct BoundProvider {
+    credential: SelectedCredential,
+    provider: Box<dyn ModelProvider>,
+}
+
+#[derive(Clone)]
+struct ProviderPin {
+    alias: String,
+    model: String,
+}
+
+#[derive(Default)]
+pub(crate) struct CredentialCooldowns {
+    cooldowns: Mutex<HashMap<CredentialId, Instant>>,
+}
+
+pub(crate) struct CredentialRotation {
+    resolve: CredentialResolver,
+    cooldowns: Arc<CredentialCooldowns>,
+}
+
+impl CredentialRotation {
+    pub(crate) fn new(resolve: CredentialResolver) -> Arc<Self> {
+        Self::with_cooldowns(resolve, Arc::new(CredentialCooldowns::default()))
+    }
+
+    pub(crate) fn with_cooldowns(
+        resolve: CredentialResolver,
+        cooldowns: Arc<CredentialCooldowns>,
+    ) -> Arc<Self> {
+        Arc::new(Self { resolve, cooldowns })
+    }
+
+    fn pool(&self) -> Vec<CredentialAttempt> {
+        let mut pool = Vec::new();
+        for attempt in (self.resolve)() {
+            if !attempt.key.is_empty()
+                && !pool
+                    .iter()
+                    .any(|existing: &CredentialAttempt| existing.key == attempt.key)
+            {
+                pool.push(attempt);
+            }
+        }
+        pool
+    }
+
+    fn select(&self, start_after: Option<usize>) -> Option<SelectedCredential> {
+        let pool = self.pool();
+        if pool.is_empty() {
+            return None;
+        }
+
+        let now = Instant::now();
+        let mut cooldowns = self
+            .cooldowns
+            .cooldowns
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cooldowns.retain(|_, deadline| now < *deadline);
+
+        let first = start_after.map_or(0, |slot| (slot + 1) % pool.len());
+        (0..pool.len()).find_map(|offset| {
+            let slot_index = (first + offset) % pool.len();
+            let attempt = &pool[slot_index];
+            (!cooldowns.contains_key(&CredentialId::of(&attempt.key))).then(|| SelectedCredential {
+                key: attempt.key.clone(),
+                build: Arc::clone(&attempt.build),
+            })
+        })
+    }
+
+    fn cool_down(
+        &self,
+        credential: &SelectedCredential,
+        err: &anyhow::Error,
+    ) -> (Duration, Option<usize>) {
+        let cooldown = parse_retry_after_ms(err)
+            .map(|ms| Duration::from_millis(ms.min(60_000)))
+            .unwrap_or(ReliableModelProvider::RATE_LIMIT_COOLDOWN);
+        let pool = self.pool();
+        let mut cooldowns = self
+            .cooldowns
+            .cooldowns
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cooldowns.retain(|_, deadline| Instant::now() < *deadline);
+        let current_slot = pool
+            .iter()
+            .position(|attempt| attempt.key == credential.key);
+        if current_slot.is_some() {
+            cooldowns.insert(CredentialId::of(&credential.key), Instant::now() + cooldown);
+        }
+        (cooldown, current_slot)
+    }
+
+    fn bind(
+        &self,
+        selected: SelectedCredential,
+        pin: Option<&ProviderPin>,
+    ) -> anyhow::Result<BoundProvider> {
+        let provider = (selected.build)(&selected.key)?;
+        let provider: Box<dyn ModelProvider> = match pin {
+            Some(pin) => Box::new(
+                crate::model_pin::ModelPinnedProvider::builder(&pin.alias)
+                    .pinned_model(&pin.model)
+                    .inner(provider)
+                    .build(),
+            ),
+            None => provider,
+        };
+        Ok(BoundProvider {
+            credential: selected,
+            provider,
+        })
+    }
+}
 
 /// Info about a model_provider fallback that occurred during a request.
 #[derive(Debug, Clone)]
@@ -146,6 +303,126 @@ where
         },
     )
     .boxed()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stream_with_credential_rotation<T, MakeStream, IsFinal>(
+    mut bound: BoundProvider,
+    rotation: Arc<CredentialRotation>,
+    pin: Option<ProviderPin>,
+    make_stream: MakeStream,
+    max_retries: u32,
+    _base_backoff_ms: u64,
+    provider_name: String,
+    model: String,
+    fallback_record: Option<ProviderFallbackRecord>,
+    is_final: IsFinal,
+) -> stream::BoxStream<'static, StreamResult<T>>
+where
+    T: Send + 'static,
+    MakeStream:
+        Fn(&dyn ModelProvider) -> stream::BoxStream<'static, StreamResult<T>> + Send + 'static,
+    IsFinal: Fn(&T) -> bool + Send + 'static,
+{
+    let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<T>>(100);
+    let handle = ::zeroclaw_spawn::spawn!(async move {
+        let mut attempt = 0;
+        let mut emitted = false;
+
+        'attempts: loop {
+            let mut provider_stream = make_stream(bound.provider.as_ref());
+            while let Some(event) = provider_stream.next().await {
+                match event {
+                    Ok(value) => {
+                        emitted = true;
+                        if tx.send(Ok(value)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        let error_text = error.to_string();
+                        let error_for_classification = anyhow::Error::msg(error_text.clone());
+                        let retryable_rate_limit = is_rate_limited(&error_for_classification)
+                            && !is_non_retryable_rate_limit(&error_for_classification);
+                        let cooled_slot = retryable_rate_limit.then(|| {
+                            rotation
+                                .cool_down(&bound.credential, &error_for_classification)
+                                .1
+                        });
+                        if retryable_rate_limit
+                            && !emitted
+                            && attempt < max_retries
+                            && let Some(selected) = rotation.select(cooled_slot.flatten())
+                        {
+                            match rotation.bind(selected, pin.as_ref()) {
+                                Ok(next) => {
+                                    let wait = 0;
+                                    ::zeroclaw_log::record!(
+                                        WARN,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Note
+                                        )
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                        .with_attrs(
+                                            ::serde_json::json!({
+                                                "model_provider": provider_name,
+                                                "model": model,
+                                                "attempt": attempt + 1,
+                                                "backoff_ms": wait,
+                                            })
+                                        ),
+                                        "Streaming request rate-limited before output; retrying with another API credential"
+                                    );
+                                    tokio::task::yield_now().await;
+                                    attempt += 1;
+                                    bound = next;
+                                    continue 'attempts;
+                                }
+                                Err(_binding_error) => {
+                                    ::zeroclaw_log::record!(
+                                        WARN,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Note
+                                        )
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                        .with_attrs(
+                                            ::serde_json::json!({
+                                                "model_provider": provider_name,
+                                                "model": model,
+                                            })
+                                        ),
+                                        "Failed to bind another API credential for streaming retry"
+                                    );
+                                }
+                            }
+                        }
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "model_provider": provider_name,
+                                "model": model,
+                                "error": compact_error_detail(&error_for_classification),
+                            })),
+                            "Streaming error"
+                        );
+                        let _ = tx.send(Err(error)).await;
+                        return;
+                    }
+                }
+            }
+            return;
+        }
+    });
+
+    let guard = AbortOnDrop::new(handle.abort_handle());
+    stream_with_success_recording(rx, guard, fallback_record, is_final)
 }
 
 pub fn transient_error_hint(err: &anyhow::Error) -> Option<&'static str> {
@@ -745,6 +1022,7 @@ pub(crate) struct ReliableModelProviderEntry {
     display_name: String,
     cooldown_key: String,
     provider: ReliableModelProviderEntryProvider,
+    credential_rotation: Option<Arc<CredentialRotation>>,
 }
 
 impl ReliableModelProviderEntry {
@@ -757,6 +1035,7 @@ impl ReliableModelProviderEntry {
             display_name: display_name.into(),
             cooldown_key: cooldown_key.into(),
             provider: ReliableModelProviderEntryProvider::Direct(provider),
+            credential_rotation: None,
         }
     }
 
@@ -780,7 +1059,16 @@ impl ReliableModelProviderEntry {
                     .inner(inner)
                     .build(),
             ),
+            credential_rotation: None,
         }
+    }
+
+    pub(crate) fn with_credential_rotation(
+        mut self,
+        rotation: Option<Arc<CredentialRotation>>,
+    ) -> Self {
+        self.credential_rotation = rotation;
+        self
     }
 
     /// Model this entry serves for `requested_model`: the pinned model when
@@ -791,6 +1079,59 @@ impl ReliableModelProviderEntry {
 
     fn provider(&self) -> &dyn ModelProvider {
         self.provider.as_model_provider()
+    }
+
+    fn bind_credential(&self, selected: SelectedCredential) -> anyhow::Result<BoundProvider> {
+        let rotation = self
+            .credential_rotation
+            .as_ref()
+            .ok_or_else(|| anyhow::Error::msg("credential rotation is not configured"))?;
+        let pin = self.owned_pin();
+        rotation.bind(selected, pin.as_ref())
+    }
+
+    fn initial_bound_provider(&self) -> anyhow::Result<Option<BoundProvider>> {
+        let Some(rotation) = &self.credential_rotation else {
+            return Ok(None);
+        };
+        rotation
+            .select(None)
+            .map(|selected| self.bind_credential(selected))
+            .transpose()
+    }
+
+    fn rotate_after_rate_limit(
+        &self,
+        current: &BoundProvider,
+        err: &anyhow::Error,
+    ) -> anyhow::Result<Option<BoundProvider>> {
+        let Some(rotation) = &self.credential_rotation else {
+            return Ok(None);
+        };
+        let (_, current_slot) = rotation.cool_down(&current.credential, err);
+        rotation
+            .select(current_slot)
+            .map(|selected| self.bind_credential(selected))
+            .transpose()
+    }
+
+    fn provider_for_attempt<'a>(
+        &'a self,
+        bound: &'a Option<BoundProvider>,
+    ) -> &'a dyn ModelProvider {
+        bound
+            .as_ref()
+            .map_or_else(|| self.provider(), |binding| binding.provider.as_ref())
+    }
+
+    fn owned_pin(&self) -> Option<ProviderPin> {
+        match &self.provider {
+            ReliableModelProviderEntryProvider::Direct(_) => None,
+            ReliableModelProviderEntryProvider::Pinned(pinned) => Some(ProviderPin {
+                alias: pinned.alias().to_string(),
+                model: pinned.pinned_model().to_string(),
+            }),
+        }
     }
 }
 
@@ -804,9 +1145,6 @@ pub struct ReliableModelProvider {
     model_providers: Vec<ReliableModelProviderEntry>,
     max_retries: u32,
     base_backoff_ms: u64,
-    /// Extra API keys for rotation (index tracks round-robin position).
-    api_keys: Vec<String>,
-    key_index: AtomicUsize,
     /// Per-model failover chains. Test-only: model_name → [alt1, alt2, ...].
     model_fallbacks: HashMap<String, Vec<String>>,
     /// Transient provider cooldowns after retryable rate limits.
@@ -843,15 +1181,23 @@ impl ReliableModelProvider {
             model_providers,
             max_retries,
             base_backoff_ms: base_backoff_ms.max(50),
-            api_keys: Vec::new(),
-            key_index: AtomicUsize::new(0),
             model_fallbacks: HashMap::new(),
             rate_limit_cooldowns: Mutex::new(HashMap::new()),
         }
     }
-    /// Set additional API keys for round-robin rotation on rate-limit errors.
-    pub fn with_api_keys(mut self, keys: Vec<String>) -> Self {
-        self.api_keys = keys;
+    pub(crate) fn with_credential_rotation(mut self, rotation: Arc<CredentialRotation>) -> Self {
+        let Some(primary_cooldown_key) = self
+            .model_providers
+            .first()
+            .map(|entry| entry.cooldown_key.clone())
+        else {
+            return self;
+        };
+        for entry in &mut self.model_providers {
+            if entry.cooldown_key == primary_cooldown_key {
+                entry.credential_rotation = Some(Arc::clone(&rotation));
+            }
+        }
         self
     }
 
@@ -868,15 +1214,6 @@ impl ReliableModelProvider {
             chain.extend(fallbacks.iter().map(|s| s.as_str()));
         }
         chain
-    }
-
-    /// Advance to the next API key and return it, or None if no extra keys configured.
-    fn rotate_key(&self) -> Option<&str> {
-        if self.api_keys.is_empty() {
-            return None;
-        }
-        let idx = self.key_index.fetch_add(1, Ordering::Relaxed) % self.api_keys.len();
-        Some(&self.api_keys[idx])
     }
 
     /// Compute backoff duration, respecting Retry-After if present.
@@ -1000,6 +1337,40 @@ impl ReliableModelProvider {
         tokio::time::sleep(Duration::from_millis(*backoff_ms)).await;
         *backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
     }
+
+    fn rotate_credential_after_rate_limit(
+        entry: &ReliableModelProviderEntry,
+        bound: &mut Option<BoundProvider>,
+        err: &anyhow::Error,
+        provider_name: &str,
+    ) -> bool {
+        let Some(current) = bound.as_ref() else {
+            return false;
+        };
+        match entry.rotate_after_rate_limit(current, err) {
+            Ok(Some(next)) => {
+                *bound = Some(next);
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"model_provider": provider_name})),
+                    "Rate limited; selected another API credential for retry"
+                );
+                true
+            }
+            Ok(None) => false,
+            Err(_error) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"model_provider": provider_name})),
+                    "Failed to bind the next API credential"
+                );
+                false
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -1056,9 +1427,29 @@ impl ModelProvider for ReliableModelProvider {
                 let mut backoff_ms = self.base_backoff_ms;
                 let mut last_error_detail: Option<String> = None;
                 let mut last_diagnostic: Option<ProviderErrorDiagnostic> = None;
+                let mut bound = match entry.initial_bound_provider() {
+                    Ok(binding) => binding,
+                    Err(_error) => {
+                        push_failure(
+                            &mut failures,
+                            provider_name,
+                            current_model,
+                            0,
+                            self.max_retries + 1,
+                            "credential_binding_failed",
+                            "provider could not bind selected credential",
+                            None,
+                        );
+                        continue;
+                    }
+                };
+                if entry.credential_rotation.is_some() && bound.is_none() {
+                    Self::record_cooldown_skip_failure(&mut failures, provider_name, current_model);
+                    continue;
+                }
 
                 for attempt in 0..=self.max_retries {
-                    match ProviderDispatch::from_ref(entry.provider())
+                    match ProviderDispatch::from_ref(entry.provider_for_attempt(&bound))
                         .chat_with_system(system_prompt, message, current_model, temperature)
                         .await
                     {
@@ -1141,16 +1532,14 @@ impl ModelProvider for ReliableModelProvider {
                                 Some(&diagnostic),
                             );
 
-                            // Rate-limit with rotatable keys: cycle to the next API key
-                            // so the retry hits a different quota bucket.
-                            if rate_limited
+                            let rotated = rate_limited
                                 && !non_retryable_rate_limit
-                                && let Some(new_key) = self.rotate_key()
-                            {
-                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "error": error_detail})), &format!("Rate limited; key rotation selected key ending ...{} \
-                                     but cannot apply (ModelProvider trait has no set_api_key). \
-                                     Retrying with original key.", &new_key[new_key.len().saturating_sub(4)..]));
-                            }
+                                && Self::rotate_credential_after_rate_limit(
+                                    entry,
+                                    &mut bound,
+                                    &e,
+                                    provider_name,
+                                );
 
                             if non_retryable {
                                 ::zeroclaw_log::record!(
@@ -1173,13 +1562,22 @@ impl ModelProvider for ReliableModelProvider {
                                 break;
                             }
 
-                            if rate_limited && self.model_providers.len() > 1 {
-                                self.cool_down_rate_limited_provider(entry, current_model, &e);
-                                break;
+                            if rate_limited && !rotated {
+                                if entry.credential_rotation.is_some() {
+                                    break;
+                                }
+                                if self.model_providers.len() > 1 {
+                                    self.cool_down_rate_limited_provider(entry, current_model, &e);
+                                    break;
+                                }
                             }
 
                             if attempt < self.max_retries {
-                                let wait = self.compute_backoff(backoff_ms, &e);
+                                let wait = if rotated {
+                                    0
+                                } else {
+                                    self.compute_backoff(backoff_ms, &e)
+                                };
                                 ::zeroclaw_log::record!(
                                     WARN,
                                     ::zeroclaw_log::Event::new(
@@ -1200,7 +1598,11 @@ impl ModelProvider for ReliableModelProvider {
                                     ),
                                     "ModelProvider call failed, retrying"
                                 );
-                                tokio::time::sleep(Duration::from_millis(wait)).await;
+                                if wait == 0 {
+                                    tokio::task::yield_now().await;
+                                } else {
+                                    tokio::time::sleep(Duration::from_millis(wait)).await;
+                                }
                                 backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
                             }
                         }
@@ -1255,9 +1657,29 @@ impl ModelProvider for ReliableModelProvider {
                 let mut backoff_ms = self.base_backoff_ms;
                 let mut last_error_detail: Option<String> = None;
                 let mut last_diagnostic: Option<ProviderErrorDiagnostic> = None;
+                let mut bound = match entry.initial_bound_provider() {
+                    Ok(binding) => binding,
+                    Err(_error) => {
+                        push_failure(
+                            &mut failures,
+                            provider_name,
+                            current_model,
+                            0,
+                            self.max_retries + 1,
+                            "credential_binding_failed",
+                            "provider could not bind selected credential",
+                            None,
+                        );
+                        continue;
+                    }
+                };
+                if entry.credential_rotation.is_some() && bound.is_none() {
+                    Self::record_cooldown_skip_failure(&mut failures, provider_name, current_model);
+                    continue;
+                }
 
                 for attempt in 0..=self.max_retries {
-                    match ProviderDispatch::from_ref(entry.provider())
+                    match ProviderDispatch::from_ref(entry.provider_for_attempt(&bound))
                         .chat_with_history(&effective_messages, current_model, temperature)
                         .await
                     {
@@ -1352,14 +1774,14 @@ impl ModelProvider for ReliableModelProvider {
                                 Some(&diagnostic),
                             );
 
-                            if rate_limited
+                            let rotated = rate_limited
                                 && !non_retryable_rate_limit
-                                && let Some(new_key) = self.rotate_key()
-                            {
-                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "error": error_detail})), &format!("Rate limited; key rotation selected key ending ...{} \
-                                     but cannot apply (ModelProvider trait has no set_api_key). \
-                                     Retrying with original key.", &new_key[new_key.len().saturating_sub(4)..]));
-                            }
+                                && Self::rotate_credential_after_rate_limit(
+                                    entry,
+                                    &mut bound,
+                                    &e,
+                                    provider_name,
+                                );
 
                             if non_retryable {
                                 ::zeroclaw_log::record!(
@@ -1382,13 +1804,22 @@ impl ModelProvider for ReliableModelProvider {
                                 break;
                             }
 
-                            if rate_limited && self.model_providers.len() > 1 {
-                                self.cool_down_rate_limited_provider(entry, current_model, &e);
-                                break;
+                            if rate_limited && !rotated {
+                                if entry.credential_rotation.is_some() {
+                                    break;
+                                }
+                                if self.model_providers.len() > 1 {
+                                    self.cool_down_rate_limited_provider(entry, current_model, &e);
+                                    break;
+                                }
                             }
 
                             if attempt < self.max_retries {
-                                let wait = self.compute_backoff(backoff_ms, &e);
+                                let wait = if rotated {
+                                    0
+                                } else {
+                                    self.compute_backoff(backoff_ms, &e)
+                                };
                                 ::zeroclaw_log::record!(
                                     WARN,
                                     ::zeroclaw_log::Event::new(
@@ -1409,7 +1840,11 @@ impl ModelProvider for ReliableModelProvider {
                                     ),
                                     "ModelProvider call failed, retrying"
                                 );
-                                tokio::time::sleep(Duration::from_millis(wait)).await;
+                                if wait == 0 {
+                                    tokio::task::yield_now().await;
+                                } else {
+                                    tokio::time::sleep(Duration::from_millis(wait)).await;
+                                }
                                 backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
                             }
                         }
@@ -1504,9 +1939,29 @@ impl ModelProvider for ReliableModelProvider {
                 let mut backoff_ms = self.base_backoff_ms;
                 let mut last_error_detail: Option<String> = None;
                 let mut last_diagnostic: Option<ProviderErrorDiagnostic> = None;
+                let mut bound = match entry.initial_bound_provider() {
+                    Ok(binding) => binding,
+                    Err(_error) => {
+                        push_failure(
+                            &mut failures,
+                            provider_name,
+                            current_model,
+                            0,
+                            self.max_retries + 1,
+                            "credential_binding_failed",
+                            "provider could not bind selected credential",
+                            None,
+                        );
+                        continue;
+                    }
+                };
+                if entry.credential_rotation.is_some() && bound.is_none() {
+                    Self::record_cooldown_skip_failure(&mut failures, provider_name, current_model);
+                    continue;
+                }
 
                 for attempt in 0..=self.max_retries {
-                    match ProviderDispatch::from_ref(entry.provider())
+                    match ProviderDispatch::from_ref(entry.provider_for_attempt(&bound))
                         .chat_with_tools(&effective_messages, tools, current_model, temperature)
                         .await
                     {
@@ -1602,14 +2057,14 @@ impl ModelProvider for ReliableModelProvider {
                                 Some(&diagnostic),
                             );
 
-                            if rate_limited
+                            let rotated = rate_limited
                                 && !non_retryable_rate_limit
-                                && let Some(new_key) = self.rotate_key()
-                            {
-                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "error": error_detail})), &format!("Rate limited; key rotation selected key ending ...{} \
-                                     but cannot apply (ModelProvider trait has no set_api_key). \
-                                     Retrying with original key.", &new_key[new_key.len().saturating_sub(4)..]));
-                            }
+                                && Self::rotate_credential_after_rate_limit(
+                                    entry,
+                                    &mut bound,
+                                    &e,
+                                    provider_name,
+                                );
 
                             if non_retryable {
                                 ::zeroclaw_log::record!(
@@ -1632,13 +2087,22 @@ impl ModelProvider for ReliableModelProvider {
                                 break;
                             }
 
-                            if rate_limited && self.model_providers.len() > 1 {
-                                self.cool_down_rate_limited_provider(entry, current_model, &e);
-                                break;
+                            if rate_limited && !rotated {
+                                if entry.credential_rotation.is_some() {
+                                    break;
+                                }
+                                if self.model_providers.len() > 1 {
+                                    self.cool_down_rate_limited_provider(entry, current_model, &e);
+                                    break;
+                                }
                             }
 
                             if attempt < self.max_retries {
-                                let wait = self.compute_backoff(backoff_ms, &e);
+                                let wait = if rotated {
+                                    0
+                                } else {
+                                    self.compute_backoff(backoff_ms, &e)
+                                };
                                 ::zeroclaw_log::record!(
                                     WARN,
                                     ::zeroclaw_log::Event::new(
@@ -1659,7 +2123,11 @@ impl ModelProvider for ReliableModelProvider {
                                     ),
                                     "ModelProvider call failed, retrying"
                                 );
-                                tokio::time::sleep(Duration::from_millis(wait)).await;
+                                if wait == 0 {
+                                    tokio::task::yield_now().await;
+                                } else {
+                                    tokio::time::sleep(Duration::from_millis(wait)).await;
+                                }
                                 backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
                             }
                         }
@@ -1710,6 +2178,26 @@ impl ModelProvider for ReliableModelProvider {
                 let mut backoff_ms = self.base_backoff_ms;
                 let mut last_error_detail: Option<String> = None;
                 let mut last_diagnostic: Option<ProviderErrorDiagnostic> = None;
+                let mut bound = match entry.initial_bound_provider() {
+                    Ok(binding) => binding,
+                    Err(_error) => {
+                        push_failure(
+                            &mut failures,
+                            provider_name,
+                            current_model,
+                            0,
+                            self.max_retries + 1,
+                            "credential_binding_failed",
+                            "provider could not bind selected credential",
+                            None,
+                        );
+                        continue;
+                    }
+                };
+                if entry.credential_rotation.is_some() && bound.is_none() {
+                    Self::record_cooldown_skip_failure(&mut failures, provider_name, current_model);
+                    continue;
+                }
 
                 for attempt in 0..=self.max_retries {
                     let req = ChatRequest {
@@ -1717,7 +2205,7 @@ impl ModelProvider for ReliableModelProvider {
                         tools: request.tools,
                         thinking: request.thinking,
                     };
-                    match ProviderDispatch::from_ref(entry.provider())
+                    match ProviderDispatch::from_ref(entry.provider_for_attempt(&bound))
                         .chat(req, current_model, temperature)
                         .await
                     {
@@ -1813,14 +2301,14 @@ impl ModelProvider for ReliableModelProvider {
                                 Some(&diagnostic),
                             );
 
-                            if rate_limited
+                            let rotated = rate_limited
                                 && !non_retryable_rate_limit
-                                && let Some(new_key) = self.rotate_key()
-                            {
-                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "error": error_detail})), &format!("Rate limited; key rotation selected key ending ...{} \
-                                     but cannot apply (ModelProvider trait has no set_api_key). \
-                                     Retrying with original key.", &new_key[new_key.len().saturating_sub(4)..]));
-                            }
+                                && Self::rotate_credential_after_rate_limit(
+                                    entry,
+                                    &mut bound,
+                                    &e,
+                                    provider_name,
+                                );
 
                             if non_retryable {
                                 ::zeroclaw_log::record!(
@@ -1843,13 +2331,22 @@ impl ModelProvider for ReliableModelProvider {
                                 break;
                             }
 
-                            if rate_limited && self.model_providers.len() > 1 {
-                                self.cool_down_rate_limited_provider(entry, current_model, &e);
-                                break;
+                            if rate_limited && !rotated {
+                                if entry.credential_rotation.is_some() {
+                                    break;
+                                }
+                                if self.model_providers.len() > 1 {
+                                    self.cool_down_rate_limited_provider(entry, current_model, &e);
+                                    break;
+                                }
                             }
 
                             if attempt < self.max_retries {
-                                let wait = self.compute_backoff(backoff_ms, &e);
+                                let wait = if rotated {
+                                    0
+                                } else {
+                                    self.compute_backoff(backoff_ms, &e)
+                                };
                                 ::zeroclaw_log::record!(
                                     WARN,
                                     ::zeroclaw_log::Event::new(
@@ -1870,7 +2367,11 @@ impl ModelProvider for ReliableModelProvider {
                                     ),
                                     "ModelProvider call failed, retrying"
                                 );
-                                tokio::time::sleep(Duration::from_millis(wait)).await;
+                                if wait == 0 {
+                                    tokio::task::yield_now().await;
+                                } else {
+                                    tokio::time::sleep(Duration::from_millis(wait)).await;
+                                }
                                 backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
                             }
                         }
@@ -1958,6 +2459,48 @@ impl ModelProvider for ReliableModelProvider {
                 &served_model,
             );
 
+            if let Some(rotation) = &entry.credential_rotation {
+                let bound = match entry.initial_bound_provider() {
+                    Ok(Some(bound)) => bound,
+                    Ok(None) => continue,
+                    Err(_error) => {
+                        let message = "Failed to bind selected API credential".to_string();
+                        return stream::once(async move {
+                            Err(super::traits::StreamError::ModelProvider(message))
+                        })
+                        .boxed();
+                    }
+                };
+                let messages = Arc::new(request.messages.to_vec());
+                let tools = request.tools.map(|tools| Arc::new(tools.to_vec()));
+                let thinking = request.thinking;
+                let stream_model = current_model.clone();
+                let make_stream = move |provider: &dyn ModelProvider| {
+                    ProviderDispatch::from_ref(provider).stream_chat(
+                        ChatRequest {
+                            messages: messages.as_slice(),
+                            tools: tools.as_deref().map(|tools| tools.as_slice()),
+                            thinking,
+                        },
+                        &stream_model,
+                        temperature,
+                        options,
+                    )
+                };
+                return stream_with_credential_rotation(
+                    bound,
+                    Arc::clone(rotation),
+                    entry.owned_pin(),
+                    make_stream,
+                    self.max_retries,
+                    self.base_backoff_ms,
+                    provider_name.to_string(),
+                    current_model,
+                    fallback_record,
+                    |event| matches!(event, StreamEvent::Final),
+                );
+            }
+
             let req = ChatRequest {
                 messages: request.messages,
                 tools: request.tools,
@@ -2038,6 +2581,44 @@ impl ModelProvider for ReliableModelProvider {
                 &served_model,
             );
 
+            if let Some(rotation) = &entry.credential_rotation {
+                let bound = match entry.initial_bound_provider() {
+                    Ok(Some(bound)) => bound,
+                    Ok(None) => continue,
+                    Err(_error) => {
+                        let message = "Failed to bind selected API credential".to_string();
+                        return stream::once(async move {
+                            Err(super::traits::StreamError::ModelProvider(message))
+                        })
+                        .boxed();
+                    }
+                };
+                let system_prompt = system_prompt.map(ToString::to_string);
+                let message = message.to_string();
+                let stream_model = current_model.clone();
+                let make_stream = move |provider: &dyn ModelProvider| {
+                    provider.stream_chat_with_system(
+                        system_prompt.as_deref(),
+                        &message,
+                        &stream_model,
+                        temperature,
+                        options,
+                    )
+                };
+                return stream_with_credential_rotation(
+                    bound,
+                    Arc::clone(rotation),
+                    entry.owned_pin(),
+                    make_stream,
+                    self.max_retries,
+                    self.base_backoff_ms,
+                    provider_name.to_string(),
+                    current_model,
+                    fallback_record,
+                    |chunk| chunk.is_final,
+                );
+            }
+
             // For streaming, we attempt once and propagate errors
             // The caller can retry the entire request if needed
             let stream = model_provider.stream_chat_with_system(
@@ -2117,6 +2698,42 @@ impl ModelProvider for ReliableModelProvider {
                 provider_name,
                 &served_model,
             );
+
+            if let Some(rotation) = &entry.credential_rotation {
+                let bound = match entry.initial_bound_provider() {
+                    Ok(Some(bound)) => bound,
+                    Ok(None) => continue,
+                    Err(_error) => {
+                        let message = "Failed to bind selected API credential".to_string();
+                        return stream::once(async move {
+                            Err(super::traits::StreamError::ModelProvider(message))
+                        })
+                        .boxed();
+                    }
+                };
+                let messages = Arc::new(messages.to_vec());
+                let stream_model = current_model.clone();
+                let make_stream = move |provider: &dyn ModelProvider| {
+                    provider.stream_chat_with_history(
+                        messages.as_slice(),
+                        &stream_model,
+                        temperature,
+                        options,
+                    )
+                };
+                return stream_with_credential_rotation(
+                    bound,
+                    Arc::clone(rotation),
+                    entry.owned_pin(),
+                    make_stream,
+                    self.max_retries,
+                    self.base_backoff_ms,
+                    provider_name.to_string(),
+                    current_model,
+                    fallback_record,
+                    |chunk| chunk.is_final,
+                );
+            }
 
             let stream = model_provider.stream_chat_with_history(
                 messages,
@@ -2228,6 +2845,133 @@ mod tests {
         fn alias(&self) -> &str {
             "MockModelProvider"
         }
+    }
+
+    struct KeyedMock {
+        key: String,
+        seen: Arc<parking_lot::Mutex<Vec<String>>>,
+        rate_limit_barrier: Option<Arc<tokio::sync::Barrier>>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for KeyedMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.seen.lock().push(self.key.clone());
+            if self.key.contains("bad") {
+                if let Some(barrier) = &self.rate_limit_barrier {
+                    barrier.wait().await;
+                }
+                if self.key.contains("retry-after") {
+                    anyhow::bail!("429 Too Many Requests Retry-After: 60");
+                }
+                anyhow::bail!("429 Too Many Requests rate limit");
+            }
+            Ok("ok".to_string())
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+            self.seen.lock().push(self.key.clone());
+            if self.key == "partial-bad" {
+                return stream::iter(vec![
+                    Ok(StreamChunk {
+                        delta: "partial".to_string(),
+                        reasoning: None,
+                        is_final: false,
+                        token_count: 0,
+                    }),
+                    Err(super::super::traits::StreamError::Http(
+                        "429 Too Many Requests rate limit".to_string(),
+                    )),
+                ])
+                .boxed();
+            }
+            if self.key.contains("bad") {
+                return stream::once(async {
+                    Err(super::super::traits::StreamError::Http(
+                        "429 Too Many Requests rate limit".to_string(),
+                    ))
+                })
+                .boxed();
+            }
+            stream::iter(vec![
+                Ok(StreamChunk {
+                    delta: "ok".to_string(),
+                    reasoning: None,
+                    is_final: false,
+                    token_count: 0,
+                }),
+                Ok(StreamChunk::final_chunk()),
+            ])
+            .boxed()
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for KeyedMock {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "keyed"
+        }
+    }
+
+    fn keyed_reliable(
+        keys: Vec<String>,
+        max_retries: u32,
+        seen: Arc<parking_lot::Mutex<Vec<String>>>,
+        barrier: Option<Arc<tokio::sync::Barrier>>,
+    ) -> ReliableModelProvider {
+        let original = Box::new(KeyedMock {
+            key: "original-unused".to_string(),
+            seen: Arc::clone(&seen),
+            rate_limit_barrier: barrier.clone(),
+        });
+        let resolve_seen = Arc::clone(&seen);
+        let resolve: CredentialResolver = Arc::new(move || {
+            keys.iter()
+                .map(|key| {
+                    let attempt_key = key.clone();
+                    let build_seen = Arc::clone(&resolve_seen);
+                    let build_barrier = barrier.clone();
+                    let build: CredentialProviderFactory = Arc::new(move |build_key| {
+                        Ok(Box::new(KeyedMock {
+                            key: build_key.to_string(),
+                            seen: Arc::clone(&build_seen),
+                            rate_limit_barrier: build_barrier.clone(),
+                        }))
+                    });
+                    CredentialAttempt::new(attempt_key, build)
+                })
+                .collect()
+        });
+        ReliableModelProvider::new("test", vec![("primary".into(), original)], max_retries, 1)
+            .with_credential_rotation(CredentialRotation::new(resolve))
+    }
+
+    fn unbound_attempt(key: &str) -> CredentialAttempt {
+        CredentialAttempt::new(key.to_string(), Arc::new(|_| anyhow::bail!("not used")))
     }
 
     /// Mock that records which model was used for each call.
@@ -3193,37 +3937,213 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
-    // ── New tests: auth rotation ──
+    #[test]
+    fn credential_pool_deduplicates_blank_and_duplicate_keys() {
+        let rotation = CredentialRotation::new(Arc::new(|| {
+            [" primary ", " ", "secondary", "primary"]
+                .into_iter()
+                .map(unbound_attempt)
+                .collect()
+        }));
 
-    #[tokio::test]
-    async fn auth_rotation_cycles_keys() {
-        let model_provider = ReliableModelProvider::new(
-            "test",
-            vec![(
-                "p".into(),
-                Box::new(MockModelProvider {
-                    calls: Arc::new(AtomicUsize::new(0)),
-                    fail_until_attempt: 0,
-                    response: "ok",
-                    error: "",
-                }),
-            )],
-            0,
-            1,
-        )
-        .with_api_keys(vec!["key-a".into(), "key-b".into(), "key-c".into()]);
-
-        // Rotate 5 times, verify round-robin
-        let keys: Vec<&str> = (0..5)
-            .map(|_| model_provider.rotate_key().unwrap())
-            .collect();
-        assert_eq!(keys, vec!["key-a", "key-b", "key-c", "key-a", "key-b"]);
+        assert_eq!(
+            rotation
+                .pool()
+                .into_iter()
+                .map(|attempt| attempt.key)
+                .collect::<Vec<_>>(),
+            vec!["primary", "secondary"]
+        );
     }
 
     #[tokio::test]
-    async fn auth_rotation_returns_none_when_empty() {
-        let model_provider = ReliableModelProvider::new("test", vec![], 0, 1);
-        assert!(model_provider.rotate_key().is_none());
+    async fn whitespace_equivalent_credentials_share_binding_and_cooldown_identity() {
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let provider = keyed_reliable(
+            vec![" bad-primary ".into(), "bad-primary".into()],
+            1,
+            Arc::clone(&seen),
+            None,
+        );
+
+        provider
+            .simple_chat("hello", "test", None)
+            .await
+            .expect_err("the canonical credential is cooled with no healthy alternate");
+
+        assert_eq!(
+            &*seen.lock(),
+            &["bad-primary"],
+            "a whitespace-equivalent spelling must not rebind or retry the same credential"
+        );
+    }
+
+    #[test]
+    fn credential_cooldown_is_bound_to_the_exact_selected_slot() {
+        let rotation = CredentialRotation::new(Arc::new(|| {
+            ["primary", "healthy"]
+                .into_iter()
+                .map(unbound_attempt)
+                .collect()
+        }));
+        let primary = rotation.select(None).expect("primary credential");
+        assert_eq!(primary.key, "primary");
+        rotation.cool_down(
+            &primary,
+            &anyhow::Error::msg("429 Too Many Requests Retry-After: 60"),
+        );
+
+        let selected = rotation.select(None).expect("healthy credential");
+        assert_eq!(selected.key, "healthy");
+    }
+
+    #[test]
+    fn credential_cooldown_survives_live_pool_reordering() {
+        let keys = Arc::new(parking_lot::Mutex::new(vec![
+            "a".to_string(),
+            "b".to_string(),
+        ]));
+        let resolve_keys = Arc::clone(&keys);
+        let rotation = CredentialRotation::new(Arc::new(move || {
+            resolve_keys
+                .lock()
+                .iter()
+                .map(|key| unbound_attempt(key))
+                .collect()
+        }));
+        let a = rotation.select(None).expect("credential a");
+        let (_, a_slot) = rotation.cool_down(&a, &anyhow::Error::msg("429 Too Many Requests"));
+        let b = rotation.select(a_slot).expect("credential b");
+
+        *keys.lock() = vec!["b".to_string(), "a".to_string(), "c".to_string()];
+        let (_, b_slot) = rotation.cool_down(&b, &anyhow::Error::msg("429 Too Many Requests"));
+        let selected = rotation.select(b_slot).expect("credential c");
+
+        assert_eq!(selected.key, "c");
+    }
+
+    #[tokio::test]
+    async fn concurrent_rate_limits_cool_only_the_bound_credential() {
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let provider = Arc::new(keyed_reliable(
+            vec!["bad-primary".into(), "healthy".into()],
+            1,
+            Arc::clone(&seen),
+            Some(barrier),
+        ));
+
+        let (first, second) = tokio::join!(
+            provider.simple_chat("one", "test", None),
+            provider.simple_chat("two", "test", None)
+        );
+        assert_eq!(first.unwrap(), "ok");
+        assert_eq!(second.unwrap(), "ok");
+        assert_eq!(
+            provider.simple_chat("three", "test", None).await.unwrap(),
+            "ok"
+        );
+
+        let calls = seen.lock();
+        assert_eq!(calls.iter().filter(|key| *key == "bad-primary").count(), 2);
+        assert_eq!(calls.iter().filter(|key| *key == "healthy").count(), 3);
+    }
+
+    #[tokio::test]
+    async fn max_retries_zero_cools_key_for_the_next_request() {
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let provider = keyed_reliable(
+            vec!["bad-primary".into(), "healthy".into()],
+            0,
+            Arc::clone(&seen),
+            None,
+        );
+
+        provider
+            .simple_chat("first", "test", None)
+            .await
+            .expect_err("the zero-retry request must surface the rate limit");
+        assert_eq!(
+            provider.simple_chat("second", "test", None).await.unwrap(),
+            "ok"
+        );
+        assert_eq!(&*seen.lock(), &["bad-primary", "healthy"]);
+    }
+
+    #[tokio::test]
+    async fn single_cooled_credential_is_not_retried() {
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let provider = keyed_reliable(vec!["bad-only".into()], 3, Arc::clone(&seen), None);
+
+        provider
+            .simple_chat("hello", "test", None)
+            .await
+            .expect_err("the only credential is rate limited");
+
+        assert_eq!(&*seen.lock(), &["bad-only"]);
+    }
+
+    #[tokio::test]
+    async fn rotated_credential_does_not_wait_for_failed_keys_retry_after() {
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let provider = keyed_reliable(
+            vec!["bad-retry-after".into(), "healthy".into()],
+            1,
+            Arc::clone(&seen),
+            None,
+        );
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            provider.simple_chat("hello", "test", None),
+        )
+        .await
+        .expect("rotation must not wait for the failed credential's Retry-After")
+        .unwrap();
+
+        assert_eq!(result, "ok");
+        assert_eq!(&*seen.lock(), &["bad-retry-after", "healthy"]);
+    }
+
+    #[tokio::test]
+    async fn streaming_rate_limit_retries_only_before_first_visible_chunk() {
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let provider = keyed_reliable(
+            vec!["bad-primary".into(), "healthy".into()],
+            1,
+            Arc::clone(&seen),
+            None,
+        );
+
+        let events = provider
+            .stream_chat_with_system(None, "hello", "test", None, StreamOptions::new(true))
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(events.iter().all(Result::is_ok));
+        assert_eq!(events[0].as_ref().unwrap().delta, "ok");
+        assert_eq!(&*seen.lock(), &["bad-primary", "healthy"]);
+    }
+
+    #[tokio::test]
+    async fn streaming_rate_limit_after_output_is_not_replayed() {
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let provider = keyed_reliable(
+            vec!["partial-bad".into(), "healthy".into()],
+            1,
+            Arc::clone(&seen),
+            None,
+        );
+
+        let events = provider
+            .stream_chat_with_system(None, "hello", "test", None, StreamOptions::new(true))
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].as_ref().unwrap().delta, "partial");
+        assert!(events[1].is_err());
+        assert_eq!(&*seen.lock(), &["partial-bad"]);
     }
 
     // ── New tests: Retry-After parsing ──

@@ -20421,12 +20421,21 @@ impl Config {
         }
 
         // Model routes
+        let mut model_route_hints = std::collections::HashMap::new();
         for (i, route) in self.model_routes.iter().enumerate() {
-            if route.hint.trim().is_empty() {
+            let hint = route.hint.trim();
+            if hint.is_empty() {
                 validation_bail!(
                     RequiredFieldEmpty,
                     format!("model_routes[{i}].hint"),
                     "model_routes[{i}].hint must not be empty"
+                );
+            }
+            if let Some(first_index) = model_route_hints.insert(hint, i) {
+                validation_bail!(
+                    InvalidFormat,
+                    format!("model_routes[{i}].hint"),
+                    "model_routes[{i}].hint = {hint:?} duplicates model_routes[{first_index}].hint"
                 );
             }
             let mp = route.model_provider.trim();
@@ -23309,6 +23318,44 @@ mod tests {
         assert_eq!(
             nc_cfg(Some(""), Some("   ")).resolve_bot_secret().unwrap(),
             None
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn config_validate_rejects_duplicate_model_route_hints() {
+        let mut config = super::Config::default();
+        config.providers.models.openai.insert(
+            "route".to_string(),
+            super::OpenAIModelProviderConfig {
+                base: super::ModelProviderConfig {
+                    api_key: Some("sk-profile".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        config.model_routes = vec![
+            super::ModelRouteConfig {
+                hint: "fast".to_string(),
+                model_provider: "openai.route".to_string(),
+                model: "model-a".to_string(),
+                api_key: Some("sk-route-a".to_string()),
+            },
+            super::ModelRouteConfig {
+                hint: "fast".to_string(),
+                model_provider: "openai.route".to_string(),
+                model: "model-a".to_string(),
+                api_key: Some("sk-route-b".to_string()),
+            },
+        ];
+
+        let error = config
+            .validate()
+            .expect_err("duplicate route hints must fail closed");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("model_routes[1].hint")
+                && message.contains("duplicates model_routes[0].hint"),
+            "unexpected duplicate-route validation error: {message}"
         );
     }
 
