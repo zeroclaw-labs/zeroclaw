@@ -559,6 +559,15 @@ pub fn contains_truncated_fullwidth_dsml_envelope(text: &str) -> bool {
     false
 }
 
+fn contains_truncated_ascii_dsml_envelope(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let Some(open_idx) = lower.find("<|dsml|>") else {
+        return false;
+    };
+    let lower_after = &lower[open_idx + 8..];
+    !lower_after.contains("</|dsml|>") && text[open_idx + 8..].trim_start().starts_with('{')
+}
+
 fn has_malformed_tool_protocol_text_signal(text: &str) -> bool {
     let trimmed = text.trim_start();
     let lower = trimmed.to_ascii_lowercase();
@@ -671,6 +680,12 @@ pub fn looks_like_tool_protocol_envelope(text: &str) -> bool {
 
     if let Some(body) = json_fence_body(trimmed) {
         return looks_like_tool_protocol_envelope(body);
+    }
+
+    if contains_truncated_fullwidth_dsml_envelope(trimmed)
+        || contains_truncated_ascii_dsml_envelope(trimmed)
+    {
+        return true;
     }
 
     serde_json::from_str::<serde_json::Value>(trimmed)
@@ -1048,9 +1063,15 @@ fn parse_dsml_tool_calls_with_delimiter(
                     .get(1)
                     .map(|m| m.as_str().trim())
                     .filter(|v| !v.is_empty());
-                let is_string = param_cap
-                    .get(2)
-                    .is_some_and(|m| m.as_str().eq_ignore_ascii_case("true"));
+                let string_val = param_cap.get(2).map(|m| m.as_str());
+                let is_string = match string_val {
+                    Some(v) if v.eq_ignore_ascii_case("true") => true,
+                    Some(v) if v.eq_ignore_ascii_case("false") => false,
+                    _ => {
+                        malformed_parameter = true;
+                        continue;
+                    }
+                };
                 let raw_value = param_cap.get(3).map(|m| m.as_str()).unwrap_or("");
                 let Some(key) = key else {
                     continue;
@@ -1072,7 +1093,7 @@ fn parse_dsml_tool_calls_with_delimiter(
                 args.insert(key.to_string(), parsed);
             }
 
-            if saw_parameter && malformed_parameter && args.is_empty() {
+            if malformed_parameter {
                 continue;
             }
 
@@ -1119,7 +1140,8 @@ fn parse_dsml_tool_calls_with_delimiter(
 }
 
 fn is_inside_markdown_fence(response: &str, byte_idx: usize) -> bool {
-    response[..byte_idx].match_indices("```").count() % 2 == 1
+    let up_to = &response[..byte_idx];
+    (up_to.match_indices("```").count() + up_to.match_indices("~~~").count()) % 2 == 1
 }
 
 fn dsml_regexes(delim: &str) -> (Regex, Regex, Regex) {
@@ -2147,6 +2169,11 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
                 continue;
             }
 
+            if matches!(open_tag, "<|DSML|>" | "<|dsml|>") {
+                remaining = &remaining[start..];
+                break;
+            }
+
             // No cross-alias close tag resolved — fall back to JSON recovery
             // from unclosed tags (brace-balancing).
             if let Some(json_end) = find_json_end(after_open)
@@ -2486,6 +2513,7 @@ pub fn detect_tool_call_parse_issue(
 
     if has_malformed_tool_protocol_text_signal(trimmed)
         || contains_truncated_fullwidth_dsml_envelope(trimmed)
+        || contains_truncated_ascii_dsml_envelope(trimmed)
     {
         return Some(
             "response resembled an internal tool protocol envelope but no valid tool call could be parsed"
@@ -2968,6 +2996,68 @@ After text."#;
             calls[0].arguments.get("mode").unwrap().as_str().unwrap(),
             "fast"
         );
+    }
+
+    #[test]
+    fn parse_tool_calls_fullwidth_dsml_rejects_unsupported_string_discriminator() {
+        let response = "<｜DSML｜tool_calls>\n\
+            <｜DSML｜invoke name=\"shell\">\n\
+            <｜DSML｜parameter name=\"command\" string=\"maybe\">{\"cmd\":\"ls\"}</｜DSML｜parameter>\n\
+            </｜DSML｜invoke>\n\
+            </｜DSML｜tool_calls>";
+
+        let (text, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 0);
+        assert!(text.contains("｜DSML｜"));
+    }
+
+    #[test]
+    fn parse_tool_calls_fullwidth_dsml_rejects_mixed_valid_and_malformed_parameters() {
+        // One parameter with a valid JSON value and one with non-JSON in
+        // a `string="false"` position — the malformed parameter must poison
+        // the entire invoke so no partial argument object is emitted.
+        let response = "<｜DSML｜tool_calls>\n\
+            <｜DSML｜invoke name=\"shell\">\n\
+            <｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter>\n\
+            <｜DSML｜parameter name=\"count\" string=\"false\">not-json</｜DSML｜parameter>\n\
+            </｜DSML｜invoke>\n\
+            </｜DSML｜tool_calls>";
+
+        let (text, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 0);
+        assert!(text.contains("｜DSML｜"));
+    }
+
+    #[test]
+    fn parse_tool_calls_ascii_dsml_unclosed_envelope_no_recovery() {
+        // An unclosed <|DSML|> tag has no matching </|DSML|> — the
+        // body must NOT be recovered via JSON brace-balancing into a
+        // legitimate tool call.
+        let response = "<|DSML|>\n\
+            {\"name\":\"shell\",\"arguments\":{\"command\":\"id\"}}\n\
+            trailing text";
+
+        let (text, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 0);
+        assert!(text.contains("<|DSML|>") || text.contains("trailing text"));
+    }
+
+    #[test]
+    fn parse_tool_calls_tilde_fenced_dsml_is_preserved_as_text() {
+        let response = "Here is a shell example using DSML syntax:\n\
+            ~~~xml\n\
+            <｜DSML｜tool_calls>\n\
+            <｜DSML｜invoke name=\"shell\">\n\
+            <｜DSML｜parameter name=\"command\" string=\"true\">uname -a</｜DSML｜parameter>\n\
+            </｜DSML｜invoke>\n\
+            </｜DSML｜tool_calls>\n\
+            ~~~\n\
+            End of example.";
+
+        let (text, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 0);
+        assert!(text.contains("uname -a"));
+        assert!(text.contains("End of example."));
     }
 
     #[test]
