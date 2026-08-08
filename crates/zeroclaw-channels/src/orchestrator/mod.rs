@@ -523,6 +523,21 @@ fn acquire_persist_lock(ctx: &ChannelRuntimeContext, key: &str) -> Arc<std::sync
         .clone()
 }
 
+/// Per-conversation-history-key locks that serialize the complete processing
+/// cycle of turns sharing one conversation history: history snapshot, model
+/// execution, and assistant append happen as one atomic turn. Sender-scoped
+/// debounce dispatches each member of a shared (`ReplyTarget`) session
+/// through an independent worker, so without this lock two members' turns
+/// could read different history snapshots and persist replies in an order
+/// the conversation never had. Sender-scoped sessions embed the sender in
+/// the history key, so distinct senders never contend there.
+type TurnLockMap = Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>;
+
+fn acquire_turn_lock(turn_locks: &TurnLockMap, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let mut map = turn_locks.lock().unwrap_or_else(|e| e.into_inner());
+    map.entry(key.to_string()).or_default().clone()
+}
+
 #[derive(Clone)]
 struct InFlightSenderTaskState {
     task_id: u64,
@@ -597,6 +612,20 @@ pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> 
     sanitize_session_key(&raw)
 }
 
+/// Debounce accumulates rapid messages into one combined turn, so its
+/// grouping must stay scoped to the actual sender even when conversation
+/// history is room-scoped (`ReplyTarget`): keying debounce on the shared
+/// history key would concatenate different members' messages into a single
+/// turn attributed to whoever sent last.
+fn message_debounce_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
+    match msg.conversation_scope {
+        zeroclaw_api::channel::ChannelConversationScope::Sender => conversation_history_key(msg),
+        zeroclaw_api::channel::ChannelConversationScope::ReplyTarget => {
+            sanitize_session_key(&format!("{}_{}", conversation_history_key(msg), msg.sender))
+        }
+    }
+}
+
 fn scope_override_key(
     scope: OverrideScope,
     msg: &zeroclaw_api::channel::ChannelMessage,
@@ -617,13 +646,23 @@ fn followup_thread_id(msg: &zeroclaw_api::channel::ChannelMessage) -> Option<Str
     }
 }
 
+/// Interruption/cancellation is always personal: a newer message or `/stop`
+/// may only target the in-flight request of the member who sent it, so the
+/// key retains `msg.sender` even when conversation history is shared
+/// (`ReplyTarget` scope). Without the sender, one member's message or `/stop`
+/// in a shared session would cancel another member's active request.
 fn interruption_scope_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
     match (msg.conversation_scope, msg.interruption_scope_id.as_deref()) {
         (zeroclaw_api::channel::ChannelConversationScope::ReplyTarget, Some(scope)) => {
-            sanitize_session_key(&format!("{}_{}", channel_scope(msg), scope))
+            sanitize_session_key(&format!("{}_{}_{}", channel_scope(msg), scope, msg.sender))
         }
         (zeroclaw_api::channel::ChannelConversationScope::ReplyTarget, None) => {
-            sanitize_session_key(&format!("{}_{}", channel_scope(msg), msg.reply_target))
+            sanitize_session_key(&format!(
+                "{}_{}_{}",
+                channel_scope(msg),
+                msg.reply_target,
+                msg.sender
+            ))
         }
         (zeroclaw_api::channel::ChannelConversationScope::Sender, Some(scope)) => format!(
             "{}_{}_{}_{}",
@@ -1147,16 +1186,31 @@ fn format_whatsapp_group_history_turn(label: &str, sender: &str, content: &str) 
     }
 }
 
-fn attributed_whatsapp_group_user_turn(
+fn format_shared_scope_history_turn(sender: &str, content: &str) -> String {
+    let sender = sender.trim();
+    if sender.is_empty() {
+        content.to_string()
+    } else {
+        format!("[Message from {sender}]\n{content}")
+    }
+}
+
+fn attributed_channel_user_turn(
     msg: &zeroclaw_api::channel::ChannelMessage,
     label: &str,
     content: &str,
 ) -> String {
     if msg.channel == "whatsapp" && is_group_reply_target(&msg.reply_target) {
-        format_whatsapp_group_history_turn(label, &msg.sender, content)
-    } else {
-        content.to_string()
+        return format_whatsapp_group_history_turn(label, &msg.sender, content);
     }
+    // `ReplyTarget` scope interleaves multiple senders in one persisted
+    // history, so each stored user turn must carry its speaker; without this,
+    // prior turns read as anonymous `user` messages once a second member
+    // writes in the shared session.
+    if msg.conversation_scope == zeroclaw_api::channel::ChannelConversationScope::ReplyTarget {
+        return format_shared_scope_history_turn(&msg.sender, content);
+    }
+    content.to_string()
 }
 
 fn timestamped_channel_user_history_content(
@@ -1164,7 +1218,7 @@ fn timestamped_channel_user_history_content(
     label: &str,
 ) -> String {
     let timestamped_content = timestamp_channel_user_content(&msg.content);
-    attributed_whatsapp_group_user_turn(msg, label, &timestamped_content)
+    attributed_channel_user_turn(msg, label, &timestamped_content)
 }
 
 /// Collapse only heavy inline `data:` image payloads in historical turns while
@@ -6496,6 +6550,7 @@ async fn dispatch_worker(
     ctx: Arc<ChannelRuntimeContext>,
     msg: zeroclaw_api::channel::ChannelMessage,
     in_flight: Arc<tokio::sync::Mutex<HashMap<String, InFlightSenderTaskState>>>,
+    turn_locks: TurnLockMap,
     task_sequence: Arc<AtomicU64>,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) {
@@ -6535,7 +6590,15 @@ async fn dispatch_worker(
         }
     }
 
-    process_channel_message(ctx, msg, cancellation_token).await;
+    // The interruption handshake above must stay outside the turn lock: a
+    // newer message from the same sender cancels the previous in-flight turn
+    // and waits for its completion first, which lets the canceled worker
+    // release the lock before this one queues on it.
+    let turn_lock = acquire_turn_lock(&turn_locks, &conversation_history_key(&msg));
+    {
+        let _turn_guard = turn_lock.lock().await;
+        process_channel_message(ctx, msg, cancellation_token).await;
+    }
 
     if register_in_flight {
         let mut active = in_flight.lock().await;
@@ -7074,6 +7137,7 @@ async fn run_message_dispatch_loop(
         InFlightSenderTaskState,
     >::new()));
     let task_sequence = Arc::new(AtomicU64::new(1));
+    let turn_locks: TurnLockMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
     while let Some(msg) = rx.recv().await {
         // Gate answers (button-click markers / `approve <ref>` text replies)
@@ -7170,7 +7234,7 @@ async fn run_message_dispatch_loop(
         // ── Debounce: accumulate rapid messages per sender ──────────
         // CLI messages bypass debouncing so the interactive loop stays responsive.
         let msg = if msg.channel != "cli" {
-            let debounce_key = conversation_history_key(&msg);
+            let debounce_key = message_debounce_key(&msg);
 
             // Resolve effective debounce window: per-channel override wins,
             // otherwise falls back to the global default from ChannelsConfig.
@@ -7193,6 +7257,7 @@ async fn run_message_dispatch_loop(
                     // worker path below.
                     let debounce_ctx = Arc::clone(&ctx);
                     let debounce_in_flight = Arc::clone(&in_flight_by_sender);
+                    let debounce_turn_locks = Arc::clone(&turn_locks);
                     let debounce_semaphore = Arc::clone(&semaphore);
                     let debounce_task_seq = Arc::clone(&task_sequence);
                     let mut debounce_msg = msg;
@@ -7216,6 +7281,7 @@ async fn run_message_dispatch_loop(
                             debounce_ctx,
                             debounce_msg,
                             debounce_in_flight,
+                            debounce_turn_locks,
                             debounce_task_seq,
                             permit,
                         )
@@ -7240,9 +7306,18 @@ async fn run_message_dispatch_loop(
 
         let worker_ctx = Arc::clone(&ctx);
         let in_flight = Arc::clone(&in_flight_by_sender);
+        let worker_turn_locks = Arc::clone(&turn_locks);
         let task_sequence = Arc::clone(&task_sequence);
         workers.spawn(async move {
-            dispatch_worker(worker_ctx, msg, in_flight, task_sequence, permit).await;
+            dispatch_worker(
+                worker_ctx,
+                msg,
+                in_flight,
+                worker_turn_locks,
+                task_sequence,
+                permit,
+            )
+            .await;
         });
 
         while let Some(result) = workers.try_join_next() {
@@ -7587,6 +7662,7 @@ fn build_channel_by_id(
                 .with_transcription(config.transcription.clone())
                 .with_tts(&config)
                 .with_workspace_dir(workspace_dir)
+                .with_per_user_session(tg.per_user_session)
                 .with_approval_timeout_secs(tg.approval_timeout_secs),
             ))
         }
@@ -8764,6 +8840,7 @@ fn collect_configured_channels(
                     .with_workspace_dir(config.channel_workspace_dir(&format!("telegram.{alias}")))
                     .with_proxy_url(tg.proxy_url.clone())
                     .with_tool_command_specs(tool_specs.to_vec())
+                    .with_per_user_session(tg.per_user_session)
                     .with_approval_timeout_secs(tg.approval_timeout_secs),
                 ),
                 tg,
@@ -22220,7 +22297,419 @@ BTC is currently around $65,000 based on latest tool output."#
             conversation_history_key(&msg),
             "wecom_ws_work_group--room-1"
         );
-        assert_eq!(interruption_scope_key(&msg), "wecom_ws_work_group--room-1");
+        // History is room-scoped, but interruption stays personal: the key
+        // retains the sender so one member cannot cancel another's request.
+        assert_eq!(
+            interruption_scope_key(&msg),
+            "wecom_ws_work_group--room-1_zeroclaw_user"
+        );
+    }
+
+    fn shared_topic_message(sender: &str, id: &str, content: &str) -> ChannelMessage {
+        ChannelMessage {
+            id: id.into(),
+            sender: sender.into(),
+            reply_target: "-1001234:77".into(),
+            content: content.into(),
+            channel: "telegram".into(),
+            channel_alias: Some("default".into()),
+            timestamp: 1,
+            thread_ts: Some("77".into()),
+            conversation_scope: zeroclaw_api::channel::ChannelConversationScope::ReplyTarget,
+
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_session_debounce_never_collapses_distinct_senders() {
+        let alice = shared_topic_message("alice", "m1", "please deploy");
+        let bob = shared_topic_message("bob", "m2", "hold on, wait for QA");
+
+        // Shared history key is identical, but debounce must stay per sender.
+        assert_eq!(
+            conversation_history_key(&alice),
+            conversation_history_key(&bob)
+        );
+        assert_ne!(message_debounce_key(&alice), message_debounce_key(&bob));
+
+        // With a nonzero window, Bob's message must open its own debounce
+        // entry instead of being appended to Alice's pending accumulation.
+        let debouncer = MessageDebouncer::new(Duration::from_millis(30));
+        let window = Duration::from_millis(30);
+        let rx_alice = match debouncer
+            .debounce_with_window(&message_debounce_key(&alice), &alice.content, window)
+            .await
+        {
+            zeroclaw_infra::debounce::DebounceResult::Pending(rx) => rx,
+            zeroclaw_infra::debounce::DebounceResult::Passthrough(_) => {
+                panic!("nonzero window must debounce")
+            }
+        };
+        let rx_bob = match debouncer
+            .debounce_with_window(&message_debounce_key(&bob), &bob.content, window)
+            .await
+        {
+            zeroclaw_infra::debounce::DebounceResult::Pending(rx) => rx,
+            zeroclaw_infra::debounce::DebounceResult::Passthrough(_) => {
+                panic!("nonzero window must debounce")
+            }
+        };
+
+        assert_eq!(rx_alice.await.unwrap(), "please deploy");
+        assert_eq!(rx_bob.await.unwrap(), "hold on, wait for QA");
+    }
+
+    #[test]
+    fn sender_scope_debounce_key_matches_history_key() {
+        let mut msg = shared_topic_message("alice", "m1", "hi");
+        msg.conversation_scope = zeroclaw_api::channel::ChannelConversationScope::Sender;
+        assert_eq!(message_debounce_key(&msg), conversation_history_key(&msg));
+    }
+
+    #[test]
+    fn shared_session_history_preserves_alice_then_bob_attribution() {
+        let alice = shared_topic_message("alice", "m1", "the budget file is v3");
+        let bob = shared_topic_message("bob", "m2", "use v4 instead");
+
+        let alice_turn =
+            timestamped_channel_user_history_content(&alice, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL);
+        let bob_turn =
+            timestamped_channel_user_history_content(&bob, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL);
+
+        assert!(
+            alice_turn.starts_with("[Message from alice]\n"),
+            "persisted shared-scope turn must retain its speaker: {alice_turn}"
+        );
+        assert!(
+            bob_turn.starts_with("[Message from bob]\n"),
+            "persisted shared-scope turn must retain its speaker: {bob_turn}"
+        );
+        assert!(alice_turn.contains("the budget file is v3"));
+        assert!(bob_turn.contains("use v4 instead"));
+
+        // Default sender-scoped Telegram turns stay unlabelled (no behavior
+        // change when per_user_session = true).
+        let mut solo = shared_topic_message("alice", "m3", "just me here");
+        solo.conversation_scope = zeroclaw_api::channel::ChannelConversationScope::Sender;
+        let solo_turn =
+            timestamped_channel_user_history_content(&solo, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL);
+        assert!(
+            !solo_turn.contains("[Message from"),
+            "sender-scoped turns must stay unlabelled: {solo_turn}"
+        );
+
+        // WhatsApp groups keep their existing channel-specific label.
+        let mut wa = shared_topic_message("carol", "m4", "wa message");
+        wa.channel = "whatsapp".into();
+        wa.reply_target = "12036302@g.us".into();
+        wa.conversation_scope = zeroclaw_api::channel::ChannelConversationScope::Sender;
+        let wa_turn =
+            timestamped_channel_user_history_content(&wa, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL);
+        assert!(
+            wa_turn.starts_with("[Current WhatsApp group message from carol]\n"),
+            "whatsapp group label must be unchanged: {wa_turn}"
+        );
+    }
+
+    #[test]
+    fn shared_session_interruption_key_stays_per_sender() {
+        let alice = shared_topic_message("alice", "m1", "long task please");
+        let bob = shared_topic_message("bob", "m2", "another task");
+
+        // One shared conversation history…
+        assert_eq!(
+            conversation_history_key(&alice),
+            conversation_history_key(&bob)
+        );
+        // …but interruption/cancellation stays personal.
+        assert_ne!(interruption_scope_key(&alice), interruption_scope_key(&bob));
+
+        // A sender's own `/stop` resolves to the same in-flight entry as
+        // their original message.
+        let alice_stop = shared_topic_message("alice", "m3", "/stop");
+        assert_eq!(
+            interruption_scope_key(&alice),
+            interruption_scope_key(&alice_stop)
+        );
+
+        // An explicit interruption_scope_id keeps the sender too.
+        let mut scoped_alice = shared_topic_message("alice", "m4", "hi");
+        scoped_alice.interruption_scope_id = Some("77".into());
+        let mut scoped_bob = shared_topic_message("bob", "m5", "hi");
+        scoped_bob.interruption_scope_id = Some("77".into());
+        assert_ne!(
+            interruption_scope_key(&scoped_alice),
+            interruption_scope_key(&scoped_bob)
+        );
+    }
+
+    /// Two members of one shared topic dispatch through independent
+    /// sender-scoped debounce workers, but their complete turns must
+    /// serialize on the shared conversation-history key: the second turn
+    /// observes the first turn's assistant reply, and the persisted
+    /// user/assistant order matches the order the conversation actually had.
+    #[tokio::test]
+    async fn shared_session_concurrent_turns_persist_deterministic_order() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(SlowModelProvider {
+                delay: Duration::from_millis(150),
+            }),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        let alice = shared_topic_message("alice", "m1", "first question");
+        let mut bob = shared_topic_message("bob", "m2", "second question");
+        bob.timestamp = 2;
+        let history_key = conversation_history_key(&alice);
+        assert_eq!(history_key, conversation_history_key(&bob));
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
+        let send_task = zeroclaw_spawn::spawn!(async move {
+            tx.send(alice).await.unwrap();
+            // Bob arrives while Alice's model call is still in flight.
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            tx.send(bob).await.unwrap();
+        });
+
+        run_message_dispatch_loop(rx, AgentRouter::single(Arc::clone(&ctx)), 4).await;
+        send_task.await.unwrap();
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 2, "both turns must complete, got: {sent:?}");
+
+        let mut histories = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let turns = histories
+            .get(&history_key)
+            .expect("shared history must exist")
+            .clone();
+        drop(histories);
+
+        let roles: Vec<&str> = turns.iter().map(|t| t.role.as_str()).collect();
+        assert_eq!(
+            roles,
+            vec!["user", "assistant", "user", "assistant"],
+            "turns sharing one history must persist as complete user/assistant pairs, got: {turns:?}"
+        );
+        assert!(
+            turns[0].content.starts_with("[Message from alice]"),
+            "first persisted turn must be Alice's: {}",
+            turns[0].content
+        );
+        assert!(turns[0].content.contains("first question"));
+        assert!(
+            turns[2].content.starts_with("[Message from bob]"),
+            "Bob's user turn must persist after Alice's assistant reply: {}",
+            turns[2].content
+        );
+        assert!(turns[2].content.contains("second question"));
+    }
+
+    /// With `interrupt_on_new_message` enabled in a shared topic, a new
+    /// message may only interrupt the in-flight request of the same sender:
+    /// Bob's message must not cancel Alice's active turn, while Alice's own
+    /// follow-up still cancels her first one.
+    #[tokio::test]
+    async fn shared_session_new_message_interrupts_only_same_sender() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            model_provider: Arc::new(SlowModelProvider {
+                delay: Duration::from_millis(150),
+            }),
+            model_provider_ref: Arc::new("test-provider".to_string()),
+            agent_alias: Arc::new("test-agent".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
+            memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: Some(0.0),
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
+            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+            provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: true,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+                whatsapp: false,
+            },
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+            agent_transcription_provider: String::new(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: zeroclaw_config::schema::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+                Duration::ZERO,
+            )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
+            last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
+        });
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
+        let send_task = zeroclaw_spawn::spawn!(async move {
+            tx.send(shared_topic_message("alice", "m1", "alice first"))
+                .await
+                .unwrap();
+            // Bob's message lands while Alice's request is in flight — it
+            // must NOT cancel her turn.
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            tx.send(shared_topic_message("bob", "m2", "bob question"))
+                .await
+                .unwrap();
+            // Alice's own follow-up still interrupts her first request.
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            tx.send(shared_topic_message("alice", "m3", "alice second"))
+                .await
+                .unwrap();
+        });
+
+        run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 4).await;
+        send_task.await.unwrap();
+
+        // The rendered prompt embeds the whole shared history, so completed
+        // turns are identified by the current turn's message_id marker
+        // rather than by raw message text.
+        let sent = channel_impl.sent_messages.lock().await;
+        assert!(
+            sent.iter().any(|m| m.contains("message_id=m2")),
+            "Bob's turn must complete despite Alice's in-flight request: {sent:?}"
+        );
+        assert!(
+            sent.iter().any(|m| m.contains("message_id=m3")),
+            "Alice's follow-up must complete: {sent:?}"
+        );
+        assert!(
+            !sent.iter().any(|m| m.contains("message_id=m1")),
+            "Alice's first request must be interrupted by her own follow-up: {sent:?}"
+        );
+        assert_eq!(sent.len(), 2, "exactly two turns must complete: {sent:?}");
+    }
+
+    /// `/stop` in a shared topic resolves only the in-flight request of the
+    /// member who sent it: Bob's `/stop` must not cancel Alice's active
+    /// turn, while Alice's own `/stop` still cancels hers.
+    #[tokio::test]
+    async fn shared_session_stop_cancels_only_own_senders_task() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(SlowModelProvider {
+                delay: Duration::from_millis(150),
+            }),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
+        let send_task = zeroclaw_spawn::spawn!(async move {
+            tx.send(shared_topic_message("alice", "m1", "please think slowly"))
+                .await
+                .unwrap();
+            // Bob's /stop lands while Alice's request is in flight — it must
+            // find no task of Bob's own and leave Alice's turn running.
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            tx.send(shared_topic_message("bob", "s1", "/stop"))
+                .await
+                .unwrap();
+            // After Alice's first turn completes, her own /stop must cancel
+            // her new in-flight request.
+            tokio::time::sleep(Duration::from_millis(220)).await;
+            tx.send(shared_topic_message("alice", "m2", "another slow one"))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            tx.send(shared_topic_message("alice", "s2", "/stop"))
+                .await
+                .unwrap();
+        });
+
+        run_message_dispatch_loop(rx, AgentRouter::single(ctx), 4).await;
+        send_task.await.unwrap();
+
+        let stop_no_task =
+            zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-stop-no-task");
+        let stop_sent =
+            zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-stop-sent");
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert!(
+            sent.iter().any(|m| m.contains("please think slowly")),
+            "Alice's turn must complete despite Bob's /stop: {sent:?}"
+        );
+        assert!(
+            sent.iter().any(|m| m.ends_with(&stop_no_task)),
+            "Bob's /stop must resolve to no task of his own: {sent:?}"
+        );
+        assert!(
+            !sent.iter().any(|m| m.contains("another slow one")),
+            "Alice's own /stop must cancel her in-flight request: {sent:?}"
+        );
+        assert!(
+            sent.iter().any(|m| m.ends_with(&stop_sent)),
+            "Alice's /stop must report the cancellation: {sent:?}"
+        );
     }
 
     #[test]
@@ -27715,6 +28204,7 @@ This is an example JSON object for profile settings."#;
                 draft_update_interval_ms: 1000,
                 interrupt_on_new_message: false,
                 mention_only: false,
+                per_user_session: true,
                 ack_reactions: None,
                 proxy_url: None,
                 approval_timeout_secs: 120,
@@ -27744,6 +28234,7 @@ This is an example JSON object for profile settings."#;
                 draft_update_interval_ms: 1000,
                 interrupt_on_new_message: false,
                 mention_only: false,
+                per_user_session: true,
                 ack_reactions: None,
                 proxy_url: None,
                 approval_timeout_secs: 120,
