@@ -372,6 +372,12 @@ channel-whatsapp-web-delivery-failure-note-many = (nota: no pude entregar {$coun
 channel-line-bind-success = ✅ ¡Emparejado! Ya puedes chatear.
 channel-line-bind-invalid-code = ❌ Código no válido. Inténtalo de nuevo.
 channel-line-bind-rate-limited = ⏳ Demasiados intentos. Reintenta en { $secs }s.
+channel-telegram-cmd-new-desc = Iniciar una nueva sesión de conversación
+channel-telegram-cmd-clear-desc = Borrar esta sesión de conversación
+channel-telegram-cmd-stop-desc = Cancelar la tarea en curso
+channel-telegram-cmd-model-desc = Mostrar o cambiar el modelo actual
+channel-telegram-cmd-models-desc = Listar los proveedores de modelos disponibles o cambiar de proveedor
+channel-telegram-cmd-config-desc = Mostrar la configuración actual
 onboard-openai-auth-note =
     Autenticación de OpenAI:
     • Clave de API — acceso estándar a la API mediante platform.openai.com (sk-...)

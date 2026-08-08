@@ -45,6 +45,11 @@ const TELEGRAM_COMMAND_NAME_MAX_LEN: usize = 32;
 /// longer than 100 characters. This conservative cap avoids that in practice.
 const TELEGRAM_COMMAND_DESCRIPTION_MAX_LEN: usize = 100;
 
+/// Resolve a localized CLI string by Fluent key, using the process-global active locale.
+fn telegram_cli_string(key: &str) -> String {
+    i18n::get_required_cli_string(key)
+}
+
 /// Sanitize a skill name into a valid Telegram command name.
 /// Telegram commands must be 1-32 characters, lowercase a-z, 0-9, underscore only.
 fn sanitize_telegram_command_name(raw: &str) -> String {
@@ -992,12 +997,12 @@ impl TelegramChannel {
     /// enabled tool commands from the configuration.
     async fn register_bot_commands(&self) {
         let mut commands: Vec<serde_json::Value> = vec![
-            serde_json::json!({ "command": "new",    "description": "Start a new conversation session" }),
-            serde_json::json!({ "command": "clear",  "description": "Clear this conversation session" }),
-            serde_json::json!({ "command": "stop",   "description": "Cancel the current in-flight task" }),
-            serde_json::json!({ "command": "model",  "description": "Show or switch the current model" }),
-            serde_json::json!({ "command": "models", "description": "List available model_providers or switch model_provider" }),
-            serde_json::json!({ "command": "config", "description": "Show current configuration" }),
+            serde_json::json!({ "command": "new",    "description": telegram_cli_string("channel-telegram-cmd-new-desc") }),
+            serde_json::json!({ "command": "clear",  "description": telegram_cli_string("channel-telegram-cmd-clear-desc") }),
+            serde_json::json!({ "command": "stop",   "description": telegram_cli_string("channel-telegram-cmd-stop-desc") }),
+            serde_json::json!({ "command": "model",  "description": telegram_cli_string("channel-telegram-cmd-model-desc") }),
+            serde_json::json!({ "command": "models", "description": telegram_cli_string("channel-telegram-cmd-models-desc") }),
+            serde_json::json!({ "command": "config", "description": telegram_cli_string("channel-telegram-cmd-config-desc") }),
         ];
 
         // Track registered names to deduplicate across skills and tools.
@@ -7675,6 +7680,32 @@ mod tests {
         assert_eq!(content, "[Forwarded from @bob] [IMAGE:/tmp/photo.jpg]");
     }
 
+    /// The 6 built-in Telegram command entries, resolved through the i18n
+    /// catalog exactly as production's `register_bot_commands` does. Shared
+    /// by every `register_bot_commands_*` test so expectations stay in sync
+    /// with production ordering/content regardless of the active locale.
+    fn expected_builtin_command_json() -> Vec<serde_json::Value> {
+        let entries = [
+            ("new", "channel-telegram-cmd-new-desc"),
+            ("clear", "channel-telegram-cmd-clear-desc"),
+            ("stop", "channel-telegram-cmd-stop-desc"),
+            ("model", "channel-telegram-cmd-model-desc"),
+            ("models", "channel-telegram-cmd-models-desc"),
+            ("config", "channel-telegram-cmd-config-desc"),
+        ];
+        entries
+            .into_iter()
+            .map(|(command, key)| {
+                let description = zeroclaw_runtime::i18n::get_required_cli_string(key);
+                assert!(
+                    !description.starts_with('{'),
+                    "description for /{command} resolved to the missing-key sentinel: {description}"
+                );
+                serde_json::json!({ "command": command, "description": description })
+            })
+            .collect()
+    }
+
     #[tokio::test]
     async fn register_bot_commands_sends_correct_payload() {
         use wiremock::matchers::{body_json, method, path_regex};
@@ -7683,14 +7714,7 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         let expected_body = serde_json::json!({
-            "commands": [
-                { "command": "new",    "description": "Start a new conversation session" },
-                { "command": "clear",  "description": "Clear this conversation session" },
-                { "command": "stop",   "description": "Cancel the current in-flight task" },
-                { "command": "model",  "description": "Show or switch the current model" },
-                { "command": "models", "description": "List available model_providers or switch model_provider" },
-                { "command": "config", "description": "Show current configuration" },
-            ]
+            "commands": expected_builtin_command_json()
         });
 
         Mock::given(method("POST"))
@@ -7716,6 +7740,78 @@ mod tests {
         ch.register_bot_commands().await;
 
         // Mock expectation assert happens on MockServer drop
+    }
+
+    #[test]
+    fn register_bot_commands_sends_independently_pinned_french_payload() {
+        // Locale selection is process-global and immutable after its first
+        // lookup. Run the ignored helper in a fresh process so `init("fr")`
+        // deterministically owns that first lookup without racing unrelated
+        // tests in this binary.
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("current test executable should be available"),
+        )
+        .args([
+            "register_bot_commands_french_payload_helper",
+            "--ignored",
+            "--nocapture",
+        ])
+        .output()
+        .expect("French command-menu child test should start");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "French command-menu child test failed\nstdout:\n{}\nstderr:\n{}",
+            stdout,
+            stderr
+        );
+        assert!(
+            stdout.contains("register_bot_commands_french_payload_helper ... ok"),
+            "French command-menu helper did not run\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "subprocess helper for process-global French locale"]
+    async fn register_bot_commands_french_payload_helper() {
+        zeroclaw_runtime::i18n::init("fr");
+
+        use wiremock::matchers::{body_json, method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let expected_body = serde_json::json!({
+            "commands": [
+                { "command": "new", "description": "Démarrer une nouvelle session de conversation" },
+                { "command": "clear", "description": "Effacer cette session de conversation" },
+                { "command": "stop", "description": "Annuler la tâche en cours" },
+                { "command": "model", "description": "Afficher ou changer le modèle actuel" },
+                { "command": "models", "description": "Lister les fournisseurs de modèles disponibles ou changer de fournisseur" },
+                { "command": "config", "description": "Afficher la configuration actuelle" },
+            ]
+        });
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/setMyCommands$"))
+            .and(body_json(&expected_body))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": true })),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_api_base(mock_server.uri());
+
+        ch.register_bot_commands().await;
     }
 
     #[tokio::test]
@@ -7837,17 +7933,11 @@ mod tests {
 
         let mock_server = MockServer::start().await;
 
-        let expected_body = serde_json::json!({
-            "commands": [
-                { "command": "new",     "description": "Start a new conversation session" },
-                { "command": "clear",   "description": "Clear this conversation session" },
-                { "command": "stop",    "description": "Cancel the current in-flight task" },
-                { "command": "model",   "description": "Show or switch the current model" },
-                { "command": "models",  "description": "List available model_providers or switch model_provider" },
-                { "command": "config",  "description": "Show current configuration" },
-                { "command": "weather", "description": "Check the weather forecast" },
-            ]
-        });
+        let mut commands = expected_builtin_command_json();
+        commands.push(
+            serde_json::json!({ "command": "weather", "description": "Check the weather forecast" }),
+        );
+        let expected_body = serde_json::json!({ "commands": commands });
 
         Mock::given(method("POST"))
             .and(path_regex(r"/bot[^/]+/setMyCommands$"))
@@ -7880,17 +7970,9 @@ mod tests {
 
         let mock_server = MockServer::start().await;
 
-        let expected_body = serde_json::json!({
-            "commands": [
-                { "command": "new",       "description": "Start a new conversation session" },
-                { "command": "clear",     "description": "Clear this conversation session" },
-                { "command": "stop",      "description": "Cancel the current in-flight task" },
-                { "command": "model",     "description": "Show or switch the current model" },
-                { "command": "models",    "description": "List available model_providers or switch model_provider" },
-                { "command": "config",    "description": "Show current configuration" },
-                { "command": "test_tool", "description": "A test tool" },
-            ]
-        });
+        let mut commands = expected_builtin_command_json();
+        commands.push(serde_json::json!({ "command": "test_tool", "description": "A test tool" }));
+        let expected_body = serde_json::json!({ "commands": commands });
 
         Mock::given(method("POST"))
             .and(path_regex(r"/bot[^/]+/setMyCommands$"))

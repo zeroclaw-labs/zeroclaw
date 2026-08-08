@@ -468,6 +468,115 @@ mod tests {
     }
 
     #[test]
+    fn telegram_command_menu_descriptions_are_translated_per_locale() {
+        // Pin the exact English wording as an independent oracle: the
+        // telegram.rs tests now resolve their expectations through this same
+        // catalog, so they can no longer catch an accidental change to the
+        // English text. This literal comparison can.
+        let keys = [
+            (
+                "channel-telegram-cmd-new-desc",
+                "Start a new conversation session",
+            ),
+            (
+                "channel-telegram-cmd-clear-desc",
+                "Clear this conversation session",
+            ),
+            (
+                "channel-telegram-cmd-stop-desc",
+                "Cancel the current in-flight task",
+            ),
+            (
+                "channel-telegram-cmd-model-desc",
+                "Show or switch the current model",
+            ),
+            (
+                "channel-telegram-cmd-models-desc",
+                "List available model_providers or switch model_provider",
+            ),
+            (
+                "channel-telegram-cmd-config-desc",
+                "Show current configuration",
+            ),
+        ];
+
+        // These descriptions are sent to Telegram's setMyCommands, which rejects
+        // the whole request if any description exceeds its length limit. The
+        // channel layer truncates skill/tool descriptions at a conservative cap;
+        // the built-in menu descriptions bypass that truncation, so guard their
+        // length (across every locale) here instead — an over-long translation
+        // then fails this test rather than breaking command registration at
+        // runtime. Keep in sync with TELEGRAM_COMMAND_DESCRIPTION_MAX_LEN.
+        const MAX_DESC_CHARS: usize = 100;
+
+        let en_map = load_cli_strings("en");
+        for (key, expected_en) in keys {
+            let en_value = en_map
+                .get(key)
+                .unwrap_or_else(|| panic!("missing en value for {key}"));
+            assert!(
+                !en_value.is_empty(),
+                "en value for {key} should not be empty"
+            );
+            assert!(
+                !en_value.starts_with('{'),
+                "en value for {key} resolved to the missing-key sentinel: {en_value}"
+            );
+            assert_eq!(
+                en_value, expected_en,
+                "en value for {key} should match the pinned English wording"
+            );
+            assert!(
+                en_value.chars().count() <= MAX_DESC_CHARS,
+                "en value for {key} is {} chars, over the {MAX_DESC_CHARS}-char Telegram menu cap: {en_value}",
+                en_value.chars().count()
+            );
+
+            for locale in ["es", "fr", "ja", "zh-CN"] {
+                let map = load_cli_strings(locale);
+                let value = map
+                    .get(key)
+                    .unwrap_or_else(|| panic!("missing {locale} value for {key}"));
+                assert!(
+                    !value.is_empty(),
+                    "{locale} value for {key} should not be empty"
+                );
+                assert!(
+                    !value.starts_with('{'),
+                    "{locale} value for {key} resolved to the missing-key sentinel: {value}"
+                );
+                assert_ne!(
+                    value, en_value,
+                    "{locale} value for {key} should be translated, not just the English fallback"
+                );
+                assert!(
+                    value.chars().count() <= MAX_DESC_CHARS,
+                    "{locale} value for {key} is {} chars, over the {MAX_DESC_CHARS}-char Telegram menu cap: {value}",
+                    value.chars().count()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn telegram_command_description_falls_back_to_english_when_locale_key_is_missing() {
+        let sources = CliFtlSources {
+            locale: "fr".to_string(),
+            disk: None,
+            // A valid non-English catalog that intentionally omits the key
+            // under test, exercising built-in-locale -> English fallback.
+            builtin: Some(
+                "channel-telegram-cmd-clear-desc = Effacer cette session de conversation",
+            ),
+        };
+
+        let rendered = format_cli_string_with_args(&sources, "channel-telegram-cmd-new-desc", &[])
+            .expect("missing French command description should fall back to English");
+
+        assert_eq!(rendered, "Start a new conversation session");
+    }
+
+    #[test]
     fn disk_approval_override_cannot_rewrite_parser_commands() {
         let sources = CliFtlSources {
             locale: "es".to_string(),

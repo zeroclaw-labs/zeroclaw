@@ -372,6 +372,12 @@ channel-whatsapp-web-delivery-failure-note-many = （注意：{$count}件のWhat
 channel-line-bind-success = ✅ ペアリングしました！チャットできるようになりました。
 channel-line-bind-invalid-code = ❌ 無効なコードです。もう一度お試しください。
 channel-line-bind-rate-limited = ⏳ 試行回数が多すぎます。{ $secs }秒後に再試行してください。
+channel-telegram-cmd-new-desc = 新しい会話セッションを開始
+channel-telegram-cmd-clear-desc = この会話セッションをクリア
+channel-telegram-cmd-stop-desc = 実行中のタスクをキャンセル
+channel-telegram-cmd-model-desc = 現在のモデルを表示または切り替え
+channel-telegram-cmd-models-desc = 利用可能なモデルプロバイダーを一覧表示、またはプロバイダーを切り替え
+channel-telegram-cmd-config-desc = 現在の設定を表示
 onboard-openai-auth-note =
     OpenAI認証:
     • APIキー — platform.openai.com 経由の標準APIアクセス (sk-...)

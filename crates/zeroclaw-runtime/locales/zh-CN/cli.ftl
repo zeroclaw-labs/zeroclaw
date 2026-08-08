@@ -371,6 +371,12 @@ channel-whatsapp-web-delivery-failure-note-many = （注意：我无法传送 {$
 channel-line-bind-success = ✅ 已配对！现在可以聊天了。
 channel-line-bind-invalid-code = ❌ 代码无效。请重试。
 channel-line-bind-rate-limited = ⏳ 尝试次数过多。请在 { $secs }s 后重试。
+channel-telegram-cmd-new-desc = 开始新的对话会话
+channel-telegram-cmd-clear-desc = 清除此对话会话
+channel-telegram-cmd-stop-desc = 取消当前进行中的任务
+channel-telegram-cmd-model-desc = 显示或切换当前模型
+channel-telegram-cmd-models-desc = 列出可用的模型提供商或切换提供商
+channel-telegram-cmd-config-desc = 显示当前配置
 onboard-openai-auth-note =
     OpenAI 身份验证：
     • API 密钥 — 通过 platform.openai.com 的标准 API 访问（sk-...）
