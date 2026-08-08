@@ -9,7 +9,6 @@ use crate::sop::{SopAuditLogger, SopEngine};
 use crate::tools::{self, Tool};
 use anyhow::{Context, Result};
 use chrono::{Datelike, Timelike};
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use zeroclaw_config::schema::Config;
@@ -23,11 +22,26 @@ use zeroclaw_providers::{
 // Re-export TurnEvent from zeroclaw-types for backwards compatibility.
 pub use zeroclaw_api::agent::TurnEvent;
 
+/// The turn engine's single per-call limits authority. Aliased from the turn
+/// module so the `Agent`, its builder, and `run_tool_call_loop` all thread one
+/// type (see `crate::agent::turn::ContextLimitsResolver`).
+use crate::agent::loop_::ContextLimitsResolver;
+
+/// Provider handle, its `<type>.<alias>` reference, the resolved model name,
+/// and the route resolver bound to that provider — the four values a session
+/// needs to swap a model provider while keeping route-aware limits correct.
+type SessionModelProvider = (
+    Box<dyn ModelProvider>,
+    String,
+    String,
+    Arc<zeroclaw_providers::router::ModelRouteResolver>,
+);
+
 pub fn build_session_model_provider(
     config: &Config,
     model_provider_ref: &str,
     model_override: Option<&str>,
-) -> Result<(Box<dyn ModelProvider>, String, String)> {
+) -> Result<SessionModelProvider> {
     let (model_provider_name, model_provider_alias) = model_provider_ref
         .split_once('.')
         .map(|(t, a)| (t.to_string(), a.to_string()))
@@ -65,18 +79,24 @@ pub fn build_session_model_provider(
         &model_provider_alias,
     );
 
-    let model_provider = zeroclaw_providers::create_routed_model_provider_with_options(
-        config,
-        model_provider_ref,
-        entry.and_then(|e| e.api_key.as_deref()),
-        entry.and_then(|e| e.uri.as_deref()),
-        &config.reliability,
-        &config.model_routes,
-        &model_name,
-        &model_provider_runtime_options,
-    )?;
+    let (model_provider, model_route_resolver) =
+        zeroclaw_providers::create_routed_model_provider_with_options_and_resolver(
+            config,
+            model_provider_ref,
+            entry.and_then(|e| e.api_key.as_deref()),
+            entry.and_then(|e| e.uri.as_deref()),
+            &config.reliability,
+            &config.model_routes,
+            &model_name,
+            &model_provider_runtime_options,
+        )?;
 
-    Ok((model_provider, model_provider_name, model_name))
+    Ok((
+        model_provider,
+        model_provider_ref.to_string(),
+        model_name,
+        model_route_resolver,
+    ))
 }
 
 /// Resolve the tool dispatcher with the same provider-capability fallback
@@ -329,6 +349,9 @@ pub struct Agent {
     /// Daemon-backed sessions capture the shared live config handle so reloads
     /// affect existing sessions without duplicating config-derived state.
     structured_history_cap_resolver: Option<Arc<dyn Fn() -> usize + Send + Sync>>,
+    /// Resolves limits from canonical config for the provider/model route that
+    /// is active when a turn starts. The route itself remains the source of truth.
+    context_limits_resolver: Option<ContextLimitsResolver>,
     multimodal_config: zeroclaw_config::schema::MultimodalConfig,
     model_name: String,
     model_provider_name: String,
@@ -349,8 +372,9 @@ pub struct Agent {
     /// by this Agent. User text is never inferred to be synthetic by content.
     history_has_trim_breadcrumb: bool,
     classification_config: zeroclaw_config::schema::QueryClassificationConfig,
-    available_hints: Vec<String>,
-    route_model_by_hint: HashMap<String, String>,
+    /// The exact immutable route table used by `model_provider` for hint
+    /// dispatch. It is replaced atomically with the provider on model switch.
+    model_route_resolver: Arc<zeroclaw_providers::router::ModelRouteResolver>,
     response_cache: Option<Arc<zeroclaw_memory::response_cache::ResponseCache>>,
     /// Pre-rendered security policy summary injected into the system prompt
     /// so the LLM knows the concrete constraints before making tool calls.
@@ -413,6 +437,16 @@ impl Drop for Agent {
 pub struct StreamedTurnSuccess {
     pub response: String,
     pub new_messages: Vec<ConversationMessage>,
+    /// Provider profile that served the final round.
+    pub provider_name: String,
+    /// Model that served the final round.
+    pub model: String,
+    /// Capacity + proactive-trim budget for the route that actually served the
+    /// final LLM call. Sourced from the loop's served-route sink so a per-call
+    /// vision switch is reflected here even when the provider returned no usage;
+    /// consumers publish the terminal context snapshot from this pair. `None`
+    /// only when no call was served (e.g. an immediate cache hit).
+    pub final_context_limits: Option<zeroclaw_config::schema::ResolvedContextLimits>,
 }
 
 #[derive(Debug)]
@@ -491,6 +525,7 @@ pub struct AgentBuilder {
     memory_inject_cfg: Option<crate::agent::memory_inject::MemoryInjectConfig>,
     config: Option<zeroclaw_config::schema::AliasedAgentConfig>,
     structured_history_cap_resolver: Option<Arc<dyn Fn() -> usize + Send + Sync>>,
+    context_limits_resolver: Option<ContextLimitsResolver>,
     multimodal_config: Option<zeroclaw_config::schema::MultimodalConfig>,
     model_name: Option<String>,
     model_provider_name: Option<String>,
@@ -503,8 +538,7 @@ pub struct AgentBuilder {
     auto_save: Option<bool>,
     memory_session_id: Option<String>,
     classification_config: Option<zeroclaw_config::schema::QueryClassificationConfig>,
-    available_hints: Option<Vec<String>>,
-    route_model_by_hint: Option<HashMap<String, String>>,
+    model_route_resolver: Option<Arc<zeroclaw_providers::router::ModelRouteResolver>>,
     allowed_tools: Option<Vec<String>>,
     response_cache: Option<Arc<zeroclaw_memory::response_cache::ResponseCache>>,
     security_summary: Option<String>,
@@ -541,6 +575,7 @@ impl AgentBuilder {
             memory_inject_cfg: None,
             config: None,
             structured_history_cap_resolver: None,
+            context_limits_resolver: None,
             multimodal_config: None,
             model_name: None,
             model_provider_name: None,
@@ -553,8 +588,7 @@ impl AgentBuilder {
             auto_save: None,
             memory_session_id: None,
             classification_config: None,
-            available_hints: None,
-            route_model_by_hint: None,
+            model_route_resolver: None,
             allowed_tools: None,
             response_cache: None,
             security_summary: None,
@@ -625,6 +659,11 @@ impl AgentBuilder {
         resolver: Arc<dyn Fn() -> usize + Send + Sync>,
     ) -> Self {
         self.structured_history_cap_resolver = Some(resolver);
+        self
+    }
+
+    fn context_limits_resolver(mut self, resolver: ContextLimitsResolver) -> Self {
+        self.context_limits_resolver = Some(resolver);
         self
     }
 
@@ -705,13 +744,11 @@ impl AgentBuilder {
         self
     }
 
-    pub fn available_hints(mut self, available_hints: Vec<String>) -> Self {
-        self.available_hints = Some(available_hints);
-        self
-    }
-
-    pub fn route_model_by_hint(mut self, route_model_by_hint: HashMap<String, String>) -> Self {
-        self.route_model_by_hint = Some(route_model_by_hint);
+    pub fn model_route_resolver(
+        mut self,
+        model_route_resolver: Arc<zeroclaw_providers::router::ModelRouteResolver>,
+    ) -> Self {
+        self.model_route_resolver = Some(model_route_resolver);
         self
     }
 
@@ -842,6 +879,17 @@ impl AgentBuilder {
             })?
         };
         let config = self.config.unwrap_or_default();
+        let model_name = self.model_name.unwrap_or_else(|| "<unconfigured>".into());
+        let model_provider_name = self
+            .model_provider_name
+            .unwrap_or_else(|| "<unconfigured>".into());
+        let model_route_resolver = self.model_route_resolver.unwrap_or_else(|| {
+            Arc::new(zeroclaw_providers::router::ModelRouteResolver::new(
+                Vec::new(),
+                model_provider_name.clone(),
+                model_name.clone(),
+            ))
+        });
 
         Ok(Agent {
             model_provider: self.model_provider.ok_or_else(|| {
@@ -887,11 +935,10 @@ impl AgentBuilder {
             }),
             config,
             structured_history_cap_resolver: self.structured_history_cap_resolver,
+            context_limits_resolver: self.context_limits_resolver,
             multimodal_config: self.multimodal_config.unwrap_or_default(),
-            model_name: self.model_name.unwrap_or_else(|| "<unconfigured>".into()),
-            model_provider_name: self
-                .model_provider_name
-                .unwrap_or_else(|| "<unconfigured>".into()),
+            model_name,
+            model_provider_name,
             temperature: self.temperature,
             // Default for test callers that don't call workspace_dir().
             workspace_dir: self
@@ -915,8 +962,7 @@ impl AgentBuilder {
             history: Vec::new(),
             history_has_trim_breadcrumb: false,
             classification_config: self.classification_config.unwrap_or_default(),
-            available_hints: self.available_hints.unwrap_or_default(),
-            route_model_by_hint: self.route_model_by_hint.unwrap_or_default(),
+            model_route_resolver,
             response_cache: self.response_cache,
             security_summary: self.security_summary,
             approval_route: self.approval_route,
@@ -1021,6 +1067,26 @@ impl Agent {
             self.agent_alias.clone(),
             self.model_provider_name.clone(),
             self.model_name.clone(),
+        )
+    }
+
+    /// Capacity and proactive-trim budget for the currently selected route.
+    /// This is resolved on demand so a model/provider switch cannot leave a
+    /// stale snapshot in a long-lived session.
+    pub fn context_limits(&self) -> zeroclaw_config::schema::ResolvedContextLimits {
+        self.context_limits_for_route(&self.model_provider_name, &self.model_name)
+    }
+
+    /// Resolve capacity and proactive budget for a route selected for the
+    /// current turn, including values supplied by a live-config resolver.
+    pub fn context_limits_for_route(
+        &self,
+        provider_name: &str,
+        model: &str,
+    ) -> zeroclaw_config::schema::ResolvedContextLimits {
+        self.context_limits_resolver.as_ref().map_or_else(
+            || self.config.resolved.context_limits(),
+            |resolve| resolve(provider_name, model),
         )
     }
 
@@ -1166,6 +1232,29 @@ impl Agent {
 
     pub fn set_model_provider_name(&mut self, model_provider_name: String) {
         self.model_provider_name = model_provider_name;
+    }
+
+    /// Install the route resolver that belongs to a newly swapped provider.
+    /// The resolver holds the hint→provider/model route table bound to a
+    /// specific provider set, so it MUST be replaced together with the provider
+    /// box (see `set_model_provider`); otherwise a routed hint resolves through
+    /// the previous provider's table while the new provider serves the call.
+    pub fn set_model_route_resolver(
+        &mut self,
+        model_route_resolver: Arc<zeroclaw_providers::router::ModelRouteResolver>,
+    ) {
+        self.model_route_resolver = model_route_resolver;
+    }
+
+    /// Resolve a selector through the agent's CURRENT route resolver. Test-only
+    /// accessor so cross-module tests (e.g. RPC session refresh) can assert the
+    /// resolver was replaced together with the provider box.
+    #[cfg(test)]
+    pub(crate) fn resolved_route_for_test(
+        &self,
+        selector: &str,
+    ) -> zeroclaw_providers::router::ResolvedModelRoute {
+        self.model_route_resolver.resolve(selector)
     }
 
     pub fn set_tool_dispatcher(&mut self, tool_dispatcher: Box<dyn ToolDispatcher>) {
@@ -1638,8 +1727,8 @@ impl Agent {
             provider_alias,
         );
 
-        let model_provider: Box<dyn ModelProvider> =
-            zeroclaw_providers::create_routed_model_provider_with_options(
+        let (model_provider, model_route_resolver) =
+            zeroclaw_providers::create_routed_model_provider_with_options_and_resolver(
                 config,
                 &provider_ref,
                 agent_model_provider.and_then(|e| e.api_key.as_deref()),
@@ -1651,13 +1740,6 @@ impl Agent {
             )?;
 
         let tool_dispatcher = tool_dispatcher_for_provider(agent_cfg, model_provider.as_ref());
-
-        let route_model_by_hint: HashMap<String, String> = config
-            .model_routes
-            .iter()
-            .map(|route| (route.hint.clone(), route.model.clone()))
-            .collect();
-        let available_hints: Vec<String> = route_model_by_hint.keys().cloned().collect();
 
         let response_cache = if config.memory.response_cache_enabled {
             zeroclaw_memory::response_cache::ResponseCache::with_hot_cache(
@@ -1677,6 +1759,28 @@ impl Agent {
         } else {
             ApprovalManager::for_non_interactive(risk_profile)
         };
+
+        let context_limits_resolver: ContextLimitsResolver =
+            if let Some(limit_config) = live_config.as_ref().map(Arc::clone) {
+                let limit_agent_alias = agent_alias.to_string();
+                Arc::new(move |provider_ref, model| {
+                    limit_config.read().resolved_context_limits_for_route(
+                        &limit_agent_alias,
+                        provider_ref,
+                        model,
+                    )
+                })
+            } else {
+                let limit_config = config.clone();
+                let limit_agent_alias = agent_alias.to_string();
+                Arc::new(move |provider_ref, model| {
+                    limit_config.resolved_context_limits_for_route(
+                        &limit_agent_alias,
+                        provider_ref,
+                        model,
+                    )
+                })
+            };
 
         let structured_history_cap_resolver: Arc<dyn Fn() -> usize + Send + Sync> =
             if let Some(cap_config) = live_config {
@@ -1711,16 +1815,16 @@ impl Agent {
                     .unwrap_or_else(|| agent_cfg.clone()),
             )
             .structured_history_cap_resolver(structured_history_cap_resolver)
+            .context_limits_resolver(context_limits_resolver)
             .multimodal_config(config.multimodal.clone())
             .agent_alias(agent_alias.to_string())
             .model_name(model_name)
-            .model_provider_name(provider_name.to_string())
+            .model_provider_name(provider_ref)
             .temperature(agent_model_provider.and_then(|e| e.temperature))
             .workspace_dir(security.workspace_dir.clone())
             .agent_workspace_dir(agent_workspace.clone())
             .classification_config(config.query_classification.clone())
-            .available_hints(available_hints)
-            .route_model_by_hint(route_model_by_hint)
+            .model_route_resolver(model_route_resolver)
             .identity_config(agent_cfg.identity.clone())
             .skills(skills)
             .skills_prompt_mode(config.effective_skills_prompt_mode(agent_alias))
@@ -2010,7 +2114,10 @@ impl Agent {
             )
         );
 
-        let switch_outcome: anyhow::Result<Box<dyn ModelProvider>> = match self
+        let switch_outcome: anyhow::Result<(
+            Box<dyn ModelProvider>,
+            Arc<zeroclaw_providers::router::ModelRouteResolver>,
+        )> = match self
             .provider_switch_config
             .as_ref()
             .and_then(|cfg| cfg.config.as_ref())
@@ -2046,7 +2153,7 @@ impl Agent {
                     })
                     .unwrap_or_default();
 
-                zeroclaw_providers::create_routed_model_provider_with_options(
+                zeroclaw_providers::create_routed_model_provider_with_options_and_resolver(
                     full_config.as_ref(),
                     &new_model_provider,
                     api_key,
@@ -2064,10 +2171,11 @@ impl Agent {
         };
 
         match switch_outcome {
-            Ok(new_prov) => {
+            Ok((new_prov, new_route_resolver)) => {
                 // Commit state only after the provider was built
                 // successfully.
                 self.model_provider = new_prov;
+                self.model_route_resolver = new_route_resolver;
                 self.model_provider_name = new_model_provider;
                 self.model_name = new_model.clone();
                 Some(new_model)
@@ -2091,12 +2199,11 @@ impl Agent {
     fn classify_model(&self, user_message: &str) -> String {
         if let Some(decision) =
             super::classifier::classify_with_decision(&self.classification_config, user_message)
-            && self.available_hints.contains(&decision.hint)
+            && self.model_route_resolver.has_hint(&decision.hint)
         {
             let resolved_model = self
-                .route_model_by_hint
-                .get(&decision.hint)
-                .map(String::as_str)
+                .model_route_resolver
+                .configured_model_for_hint(&decision.hint)
                 .unwrap_or("unknown");
             ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"hint": decision.hint.as_str(), "model": resolved_model, "rule_priority": decision.priority, "message_length": user_message.len()})), "Classified message route");
             return format!("hint:{}", decision.hint);
@@ -2106,7 +2213,7 @@ impl Agent {
         if let Some(ref ac) = self.config.resolved.auto_classify {
             let tier = super::eval::estimate_complexity(user_message);
             if let Some(hint) = ac.hint_for(tier)
-                && self.available_hints.contains(&hint.to_string())
+                && self.model_route_resolver.has_hint(hint)
             {
                 ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"hint": hint, "complexity": format!("{:?}", tier), "message_length": user_message.len()})), "Auto-classified by complexity");
                 return format!("hint:{hint}");
@@ -2248,13 +2355,16 @@ impl Agent {
         }
 
         let effective_model = self.classify_model(user_message);
+        let selected_route = self.model_route_resolver.resolve(&effective_model);
+        let context_limits =
+            self.context_limits_for_route(&selected_route.provider_name, &selected_route.model);
 
         let turn_id = Self::new_turn_id();
         let turn_observer = Arc::clone(&self.observer);
         let mut guard = crate::observability::AgentTurnGuard::start(
             turn_observer.as_ref(),
-            self.model_provider_name.clone(),
-            effective_model.clone(),
+            selected_route.provider_name.clone(),
+            selected_route.model.clone(),
             Some(self.channel_name.clone()),
             self.observer_agent_alias(),
             Some(turn_id.clone()),
@@ -2304,7 +2414,8 @@ impl Agent {
                     self.model_provider.as_ref(),
                     &base_provider_messages,
                     &self.multimodal_config,
-                    &self.model_provider_name,
+                    &selected_route.provider_name,
+                    &selected_route.model,
                     &effective_model,
                 ) {
                     Ok(resolved) => resolved,
@@ -2387,8 +2498,9 @@ impl Agent {
                         exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
                             crate::agent::loop_::ResolvedModelAccess {
                                 model_provider: self.model_provider.as_ref(),
-                                provider_name: &self.model_provider_name,
-                                model: &effective_model,
+                                provider_name: &selected_route.provider_name,
+                                model: &selected_route.model,
+                                dispatch_model: &effective_model,
                                 temperature: self.temperature,
                             },
                             crate::agent::loop_::ResolvedIo {
@@ -2418,10 +2530,8 @@ impl Agent {
                                 strict_tool_parsing: self.config.resolved.strict_tool_parsing,
                                 parallel_tools: self.config.resolved.parallel_tools,
                                 max_tool_result_chars: self.config.resolved.max_tool_result_chars,
-                                context_token_budget: self
-                                    .config
-                                    .resolved
-                                    .effective_context_budget(),
+                                context_limits,
+                                context_limits_resolver: self.context_limits_resolver.clone(),
                                 knobs: &knobs,
                             },
                         ),
@@ -2452,6 +2562,10 @@ impl Agent {
                         agent_alias: agent_alias_for_loop.as_deref(),
                         parent_agent_alias: None,
                         turn_id: &turn_id,
+                        // Non-streamed `Agent::turn` returns text, not a
+                        // terminal `StreamedTurnSuccess`, so it publishes no
+                        // route snapshot.
+                        served_route_sink: None,
                         // Live-daemon SOP path: re-assemble a nested step's agent
                         // when it delegates elsewhere. Config survives only via
                         // `provider_switch_config`; with `None` (test builder) a
@@ -2598,6 +2712,7 @@ impl Agent {
         // (handled in the round loop's `ModelSwitchRequested` arm via
         // `try_apply_model_switch`) can rebind it for later rounds
         let mut effective_model = self.classify_model(user_message);
+        let mut selected_route = self.model_route_resolver.resolve(&effective_model);
         let turn_id = Self::new_turn_id();
         let mut committed_response = String::new();
         // Requested-vs-served divergence for THIS turn. Source of truth is the
@@ -2609,8 +2724,8 @@ impl Agent {
         let turn_observer = Arc::clone(&self.observer);
         let mut guard = crate::observability::AgentTurnGuard::start(
             turn_observer.as_ref(),
-            self.model_provider_name.clone(),
-            effective_model.clone(),
+            selected_route.provider_name.clone(),
+            selected_route.model.clone(),
             Some(self.channel_name.clone()),
             self.observer_agent_alias(),
             Some(turn_id.clone()),
@@ -2626,7 +2741,8 @@ impl Agent {
                     self.model_provider.as_ref(),
                     &base_provider_messages,
                     &self.multimodal_config,
-                    &self.model_provider_name,
+                    &selected_route.provider_name,
+                    &selected_route.model,
                     &effective_model,
                 ) {
                     Ok(resolved) => resolved,
@@ -2676,6 +2792,12 @@ impl Agent {
                 return Ok(StreamedTurnSuccess {
                     response: committed_response,
                     new_messages: new_msgs,
+                    provider_name: selected_route.provider_name.clone(),
+                    model: selected_route.model.clone(),
+                    // Cache hit: no LLM call was served, so there is no
+                    // per-call route snapshot. The gateway falls back to
+                    // resolving limits from the selected route.
+                    final_context_limits: None,
                 });
             }
             self.observer.record_event(&ObserverEvent::CacheMiss {
@@ -2724,6 +2846,13 @@ impl Agent {
         );
 
         // ── Round loop: one tool-call-loop run per steering round ──────────
+        // Sink the loop writes the final serving route into each round, so the
+        // terminal `StreamedTurnSuccess` carries the route/limits that actually
+        // served the last call — including a per-call vision switch — even when
+        // the provider returned no usage. Carried across rounds; the last write
+        // wins.
+        let served_route_sink: crate::agent::loop_::ServedRouteSink =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
         for round in 0..self.config.resolved.max_tool_iterations {
             // Early exit if the caller cancelled this turn (e.g. user abort)
             if cancel_token
@@ -2789,8 +2918,9 @@ impl Agent {
                         exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
                             crate::agent::loop_::ResolvedModelAccess {
                                 model_provider: self.model_provider.as_ref(),
-                                provider_name: &self.model_provider_name,
-                                model: &effective_model,
+                                provider_name: &selected_route.provider_name,
+                                model: &selected_route.model,
+                                dispatch_model: &effective_model,
                                 temperature: self.temperature,
                             },
                             crate::agent::loop_::ResolvedIo {
@@ -2826,10 +2956,13 @@ impl Agent {
                                 strict_tool_parsing: self.config.resolved.strict_tool_parsing,
                                 parallel_tools: self.config.resolved.parallel_tools,
                                 max_tool_result_chars: self.config.resolved.max_tool_result_chars,
-                                context_token_budget: self
-                                    .config
-                                    .resolved
-                                    .effective_context_budget(),
+                                // Fallback pair for the loop when no resolver is
+                                // wired; when `context_limits_resolver` is set
+                                // the loop re-resolves per call, so seed with the
+                                // resolver-free config limits instead of invoking
+                                // the resolver a second time here.
+                                context_limits: self.config.resolved.context_limits(),
+                                context_limits_resolver: self.context_limits_resolver.clone(),
                                 knobs: &knobs,
                             },
                         ),
@@ -2860,6 +2993,7 @@ impl Agent {
                         agent_alias: agent_alias_for_loop.as_deref(),
                         parent_agent_alias: None,
                         turn_id: &turn_id,
+                        served_route_sink: Some(served_route_sink.clone()),
                         // Live-daemon SOP path: re-assemble a nested step's
                         // agent when it delegates elsewhere. Config survives
                         // only via `provider_switch_config`; with `None`
@@ -2958,9 +3092,62 @@ impl Agent {
                         &event_tx,
                     )
                     .await;
+                    // Prefer the route that actually served the final call
+                    // (a per-call vision switch differs from the selected text
+                    // route); fall back to the selected route when no call was
+                    // served this turn.
+                    let served = served_route_sink
+                        .lock()
+                        .expect("served-route sink lock")
+                        .clone();
+                    let (final_provider, final_model, final_limits, final_reported_usage) =
+                        match served {
+                            Some(route) => (
+                                route.provider_name,
+                                route.model,
+                                Some(route.context_limits),
+                                route.reported_usage,
+                            ),
+                            None => (
+                                selected_route.provider_name.clone(),
+                                selected_route.model.clone(),
+                                None,
+                                false,
+                            ),
+                        };
+                    // Publish one terminal context snapshot for the final served
+                    // route only when that final call emitted no usage-bearing
+                    // frame of its own. A no-usage final call (e.g. a vision reply
+                    // without token usage) otherwise leaves the client meter on an
+                    // earlier route's numbers; this authoritative frame carries the
+                    // final route's budget/window even with no token counts. When
+                    // the final call already reported usage, its per-call frame
+                    // carried the route limits and this snapshot would be redundant.
+                    //
+                    // The gate keys on the FINAL served call's usage — not the
+                    // turn's cumulative usage — so a multi-iteration turn whose
+                    // earlier call reported usage but whose final call switched to
+                    // a usage-less route still publishes the final route's window.
+                    if let Some(limits) = final_limits.filter(|_| !final_reported_usage) {
+                        let _ = event_tx
+                            .send(TurnEvent::Usage {
+                                input_tokens: None,
+                                cached_input_tokens: None,
+                                output_tokens: None,
+                                cost_usd: None,
+                                context_token_budget: Some(limits.context_token_budget as u64),
+                                model_context_window: limits
+                                    .configured_model_context_window()
+                                    .map(|t| t as u64),
+                            })
+                            .await;
+                    }
                     return Ok(StreamedTurnSuccess {
                         response: committed_response,
                         new_messages: new_msgs,
+                        provider_name: final_provider,
+                        model: final_model,
+                        final_context_limits: final_limits,
                     });
                 }
                 Err(error) => {
@@ -2995,6 +3182,7 @@ impl Agent {
                         let notice = self.trim_history(Some(&turn_id));
                         forward_history_trim_notice(&event_tx, notice).await;
                         effective_model = new_effective_model;
+                        selected_route = self.model_route_resolver.resolve(&effective_model);
                         continue;
                     }
                     // Rebuild the committed text from the failed round's plain
@@ -4876,7 +5064,11 @@ mod tests {
             responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
                 text: Some("classified".into()),
                 tool_calls: vec![],
-                usage: None,
+                usage: Some(zeroclaw_providers::traits::TokenUsage {
+                    input_tokens: Some(100),
+                    cached_input_tokens: None,
+                    output_tokens: Some(20),
+                }),
                 reasoning_content: None,
             }]),
             seen_models: seen_models.clone(),
@@ -4892,8 +5084,17 @@ mod tests {
         );
 
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        let mut route_model_by_hint = HashMap::new();
-        route_model_by_hint.insert("fast".to_string(), "anthropic/claude-haiku-4-5".to_string());
+        let model_route_resolver = Arc::new(zeroclaw_providers::router::ModelRouteResolver::new(
+            vec![(
+                "fast".to_string(),
+                zeroclaw_providers::router::Route {
+                    provider_name: "anthropic.fast".to_string(),
+                    model: "anthropic/claude-haiku-4-5".to_string(),
+                },
+            )],
+            "custom.default".to_string(),
+            "default-model".to_string(),
+        ));
         let mut agent = Agent::builder()
             .model_provider(model_provider)
             .tools(vec![Box::new(MockTool)])
@@ -4912,15 +5113,51 @@ mod tests {
                     priority: 10,
                 }],
             })
-            .available_hints(vec!["fast".to_string()])
-            .route_model_by_hint(route_model_by_hint)
+            .model_route_resolver(model_route_resolver)
             .build()
             .expect("agent builder should succeed with valid config");
+        let resolved_routes = Arc::new(Mutex::new(Vec::new()));
+        let resolved_routes_capture = Arc::clone(&resolved_routes);
+        agent.context_limits_resolver = Some(Arc::new(move |provider, model| {
+            resolved_routes_capture
+                .lock()
+                .push((provider.to_string(), model.to_string()));
+            zeroclaw_config::schema::ResolvedContextLimits {
+                model_context_window: 200_000,
+                context_token_budget: 160_000,
+                model_context_window_source:
+                    zeroclaw_config::schema::ModelContextWindowSource::Configured,
+            }
+        }));
 
-        let response = agent.turn("quick summary please").await.unwrap();
-        assert_eq!(response, "classified");
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+        let outcome = agent
+            .turn_streamed_with_steering_state("quick summary please", event_tx, None, None)
+            .await
+            .unwrap();
+        assert_eq!(outcome.response, "classified");
+        assert_eq!(outcome.provider_name, "anthropic.fast");
+        assert_eq!(outcome.model, "anthropic/claude-haiku-4-5");
         let seen = seen_models.lock();
         assert_eq!(seen.as_slice(), &["hint:fast".to_string()]);
+        assert_eq!(
+            resolved_routes.lock().as_slice(),
+            &[(
+                "anthropic.fast".to_string(),
+                "anthropic/claude-haiku-4-5".to_string(),
+            )]
+        );
+        let usage = std::iter::from_fn(|| event_rx.try_recv().ok())
+            .find(|event| matches!(event, TurnEvent::Usage { .. }))
+            .expect("the routed call should emit usage");
+        assert!(matches!(
+            usage,
+            TurnEvent::Usage {
+                context_token_budget: Some(160_000),
+                model_context_window: Some(200_000),
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -9189,6 +9426,233 @@ mod tests {
         assert_all_events_share_turn_id(&events, Some("test-agent"), Some("agent"));
     }
 
+    // B4: a streamed turn whose final (and only) provider call returns
+    // `usage: None` must still publish a terminal `TurnEvent::Usage` carrying the
+    // served route's budget/window, so the client meter reflects the final route
+    // instead of staying blank or stuck on an earlier snapshot.
+    #[tokio::test]
+    async fn streamed_turn_publishes_terminal_context_snapshot_without_usage() {
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        // Single response with no token usage.
+        let model_provider = Box::new(MockModelProvider {
+            responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                text: Some("done".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            }]),
+        });
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .model_provider(model_provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .agent_alias("test-agent".into())
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let _ = agent
+            .turn_streamed_with_steering_state("hello", event_tx, None, None)
+            .await
+            .expect("streamed turn should succeed");
+
+        let mut terminal_usage = None;
+        while let Ok(ev) = event_rx.try_recv() {
+            if let TurnEvent::Usage {
+                input_tokens,
+                output_tokens,
+                context_token_budget,
+                model_context_window,
+                ..
+            } = ev
+            {
+                // The terminal snapshot carries route limits but no token counts.
+                if input_tokens.is_none() && output_tokens.is_none() {
+                    terminal_usage = Some((context_token_budget, model_context_window));
+                }
+            }
+        }
+        let (budget, window) = terminal_usage
+            .expect("a terminal Usage snapshot must fire even without provider usage");
+        // Default builder has no configured capacity -> 32k compatibility
+        // fallback budget, and the window is omitted (not configured truth).
+        assert_eq!(
+            budget,
+            Some(zeroclaw_config::schema::LEGACY_DEFAULT_CONTEXT_BUDGET as u64)
+        );
+        assert_eq!(
+            window, None,
+            "compatibility-fallback capacity is omitted from the wire snapshot"
+        );
+    }
+
+    // A provider that returns `Some(usage)` with `None` token counts (kilocli,
+    // gemini-cli) still emits a per-call frame carrying the route limits. The
+    // terminal snapshot must NOT also fire, or the client would get two frames
+    // for one call. The gate keys on whether a per-call frame was emitted, not
+    // on whether token counts were present.
+    #[tokio::test]
+    async fn no_terminal_snapshot_when_call_emits_usage_frame_without_token_counts() {
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        // Single response carrying usage WITHOUT token counts (kilocli-style).
+        let model_provider = Box::new(MockModelProvider {
+            responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                text: Some("done".into()),
+                tool_calls: vec![],
+                usage: Some(zeroclaw_providers::traits::TokenUsage::default()),
+                reasoning_content: None,
+            }]),
+        });
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .model_provider(model_provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .agent_alias("test-agent".into())
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let _ = agent
+            .turn_streamed_with_steering_state("hello", event_tx, None, None)
+            .await
+            .expect("streamed turn should succeed");
+
+        let usage_frames = std::iter::from_fn(|| event_rx.try_recv().ok())
+            .filter(|ev| matches!(ev, TurnEvent::Usage { .. }))
+            .count();
+        assert_eq!(
+            usage_frames, 1,
+            "a usage frame with no token counts must not also trigger a terminal snapshot"
+        );
+    }
+
+    // A multi-iteration turn whose earlier call reports usage but whose final
+    // call returns no usage must still publish a terminal snapshot for the final
+    // served route. The gate keys on the FINAL call's usage, not the turn's
+    // cumulative usage, so the earlier usage-bearing frame does not suppress the
+    // authoritative final-route window.
+    #[tokio::test]
+    async fn terminal_snapshot_fires_when_only_final_call_lacks_usage() {
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        // Call 1: a tool request WITH usage (drives iteration 2 and emits a
+        // usage-bearing per-call frame). Call 2: the final response WITHOUT usage.
+        let model_provider = Box::new(MockModelProvider {
+            responses: Mutex::new(vec![
+                zeroclaw_providers::ChatResponse {
+                    text: Some("calling tool".into()),
+                    tool_calls: vec![zeroclaw_providers::ToolCall {
+                        id: "tc1".into(),
+                        name: "echo".into(),
+                        arguments: "{}".into(),
+                        extra_content: None,
+                    }],
+                    usage: Some(zeroclaw_providers::traits::TokenUsage {
+                        input_tokens: Some(100),
+                        cached_input_tokens: None,
+                        output_tokens: Some(20),
+                    }),
+                    reasoning_content: None,
+                },
+                zeroclaw_providers::ChatResponse {
+                    text: Some("final answer".into()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                },
+            ]),
+        });
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .model_provider(model_provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .agent_alias("test-agent".into())
+            .build()
+            .expect("agent builder should succeed with valid config");
+        // A resolver so the served route carries a configured window distinct
+        // from the 32k compatibility fallback; the terminal frame must carry it.
+        agent.context_limits_resolver = Some(Arc::new(|_provider, _model| {
+            zeroclaw_config::schema::ResolvedContextLimits {
+                model_context_window: 200_000,
+                context_token_budget: 180_000,
+                model_context_window_source:
+                    zeroclaw_config::schema::ModelContextWindowSource::Configured,
+            }
+        }));
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let _ = agent
+            .turn_streamed_with_steering_state("hello", event_tx, None, None)
+            .await
+            .expect("streamed turn should succeed");
+
+        let mut usage_frames = 0usize;
+        let mut terminal_snapshot = None;
+        while let Ok(ev) = event_rx.try_recv() {
+            if let TurnEvent::Usage {
+                input_tokens,
+                output_tokens,
+                context_token_budget,
+                model_context_window,
+                ..
+            } = ev
+            {
+                usage_frames += 1;
+                // The terminal snapshot carries route limits but no token counts.
+                if input_tokens.is_none() && output_tokens.is_none() {
+                    terminal_snapshot = Some((context_token_budget, model_context_window));
+                }
+            }
+        }
+        // One usage-bearing frame from call 1, plus the terminal snapshot.
+        assert_eq!(
+            usage_frames, 2,
+            "expected the call-1 usage frame and a terminal snapshot for the usage-less final call"
+        );
+        let (budget, window) = terminal_snapshot.expect(
+            "the final usage-less call must publish a terminal snapshot despite the earlier \
+             usage-bearing call",
+        );
+        assert_eq!(budget, Some(180_000));
+        assert_eq!(
+            window,
+            Some(200_000),
+            "the terminal snapshot must carry the final served route's configured window"
+        );
+    }
+
     fn build_test_agent(
         initial_provider_name: &str,
         initial_model_name: &str,
@@ -9306,6 +9770,57 @@ mod tests {
             "provider_name must update on a provider-only switch"
         );
         assert_eq!(agent.model_name, "shared-name");
+    }
+
+    #[test]
+    fn model_switch_re_resolves_context_limits_for_new_route() {
+        let switch_cfg = ProviderSwitchConfig {
+            config: Some(std::sync::Arc::new(
+                zeroclaw_config::schema::Config::default(),
+            )),
+        };
+        let mut agent = build_test_agent("ollama.large", "large", Some(switch_cfg));
+        agent.context_limits_resolver = Some(Arc::new(|provider_ref, model| {
+            match (provider_ref, model) {
+                ("ollama.large", "large") => zeroclaw_config::schema::ResolvedContextLimits {
+                    model_context_window: 200_000,
+                    context_token_budget: 180_000,
+                    model_context_window_source:
+                        zeroclaw_config::schema::ModelContextWindowSource::Configured,
+                },
+                ("ollama.small", "small") => zeroclaw_config::schema::ResolvedContextLimits {
+                    model_context_window: 8_000,
+                    context_token_budget: 7_200,
+                    model_context_window_source:
+                        zeroclaw_config::schema::ModelContextWindowSource::Configured,
+                },
+                _ => zeroclaw_config::schema::ResolvedContextLimits {
+                    model_context_window: 32_000,
+                    context_token_budget: 32_000,
+                    model_context_window_source:
+                        zeroclaw_config::schema::ModelContextWindowSource::CompatibilityFallback,
+                },
+            }
+        }));
+
+        assert_eq!(agent.context_limits().context_token_budget, 180_000);
+        let switched =
+            agent.try_apply_model_switch("large", "ollama.small".to_string(), "small".to_string());
+
+        assert_eq!(switched.as_deref(), Some("small"));
+        let selected = agent.model_route_resolver.resolve("small");
+        assert_eq!(selected.provider_name, "ollama.small");
+        assert_eq!(selected.model, "small");
+        assert_eq!(
+            agent.context_limits(),
+            zeroclaw_config::schema::ResolvedContextLimits {
+                model_context_window: 8_000,
+                context_token_budget: 7_200,
+                model_context_window_source:
+                    zeroclaw_config::schema::ModelContextWindowSource::Configured,
+            },
+            "provider/model and their limits must change as one session state transition"
+        );
     }
 
     #[test]

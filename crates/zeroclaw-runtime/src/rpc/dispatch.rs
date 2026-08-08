@@ -528,7 +528,7 @@ impl RpcDispatcher {
 
     async fn forward_seed_event(&self, session_id: &str, event: Option<TurnEvent>) {
         if let Some(event) = event
-            && let Some(notification) = notification_for_turn_event(session_id, &event, None)
+            && let Some(notification) = notification_for_turn_event(session_id, &event)
         {
             let _ = self.rpc.send_raw(notification).await;
         }
@@ -1010,6 +1010,11 @@ impl RpcDispatcher {
     #[cfg(test)]
     pub async fn handle_session_messages_for_test(&self, params: &Value) -> RpcResult {
         self.handle_session_messages(params).await
+    }
+
+    #[cfg(test)]
+    pub async fn handle_session_configure_for_test(&self, params: &Value) -> RpcResult {
+        self.handle_session_configure(params).await
     }
 
     /// Drive a full JSON-RPC request line through the dispatcher from an
@@ -1726,12 +1731,10 @@ impl RpcDispatcher {
             .chat_mode(sid)
             .await
             .unwrap_or(crate::rpc::types::ChatMode::Chat);
-        // Capture live attribution fields and max_context_tokens for the turn span.
-        // Zerocode's context meter field is named `max_context_tokens` and must
-        // reflect the runtime-profile budget (`[runtime_profiles.<name>]
-        // max_context_tokens`), not the provider model-window helper (which
-        // falls back to 32_000 when `context_window` is unset).
-        let (agent_alias, model_provider, model, max_ctx) = {
+        // Capture live attribution fields for the turn span. Context limits are
+        // emitted by the model-call event itself so a mid-session route switch
+        // cannot leave the meter on a precomputed provider/model snapshot.
+        let (agent_alias, model_provider, model) = {
             let alias = self
                 .ctx
                 .sessions
@@ -1744,11 +1747,7 @@ impl RpcDispatcher {
             } else {
                 (String::new(), String::new())
             };
-            let max_ctx = {
-                let cfg = self.ctx.config.read();
-                Some(context_usage_max_tokens(&cfg, &alias))
-            };
-            (alias, mp, m, max_ctx)
+            (alias, mp, m)
         };
 
         let rpc = self.rpc.clone();
@@ -1813,7 +1812,7 @@ impl RpcDispatcher {
                     }
                     persist_plan_if_any(&sessions_for_plan, acp_token_store.as_ref(), &sid, &event)
                         .await;
-                    if let Some(n) = notification_for_turn_event(&sid, &event, max_ctx) {
+                    if let Some(n) = notification_for_turn_event(&sid, &event) {
                         let _ = rpc.send_raw(n).await;
                     }
                 }
@@ -2080,7 +2079,7 @@ impl RpcDispatcher {
                     .model_provider
                     .as_deref()
                     .unwrap_or_else(|| agent_cfg.model_provider.as_str());
-                let (model_provider, model_provider_name, model_name) =
+                let (model_provider, model_provider_name, model_name, model_route_resolver) =
                     crate::agent::agent::build_session_model_provider(
                         &config,
                         model_provider_ref,
@@ -2095,6 +2094,7 @@ impl RpcDispatcher {
                     model_provider,
                     model_provider_name,
                     model_name,
+                    model_route_resolver,
                     tool_dispatcher,
                 )
             };
@@ -2110,8 +2110,13 @@ impl RpcDispatcher {
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
 
-        if let Some((model_provider, model_provider_name, model_name, tool_dispatcher)) =
-            built_model_provider
+        if let Some((
+            model_provider,
+            model_provider_name,
+            model_name,
+            model_route_resolver,
+            tool_dispatcher,
+        )) = built_model_provider
         {
             self.ctx
                 .sessions
@@ -2120,6 +2125,7 @@ impl RpcDispatcher {
                     model_provider,
                     model_provider_name,
                     model_name,
+                    model_route_resolver,
                     tool_dispatcher,
                 )
                 .await
@@ -2899,7 +2905,14 @@ impl RpcDispatcher {
             let Some(overrides) = ctx.sessions.get_overrides(&session_id).await else {
                 continue;
             };
-            let (model_provider, model_provider_name, model_name, tool_dispatcher, temperature) = {
+            let (
+                model_provider,
+                model_provider_name,
+                model_name,
+                model_route_resolver,
+                tool_dispatcher,
+                temperature,
+            ) = {
                 let config = ctx.config.read();
                 let Some(model_provider_ref) =
                     resolve_provider_ref(&config, &agent_alias, &overrides)
@@ -2937,7 +2950,7 @@ impl RpcDispatcher {
                     &model_provider_ref,
                     overrides.model.as_deref(),
                 ) {
-                    Ok((model_provider, model_provider_name, model_name)) => {
+                    Ok((model_provider, model_provider_name, model_name, model_route_resolver)) => {
                         let tool_dispatcher = crate::agent::agent::tool_dispatcher_for_provider(
                             &agent_cfg,
                             model_provider.as_ref(),
@@ -2946,6 +2959,7 @@ impl RpcDispatcher {
                             model_provider,
                             model_provider_name,
                             model_name,
+                            model_route_resolver,
                             tool_dispatcher,
                             overrides.temperature.or(provider_temperature),
                         )
@@ -2977,6 +2991,7 @@ impl RpcDispatcher {
                     model_provider,
                     model_provider_name,
                     model_name,
+                    model_route_resolver,
                     tool_dispatcher,
                 )
                 .await
@@ -4639,16 +4654,28 @@ fn truncate_memory_previews(
     entries
 }
 
-/// Resolve the max-token ceiling shown on Zerocode's context usage meter.
+/// Resolve the preemptive-trim budget shown on Zerocode's context usage meter.
 ///
-/// The wire field is named `max_context_tokens` and must track the operator's
-/// runtime-profile budget (`[runtime_profiles.<name>] max_context_tokens`),
-/// which is also the preemptive history-trim budget. Using the provider
-/// model-window helper here is wrong: that path ignores the runtime profile
-/// and falls back to 32_000 when `providers.models.*.context_window` is unset,
-/// so the meter freezes at the default even when the profile is set higher.
+/// This is the value `input_tokens` fills toward before trimming triggers — the
+/// resolved `effective_context_budget`: the legacy absolute budget unless a
+/// profile explicitly opts into model-relative budgeting, with positive
+/// `history_pruning.max_tokens` values acting as an additional downward cap.
+/// Falls back to the legacy 32,000-token value when the agent can't be resolved.
+/// Emitted on the wire as `max_context_tokens`, preserving that field's original
+/// "budget the meter fills toward" meaning.
+#[cfg(test)]
 fn context_usage_max_tokens(cfg: &zeroclaw_config::schema::Config, agent_alias: &str) -> u64 {
-    cfg.effective_max_context_tokens(agent_alias) as u64
+    cfg.resolved_agent_config(agent_alias)
+        .map(|a| a.resolved.effective_context_budget() as u64)
+        .unwrap_or_else(|| cfg.effective_model_context_window(agent_alias) as u64)
+}
+
+/// Resolve the model's full context window (provider `context_window`, 32_000
+/// fallback). Exposed on the wire as `model_context_window`, distinct from the
+/// trim budget, so a client can render capacity and budget separately.
+#[cfg(test)]
+fn context_usage_model_window(cfg: &zeroclaw_config::schema::Config, agent_alias: &str) -> u64 {
+    cfg.effective_model_context_window(agent_alias) as u64
 }
 
 /// Persist the exact turn delta captured before structured history trimming.
@@ -4725,14 +4752,10 @@ fn plan_replay_notification(
     let event = TurnEvent::Plan {
         entries: entries.to_vec(),
     };
-    notification_for_turn_event(session_id, &event, None)
+    notification_for_turn_event(session_id, &event)
 }
 
-fn notification_for_turn_event(
-    session_id: &str,
-    event: &TurnEvent,
-    max_context_tokens: Option<u64>,
-) -> Option<String> {
+fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<String> {
     let update = match event {
         TurnEvent::Chunk { delta } => SessionUpdateEvent::AgentMessageChunk {
             session_id: session_id.to_string(),
@@ -4783,10 +4806,18 @@ fn notification_for_turn_event(
             kept_turns: *kept_turns,
             reason: reason.clone(),
         },
-        TurnEvent::Usage { input_tokens, .. } => SessionUpdateEvent::ContextUsage {
+        TurnEvent::Usage {
+            input_tokens,
+            cached_input_tokens: _,
+            output_tokens: _,
+            context_token_budget,
+            model_context_window,
+            cost_usd: _,
+        } => SessionUpdateEvent::ContextUsage {
             session_id: session_id.to_string(),
             input_tokens: *input_tokens,
-            max_context_tokens,
+            max_context_tokens: *context_token_budget,
+            model_context_window: *model_context_window,
         },
         TurnEvent::Plan { entries } => SessionUpdateEvent::Plan {
             session_id: session_id.to_string(),
@@ -5146,6 +5177,88 @@ mod tests {
         assert!(
             prompt.contains("remote__domains.list"),
             "system prompt must advertise the dotted `<server>__<tool>` stub; prompt: {prompt}"
+        );
+    }
+
+    // B2: a session/configure that switches the provider must install the new
+    // provider's route resolver in the SAME transition. Before the fix the
+    // resolver from the original provider was left in place, so a routed hint
+    // (and the Direct default) still resolved through the old provider while the
+    // new box served the call.
+    #[tokio::test]
+    async fn session_configure_swaps_route_resolver_with_provider() {
+        use zeroclaw_config::schema::AliasedAgentConfig;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_acp_test_config(&tmp);
+        // Register a second, distinct provider the session can switch to.
+        {
+            let base = config
+                .providers
+                .models
+                .ensure("openai", "provider-b")
+                .expect("`openai` slot must exist");
+            base.api_key = Some("test-key-b".into());
+            base.model = Some("model-b".into());
+            base.uri = Some("http://127.0.0.1:2".into());
+        }
+        // Point the agent at provider A initially.
+        config.agents.insert(
+            "test-agent".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "openai.test-provider".into(),
+                risk_profile: "test-profile".into(),
+                ..Default::default()
+            },
+        );
+        let (dispatcher, sessions) = make_acp_test_dispatcher(config);
+
+        let new_params = json!({
+            "agent_alias": "test-agent",
+            "chat_mode": "chat",
+            "session_id": "cfg-resolver-swap-001"
+        });
+        dispatcher
+            .handle_session_new_for_test(&new_params)
+            .await
+            .expect("session/new should succeed");
+
+        // Before the switch the resolver resolves the default through provider A.
+        {
+            let agent = sessions
+                .get_agent("cfg-resolver-swap-001")
+                .await
+                .expect("session registered");
+            let agent = agent.lock().await;
+            assert_eq!(
+                agent.resolved_route_for_test("anything").provider_name,
+                "openai.test-provider",
+                "the initial resolver must resolve through provider A"
+            );
+        }
+
+        // Switch the session to provider B.
+        let cfg_params = json!({
+            "session_id": "cfg-resolver-swap-001",
+            "overrides": { "model_provider": "openai.provider-b" }
+        });
+        dispatcher
+            .handle_session_configure_for_test(&cfg_params)
+            .await
+            .expect("session/configure switching provider should succeed");
+
+        // After the switch the resolver must resolve through provider B — proving
+        // the resolver was replaced together with the provider box.
+        let agent = sessions
+            .get_agent("cfg-resolver-swap-001")
+            .await
+            .expect("session still registered");
+        let agent = agent.lock().await;
+        assert_eq!(
+            agent.resolved_route_for_test("anything").provider_name,
+            "openai.provider-b",
+            "session/configure must install the new provider's route resolver, not keep the old one"
         );
     }
 
@@ -6388,7 +6501,7 @@ mod tests {
         let event = TurnEvent::Chunk {
             delta: "hello".into(),
         };
-        let json = notification_for_turn_event("s1", &event, None).unwrap();
+        let json = notification_for_turn_event("s1", &event).unwrap();
         let v = parse(&json);
         assert_eq!(v["jsonrpc"], JSONRPC_VERSION);
         assert_eq!(v["method"], notification::SESSION_UPDATE);
@@ -6402,7 +6515,7 @@ mod tests {
         let event = TurnEvent::Thinking {
             delta: "hmm".into(),
         };
-        let json = notification_for_turn_event("s1", &event, None).unwrap();
+        let json = notification_for_turn_event("s1", &event).unwrap();
         let v = parse(&json);
         assert_eq!(v["params"]["type"], "agent_thought_chunk");
         assert_eq!(v["params"]["text"], "hmm");
@@ -6415,7 +6528,7 @@ mod tests {
             name: "bash".into(),
             args: json!({"cmd": "ls"}),
         };
-        let json = notification_for_turn_event("s1", &event, None).unwrap();
+        let json = notification_for_turn_event("s1", &event).unwrap();
         let v = parse(&json);
         assert_eq!(v["params"]["type"], "tool_call");
         assert_eq!(v["params"]["tool_call_id"], "tc_1");
@@ -6431,7 +6544,7 @@ mod tests {
             output: "file.txt".into(),
             artifact: None,
         };
-        let json = notification_for_turn_event("s1", &event, None).unwrap();
+        let json = notification_for_turn_event("s1", &event).unwrap();
         let v = parse(&json);
         assert_eq!(v["params"]["type"], "tool_result");
         assert_eq!(v["params"]["tool_call_id"], "tc_1");
@@ -6450,8 +6563,8 @@ mod tests {
                 active_form: Some("Analyzing codebase".to_string()),
             }],
         };
-        let json = notification_for_turn_event("sess-1", &event, None)
-            .expect("plan yields a notification");
+        let json =
+            notification_for_turn_event("sess-1", &event).expect("plan yields a notification");
         let v = parse(&json);
         assert_eq!(v["method"], "session/update");
         assert_eq!(v["params"]["type"], "plan");
@@ -6469,7 +6582,7 @@ mod tests {
     fn empty_plan_turn_event_maps_to_empty_entries() {
         let event = TurnEvent::Plan { entries: vec![] };
         let json =
-            notification_for_turn_event("sess-2", &event, None).expect("empty plan still notifies");
+            notification_for_turn_event("sess-2", &event).expect("empty plan still notifies");
         let v = parse(&json);
         assert_eq!(v["params"]["type"], "plan");
         assert!(v["params"]["entries"].as_array().unwrap().is_empty());
@@ -6584,7 +6697,7 @@ mod tests {
             arguments_summary: "rm -rf /".into(),
             timeout_secs: 30,
         };
-        let json = notification_for_turn_event("s1", &event, None).unwrap();
+        let json = notification_for_turn_event("s1", &event).unwrap();
         let v = parse(&json);
         assert_eq!(v["params"]["type"], "approval_request");
         assert_eq!(v["params"]["request_id"], "ar_1");
@@ -6599,7 +6712,7 @@ mod tests {
             kept_turns: 1,
             reason: "context token budget exceeded".into(),
         };
-        let json = notification_for_turn_event("s1", &event, None).unwrap();
+        let json = notification_for_turn_event("s1", &event).unwrap();
         let v = parse(&json);
         assert_eq!(v["method"], "session/update");
         assert_eq!(v["params"]["type"], "history_trimmed");
@@ -6616,8 +6729,11 @@ mod tests {
             cached_input_tokens: None,
             output_tokens: Some(50),
             cost_usd: Some(0.01),
+            context_token_budget: Some(180_000),
+            model_context_window: Some(200_000),
         };
-        let json = notification_for_turn_event("s1", &event, Some(32_000)).unwrap();
+        // budget = trim budget (fills toward), window = full model capacity.
+        let json = notification_for_turn_event("s1", &event).unwrap();
         let v = parse(&json);
         assert_eq!(v["params"]["type"], "context_usage");
         assert_eq!(v["params"]["session_id"], "s1");
@@ -6626,23 +6742,51 @@ mod tests {
         // cached_input_tokens is a *subset* of input_tokens per the
         // TokenUsage contract and must NOT be added (double-counts).
         assert_eq!(v["params"]["input_tokens"], 100);
-        assert_eq!(v["params"]["max_context_tokens"], 32_000);
+        // max_context_tokens keeps its original meaning: the trim budget the
+        // meter fills toward. model_context_window is the full capacity, distinct.
+        assert_eq!(v["params"]["max_context_tokens"], 180_000);
+        assert_eq!(v["params"]["model_context_window"], 200_000);
     }
 
-    /// Regression: Zerocode's context meter must read the runtime-profile
-    /// `max_context_tokens` budget, not the provider model-window helper.
-    /// The model-window path falls back to 32_000 when `context_window` is
-    /// unset, which made the meter ignore a profile set to e.g. 128_000.
-    #[test]
-    fn context_usage_max_tokens_uses_runtime_profile_budget() {
+    /// Build a Config whose `coder` agent resolves to a provider entry with the
+    /// given `context_window`, and an optional runtime profile carrying an
+    /// absolute `max_context_tokens` budget. Exercises the real `custom.<alias>`
+    /// provider lookup plus runtime-profile resolution.
+    #[cfg(test)]
+    fn cfg_with_provider_context_window(
+        context_window: Option<usize>,
+    ) -> zeroclaw_config::schema::Config {
+        cfg_with_window_and_cap(context_window, None)
+    }
+
+    #[cfg(test)]
+    fn cfg_with_window_and_cap(
+        context_window: Option<usize>,
+        max_context_tokens: Option<usize>,
+    ) -> zeroclaw_config::schema::Config {
         use std::collections::HashMap;
-        use zeroclaw_config::schema::{AliasedAgentConfig, Config, RuntimeProfileConfig};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, CustomModelProviderConfig, ModelProviderConfig,
+            RuntimeProfileConfig,
+        };
+
+        let mut custom = HashMap::new();
+        custom.insert(
+            "default".to_string(),
+            CustomModelProviderConfig {
+                base: ModelProviderConfig {
+                    context_window,
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
 
         let mut runtime_profiles = HashMap::new();
         runtime_profiles.insert(
             "coding".to_string(),
             RuntimeProfileConfig {
-                max_context_tokens: Some(128_000),
+                max_context_tokens,
+                context_compact_ratio: Some(0.9),
                 ..RuntimeProfileConfig::default()
             },
         );
@@ -6652,86 +6796,112 @@ mod tests {
             "coder".to_string(),
             AliasedAgentConfig {
                 enabled: true,
+                model_provider: zeroclaw_config::providers::ModelProviderRef::new("custom.default"),
                 runtime_profile: "coding".into(),
-                // No provider context_window configured — the broken path
-                // would fall back to 32_000 here.
                 ..AliasedAgentConfig::default()
             },
         );
 
-        let cfg = Config {
+        let mut cfg = Config {
             agents,
             runtime_profiles,
             ..Config::default()
         };
+        cfg.providers.models.custom = custom;
+        cfg
+    }
 
+    /// A configured ratio opts the meter into a model-relative trim budget.
+    #[test]
+    fn context_usage_max_tokens_is_trim_budget_from_window() {
+        let cfg = cfg_with_provider_context_window(Some(200_000));
         assert_eq!(
             context_usage_max_tokens(&cfg, "coder"),
-            128_000,
-            "context meter must use runtime_profiles.<name>.max_context_tokens"
-        );
-        assert_eq!(
-            cfg.effective_model_context_window("coder"),
-            32_000,
-            "sanity: model-window helper still defaults to 32k without provider context_window"
+            180_000,
+            "budget must be model_context_window × configured 0.9 ratio"
         );
     }
 
-    /// Boundary regression: prove the corrected ceiling survives the *wire*
-    /// path, not just the config helper. This threads
-    /// `context_usage_max_tokens(&cfg, alias)` through the exact
-    /// `notification_for_turn_event` serialization the RPC dispatch emits, and
-    /// asserts the on-the-wire `context_usage.max_context_tokens` reads the
-    /// runtime-profile budget (128_000) rather than the model-window fallback
-    /// (32_000). This closes the "helper is right but does the emitted payload
-    /// carry it?" gap without needing a live daemon smoke.
+    /// In ratio mode an explicit `max_context_tokens` value caps the derived
+    /// budget; the model-window helper is unaffected.
     #[test]
-    fn context_usage_notification_wire_reports_runtime_profile_budget() {
-        use std::collections::HashMap;
-        use zeroclaw_config::schema::{AliasedAgentConfig, Config, RuntimeProfileConfig};
-
-        let mut runtime_profiles = HashMap::new();
-        runtime_profiles.insert(
-            "coding".to_string(),
-            RuntimeProfileConfig {
-                max_context_tokens: Some(128_000),
-                ..RuntimeProfileConfig::default()
-            },
+    fn context_usage_max_tokens_clamped_by_explicit_cap() {
+        let cfg = cfg_with_window_and_cap(Some(200_000), Some(50_000));
+        assert_eq!(
+            context_usage_max_tokens(&cfg, "coder"),
+            50_000,
+            "explicit max_context_tokens must clamp the budget down"
         );
-
-        let mut agents = HashMap::new();
-        agents.insert(
-            "coder".to_string(),
-            AliasedAgentConfig {
-                enabled: true,
-                runtime_profile: "coding".into(),
-                // No provider context_window: the broken path would emit 32_000.
-                ..AliasedAgentConfig::default()
-            },
+        assert_eq!(
+            context_usage_model_window(&cfg, "coder"),
+            200_000,
+            "model window is independent of the absolute budget"
         );
+    }
 
-        let cfg = Config {
-            agents,
-            runtime_profiles,
-            ..Config::default()
-        };
+    #[test]
+    fn context_usage_preserves_legacy_budget_without_ratio() {
+        let mut cfg = cfg_with_window_and_cap(Some(200_000), None);
+        cfg.runtime_profiles
+            .get_mut("coding")
+            .unwrap()
+            .context_compact_ratio = None;
+        assert_eq!(context_usage_max_tokens(&cfg, "coder"), 32_000);
+    }
 
-        // Resolve the ceiling exactly as RPC dispatch does, then emit it
+    #[test]
+    fn context_usage_preserves_zero_disable_sentinel() {
+        let cfg = cfg_with_window_and_cap(Some(200_000), Some(0));
+        assert_eq!(context_usage_max_tokens(&cfg, "coder"), 0);
+    }
+
+    /// The model-window helper reports the provider `context_window` distinctly
+    /// from the trim budget.
+    #[test]
+    fn context_usage_model_window_reports_provider_window() {
+        let cfg = cfg_with_provider_context_window(Some(200_000));
+        assert_eq!(context_usage_model_window(&cfg, "coder"), 200_000);
+    }
+
+    /// With an explicit ratio and no provider `context_window`, capacity falls
+    /// back to 32k and the derived budget is 28.8k.
+    #[test]
+    fn context_usage_falls_back_to_32k_window() {
+        let cfg = cfg_with_provider_context_window(None);
+        assert_eq!(context_usage_model_window(&cfg, "coder"), 32_000);
+        assert_eq!(context_usage_max_tokens(&cfg, "coder"), 28_800);
+    }
+
+    /// Boundary regression: prove BOTH meter values survive the *wire* path, not
+    /// just the config helpers. Threads them through the exact
+    /// `notification_for_turn_event` serialization the RPC dispatch emits.
+    #[test]
+    fn context_usage_notification_wire_reports_budget_and_window() {
+        let cfg = cfg_with_window_and_cap(Some(200_000), Some(50_000));
+
+        // Resolve both values exactly as RPC dispatch does, then emit them
         // through the real wire serializer.
         let max_ctx = context_usage_max_tokens(&cfg, "coder");
+        let model_win = context_usage_model_window(&cfg, "coder");
         let event = TurnEvent::Usage {
             input_tokens: Some(100),
             cached_input_tokens: None,
             output_tokens: Some(50),
             cost_usd: Some(0.01),
+            context_token_budget: Some(max_ctx),
+            model_context_window: Some(model_win),
         };
-        let json = notification_for_turn_event("s1", &event, Some(max_ctx)).unwrap();
+        let json = notification_for_turn_event("s1", &event).unwrap();
         let v = parse(&json);
 
         assert_eq!(v["params"]["type"], "context_usage");
         assert_eq!(
-            v["params"]["max_context_tokens"], 128_000,
-            "emitted context_usage must carry the runtime-profile budget, not the 32k model-window fallback"
+            v["params"]["max_context_tokens"], 50_000,
+            "wire max_context_tokens must carry the (clamped) trim budget"
+        );
+        assert_eq!(
+            v["params"]["model_context_window"], 200_000,
+            "wire model_context_window must carry the full model capacity"
         );
     }
 
@@ -6742,8 +6912,10 @@ mod tests {
             cached_input_tokens: None,
             output_tokens: Some(50),
             cost_usd: None,
+            context_token_budget: None,
+            model_context_window: None,
         };
-        let json = notification_for_turn_event("s1", &event, None).unwrap();
+        let json = notification_for_turn_event("s1", &event).unwrap();
         let v = parse(&json);
         assert_eq!(v["params"]["type"], "context_usage");
         // No input_tokens reported → field omitted (skip_serializing_if).
@@ -6760,8 +6932,10 @@ mod tests {
             cached_input_tokens: Some(15_000),
             output_tokens: Some(200),
             cost_usd: None,
+            context_token_budget: Some(200_000),
+            model_context_window: None,
         };
-        let json = notification_for_turn_event("s1", &event, Some(200_000)).unwrap();
+        let json = notification_for_turn_event("s1", &event).unwrap();
         let v = parse(&json);
         assert_eq!(v["params"]["type"], "context_usage");
         assert_eq!(
@@ -6779,8 +6953,10 @@ mod tests {
             cached_input_tokens: Some(80_000),
             output_tokens: Some(100),
             cost_usd: None,
+            context_token_budget: Some(100_000),
+            model_context_window: None,
         };
-        let json = notification_for_turn_event("s1", &event, Some(100_000)).unwrap();
+        let json = notification_for_turn_event("s1", &event).unwrap();
         let v = parse(&json);
         assert!(
             v["params"].get("input_tokens").is_none(),

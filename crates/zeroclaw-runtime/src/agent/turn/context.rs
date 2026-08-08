@@ -8,12 +8,13 @@ use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_api::agent::TurnEvent;
 use zeroclaw_api::channel::Channel;
-use zeroclaw_config::schema::PacingConfig;
+use zeroclaw_config::schema::{PacingConfig, ResolvedContextLimits};
 
 pub(crate) struct TurnCtx<'a> {
     pub(crate) observer: &'a dyn Observer,
     pub(crate) provider_name: &'a str,
     pub(crate) model: &'a str,
+    pub(crate) context_limits: ResolvedContextLimits,
     pub(crate) temperature: Option<f64>,
     pub(crate) approval: Option<&'a ApprovalManager>,
     pub(crate) channel_name: &'a str,
@@ -48,6 +49,42 @@ pub struct TurnMeta<'a> {
 }
 
 impl<'a> TurnCtx<'a> {
+    /// Materialize the route-specific view for one provider call. The base
+    /// context remains the turn metadata owner; provider/model/limits are
+    /// resolved at the call boundary so a vision override cannot inherit the
+    /// starting text route's policy or attribution.
+    pub(crate) fn for_route<'b>(
+        &'b self,
+        provider_name: &'b str,
+        model: &'b str,
+        context_limits: ResolvedContextLimits,
+    ) -> TurnCtx<'b>
+    where
+        'a: 'b,
+    {
+        TurnCtx {
+            observer: self.observer,
+            provider_name,
+            model,
+            context_limits,
+            temperature: self.temperature,
+            approval: self.approval,
+            channel_name: self.channel_name,
+            channel_reply_target: self.channel_reply_target,
+            cancellation_token: self.cancellation_token,
+            on_delta: self.on_delta,
+            event_tx: self.event_tx,
+            hooks: self.hooks,
+            dedup_exempt_tools: self.dedup_exempt_tools,
+            pacing: self.pacing,
+            strict_tool_parsing: self.strict_tool_parsing,
+            channel: self.channel,
+            turn_id: self.turn_id,
+            agent_alias: self.agent_alias,
+            parent_agent_alias: self.parent_agent_alias,
+        }
+    }
+
     pub(crate) fn meta(&self) -> TurnMeta<'a> {
         TurnMeta {
             agent_alias: self.agent_alias,

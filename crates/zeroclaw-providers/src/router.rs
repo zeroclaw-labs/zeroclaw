@@ -6,6 +6,7 @@ use super::traits::{
 use async_trait::async_trait;
 use futures_util::stream::BoxStream;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Score a model against a user-keyed pricing map. Sums any entry matching
 /// the model directly, plus optional `.input` and `.output` dimension keys.
@@ -35,13 +36,89 @@ pub struct Route {
     pub model: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteResolutionKind {
+    Direct,
+    MatchedHint,
+    UnknownHintFallback,
+}
+
+/// Provider profile and model selected by the same immutable route table the
+/// router uses for dispatch. Callers may retain the selector separately when
+/// the provider still needs `hint:<name>` to perform the actual dispatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedModelRoute {
+    pub provider_name: String,
+    pub model: String,
+    pub kind: RouteResolutionKind,
+}
+
+/// One route-selection source shared by the router and its owning Agent.
+/// This avoids parallel hint lookup tables that can disagree about which
+/// provider/model actually serves a turn.
+#[derive(Debug)]
+pub struct ModelRouteResolver {
+    routes: HashMap<String, Route>,
+    default_provider_name: String,
+    default_model: String,
+}
+
+impl ModelRouteResolver {
+    #[must_use]
+    pub fn new(
+        routes: Vec<(String, Route)>,
+        default_provider_name: String,
+        default_model: String,
+    ) -> Self {
+        Self {
+            routes: routes.into_iter().collect(),
+            default_provider_name,
+            default_model,
+        }
+    }
+
+    #[must_use]
+    pub fn resolve(&self, selector: &str) -> ResolvedModelRoute {
+        if let Some(hint) = selector.strip_prefix("hint:") {
+            if let Some(route) = self.routes.get(hint) {
+                return ResolvedModelRoute {
+                    provider_name: route.provider_name.clone(),
+                    model: route.model.clone(),
+                    kind: RouteResolutionKind::MatchedHint,
+                };
+            }
+            return ResolvedModelRoute {
+                provider_name: self.default_provider_name.clone(),
+                model: selector.to_string(),
+                kind: RouteResolutionKind::UnknownHintFallback,
+            };
+        }
+
+        ResolvedModelRoute {
+            provider_name: self.default_provider_name.clone(),
+            model: selector.to_string(),
+            kind: RouteResolutionKind::Direct,
+        }
+    }
+
+    #[must_use]
+    pub fn has_hint(&self, hint: &str) -> bool {
+        self.routes.contains_key(hint)
+    }
+
+    #[must_use]
+    pub fn configured_model_for_hint(&self, hint: &str) -> Option<&str> {
+        self.routes.get(hint).map(|route| route.model.as_str())
+    }
+}
+
 pub struct RouterModelProvider {
     /// `[providers.models.<family>.<alias>]` config-key alias.
     alias: String,
-    routes: HashMap<String, (usize, String)>, // hint → (provider_index, model)
+    route_resolver: Arc<ModelRouteResolver>,
+    provider_indices: HashMap<String, usize>,
     model_providers: Vec<(String, Box<dyn ModelProvider>)>,
     default_index: usize,
-    default_model: String,
 }
 
 impl RouterModelProvider {
@@ -54,20 +131,20 @@ impl RouterModelProvider {
         routes: Vec<(String, Route)>,
         default_model: String,
     ) -> Self {
-        // Build model_provider name → index lookup
-        let name_to_index: HashMap<&str, usize> = model_providers
+        // Build model_provider name → index lookup.
+        let provider_indices: HashMap<String, usize> = model_providers
             .iter()
             .enumerate()
-            .map(|(i, (name, _))| (name.as_str(), i))
+            .map(|(i, (name, _))| (name.clone(), i))
             .collect();
 
-        // Resolve routes to model_provider indices
-        let resolved_routes: HashMap<String, (usize, String)> = routes
+        // Keep only routes whose provider was constructed successfully. The
+        // resulting resolver is then shared with Agent metadata resolution.
+        let resolved_routes: Vec<(String, Route)> = routes
             .into_iter()
             .filter_map(|(hint, route)| {
-                let index = name_to_index.get(route.provider_name.as_str()).copied();
-                match index {
-                    Some(i) => Some((hint, (i, route.model))),
+                match provider_indices.get(&route.provider_name) {
+                    Some(_) => Some((hint, route)),
                     None => {
                         ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"hint": hint, "model_provider": route.provider_name})), "Route references unknown model_provider, skipping");
                         None
@@ -75,14 +152,28 @@ impl RouterModelProvider {
                 }
             })
             .collect();
+        let default_provider_name = model_providers
+            .first()
+            .map(|(name, _)| name.clone())
+            .unwrap_or_else(|| alias.to_string());
+        let route_resolver = Arc::new(ModelRouteResolver::new(
+            resolved_routes,
+            default_provider_name,
+            default_model,
+        ));
 
         Self {
             alias: alias.to_string(),
-            routes: resolved_routes,
+            route_resolver,
+            provider_indices,
             model_providers,
             default_index: 0,
-            default_model,
         }
+    }
+
+    #[must_use]
+    pub fn route_resolver(&self) -> Arc<ModelRouteResolver> {
+        Arc::clone(&self.route_resolver)
     }
     pub fn resolve_cost_optimized(
         &self,
@@ -100,9 +191,12 @@ impl RouterModelProvider {
 
         let mut candidates: Vec<(usize, String, f64)> = Vec::new();
 
-        for (idx, route_model) in self.routes.values() {
+        for route in self.route_resolver.routes.values() {
+            let Some(idx) = self.provider_indices.get(&route.provider_name).copied() else {
+                continue;
+            };
             // Capability filtering
-            if let Some((_, model_provider)) = self.model_providers.get(*idx) {
+            if let Some((_, model_provider)) = self.model_providers.get(idx) {
                 if required_vision && !model_provider.supports_vision() {
                     continue;
                 }
@@ -111,13 +205,13 @@ impl RouterModelProvider {
                 }
             }
 
-            let Some((model_provider_name, _)) = self.model_providers.get(*idx) else {
+            let Some((model_provider_name, _)) = self.model_providers.get(idx) else {
                 continue;
             };
             if let Some(pricing) = model_provider_pricing.get(model_provider_name)
-                && let Some(total_cost) = score_model(pricing, route_model)
+                && let Some(total_cost) = score_model(pricing, &route.model)
             {
-                candidates.push((*idx, route_model.clone(), total_cost));
+                candidates.push((idx, route.model.clone(), total_cost));
             }
         }
 
@@ -136,14 +230,16 @@ impl RouterModelProvider {
             "No cost-optimized route found with matching pricing data, \
              falling back to default"
         );
-        (self.default_index, self.default_model.clone())
+        (
+            self.default_index,
+            self.route_resolver.default_model.clone(),
+        )
     }
 
     fn resolve(&self, model: &str) -> (usize, String) {
-        if let Some(hint) = model.strip_prefix("hint:") {
-            if let Some((idx, resolved_model)) = self.routes.get(hint) {
-                return (*idx, resolved_model.clone());
-            }
+        let resolved = self.route_resolver.resolve(model);
+        if resolved.kind == RouteResolutionKind::UnknownHintFallback {
+            let hint = model.strip_prefix("hint:").unwrap_or_default();
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -152,9 +248,12 @@ impl RouterModelProvider {
                 "Unknown route hint, falling back to default model_provider"
             );
         }
-
-        // Not a hint or hint not found — use default model_provider with the model as-is
-        (self.default_index, model.to_string())
+        let index = self
+            .provider_indices
+            .get(&resolved.provider_name)
+            .copied()
+            .unwrap_or(self.default_index);
+        (index, resolved.model)
     }
 }
 
@@ -761,7 +860,27 @@ mod tests {
         );
 
         // Route should not exist
-        assert!(!router.routes.contains_key("broken"));
+        assert!(!router.route_resolver().has_hint("broken"));
+    }
+
+    #[test]
+    fn shared_resolver_reports_the_route_used_for_hint_dispatch() {
+        let (router, _) = make_router(
+            vec![("default.profile", "default"), ("fast.profile", "fast")],
+            vec![("fast", "fast.profile", "fast-model")],
+        );
+        let resolver = router.route_resolver();
+
+        let selected = resolver.resolve("hint:fast");
+        assert_eq!(selected.provider_name, "fast.profile");
+        assert_eq!(selected.model, "fast-model");
+        assert_eq!(selected.kind, RouteResolutionKind::MatchedHint);
+        assert_eq!(router.resolve("hint:fast"), (1, "fast-model".to_string()));
+
+        let unknown = resolver.resolve("hint:missing");
+        assert_eq!(unknown.provider_name, "default.profile");
+        assert_eq!(unknown.model, "hint:missing");
+        assert_eq!(unknown.kind, RouteResolutionKind::UnknownHintFallback);
     }
 
     #[tokio::test]

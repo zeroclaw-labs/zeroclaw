@@ -235,12 +235,17 @@ impl SessionStore {
     /// Swap a freshly built `ModelProvider` box (and its name) onto the
     /// session's agent. Called by the dispatcher after it constructs the
     /// box from config, keeping model_provider-build logic out of the store.
+    /// The route resolver is installed in the SAME state transition as the
+    /// provider box: it holds the hint→route table bound to that provider set,
+    /// so leaving the old resolver would resolve routed hints through the
+    /// previous provider while the new box serves the call.
     pub async fn apply_model_provider(
         &self,
         id: &str,
         model_provider: Box<dyn ModelProvider>,
         model_provider_name: String,
         model_name: String,
+        model_route_resolver: Arc<zeroclaw_providers::router::ModelRouteResolver>,
         tool_dispatcher: Box<dyn ToolDispatcher>,
     ) -> bool {
         let agent = {
@@ -254,6 +259,7 @@ impl SessionStore {
         guard.set_model_provider(model_provider);
         guard.set_model_provider_name(model_provider_name);
         guard.set_model_name(model_name);
+        guard.set_model_route_resolver(model_route_resolver);
         guard.set_tool_dispatcher(tool_dispatcher);
         true
     }

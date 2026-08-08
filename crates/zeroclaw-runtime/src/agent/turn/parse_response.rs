@@ -114,6 +114,10 @@ pub(crate) struct InterpretedResponse {
     pub(crate) native_tool_calls: Vec<ToolCall>,
     pub(crate) parse_issue_detected: bool,
     pub(crate) input_tokens: Option<u64>,
+    /// Whether this call emitted a per-call `TurnEvent::Usage` carrying the
+    /// route's context limits. Distinct from `input_tokens.is_some()`: a
+    /// `Some(usage)` with `None` token counts still emits the frame.
+    pub(crate) emitted_usage_frame: bool,
 }
 
 /// Interpret a successful chat response. Takes the response by value and
@@ -158,7 +162,12 @@ pub(crate) async fn interpret_chat_response(
         .map(|(_total_tokens, cost_usd)| cost_usd);
 
     // Per-LLM-call usage event, right after the observer success event
-    // (upstream E2 parity, agent.rs Usage emission).
+    // (upstream E2 parity, agent.rs Usage emission). `emitted_usage_frame`
+    // records whether this per-call frame carried the route's limits, so the
+    // terminal-snapshot gate can tell a usage-bearing call from a usage-less one
+    // without conflating "no input_tokens" (a `Some(usage)` with `None` counts,
+    // e.g. kilocli/gemini-cli) with "no usage frame at all".
+    let emitted_usage_frame = ctx.event_tx.is_some() && resp.usage.is_some();
     if let Some(tx) = ctx.event_tx
         && let Some(ref usage) = resp.usage
     {
@@ -168,6 +177,11 @@ pub(crate) async fn interpret_chat_response(
                 cached_input_tokens: usage.cached_input_tokens,
                 output_tokens: usage.output_tokens,
                 cost_usd: call_cost_usd,
+                context_token_budget: Some(ctx.context_limits.context_token_budget as u64),
+                model_context_window: ctx
+                    .context_limits
+                    .configured_model_context_window()
+                    .map(|tokens| tokens as u64),
             })
             .await;
     }
@@ -306,6 +320,7 @@ pub(crate) async fn interpret_chat_response(
         native_tool_calls: native_calls,
         parse_issue_detected: parse_issue.is_some(),
         input_tokens: resp_input_tokens,
+        emitted_usage_frame,
     }
 }
 
@@ -462,6 +477,12 @@ mod cost_usd_regression_tests {
             observer: &crate::observability::NoopObserver,
             provider_name: provider,
             model,
+            context_limits: zeroclaw_config::schema::ResolvedContextLimits {
+                model_context_window: 32_000,
+                context_token_budget: 32_000,
+                model_context_window_source:
+                    zeroclaw_config::schema::ModelContextWindowSource::Configured,
+            },
             temperature: None,
             approval: None,
             channel_name: "",

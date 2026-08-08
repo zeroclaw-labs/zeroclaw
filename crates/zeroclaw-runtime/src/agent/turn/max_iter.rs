@@ -16,6 +16,7 @@ pub(crate) async fn finish_after_max_iterations(
     history: &mut Vec<ChatMessage>,
     provider_name: &str,
     model: &str,
+    dispatch_model: &str,
     temperature: Option<f64>,
     pacing: &PacingConfig,
     cancellation_token: Option<&CancellationToken>,
@@ -97,6 +98,7 @@ pub(crate) async fn finish_after_max_iterations(
             model_provider,
             provider_name,
             model,
+            dispatch_model,
             temperature,
         };
         // Route the graceful-summary call through the metered provider seam. This
@@ -258,6 +260,7 @@ mod graceful_summary_metering_tests {
             &mut history,
             "custom",
             "test-model",
+            "test-model",
             None,
             &pacing,
             None,
@@ -413,6 +416,7 @@ mod graceful_summary_metering_tests {
             &provider,
             &mut history,
             "custom",
+            "test-model",
             "test-model",
             None,
             &pacing,
