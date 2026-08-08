@@ -60,6 +60,70 @@ pub fn is_no_reply_sentinel(output: &str) -> bool {
     false
 }
 
+/// The delivery contract stated to an autonomous cron turn.
+///
+/// A cron turn has no live reader: nothing the model writes is streamed to a
+/// person, and whether the final message reaches anyone at all is decided by
+/// `delivery`, which the model cannot see. Without this the agent cannot tell
+/// "I reported it" from "I wrote it where nobody looks", and the `NO_REPLY`
+/// sentinel honored below is unreachable on purpose — only by accident of
+/// phrasing.
+///
+/// Kept beside [`announce_delivery_decision`] deliberately: the text promises
+/// behavior that function implements, and a test pins the two together.
+///
+/// `destination` is the resolved answer to "where does the final message go":
+/// `None` when it reaches nobody, `Some(channel)` when it is sent there once
+/// the run ends. An empty name renders as "the configured channel" so a
+/// half-configured delivery still states the contract.
+#[must_use]
+pub(crate) fn delivery_contract(destination: Option<&str>) -> String {
+    let Some(channel) = destination else {
+        return "Delivery: no one reads this turn as you write it, and your final \
+message is not delivered to anyone — it is recorded in this run's history only. \
+To reach a person you must call a tool that sends a message. Do not state that you \
+have notified, alerted, messaged, or replied to anyone unless you actually called \
+such a tool in this turn."
+            .to_string();
+    };
+
+    let named = match channel.trim() {
+        "" => "the configured channel".to_string(),
+        channel => format!("the {channel} channel"),
+    };
+
+    format!(
+        "Delivery: no one reads this turn as you write it. When the run ends your \
+final message is sent to {named}, so write it as a standalone report rather \
+than a reply. If there is nothing worth reporting, answer with exactly NO_REPLY and \
+nothing is sent. To surface a problem an operator should see, answer \
+NO_REPLY[FAIL]: <reason> or NO_REPLY[REFUSE]: <reason> — those ARE delivered."
+    )
+}
+
+/// Where a cron job's final message goes. Announce mode sends to the
+/// configured channel; every other mode reaches nobody.
+#[must_use]
+fn cron_delivery_destination(delivery: &DeliveryConfig) -> Option<&str> {
+    delivery
+        .mode
+        .eq_ignore_ascii_case("announce")
+        .then(|| delivery.channel.as_deref().unwrap_or(""))
+}
+
+/// The full prompt an autonomous cron turn receives: the origin prefix, the
+/// operator's own prompt, then the delivery contract.
+#[must_use]
+fn cron_turn_prompt(job: &CronJob) -> String {
+    let name = job.name.clone().unwrap_or_else(|| "cron-job".to_string());
+    let prompt = job.prompt.clone().unwrap_or_default();
+    format!(
+        "[cron:{} {name}] {prompt}\n\n{}",
+        job.id,
+        delivery_contract(cron_delivery_destination(&job.delivery))
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnnounceDecision {
     /// Send the output to the configured channel.
@@ -760,10 +824,7 @@ async fn run_agent_job(
             "blocked by security policy: action budget exhausted".to_string(),
         );
     }
-    let name = job.name.clone().unwrap_or_else(|| "cron-job".to_string());
-    let prompt = job.prompt.clone().unwrap_or_default();
-
-    let prefixed_prompt = format!("[cron:{} {name}] {prompt}", job.id);
+    let prefixed_prompt = cron_turn_prompt(job);
     let model_override = job.model.clone();
 
     let mut cron_config = config.clone();
@@ -1219,6 +1280,162 @@ mod tests {
     use zeroclaw_config::schema::Config;
 
     const TEST_AGENT: &str = "test-agent";
+
+    fn announce_delivery() -> DeliveryConfig {
+        DeliveryConfig {
+            mode: "announce".to_string(),
+            channel: Some("telegram".to_string()),
+            to: Some("12345".to_string()),
+            ..DeliveryConfig::default()
+        }
+    }
+
+    #[test]
+    fn delivery_contract_for_announce_names_the_destination_and_the_sentinel() {
+        let contract = delivery_contract(cron_delivery_destination(&announce_delivery()));
+        assert!(
+            contract.contains("telegram"),
+            "names the destination channel"
+        );
+        assert!(
+            contract.contains("NO_REPLY"),
+            "names the suppression sentinel"
+        );
+    }
+
+    #[test]
+    fn delivery_contract_for_announce_marks_escalating_kinds_as_delivered() {
+        let contract = delivery_contract(cron_delivery_destination(&announce_delivery()));
+        assert!(contract.contains("NO_REPLY[FAIL]"));
+        assert!(contract.contains("NO_REPLY[REFUSE]"));
+    }
+
+    #[test]
+    fn delivery_contract_without_announce_says_the_reply_reaches_nobody() {
+        let contract = delivery_contract(cron_delivery_destination(&DeliveryConfig::default()));
+        assert!(
+            contract.contains("not delivered"),
+            "must state plainly that the final message reaches nobody, got: {contract}"
+        );
+        assert!(
+            contract.contains("history"),
+            "must say where the text does go, got: {contract}"
+        );
+        assert!(
+            contract.contains("call a tool that sends"),
+            "must name the only way to actually reach a person, got: {contract}"
+        );
+    }
+
+    #[test]
+    fn delivery_contract_defaults_to_the_non_delivering_form() {
+        // `DeliveryConfig::default()` is mode="none", so the undelivered
+        // contract is what an unconfigured cron job actually gets.
+        assert_eq!(DeliveryConfig::default().mode, "none");
+        assert_eq!(
+            delivery_contract(cron_delivery_destination(&DeliveryConfig::default())),
+            delivery_contract(cron_delivery_destination(&DeliveryConfig {
+                mode: "none".to_string(),
+                ..DeliveryConfig::default()
+            }))
+        );
+    }
+
+    #[test]
+    fn delivery_contract_for_announce_without_a_channel_still_states_the_sentinel() {
+        let contract = delivery_contract(cron_delivery_destination(&DeliveryConfig {
+            mode: "announce".to_string(),
+            channel: None,
+            to: None,
+            ..DeliveryConfig::default()
+        }));
+        assert!(contract.contains("NO_REPLY"));
+    }
+
+    /// The prompt and the delivery path must agree. If the sentinel the
+    /// contract instructs the model to use stopped being the one
+    /// `announce_delivery_decision` honors, the agent would be following
+    /// documented advice that silently no longer works.
+    #[test]
+    fn the_sentinel_the_contract_names_is_the_one_the_delivery_path_honors() {
+        let contract = delivery_contract(cron_delivery_destination(&announce_delivery()));
+
+        assert!(contract.contains("NO_REPLY"));
+        assert!(
+            !announce_delivery_decision("NO_REPLY").should_deliver(),
+            "the bare sentinel the contract names must suppress delivery"
+        );
+
+        assert!(contract.contains("NO_REPLY[FAIL]"));
+        assert!(
+            announce_delivery_decision("NO_REPLY[FAIL]: disk full").should_deliver(),
+            "the contract promises FAIL is delivered"
+        );
+        assert!(contract.contains("NO_REPLY[REFUSE]"));
+        assert!(
+            announce_delivery_decision("NO_REPLY[REFUSE]: not permitted").should_deliver(),
+            "the contract promises REFUSE is delivered"
+        );
+    }
+
+    #[test]
+    fn cron_delivery_destination_is_none_unless_announce() {
+        assert_eq!(cron_delivery_destination(&DeliveryConfig::default()), None);
+        assert_eq!(
+            cron_delivery_destination(&announce_delivery()),
+            Some("telegram")
+        );
+        // Announce with no channel still counts as delivering; the contract
+        // renders the unnamed destination rather than claiming nobody reads it.
+        assert_eq!(
+            cron_delivery_destination(&DeliveryConfig {
+                mode: "announce".to_string(),
+                channel: None,
+                ..DeliveryConfig::default()
+            }),
+            Some("")
+        );
+    }
+
+    /// Heartbeat resolves delivery as `Option<(channel, target)>` and
+    /// auto-detects a channel when unconfigured, so its default is the
+    /// opposite of cron's: it usually DOES deliver. The shared contract has
+    /// to render that shape correctly.
+    #[test]
+    fn delivery_contract_renders_the_heartbeat_destination_shape() {
+        let resolved: Option<(String, String)> = Some(("discord".into(), "99".into()));
+        let contract = delivery_contract(resolved.as_ref().map(|(channel, _)| channel.as_str()));
+        assert!(contract.contains("discord"));
+        assert!(contract.contains("NO_REPLY"));
+
+        let unresolved: Option<(String, String)> = None;
+        let contract = delivery_contract(unresolved.as_ref().map(|(channel, _)| channel.as_str()));
+        assert!(contract.contains("not delivered"));
+    }
+
+    #[test]
+    fn cron_turn_prompt_keeps_the_origin_prefix_and_appends_the_contract() {
+        let mut job = test_job("unused");
+        job.job_type = JobType::Agent;
+        job.name = Some("build-watch".to_string());
+        job.prompt = Some("check the build".to_string());
+        job.delivery = DeliveryConfig::default();
+
+        let prompt = cron_turn_prompt(&job);
+
+        assert!(
+            prompt.contains(&format!("[cron:{} build-watch]", job.id)),
+            "origin prefix is preserved, got: {prompt}"
+        );
+        assert!(
+            prompt.contains("check the build"),
+            "operator prompt survives"
+        );
+        assert!(
+            prompt.contains(&delivery_contract(cron_delivery_destination(&job.delivery))),
+            "the delivery contract is stated to the model"
+        );
+    }
 
     #[test]
     fn is_no_reply_sentinel_matches_bare_form_case_insensitively() {
