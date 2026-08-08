@@ -294,9 +294,9 @@ jobs:
         with:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
-      - name: Install mold linker
+      - name: Install Linux system dependencies
         if: runner.os == 'Linux'
-        run: bash scripts/ci/apt_install.sh mold
+        run: bash scripts/ci/apt_install.sh mold libasound2-dev
       - name: Ensure web/dist placeholder exists
         shell: bash
         run: mkdir -p web/dist && touch web/dist/.gitkeep
@@ -335,6 +335,17 @@ jobs:
           exit "$cargo_status"
         env:
           RUST_CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+      - name: Check voice-wake
+        if: runner.os != 'Linux'
+        shell: bash
+        run: cargo check --locked -p zeroclaw-channels --no-default-features --features voice-wake --target ${{ matrix.target }}
+      - name: Test voice-wake
+        if: runner.os == 'Linux'
+        shell: bash
+        run: cargo test --locked -p zeroclaw-channels --no-default-features --features voice-wake --target ${{ matrix.target }} --lib voice_wake
+        env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
