@@ -386,6 +386,12 @@ fn starts_with_tool_protocol_tag_or_fence(text: &str) -> bool {
         || lower.starts_with("<invoke")
         || lower.starts_with("<functioncall")
         || lower.starts_with("<function_call")
+        || lower.starts_with("<|dsml|")
+        || lower.starts_with("<|tool_call|")
+        || lower.starts_with("<｜dsml｜tool_calls")
+        || lower.starts_with("<｜dsml｜invoke")
+        || lower.starts_with("<＼dsml＼tool_calls")
+        || lower.starts_with("<＼dsml＼invoke")
         || starts_with_tool_protocol_fence_lower(&lower)
         || lower.starts_with("[tool_call]")
 }
@@ -418,6 +424,14 @@ fn contains_tool_protocol_tag_marker(text: &str) -> bool {
         || lower.contains("<invoke")
         || lower.contains("<functioncall")
         || lower.contains("<function_call")
+        || lower.contains("<|dsml|")
+        || lower.contains("<|tool_call|")
+        || lower.contains("<｜dsml｜tool_calls")
+        || lower.contains("<｜dsml｜invoke")
+        || lower.contains("<｜dsml｜parameter")
+        || lower.contains("<＼dsml＼tool_calls")
+        || lower.contains("<＼dsml＼invoke")
+        || lower.contains("<＼dsml＼parameter")
         || lower.contains("```tool_call")
         || lower.contains("```toolcall")
         || lower.contains("```tool-call")
@@ -522,6 +536,36 @@ fn looks_like_malformed_tagged_tool_protocol_envelope(text: &str) -> bool {
         || lower.contains("name")
         || lower.contains("call_id")
         || lower.contains("tool_call_id")
+        || lower.contains("<|dsml|")
+        || lower.contains("<|tool_call|")
+        || lower.contains("<｜dsml｜")
+        || lower.contains("<＼dsml＼")
+}
+
+pub fn contains_truncated_fullwidth_dsml_envelope(text: &str) -> bool {
+    for delim in ["｜", "＼"] {
+        let open_wrapper = format!("<{delim}DSML{delim}tool_calls>");
+        let close_wrapper = format!("</{delim}DSML{delim}tool_calls>");
+        let Some(open_idx) = text.find(&open_wrapper) else {
+            continue;
+        };
+        if text[open_idx + open_wrapper.len()..]
+            .find(&close_wrapper)
+            .is_none()
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn contains_truncated_ascii_dsml_envelope(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let Some(open_idx) = lower.find("<|dsml|>") else {
+        return false;
+    };
+    let lower_after = &lower[open_idx + 8..];
+    !lower_after.contains("</|dsml|>") && text[open_idx + 8..].trim_start().starts_with('{')
 }
 
 fn has_malformed_tool_protocol_text_signal(text: &str) -> bool {
@@ -830,6 +874,9 @@ fn parse_minimax_invoke_calls(response: &str) -> Option<(String, Vec<ParsedToolC
         let Some(full_match) = cap.get(0) else {
             continue;
         };
+        if is_inside_markdown_fence(response, full_match.start()) {
+            continue;
+        }
 
         let before = response[last_end..full_match.start()].trim();
         if !before.is_empty() {
@@ -917,7 +964,198 @@ fn parse_minimax_invoke_calls(response: &str) -> Option<(String, Vec<ParsedToolC
     Some((text, calls))
 }
 
-const TOOL_CALL_OPEN_TAGS: [&str; 7] = [
+fn parse_fullwidth_dsml_tool_calls(response: &str) -> Option<(String, Vec<ParsedToolCall>)> {
+    parse_dsml_tool_calls_with_delimiter(response, "｜")
+        .or_else(|| parse_dsml_tool_calls_with_delimiter(response, "＼"))
+}
+
+/// Removes complete fullwidth DSML envelopes (either delimiter) so the leftover
+/// text can be scanned again for ASCII or other tagged tool calls.
+fn strip_fullwidth_dsml_envelopes(response: &str) -> String {
+    let mut stripped = response.to_string();
+    for delim in ["｜", "＼"] {
+        let open_wrapper = format!("<{delim}DSML{delim}tool_calls>");
+        let close_wrapper = format!("</{delim}DSML{delim}tool_calls>");
+        let mut out = String::with_capacity(stripped.len());
+        let mut scan = 0usize;
+        while let Some(rel_open) = stripped[scan..].find(&open_wrapper) {
+            let open_idx = scan + rel_open;
+            let body_start = open_idx + open_wrapper.len();
+            if is_inside_markdown_fence(&stripped, open_idx) {
+                scan = open_idx + open_wrapper.len();
+                continue;
+            }
+            let Some(rel_close) = stripped[body_start..].find(&close_wrapper) else {
+                break;
+            };
+            let close_idx = body_start + rel_close;
+            out.push_str(&stripped[..open_idx]);
+            stripped = stripped[close_idx + close_wrapper.len()..].to_string();
+            scan = 0;
+        }
+        if !out.is_empty() {
+            stripped = format!("{out}{stripped}");
+        }
+    }
+    stripped
+}
+
+fn parse_dsml_tool_calls_with_delimiter(
+    response: &str,
+    delim: &str,
+) -> Option<(String, Vec<ParsedToolCall>)> {
+    let (invoke_re, parameter_re, markup_re) = dsml_regexes(delim);
+    let open_wrapper = format!("<{delim}DSML{delim}tool_calls>");
+    let close_wrapper = format!("</{delim}DSML{delim}tool_calls>");
+
+    let mut calls = Vec::new();
+    let mut text_parts = Vec::new();
+    let mut last_end = 0usize;
+
+    let mut scan = 0usize;
+    while let Some(rel_open) = response[scan..].find(&open_wrapper) {
+        let open_idx = scan + rel_open;
+        let body_start = open_idx + open_wrapper.len();
+        if is_inside_markdown_fence(response, open_idx) {
+            scan = open_idx + open_wrapper.len();
+            continue;
+        }
+        let Some(rel_close) = response[body_start..].find(&close_wrapper) else {
+            break;
+        };
+        let close_idx = body_start + rel_close;
+
+        let before = &response[last_end..open_idx];
+        if !before.trim().is_empty() {
+            text_parts.push(before.trim().to_string());
+        }
+        last_end = close_idx + close_wrapper.len();
+
+        let body = &response[body_start..close_idx];
+        for cap in invoke_re.captures_iter(body) {
+            let Some(full_invoke) = cap.get(0) else {
+                continue;
+            };
+            if is_inside_markdown_fence(response, body_start + full_invoke.start()) {
+                continue;
+            }
+
+            let name = cap
+                .get(1)
+                .map(|m| m.as_str().trim())
+                .filter(|v| !v.is_empty());
+            let inner = cap.get(2).map(|m| m.as_str()).unwrap_or("").trim();
+            let Some(name) = name else {
+                continue;
+            };
+
+            let mut args = serde_json::Map::new();
+            let mut saw_parameter = false;
+            let mut malformed_parameter = false;
+            for param_cap in parameter_re.captures_iter(inner) {
+                let key = param_cap
+                    .get(1)
+                    .map(|m| m.as_str().trim())
+                    .filter(|v| !v.is_empty());
+                let string_val = param_cap.get(2).map(|m| m.as_str());
+                let is_string = match string_val {
+                    Some(v) if v.eq_ignore_ascii_case("true") => true,
+                    Some(v) if v.eq_ignore_ascii_case("false") => false,
+                    _ => {
+                        malformed_parameter = true;
+                        continue;
+                    }
+                };
+                let raw_value = param_cap.get(3).map(|m| m.as_str()).unwrap_or("");
+                let Some(key) = key else {
+                    continue;
+                };
+                saw_parameter = true;
+
+                let parsed = if is_string {
+                    serde_json::Value::String(raw_value.to_string())
+                } else {
+                    let value = raw_value.trim();
+                    match serde_json::from_str::<serde_json::Value>(value) {
+                        Ok(json) => json,
+                        Err(_) => {
+                            malformed_parameter = true;
+                            continue;
+                        }
+                    }
+                };
+                args.insert(key.to_string(), parsed);
+            }
+
+            if malformed_parameter {
+                continue;
+            }
+
+            if args.is_empty() && !saw_parameter {
+                if let Some(first_json) = extract_json_values(inner).into_iter().next() {
+                    match first_json {
+                        serde_json::Value::Object(obj) => args = obj,
+                        other => {
+                            args.insert("value".to_string(), other);
+                        }
+                    }
+                } else if !inner.is_empty() {
+                    args.insert(
+                        "content".to_string(),
+                        serde_json::Value::String(inner.to_string()),
+                    );
+                }
+            }
+
+            calls.push(ParsedToolCall {
+                name: name.to_string(),
+                arguments: serde_json::Value::Object(args),
+                tool_call_id: None,
+            });
+        }
+        scan = close_idx;
+    }
+
+    if calls.is_empty() {
+        return None;
+    }
+
+    let after = response[last_end..].trim();
+    if !after.is_empty() {
+        text_parts.push(after.to_string());
+    }
+
+    let text = markup_re
+        .replace_all(&text_parts.join("\n"), "")
+        .trim()
+        .to_string();
+
+    Some((text, calls))
+}
+
+fn is_inside_markdown_fence(response: &str, byte_idx: usize) -> bool {
+    let up_to = &response[..byte_idx];
+    (up_to.match_indices("```").count() + up_to.match_indices("~~~").count()) % 2 == 1
+}
+
+fn dsml_regexes(delim: &str) -> (Regex, Regex, Regex) {
+    let delim_re = regex::escape(delim);
+    let invoke = Regex::new(&format!(
+        r#"(?is)<{delim_re}DSML{delim_re}\s*invoke\b[^>]*\bname\s*=\s*"([^"]+)"[^>]*>(.*?)</{delim_re}DSML{delim_re}\s*invoke\s*>"#
+    ))
+    .expect("DSML invoke regex must compile");
+    let parameter = Regex::new(&format!(
+        r#"(?is)<{delim_re}DSML{delim_re}\s*parameter\b[^>]*\bname\s*=\s*"([^"]+)"[^>]*\bstring\s*=\s*"([^"]+)"[^>]*>(.*?)</{delim_re}DSML{delim_re}\s*parameter\s*>"#
+    ))
+    .expect("DSML parameter regex must compile");
+    let markup = Regex::new(&format!(
+        r"(?is)</?{delim_re}DSML{delim_re}\s*(?:tool_calls|invoke|parameter)\b[^>]*>"
+    ))
+    .expect("DSML markup regex must compile");
+    (invoke, parameter, markup)
+}
+
+const TOOL_CALL_OPEN_TAGS: [&str; 10] = [
     "<tool_call>",
     "<tool_calls>",
     "<toolcall>",
@@ -925,9 +1163,12 @@ const TOOL_CALL_OPEN_TAGS: [&str; 7] = [
     "<invoke>",
     "<minimax:tool_call>",
     "<minimax:toolcall>",
+    "<|DSML|>",
+    "<|dsml|>",
+    "<|tool_call|>",
 ];
 
-const TOOL_CALL_CLOSE_TAGS: [&str; 7] = [
+const TOOL_CALL_CLOSE_TAGS: [&str; 10] = [
     "</tool_call>",
     "</tool_calls>",
     "</toolcall>",
@@ -935,6 +1176,9 @@ const TOOL_CALL_CLOSE_TAGS: [&str; 7] = [
     "</invoke>",
     "</minimax:tool_call>",
     "</minimax:toolcall>",
+    "</|DSML|>",
+    "</|dsml|>",
+    "</|tool_call|>",
 ];
 
 fn find_first_tag<'a>(haystack: &str, tags: &'a [&'a str]) -> Option<(usize, &'a str)> {
@@ -1761,7 +2005,6 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     let mut text_parts = Vec::new();
     let mut calls = Vec::new();
     let mut remaining = response;
-
     // First, try to parse as OpenAI-style JSON response with tool_calls array
     // This handles model_providers like Minimax that return tool_calls in native JSON format
     if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(response.trim()) {
@@ -1786,8 +2029,36 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
         return (minimax_text, minimax_calls);
     }
 
-    // Fall back to XML-style tool-call tag parsing.
+    // Fullwidth DSML (DeepSeek-V4 `｜DSML｜` envelope) needs dedicated
+    // parameter handling. Extract its envelopes, then feed the leftover text
+    // through the generic loop so mixed ASCII + fullwidth envelopes still
+    // resolve into one call set and all narration is captured once.
+    let dsml_remaining;
+    if let Some((_, fw_calls)) = parse_fullwidth_dsml_tool_calls(response)
+        && !fw_calls.is_empty()
+    {
+        calls.extend(fw_calls);
+        dsml_remaining = strip_fullwidth_dsml_envelopes(response);
+        remaining = dsml_remaining.as_str();
+    }
     while let Some((start, open_tag)) = find_first_tag(remaining, &TOOL_CALL_OPEN_TAGS) {
+        if is_inside_markdown_fence(remaining, start) {
+            let before = &remaining[..start];
+            if !before.trim().is_empty() {
+                text_parts.push(before.trim().to_string());
+            }
+            let after_start = start + open_tag.len();
+            remaining = match remaining[after_start..].find("```") {
+                Some(rel_close) => {
+                    let block_end = after_start + rel_close + 3;
+                    text_parts.push(remaining[start..block_end].trim().to_string());
+                    &remaining[block_end..]
+                }
+                None => "",
+            };
+            continue;
+        }
+
         // Everything before the tag is text
         let before = &remaining[..start];
         if !before.trim().is_empty() {
@@ -1802,6 +2073,9 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
             "<invoke>" => Some("</invoke>"),
             "<minimax:tool_call>" => Some("</minimax:tool_call>"),
             "<minimax:toolcall>" => Some("</minimax:toolcall>"),
+            "<|DSML|>" => Some("</|DSML|>"),
+            "<|dsml|>" => Some("</|dsml|>"),
+            "<|tool_call|>" => Some("</|tool_call|>"),
             _ => None,
         }) else {
             break;
@@ -2238,7 +2512,10 @@ pub fn detect_tool_call_parse_issue(
         });
     }
 
-    if has_malformed_tool_protocol_text_signal(trimmed) {
+    if has_malformed_tool_protocol_text_signal(trimmed)
+        || contains_truncated_fullwidth_dsml_envelope(trimmed)
+        || contains_truncated_ascii_dsml_envelope(trimmed)
+    {
         return Some(
             "response resembled an internal tool protocol envelope but no valid tool call could be parsed"
                 .into(),
@@ -2248,6 +2525,12 @@ pub fn detect_tool_call_parse_issue(
     let contains_tool_payload_marker = trimmed.contains("<tool_call")
         || trimmed.contains("<toolcall")
         || trimmed.contains("<tool-call")
+        || trimmed.contains("<|dsml|")
+        || trimmed.contains("<|tool_call|")
+        || trimmed.contains("<｜DSML｜")
+        || trimmed.contains("<｜dsml｜")
+        || trimmed.contains("<＼DSML＼")
+        || trimmed.contains("<＼dsml＼")
         || trimmed.contains("```tool_call")
         || trimmed.contains("```toolcall")
         || trimmed.contains("```tool-call")
@@ -2537,6 +2820,490 @@ After text."#;
         let (_, calls) = parse_tool_calls(response);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].tool_call_id.as_deref(), Some("call_42"));
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_dsml_uppercase() {
+        let response = r#"<|DSML|>
+{"name": "shell", "arguments": {"command": "ls -la"}}
+</|DSML|>"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.trim().is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
+            "ls -la"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_dsml_lowercase() {
+        let response = r#"<|dsml|>
+{"name": "file_read", "arguments": {"path": "a.txt"}}
+</|dsml|>"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.trim().is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "file_read");
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_dsml_with_trailing_text() {
+        let response = r#"Before text.
+<|DSML|>
+{"name": "shell", "arguments": {"command": "echo hi"}}
+</|DSML|>
+After text."#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.contains("Before text."));
+        assert!(text.contains("After text."));
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_tool_call_pipe_tag() {
+        let response = r#"<|tool_call|>
+{"name": "shell", "arguments": {"command": "pwd"}}
+</|tool_call|>"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.trim().is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
+            "pwd"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_dsml_with_string_arguments() {
+        // Some models serialize arguments as a JSON string inside DSML.
+        let response = r#"<|DSML|>
+{"name": "shell", "arguments": "{\"command\": \"echo hi\"}"}
+</|DSML|>"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.trim().is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
+            "echo hi"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_fullwidth_dsml_single_invoke_string_parameter() {
+        let response = "<｜DSML｜tool_calls>\n\
+            <｜DSML｜invoke name=\"shell\">\n\
+            <｜DSML｜parameter name=\"command\" string=\"true\">ls -la</｜DSML｜parameter>\n\
+            </｜DSML｜invoke>\n\
+            </｜DSML｜tool_calls>";
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.trim().is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
+            "ls -la"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_fullwidth_dsml_multiple_invokes_in_one_block() {
+        let response = "<｜DSML｜tool_calls>\n\
+            <｜DSML｜invoke name=\"shell\">\n\
+            <｜DSML｜parameter name=\"command\" string=\"true\">pwd</｜DSML｜parameter>\n\
+            </｜DSML｜invoke>\n\
+            <｜DSML｜invoke name=\"file_read\">\n\
+            <｜DSML｜parameter name=\"path\" string=\"true\">a.txt</｜DSML｜parameter>\n\
+            </｜DSML｜invoke>\n\
+            </｜DSML｜tool_calls>";
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.trim().is_empty());
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[1].name, "file_read");
+        assert_eq!(
+            calls[1].arguments.get("path").unwrap().as_str().unwrap(),
+            "a.txt"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_fullwidth_dsml_preserves_string_parameter_whitespace() {
+        let response = "<｜DSML｜tool_calls>\n\
+            <｜DSML｜invoke name=\"shell\">\n\
+            <｜DSML｜parameter name=\"script\" string=\"true\">  echo hi  \n\tls -la  </｜DSML｜parameter>\n\
+            </｜DSML｜invoke>\n\
+            </｜DSML｜tool_calls>";
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.trim().is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        let script = calls[0].arguments.get("script").unwrap().as_str().unwrap();
+        assert_eq!(script, "  echo hi  \n\tls -la  ");
+    }
+
+    #[test]
+    fn parse_tool_calls_fullwidth_dsml_trims_non_string_parameter_before_json() {
+        let response = "<｜DSML｜tool_calls>\n\
+            <｜DSML｜invoke name=\"shell\">\n\
+            <｜DSML｜parameter name=\"count\" string=\"false\">  3  </｜DSML｜parameter>\n\
+            </｜DSML｜invoke>\n\
+            </｜DSML｜tool_calls>";
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.trim().is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].arguments.get("count").unwrap(),
+            &serde_json::json!(3)
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_fullwidth_dsml_json_parameter_types() {
+        let response = "<｜DSML｜tool_calls>\n\
+            <｜DSML｜invoke name=\"shell\">\n\
+            <｜DSML｜parameter name=\"count\" string=\"false\">3</｜DSML｜parameter>\n\
+            <｜DSML｜parameter name=\"tags\" string=\"false\">[\"a\",\"b\"]</｜DSML｜parameter>\n\
+            <｜DSML｜parameter name=\"mode\" string=\"true\">fast</｜DSML｜parameter>\n\
+            </｜DSML｜invoke>\n\
+            </｜DSML｜tool_calls>";
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.trim().is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments.get("count").unwrap(),
+            &serde_json::json!(3)
+        );
+        assert_eq!(
+            calls[0].arguments.get("tags").unwrap(),
+            &serde_json::json!(["a", "b"])
+        );
+        assert_eq!(
+            calls[0].arguments.get("mode").unwrap().as_str().unwrap(),
+            "fast"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_fullwidth_dsml_rejects_unsupported_string_discriminator() {
+        let response = "<｜DSML｜tool_calls>\n\
+            <｜DSML｜invoke name=\"shell\">\n\
+            <｜DSML｜parameter name=\"command\" string=\"maybe\">{\"cmd\":\"ls\"}</｜DSML｜parameter>\n\
+            </｜DSML｜invoke>\n\
+            </｜DSML｜tool_calls>";
+
+        let (text, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 0);
+        assert!(text.contains("｜DSML｜"));
+    }
+
+    #[test]
+    fn parse_tool_calls_fullwidth_dsml_rejects_mixed_valid_and_malformed_parameters() {
+        // One parameter with a valid JSON value and one with non-JSON in
+        // a `string="false"` position — the malformed parameter must poison
+        // the entire invoke so no partial argument object is emitted.
+        let response = "<｜DSML｜tool_calls>\n\
+            <｜DSML｜invoke name=\"shell\">\n\
+            <｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter>\n\
+            <｜DSML｜parameter name=\"count\" string=\"false\">not-json</｜DSML｜parameter>\n\
+            </｜DSML｜invoke>\n\
+            </｜DSML｜tool_calls>";
+
+        let (text, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 0);
+        assert!(text.contains("｜DSML｜"));
+    }
+
+    #[test]
+    fn parse_tool_calls_ascii_dsml_unclosed_envelope_no_recovery() {
+        // An unclosed <|DSML|> tag has no matching </|DSML|> — the
+        // detection layer must flag it as a parse issue so the execution
+        // engine can refuse to run calls recovered from unclosed envelopes.
+        let response = "<|DSML|>\n\
+            {\"name\":\"shell\",\"arguments\":{\"command\":\"id\"}}\n\
+            trailing text";
+
+        assert!(
+            detect_tool_call_parse_issue(response, &[]).is_some(),
+            "unclosed ASCII DSML must be flagged as a parse issue"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_tilde_fenced_dsml_is_preserved_as_text() {
+        let response = "Here is a shell example using DSML syntax:\n\
+            ~~~xml\n\
+            <｜DSML｜tool_calls>\n\
+            <｜DSML｜invoke name=\"shell\">\n\
+            <｜DSML｜parameter name=\"command\" string=\"true\">uname -a</｜DSML｜parameter>\n\
+            </｜DSML｜invoke>\n\
+            </｜DSML｜tool_calls>\n\
+            ~~~\n\
+            End of example.";
+
+        let (text, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 0);
+        assert!(text.contains("uname -a"));
+        assert!(text.contains("End of example."));
+    }
+
+    #[test]
+    fn parse_tool_calls_fullwidth_dsml_with_trailing_text() {
+        let response = "Before text.\n\
+            <｜DSML｜tool_calls>\n\
+            <｜DSML｜invoke name=\"shell\">\n\
+            <｜DSML｜parameter name=\"command\" string=\"true\">echo hi</｜DSML｜parameter>\n\
+            </｜DSML｜invoke>\n\
+            </｜DSML｜tool_calls>\n\
+            After text.";
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.contains("Before text."));
+        assert!(text.contains("After text."));
+        assert!(!text.contains("｜DSML｜"));
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+    }
+
+    #[test]
+    fn parse_tool_calls_fullwidth_dsml_wrapper_less_invoke_is_preserved_as_text() {
+        let response = "<｜DSML｜invoke name=\"shell\">\n\
+            <｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter>\n\
+            </｜DSML｜invoke>";
+
+        let (text, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 0);
+        assert!(text.contains("｜DSML｜invoke"));
+        assert!(text.contains("ls"));
+    }
+
+    #[test]
+    fn parse_tool_calls_fullwidth_reverse_solidus_dsml_single_invoke() {
+        let response = "<＼DSML＼tool_calls>\n\
+            <＼DSML＼invoke name=\"shell\">\n\
+            <＼DSML＼parameter name=\"command\" string=\"true\">ls -la</＼DSML＼parameter>\n\
+            </＼DSML＼invoke>\n\
+            </＼DSML＼tool_calls>";
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.trim().is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
+            "ls -la"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_fullwidth_reverse_solidus_dsml_json_parameter_types() {
+        let response = "<＼DSML＼tool_calls>\n\
+            <＼DSML＼invoke name=\"shell\">\n\
+            <＼DSML＼parameter name=\"count\" string=\"false\">3</＼DSML＼parameter>\n\
+            <＼DSML＼parameter name=\"tags\" string=\"false\">[\"a\",\"b\"]</＼DSML＼parameter>\n\
+            <＼DSML＼parameter name=\"mode\" string=\"true\">fast</＼DSML＼parameter>\n\
+            </＼DSML＼invoke>\n\
+            </＼DSML＼tool_calls>";
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.trim().is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments.get("count").unwrap(),
+            &serde_json::json!(3)
+        );
+        assert_eq!(
+            calls[0].arguments.get("tags").unwrap(),
+            &serde_json::json!(["a", "b"])
+        );
+        assert_eq!(
+            calls[0].arguments.get("mode").unwrap().as_str().unwrap(),
+            "fast"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_fullwidth_reverse_solidus_dsml_with_trailing_text() {
+        let response = "Before text.\n\
+            <＼DSML＼tool_calls>\n\
+            <＼DSML＼invoke name=\"shell\">\n\
+            <＼DSML＼parameter name=\"command\" string=\"true\">echo hi</＼DSML＼parameter>\n\
+            </＼DSML＼invoke>\n\
+            </＼DSML＼tool_calls>\n\
+            After text.";
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.contains("Before text."));
+        assert!(text.contains("After text."));
+        assert!(!text.contains("＼DSML＼"));
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+    }
+
+    #[test]
+    fn parse_tool_calls_fullwidth_reverse_solidus_wrapper_less_invoke_is_preserved_as_text() {
+        let response = "<＼DSML＼invoke name=\"shell\">\n\
+            <＼DSML＼parameter name=\"command\" string=\"true\">ls</＼DSML＼parameter>\n\
+            </＼DSML＼invoke>";
+
+        let (text, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 0);
+        assert!(text.contains("＼DSML＼invoke"));
+        assert!(text.contains("ls"));
+    }
+
+    #[test]
+    fn parse_tool_calls_fullwidth_dsml_inside_markdown_fence_is_preserved_as_text() {
+        let response = "The model showed an example:\n\
+            ```xml\n\
+            <｜DSML｜tool_calls>\n\
+            <｜DSML｜invoke name=\"shell\">\n\
+            <｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter>\n\
+            </｜DSML｜invoke>\n\
+            </｜DSML｜tool_calls>\n\
+            ```\n\
+            That is not a real call.";
+
+        let (text, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 0);
+        assert!(text.contains("｜DSML｜tool_calls"));
+        assert!(text.contains("That is not a real call."));
+    }
+
+    #[test]
+    fn parse_tool_calls_fullwidth_reverse_solidus_dsml_inside_markdown_fence_is_preserved_as_text()
+    {
+        let response = "Example:\n\
+            ```xml\n\
+            <＼DSML＼tool_calls>\n\
+            <＼DSML＼invoke name=\"shell\">\n\
+            <＼DSML＼parameter name=\"command\" string=\"true\">ls</＼DSML＼parameter>\n\
+            </＼DSML＼invoke>\n\
+            </＼DSML＼tool_calls>\n\
+            ```";
+
+        let (text, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 0);
+        assert!(text.contains("＼DSML＼tool_calls"));
+    }
+
+    #[test]
+    fn parse_tool_calls_sequential_fullwidth_dsml_envelopes_preserve_narration() {
+        let response = "First.\n\
+            <｜DSML｜tool_calls>\n\
+            <｜DSML｜invoke name=\"shell\">\n\
+            <｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter>\n\
+            </｜DSML｜invoke>\n\
+            </｜DSML｜tool_calls>\n\
+            Done with step one.\n\
+            <｜DSML｜tool_calls>\n\
+            <｜DSML｜invoke name=\"file_read\">\n\
+            <｜DSML｜parameter name=\"path\" string=\"true\">a.txt</｜DSML｜parameter>\n\
+            </｜DSML｜invoke>\n\
+            </｜DSML｜tool_calls>\n\
+            All done.";
+
+        let (text, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[1].name, "file_read");
+        assert_eq!(text.matches("Done with step one.").count(), 1);
+        assert!(text.contains("First."));
+        assert!(text.contains("All done."));
+        assert!(!text.contains("｜DSML｜"));
+    }
+
+    #[test]
+    fn parse_tool_calls_mixed_ascii_then_fullwidth_dsml() {
+        let response = "Start.\n\
+            <|DSML|>\n\
+            {\"name\": \"shell\", \"arguments\": {\"command\": \"ls\"}}\n\
+            </|DSML|>\n\
+            Mid.\n\
+            <｜DSML｜tool_calls>\n\
+            <｜DSML｜invoke name=\"file_read\">\n\
+            <｜DSML｜parameter name=\"path\" string=\"true\">a.txt</｜DSML｜parameter>\n\
+            </｜DSML｜invoke>\n\
+            </｜DSML｜tool_calls>\n\
+            End.";
+
+        let (text, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "file_read");
+        assert_eq!(calls[1].name, "shell");
+        assert!(text.contains("Start."));
+        assert!(text.contains("Mid."));
+        assert!(text.contains("End."));
+        assert!(!text.contains("<|DSML|>"));
+        assert!(!text.contains("｜DSML｜"));
+    }
+
+    #[test]
+    fn parse_tool_calls_mixed_fullwidth_then_ascii_dsml() {
+        let response = "Start.\n\
+            <｜DSML｜tool_calls>\n\
+            <｜DSML｜invoke name=\"file_read\">\n\
+            <｜DSML｜parameter name=\"path\" string=\"true\">a.txt</｜DSML｜parameter>\n\
+            </｜DSML｜invoke>\n\
+            </｜DSML｜tool_calls>\n\
+            Mid.\n\
+            <|DSML|>\n\
+            {\"name\": \"shell\", \"arguments\": {\"command\": \"ls\"}}\n\
+            </|DSML|>\n\
+            End.";
+
+        let (text, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "file_read");
+        assert_eq!(calls[1].name, "shell");
+        assert!(text.contains("Start."));
+        assert!(text.contains("Mid."));
+        assert!(text.contains("End."));
+        assert!(!text.contains("<|DSML|>"));
+        assert!(!text.contains("｜DSML｜"));
+    }
+
+    #[test]
+    fn parse_tool_calls_ascii_dsml_inside_markdown_fence_is_preserved_as_text() {
+        let response = "The model showed an example:\n\
+            ```xml\n\
+            <|DSML|>\n\
+            {\"name\": \"shell\", \"arguments\": {\"command\": \"ls\"}}\n\
+            </|DSML|>\n\
+            ```\n\
+            That is not a real call.";
+
+        let (text, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 0);
+        assert!(text.contains("<|DSML|>"));
+        assert!(text.contains("That is not a real call."));
+    }
+
+    #[test]
+    fn parse_tool_calls_prose_mentioning_dsml_is_not_a_call() {
+        let response = "Here is a DSML example: <｜DSML｜tool_calls> is a wrapper tag.\n\
+            The ASCII variant <|DSML|> works the same way.";
+
+        let (text, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 0);
+        assert!(text.contains("<｜DSML｜tool_calls>"));
+        assert!(text.contains("<|DSML|>"));
     }
 
     #[test]
@@ -3567,6 +4334,172 @@ Done."#;
     }
 
     #[test]
+    fn classify_tool_protocol_envelope_flags_dsml_envelopes() {
+        let uppercase = r#"<|DSML|>
+{"name":"shell","arguments":{"command":"pwd"}}
+</|DSML|>"#;
+        let lowercase = r#"<|dsml|>
+{"name":"shell","arguments":{"command":"pwd"}}
+</|dsml|>"#;
+        let tool_call_tag = r#"<|tool_call|>
+{"name":"shell","arguments":{"command":"pwd"}}
+</|tool_call|>"#;
+
+        for envelope in [uppercase, lowercase, tool_call_tag] {
+            assert_eq!(
+                classify_tool_protocol_envelope(envelope),
+                Some(ToolProtocolEnvelopeKind::TaggedToolCall),
+                "DSML envelope must classify as a tagged tool call: {envelope}"
+            );
+            assert!(
+                looks_like_tool_protocol_envelope(envelope),
+                "DSML envelope must look like a tool protocol envelope: {envelope}"
+            );
+            assert!(
+                contains_tool_protocol_tag_call(envelope),
+                "DSML envelope must contain a tool protocol tag call: {envelope}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_tool_protocol_envelope_flags_fullwidth_dsml_envelopes() {
+        let envelope = "<｜DSML｜tool_calls>\n\
+            <｜DSML｜invoke name=\"shell\">\n\
+            <｜DSML｜parameter name=\"command\" string=\"true\">pwd</｜DSML｜parameter>\n\
+            </｜DSML｜invoke>\n\
+            </｜DSML｜tool_calls>";
+
+        assert_eq!(
+            classify_tool_protocol_envelope(envelope),
+            Some(ToolProtocolEnvelopeKind::TaggedToolCall),
+            "fullwidth DSML envelope must classify as a tagged tool call"
+        );
+        assert!(
+            looks_like_tool_protocol_envelope(envelope),
+            "fullwidth DSML envelope must look like a tool protocol envelope"
+        );
+        assert!(
+            contains_tool_protocol_tag_call(envelope),
+            "fullwidth DSML envelope must contain a tool protocol tag call"
+        );
+        assert!(
+            detect_tool_call_parse_issue(
+                "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"shell\">\n",
+                &[],
+            )
+            .is_some(),
+            "truncated fullwidth DSML with an unterminated canonical envelope must be flagged"
+        );
+    }
+
+    #[test]
+    fn detect_tool_call_parse_issue_flags_truncated_fullwidth_dsml() {
+        let truncated = "<｜DSML｜tool_calls>\n\
+            <｜DSML｜invoke name=\"shell\">\n\
+            <｜DSML｜parameter name=\"command\" string=\"true\">pwd</｜DSML｜parameter>\n\
+            </｜DSML｜invoke>";
+        assert!(
+            detect_tool_call_parse_issue(truncated, &[]).is_some(),
+            "truncated fullwidth DSML must be flagged as a tool-call parse issue"
+        );
+        assert!(
+            contains_truncated_fullwidth_dsml_envelope(truncated),
+            "truncated fullwidth DSML must be detected as an unterminated canonical envelope"
+        );
+    }
+
+    #[test]
+    fn classify_tool_protocol_envelope_preserves_fullwidth_dsml_examples() {
+        let example = "<｜DSML｜tool_calls>\n\
+            <｜DSML｜invoke name=\"shell\">\n\
+            <｜DSML｜parameter name=\"command\" string=\"true\">pwd</｜DSML｜parameter>\n\
+            </｜DSML｜invoke>\n\
+            </｜DSML｜tool_calls>\n\
+            This is an example, not an invocation.";
+        assert_eq!(classify_tool_protocol_envelope(example), None);
+        assert!(!looks_like_tool_protocol_envelope(example));
+        assert!(looks_like_tool_protocol_example(example));
+    }
+
+    #[test]
+    fn classify_tool_protocol_envelope_flags_fullwidth_reverse_solidus_dsml_envelopes() {
+        let envelope = "<＼DSML＼tool_calls>\n\
+            <＼DSML＼invoke name=\"shell\">\n\
+            <＼DSML＼parameter name=\"command\" string=\"true\">pwd</＼DSML＼parameter>\n\
+            </＼DSML＼invoke>\n\
+            </＼DSML＼tool_calls>";
+
+        assert_eq!(
+            classify_tool_protocol_envelope(envelope),
+            Some(ToolProtocolEnvelopeKind::TaggedToolCall),
+            "fullwidth reverse-solidus DSML envelope must classify as a tagged tool call"
+        );
+        assert!(
+            looks_like_tool_protocol_envelope(envelope),
+            "fullwidth reverse-solidus DSML envelope must look like a tool protocol envelope"
+        );
+        assert!(
+            contains_tool_protocol_tag_call(envelope),
+            "fullwidth reverse-solidus DSML envelope must contain a tool protocol tag call"
+        );
+    }
+
+    #[test]
+    fn detect_tool_call_parse_issue_flags_truncated_fullwidth_reverse_solidus_dsml() {
+        let truncated = "<＼DSML＼tool_calls>\n\
+            <＼DSML＼invoke name=\"shell\">\n\
+            <＼DSML＼parameter name=\"command\" string=\"true\">pwd</＼DSML＼parameter>\n\
+            </＼DSML＼invoke>";
+        assert!(
+            detect_tool_call_parse_issue(truncated, &[]).is_some(),
+            "truncated fullwidth reverse-solidus DSML must be flagged as a tool-call parse issue"
+        );
+        assert!(
+            contains_truncated_fullwidth_dsml_envelope(truncated),
+            "truncated fullwidth reverse-solidus DSML must be detected as an unterminated canonical envelope"
+        );
+    }
+
+    #[test]
+    fn classify_tool_protocol_envelope_preserves_fullwidth_reverse_solidus_dsml_examples() {
+        let example = "<＼DSML＼tool_calls>\n\
+            <＼DSML＼invoke name=\"shell\">\n\
+            <＼DSML＼parameter name=\"command\" string=\"true\">pwd</＼DSML＼parameter>\n\
+            </＼DSML＼invoke>\n\
+            </＼DSML＼tool_calls>\n\
+            This is an example, not an invocation.";
+        assert_eq!(classify_tool_protocol_envelope(example), None);
+        assert!(!looks_like_tool_protocol_envelope(example));
+        assert!(looks_like_tool_protocol_example(example));
+    }
+
+    #[test]
+    fn detect_tool_call_parse_issue_flags_truncated_dsml() {
+        let truncated = r#"<|DSML|>
+{"name":"shell","arguments":{"command":"pwd"}}"#;
+        assert!(
+            detect_tool_call_parse_issue(truncated, &[]).is_some(),
+            "truncated DSML must be flagged as a tool-call parse issue"
+        );
+        assert!(
+            looks_like_tool_protocol_envelope(truncated),
+            "truncated DSML must look like a tool protocol envelope"
+        );
+    }
+
+    #[test]
+    fn classify_tool_protocol_envelope_preserves_dsml_examples() {
+        let example = r#"<|DSML|>
+{"name":"shell","arguments":{"command":"pwd"}}
+</|DSML|>
+This is an example, not an invocation."#;
+        assert_eq!(classify_tool_protocol_envelope(example), None);
+        assert!(!looks_like_tool_protocol_envelope(example));
+        assert!(looks_like_tool_protocol_example(example));
+    }
+
+    #[test]
     fn classify_tool_protocol_envelope_preserves_top_level_schema_array() {
         let schema = r#"[{"name":"planner","parameters":{"goal":"string"}}]"#;
 
@@ -4117,7 +5050,7 @@ Let me check the result."#;
     #[test]
     fn extract_json_values_handles_whitespace_only() {
         let result = extract_json_values(
-            "   
+            "
 	  ",
         );
         assert!(result.is_empty());
