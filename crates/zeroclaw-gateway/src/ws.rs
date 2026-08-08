@@ -960,13 +960,12 @@ async fn process_chat_message(
         ))
     });
 
-    // Resolve context budget for this agent. Wire field is named
-    // `max_context_tokens` and must track the runtime-profile budget
-    // (same source Zerocode's context meter uses), not the provider
-    // model-window helper which falls back to 32_000 when unset.
+    // Resolve the same effective budget enforced before dispatch, including
+    // an optional lower history-pruning floor. The wire field remains named
+    // `max_context_tokens`.
     let max_context_tokens = {
         let cfg = state.config.read();
-        cfg.effective_max_context_tokens(&turn_alias) as u64
+        cfg.effective_context_budget(&turn_alias) as u64
     };
 
     // Broadcast agent_start event
@@ -1181,6 +1180,13 @@ async fn process_chat_message(
                             if let Some(ot) = output_tokens {
                                 total_output_tokens = Some(total_output_tokens.unwrap_or(0) + ot);
                             }
+                            continue;
+                        }
+                        TurnEvent::UsageEstimate { .. } => {
+                            // Pre-dispatch estimate is surfaced on the RPC/ACP
+                            // context meter; the gateway WS stream reports
+                            // accumulated provider-measured usage at turn end,
+                            // so skip the estimate here without a frame.
                             continue;
                         }
                         TurnEvent::Chunk { ref delta } => {

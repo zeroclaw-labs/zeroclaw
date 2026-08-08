@@ -116,6 +116,15 @@ pub enum TurnEvent {
         output_tokens: Option<u64>,
         cost_usd: Option<f64>,
     },
+    /// Pre-dispatch estimate of the context size the NEXT provider call will
+    /// send, measured from the prepared multimodal payload (after image caps
+    /// and provider preparation) rather than a provider report. Emitted before
+    /// each dispatch so a client meter reflects an image-heavy turn's true
+    /// size before the response lands; distinct from [`TurnEvent::Usage`],
+    /// which carries the provider-reported total after the call.
+    UsageEstimate {
+        estimated_input_tokens: Option<u64>,
+    },
 }
 
 #[cfg(test)]

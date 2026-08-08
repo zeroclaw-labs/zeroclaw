@@ -2524,10 +2524,14 @@ impl Chat {
         }
     }
 
-    pub(crate) fn ctx_tokens(&self) -> (Option<u64>, Option<u64>) {
+    pub(crate) fn ctx_tokens(&self) -> (Option<u64>, Option<u64>, bool) {
         match &self.phase {
-            ChatPhase::Active(s) => (s.context_input_tokens, s.context_max_tokens),
-            _ => (None, None),
+            ChatPhase::Active(s) => (
+                s.context_input_tokens,
+                s.context_max_tokens,
+                s.context_is_estimate,
+            ),
+            _ => (None, None, false),
         }
     }
 
@@ -5253,6 +5257,10 @@ pub struct ChatState {
     pub context_input_tokens: Option<u64>,
     /// Configured context limit for this session's model.
     pub context_max_tokens: Option<u64>,
+    /// `true` when `context_input_tokens` currently holds a pre-dispatch
+    /// estimate (from the prepared payload) rather than a provider-reported
+    /// figure. Reset to `false` by the next measured `ContextUsage`.
+    pub context_is_estimate: bool,
     /// Outbound message queue; the front dispatches when the session is free.
     message_queue: VecDeque<QueuedMessage>,
     /// Monotonic id source for queued messages.
@@ -5348,6 +5356,7 @@ impl ChatState {
             cached_total_rows: 0,
             context_input_tokens: None,
             context_max_tokens: None,
+            context_is_estimate: false,
             message_queue: VecDeque::new(),
             next_queue_id: 0,
             queue_paused: false,
@@ -6200,10 +6209,12 @@ impl ChatState {
             SessionUpdate::ContextUsage {
                 input_tokens,
                 max_context_tokens,
+                estimated,
                 ..
             } => {
                 if input_tokens.is_some() {
                     self.context_input_tokens = input_tokens;
+                    self.context_is_estimate = estimated;
                 }
                 if max_context_tokens.is_some() {
                     self.context_max_tokens = max_context_tokens;
@@ -6719,6 +6730,7 @@ impl ChatState {
         // ContextUsage event.
         self.context_input_tokens = None;
         self.context_max_tokens = None;
+        self.context_is_estimate = false;
         self.clear_queue();
     }
 }

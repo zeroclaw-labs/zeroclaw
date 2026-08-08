@@ -1568,6 +1568,12 @@ impl AcpServer {
                 }
                 continue;
             }
+            // Pre-dispatch estimate: ACP has no session/update shape for token
+            // usage (same as the measured Usage event above), so drop it rather
+            // than emit a custom notification.
+            if matches!(event, TurnEvent::UsageEstimate { .. }) {
+                continue;
+            }
             // Emit attributable span logs for every tool call and result.
             // Attribution (agent_alias, model_provider, session_key) flows
             // from the enclosing spans — not repeated here in attrs.
@@ -2444,8 +2450,8 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<Js
         // Usage events are filtered out at every call site (ACP has no
         // `session/update` shape for them; the cost tracker records them
         // out-of-band). Reaching this arm means a caller forgot the filter.
-        TurnEvent::Usage { .. } => unreachable!(
-            "TurnEvent::Usage must be filtered before notification_for_turn_event; \
+        TurnEvent::Usage { .. } | TurnEvent::UsageEstimate { .. } => unreachable!(
+            "TurnEvent::Usage/UsageEstimate must be filtered before notification_for_turn_event; \
              ACP has no session/update notification for token usage"
         ),
     })
