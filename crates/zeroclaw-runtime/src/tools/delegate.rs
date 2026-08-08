@@ -5418,6 +5418,7 @@ mod tests {
                     .await
                     .unwrap(),
             ),
+            security: Arc::new(zeroclaw_config::policy::SecurityPolicy::default()),
         };
         let handle = Arc::clone(&parent_tools);
         let tool_search = crate::tools::ToolSearchTool::new(deferred, Arc::clone(&activated))
