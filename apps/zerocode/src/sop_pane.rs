@@ -10,9 +10,14 @@ use ratatui::{
 
 use crate::client::{
     FlowRole, GraphLayout, GraphNode, GraphPin, GraphWire, NodeKind, NodeRunState, PinClass,
-    PlannedToolCall, RpcClient, SopDraft, SopGraphView, SopStep, SopStepKind, StepFailure,
-    SwitchRule,
+    PlannedToolCall, RpcClient, SopDraft, SopGraphView, SopRunStatusView, SopRunSummaryView,
+    SopStep, SopStepKind, StepFailure, SwitchRule,
 };
+
+/// Minimum spacing between `sops/runs` polls. Run state moves faster than
+/// the dashboard's aggregate counters, so the SOP pane polls harder (2s vs
+/// the dashboard's 5s) while still coalescing the 200ms event-loop ticks.
+const RUNS_POLL_INTERVAL_SECS: u64 = 2;
 
 pub(crate) struct SopPane {
     rpc: Arc<RpcClient>,
@@ -40,6 +45,20 @@ pub(crate) struct SopPane {
     pan_y: u16,
     canvas_rect: Rect,
     pan_drag: Option<(u16, u16, u16, u16)>,
+    /// Aggregated live status per SOP name, refreshed by [`SopPane::tick`]
+    /// and rendered as the leading icon on each list row.
+    run_status: std::collections::HashMap<String, SopRunStatusView>,
+    /// Per-SOP run id that a Resume click should approve: the newest *active*
+    /// run currently blocked on a human. Refreshed from the same
+    /// `sops/runs` response as [`SopPane::run_status`].
+    resume_targets: std::collections::HashMap<String, String>,
+    last_runs_poll: Option<std::time::Instant>,
+    /// Hit rect of the `[▶ Run]` label, `None` when the controls strip was
+    /// not drawn (pane too short) or the label did not fit.
+    run_btn_rect: Option<Rect>,
+    /// Hit rect of the `[⏯ Resume]` label, same `None` rules as
+    /// [`SopPane::run_btn_rect`].
+    resume_btn_rect: Option<Rect>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -488,6 +507,11 @@ impl SopPane {
             pan_y: 0,
             canvas_rect: Rect::new(0, 0, 0, 0),
             pan_drag: None,
+            run_status: std::collections::HashMap::new(),
+            resume_targets: std::collections::HashMap::new(),
+            last_runs_poll: None,
+            run_btn_rect: None,
+            resume_btn_rect: None,
         }
     }
 
@@ -496,6 +520,50 @@ impl SopPane {
             .selected()
             .and_then(|i| self.names.get(i))
             .map(String::as_str)
+    }
+
+    /// Run id the Resume control would act on for the current selection, or
+    /// `None` when nothing is selected or the selected SOP has no run blocked
+    /// on a human. Drives both the enabled styling and the click guard.
+    fn selected_resume_target(&self) -> Option<&str> {
+        self.resume_targets
+            .get(self.selected_name()?)
+            .map(String::as_str)
+    }
+
+    /// Called on every event-loop tick while the SOP pane is focused.
+    /// Throttled to one `sops/runs` call every
+    /// [`RUNS_POLL_INTERVAL_SECS`]; a single unfiltered call covers every
+    /// SOP, so the row icons cost one RPC regardless of list length.
+    ///
+    /// A failed poll is silent on purpose: at a 2s cadence surfacing the
+    /// error would spam the pane's single error slot (and clobber whatever
+    /// a user action put there), so we keep the previous map and let the
+    /// icons go stale until the next successful poll.
+    pub(crate) async fn tick(&mut self) {
+        let should_poll = self
+            .last_runs_poll
+            .map(|t| t.elapsed().as_secs() >= RUNS_POLL_INTERVAL_SECS)
+            .unwrap_or(true);
+        if !should_poll {
+            return;
+        }
+        self.last_runs_poll = Some(std::time::Instant::now());
+        let Ok(runs) = self.rpc.sops_runs(None).await else {
+            return;
+        };
+        let mut by_sop: std::collections::HashMap<String, Vec<SopRunSummaryView>> =
+            std::collections::HashMap::new();
+        // Full replace, same as `run_status`: a SOP whose blocked run has since
+        // been decided must lose its Resume target on this poll, not linger.
+        self.resume_targets = resume_targets_from(&runs);
+        for run in runs {
+            by_sop.entry(run.sop_name.clone()).or_default().push(run);
+        }
+        self.run_status = by_sop
+            .into_iter()
+            .filter_map(|(name, runs)| aggregate_sop_status(&runs).map(|s| (name, s)))
+            .collect();
     }
 
     pub(crate) async fn refresh(&mut self) {
@@ -581,6 +649,34 @@ impl SopPane {
                 } else {
                     "checkpoint denied".into()
                 });
+                self.error = None;
+            }
+            Err(e) => self.error = Some(e.to_string()),
+        }
+    }
+
+    /// Approve the checkpoint of the SOP's blocked run without first having
+    /// watched it. [`SopPane::decide_checkpoint`] needs `current_run_id`,
+    /// which only a run-overlay load sets; the Resume button instead uses the
+    /// target the poll in [`SopPane::tick`] already resolved, so a click on a
+    /// blue row works straight from the list. Sends the same `approve`
+    /// decision and adopts the returned overlay as the current run.
+    pub(crate) async fn resume_selected(&mut self) {
+        let Some(name) = self.selected_name().map(String::from) else {
+            return;
+        };
+        let Some(run_id) = self.resume_targets.get(&name).cloned() else {
+            return;
+        };
+        match self
+            .rpc
+            .sops_decide(&name, &run_id, serde_json::json!("approve"))
+            .await
+        {
+            Ok(value) => {
+                self.overlay = serde_json::from_value(value).ok();
+                self.current_run_id = Some(run_id);
+                self.status = Some("checkpoint approved".into());
                 self.error = None;
             }
             Err(e) => self.error = Some(e.to_string()),
@@ -673,6 +769,21 @@ impl SopPane {
         let (col, row) = (mouse.column, mouse.row);
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                // Controls strip first: its rects never overlap the list rows,
+                // but a click that lands on a button must never fall through
+                // to the list / editor / canvas handlers below.
+                if self.run_btn_rect.is_some_and(|r| in_rect(col, row, r)) {
+                    if self.selected_name().is_some() {
+                        self.start_run_payload().await;
+                    }
+                    return;
+                }
+                if self.resume_btn_rect.is_some_and(|r| in_rect(col, row, r)) {
+                    if self.selected_resume_target().is_some() {
+                        self.resume_selected().await;
+                    }
+                    return;
+                }
                 if let Some(idx) = self
                     .list_row_rects
                     .iter()
@@ -1387,16 +1498,44 @@ impl SopPane {
             .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
             .split(area);
 
+        // Carve the controls strip off the bottom of the left column. Below
+        // `MIN_LEFT_COL_H` the strip would leave the list with no usable rows,
+        // so the list keeps the whole column and the buttons simply do not
+        // exist this frame (rects `None` => clicks fall through as before).
+        let (list_rect, controls_rect) = if cols[0].height >= MIN_LEFT_COL_H {
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(0), Constraint::Length(CONTROLS_H)])
+                .split(cols[0]);
+            (rows[0], Some(rows[1]))
+        } else {
+            (cols[0], None)
+        };
+
         let items: Vec<ListItem> = self
             .names
             .iter()
-            .map(|n| ListItem::new(Line::from(n.clone())))
+            .map(|n| {
+                let line = match self.run_status.get(n) {
+                    Some(status) => Line::from(vec![
+                        Span::raw(status_icon(*status)),
+                        Span::raw(" "),
+                        Span::raw(n.clone()),
+                    ]),
+                    None => Line::from(n.clone()),
+                };
+                ListItem::new(line)
+            })
             .collect();
         let list = List::new(items)
             .block(Block::default().borders(Borders::ALL).title("SOPs"))
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
-        f.render_stateful_widget(list, cols[0], &mut self.list_state);
-        self.list_row_rects = list_row_rects(cols[0], self.names.len());
+        f.render_stateful_widget(list, list_rect, &mut self.list_state);
+        // Hit rects must come from the same (shrunk) rect the list was drawn
+        // into, or every row click lands one strip too low.
+        self.list_row_rects = list_row_rects(list_rect, self.names.len());
+
+        self.render_controls(f, controls_rect);
 
         let editing = self.editor.is_some();
         let visual = self.layer == RenderLayer::Visual;
@@ -1421,6 +1560,39 @@ impl SopPane {
             .block(Block::default().borders(Borders::ALL).title(title))
             .wrap(Wrap { trim: false });
         f.render_widget(para, cols[1]);
+    }
+
+    /// Draw the bordered Run/Resume strip and record its hit rects. `None`
+    /// area means the pane was too short for a strip this frame; both rects
+    /// are cleared so stale coordinates cannot take a click.
+    fn render_controls(&mut self, f: &mut Frame, area: Option<Rect>) {
+        let Some(area) = area else {
+            self.run_btn_rect = None;
+            self.resume_btn_rect = None;
+            return;
+        };
+        let block = Block::default().borders(Borders::ALL).title("Controls");
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+
+        let (run_rect, resume_rect) = control_button_rects(inner);
+        self.run_btn_rect = run_rect;
+        self.resume_btn_rect = resume_rect;
+
+        let run_enabled = self.selected_name().is_some();
+        let resume_enabled = self.selected_resume_target().is_some();
+        let mut spans = Vec::new();
+        if run_rect.is_some() {
+            spans.push(Span::styled(RUN_LABEL, button_style(run_enabled)));
+        }
+        if resume_rect.is_some() {
+            spans.push(Span::raw(BUTTON_GAP));
+            spans.push(Span::styled(RESUME_LABEL, button_style(resume_enabled)));
+        }
+        if spans.is_empty() {
+            return;
+        }
+        f.render_widget(Paragraph::new(Line::from(spans)), inner);
     }
 
     fn right_title(&self) -> String {
@@ -1900,6 +2072,79 @@ fn in_rect(col: u16, row: u16, r: Rect) -> bool {
     col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height
 }
 
+/// Height of the Run/Resume strip: two border rows plus one label row.
+const CONTROLS_H: u16 = 3;
+
+/// Below this the left column cannot host both a usable list and the strip,
+/// so the strip is dropped rather than squeezing the list to nothing.
+const MIN_LEFT_COL_H: u16 = 5;
+
+const RUN_LABEL: &str = "[▶ Run]";
+const RESUME_LABEL: &str = "[⏯ Resume]";
+/// One blank cell between the two labels.
+const BUTTON_GAP: &str = " ";
+
+/// Enabled labels are bright and bold; disabled ones dim, matching the
+/// pane's existing "unavailable" treatment.
+fn button_style(enabled: bool) -> Style {
+    if enabled {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM)
+    }
+}
+
+/// Hit rects for the two control labels inside the strip's *inner* rect.
+///
+/// Widths come from [`crate::display_width::display_width`] because the glyphs
+/// are emoji (`▶`/`⏯`) whose cell width is not their char count. Layout is
+/// left-aligned: `[▶ Run]`, one space, `[⏯ Resume]`. A label that does not fit
+/// in the remaining width is `None` (clipped, hence unclickable) rather than a
+/// rect running off the edge; zero height yields `(None, None)`.
+fn control_button_rects(inner: Rect) -> (Option<Rect>, Option<Rect>) {
+    if inner.height == 0 || inner.width == 0 {
+        return (None, None);
+    }
+    let run_w = crate::display_width::display_width(RUN_LABEL) as u16;
+    let gap_w = crate::display_width::display_width(BUTTON_GAP) as u16;
+    let resume_w = crate::display_width::display_width(RESUME_LABEL) as u16;
+
+    if run_w > inner.width {
+        return (None, None);
+    }
+    let run = Rect::new(inner.x, inner.y, run_w, 1);
+    let resume_x = inner.x.saturating_add(run_w).saturating_add(gap_w);
+    let used = run_w.saturating_add(gap_w).saturating_add(resume_w);
+    let resume = (used <= inner.width).then(|| Rect::new(resume_x, inner.y, resume_w, 1));
+    (Some(run), resume)
+}
+
+/// Newest *active* run per SOP that is blocked on a human, as
+/// `sop_name -> run_id`. Inactive records are ignored however they ended: a
+/// retained `WaitingApproval` row is history, and approving it would be a
+/// no-op at best. `started_at` is RFC3339, so lexicographic max is
+/// chronological max — same assumption [`aggregate_sop_status`] makes.
+fn resume_targets_from(runs: &[SopRunSummaryView]) -> std::collections::HashMap<String, String> {
+    let mut best: std::collections::HashMap<String, &SopRunSummaryView> =
+        std::collections::HashMap::new();
+    for run in runs.iter().filter(|r| r.active && r.status.needs_input()) {
+        best.entry(run.sop_name.clone())
+            .and_modify(|cur| {
+                if run.started_at > cur.started_at {
+                    *cur = run;
+                }
+            })
+            .or_insert(run);
+    }
+    best.into_iter()
+        .map(|(name, run)| (name, run.run_id.clone()))
+        .collect()
+}
+
 fn list_row_rects(area: Rect, count: usize) -> Vec<Rect> {
     let inner_x = area.x.saturating_add(1);
     let inner_y = area.y.saturating_add(1);
@@ -1960,12 +2205,14 @@ fn wire_color(w: &GraphWire) -> Color {
     }
 }
 
+/// Node borders follow the run-status palette: green in flight, red failed,
+/// white ended cleanly, dark gray skipped or no run state.
 fn node_border_color(state: Option<NodeRunState>) -> Color {
     match state {
-        Some(NodeRunState::Active) => Color::Magenta,
-        Some(NodeRunState::Completed) => Color::Green,
+        Some(NodeRunState::Active) => Color::Green,
+        Some(NodeRunState::Completed) => Color::White,
         Some(NodeRunState::Failed) => Color::Red,
-        Some(NodeRunState::Skipped) => Color::Yellow,
+        Some(NodeRunState::Skipped) => Color::DarkGray,
         _ => Color::Gray,
     }
 }
@@ -2152,6 +2399,70 @@ fn render_editor_card(
     );
 }
 
+/// Collapse one SOP's run rows into the single status its list row shows.
+///
+/// Live runs always win over history: while anything is active the row
+/// reflects the engine, not the archive. Within the active set the rule is
+/// "loudest first" — a run parked on an operator decision outranks one that
+/// is merely executing, because the former is the only one that needs the
+/// user. `Unknown` (a status from a newer daemon) is deliberately ranked
+/// below every status we understand: it must never mask a real
+/// needs-input signal, but it still surfaces when it is all we have.
+///
+/// With no active runs the row falls back to the most recently started
+/// record. `started_at` is RFC3339, so a lexicographic max is a chronological
+/// max.
+fn aggregate_sop_status(runs: &[SopRunSummaryView]) -> Option<SopRunStatusView> {
+    /// Higher wins. A terminal status on a run the engine still lists as
+    /// active is a race between the run finishing and this poll, so it sits
+    /// at the floor — below `Unknown`, which at least might be a live state
+    /// this build does not know yet. Everything stays eligible, so a lone
+    /// active run always yields something.
+    fn liveness_rank(status: SopRunStatusView) -> u8 {
+        if status.needs_input() {
+            4
+        } else if status == SopRunStatusView::Running {
+            3
+        } else if status == SopRunStatusView::Pending {
+            2
+        } else if status.is_terminal() {
+            0
+        } else {
+            1
+        }
+    }
+
+    let best_active = runs
+        .iter()
+        .filter(|r| r.active)
+        .max_by(|a, b| {
+            liveness_rank(a.status)
+                .cmp(&liveness_rank(b.status))
+                .then_with(|| a.started_at.cmp(&b.started_at))
+        })
+        .map(|r| r.status);
+    if best_active.is_some() {
+        return best_active;
+    }
+
+    runs.iter()
+        .max_by(|a, b| a.started_at.cmp(&b.started_at))
+        .map(|r| r.status)
+}
+
+/// Row icon for an aggregated status. Green in flight, yellow waiting on a
+/// human, red failed, white ended cleanly (completed or cancelled), black
+/// "this daemon knows something we don't".
+fn status_icon(status: SopRunStatusView) -> &'static str {
+    match status {
+        SopRunStatusView::Pending | SopRunStatusView::Running => "🟢",
+        SopRunStatusView::WaitingApproval | SopRunStatusView::PausedCheckpoint => "🟡",
+        SopRunStatusView::Failed => "🔴",
+        SopRunStatusView::Completed | SopRunStatusView::Cancelled => "⚪",
+        SopRunStatusView::Unknown => "⚫",
+    }
+}
+
 fn render_node_card(
     f: &mut Frame,
     area: Rect,
@@ -2331,5 +2642,442 @@ mod tests {
             "with no backend `sources` (old/failed response) the picker \
              reconstructs from bound + channel so it still works"
         );
+    }
+}
+
+#[cfg(test)]
+mod status_agg_tests {
+    use super::{aggregate_sop_status, status_icon};
+    use crate::client::{SopRunStatusView, SopRunSummaryView};
+
+    fn run(status: SopRunStatusView, active: bool, started_at: &str) -> SopRunSummaryView {
+        SopRunSummaryView {
+            run_id: format!("run-{started_at}"),
+            sop_name: "deploy".to_string(),
+            status,
+            started_at: started_at.to_string(),
+            active,
+            ..SopRunSummaryView::default()
+        }
+    }
+
+    #[test]
+    fn no_runs_yields_no_status() {
+        assert_eq!(
+            aggregate_sop_status(&[]),
+            None,
+            "a SOP that never ran must render as a bare name, not an icon"
+        );
+    }
+
+    #[test]
+    fn single_active_running_wins() {
+        let runs = [run(SopRunStatusView::Running, true, "2026-08-02T10:00:00Z")];
+        assert_eq!(aggregate_sop_status(&runs), Some(SopRunStatusView::Running));
+    }
+
+    #[test]
+    fn active_waiting_approval_beats_active_running() {
+        let runs = [
+            run(SopRunStatusView::Running, true, "2026-08-02T12:00:00Z"),
+            run(
+                SopRunStatusView::WaitingApproval,
+                true,
+                "2026-08-02T09:00:00Z",
+            ),
+        ];
+        assert_eq!(
+            aggregate_sop_status(&runs),
+            Some(SopRunStatusView::WaitingApproval),
+            "needs-input outranks execution even when it started earlier — \
+             the row exists to tell the user someone is blocked on them"
+        );
+    }
+
+    #[test]
+    fn active_paused_checkpoint_also_outranks_running() {
+        let runs = [
+            run(SopRunStatusView::Running, true, "2026-08-02T12:00:00Z"),
+            run(
+                SopRunStatusView::PausedCheckpoint,
+                true,
+                "2026-08-02T11:00:00Z",
+            ),
+        ];
+        assert_eq!(
+            aggregate_sop_status(&runs),
+            Some(SopRunStatusView::PausedCheckpoint)
+        );
+    }
+
+    #[test]
+    fn active_running_beats_active_pending() {
+        let runs = [
+            run(SopRunStatusView::Pending, true, "2026-08-02T13:00:00Z"),
+            run(SopRunStatusView::Running, true, "2026-08-02T08:00:00Z"),
+        ];
+        assert_eq!(
+            aggregate_sop_status(&runs),
+            Some(SopRunStatusView::Running),
+            "the most-alive active run drives the row"
+        );
+    }
+
+    #[test]
+    fn active_run_beats_newer_terminal_run() {
+        let runs = [
+            run(SopRunStatusView::Completed, false, "2026-08-02T23:00:00Z"),
+            run(SopRunStatusView::Failed, false, "2026-08-02T22:00:00Z"),
+            run(SopRunStatusView::Pending, true, "2026-08-02T01:00:00Z"),
+        ];
+        assert_eq!(
+            aggregate_sop_status(&runs),
+            Some(SopRunStatusView::Pending),
+            "history never masks a live run, however recent the history is"
+        );
+    }
+
+    #[test]
+    fn terminal_only_picks_greatest_started_at() {
+        let runs = [
+            run(SopRunStatusView::Completed, false, "2026-08-01T10:00:00Z"),
+            run(SopRunStatusView::Failed, false, "2026-08-02T10:00:00Z"),
+            run(SopRunStatusView::Cancelled, false, "2026-07-30T10:00:00Z"),
+        ];
+        assert_eq!(
+            aggregate_sop_status(&runs),
+            Some(SopRunStatusView::Failed),
+            "with nothing live the row shows the latest outcome"
+        );
+    }
+
+    #[test]
+    fn lone_active_unknown_still_surfaces() {
+        let runs = [run(SopRunStatusView::Unknown, true, "2026-08-02T10:00:00Z")];
+        assert_eq!(
+            aggregate_sop_status(&runs),
+            Some(SopRunStatusView::Unknown),
+            "an unrecognized status is not a reason to render nothing"
+        );
+    }
+
+    #[test]
+    fn active_unknown_loses_to_running_and_needs_input() {
+        let with_running = [
+            run(SopRunStatusView::Unknown, true, "2026-08-02T14:00:00Z"),
+            run(SopRunStatusView::Running, true, "2026-08-02T02:00:00Z"),
+        ];
+        assert_eq!(
+            aggregate_sop_status(&with_running),
+            Some(SopRunStatusView::Running)
+        );
+
+        let with_waiting = [
+            run(SopRunStatusView::Unknown, true, "2026-08-02T14:00:00Z"),
+            run(
+                SopRunStatusView::WaitingApproval,
+                true,
+                "2026-08-02T02:00:00Z",
+            ),
+        ];
+        assert_eq!(
+            aggregate_sop_status(&with_waiting),
+            Some(SopRunStatusView::WaitingApproval),
+            "Unknown must never mask a run that is blocked on the user"
+        );
+    }
+
+    #[test]
+    fn active_terminal_row_loses_to_every_live_status() {
+        // A run the engine still lists as active but whose status already
+        // reads terminal is a poll racing the run's own completion; it must
+        // not outrank a genuinely live sibling.
+        let runs = [
+            run(SopRunStatusView::Completed, true, "2026-08-02T20:00:00Z"),
+            run(SopRunStatusView::Unknown, true, "2026-08-02T01:00:00Z"),
+        ];
+        assert_eq!(aggregate_sop_status(&runs), Some(SopRunStatusView::Unknown));
+    }
+
+    #[test]
+    fn unknown_is_neither_needs_input_nor_terminal() {
+        assert!(!SopRunStatusView::Unknown.needs_input());
+        assert!(!SopRunStatusView::Unknown.is_terminal());
+        // An inactive Unknown is still the latest record, so it wins the
+        // history fallback rather than being skipped.
+        let runs = [
+            run(SopRunStatusView::Completed, false, "2026-08-01T10:00:00Z"),
+            run(SopRunStatusView::Unknown, false, "2026-08-02T10:00:00Z"),
+        ];
+        assert_eq!(aggregate_sop_status(&runs), Some(SopRunStatusView::Unknown));
+    }
+
+    #[test]
+    fn icon_mapping_covers_every_status() {
+        assert_eq!(status_icon(SopRunStatusView::Pending), "🟢");
+        assert_eq!(status_icon(SopRunStatusView::Running), "🟢");
+        assert_eq!(status_icon(SopRunStatusView::WaitingApproval), "🟡");
+        assert_eq!(status_icon(SopRunStatusView::PausedCheckpoint), "🟡");
+        assert_eq!(status_icon(SopRunStatusView::Failed), "🔴");
+        assert_eq!(status_icon(SopRunStatusView::Completed), "⚪");
+        assert_eq!(status_icon(SopRunStatusView::Cancelled), "⚪");
+        assert_eq!(status_icon(SopRunStatusView::Unknown), "⚫");
+    }
+}
+
+#[cfg(test)]
+mod controls_tests {
+    use super::{
+        CONTROLS_H, MIN_LEFT_COL_H, RESUME_LABEL, RUN_LABEL, control_button_rects, list_row_rects,
+        resume_targets_from,
+    };
+    use crate::client::{SopRunStatusView, SopRunSummaryView};
+    use ratatui::layout::Rect;
+
+    fn run(
+        run_id: &str,
+        sop: &str,
+        status: SopRunStatusView,
+        active: bool,
+        started_at: &str,
+    ) -> SopRunSummaryView {
+        SopRunSummaryView {
+            run_id: run_id.to_string(),
+            sop_name: sop.to_string(),
+            status,
+            started_at: started_at.to_string(),
+            active,
+            ..SopRunSummaryView::default()
+        }
+    }
+
+    #[test]
+    fn no_runs_yields_no_resume_targets() {
+        assert!(
+            resume_targets_from(&[]).is_empty(),
+            "nothing to resume means the button stays dim"
+        );
+    }
+
+    #[test]
+    fn active_needs_input_is_the_target() {
+        let runs = [run(
+            "r1",
+            "deploy",
+            SopRunStatusView::WaitingApproval,
+            true,
+            "2026-08-02T10:00:00Z",
+        )];
+        let targets = resume_targets_from(&runs);
+        assert_eq!(targets.get("deploy").map(String::as_str), Some("r1"));
+    }
+
+    #[test]
+    fn active_running_is_not_a_resume_target() {
+        let runs = [run(
+            "r1",
+            "deploy",
+            SopRunStatusView::Running,
+            true,
+            "2026-08-02T10:00:00Z",
+        )];
+        assert!(
+            resume_targets_from(&runs).is_empty(),
+            "a run that is executing has no checkpoint to approve"
+        );
+    }
+
+    #[test]
+    fn inactive_needs_input_is_not_a_resume_target() {
+        let runs = [run(
+            "deploy-old",
+            "deploy",
+            SopRunStatusView::PausedCheckpoint,
+            false,
+            "2026-08-01T10:00:00Z",
+        )];
+        assert!(
+            resume_targets_from(&runs).is_empty(),
+            "a retained terminal record is history; approving it is a no-op"
+        );
+    }
+
+    #[test]
+    fn newest_started_active_needs_input_wins() {
+        let runs = [
+            run(
+                "old",
+                "deploy",
+                SopRunStatusView::WaitingApproval,
+                true,
+                "2026-08-02T09:00:00Z",
+            ),
+            run(
+                "new",
+                "deploy",
+                SopRunStatusView::PausedCheckpoint,
+                true,
+                "2026-08-02T11:00:00Z",
+            ),
+        ];
+        assert_eq!(
+            resume_targets_from(&runs).get("deploy").map(String::as_str),
+            Some("new"),
+            "with two blocked runs the button acts on the most recent one"
+        );
+    }
+
+    #[test]
+    fn mixed_summaries_map_each_sop_to_its_own_blocked_run() {
+        let runs = [
+            run(
+                "d-run",
+                "deploy",
+                SopRunStatusView::Running,
+                true,
+                "2026-08-02T12:00:00Z",
+            ),
+            run(
+                "d-wait",
+                "deploy",
+                SopRunStatusView::WaitingApproval,
+                true,
+                "2026-08-02T08:00:00Z",
+            ),
+            run(
+                "b-wait-dead",
+                "backup",
+                SopRunStatusView::WaitingApproval,
+                false,
+                "2026-08-02T07:00:00Z",
+            ),
+            run(
+                "r-pause",
+                "report",
+                SopRunStatusView::PausedCheckpoint,
+                true,
+                "2026-08-02T06:00:00Z",
+            ),
+        ];
+        let targets = resume_targets_from(&runs);
+        assert_eq!(targets.get("deploy").map(String::as_str), Some("d-wait"));
+        assert_eq!(targets.get("report").map(String::as_str), Some("r-pause"));
+        assert_eq!(
+            targets.get("backup"),
+            None,
+            "an inactive blocked record must not light up backup's Resume"
+        );
+        assert_eq!(targets.len(), 2);
+    }
+
+    #[test]
+    fn normal_width_places_both_buttons_side_by_side() {
+        let inner = Rect::new(1, 5, 30, 1);
+        let (run_rect, resume_rect) = control_button_rects(inner);
+        let run_rect = run_rect.expect("run button fits");
+        let resume_rect = resume_rect.expect("resume button fits");
+        assert_eq!((run_rect.x, run_rect.y, run_rect.height), (1, 5, 1));
+        assert_eq!(
+            run_rect.width,
+            crate::display_width::display_width(RUN_LABEL) as u16
+        );
+        assert_eq!(
+            resume_rect.x,
+            run_rect.x + run_rect.width + 1,
+            "one blank cell separates the labels"
+        );
+        assert_eq!(
+            resume_rect.width,
+            crate::display_width::display_width(RESUME_LABEL) as u16
+        );
+        assert_eq!(resume_rect.y, inner.y);
+    }
+
+    #[test]
+    fn emoji_labels_measure_wider_than_their_char_count() {
+        // `▶`/`⏯` are why the rects come from display width: a char-count
+        // rect would under-measure and leave a dead cell at the label's end.
+        assert!(
+            crate::display_width::display_width(RESUME_LABEL) >= RESUME_LABEL.chars().count(),
+            "display width must never undercount the rendered label"
+        );
+    }
+
+    #[test]
+    fn too_narrow_clips_the_second_button() {
+        let run_w = crate::display_width::display_width(RUN_LABEL) as u16;
+        let inner = Rect::new(0, 0, run_w + 2, 1);
+        let (run_rect, resume_rect) = control_button_rects(inner);
+        assert!(run_rect.is_some(), "the first button still fits");
+        assert_eq!(
+            resume_rect, None,
+            "a clipped label must be unclickable, not a rect running off the edge"
+        );
+    }
+
+    #[test]
+    fn width_below_the_first_label_yields_no_buttons() {
+        let inner = Rect::new(0, 0, 3, 1);
+        assert_eq!(control_button_rects(inner), (None, None));
+    }
+
+    #[test]
+    fn zero_height_yields_no_buttons() {
+        let inner = Rect::new(0, 0, 40, 0);
+        assert_eq!(control_button_rects(inner), (None, None));
+    }
+
+    #[test]
+    fn exact_fit_keeps_both_buttons() {
+        let w = crate::display_width::display_width(RUN_LABEL)
+            + 1
+            + crate::display_width::display_width(RESUME_LABEL);
+        let inner = Rect::new(0, 0, w as u16, 1);
+        let (run_rect, resume_rect) = control_button_rects(inner);
+        assert!(run_rect.is_some());
+        let resume_rect = resume_rect.expect("both labels fit exactly");
+        assert_eq!(
+            resume_rect.x + resume_rect.width,
+            inner.x + inner.width,
+            "the last cell of the strip is the last cell of the label"
+        );
+    }
+
+    #[test]
+    fn tall_left_column_splits_into_list_plus_strip() {
+        // Mirrors render()'s split arithmetic without a Frame: the list keeps
+        // everything above the 3-row strip, and its row rects must start
+        // inside the *shrunk* list rect.
+        let col = Rect::new(0, 0, 20, 12);
+        assert!(col.height >= MIN_LEFT_COL_H);
+        let list_rect = Rect::new(col.x, col.y, col.width, col.height - CONTROLS_H);
+        let rects = list_row_rects(list_rect, 20);
+        assert_eq!(
+            rects.len(),
+            (list_rect.height - 2) as usize,
+            "rows stop at the shrunk list's inner height, not the full column"
+        );
+        let last = rects.last().copied().expect("rows exist");
+        assert!(
+            last.y < col.y + col.height - CONTROLS_H,
+            "no row may overlap the controls strip"
+        );
+    }
+
+    #[test]
+    fn tiny_left_column_keeps_the_whole_height_for_the_list() {
+        let col = Rect::new(0, 0, 20, 4);
+        assert!(col.height < MIN_LEFT_COL_H, "strip is omitted at this size");
+        let rects = list_row_rects(col, 5);
+        assert_eq!(rects.len(), 2, "list still renders its two inner rows");
+    }
+
+    #[test]
+    fn strip_inner_is_a_single_row() {
+        let strip = Rect::new(0, 9, 20, CONTROLS_H);
+        let inner = Rect::new(strip.x + 1, strip.y + 1, strip.width - 2, strip.height - 2);
+        assert_eq!(inner.height, 1, "borders leave exactly one label row");
+        let (run_rect, _) = control_button_rects(inner);
+        assert_eq!(run_rect.map(|r| r.y), Some(strip.y + 1));
     }
 }
