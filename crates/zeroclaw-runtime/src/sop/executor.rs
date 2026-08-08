@@ -305,8 +305,7 @@ async fn drive_headless_run(
                         .get_run(&run_id)
                         .and_then(|run| run.initiating_agent.clone())
                 };
-                let resolved_agent =
-                    headless_step_agent(&config, &step, run_initiator.as_deref());
+                let resolved_agent = headless_step_agent(&config, &step, run_initiator.as_deref());
                 // Attribution follows execution: a step that never ran — no
                 // owner, or an owner naming an unconfigured agent — is recorded
                 // against no agent at all, so a refusal can never read as an
@@ -334,29 +333,28 @@ async fn drive_headless_run(
                         // it to the heap.
                         let task_scope = scope.clone();
                         let turn = Box::pin(crate::agent::run(
-                                config.clone(),
-                                agent_alias,
-                                Some(context),
-                                None,
-                                None,
-                                config
-                                    .model_provider_for_agent(agent_alias)
-                                    .and_then(|e| e.temperature),
-                                vec![],
-                                false,
-                                Some(session_path),
-                                None,
-                                zeroclaw_api::ingress::TurnOrigin::Daemon,
-                                crate::agent::loop_::AgentRunOverrides {
-                                    sop_step_scope: Some(scope),
-                                    ..Default::default()
-                                },
+                            config.clone(),
+                            agent_alias,
+                            Some(context),
+                            None,
+                            None,
+                            config
+                                .model_provider_for_agent(agent_alias)
+                                .and_then(|e| e.temperature),
+                            vec![],
+                            false,
+                            Some(session_path),
+                            None,
+                            zeroclaw_api::ingress::TurnOrigin::Daemon,
+                            crate::agent::loop_::AgentRunOverrides {
+                                sop_step_scope: Some(scope),
+                                ..Default::default()
+                            },
                         ));
                         scope_step_call_sink(
                             call_sink.clone(),
                             crate::sop::active_scope::with_active_headless_step_scope(
-                                task_scope,
-                                turn,
+                                task_scope, turn,
                             ),
                         )
                         .await
@@ -903,7 +901,8 @@ mod tests {
         let config = config_with_agent("ops", true);
 
         assert_eq!(
-            headless_step_agent(&config, &owned_step(Some("ops")), None).expect("enabled owner resolves"),
+            headless_step_agent(&config, &owned_step(Some("ops")), None)
+                .expect("enabled owner resolves"),
             "ops"
         );
     }

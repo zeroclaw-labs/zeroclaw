@@ -7893,6 +7893,52 @@ fn build_sop_adapters(config: &Config) -> zeroclaw_runtime::sop::SopEngineAdapte
     }
 }
 
+/// Abort SOP cron drivers that no generation will adopt, and keep joining them.
+///
+/// `abort` only requests cancellation, so a driver that reaches no await point
+/// keeps running under the superseded config. Dropping its `JoinHandle` would
+/// detach that task, losing the last way to observe work still in flight — so a
+/// reaper owns the handles and joins them instead.
+///
+/// Returns the reaper's handle (`None` when nothing was still running) so a test
+/// can observe that ownership was retained rather than merely claimed.
+#[cfg(feature = "agent-runtime")]
+fn reap_orphaned_sop_drivers(
+    carried: Vec<tokio::task::JoinHandle<()>>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let orphaned = carried
+        .iter()
+        .filter(|driver| !driver.is_finished())
+        .count();
+    for driver in &carried {
+        driver.abort();
+    }
+    if orphaned == 0 {
+        return None;
+    }
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({"orphaned": orphaned})),
+        "SOP cron driver(s) from a previous generation are still running, but this \
+         configuration runs no SOP maintenance to own them; re-aborted and handed to a \
+         reaper that joins them"
+    );
+    Some(::zeroclaw_spawn::spawn!(async move {
+        for driver in carried {
+            let _ = driver.await;
+        }
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                .with_attrs(::serde_json::json!({"orphaned": orphaned})),
+            "orphaned SOP cron driver(s) from a superseded generation have stopped"
+        );
+    }))
+}
+
 /// Spawn the periodic SOP maintenance tick (EPIC A1 + SOP cron): on each interval it
 /// fires fail-closed approval timeouts, reaps expired concurrency-claim leases,
 /// prunes terminal runs past the retention policy, and dispatches cached cron
@@ -7914,42 +7960,9 @@ fn spawn_sop_maintenance(
     carried: Vec<tokio::task::JoinHandle<()>>,
 ) -> Option<SopMaintenance> {
     let disown = |carried: Vec<tokio::task::JoinHandle<()>>| {
-        let orphaned = carried
-            .iter()
-            .filter(|driver| !driver.is_finished())
-            .count();
-        for driver in &carried {
-            driver.abort();
-        }
-        if orphaned > 0 {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"orphaned": orphaned})),
-                "SOP cron driver(s) from a previous generation are still running, but this \
-                 configuration runs no SOP maintenance to own them; re-aborted and handed to a \
-                 reaper that joins them"
-            );
-            // Ownership, not detachment. `abort` only *requests* cancellation, so
-            // a driver that reaches no await point keeps running under the
-            // superseded config; dropping its `JoinHandle` here would detach that
-            // task and lose the re-check this type exists to provide. A reaper
-            // owns the handles instead and joins them, so the process still has
-            // something that ends when they do.
-            drop(::zeroclaw_spawn::spawn!(async move {
-                for driver in carried {
-                    let _ = driver.await;
-                }
-                ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Success)
-                        .with_attrs(::serde_json::json!({"orphaned": orphaned})),
-                    "orphaned SOP cron driver(s) from a superseded generation have stopped"
-                );
-            }));
-        }
+        // Production drops the reaper's handle: the reaper is what owns the
+        // drivers, so nothing else needs to hold it.
+        drop(reap_orphaned_sop_drivers(carried));
     };
     if interval_secs == 0 {
         disown(carried);
@@ -10017,8 +10030,8 @@ mod tests {
             // to the plain answer mounted below.
             wiremock::Mock::given(wiremock::matchers::method("POST"))
                 .and(wiremock::matchers::path("/chat/completions"))
-                .respond_with(
-                    wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({
                         "id": "chatcmpl-tool",
                         "object": "chat.completion",
                         "created": 0,
@@ -10040,8 +10053,8 @@ mod tests {
                             "finish_reason": "tool_calls",
                         }],
                         "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
-                    })),
-                )
+                    }),
+                ))
                 .up_to_n_times(1)
                 .mount(&server)
                 .await;
@@ -10418,6 +10431,69 @@ mod tests {
         assert!(
             carried.is_empty(),
             "a driver that stopped on abort has nothing to carry forward"
+        );
+    }
+
+    /// A generation that adopts no drivers must still own the ones it inherited.
+    /// The flag is the point: if the reaper returned without joining — or if the
+    /// handles were dropped, which detaches the tasks — it would still be false
+    /// when the reaper finished.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "agent-runtime")]
+    async fn orphaned_sop_drivers_are_reaped_rather_than_detached() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let started = std::sync::Arc::new(AtomicBool::new(false));
+        let finished = std::sync::Arc::new(AtomicBool::new(false));
+        let start_flag = std::sync::Arc::clone(&started);
+        let flag = std::sync::Arc::clone(&finished);
+        // Blocking, so `abort` cannot stop it once it is polled: exactly the
+        // driver whose handle must not be dropped.
+        let driver = ::zeroclaw_spawn::spawn!(async move {
+            start_flag.store(true, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            flag.store(true, Ordering::SeqCst);
+        });
+        // Wait for the first poll. `abort` on a task the runtime has not polled
+        // yet cancels it outright, which under load would leave the driver never
+        // having run at all — a race in the test, not in the reaper.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the driver must begin before it is reaped");
+
+        let reaper = reap_orphaned_sop_drivers(vec![driver])
+            .expect("a driver still running must be reaped, not dropped");
+        tokio::time::timeout(std::time::Duration::from_secs(5), reaper)
+            .await
+            .expect("the reaper must finish once its drivers stop")
+            .expect("the reaper task itself must not fail");
+
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "the reaper must join its drivers before finishing"
+        );
+    }
+
+    /// Nothing to own: every carried driver already stopped, so there is no
+    /// reaper to spawn.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "agent-runtime")]
+    async fn finished_drivers_need_no_reaper() {
+        let driver = ::zeroclaw_spawn::spawn!(async {});
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !driver.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+
+        assert!(
+            reap_orphaned_sop_drivers(vec![driver]).is_none(),
+            "a batch with nothing running must not spawn a reaper"
         );
     }
 

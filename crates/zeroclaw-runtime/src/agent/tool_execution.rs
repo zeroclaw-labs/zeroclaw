@@ -772,7 +772,10 @@ mod tests {
             turn_id: "test-turn-id",
             channel_name: "test",
         };
-        let calls = vec![parsed_tool_call("activator"), parsed_tool_call("sop_execute")];
+        let calls = vec![
+            parsed_tool_call("activator"),
+            parsed_tool_call("sop_execute"),
+        ];
         let scope = crate::sop::active_scope::HeadlessStepScope {
             run_id: "run-1".into(),
             step: crate::sop::types::SopStep::default(),
