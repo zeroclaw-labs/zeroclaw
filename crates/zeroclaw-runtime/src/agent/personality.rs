@@ -69,7 +69,6 @@ impl PersonalityProfile {
     pub fn render(&self) -> String {
         let mut out = String::new();
         for file in &self.files {
-            let _ = writeln!(out, "### {}\n", file.name);
             out.push_str(&file.content);
             if file.truncated {
                 let _ = writeln!(
@@ -227,9 +226,12 @@ mod tests {
 
         let profile = load_personality(&ws);
         let rendered = profile.render();
-        assert!(rendered.contains("### SOUL.md"));
+        assert!(!rendered.contains("SOUL.md"), "heading removed: {rendered}");
         assert!(rendered.contains("Be kind."));
-        assert!(rendered.contains("### IDENTITY.md"));
+        assert!(
+            !rendered.contains("IDENTITY.md"),
+            "heading removed: {rendered}"
+        );
         assert!(rendered.contains("Name: Nova"));
 
         let _ = std::fs::remove_dir_all(ws);
@@ -242,7 +244,10 @@ mod tests {
 
         let profile = load_personality(&ws);
         let rendered = profile.render();
-        assert!(rendered.contains("[... truncated at"));
+        assert!(
+            rendered.contains("SOUL.md truncated"),
+            "expected filename in truncation notice: {rendered}"
+        );
 
         let _ = std::fs::remove_dir_all(ws);
     }

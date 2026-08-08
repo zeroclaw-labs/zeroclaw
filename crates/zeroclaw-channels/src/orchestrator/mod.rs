@@ -21443,16 +21443,25 @@ BTC is currently around $65,000 based on latest tool output."#
         let ws = make_workspace();
         let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
 
-        assert!(prompt.contains("### SOUL.md"), "missing SOUL.md header");
+        assert!(!prompt.contains("### SOUL.md"), "heading removed: SOUL.md");
         assert!(prompt.contains("Be helpful"), "missing SOUL content");
-        assert!(prompt.contains("### IDENTITY.md"), "missing IDENTITY.md");
+        assert!(
+            !prompt.contains("### IDENTITY.md"),
+            "heading removed: IDENTITY.md"
+        );
         assert!(
             prompt.contains("Name: ZeroClaw"),
             "missing IDENTITY content"
         );
-        assert!(prompt.contains("### USER.md"), "missing USER.md");
-        assert!(prompt.contains("### AGENTS.md"), "missing AGENTS.md");
-        assert!(prompt.contains("### TOOLS.md"), "missing TOOLS.md");
+        assert!(!prompt.contains("### USER.md"), "heading removed: USER.md");
+        assert!(
+            !prompt.contains("### AGENTS.md"),
+            "heading removed: AGENTS.md"
+        );
+        assert!(
+            !prompt.contains("### TOOLS.md"),
+            "heading removed: TOOLS.md"
+        );
         // HEARTBEAT.md is intentionally excluded from channel prompts — it's only
         // relevant to the heartbeat worker and causes LLMs to emit spurious
         // "HEARTBEAT_OK" acknowledgments in channel conversations.
