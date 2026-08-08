@@ -1,3 +1,5 @@
+#[cfg(all(feature = "agent-runtime", feature = "channel-acp-server"))]
+mod acp_cli;
 #[cfg(feature = "agent-runtime")]
 mod config_dir_locale_regression;
 mod config_patch_cli;

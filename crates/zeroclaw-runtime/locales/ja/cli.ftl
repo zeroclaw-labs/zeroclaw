@@ -176,6 +176,7 @@ cli-acp-long-about =
 
     例:
     zeroclaw acp                        # ACP サーバーを起動
+    zeroclaw acp --agent fable
     zeroclaw acp --max-sessions 5       # 同時セッション数を制限
 cli-daemon-long-about =
     長時間実行の自律型デーモンを起動します。

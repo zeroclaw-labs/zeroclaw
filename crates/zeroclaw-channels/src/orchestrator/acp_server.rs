@@ -98,11 +98,11 @@ pub struct AcpServer {
     /// build their own engine from config.
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
-    /// Connection-scoped default agent alias (`?agent=` on the gateway ACP
-    /// endpoint). Slots into the `session/new` alias precedence chain between
-    /// an explicit `agentAlias` and `[acp].default_agent`. Not a config
-    /// change: it only supplies the default for new sessions on this
-    /// connection (restore keeps the operator-controlled fallback chain).
+    /// Process- or connection-scoped default agent alias (`--agent` for
+    /// standalone ACP or `?agent=` on the gateway endpoint). Slots into the
+    /// `session/new` alias precedence chain between an explicit `agentAlias`
+    /// and `[acp].default_agent`. Not a config change: it only supplies the
+    /// default for new sessions (restore keeps the operator-controlled chain).
     connection_default_agent: Option<String>,
     client_elicitation_caps: std::sync::RwLock<ElicitationCapabilities>,
 }
@@ -269,10 +269,11 @@ impl AcpServer {
         }
     }
 
-    /// Set the connection-scoped default agent alias (`?agent=` query param
-    /// on the gateway ACP endpoint). Blank values are treated as absent. The
-    /// alias is validated at `session/new` with the same dispatchable-agent
-    /// checks as an explicit `agentAlias`. Restore paths ignore this value.
+    /// Set the process- or connection-scoped default agent alias (`--agent`
+    /// for standalone ACP or `?agent=` on the gateway endpoint). Blank values
+    /// are treated as absent. The alias is validated at `session/new` with the
+    /// same dispatchable-agent checks as an explicit `agentAlias`. Restore
+    /// paths ignore this value.
     pub fn with_connection_default_agent(mut self, alias: Option<String>) -> Self {
         self.connection_default_agent = alias
             .as_deref()
@@ -605,8 +606,8 @@ impl AcpServer {
             .map(|_| alias.to_string())
     }
 
-    /// Shared validation for explicit `agentAlias`, `?agent=`, config defaults,
-    /// and sole-agent auto-select.
+    /// Shared validation for explicit `agentAlias`, process/connection
+    /// defaults, config defaults, and sole-agent auto-select.
     fn validate_dispatchable_agent_alias(
         config: &Config,
         agent_alias: &str,
@@ -631,8 +632,8 @@ impl AcpServer {
     /// Restore alias precedence: persisted owner (when still dispatchable) →
     /// `[acp].default_agent` → sole configured agent → `"default"`.
     ///
-    /// The connection-scoped `?agent=` default is intentionally omitted: restore
-    /// accepts only a session ID and must not let transport input rebind a
+    /// The process/connection default is intentionally omitted: restore accepts
+    /// only a session ID and must not let launcher or transport input rebind a
     /// persisted workspace/history to a different agent.
     fn resolve_restore_agent_alias(config: &Config, persisted_agent_alias: &str) -> String {
         Self::alias_if_dispatchable(config, persisted_agent_alias)

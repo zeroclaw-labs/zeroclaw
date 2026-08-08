@@ -176,6 +176,7 @@ cli-acp-long-about =
 
     Ejemplos:
     zeroclaw acp                        # iniciar servidor ACP
+    zeroclaw acp --agent fable
     zeroclaw acp --max-sessions 5       # limitar sesiones concurrentes
 cli-daemon-long-about =
     Inicia el daemon autónomo de larga duración.

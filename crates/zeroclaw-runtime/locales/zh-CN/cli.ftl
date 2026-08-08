@@ -175,6 +175,7 @@ cli-acp-long-about =
 
     示例：
     zeroclaw acp                        # 启动 ACP 服务器
+    zeroclaw acp --agent fable
     zeroclaw acp --max-sessions 5       # 限制并发会话数
 cli-daemon-long-about =
     启动长期运行的自主守护进程。
