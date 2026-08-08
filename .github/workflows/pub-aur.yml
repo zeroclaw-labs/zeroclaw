@@ -155,23 +155,63 @@ jobs:
           ssh-keygen -l -f ~/.ssh/aur || { echo "::error::AUR_SSH_KEY is not a valid SSH private key"; exit 1; }
           echo "::endgroup::"
 
-          tmp_dir="$(mktemp -d)"
-          # A successful clone is the authoritative authentication check. AUR's
-          # `ssh -T` response is not a stable machine-readable success contract.
-          git clone ssh://aur@aur.archlinux.org/zeroclawlabs.git "$tmp_dir/aur"
+          work_root="$(mktemp -d)"
+          trap 'rm -rf "$work_root"' EXIT
 
-          cp "$PKGBUILD_FILE" "$tmp_dir/aur/PKGBUILD"
-          cp "$SRCINFO_FILE" "$tmp_dir/aur/.SRCINFO"
+          # aur.archlinux.org takes scheduled maintenance windows, and a window
+          # that overlaps a release used to drop that release from the AUR
+          # permanently: the job did one unretried clone, failed, and nothing
+          # re-checked afterwards. Retry the whole clone-to-push unit rather
+          # than the clone alone, so a retry always rebases onto whatever the
+          # AUR currently has instead of pushing a stale tree.
+          #
+          # Every step is guarded with `|| return 1`: `set -e` is suppressed
+          # inside a function invoked from an `if` condition, so an unguarded
+          # failure here would fall through to the next command.
+          publish_attempt() {
+            local attempt="$1"
+            local work_dir="${work_root}/attempt-${attempt}"
 
-          cd "$tmp_dir/aur"
-          git config user.name "zeroclaw-bot"
-          git config user.email "bot@zeroclaw.dev"
-          git add PKGBUILD .SRCINFO
-          git diff --cached --quiet && { echo "No changes to push."; exit 0; }
-          git commit -m "zeroclawlabs ${VERSION}"
-          git push origin HEAD
+            # A successful clone is the authoritative authentication check. AUR's
+            # `ssh -T` response is not a stable machine-readable success contract.
+            git clone --quiet ssh://aur@aur.archlinux.org/zeroclawlabs.git "$work_dir" || return 1
 
-          echo "AUR package updated to ${VERSION}"
+            cp "$PKGBUILD_FILE" "$work_dir/PKGBUILD" || return 1
+            cp "$SRCINFO_FILE" "$work_dir/.SRCINFO" || return 1
+
+            git -C "$work_dir" config user.name "zeroclaw-bot" || return 1
+            git -C "$work_dir" config user.email "bot@zeroclaw.dev" || return 1
+            git -C "$work_dir" add PKGBUILD .SRCINFO || return 1
+
+            if git -C "$work_dir" diff --cached --quiet; then
+              echo "No changes to push; the AUR is already at ${VERSION}."
+              return 0
+            fi
+
+            git -C "$work_dir" commit --quiet -m "zeroclawlabs ${VERSION}" || return 1
+            git -C "$work_dir" push --quiet origin HEAD || return 1
+
+            echo "AUR package updated to ${VERSION}"
+          }
+
+          max_attempts=5
+          delay=30
+
+          for attempt in $(seq 1 "$max_attempts"); do
+            if publish_attempt "$attempt"; then
+              exit 0
+            fi
+
+            if (( attempt < max_attempts )); then
+              echo "::warning::AUR publish attempt ${attempt}/${max_attempts} failed; retrying in ${delay}s."
+              sleep "$delay"
+              delay=$(( delay * 2 ))
+            fi
+          done
+
+          echo "::error::AUR publish failed after ${max_attempts} attempts."
+          echo "::error::If the log above shows 'The AUR is down due to maintenance', this is an upstream outage rather than a credential problem: re-dispatch Pub AUR Package at ${RELEASE_TAG} once aur.archlinux.org is reachable."
+          exit 1
 
       - name: Summary
         shell: bash

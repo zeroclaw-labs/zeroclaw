@@ -87,6 +87,14 @@ Fires after a successful stable release. Posts the release notes to the communit
 
 Fires after a successful stable release. Posts an announcement tweet.
 
+### Weekly AUR Freshness Check (`aur-freshness-check.yml`)
+
+Compares the published `zeroclawlabs` AUR version against the current stable GitHub release every Monday, and fails if the AUR is behind.
+
+Publishing to the AUR is fire-and-forget: if `pub-aur.yml` fails, nothing re-checks, so the package silently falls behind. That is exactly what happened after v0.8.4. An `aur.archlinux.org` maintenance window overlapped the release, the single unretried clone failed with `The AUR is down due to maintenance`, and the package sat three weeks behind with no signal. The publisher now retries to survive a short outage, but a retry budget cannot cover every failure, so this check is the backstop that turns a silent miss into a visible one.
+
+If the AUR RPC is unreachable the check warns and passes rather than failing. An AUR outage is an upstream availability problem, not package staleness, and the next scheduled run re-checks. Staleness is durable, so a delayed detection is acceptable; a weekly page about someone else's maintenance window is not.
+
 Docs are built and published as part of the release pipeline rather than on every `master` push. Translation is a local-only workflow for dedicated translation-cache PRs, new locales, and release translation passes. Routine English docs PRs may defer broad generated `.po` churn. See [Docs & Translations](./docs-and-translations.md) for contributor guidance and the [Release Runbook](./release-runbook.md#refresh-and-pin-translations) for the release procedure.
 
 ## Manual and Advisory Workflows

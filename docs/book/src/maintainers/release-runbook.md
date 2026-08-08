@@ -532,6 +532,17 @@ failed distribution job does not invalidate the release itself.
 [Homebrew autobump status and documented manual bump
 path](https://docs.brew.sh/Autobump) instead of adding a repository fork token.
 
+**The AUR job failed with `The AUR is down due to maintenance`:** An upstream
+outage, not a credential problem. `AUR_SSH_KEY` is fine if the log shows a key
+fingerprint under `SSH key diagnostics` and the failure came from the server
+rather than from SSH. The publisher retries five times over roughly seven
+minutes, so reaching this state means the window outlasted the budget. Wait for
+`aur.archlinux.org` to come back, then re-dispatch Pub AUR Package at the
+release tag with `dry_run: true`, then `dry_run: false`. Confirm the result with
+`curl -fsS 'https://aur.archlinux.org/rpc/v5/info?arg%5B%5D=zeroclawlabs'`, or
+just dispatch AUR Freshness Check. Skipping this leaves the AUR silently behind
+until the weekly check catches it.
+
 ---
 
 ## Removed legacy workflows
