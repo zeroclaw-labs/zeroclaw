@@ -7,6 +7,17 @@ license = "MIT OR Apache-2.0"
 description = "Low-level bindings for the Total Phase Aardvark I2C/SPI/GPIO USB adapter"
 repository = "https://github.com/zeroclaw-labs/zeroclaw"
 
+# RETIREMENT PROPOSED, NOT DECIDED: an open proposal would delete this crate and
+# fold its FFI into zeroclaw-hardware. It is under discussion and has not been
+# ratified, so the current architecture contract still stands: FND-001 lists this
+# crate as an intentional independent exception. Follow the discussion at
+# https://github.com/zeroclaw-labs/zeroclaw/issues/8043, and the related
+# unsafe-code question at
+# https://github.com/zeroclaw-labs/zeroclaw/issues/7130, before adding call
+# sites. If the proposal is accepted, new peripheral work belongs in
+# zeroclaw-hardware instead, and the unsafe exemption below would need its own
+# narrow reviewed boundary there rather than transferring wholesale.
+#
 # NOTE: This crate is the ONLY place in ZeroClaw where unsafe code is permitted.
 # The rest of the workspace remains #![forbid(unsafe_code)].
 #

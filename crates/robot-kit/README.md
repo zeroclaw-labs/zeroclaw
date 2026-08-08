@@ -1,5 +1,13 @@
 # ZeroClaw Robot Kit
 
+> **Retirement proposed.** An open proposal would fold `zeroclaw-robot-kit` into
+> `zeroclaw-hardware`. It has not been decided, so this crate remains supported
+> as it is today. If you are planning new peripheral or robot support, weigh in
+> on [RFC #9803](https://github.com/zeroclaw-labs/zeroclaw/issues/9803) first,
+> and consider whether `zeroclaw-hardware` is the better home. The related
+> `aardvark-sys` proposal is
+> [RFC #8043](https://github.com/zeroclaw-labs/zeroclaw/issues/8043).
+
 A complete toolkit for building AI-powered robots with ZeroClaw. Designed for Raspberry Pi deployment with offline Ollama inference.
 
 ## Features
