@@ -215,6 +215,9 @@ Examples:
 /// Service management subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ServiceCommands {
+    /// Internal launchd runner that owns bounded daemon output capture
+    #[command(hide = true)]
+    RunLaunchdDaemon,
     /// Install daemon service unit for auto-start and restart
     Install,
     /// Start daemon service

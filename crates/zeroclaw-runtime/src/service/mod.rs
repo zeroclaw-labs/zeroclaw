@@ -1,12 +1,454 @@
 use anyhow::{Context, Result, bail};
+#[cfg(any(target_os = "macos", test))]
+use std::collections::VecDeque;
 use std::fs;
+#[cfg(any(target_os = "macos", test))]
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(any(target_os = "macos", test))]
+use std::process::Stdio;
 use std::str::FromStr;
+#[cfg(any(target_os = "macos", test))]
+use std::sync::{Arc, Condvar, Mutex};
+#[cfg(any(target_os = "macos", test))]
+use std::thread::JoinHandle;
+#[cfg(any(target_os = "macos", test))]
+use std::time::{Duration, Instant};
+#[cfg(any(target_os = "macos", test))]
+use tokio::io::{AsyncRead, AsyncReadExt};
+#[cfg(any(target_os = "macos", test))]
+use tokio::process::{Child, Command as TokioCommand};
 use zeroclaw_config::schema::Config;
 
 const SERVICE_LABEL: &str = "com.zeroclaw.daemon";
 const WINDOWS_TASK_NAME: &str = "ZeroClaw Daemon";
+#[cfg(any(target_os = "macos", test))]
+const LAUNCHD_LOG_MAX_BYTES: u64 = 8 * 1024 * 1024;
+#[cfg(any(target_os = "macos", test))]
+const LAUNCHD_LOG_COMPACT_BYTES: u64 = 4 * 1024 * 1024;
+#[cfg(any(target_os = "macos", test))]
+const LAUNCHD_LOG_PENDING_BYTES: usize = 1024 * 1024;
+#[cfg(any(target_os = "macos", test))]
+const LAUNCHD_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(any(target_os = "macos", test))]
+const LAUNCHD_PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug)]
+struct LaunchdCapturePaths {
+    stdout: PathBuf,
+    stderr: PathBuf,
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn launchd_capture_paths(config_dir: &Path) -> LaunchdCapturePaths {
+    let logs = config_dir.join("logs");
+    LaunchdCapturePaths {
+        stdout: logs.join("daemon.stdout.log"),
+        stderr: logs.join("daemon.stderr.log"),
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+struct BoundedLaunchdLog {
+    file: fs::File,
+    len: u64,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl BoundedLaunchdLog {
+    fn open(path: &Path) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create log directory {}", parent.display()))?;
+        }
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)
+            .with_context(|| format!("Failed to open launchd log {}", path.display()))?;
+        let mut log = Self {
+            len: file.metadata()?.len(),
+            file,
+        };
+        if log.len > LAUNCHD_LOG_MAX_BYTES {
+            log.retain_tail(LAUNCHD_LOG_MAX_BYTES)?;
+        }
+        Ok(log)
+    }
+
+    fn write_chunk(&mut self, chunk: &[u8]) -> Result<()> {
+        if chunk.is_empty() {
+            return Ok(());
+        }
+        if chunk.len() as u64 >= LAUNCHD_LOG_MAX_BYTES {
+            let start = chunk.len() - LAUNCHD_LOG_MAX_BYTES as usize;
+            return self.rewrite(&chunk[start..]);
+        }
+        if self.len + chunk.len() as u64 > LAUNCHD_LOG_MAX_BYTES {
+            let headroom = LAUNCHD_LOG_MAX_BYTES - chunk.len() as u64;
+            self.retain_tail(LAUNCHD_LOG_COMPACT_BYTES.min(headroom))?;
+        }
+        self.file.seek(SeekFrom::End(0))?;
+        self.file.write_all(chunk)?;
+        self.len += chunk.len() as u64;
+        Ok(())
+    }
+
+    fn retain_tail(&mut self, keep: u64) -> Result<()> {
+        let keep = keep.min(self.len);
+        let mut tail = vec![0; keep as usize];
+        self.file.seek(SeekFrom::End(-(keep as i64)))?;
+        self.file.read_exact(&mut tail)?;
+        self.rewrite(&tail)
+    }
+
+    fn rewrite(&mut self, bytes: &[u8]) -> Result<()> {
+        self.file.seek(SeekFrom::Start(0))?;
+        self.file.write_all(bytes)?;
+        self.file.set_len(bytes.len() as u64)?;
+        self.file.flush()?;
+        self.len = bytes.len() as u64;
+        Ok(())
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+struct PendingLaunchdLog {
+    chunks: VecDeque<Vec<u8>>,
+    bytes: usize,
+    closed: bool,
+}
+
+#[cfg(any(target_os = "macos", test))]
+struct LaunchdLogSinkInner {
+    pending: Mutex<PendingLaunchdLog>,
+    ready: Condvar,
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone)]
+struct LaunchdLogSink(Arc<LaunchdLogSinkInner>);
+
+#[cfg(any(target_os = "macos", test))]
+impl LaunchdLogSink {
+    fn push(&self, mut chunk: Vec<u8>) {
+        if chunk.len() > LAUNCHD_LOG_PENDING_BYTES {
+            chunk = chunk.split_off(chunk.len() - LAUNCHD_LOG_PENDING_BYTES);
+        }
+        let mut pending = self.0.pending.lock().unwrap_or_else(|e| e.into_inner());
+        if pending.closed {
+            return;
+        }
+        while pending.bytes + chunk.len() > LAUNCHD_LOG_PENDING_BYTES {
+            let Some(discarded) = pending.chunks.pop_front() else {
+                break;
+            };
+            pending.bytes -= discarded.len();
+        }
+        pending.bytes += chunk.len();
+        pending.chunks.push_back(chunk);
+        self.0.ready.notify_one();
+    }
+
+    fn close(&self) {
+        let mut pending = self.0.pending.lock().unwrap_or_else(|e| e.into_inner());
+        pending.closed = true;
+        self.0.ready.notify_one();
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+struct LaunchdCaptureWriters {
+    stdout: LaunchdLogSink,
+    stderr: LaunchdLogSink,
+    tasks: Vec<JoinHandle<()>>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl LaunchdCaptureWriters {
+    fn open(paths: &LaunchdCapturePaths) -> Result<Self> {
+        let stdout_log = BoundedLaunchdLog::open(&paths.stdout)?;
+        let stderr_log = BoundedLaunchdLog::open(&paths.stderr)?;
+        let (stdout, stdout_task) = spawn_launchd_log_writer(paths.stdout.clone(), stdout_log);
+        let (stderr, stderr_task) = spawn_launchd_log_writer(paths.stderr.clone(), stderr_log);
+        Ok(Self {
+            stdout,
+            stderr,
+            tasks: vec![stdout_task, stderr_task],
+        })
+    }
+
+    async fn finish(mut self) {
+        self.stdout.close();
+        self.stderr.close();
+        let deadline = Instant::now() + LAUNCHD_PIPE_DRAIN_TIMEOUT;
+        for task in self.tasks.drain(..) {
+            while !task.is_finished() && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            if task.is_finished() {
+                let _ = task.join();
+            }
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl Drop for LaunchdCaptureWriters {
+    fn drop(&mut self) {
+        self.stdout.close();
+        self.stderr.close();
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn spawn_launchd_log_writer(
+    path: PathBuf,
+    mut log: BoundedLaunchdLog,
+) -> (LaunchdLogSink, JoinHandle<()>) {
+    let inner = Arc::new(LaunchdLogSinkInner {
+        pending: Mutex::new(PendingLaunchdLog {
+            chunks: VecDeque::new(),
+            bytes: 0,
+            closed: false,
+        }),
+        ready: Condvar::new(),
+    });
+    let sink = LaunchdLogSink(Arc::clone(&inner));
+    let task = std::thread::spawn(move || {
+        let mut writable = true;
+        loop {
+            let chunk = {
+                let mut pending = inner.pending.lock().unwrap_or_else(|e| e.into_inner());
+                while pending.chunks.is_empty() && !pending.closed {
+                    pending = inner.ready.wait(pending).unwrap_or_else(|e| e.into_inner());
+                }
+                let chunk = pending.chunks.pop_front();
+                if let Some(ref chunk) = chunk {
+                    pending.bytes -= chunk.len();
+                } else if pending.closed {
+                    break;
+                }
+                chunk
+            };
+            let Some(chunk) = chunk else {
+                continue;
+            };
+            if writable && let Err(error) = log.write_chunk(&chunk) {
+                eprintln!(
+                    "launchd log write failed for {}; continuing without capture: {error:#}",
+                    path.display()
+                );
+                writable = false;
+            }
+        }
+    });
+    (sink, task)
+}
+
+#[cfg(any(target_os = "macos", test))]
+async fn drain_launchd_pipe<R>(mut pipe: R, sink: LaunchdLogSink)
+where
+    R: AsyncRead + Unpin,
+{
+    let mut buffer = vec![0; 16 * 1024];
+    loop {
+        match pipe.read(&mut buffer).await {
+            Ok(0) => break,
+            Ok(read) => sink.push(buffer[..read].to_vec()),
+            Err(error) => {
+                sink.push(format!("launchd log pipe read failed: {error}\n").into_bytes());
+                break;
+            }
+        }
+    }
+}
+
+pub async fn run_launchd_daemon(config_dir: &Path) -> Result<()> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = config_dir;
+        bail!("the launchd daemon runner is only supported on macOS")
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let paths = launchd_capture_paths(config_dir);
+        run_with_launchd_capture(paths, || {
+            let executable = std::env::current_exe()
+                .context("Failed to resolve the launchd daemon executable")?;
+            let mut command = TokioCommand::new(executable);
+            command.arg("--config-dir").arg(config_dir).arg("daemon");
+            Ok(command)
+        })
+        .await
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+async fn run_with_launchd_capture<F>(paths: LaunchdCapturePaths, make_command: F) -> Result<()>
+where
+    F: FnOnce() -> Result<TokioCommand>,
+{
+    let writers = LaunchdCaptureWriters::open(&paths)?;
+    let result = async {
+        let command = make_command()?;
+        supervise_launchd_child(command, &writers).await
+    }
+    .await;
+    if let Err(error) = &result {
+        writers
+            .stderr
+            .push(format!("launchd capture failed: {error:#}\n").into_bytes());
+    }
+    writers.finish().await;
+    result
+}
+
+#[cfg(any(target_os = "macos", test))]
+async fn supervise_launchd_child(
+    mut command: TokioCommand,
+    writers: &LaunchdCaptureWriters,
+) -> Result<()> {
+    #[cfg(any(target_os = "macos", all(test, unix)))]
+    let mut signals = LaunchdSignals::new()?;
+    command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command.spawn().context("Failed to start daemon child")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("daemon stdout pipe unavailable")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("daemon stderr pipe unavailable")?;
+    let stdout_sink = writers.stdout.clone();
+    let stderr_sink = writers.stderr.clone();
+    let stdout_task = zeroclaw_spawn::spawn!(drain_launchd_pipe(stdout, stdout_sink));
+    let stderr_task = zeroclaw_spawn::spawn!(drain_launchd_pipe(stderr, stderr_sink));
+
+    #[cfg(any(target_os = "macos", all(test, unix)))]
+    let outcome = wait_for_launchd_child(&mut child, &mut signals).await;
+    #[cfg(all(test, not(unix)))]
+    let outcome = wait_for_launchd_child(&mut child).await;
+    finish_launchd_pipes(stdout_task, stderr_task).await;
+    let status = outcome?;
+    if status.success() {
+        Ok(())
+    } else {
+        bail!("daemon child exited with status {status}")
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+async fn finish_launchd_pipes(
+    mut stdout: tokio::task::JoinHandle<()>,
+    mut stderr: tokio::task::JoinHandle<()>,
+) {
+    if tokio::time::timeout(LAUNCHD_PIPE_DRAIN_TIMEOUT, async {
+        let _ = tokio::join!(&mut stdout, &mut stderr);
+    })
+    .await
+    .is_err()
+    {
+        stdout.abort();
+        stderr.abort();
+        let _ = tokio::join!(stdout, stderr);
+    }
+}
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+struct LaunchdSignals {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+}
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+impl LaunchdSignals {
+    fn new() -> Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt())?,
+            terminate: signal(SignalKind::terminate())?,
+        })
+    }
+}
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+async fn wait_for_launchd_child(
+    child: &mut Child,
+    signals: &mut LaunchdSignals,
+) -> Result<std::process::ExitStatus> {
+    let forwarded = tokio::select! {
+        status = child.wait() => return status.context("Failed to wait for daemon child"),
+        _ = signals.interrupt.recv() => libc::SIGINT,
+        _ = signals.terminate.recv() => libc::SIGTERM,
+    };
+    stop_launchd_child(child, forwarded).await
+}
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+async fn stop_launchd_child(
+    child: &mut Child,
+    signal: libc::c_int,
+) -> Result<std::process::ExitStatus> {
+    if let Err(error) = forward_launchd_signal(child, signal)
+        && error
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::raw_os_error)
+            != Some(libc::ESRCH)
+    {
+        return Err(error);
+    }
+
+    match tokio::time::timeout(LAUNCHD_STOP_TIMEOUT, child.wait()).await {
+        Ok(status) => status.context("Failed to wait for stopped daemon child"),
+        Err(_) => {
+            if let Some(status) = child
+                .try_wait()
+                .context("Failed to inspect daemon child after stop timeout")?
+            {
+                return Ok(status);
+            }
+            child
+                .kill()
+                .await
+                .context("Failed to kill daemon child after stop timeout")?;
+            child
+                .wait()
+                .await
+                .context("Failed to reap daemon child after forced stop")
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn forward_launchd_signal(child: &Child, signal: libc::c_int) -> Result<()> {
+    let pid = child.id().context("daemon child PID unavailable")?;
+    // SAFETY: `pid` belongs to the child owned by this runner, and the caller
+    // passes only the SIGINT or SIGTERM value received from launchd.
+    if unsafe { libc::kill(pid as libc::pid_t, signal) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error()).context("Failed to forward launchd stop signal")
+    }
+}
+
+#[cfg(all(test, not(unix)))]
+async fn wait_for_launchd_child(child: &mut Child) -> Result<std::process::ExitStatus> {
+    child
+        .wait()
+        .await
+        .context("Failed to wait for daemon child")
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum SystemdUserLinger {
@@ -772,22 +1214,19 @@ fn install_macos(config: &Config) -> Result<()> {
         })?;
     }
 
-    let logs_dir = if let Some(ref var_dir) = homebrew_var_dir {
-        var_dir.join("logs")
-    } else {
-        config
-            .config_path
-            .parent()
-            .map_or_else(|| PathBuf::from("."), PathBuf::from)
-            .join("logs")
-    };
+    let config_dir = homebrew_var_dir.as_deref().map_or_else(
+        || {
+            config
+                .config_path
+                .parent()
+                .map_or_else(|| PathBuf::from("."), PathBuf::from)
+        },
+        Path::to_path_buf,
+    );
+    let logs_dir = config_dir.join("logs");
     fs::create_dir_all(&logs_dir)?;
 
-    let stdout = logs_dir.join("daemon.stdout.log");
-    let stderr = logs_dir.join("daemon.stderr.log");
-
-    let plist =
-        render_macos_launch_agent_plist(&exe, &stdout, &stderr, homebrew_var_dir.as_deref());
+    let plist = render_macos_launch_agent_plist(&exe, &config_dir, homebrew_var_dir.as_deref());
 
     fs::write(&file, plist)?;
     println!("✅ Installed launchd service: {}", file.display());
@@ -802,23 +1241,14 @@ fn install_macos(config: &Config) -> Result<()> {
 /// and the caller is responsible for writing the returned XML to the plist path.
 fn render_macos_launch_agent_plist(
     exe: &Path,
-    stdout: &Path,
-    stderr: &Path,
+    config_dir: &Path,
     homebrew_var_dir: Option<&Path>,
 ) -> String {
-    // When running under Homebrew, inject ZEROCLAW_CONFIG_DIR and
-    // WorkingDirectory so the daemon finds its data in the Homebrew prefix.
-    let env_section = if let Some(var_dir) = homebrew_var_dir {
+    let working_dir_section = if let Some(var_dir) = homebrew_var_dir {
         format!(
-            r#"  <key>EnvironmentVariables</key>
-  <dict>
-    <key>ZEROCLAW_CONFIG_DIR</key>
-    <string>{config_dir}</string>
-  </dict>
-  <key>WorkingDirectory</key>
+            r#"  <key>WorkingDirectory</key>
   <string>{working_dir}</string>
 "#,
-            config_dir = xml_escape(&var_dir.display().to_string()),
             working_dir = xml_escape(&var_dir.display().to_string()),
         )
     } else {
@@ -835,24 +1265,23 @@ fn render_macos_launch_agent_plist(
   <key>ProgramArguments</key>
   <array>
     <string>{exe}</string>
-    <string>daemon</string>
+    <string>--config-dir</string>
+    <string>{config_dir}</string>
+    <string>service</string>
+    <string>run-launchd-daemon</string>
   </array>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
   <true/>
-{env_section}  <key>StandardOutPath</key>
-  <string>{stdout}</string>
-  <key>StandardErrorPath</key>
-  <string>{stderr}</string>
+{working_dir_section}
 </dict>
 </plist>
 "#,
         label = SERVICE_LABEL,
         exe = xml_escape(&exe.display().to_string()),
-        env_section = env_section,
-        stdout = xml_escape(&stdout.display().to_string()),
-        stderr = xml_escape(&stderr.display().to_string())
+        config_dir = xml_escape(&config_dir.display().to_string()),
+        working_dir_section = working_dir_section,
     )
 }
 
@@ -1681,8 +2110,7 @@ mod macos_plist_tests {
     fn macos_plist_renderer_uses_plain_xml_quotes() {
         let plist = render_macos_launch_agent_plist(
             Path::new("/opt/homebrew/bin/zeroclaw"),
-            Path::new("/opt/homebrew/var/zeroclaw/logs/daemon.stdout.log"),
-            Path::new("/opt/homebrew/var/zeroclaw/logs/daemon.stderr.log"),
+            Path::new("/opt/homebrew/var/zeroclaw"),
             Some(Path::new("/opt/homebrew/var/zeroclaw")),
         );
 
@@ -1692,23 +2120,38 @@ mod macos_plist_tests {
             r#"<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">"#
         ));
         assert!(plist.contains(r#"<plist version="1.0">"#));
-        assert!(plist.contains("<key>EnvironmentVariables</key>"));
+        assert!(plist.contains("<key>WorkingDirectory</key>"));
     }
 
     #[test]
     fn macos_plist_renderer_escapes_paths_and_omits_homebrew_section_when_absent() {
         let plist = render_macos_launch_agent_plist(
             Path::new("/tmp/Zero<&>\"'Claw/bin/zeroclaw"),
-            Path::new("/tmp/Zero<&>\"'Claw/logs/daemon.stdout.log"),
-            Path::new("/tmp/Zero<&>\"'Claw/logs/daemon.stderr.log"),
+            Path::new("/tmp/Zero<&>\"'Claw"),
             None,
         );
 
         assert!(plist.contains("/tmp/Zero&lt;&amp;&gt;&quot;&apos;Claw/bin/zeroclaw"));
-        assert!(plist.contains("/tmp/Zero&lt;&amp;&gt;&quot;&apos;Claw/logs/daemon.stdout.log"));
-        assert!(plist.contains("/tmp/Zero&lt;&amp;&gt;&quot;&apos;Claw/logs/daemon.stderr.log"));
+        assert!(plist.contains("/tmp/Zero&lt;&amp;&gt;&quot;&apos;Claw"));
         assert!(!plist.contains("<key>EnvironmentVariables</key>"));
         assert!(!plist.contains("<key>WorkingDirectory</key>"));
+    }
+
+    #[test]
+    fn macos_plist_routes_only_launchd_through_bounded_capture() {
+        let plist = render_macos_launch_agent_plist(
+            Path::new("/usr/local/bin/zeroclaw"),
+            Path::new("/Users/test/.zeroclaw"),
+            None,
+        );
+
+        assert!(plist.contains("<string>--config-dir</string>"));
+        assert!(plist.contains("<string>/Users/test/.zeroclaw</string>"));
+        assert!(plist.contains("<string>service</string>"));
+        assert!(plist.contains("<string>run-launchd-daemon</string>"));
+        assert!(plist.contains("<key>KeepAlive</key>"));
+        assert!(!plist.contains("<key>StandardOutPath</key>"));
+        assert!(!plist.contains("<key>StandardErrorPath</key>"));
     }
 
     #[cfg(target_os = "macos")]
@@ -1716,8 +2159,7 @@ mod macos_plist_tests {
     fn macos_plist_renderer_emits_plutil_parseable_xml() {
         let plist = render_macos_launch_agent_plist(
             Path::new("/tmp/Zero<&>\"'Claw/bin/zeroclaw"),
-            Path::new("/tmp/Zero<&>\"'Claw/logs/daemon.stdout.log"),
-            Path::new("/tmp/Zero<&>\"'Claw/logs/daemon.stderr.log"),
+            Path::new("/tmp/Zero<&>\"'Claw/var/zeroclaw"),
             Some(Path::new("/tmp/Zero<&>\"'Claw/var/zeroclaw")),
         );
 
@@ -1740,6 +2182,153 @@ mod macos_plist_tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+}
+
+#[cfg(test)]
+mod bounded_launchd_tests {
+    use super::*;
+
+    #[test]
+    fn opening_oversized_log_keeps_newest_bytes() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("daemon.stdout.log");
+        let mut original = vec![b'a'; LAUNCHD_LOG_MAX_BYTES as usize + 17];
+        original[17..].fill(b'b');
+        fs::write(&path, original).expect("write oversized log");
+
+        drop(BoundedLaunchdLog::open(&path).expect("open bounded log"));
+
+        let bytes = fs::read(&path).expect("read compacted log");
+        assert_eq!(bytes.len(), LAUNCHD_LOG_MAX_BYTES as usize);
+        assert!(bytes.iter().all(|byte| *byte == b'b'));
+    }
+
+    #[test]
+    fn crossing_limit_compacts_before_appending_newest_chunk() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("daemon.stderr.log");
+        let mut log = BoundedLaunchdLog::open(&path).expect("open bounded log");
+        log.write_chunk(&vec![b'a'; 5 * 1024 * 1024])
+            .expect("write initial chunk");
+        log.write_chunk(&vec![b'b'; 4 * 1024 * 1024])
+            .expect("write overflowing chunk");
+        drop(log);
+
+        let bytes = fs::read(&path).expect("read bounded log");
+        assert_eq!(bytes.len(), LAUNCHD_LOG_MAX_BYTES as usize);
+        assert!(bytes[..4 * 1024 * 1024].iter().all(|byte| *byte == b'a'));
+        assert!(bytes[4 * 1024 * 1024..].iter().all(|byte| *byte == b'b'));
+    }
+
+    #[test]
+    fn oversized_chunk_keeps_only_its_tail() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("daemon.stdout.log");
+        let mut log = BoundedLaunchdLog::open(&path).expect("open bounded log");
+        let mut chunk = vec![b'a'; LAUNCHD_LOG_MAX_BYTES as usize + 23];
+        chunk[23..].fill(b'z');
+        log.write_chunk(&chunk).expect("write oversized chunk");
+        drop(log);
+
+        let bytes = fs::read(&path).expect("read bounded log");
+        assert_eq!(bytes.len(), LAUNCHD_LOG_MAX_BYTES as usize);
+        assert!(bytes.iter().all(|byte| *byte == b'z'));
+    }
+
+    #[test]
+    fn pending_output_evicts_oldest_chunks() {
+        let inner = Arc::new(LaunchdLogSinkInner {
+            pending: Mutex::new(PendingLaunchdLog {
+                chunks: VecDeque::new(),
+                bytes: 0,
+                closed: false,
+            }),
+            ready: Condvar::new(),
+        });
+        let sink = LaunchdLogSink(Arc::clone(&inner));
+        sink.push(vec![b'a'; 700 * 1024]);
+        sink.push(vec![b'b'; 700 * 1024]);
+
+        let pending = inner.pending.lock().expect("pending queue");
+        assert!(pending.bytes <= LAUNCHD_LOG_PENDING_BYTES);
+        assert_eq!(pending.chunks.len(), 1);
+        assert!(pending.chunks[0].iter().all(|byte| *byte == b'b'));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runner_captures_both_child_streams() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let paths = launchd_capture_paths(dir.path());
+        run_with_launchd_capture(paths, || {
+            let mut command = TokioCommand::new("/bin/sh");
+            command.args(["-c", "printf stdout-value; printf stderr-value >&2"]);
+            Ok(command)
+        })
+        .await
+        .expect("capture child output");
+
+        assert_eq!(
+            fs::read(dir.path().join("logs/daemon.stdout.log")).expect("read stdout"),
+            b"stdout-value"
+        );
+        assert_eq!(
+            fs::read(dir.path().join("logs/daemon.stderr.log")).expect("read stderr"),
+            b"stderr-value"
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_opens_before_command_resolution() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let paths = launchd_capture_paths(dir.path());
+        let error = run_with_launchd_capture(paths, || bail!("fixture resolution failed"))
+            .await
+            .expect_err("resolution should fail");
+
+        assert!(error.to_string().contains("fixture resolution failed"));
+        let stderr = fs::read_to_string(dir.path().join("logs/daemon.stderr.log"))
+            .expect("read bootstrap diagnostics");
+        assert!(stderr.contains("launchd capture failed: fixture resolution failed"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn nonzero_child_exit_is_reported_in_bounded_stderr() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let paths = launchd_capture_paths(dir.path());
+        let error = run_with_launchd_capture(paths, || {
+            let mut command = TokioCommand::new("/bin/sh");
+            command.args(["-c", "exit 7"]);
+            Ok(command)
+        })
+        .await
+        .expect_err("child should fail");
+
+        assert!(error.to_string().contains("status"));
+        let stderr = fs::read_to_string(dir.path().join("logs/daemon.stderr.log"))
+            .expect("read failure diagnostics");
+        assert!(stderr.contains("daemon child exited with status"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_signal_reaps_owned_child_and_preserves_status() {
+        let mut child = TokioCommand::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn child");
+        let status = tokio::time::timeout(
+            Duration::from_secs(2),
+            stop_launchd_child(&mut child, libc::SIGTERM),
+        )
+        .await
+        .expect("child stop timeout")
+        .expect("stop child");
+        assert!(!status.success());
+        assert!(child.try_wait().expect("inspect child").is_some());
     }
 }
 

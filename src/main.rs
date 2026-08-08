@@ -3545,6 +3545,20 @@ async fn async_main(command: clap::Command) -> Result<()> {
         return Ok(());
     }
 
+    #[cfg(feature = "agent-runtime")]
+    if let Commands::Service {
+        service_command: ServiceCommands::RunLaunchdDaemon,
+        ..
+    } = &cli.command
+    {
+        let config_dir = cli
+            .config_dir
+            .as_deref()
+            .map(std::path::Path::new)
+            .context("launchd runner requires --config-dir")?;
+        return service::run_launchd_daemon(config_dir).await;
+    }
+
     // All other commands need config loaded first
     let mut config = Box::pin(Config::load_or_init()).await?;
     for section in config
