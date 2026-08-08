@@ -1846,6 +1846,16 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 Some(sc) => format!("{sc}\n\n{task_prompt}"),
                 None => task_prompt,
             };
+            // Appended, never prepended: heartbeat delivery is resolved from
+            // config (and auto-detects a channel when unset), so unlike cron
+            // this turn usually IS broadcast — the model has to know that
+            // before it writes an internal-sounding worklog.
+            let prompt = format!(
+                "{prompt}\n\n{}",
+                crate::cron::scheduler::delivery_contract(
+                    delivery.as_ref().map(|(channel, _)| channel.as_str())
+                )
+            );
             let temp: Option<f64> = config
                 .model_provider_for_agent(&agent_alias)
                 .and_then(|e| e.temperature);
