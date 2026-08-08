@@ -6,6 +6,7 @@
 
 use std::fs;
 use std::path::Path;
+#[cfg(unix)]
 use std::process::Command;
 
 fn workflow(name: &str) -> String {
@@ -130,7 +131,7 @@ fn package_publishers_use_canonical_sources_and_scoped_credentials() {
 }
 
 #[test]
-fn scoop_publisher_metadata_follows_canonical_url_template() {
+fn scoop_metadata_template_is_not_evaluated() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let metadata_script = root.join("scripts/release/scoop_metadata.sh");
     let script = fs::read_to_string(&metadata_script)
@@ -139,7 +140,13 @@ fn scoop_publisher_metadata_follows_canonical_url_template() {
         !script.contains("eval "),
         "canonical Scoop URL templates must never be evaluated as shell code"
     );
+}
 
+#[test]
+#[cfg(unix)]
+fn scoop_publisher_metadata_follows_canonical_url_template() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let metadata_script = root.join("scripts/release/scoop_metadata.sh");
     let temp = tempfile::tempdir().expect("create temporary Scoop manifest directory");
     let manifest_path = temp.path().join("zeroclaw.json");
     fs::write(
