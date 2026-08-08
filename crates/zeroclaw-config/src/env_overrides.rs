@@ -8,8 +8,51 @@ use std::sync::LazyLock;
 const PREFIX: &str = "ZEROCLAW_";
 const SEP: &str = "__";
 
+/// Legacy env var naming the Hindsight shared/family tier bank. Bridged into
+/// the typed `memory.hindsight.shared_bank` field at load so it is subject to
+/// the same complete-set cross-agent collision validation and save-masking as a
+/// TOML value. See [`apply_hindsight_tier_bank_env_bridge`].
+const HINDSIGHT_SHARED_BANK_ENV: &str = "ZC_HINDSIGHT_SHARED_BANK";
+/// Legacy env var naming the Hindsight system tier bank. Bridged like
+/// [`HINDSIGHT_SHARED_BANK_ENV`].
+const HINDSIGHT_SYSTEM_BANK_ENV: &str = "ZC_HINDSIGHT_SYSTEM_BANK";
+
 static NON_OVERRIDABLE_PATHS: LazyLock<HashSet<&'static str>> =
     LazyLock::new(|| HashSet::from(["schema_version"]));
+
+/// Legacy short-form env var overriding `[memory.hindsight] recall_types`. It
+/// predates the generic `ZEROCLAW_memory__hindsight__recall_types` scheme and is
+/// kept for rollback compatibility, but it is BRIDGED here into the same typed
+/// `Config` field + override-tracking path rather than re-read in the memory
+/// backend. That keeps ONE observable source of truth: the effective value lives
+/// in typed `Config`, shows up in config inspection / drift surfaces, and is
+/// masked back out at save time like any other env override.
+const LEGACY_HINDSIGHT_RECALL_TYPES_ENV: &str = "ZC_HINDSIGHT_RECALL_TYPES";
+/// Schema prop-path the legacy override bridges into.
+const HINDSIGHT_RECALL_TYPES_PATH: &str = "memory.hindsight.recall_types";
+
+/// Legacy short-form env var overriding `[memory.hindsight] retain_async`. It
+/// predates the generic `ZEROCLAW_memory__hindsight__retain_async` scheme and is
+/// kept for rollback compatibility, but it is BRIDGED here into the same typed
+/// `Config` field + override-tracking path rather than re-read in the memory
+/// backend. That keeps ONE observable source of truth: the effective value lives
+/// in typed `Config`, shows up in config inspection / drift surfaces, and is
+/// masked back out at save time like any other env override.
+const LEGACY_HINDSIGHT_RETAIN_ASYNC_ENV: &str = "ZC_HINDSIGHT_RETAIN_ASYNC";
+/// Schema prop-path the legacy override bridges into.
+const HINDSIGHT_RETAIN_ASYNC_PATH: &str = "memory.hindsight.retain_async";
+
+/// Strictly parse a boolean-shaped env value. Unlike a falsey-only check, an
+/// unrecognized value (e.g. a typo) is REJECTED as an error instead of silently
+/// defaulting to `true` - a typo in a durability-affecting override must fail
+/// loudly, not flip retain semantics unnoticed.
+fn parse_strict_bool(raw: &str) -> std::result::Result<bool, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" => Ok(true),
+        "0" | "false" | "no" => Ok(false),
+        other => Err(other.to_string()),
+    }
+}
 
 #[derive(Debug, Default, Clone)]
 pub struct AppliedOverrides {
@@ -77,12 +120,160 @@ pub fn apply_env_overrides(config: &mut Config) -> Result<AppliedOverrides> {
         }
         paths.insert(path);
     }
+
+    // Bridge the legacy short-form `ZC_HINDSIGHT_RECALL_TYPES` into the same
+    // typed field + override-tracking path as the generic scheme, so the
+    // effective recall-type filter has ONE observable source of truth (typed
+    // `Config`, visible to config inspection and drift). The generic
+    // `ZEROCLAW_memory__hindsight__recall_types` form, if set, was already
+    // applied in the loop above and takes precedence; the legacy name only
+    // fills in when the canonical path was not overridden. The comma-separated
+    // env value is validated by the SAME `normalize_recall_types` validator the
+    // typed config uses, so an invalid fact type (e.g. a typo like
+    // `observations`) is a hard startup error, exactly like an invalid TOML
+    // value. An env var that is SET but blank is an explicit empty override
+    // (filter disabled); UNSET falls back to the typed config value.
+    if !paths.contains(HINDSIGHT_RECALL_TYPES_PATH)
+        && let Ok(raw) = std::env::var(LEGACY_HINDSIGHT_RECALL_TYPES_ENV)
+    {
+        let normalized = crate::schema::HindsightMemoryConfig::normalize_recall_types(
+            raw.split(','),
+        )
+        .map_err(|bad| {
+            anyhow::Error::msg(format!(
+                "environment variable {LEGACY_HINDSIGHT_RECALL_TYPES_ENV} contains an invalid \
+                 Hindsight fact type {bad:?}; must be a comma-separated list of experience, \
+                 observation, world"
+            ))
+        })?;
+        let snapshot = raw_value_for_path(config, HINDSIGHT_RECALL_TYPES_PATH).unwrap_or_default();
+        snapshots.insert(HINDSIGHT_RECALL_TYPES_PATH.to_string(), snapshot);
+        // `recall_types` is a `Vec<String>` (`PropKind::StringArray`), set from a
+        // comma-separated string. The normalized tokens are re-joined so
+        // `set_prop` stores exactly the canonical values; an empty result writes
+        // an empty array (the explicit "filter disabled" override).
+        config
+            .set_prop(HINDSIGHT_RECALL_TYPES_PATH, &normalized.join(","))
+            .with_context(|| {
+                format!("{LEGACY_HINDSIGHT_RECALL_TYPES_ENV} → {HINDSIGHT_RECALL_TYPES_PATH}")
+            })?;
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "path": HINDSIGHT_RECALL_TYPES_PATH,
+                    "env_var": LEGACY_HINDSIGHT_RECALL_TYPES_ENV,
+                })
+            ),
+            "Legacy hindsight recall_types env override bridged into typed config"
+        );
+        paths.insert(HINDSIGHT_RECALL_TYPES_PATH.to_string());
+    }
+
+    // Bridge the legacy short-form `ZC_HINDSIGHT_RETAIN_ASYNC` into the same
+    // typed field + override-tracking path as the generic scheme, so the
+    // effective retain-durability value has ONE observable source of truth
+    // (typed `Config`, visible to config inspection and drift). The generic
+    // `ZEROCLAW_memory__hindsight__retain_async` form, if set, was already
+    // applied in the loop above and takes precedence; the legacy name only
+    // fills in when the canonical path was not overridden.
+    if !paths.contains(HINDSIGHT_RETAIN_ASYNC_PATH)
+        && let Ok(raw) = std::env::var(LEGACY_HINDSIGHT_RETAIN_ASYNC_ENV)
+    {
+        let parsed = parse_strict_bool(&raw).map_err(|bad| {
+            anyhow::Error::msg(format!(
+                "environment variable {LEGACY_HINDSIGHT_RETAIN_ASYNC_ENV} has an invalid \
+                 value {bad:?}; must be one of true, false, 1, 0, yes, no (case-insensitive)"
+            ))
+        })?;
+        let snapshot = raw_value_for_path(config, HINDSIGHT_RETAIN_ASYNC_PATH).unwrap_or_default();
+        snapshots.insert(HINDSIGHT_RETAIN_ASYNC_PATH.to_string(), snapshot);
+        config
+            .set_prop(HINDSIGHT_RETAIN_ASYNC_PATH, &parsed.to_string())
+            .with_context(|| {
+                format!("{LEGACY_HINDSIGHT_RETAIN_ASYNC_ENV} → {HINDSIGHT_RETAIN_ASYNC_PATH}")
+            })?;
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "path": HINDSIGHT_RETAIN_ASYNC_PATH,
+                    "env_var": LEGACY_HINDSIGHT_RETAIN_ASYNC_ENV,
+                })
+            ),
+            "Legacy hindsight retain_async env override bridged into typed config"
+        );
+        paths.insert(HINDSIGHT_RETAIN_ASYNC_PATH.to_string());
+    }
+
     if !paths.is_empty() {
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                 .with_attrs(::serde_json::json!({"count": paths.len()})),
             "Applied env-var config overrides"
+        );
+    }
+    Ok(AppliedOverrides { paths, snapshots })
+}
+
+/// Bridge the legacy `ZC_HINDSIGHT_SHARED_BANK` / `ZC_HINDSIGHT_SYSTEM_BANK`
+/// env vars into the typed `memory.hindsight.shared_bank` / `system_bank`
+/// fields, recording each as an applied override (with a pre-override snapshot)
+/// so save-masking resets it to the on-disk value.
+///
+/// Why here and not only at backend construction: the backend previously read
+/// these env vars itself and compared the resolved tier bank ONLY against the
+/// constructing agent's own private bank, so an env-provided tier bank that
+/// aliased ANOTHER agent's private bank slipped past validation and leaked that
+/// agent's private data across the whole install. Folding the env values into
+/// typed config at load time subjects them to `Config::validate`'s existing
+/// complete-set cross-agent collision check - the same check the TOML values
+/// already get - which closes the hole.
+///
+/// Precedence: this runs BEFORE [`apply_env_overrides`], so a generic
+/// `ZEROCLAW_memory__hindsight__shared_bank` (or `__system_bank`) override
+/// applied afterward wins, matching the "generic form takes precedence" rule.
+/// A non-empty TOML value already present in the field is left untouched (the
+/// legacy env var is only a fallback for an unset field).
+pub fn apply_hindsight_tier_bank_env_bridge(config: &mut Config) -> Result<AppliedOverrides> {
+    let mut paths: HashSet<String> = HashSet::new();
+    let mut snapshots: HashMap<String, String> = HashMap::new();
+    for (env_var, path, current_is_empty) in [
+        (
+            HINDSIGHT_SHARED_BANK_ENV,
+            "memory.hindsight.shared_bank",
+            config.memory.hindsight.shared_bank.trim().is_empty(),
+        ),
+        (
+            HINDSIGHT_SYSTEM_BANK_ENV,
+            "memory.hindsight.system_bank",
+            config.memory.hindsight.system_bank.trim().is_empty(),
+        ),
+    ] {
+        // Only bridge when the typed field is unset: a TOML value always wins
+        // over the legacy env fallback (parity with the old resolution order).
+        if !current_is_empty {
+            continue;
+        }
+        let Some(value) = std::env::var(env_var)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let snapshot = raw_value_for_path(config, path).unwrap_or_default();
+        config
+            .set_prop(path, &value)
+            .with_context(|| format!("{env_var} -> {path}"))?;
+        snapshots.insert(path.to_string(), snapshot);
+        paths.insert(path.to_string());
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"path": path, "env_var": env_var})),
+            "Legacy Hindsight tier-bank env bridged into typed config"
         );
     }
     Ok(AppliedOverrides { paths, snapshots })
@@ -419,6 +610,200 @@ mod tests {
             Some("**** (encrypted)"),
             "must not corrupt the field with the display mask",
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_hindsight_recall_types_env_bridges_into_typed_field() {
+        // The legacy short-form `ZC_HINDSIGHT_RECALL_TYPES` is resolved into the
+        // typed `memory.hindsight.recall_types` list during config loading, so
+        // the effective filter is a single observable source of truth (typed
+        // Config) rather than a second read in the backend.
+        let _guard = super::env_test_lock().await;
+        let _v = EnvVarGuard::set(LEGACY_HINDSIGHT_RECALL_TYPES_ENV, " observation , world ");
+
+        let mut config = Config::default();
+        assert!(
+            config.memory.hindsight.recall_types.is_empty(),
+            "default must be no filter before bridging",
+        );
+        let applied = apply_env_overrides(&mut config).expect("apply succeeds");
+        assert!(
+            applied.paths.contains(HINDSIGHT_RECALL_TYPES_PATH),
+            "legacy override must be recorded as a tracked override: {:?}",
+            applied.paths,
+        );
+        assert_eq!(
+            config.memory.hindsight.recall_types,
+            vec!["observation".to_string(), "world".to_string()],
+            "legacy env must populate the typed list, trimmed and normalized",
+        );
+    }
+
+    #[tokio::test]
+    async fn generic_form_takes_precedence_over_legacy_hindsight_recall_types() {
+        // If both the generic `ZEROCLAW_memory__hindsight__recall_types` and the
+        // legacy short form are set, the generic (canonical) form wins and the
+        // legacy bridge does not clobber it.
+        let _guard = super::env_test_lock().await;
+        let _generic = EnvVarGuard::set("ZEROCLAW_memory__hindsight__recall_types", "world");
+        let _legacy = EnvVarGuard::set(LEGACY_HINDSIGHT_RECALL_TYPES_ENV, "observation");
+
+        let mut config = Config::default();
+        let applied = apply_env_overrides(&mut config).expect("apply succeeds");
+        assert!(applied.paths.contains(HINDSIGHT_RECALL_TYPES_PATH));
+        assert_eq!(
+            config.memory.hindsight.recall_types,
+            vec!["world".to_string()],
+            "the generic canonical form must win over the legacy short name",
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_hindsight_recall_types_env_rejects_invalid_value() {
+        // A typo in the recall-type filter must fail loudly at startup - the
+        // same normalizing validator the typed TOML value uses - not silently
+        // send an invalid `types` array on every recall.
+        let _guard = super::env_test_lock().await;
+        let _v = EnvVarGuard::set(LEGACY_HINDSIGHT_RECALL_TYPES_ENV, "observations");
+
+        let mut config = Config::default();
+        let err = apply_env_overrides(&mut config).expect_err("invalid value must hard-error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(LEGACY_HINDSIGHT_RECALL_TYPES_ENV) && msg.contains("observations"),
+            "error must name the env var and the bad value: {msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_hindsight_recall_types_env_blank_is_explicit_empty_override() {
+        // An env var that is SET but blank is an EXPLICIT empty override (filter
+        // disabled), distinct from UNSET (fall back to typed config). Start from
+        // a non-empty typed default to prove the blank env clears it.
+        let _guard = super::env_test_lock().await;
+        let _v = EnvVarGuard::set(LEGACY_HINDSIGHT_RECALL_TYPES_ENV, "");
+
+        let mut config = Config::default();
+        config.memory.hindsight.recall_types = vec!["observation".to_string()];
+        let applied = apply_env_overrides(&mut config).expect("apply succeeds");
+        assert!(
+            applied.paths.contains(HINDSIGHT_RECALL_TYPES_PATH),
+            "a blank-but-set env is still a tracked override: {:?}",
+            applied.paths,
+        );
+        assert!(
+            config.memory.hindsight.recall_types.is_empty(),
+            "blank env must clear the filter to an explicit empty override",
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_hindsight_recall_types_env_masked_back_out_for_save() {
+        // The bridged legacy override is snapshotted and masked on save just
+        // like any other env override, so it never gets written to disk.
+        let _guard = super::env_test_lock().await;
+        let _v = EnvVarGuard::set(LEGACY_HINDSIGHT_RECALL_TYPES_ENV, "observation");
+
+        let mut config = Config::default();
+        let applied = apply_env_overrides(&mut config).expect("apply succeeds");
+        assert_eq!(
+            config.memory.hindsight.recall_types,
+            vec!["observation".to_string()],
+            "env value is live",
+        );
+
+        let mut to_save = config.clone();
+        mask_env_overrides_for_save(&mut to_save, &applied.snapshots).expect("mask succeeds");
+        assert!(
+            to_save.memory.hindsight.recall_types.is_empty(),
+            "save-bound clone resets to the pre-override default (empty)",
+        );
+        // In-memory config keeps the env value for the running process.
+        assert_eq!(
+            config.memory.hindsight.recall_types,
+            vec!["observation".to_string()],
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_hindsight_retain_async_env_bridges_into_typed_field() {
+        // Blocker fix B1: the legacy short-form `ZC_HINDSIGHT_RETAIN_ASYNC` is
+        // resolved into the typed `memory.hindsight.retain_async` field during
+        // config loading, so the effective value is a single observable source
+        // of truth (typed Config) rather than a second read in the backend.
+        let _guard = super::env_test_lock().await;
+        let _v = EnvVarGuard::set(LEGACY_HINDSIGHT_RETAIN_ASYNC_ENV, "true");
+
+        let mut config = Config::default();
+        assert!(
+            !config.memory.hindsight.retain_async,
+            "default must be sync/false before bridging",
+        );
+        let applied = apply_env_overrides(&mut config).expect("apply succeeds");
+        assert!(
+            applied.paths.contains(HINDSIGHT_RETAIN_ASYNC_PATH),
+            "legacy override must be recorded as a tracked override: {:?}",
+            applied.paths,
+        );
+        assert!(
+            config.memory.hindsight.retain_async,
+            "legacy env must flip the typed field to async",
+        );
+    }
+
+    #[tokio::test]
+    async fn generic_form_takes_precedence_over_legacy_hindsight_retain_async() {
+        // If both the generic `ZEROCLAW_memory__hindsight__retain_async` and the
+        // legacy short form are set, the generic (canonical) form wins and the
+        // legacy bridge does not clobber it.
+        let _guard = super::env_test_lock().await;
+        let _generic = EnvVarGuard::set("ZEROCLAW_memory__hindsight__retain_async", "false");
+        let _legacy = EnvVarGuard::set(LEGACY_HINDSIGHT_RETAIN_ASYNC_ENV, "true");
+
+        let mut config = Config::default();
+        let applied = apply_env_overrides(&mut config).expect("apply succeeds");
+        assert!(applied.paths.contains(HINDSIGHT_RETAIN_ASYNC_PATH));
+        assert!(
+            !config.memory.hindsight.retain_async,
+            "the generic canonical form must win over the legacy short name",
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_hindsight_retain_async_env_rejects_invalid_value() {
+        // A typo in the durability-affecting override must fail loudly at
+        // startup, not silently coerce to true.
+        let _guard = super::env_test_lock().await;
+        let _v = EnvVarGuard::set(LEGACY_HINDSIGHT_RETAIN_ASYNC_ENV, "asyncc");
+
+        let mut config = Config::default();
+        let err = apply_env_overrides(&mut config).expect_err("invalid value must hard-error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(LEGACY_HINDSIGHT_RETAIN_ASYNC_ENV) && msg.contains("asyncc"),
+            "error must name the env var and the bad value: {msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_hindsight_retain_async_env_masked_back_out_for_save() {
+        // The bridged legacy override is snapshotted and masked on save just
+        // like any other env override, so it never gets written to disk.
+        let _guard = super::env_test_lock().await;
+        let _v = EnvVarGuard::set(LEGACY_HINDSIGHT_RETAIN_ASYNC_ENV, "true");
+
+        let mut config = Config::default();
+        let applied = apply_env_overrides(&mut config).expect("apply succeeds");
+        assert!(config.memory.hindsight.retain_async, "env value is live");
+
+        let mut to_save = config.clone();
+        mask_env_overrides_for_save(&mut to_save, &applied.snapshots).expect("mask succeeds");
+        assert!(
+            !to_save.memory.hindsight.retain_async,
+            "save-bound clone resets to the pre-override default (false)",
+        );
+        // In-memory config keeps the env value for the running process.
+        assert!(config.memory.hindsight.retain_async);
     }
 
     #[tokio::test]

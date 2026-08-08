@@ -361,6 +361,7 @@ async fn parity_l2_sop_live_step_agent_isolation() {
             risk_profile: "restricted".into(),
             memory: AgentMemoryConfig {
                 backend: MemoryBackendKind::Markdown,
+                ..Default::default()
             },
             ..AliasedAgentConfig::default()
         },

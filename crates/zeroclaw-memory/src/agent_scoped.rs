@@ -280,6 +280,25 @@ impl Memory for AgentScopedMemory {
             .collect())
     }
 
+    async fn list_own_daily_history(&self) -> Result<Vec<MemoryEntry>> {
+        // Own-history query for the per-turn Daily dedup gate. The trait
+        // default lists `Daily`, but `AgentScopedMemory::list` intentionally
+        // keeps EVERY row whose `agent_id` is in `allowed_agent_ids` - the
+        // bound agent PLUS every `read_memory_from` sibling - so on this
+        // wrapper the default is a cross-agent read, not an own-history read.
+        // With `daily_dedup = true` that would let a sibling's Daily row
+        // suppress THIS agent's private Daily write, silently erasing the turn
+        // from the bound agent's own history even though the agent never
+        // persisted the fact. Filter STRICTLY to the bound `agent_id` (never
+        // the allowlist) so dedup only ever compares the agent against its own
+        // prior Daily rows.
+        let entries = self.inner.list(Some(&MemoryCategory::Daily), None).await?;
+        Ok(entries
+            .into_iter()
+            .filter(|e| e.agent_id.as_deref() == Some(self.agent_id.as_str()))
+            .collect())
+    }
+
     async fn forget(&self, key: &str) -> Result<bool> {
         if self.inner.forget_for_agent(key, &self.agent_id).await? {
             return Ok(true);
@@ -1089,6 +1108,81 @@ mod tests {
         assert!(
             !hits.iter().any(|e| e.key == "rogue-key"),
             "caller allowlist must be intersected, not unioned"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_own_daily_history_excludes_allowlisted_sibling_and_cannot_suppress_own_write() {
+        // B1 regression: `list_own_daily_history` must scope STRICTLY to the
+        // bound agent, never the `read_memory_from` allowlist. Otherwise, with
+        // `daily_dedup = true`, a matching SIBLING Daily row could suppress
+        // THIS agent's private Daily write, silently erasing the turn from the
+        // bound agent's own history even though it never persisted the fact.
+        use crate::consolidation::consolidate_daily_history_for_test;
+        use zeroclaw_config::schema::MemoryConfig;
+
+        let (_tmp, inner) = fresh_sqlite();
+        let uuids = provision_agents(&inner, &["alpha", "beta"]).await;
+        let alpha_uuid = &uuids[0];
+        let beta_uuid = &uuids[1];
+
+        // Seed an identical Daily summary attributed to the ALLOWLISTED
+        // sibling (beta). The bound agent (alpha) has NO Daily row of its own.
+        let summary = "User asked what time it is";
+        inner
+            .store_with_agent(
+                "beta-daily",
+                summary,
+                MemoryCategory::Daily,
+                None,
+                None,
+                None,
+                Some(beta_uuid),
+            )
+            .await
+            .unwrap();
+
+        // Wrapper is bound to alpha and allowlists beta for recall.
+        let wrapper =
+            AgentScopedMemory::new(as_dyn(inner.clone()), alpha_uuid, vec![beta_uuid.clone()]);
+
+        // `list` (allowlist-scoped) DOES see the sibling row...
+        let listed = wrapper
+            .list(Some(&MemoryCategory::Daily), None)
+            .await
+            .unwrap();
+        assert!(
+            listed.iter().any(|e| e.key == "beta-daily"),
+            "sanity: allowlist-scoped list includes the sibling's Daily row"
+        );
+
+        // ...but the own-history query must NOT: it is strictly the bound agent.
+        let own = wrapper.list_own_daily_history().await.unwrap();
+        assert!(
+            own.is_empty(),
+            "own-Daily history must exclude allowlisted sibling rows; got {own:?}"
+        );
+
+        // End-to-end: with daily_dedup on, the bound agent's write must land
+        // even though a byte-identical sibling row already exists.
+        let cfg = MemoryConfig {
+            daily_dedup: true,
+            ..MemoryConfig::default()
+        };
+        consolidate_daily_history_for_test(&wrapper, &cfg, summary)
+            .await
+            .unwrap();
+
+        let alpha_daily = inner
+            .list(Some(&MemoryCategory::Daily), None)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.agent_id.as_deref() == Some(alpha_uuid.as_str()))
+            .count();
+        assert_eq!(
+            alpha_daily, 1,
+            "the bound agent's private Daily write must not be suppressed by an allowlisted sibling's duplicate row"
         );
     }
 }

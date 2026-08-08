@@ -336,6 +336,7 @@ pub enum MemoryKind {
     Qdrant,
     Postgres,
     Lucid,
+    Hindsight,
     None,
     Plugin,
 }
