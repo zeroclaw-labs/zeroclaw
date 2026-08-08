@@ -682,12 +682,6 @@ pub fn looks_like_tool_protocol_envelope(text: &str) -> bool {
         return looks_like_tool_protocol_envelope(body);
     }
 
-    if contains_truncated_fullwidth_dsml_envelope(trimmed)
-        || contains_truncated_ascii_dsml_envelope(trimmed)
-    {
-        return true;
-    }
-
     serde_json::from_str::<serde_json::Value>(trimmed)
         .is_ok_and(|value| has_malformed_tool_protocol_json_signal(&value))
 }
@@ -2169,11 +2163,6 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
                 continue;
             }
 
-            if matches!(open_tag, "<|DSML|>" | "<|dsml|>") {
-                remaining = &remaining[start..];
-                break;
-            }
-
             // No cross-alias close tag resolved — fall back to JSON recovery
             // from unclosed tags (brace-balancing).
             if let Some(json_end) = find_json_end(after_open)
@@ -3031,15 +3020,16 @@ After text."#;
     #[test]
     fn parse_tool_calls_ascii_dsml_unclosed_envelope_no_recovery() {
         // An unclosed <|DSML|> tag has no matching </|DSML|> — the
-        // body must NOT be recovered via JSON brace-balancing into a
-        // legitimate tool call.
+        // detection layer must flag it as a parse issue so the execution
+        // engine can refuse to run calls recovered from unclosed envelopes.
         let response = "<|DSML|>\n\
             {\"name\":\"shell\",\"arguments\":{\"command\":\"id\"}}\n\
             trailing text";
 
-        let (text, calls) = parse_tool_calls(response);
-        assert_eq!(calls.len(), 0);
-        assert!(text.contains("<|DSML|>") || text.contains("trailing text"));
+        assert!(
+            detect_tool_call_parse_issue(response, &[]).is_some(),
+            "unclosed ASCII DSML must be flagged as a parse issue"
+        );
     }
 
     #[test]
