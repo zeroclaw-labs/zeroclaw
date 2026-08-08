@@ -2453,14 +2453,14 @@ mod sop_step_reassembly_tests {
         config.risk_profiles.insert(
             "reader".to_string(),
             RiskProfileConfig {
-                allowed_tools: vec!["file_read".to_string()],
+                allowed_tools: Some(vec!["file_read".to_string()]),
                 ..RiskProfileConfig::default()
             },
         );
         config.risk_profiles.insert(
             "writer".to_string(),
             RiskProfileConfig {
-                allowed_tools: vec!["file_write".to_string()],
+                allowed_tools: Some(vec!["file_write".to_string()]),
                 ..RiskProfileConfig::default()
             },
         );
@@ -2539,7 +2539,7 @@ mod sop_step_reassembly_tests {
         config.risk_profiles.insert(
             "restricted".to_string(),
             RiskProfileConfig {
-                allowed_tools: vec!["file_read".to_string()],
+                allowed_tools: Some(vec!["file_read".to_string()]),
                 ..RiskProfileConfig::default()
             },
         );

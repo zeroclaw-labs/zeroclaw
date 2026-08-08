@@ -943,7 +943,7 @@ impl ModelRoutingConfigTool {
         {
             let risk = cfg.risk_profiles.entry(name.clone()).or_default();
             if let Some(tools) = allowed_tools_update {
-                risk.allowed_tools = tools;
+                risk.allowed_tools = Some(tools);
             }
         }
 

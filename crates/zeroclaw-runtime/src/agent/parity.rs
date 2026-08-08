@@ -336,7 +336,7 @@ async fn parity_l2_sop_live_step_agent_isolation() {
     config.risk_profiles.insert(
         "restricted".to_string(),
         RiskProfileConfig {
-            allowed_tools: vec!["file_read".to_string()],
+            allowed_tools: Some(vec!["file_read".to_string()]),
             ..RiskProfileConfig::default()
         },
     );

@@ -104,8 +104,10 @@ impl Tool for SpawnSubagentTool {
         let risk_profile = self.config.risk_profile_for_agent(&self.parent_alias);
         if let Some(rp) = risk_profile {
             let excluded = rp.excluded_tools.iter().any(|t| t == "spawn_subagent");
-            let allowed_when_listed = rp.allowed_tools.is_empty()
-                || rp.allowed_tools.iter().any(|t| t == "spawn_subagent");
+            let allowed_when_listed = rp
+                .allowed_tools
+                .as_ref()
+                .is_none_or(|list| list.iter().any(|t| t == "spawn_subagent"));
             if excluded || !allowed_when_listed {
                 return Ok(ToolResult {
                     success: false,
@@ -399,7 +401,11 @@ mod tests {
         config.risk_profiles.insert(
             "default".to_string(),
             RiskProfileConfig {
-                allowed_tools,
+                allowed_tools: if allowed_tools.is_empty() {
+                    None
+                } else {
+                    Some(allowed_tools)
+                },
                 ..RiskProfileConfig::default()
             },
         );

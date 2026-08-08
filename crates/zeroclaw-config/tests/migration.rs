@@ -815,7 +815,7 @@ fn t14b_runtime_overrides_synthesize_per_agent_runtime_profile() {
         .risk_profiles
         .get("agent_complex_agent")
         .expect("synthesized risk_profiles.agent_complex_agent (allowed_tools home)");
-    assert_eq!(risk.allowed_tools, vec!["shell", "memory"]);
+    assert_eq!(risk.allowed_tools, Some(vec!["shell".to_string(), "memory".to_string()]));
 }
 
 #[test]
