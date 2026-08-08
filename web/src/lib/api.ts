@@ -2106,7 +2106,29 @@ export function getSessionMessages(
   );
 }
 
-/** Delete a persisted session by its full DB key. */
+/**
+ * Give a persisted session a display name.
+ *
+ * Takes the bare session id (the `gw_`-stripped `session_id`, not
+ * `session_key`) because the handler prefixes `gw_` itself. Answers 404 when
+ * the gateway has no metadata row for the session — notably when session
+ * persistence is disabled.
+ */
+export function renameSession(
+  id: string,
+  name: string,
+): Promise<{ session_id: string; name: string }> {
+  return apiFetch<{ session_id: string; name: string }>(
+    `/api/sessions/${encodeURIComponent(id)}`,
+    { method: "PUT", body: JSON.stringify({ name }) },
+  );
+}
+
+/**
+ * Delete a persisted session. Accepts either the full DB key or a bare gateway
+ * session id — the handler prefixes `gw_` only when the id carries no
+ * underscore. Unlike {@link renameSession}, which needs the bare id.
+ */
 export function deleteSession(
   sessionKey: string,
 ): Promise<{ deleted: boolean }> {
