@@ -5,9 +5,12 @@ use anyhow::Result;
 use zeroclaw_runtime::i18n::{get_required_cli_string, get_required_cli_string_with_args};
 
 pub fn handle_command(command: crate::SopCommands, config: &crate::config::Config) -> Result<()> {
-    let workspace_dir = &config.data_dir;
+    // SOP definitions live under the shared workspace (`<shared>/sops` by
+    // default), the same root the web/RPC author writes to. Loading them from
+    // `data_dir` instead would never see authored SOPs.
+    let workspace_dir = config.shared_workspace_dir();
     let default_mode = parse_execution_mode(&config.sop.default_execution_mode);
-    let sops = load_sops(workspace_dir, config.sop.sops_dir.as_deref(), default_mode);
+    let sops = load_sops(&workspace_dir, config.sop.sops_dir.as_deref(), default_mode);
 
     match command {
         crate::SopCommands::List => {
@@ -228,7 +231,7 @@ pub fn handle_command(command: crate::SopCommands, config: &crate::config::Confi
             Ok(())
         }
         crate::SopCommands::Delete { name } => {
-            let dir = resolve_sops_dir(workspace_dir, config.sop.sops_dir.as_deref());
+            let dir = resolve_sops_dir(&workspace_dir, config.sop.sops_dir.as_deref());
             delete_sop(&dir, &name)?;
             println!(
                 "{}",

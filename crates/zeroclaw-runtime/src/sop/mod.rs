@@ -109,9 +109,20 @@ pub struct SopEngineAdapters {
 /// Callers receive `Arc<Mutex<SopEngine>>` and `Arc<SopAuditLogger>`
 /// handles — never call `SopEngine::new` or `SopAuditLogger::new`
 /// directly outside this module.
+///
+/// The two directory arguments serve different roles and must not be conflated:
+/// - `data_dir` is the daemon state dir. It anchors the durable run store, which
+///   lands at `<data_dir>/sop/runs.db` unless `[sop] run_state_dir` overrides it.
+/// - `sops_workspace_dir` is the shared workspace (`config.shared_workspace_dir()`).
+///   It anchors SOP-*definition* loading, so a relative `[sop] sops_dir` (default
+///   `sops`) resolves to `<shared>/sops` — the same directory the web/RPC SOP
+///   author writes to. Passing `data_dir` for both (the historical bug) made the
+///   engine load definitions from `<data_dir>/sops`, which authored SOPs never
+///   populate, so every manual trigger reported "no matching manual trigger".
 pub fn build_sop_engine(
     config: SopConfig,
-    workspace_dir: &Path,
+    data_dir: &Path,
+    sops_workspace_dir: &Path,
     audit_memory: Arc<dyn Memory>,
     adapters: SopEngineAdapters,
 ) -> (Arc<Mutex<SopEngine>>, Arc<SopAuditLogger>) {
@@ -122,10 +133,10 @@ pub fn build_sop_engine(
     } = adapters;
     // Select the run-state backend from config (default: durable sqlite, so parked
     // HITL runs survive a restart). A backend-open failure must not crash daemon
-    // startup, so fall back to in-memory with a loud log. `workspace_dir` here is the
-    // daemon data dir (every caller passes `config.data_dir`), so a durable store
-    // lands at `<data_dir>/sop/runs.db` unless `[sop] run_state_dir` overrides it.
-    let store = store::build_run_store(&config, workspace_dir).unwrap_or_else(|e| {
+    // startup, so fall back to in-memory with a loud log. The run store is anchored
+    // at the daemon data dir, so a durable store lands at `<data_dir>/sop/runs.db`
+    // unless `[sop] run_state_dir` overrides it.
+    let store = store::build_run_store(&config, data_dir).unwrap_or_else(|e| {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -158,7 +169,7 @@ pub fn build_sop_engine(
         .with_run_notifier(run_tx)
         .with_approval_broker(approval_broker)
         .with_capabilities(Arc::new(capabilities));
-    engine.reload(workspace_dir);
+    engine.reload(sops_workspace_dir);
     engine.restore_runs();
     let engine = Arc::new(Mutex::new(engine));
     let audit = Arc::new(SopAuditLogger::new(audit_memory));
@@ -180,17 +191,17 @@ pub fn parse_execution_mode(s: &str) -> SopExecutionMode {
 
 // ── SOP directory helpers ───────────────────────────────────────
 
-/// Return the default SOPs directory: `<workspace>/sops`.
+/// Return the fallback SOPs directory: `<shared>/sops`.
 fn sops_dir(workspace_dir: &Path) -> PathBuf {
     workspace_dir.join("sops")
 }
 
-/// Resolve the SOPs directory from config, falling back to workspace default.
+/// Resolve the SOPs directory from config, falling back to the shared default.
 ///
-/// A relative `config_dir` (the common case in the documented
-/// `<workspace>/sops` layout) resolves against `workspace_dir`; an
-/// absolute or `~`-prefixed value is used as-is (`Path::join` replaces
-/// the base entirely when the joined path is itself absolute).
+/// A relative `config_dir` resolves against `workspace_dir` (the shared
+/// workspace), so `sops` yields `<shared>/sops`; an absolute or `~`-prefixed
+/// value is used as-is (`Path::join` replaces the base entirely when the
+/// joined path is itself absolute).
 pub fn resolve_sops_dir(workspace_dir: &Path, config_dir: Option<&str>) -> PathBuf {
     match config_dir {
         Some(dir) if !dir.is_empty() => {

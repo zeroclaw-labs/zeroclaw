@@ -2,7 +2,7 @@
 
 ## Runtime contract
 
-- SOP definitions are loaded from `<workspace>/sops/<sop_name>/SOP.toml` plus optional `SOP.md`.
+- SOP definitions are loaded from `<shared>/sops/<sop_name>/SOP.toml` plus optional `SOP.md`.
 - CLI `zeroclaw sop` currently manages definitions only: `list`, `validate`, `show`.
 - SOP runs are started by a live event fan-in (MQTT, filesystem, or AMQP), by the daemon's periodic SOP maintenance tick for `cron` triggers, or by the in-agent tool `sop_execute`. The remaining trigger types (webhook, peripheral, calendar) are defined and matched but not yet wired to a live event source (see [SOP Fan-In](./fan-in/overview.md)).
 - Run progression uses tools: `sop_status`, `sop_approve`, `sop_advance`.
@@ -31,13 +31,15 @@ graph LR
 
 ## Getting started
 
-1. Set the SOP directory through the gateway, zerocode, or `zeroclaw config set` (required for runtime SOP loading):
+1. `sops_dir` is unset by default, so runtime SOP loading is off out of the box. Opt in by setting `sops_dir` through the gateway, zerocode, or `zeroclaw config set`: a relative value such as `sops` resolves against the shared workspace (`<shared>/sops`), the same directory the SOP author writes to. Setting it back to `""` (or removing it) disables runtime SOP loading again.
+
+   > **Migrating from an earlier build?** Relative `sops_dir` values now resolve against the shared workspace rather than a per-agent workspace. A config that carried `sops_dir = "shared/sops"` from before would resolve to `<shared>/shared/sops` (doubled). Set `sops_dir = "sops"` to point at the canonical `<shared>/sops`, or use an absolute path if you keep definitions elsewhere.
 
 2. Create a SOP directory, for example:
 
    ```text
-   ~/.zeroclaw/workspace/sops/deploy-prod/SOP.toml
-   ~/.zeroclaw/workspace/sops/deploy-prod/SOP.md
+   ~/.zeroclaw/shared/sops/deploy-prod/SOP.toml
+   ~/.zeroclaw/shared/sops/deploy-prod/SOP.md
    ```
 
 3. Validate and inspect definitions:

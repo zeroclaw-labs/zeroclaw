@@ -63,14 +63,18 @@ sop_workshop_actions! {
 /// Agent-facing SOP proposal lifecycle tool.
 pub struct SopWorkshopTool {
     engine: Arc<Mutex<SopEngine>>,
-    workspace_dir: std::path::PathBuf,
+    /// Shared workspace root that anchors SOP-definition writes. `apply`
+    /// resolves `<shared_sops_root>/sops` (via `resolve_sops_dir`) and reloads
+    /// the engine from the same root, so it must match the root the engine was
+    /// built from — otherwise apply would write to one tree and reload another.
+    shared_sops_root: std::path::PathBuf,
 }
 
 impl SopWorkshopTool {
-    pub fn new(engine: Arc<Mutex<SopEngine>>, workspace_dir: std::path::PathBuf) -> Self {
+    pub fn new(engine: Arc<Mutex<SopEngine>>, shared_sops_root: std::path::PathBuf) -> Self {
         Self {
             engine,
-            workspace_dir,
+            shared_sops_root,
         }
     }
 }
@@ -268,7 +272,7 @@ impl SopWorkshopTool {
             .and_then(|v| v.as_str())
             .map(str::to_string);
         let mut engine = self.lock_engine()?;
-        let outcome = apply_proposal(&mut engine, &self.workspace_dir, id, actor)?;
+        let outcome = apply_proposal(&mut engine, &self.shared_sops_root, id, actor)?;
         Ok(serde_json::to_string_pretty(&json!({
             "id": outcome.proposal.id,
             "status": outcome.proposal.status,
@@ -337,5 +341,93 @@ mod tests {
         let listed = tool.execute(json!({"action": "list"})).await.unwrap();
         assert!(listed.success);
         assert!(listed.output.contains("daily-check"));
+    }
+
+    // Regression: apply must write only under the shared SOP root the workshop was
+    // constructed with, never a per-agent or data dir, and reload must not drop
+    // SOPs that already live in the shared root. Guards issue where apply wrote to
+    // the wrong workspace and then reloaded that root over the shared definitions.
+    #[tokio::test]
+    async fn apply_writes_only_to_shared_root_and_preserves_existing_sops() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let shared_dir = tmp.path().join("shared");
+        let agent_dir = tmp.path().join("agent-ws");
+        for d in [&data_dir, &shared_dir, &agent_dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+
+        // Pre-seed an existing SOP directly in the shared root's `sops/` dir.
+        let existing = shared_dir.join("sops").join("existing-sop");
+        std::fs::create_dir_all(&existing).unwrap();
+        std::fs::write(
+            existing.join("SOP.toml"),
+            "[sop]\nname = \"existing-sop\"\ndescription = \"pre-seeded\"\nversion = \"0.1.0\"\n\n[[triggers]]\ntype = \"manual\"\n",
+        )
+        .unwrap();
+        std::fs::write(existing.join("SOP.md"), "## Steps\n\n1. **Do** - it.\n").unwrap();
+
+        // Engine + workshop use the SHARED root (mirrors build_sop_engine wiring).
+        let engine = Arc::new(Mutex::new(SopEngine::new(SopConfig {
+            sops_dir: Some("sops".to_string()),
+            ..SopConfig::default()
+        })));
+        engine.lock().unwrap().reload(&shared_dir);
+        assert!(
+            engine.lock().unwrap().get_sop("existing-sop").is_some(),
+            "pre-seeded shared SOP should load"
+        );
+
+        let tool = SopWorkshopTool::new(Arc::clone(&engine), shared_dir.clone());
+
+        let proposed = tool
+            .execute(json!({
+                "action": "propose",
+                "sop_name": "new-sop",
+                "description": "Freshly proposed",
+                "procedure_markdown": "## Steps\n\n1. **Check** - Do it.\n",
+                "actor": "test"
+            }))
+            .await
+            .unwrap();
+        assert!(proposed.success, "{:?}", proposed.error);
+        let proposal: serde_json::Value = serde_json::from_str(&proposed.output).unwrap();
+        let id = proposal["id"].as_str().unwrap();
+
+        let applied = tool
+            .execute(json!({"action": "apply", "id": id, "actor": "test"}))
+            .await
+            .unwrap();
+        assert!(applied.success, "{:?}", applied.error);
+
+        // apply wrote to the shared root, not data or agent roots.
+        assert!(
+            shared_dir
+                .join("sops")
+                .join("new-sop")
+                .join("SOP.md")
+                .exists(),
+            "new SOP must land under the shared root"
+        );
+        assert!(
+            !data_dir.join("sops").join("new-sop").exists(),
+            "apply must not write under the data dir"
+        );
+        assert!(
+            !agent_dir.join("sops").join("new-sop").exists(),
+            "apply must not write under the per-agent workspace"
+        );
+
+        // reload after apply must keep both the pre-seeded and the new SOP.
+        engine.lock().unwrap().reload(&shared_dir);
+        let guard = engine.lock().unwrap();
+        assert!(
+            guard.get_sop("existing-sop").is_some(),
+            "reload must not drop the pre-existing shared SOP"
+        );
+        assert!(
+            guard.get_sop("new-sop").is_some(),
+            "reload must surface the newly applied SOP"
+        );
     }
 }

@@ -5625,6 +5625,36 @@ mod tests {
         assert_eq!(err.code, INTERNAL_ERROR);
     }
 
+    // The `sop list` create-hint tells users to author under `<shared>/sops`;
+    // this locks the CLI scan root (sops_dir_and_mode) to that same path when
+    // sops_dir is unset, so the hint can never drift from where we actually
+    // read.
+    #[test]
+    fn sops_list_scan_root_matches_shared_sops_create_hint() {
+        use zeroclaw_config::schema::Config;
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        assert!(
+            config.sop.sops_dir.is_none(),
+            "default config must leave sops_dir unset so the hint path applies",
+        );
+
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal(config, sessions);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let d = RpcDispatcher::new(ctx, tx, "test-peer-sopscan:pid=1".into());
+
+        let (dir, _mode) = d.sops_dir_and_mode();
+        assert_eq!(dir, tmp.path().join("shared").join("sops"));
+    }
+
     fn make_checkpoint_rpc_dispatcher(
         quorum: u32,
         members: &[&str],

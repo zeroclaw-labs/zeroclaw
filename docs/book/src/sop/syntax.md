@@ -1,11 +1,11 @@
 # SOP Syntax Reference
 
-SOP definitions are loaded from subdirectories under `sops_dir`. When `sops_dir` is omitted from config, CLI commands fall back to `<workspace>/sops` for offline inspection, but runtime SOP execution is disabled.
+SOP definitions are loaded from subdirectories under `sops_dir`, which is unset by default, so runtime SOP execution is off until an operator opts in. Set `sops_dir` to a directory to enable it: a relative value such as `sops` resolves against the shared workspace (`<shared>/sops`), the same directory the SOP author writes to. Setting it back to `""` (or leaving it unset) disables runtime SOP execution; CLI commands still fall back to `<shared>/sops` for offline inspection.
 
 ## 1. Directory Layout
 
 ```text
-<workspace>/sops/
+<shared>/sops/
   deploy-prod/
     SOP.toml
     SOP.md
