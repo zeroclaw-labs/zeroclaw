@@ -241,11 +241,49 @@ impl V2Config {
                 "providers.fallback eradicated"
             );
         }
-        let mut aliased_models = alias_provider_models(new_providers.remove("models"));
+        let (mut aliased_models, mut provenance) =
+            alias_provider_models(new_providers.remove("models"));
 
         // V3 ModelProviderConfig absorbed the V2 [providers] globals
         // (api_key, default_model, etc.) inline; fold them down.
-        fold_providers_globals_into_models(&mut new_providers, &mut aliased_models);
+        let folded = fold_providers_globals_into_models(&mut new_providers, &mut aliased_models);
+        // Reflect the fold in alias provenance so the later bare-vision rewrite
+        // never reads authority the fold did not earn. An explicit
+        // `default_provider` or the synthesized OpenRouter fallback registers as
+        // the producer of the slot it created; a no-`default_provider` fold over
+        // more than one canonical family marks the target ambiguous instead, so
+        // the slot's credential cannot be gifted to whichever family iteration
+        // selected (see the struct doc above the fold).
+        match folded {
+            GlobalFold::Producer(source) => {
+                let (family, alias, _) = normalize_provider_type(&source, "default");
+                provenance
+                    .entry((family, alias))
+                    .or_default()
+                    .insert(source);
+            }
+            GlobalFold::Ambiguous { family, alias } => {
+                // Bolt two distinct, never-producible sentinel sources onto the
+                // slot. The bare-rewrite only fires on exactly one equivalently
+                // normalized producer, so the fold sees a collided slot and
+                // leaves the target bare (fail-closed) instead of redirecting a
+                // credential that has no stated owner.
+                let slot = provenance
+                    .entry((family.clone(), alias.clone()))
+                    .or_default();
+                slot.insert(format!("<unowned-globals:{family}:{alias}:1>"));
+                slot.insert(format!("<unowned-globals:{family}:{alias}:2>"));
+            }
+            GlobalFold::None => {}
+        }
+
+        // A bare `[multimodal] vision_model_provider = "<family>"` cannot select
+        // the migrated V3 alias: runtime resolves only dotted `<family>.<alias>`
+        // refs to typed alias config, so a bare ref reaches the legacy
+        // configless construction path and loses the alias's api_key. Rewrite
+        // it to the migrated alias only when every producer of that alias slot
+        // is equivalent to the reference's canonical variant.
+        rewrite_bare_vision_provider_reference(&mut passthrough, &provenance);
 
         // V3 dropped cost.prices: the V2 keys ("<provider>/<model>")
         // don't carry the V3 alias path, so remapping is fragile.
@@ -722,12 +760,27 @@ fn normalize_provider_type(
     (raw.to_string(), incoming_alias.to_string(), extras)
 }
 
-fn alias_provider_models(models: Option<toml::Value>) -> toml::Table {
+/// Alias-wrap V2 flat provider models into the V3 `<family>.<alias>` shape.
+/// Returns the migrated table together with a provenance map recording, for
+/// each `(family, alias)` slot, every raw provider key that wrote to it. The
+/// rewrite of a vision reference needs that provenance so it cannot infer
+/// source selection from the post-canonicalization alias count (variants such
+/// as `qwen-code` collapse onto the same `qwen.default` slot).
+fn alias_provider_models(
+    models: Option<toml::Value>,
+) -> (
+    toml::Table,
+    std::collections::HashMap<(String, String), std::collections::BTreeSet<String>>,
+) {
     let flat = match models {
         Some(toml::Value::Table(t)) => t,
-        _ => return toml::Table::new(),
+        _ => return (toml::Table::new(), std::collections::HashMap::new()),
     };
     let mut aliased = toml::Table::new();
+    let mut provenance: std::collections::HashMap<
+        (String, String),
+        std::collections::BTreeSet<String>,
+    > = std::collections::HashMap::new();
     for (provider_id, mut config) in flat {
         // Colon-URL form like `"anthropic-custom:https://..."`: split the URL
         // out into `uri` and use only the prefix as the seed for normalization.
@@ -755,19 +808,99 @@ fn alias_provider_models(models: Option<toml::Value>) -> toml::Table {
         }
 
         let entry = aliased
-            .entry(provider_type)
+            .entry(provider_type.clone())
             .or_insert_with(|| toml::Value::Table(toml::Table::new()));
         if let toml::Value::Table(entry_table) = entry {
-            entry_table.insert(alias, config);
+            entry_table.insert(alias.clone(), config);
         }
+        provenance
+            .entry((provider_type, alias))
+            .or_default()
+            .insert(provider_id);
     }
-    aliased
+    (aliased, provenance)
+}
+
+/// Rewrite a `[multimodal] vision_model_provider` reference to the dotted
+/// `<family>.<alias>` form the runtime resolves. The reference is resolved
+/// through the same [`normalize_provider_type`] mapping used by
+/// [`alias_provider_models`], so legacy spellings select their migrated alias:
+/// `grok` -> `xai.default`, `openai-codex` -> `openai.codex`,
+/// `opencode-go` -> `opencode.go`, and dot-bearing `llama.cpp` ->
+/// `llamacpp.default`. The rewrite only happens when EVERY raw producer of the
+/// target `(family, alias)` slot canonicalizes to the same variant as the
+/// reference (same family, alias, and extras). That preserves raw-provider
+/// provenance: a bare or variant reference is never redirected to an alias
+/// supplied by a differently-named source, and a collided slot (e.g. `qwen`
+/// plus `qwen-intl` both writing `qwen.default`) is left unchanged. Colon-URL
+/// refs and already-valid dotted refs that do not canonicalize to a configured
+/// alias are left untouched, and an unknown family stays as-is so the runtime
+/// keeps failing closed on an unknown provider.
+fn rewrite_bare_vision_provider_reference(
+    passthrough: &mut toml::Table,
+    provenance: &std::collections::HashMap<(String, String), std::collections::BTreeSet<String>>,
+) {
+    let Some(toml::Value::Table(multimodal)) = passthrough.get_mut("multimodal") else {
+        return;
+    };
+    let Some(toml::Value::String(reference)) = multimodal.get("vision_model_provider") else {
+        return;
+    };
+    if reference.contains(':') {
+        return;
+    }
+    let (canonical_family, canonical_alias, reference_extras) =
+        normalize_provider_type(reference, "default");
+    let Some(producers) = provenance.get(&(canonical_family.clone(), canonical_alias.clone()))
+    else {
+        // No source produced the alias the reference names (unknown family,
+        // an already-valid dotted ref, or the reference's variant is absent) —
+        // preserve.
+        return;
+    };
+    // A single producer is required: two sources collapsing onto the same slot
+    // (synonyms `gemini`/`google`, variants `qwen`/`qwen-intl`, or two colon-URL
+    // forms) are ambiguous regardless of whether they normalize equivalently,
+    // because the materialized table retains only one of their configs.
+    if producers.len() != 1 {
+        return;
+    }
+    // The producer must canonicalize to the same variant as the reference.
+    // Colon-URL producers (`custom:https://...`) are split back to their prefix
+    // before normalization so they match a bare `custom` reference.
+    let all_equivalent = producers.iter().all(|key| {
+        let (raw_type, _url) = split_colon_url_provider(key);
+        let (family, alias, extras) = normalize_provider_type(&raw_type, "default");
+        family == canonical_family && alias == canonical_alias && extras == reference_extras
+    });
+    if !all_equivalent {
+        return;
+    }
+    multimodal.insert(
+        "vision_model_provider".to_string(),
+        toml::Value::String(format!("{canonical_family}.{canonical_alias}")),
+    );
+}
+
+/// Outcome of folding V2 `[providers]` globals onto `aliased_models`, used to
+/// keep alias provenance accurate for the bare-vision rewrite.
+enum GlobalFold {
+    /// Nothing to register: no value globals and no default provider.
+    None,
+    /// The fold created the target slot (explicit `default_provider`, the
+    /// OpenRouter fallback, or a missing `default` alias in a single-family
+    /// config); the given raw source becomes its producer.
+    Producer(String),
+    /// The fold wrote unowned globals into a target across multiple canonical
+    /// families with no `default_provider` to establish ownership. The target
+    /// must stay ambiguous: do not let the bare-vision rewrite claim it.
+    Ambiguous { family: String, alias: String },
 }
 
 fn fold_providers_globals_into_models(
     new_providers: &mut toml::Table,
     aliased_models: &mut toml::Table,
-) {
+) -> GlobalFold {
     let g_api_key = new_providers.remove("api_key");
     let g_api_url = new_providers.remove("api_url");
     let g_api_path = new_providers.remove("api_path");
@@ -788,24 +921,83 @@ fn fold_providers_globals_into_models(
         || g_extra_headers.is_some();
 
     if !any_value_globals && g_default_provider.is_none() {
-        return;
+        return GlobalFold::None;
     }
 
-    let (target_type, target_alias, colon_url, normalized_extras) =
+    // `source_key` is `Some(raw)` only when this fold introduces a *new*
+    // producer of the target slot that `alias_provider_models` could not
+    // already know about: an explicit `default_provider` string that
+    // materializes a slot, the synthesized `openrouter` fallback when no
+    // models exist at all, or a missing `default` alias created beside an
+    // existing non-default alias in a single-family config. When the fold
+    // merely overlays an already-materialized `default` alias — either the
+    // explicit `default_provider` naming a slot a model already wrote to, or
+    // the `aliased_models.keys().first()` reuse with an existing `default` in
+    // a single-family config — that slot's raw source is already registered,
+    // so re-inserting the canonical family name would count it twice. Across
+    // multiple canonical families with no `default_provider`, the globals are
+    // unowned: the fold claims no producer and instead marks the target
+    // `ambiguous`, so a bare vision reference cannot be redirected to a
+    // credential with no stated owner.
+    let (target_type, target_alias, colon_url, normalized_extras, source_key, ambiguous) =
         match g_default_provider.as_ref().and_then(toml::Value::as_str) {
             Some(s) => {
                 let (raw_type, url) = split_colon_url_provider(s);
                 let (canonical, alias, extras) = normalize_provider_type(&raw_type, "default");
-                (canonical, alias, url, extras)
+                let existed = aliased_models
+                    .get(&canonical)
+                    .and_then(toml::Value::as_table)
+                    .is_some_and(|t| t.contains_key(&alias));
+                let source_key = (!existed).then(|| raw_type.clone());
+                (canonical, alias, url, extras, source_key, false)
             }
-            None => match aliased_models.keys().next() {
-                Some(k) => (k.clone(), "default".to_string(), None, Vec::new()),
-                None => (
+            None => match aliased_models.keys().len() {
+                // No migrated family at all: synthesize the OpenRouter default.
+                0 => (
                     "openrouter".to_string(),
                     "default".to_string(),
                     None,
                     Vec::new(),
+                    Some("openrouter".to_string()),
+                    false,
                 ),
+                // A single migrated canonical family owns the unowned globals.
+                1 => {
+                    let k = aliased_models.keys().next().expect("len 1").clone();
+                    let default_existed = aliased_models
+                        .get(&k)
+                        .and_then(toml::Value::as_table)
+                        .is_some_and(|t| t.contains_key("default"));
+                    let source_key = (!default_existed).then(|| k.clone());
+                    (
+                        k,
+                        "default".to_string(),
+                        None,
+                        Vec::new(),
+                        source_key,
+                        false,
+                    )
+                }
+                // Multiple distinct canonical families and no `default_provider`
+                // to say which one owns the global credentials. Nothing ties the
+                // unowned value(s) to whichever family iteration selects, so the
+                // fold must not claim a producer and must mark the target
+                // ambiguous. Already-family-owned slots stay single (explicit
+                // per-provider entries were registered by alias_provider_models);
+                // only globals-created/augmented slots lose their assumed owner
+                // so a bare vision reference is never redirected to credentials
+                // that have no stated owner.
+                _ => {
+                    let k = aliased_models.keys().next().expect("len > 1").clone();
+                    (
+                        k.clone(),
+                        "default".to_string(),
+                        None,
+                        Vec::new(),
+                        None,
+                        true,
+                    )
+                }
             },
         };
 
@@ -814,14 +1006,14 @@ fn fold_providers_globals_into_models(
         .or_insert_with(|| toml::Value::Table(toml::Table::new()));
     let provider_table = match provider_value.as_table_mut() {
         Some(t) => t,
-        None => return,
+        None => return GlobalFold::None,
     };
     let alias_value = provider_table
         .entry(target_alias.clone())
         .or_insert_with(|| toml::Value::Table(toml::Table::new()));
     let alias_table = match alias_value.as_table_mut() {
         Some(t) => t,
-        None => return,
+        None => return GlobalFold::None,
     };
 
     let base_url_source = colon_url.map(toml::Value::String).or(g_api_url);
@@ -874,6 +1066,16 @@ fn fold_providers_globals_into_models(
             ),
             "[providers] globals folded onto model_providers.."
         );
+    }
+    if ambiguous {
+        GlobalFold::Ambiguous {
+            family: target_type,
+            alias: target_alias,
+        }
+    } else if let Some(source) = source_key {
+        GlobalFold::Producer(source)
+    } else {
+        GlobalFold::None
     }
 }
 

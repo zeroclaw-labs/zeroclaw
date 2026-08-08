@@ -1095,6 +1095,681 @@ temperature = "hot"
     }
 
     #[test]
+    fn v2_bare_vision_provider_reference_migrates_to_dotted_alias() {
+        // Repro: a bare `[multimodal] vision_model_provider` cannot
+        // select the migrated V3 alias, so the keyed provider's credentials
+        // never reach the vision route. Migration must rewrite the reference
+        // to the family's unambiguous migrated alias.
+        let raw = r#"
+schema_version = 2
+
+[providers.models.openrouter]
+api_key = "sk-openrouter-test"
+model = "a-vision-capable-openrouter-model"
+
+[multimodal]
+vision_model_provider = "openrouter"
+vision_model = "a-vision-capable-openrouter-model"
+
+[media_pipeline]
+enabled = true
+describe_images = true
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("openrouter.default"),
+            "bare reference must become a dotted alias ref"
+        );
+        let alias = cfg
+            .providers
+            .models
+            .find("openrouter", "default")
+            .expect("migrated alias must exist");
+        assert_eq!(
+            alias.api_key.as_deref(),
+            Some("sk-openrouter-test"),
+            "dotted reference must select the migrated alias credential"
+        );
+    }
+
+    #[test]
+    fn v2_dotted_vision_provider_reference_preserved() {
+        // An explicit dotted reference already selects the migrated alias;
+        // migration must leave it unchanged.
+        let raw = r#"
+schema_version = 2
+
+[providers.models.openrouter]
+api_key = "sk-openrouter-test"
+model = "m"
+
+[multimodal]
+vision_model_provider = "openrouter.default"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("openrouter.default"),
+            "explicit dotted reference must be preserved unchanged"
+        );
+    }
+
+    #[test]
+    fn v2_bare_vision_provider_reference_without_alias_left_alone() {
+        // A bare family with no migrated alias stays bare so the runtime
+        // keeps failing closed on an unknown provider.
+        let raw = r#"
+schema_version = 2
+
+[providers.models.openrouter]
+api_key = "sk-openrouter-test"
+model = "m"
+
+[multimodal]
+vision_model_provider = "nonexistent"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("nonexistent"),
+            "bare reference to an unknown family must not be rewritten"
+        );
+    }
+
+    #[test]
+    fn v2_legacy_grok_vision_reference_migrates_to_xai_default() {
+        // `grok` canonicalizes to the xai family; the bare reference must be
+        // resolved through the same mapping and rewrite to xai.default.
+        let raw = r#"
+schema_version = 2
+
+[providers.models.grok]
+api_key = "sk-grok-test"
+model = "m"
+
+[multimodal]
+vision_model_provider = "grok"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("xai.default"),
+            "legacy grok reference must rewrite to the canonical xai.default alias"
+        );
+        assert!(
+            cfg.providers.models.find("xai", "default").is_some(),
+            "migrated grok entry must live at xai.default"
+        );
+    }
+
+    #[test]
+    fn v2_legacy_source_with_folded_globals_still_migrates() {
+        // A sole legacy source (`[providers.models.grok]`) plus global
+        // `[providers]` values with no explicit `default_provider`: the fold
+        // reuses the already-materialized `xai` alias table (the only
+        // family present) rather than introducing a second distinct source.
+        // Registering the canonical family name as a second provenance
+        // producer here would falsely make the slot look ambiguous and
+        // leave the bare reference unrewritten even though `grok` is the
+        // sole real source.
+        let raw = r#"
+schema_version = 2
+
+[providers]
+api_key = "sk-global-test"
+default_model = "vision-model"
+
+[providers.models.grok]
+
+[multimodal]
+vision_model_provider = "grok"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("xai.default"),
+            "the sole legacy source must still resolve the bare reference \
+             even after global values are folded into the same slot"
+        );
+        let alias = cfg
+            .providers
+            .models
+            .find("xai", "default")
+            .expect("global values must fold into the migrated xai.default alias");
+        assert_eq!(alias.api_key.as_deref(), Some("sk-global-test"));
+        assert_eq!(alias.model.as_deref(), Some("vision-model"));
+    }
+
+    #[test]
+    fn v2_explicit_default_provider_overlay_keeps_single_producer() {
+        // Explicit `default_provider = "xai"` names the same slot a legacy
+        // `[providers.models.grok]` already materialized (grok -> xai.default).
+        // The globals fold overlays that existing slot; counting `xai` as a
+        // second producer would make the slot look ambiguous and leave the
+        // bare `grok` reference unrewritten, losing the typed credentials on
+        // the runtime's bare-provider path.
+        let raw = r#"
+schema_version = 2
+
+[providers]
+default_provider = "xai"
+api_key = "global-test-key"
+default_model = "vision-model"
+
+[providers.models.grok]
+api_key = "grok-test-key"
+model = "grok-model"
+
+[multimodal]
+vision_model_provider = "grok"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("xai.default"),
+            "the explicit default_provider overlay must not double-count the \
+             existing producer or strand the bare reference"
+        );
+        let alias = cfg
+            .providers
+            .models
+            .find("xai", "default")
+            .expect("the migrated xai.default alias must exist");
+        assert_eq!(alias.api_key.as_deref(), Some("grok-test-key"));
+        assert_eq!(alias.model.as_deref(), Some("grok-model"));
+    }
+
+    #[test]
+    fn v2_globals_create_missing_default_alias_beside_non_default_alias() {
+        // No `default_provider`, only a non-default alias (`openai.codex` from
+        // `openai-codex`), and global `[providers]` values. The globals fold
+        // creates the missing `openai.default` alias; that fold must be
+        // registered as the slot's producer so the bare `openai` vision
+        // reference rewrites to it and keeps the folded credentials.
+        let raw = r#"
+schema_version = 2
+
+[providers]
+api_key = "global-test-key"
+default_model = "vision-model"
+
+[providers.models.openai-codex]
+
+[multimodal]
+vision_model_provider = "openai"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("openai.default"),
+            "the globals-created default alias must resolve the bare reference"
+        );
+        let alias = cfg
+            .providers
+            .models
+            .find("openai", "default")
+            .expect("globals must fold into the created openai.default alias");
+        assert_eq!(alias.api_key.as_deref(), Some("global-test-key"));
+        assert_eq!(alias.model.as_deref(), Some("vision-model"));
+    }
+
+    #[test]
+    fn v2_globals_overlay_existing_default_alias_keeps_single_producer() {
+        // `default_provider` absent, global values folded onto an existing
+        // `openai.default` alias. The overlay must not register a second
+        // producer, or the slot would look ambiguous and the bare reference
+        // would stay unrewritten.
+        let raw = r#"
+schema_version = 2
+
+[providers]
+api_key = "global-test-key"
+default_model = "vision-model"
+
+[providers.models.openai]
+api_key = "sk-openai-test"
+model = "m"
+
+[multimodal]
+vision_model_provider = "openai"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("openai.default"),
+            "overlaying globals must not make the existing default slot ambiguous"
+        );
+        let alias = cfg
+            .providers
+            .models
+            .find("openai", "default")
+            .expect("openai.default must exist");
+        assert_eq!(
+            alias.api_key.as_deref(),
+            Some("sk-openai-test"),
+            "per-provider api_key must win over the folded global value"
+        );
+    }
+
+    #[test]
+    fn v2_legacy_non_default_alias_vision_reference_migrates() {
+        // `openai-codex` folds into openai as the codex alias; the reference
+        // must rewrite to the non-default alias.
+        let raw = r#"
+schema_version = 2
+
+[providers.models.openai-codex]
+api_key = "sk-codex-test"
+model = "m"
+
+[multimodal]
+vision_model_provider = "openai-codex"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("openai.codex"),
+            "legacy openai-codex reference must rewrite to openai.codex"
+        );
+        assert!(
+            cfg.providers.models.find("openai", "codex").is_some(),
+            "migrated openai-codex entry must live at openai.codex"
+        );
+    }
+
+    #[test]
+    fn v2_globals_created_vision_target_with_second_family_stays_bare() {
+        // The maintainer's exact repro: global credentials, two migrated
+        // canonical families (`openai` via openai-codex, `opencode` via
+        // opencode-go), no `default_provider`, and a bare `openai` vision
+        // reference. The fold must NOT claim whichever `keys().next()` family
+        // iteration selects as the producer of a globals-created `default`
+        // alias — nothing ties the unowned credential to it. The target stays
+        // ambiguous so the bare reference is not rewritten to a slot holding a
+        // credential with no stated owner.
+        let raw = r#"
+schema_version = 2
+
+[providers]
+api_key = "global-key"
+default_model = "vision-model"
+
+[providers.models.openai-codex]
+
+[providers.models.opencode-go]
+
+[multimodal]
+vision_model_provider = "openai"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("openai"),
+            "a globals-created target across multiple families must stay bare"
+        );
+        let alias = cfg
+            .providers
+            .models
+            .find("openai", "default")
+            .expect("globals still fold into the first family's default alias");
+        assert_eq!(alias.api_key.as_deref(), Some("global-key"));
+        assert_eq!(alias.model.as_deref(), Some("vision-model"));
+    }
+
+    #[test]
+    fn v2_globals_augmented_vision_target_with_second_family_stays_bare() {
+        // The sibling overlay case: an existing `openai.default` producer
+        // lacks a key, a second canonical family (`opencode`) exists, and no
+        // `default_provider` says the global credential belongs to `openai`.
+        // The globals fill the alias's key, but the slot must not be treated
+        // as single-owner: a bare `openai` reference would consume a global
+        // credential that has no stated owner, so the target stays ambiguous
+        // and the reference stays bare.
+        let raw = r#"
+schema_version = 2
+
+[providers]
+api_key = "global-key"
+default_model = "vision-model"
+
+[providers.models.openai]
+model = "m"
+
+[providers.models.opencode-go]
+api_key = "sk-opencode-test"
+
+[multimodal]
+vision_model_provider = "openai"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("openai"),
+            "a globals-augmented target across multiple families must stay bare"
+        );
+        let alias = cfg
+            .providers
+            .models
+            .find("openai", "default")
+            .expect("openai.default must exist");
+        assert_eq!(alias.api_key.as_deref(), Some("global-key"));
+    }
+
+    #[test]
+    fn v2_dot_bearing_legacy_vision_reference_migrates() {
+        // `llama.cpp` carries a dot but is a legacy synonym for the llamacpp
+        // family; the rewrite must not early-return on the dot.
+        let raw = r#"
+schema_version = 2
+
+[providers.models."llama.cpp"]
+uri = "http://127.0.0.1:8080/v1"
+model = "m"
+
+[multimodal]
+vision_model_provider = "llama.cpp"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("llamacpp.default"),
+            "dot-bearing llama.cpp reference must rewrite to llamacpp.default"
+        );
+        assert!(
+            cfg.providers.models.find("llamacpp", "default").is_some(),
+            "migrated llama.cpp entry must live at llamacpp.default"
+        );
+    }
+
+    #[test]
+    fn v2_bare_family_with_only_legacy_alias_left_alone() {
+        // A bare `openai` reference must NOT be redirected to the `openai.codex`
+        // alias created from a different legacy spelling (`openai-codex`); that
+        // would silently change provider and credential selection. The bare
+        // family has no `default` entry, so it stays bare (fail-closed).
+        let raw = r#"
+schema_version = 2
+
+[providers.models.openai-codex]
+api_key = "sk-codex-test"
+model = "m"
+
+[multimodal]
+vision_model_provider = "openai"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("openai"),
+            "bare family with only a legacy-spelling alias must stay bare"
+        );
+        assert!(
+            cfg.providers.models.find("openai", "codex").is_some(),
+            "the openai-codex entry must still migrate to openai.codex"
+        );
+    }
+
+    #[test]
+    fn v2_bare_family_with_only_default_alias_variant_left_alone() {
+        // `qwen-intl` canonicalizes to `qwen.default` (with the intl endpoint)
+        // — a DEFAULT-named alias. A bare `qwen` reference must NOT be
+        // redirected to it, since that would silently inherit the qwen-intl
+        // endpoint/credentials. The bare family has no own source entry, so it
+        // stays bare (fail-closed).
+        let raw = r#"
+schema_version = 2
+
+[providers.models.qwen-intl]
+api_key = "sk-qwen-intl-test"
+model = "m"
+
+[multimodal]
+vision_model_provider = "qwen"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("qwen"),
+            "bare family with only a default-named variant must stay bare"
+        );
+        assert!(
+            cfg.providers.models.find("qwen", "default").is_some(),
+            "the qwen-intl entry must still migrate to qwen.default"
+        );
+    }
+
+    #[test]
+    fn v2_variant_vision_reference_with_only_canonical_source_left_alone() {
+        // `qwen-intl` names the international variant, but only the canonical
+        // `qwen` entry exists (which migrates to qwen.default with no intl
+        // endpoint). The reference must NOT be rewritten to qwen.default, since
+        // that would silently drop the variant's endpoint/credentials intent.
+        let raw = r#"
+schema_version = 2
+
+[providers.models.qwen]
+api_key = "sk-qwen-test"
+model = "m"
+
+[multimodal]
+vision_model_provider = "qwen-intl"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("qwen-intl"),
+            "variant reference with only a canonical source must stay as-is"
+        );
+        assert!(
+            cfg.providers.models.find("qwen", "default").is_some(),
+            "the canonical qwen entry must still migrate to qwen.default"
+        );
+    }
+
+    #[test]
+    fn v2_variant_vision_reference_with_equivalent_source_migrates() {
+        // With the matching variant source present, `qwen-intl` rewrites to
+        // its own migrated alias (endpoint carried on the alias entry).
+        let raw = r#"
+schema_version = 2
+
+[providers.models.qwen-intl]
+api_key = "sk-qwen-intl-test"
+model = "m"
+
+[multimodal]
+vision_model_provider = "qwen-intl"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("qwen.default"),
+            "variant reference with an equivalent source must rewrite"
+        );
+    }
+
+    #[test]
+    fn v2_bare_family_with_canonical_and_legacy_alias_rewrites_to_default() {
+        // A bare `openai` reference alongside BOTH a canonical `openai` entry
+        // and a legacy `openai-codex` entry: the exact raw `openai` key
+        // establishes the source, so the unrelated codex alias must not strand
+        // the canonical reference on the configless path.
+        let raw = r#"
+schema_version = 2
+
+[providers.models.openai]
+api_key = "sk-openai-test"
+model = "m"
+
+[providers.models.openai-codex]
+api_key = "sk-codex-test"
+model = "m2"
+
+[multimodal]
+vision_model_provider = "openai"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("openai.default"),
+            "bare canonical family with its own entry must rewrite to its default alias"
+        );
+        assert!(
+            cfg.providers.models.find("openai", "default").is_some(),
+            "canonical openai entry must live at openai.default"
+        );
+        assert!(
+            cfg.providers.models.find("openai", "codex").is_some(),
+            "openai-codex entry must live at openai.codex"
+        );
+    }
+
+    #[test]
+    fn v2_collided_default_alias_left_bare() {
+        // `qwen` and `qwen-intl` both normalize to qwen.default with different
+        // endpoint variants; the retained slot is ambiguous. A bare `qwen`
+        // reference must NOT be rewritten to it (it could silently pick the
+        // wrong endpoint/credential), so it stays bare (fail-closed).
+        let raw = r#"
+schema_version = 2
+
+[providers.models.qwen]
+api_key = "sk-qwen-test"
+model = "m"
+
+[providers.models.qwen-intl]
+api_key = "sk-qwen-intl-test"
+model = "m2"
+
+[multimodal]
+vision_model_provider = "qwen"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("qwen"),
+            "a collided default alias slot must not capture a bare family reference"
+        );
+        assert!(
+            cfg.providers.models.find("qwen", "default").is_some(),
+            "the collided qwen.default slot still migrates"
+        );
+    }
+
+    #[test]
+    fn v2_synonym_collision_left_bare() {
+        // `gemini` and `google` are synonyms that both collapse onto
+        // gemini.default. The materialized slot retains only one of their
+        // configs, so a bare `gemini` reference must not be rewritten (it could
+        // silently pick the `google` config).
+        let raw = r#"
+schema_version = 2
+
+[providers.models.gemini]
+model = "canonical-model"
+api_key = "sk-gemini"
+
+[providers.models.google]
+model = "synonym-model"
+api_key = "sk-google"
+
+[multimodal]
+vision_model_provider = "gemini"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("gemini"),
+            "a synonym-collided slot must not capture a bare family reference"
+        );
+    }
+
+    #[test]
+    fn v2_colon_url_source_rewrites_bare_custom() {
+        // A colon-URL source materializes custom.default with the uri. The
+        // provenance records the unsplit key; the equivalence check must split
+        // it back to the `custom` prefix so the bare reference rewrites.
+        let raw = r#"
+schema_version = 2
+
+[providers.models."custom:https://vision.example.invalid/v1"]
+model = "vision-model"
+
+[multimodal]
+vision_model_provider = "custom"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("custom.default"),
+            "bare custom reference must rewrite to the colon-URL source's alias"
+        );
+        let alias = cfg
+            .providers
+            .models
+            .find("custom", "default")
+            .expect("migrated colon-URL entry must live at custom.default");
+        assert_eq!(
+            alias.uri.as_deref(),
+            Some("https://vision.example.invalid/v1"),
+            "the migrated custom.default must retain the source uri"
+        );
+    }
+
+    #[test]
+    fn v2_global_only_fallback_rewrites_bare_openrouter() {
+        // No model entries and no default_provider: the fold synthesizes
+        // openrouter.default from the global default_model. The synthesized
+        // slot must be registered as a source so the bare reference rewrites.
+        let raw = r#"
+schema_version = 2
+
+[providers]
+default_model = "vision-model"
+
+[multimodal]
+vision_model_provider = "openrouter"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("openrouter.default"),
+            "bare openrouter reference must rewrite to the synthesized global alias"
+        );
+        assert!(
+            cfg.providers.models.find("openrouter", "default").is_some(),
+            "the synthesized openrouter.default must exist"
+        );
+    }
+
+    #[test]
+    fn v1_legacy_vision_reference_migrates_through_chain() {
+        // No `schema_version` implies V1. The `model_providers` shape feeds
+        // V2 `[providers.models]`, and the V2->V3 step canonicalizes the
+        // legacy vision reference through the same mapping, so a V1 legacy
+        // spelling must resolve too.
+        let raw = r#"
+[model_providers.grok]
+api_key = "sk-grok-test"
+model = "m"
+
+[multimodal]
+vision_model_provider = "grok"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("xai.default"),
+            "V1 legacy grok reference must rewrite through the full chain"
+        );
+        assert!(
+            cfg.providers.models.find("xai", "default").is_some(),
+            "migrated V1 grok entry must live at xai.default"
+        );
+    }
+
+    #[test]
     fn provider_pruner_never_panics_on_non_table_shapes() {
         // Array-of-tables where a family map is expected, scalar [providers],
         // array alias value. The salvage path is the daemon's never-fail
