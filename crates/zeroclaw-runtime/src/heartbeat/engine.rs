@@ -252,6 +252,48 @@ impl HeartbeatEngine {
         Ok(Self::parse_tasks(&content))
     }
 
+    /// Read the non-task prose of `HEARTBEAT.md` — everything that is not a
+    /// task bullet — so a tick can be told *how* to carry its tasks out.
+    ///
+    /// Tasks are one-line bullets, but authors write the surrounding file as
+    /// standing instructions for the tick: when to act, when to stay quiet,
+    /// what shape the output must take. None of it reached the model, because
+    /// `collect_tasks` keeps only the bullet text and `HEARTBEAT.md` is not in
+    /// the prompt builder's bootstrap set (`agent::system_prompt`). An
+    /// instruction that governs a tick has to be visible during that tick.
+    ///
+    /// Returns `None` when the file is absent or carries no prose, so callers
+    /// can leave the prompt byte-identical to today's.
+    pub async fn collect_briefing(&self) -> Result<Option<String>> {
+        let heartbeat_path = self.workspace_dir.join("HEARTBEAT.md");
+        if !heartbeat_path.exists() {
+            return Ok(None);
+        }
+        let content = tokio::fs::read_to_string(&heartbeat_path).await?;
+        Ok(Self::extract_briefing(&content))
+    }
+
+    /// Strip task bullets from `HEARTBEAT.md`, keeping the prose around them.
+    ///
+    /// Only the exact `- ` bullet form is dropped, matching `parse_tasks`, so
+    /// the two cannot disagree about what a task is: anything `parse_tasks`
+    /// would run is removed here, and everything else is briefing.
+    fn extract_briefing(content: &str) -> Option<String> {
+        let prose: Vec<&str> = content
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim();
+                match trimmed.strip_prefix("- ") {
+                    Some(text) => text.is_empty(),
+                    None => true,
+                }
+            })
+            .collect();
+        let joined = prose.join("\n");
+        let trimmed = joined.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    }
+
     /// Collect only runnable (active) tasks, sorted by priority (high first).
     pub async fn collect_runnable_tasks(&self) -> Result<Vec<HeartbeatTask>> {
         let mut tasks: Vec<HeartbeatTask> = self
@@ -411,6 +453,81 @@ impl HeartbeatEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The reported failure, reduced: an operator documents the rule that makes
+    /// output deliverable in the prose of HEARTBEAT.md, and the model never
+    /// sees it. `parse_tasks` keeps only the bullet, so before `extract_briefing`
+    /// the rule reached nobody and every composed message was discarded.
+    #[test]
+    fn briefing_carries_the_rule_that_tasks_alone_lose() {
+        let content = "\
+# HEARTBEAT.md
+
+Only what you put between <send> and </send> is delivered.
+Everything else is yours: think, hesitate, discard.
+
+## The task
+
+- [normal] Decide whether to write now.
+";
+        let tasks = HeartbeatEngine::parse_tasks(content);
+        assert_eq!(tasks.len(), 1, "the bullet is still the only task");
+        assert_eq!(tasks[0].text, "Decide whether to write now.");
+        assert!(
+            !tasks[0].text.contains("<send>"),
+            "tasks carry no prose — this is exactly why the briefing is needed"
+        );
+
+        let briefing = HeartbeatEngine::extract_briefing(content)
+            .expect("prose around the task must be recoverable");
+        assert!(
+            briefing.contains("<send>") && briefing.contains("</send>"),
+            "the delivery rule must survive into the briefing, got: {briefing:?}"
+        );
+        assert!(
+            !briefing.contains("Decide whether to write now."),
+            "task bullets belong to parse_tasks, not the briefing"
+        );
+    }
+
+    /// A file that is nothing but tasks must not grow a prompt section: callers
+    /// use `None` to keep the tick prompt byte-identical to the old behavior.
+    #[test]
+    fn briefing_is_none_when_there_is_no_prose() {
+        assert_eq!(HeartbeatEngine::extract_briefing("- one\n- two\n"), None);
+        assert_eq!(HeartbeatEngine::extract_briefing(""), None);
+        assert_eq!(HeartbeatEngine::extract_briefing("   \n\n  \n"), None);
+    }
+
+    /// `extract_briefing` and `parse_tasks` must agree on what a task is, or
+    /// text would be dropped by one and not claimed by the other.
+    #[test]
+    fn briefing_and_tasks_partition_every_line() {
+        let content = "\
+Intro prose.
+
+- [high] real task
+-not a bullet, no space
+- 
+  - indented bullet
+
+Trailing prose.
+";
+        let tasks = HeartbeatEngine::parse_tasks(content);
+        let briefing = HeartbeatEngine::extract_briefing(content).unwrap();
+
+        for task in &tasks {
+            assert!(
+                !briefing.contains(&task.text),
+                "task {:?} leaked into the briefing",
+                task.text
+            );
+        }
+        // A hyphen with no space is prose to parse_tasks, so it must be kept.
+        assert!(briefing.contains("-not a bullet, no space"));
+        assert!(briefing.contains("Intro prose."));
+        assert!(briefing.contains("Trailing prose."));
+    }
 
     #[test]
     fn parse_tasks_basic() {
