@@ -84,6 +84,11 @@ jobs:
       - name: Guard release attestation contract
         run: python3 scripts/ci/release_attestation_contract_test.py
 
+      - name: Guard temporary React Router RSC advisory exception
+        run: |
+          bash scripts/ci/web_rsc_mode_guard.test.sh
+          bash scripts/ci/web_rsc_mode_guard.sh
+
   # ── Post-format required quality gate ─────────────────────────────────────
 
   lint:
