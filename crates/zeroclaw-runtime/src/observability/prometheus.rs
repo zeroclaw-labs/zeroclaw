@@ -319,6 +319,7 @@ impl Observer for PrometheusObserver {
                 channel: _,
                 agent_alias: _,
                 turn_id: _,
+                conversation_id: _,
             } => {
                 self.agent_starts
                     .with_label_values(&[model_provider, model])
@@ -333,6 +334,7 @@ impl Observer for PrometheusObserver {
                 channel: _,
                 agent_alias: _,
                 turn_id: _,
+                conversation_id: _,
             } => {
                 // Agent duration is recorded via the histogram with model_provider/model labels
                 self.agent_duration
@@ -520,6 +522,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::AgentEnd {
             model_provider: "openrouter".into(),
@@ -533,6 +536,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::AgentEnd {
             model_provider: "openrouter".into(),
@@ -543,6 +547,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             parent_agent_alias: None,
@@ -555,6 +560,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             parent_agent_alias: None,
@@ -567,6 +573,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::ChannelMessage {
             channel: "telegram".into(),
@@ -604,6 +611,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             parent_agent_alias: None,
@@ -616,6 +624,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::HeartbeatTick);
         obs.record_metric(&ObserverMetric::RequestLatency(Duration::from_millis(250)));
@@ -664,6 +673,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             parent_agent_alias: None,
@@ -676,6 +686,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             parent_agent_alias: None,
@@ -688,6 +699,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
 
         let output = obs.encode();
@@ -743,6 +755,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::LlmResponse {
             parent_agent_alias: None,
@@ -757,6 +770,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
 
         let output = obs.encode();
@@ -788,6 +802,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
 
         let output = obs.encode();
@@ -912,6 +927,74 @@ mod tests {
                 .is_some(),
             "the /metrics resolver downcasts through `as_any` — Arc<T> must \
              surface the inner T, not the Arc wrapper"
+        );
+    }
+
+    /// The caller-owned `conversation_id` rides the typed `ObserverEvent`
+    /// but must never reach the Prometheus text exposition: it is not a
+    /// label on any counter/histogram/gauge, and the canary value must not
+    /// surface in `encode()` output. Guards against a future change that
+    /// promotes the id to a Prometheus label, which would be a cardinality
+    /// hazard across long-lived conversations.
+    #[test]
+    fn conversation_attr_absent_from_prometheus_encode() {
+        let canary = "prom-canary-conv-id";
+        let obs = PrometheusObserver::new();
+        obs.record_event(&ObserverEvent::AgentStart {
+            model_provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
+            conversation_id: Some(canary.into()),
+        });
+        obs.record_event(&ObserverEvent::LlmResponse {
+            parent_agent_alias: None,
+            model_provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            duration: Duration::from_millis(25),
+            success: true,
+            error_message: None,
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            messages: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
+            conversation_id: Some(canary.into()),
+        });
+        obs.record_event(&ObserverEvent::ToolCall {
+            parent_agent_alias: None,
+            tool: "shell".into(),
+            tool_call_id: None,
+            duration: Duration::from_millis(5),
+            success: true,
+            arguments: None,
+            result: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
+            conversation_id: Some(canary.into()),
+        });
+        obs.record_event(&ObserverEvent::MemoryAudit {
+            action: "store".into(),
+            backend: "sqlite".into(),
+            duration: Duration::from_millis(3),
+            success: true,
+        });
+
+        let output = obs.encode();
+        assert!(
+            !output.contains(canary),
+            "conversation id leaked into Prometheus encode output: {output}"
+        );
+        assert!(
+            !output.contains("conversation_id"),
+            "conversation_id label leaked into Prometheus encode output: {output}"
+        );
+        assert!(
+            !output.contains("gen_ai.conversation.id"),
+            "gen_ai.conversation.id label leaked into Prometheus encode output: {output}"
         );
     }
 }

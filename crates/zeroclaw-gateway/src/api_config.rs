@@ -2660,6 +2660,9 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             session_queue: Arc::new(crate::session_queue::SessionActorQueue::new(8, 30, 600)),
             device_registry: None,
             pending_pairings: None,

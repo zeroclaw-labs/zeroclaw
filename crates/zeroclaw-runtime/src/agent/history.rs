@@ -612,4 +612,73 @@ mod tests {
             "expected head to retain full marker, got: {truncated}"
         );
     }
+
+    // ── CLI conversation attribution: state schema contract (Task 6) ────
+    //
+    // The conversation_id is caller-owned and lives only in the running
+    // process (single-shot invocation or REPL session). The interactive
+    // session state file persists history only; it MUST NOT carry a
+    // conversation_id, so a later process restoring this history mints its
+    // own fresh id rather than inheriting a stale one.
+
+    #[test]
+    fn cli_conversation_id_state_schema_has_no_id_field() {
+        let state = InteractiveSessionState {
+            version: 1,
+            history: vec![
+                ChatMessage::system("sys"),
+                ChatMessage::user("hi"),
+                ChatMessage::assistant("hello"),
+            ],
+        };
+
+        let json = serde_json::to_string(&state).expect("serialize state");
+
+        // Negative contract: no conversation-id is persisted to the state file.
+        assert!(
+            !json.contains("conversation_id"),
+            "InteractiveSessionState must not serialize a conversation_id; got: {json}"
+        );
+        assert!(
+            !json.contains("conversation"),
+            "InteractiveSessionState must not carry any conversation field; got: {json}"
+        );
+
+        // Round-trip preserves exactly version + history.
+        let restored: InteractiveSessionState =
+            serde_json::from_str(&json).expect("deserialize state");
+        assert_eq!(restored.version, 1);
+        assert_eq!(restored.history.len(), 3);
+        assert_eq!(restored.history[1].content, "hi");
+    }
+
+    #[test]
+    fn cli_conversation_id_state_schema_drops_unknown_id_on_load() {
+        // A poisoned state file (hand-edited to inject a conversation_id) must
+        // not surface an id through the loaded history. serde's default
+        // ignores unknown fields; the loader returns messages only.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        // Serialize a real state so the message shape matches the loader, then
+        // inject a foreign conversation_id field by hand.
+        let mut value = serde_json::to_value(&InteractiveSessionState {
+            version: 1,
+            history: vec![ChatMessage::system("sys"), ChatMessage::user("question")],
+        })
+        .unwrap();
+        value["conversation_id"] = serde_json::json!("POISON-FROM-STATE-FILE");
+        std::fs::write(&path, serde_json::to_string_pretty(&value).unwrap()).unwrap();
+
+        let restored = load_interactive_session_history(&path, "fallback").unwrap();
+
+        assert_eq!(restored.len(), 2);
+        assert_eq!(restored[0].role, "system");
+        assert_eq!(restored[1].content, "question");
+        assert!(
+            !restored
+                .iter()
+                .any(|m| m.content.contains("POISON-FROM-STATE-FILE")),
+            "poisoned conversation_id leaked into restored history: {restored:?}"
+        );
+    }
 }

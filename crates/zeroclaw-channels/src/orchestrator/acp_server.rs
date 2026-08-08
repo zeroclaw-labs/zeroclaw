@@ -840,6 +840,31 @@ impl AcpServer {
             }
         }
 
+        let conversation_id = if let Some(store) = &self.store {
+            match store.conversation_id(&session_id) {
+                Ok(Some(id)) => id,
+                Ok(None) => {
+                    self.loading_sessions.lock().await.remove(&session_id);
+                    return Err(RpcError {
+                        code: INTERNAL_ERROR,
+                        message: "ACP session conversation identity is missing".into(),
+                        data: None,
+                    });
+                }
+                Err(error) => {
+                    self.loading_sessions.lock().await.remove(&session_id);
+                    return Err(RpcError {
+                        code: INTERNAL_ERROR,
+                        message: format!("Failed to load session conversation identity: {error}"),
+                        data: None,
+                    });
+                }
+            }
+        } else {
+            uuid::Uuid::new_v4().to_string()
+        };
+        agent.set_conversation_id(Some(conversation_id));
+
         let now = Instant::now();
         // Atomically insert and release the reservation.
         {
@@ -1017,6 +1042,8 @@ impl AcpServer {
                 return Err(e);
             }
         };
+
+        agent.set_conversation_id(Some(data.conversation_id.clone()));
 
         let stored_messages: Vec<_> = data
             .messages
@@ -1232,6 +1259,8 @@ impl AcpServer {
                 return Err(e);
             }
         };
+
+        agent.set_conversation_id(Some(data.conversation_id.clone()));
 
         let restore_trim_event = agent.seed_conversation_history_with_event(data.messages);
 
@@ -5541,6 +5570,154 @@ mod tests {
             second_err.code, INTERNAL_ERROR,
             "second resume must fail with INTERNAL_ERROR, not INVALID_PARAMS (leaked slot); got: {:?}",
             second_err
+        );
+    }
+
+    /// Read the cross-turn conversation id stamped on an in-memory session's
+    /// agent. Mirrors `session_agent_alias` for the conversation-id field.
+    async fn session_conversation_id(server: &AcpServer, session_id: &str) -> Option<String> {
+        let sessions = server.sessions.lock().await;
+        let session = sessions.get(session_id).expect("session must exist");
+        let session = session.lock().await;
+        session.agent.conversation_id().map(str::to_string)
+    }
+
+    /// `session/new` mints a server-owned UUID separate from the ACP protocol
+    /// session ID and stamps it on the agent as the cross-turn identity.
+    #[tokio::test]
+    async fn acp_conversation_id_session_new_is_server_owned_uuid() {
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let server = AcpServer::new_with_store(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+            Arc::clone(&store),
+        );
+
+        let result = server
+            .handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy()
+            }))
+            .await
+            .expect("session/new must succeed");
+        let session_id = result["sessionId"]
+            .as_str()
+            .expect("session/new returns a sessionId")
+            .to_string();
+
+        let stamped = session_conversation_id(&server, &session_id)
+            .await
+            .expect("session/new must stamp a conversation id");
+        assert_ne!(stamped, session_id);
+        assert!(uuid::Uuid::parse_str(&stamped).is_ok());
+    }
+
+    /// Closing then loading a session restores the same persisted conversation
+    /// ID so observer events stay grouped across the close/open boundary.
+    #[tokio::test]
+    async fn acp_conversation_id_load_restores_persisted_id() {
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let server = AcpServer::new_with_store(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+            Arc::clone(&store),
+        );
+
+        let result = server
+            .handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy()
+            }))
+            .await
+            .expect("session/new must succeed");
+        let session_id = result["sessionId"].as_str().unwrap().to_string();
+        assert_eq!(
+            session_conversation_id(&server, &session_id)
+                .await
+                .expect("session/new stamps a conversation id"),
+            store.conversation_id(&session_id).unwrap().unwrap(),
+            "session/new must stamp the persisted conversation id"
+        );
+
+        // Close evicts the in-memory agent; the persisted session row remains.
+        server
+            .handle_session_close(&serde_json::json!({ "sessionId": session_id }))
+            .await
+            .expect("session/close must succeed");
+        assert!(
+            !server.sessions.lock().await.contains_key(&session_id),
+            "session/close must evict the in-memory session"
+        );
+
+        // session/load rebuilds the agent with the persisted conversation ID.
+        server
+            .handle_session_load(&serde_json::json!({
+                "sessionId": session_id,
+                "cwd": cwd.path().to_string_lossy()
+            }))
+            .await
+            .expect("session/load must succeed");
+        assert_eq!(
+            session_conversation_id(&server, &session_id)
+                .await
+                .expect("session/load stamps a conversation id"),
+            store.conversation_id(&session_id).unwrap().unwrap(),
+            "session/load must restore the persisted conversation id"
+        );
+    }
+
+    /// Closing then resuming a session restores the same persisted conversation
+    /// ID used by `session/new` and `session/load`.
+    #[tokio::test]
+    async fn acp_conversation_id_resume_restores_persisted_id() {
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let server = AcpServer::new_with_store(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+            Arc::clone(&store),
+        );
+
+        let result = server
+            .handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy()
+            }))
+            .await
+            .expect("session/new must succeed");
+        let session_id = result["sessionId"].as_str().unwrap().to_string();
+        assert_eq!(
+            session_conversation_id(&server, &session_id)
+                .await
+                .expect("session/new stamps a conversation id"),
+            store.conversation_id(&session_id).unwrap().unwrap(),
+            "session/new must stamp the persisted conversation id"
+        );
+
+        server
+            .handle_session_close(&serde_json::json!({ "sessionId": session_id }))
+            .await
+            .expect("session/close must succeed");
+        assert!(
+            !server.sessions.lock().await.contains_key(&session_id),
+            "session/close must evict the in-memory session"
+        );
+
+        server
+            .handle_session_resume(&serde_json::json!({
+                "sessionId": session_id,
+                "cwd": cwd.path().to_string_lossy()
+            }))
+            .await
+            .expect("session/resume must succeed");
+        assert_eq!(
+            session_conversation_id(&server, &session_id)
+                .await
+                .expect("session/resume stamps a conversation id"),
+            store.conversation_id(&session_id).unwrap().unwrap(),
+            "session/resume must restore the persisted conversation id"
         );
     }
 }

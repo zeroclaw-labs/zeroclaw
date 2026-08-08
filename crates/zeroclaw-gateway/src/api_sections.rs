@@ -1429,6 +1429,9 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
+            channel_sessions: std::sync::Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),

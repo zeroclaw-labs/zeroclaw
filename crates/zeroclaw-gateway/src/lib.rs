@@ -549,6 +549,12 @@ pub struct AppState {
     pub web_dist_dir: Option<std::path::PathBuf>,
     /// Session backend for persisting gateway WS chat sessions
     pub session_backend: Option<Arc<dyn SessionBackend>>,
+    /// Shared Channel conversation identity for the four Channel webhooks
+    /// (WhatsApp, Linq, WATI, Nextcloud Talk). Resolves one opaque id per
+    /// `conversation_history_key` so re-delivered or follow-up messages reuse
+    /// the same id. The gateway's own `session_backend` above only serves `gw_`
+    /// WS/API sessions and is NOT a Channel conversation fallback.
+    pub channel_sessions: Arc<zeroclaw_infra::channel_conversation::ChannelConversationStore>,
     /// Per-session actor queue for serializing concurrent turns
     pub session_queue: Arc<session_queue::SessionActorQueue>,
     /// Device registry for paired device management
@@ -579,7 +585,7 @@ pub struct AppState {
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn run_gateway(
     host: &str,
     port: u16,
@@ -597,6 +603,11 @@ pub async fn run_gateway(
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
     readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
+    // Shared Channel conversation identity for the four Channel webhooks.
+    // Constructed once per daemon iteration and cloned into the channel
+    // orchestrator too, so an inbound webhook and the orchestrator agree on
+    // one id per `conversation_history_key`.
+    channel_sessions: Arc<zeroclaw_infra::channel_conversation::ChannelConversationStore>,
 ) -> Result<()> {
     // ── Security: warn on public bind without tunnel or explicit opt-in ──
     if is_public_bind(host)
@@ -832,6 +843,7 @@ pub async fn run_gateway(
                 sop_engine.clone(),
                 sop_audit.clone(),
                 None,
+                None,
             );
             let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
                 config: &config,
@@ -965,6 +977,7 @@ pub async fn run_gateway(
             None,
             sop_engine.clone(),
             sop_audit.clone(),
+            None,
             None,
         );
         // Same gated seam as the dashboard seed above, so this listing shows
@@ -1619,6 +1632,7 @@ pub async fn run_gateway(
         node_registry,
         mdns_peer_registry,
         session_backend,
+        channel_sessions,
         session_queue: Arc::new(session_queue::SessionActorQueue::new(8, 30, 600)),
         device_registry,
         pending_pairings,
@@ -2445,6 +2459,13 @@ pub(crate) async fn persist_pairing_tokens(
 /// Result of a gateway chat turn.
 struct GatewayChatOutcome {
     response: String,
+    #[cfg(any(
+        feature = "channel-whatsapp-cloud",
+        feature = "channel-linq",
+        feature = "channel-wati",
+        feature = "channel-nextcloud"
+    ))]
+    generated_history: Vec<zeroclaw_api::model_provider::ChatMessage>,
 }
 
 struct UnconfiguredModelProvider;
@@ -2565,8 +2586,17 @@ fn record_gateway_chat_dispatch_for_test(
 pub(crate) async fn run_gateway_chat_with_tools(
     state: &AppState,
     message: &str,
-    session_id: Option<&str>,
+    memory_session_id: Option<&str>,
     agent_override: Option<&str>,
+    conversation_id: Option<&str>,
+    // Prior turn history captured from the shared Channel conversation store
+    // (`ChannelConversationStore::open`) BEFORE any async preprocessing. The
+    // Channel webhooks pass this so the chat turn sees the same history view
+    // the lifecycle fence captured, without re-opening the record or building a
+    // webhook-specific cache. The generic HTTP webhook and A2A entry points
+    // pass an empty slice (they have no shared store record).
+    prior_history: &[zeroclaw_api::model_provider::ChatMessage],
+    cancellation_token: Option<tokio_util::sync::CancellationToken>,
 ) -> anyhow::Result<GatewayChatOutcome> {
     if let Some(err) = needs_quickstart_for(&state.model) {
         return Err(err);
@@ -2578,12 +2608,30 @@ pub(crate) async fn run_gateway_chat_with_tools(
     // doesn't go through the cost-tracking scope.
     #[cfg(test)]
     {
-        record_gateway_chat_dispatch_for_test(message, session_id, agent_override);
+        record_gateway_chat_dispatch_for_test(message, memory_session_id, agent_override);
+        let _ = conversation_id;
+        if cancellation_token
+            .as_ref()
+            .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+        {
+            anyhow::bail!("channel webhook turn cancelled");
+        }
+        let mut history = prior_history.to_vec();
+        history.push(zeroclaw_api::model_provider::ChatMessage::user(message));
         let response = state
             .model_provider
-            .chat_with_system(None, message, &state.model, state.temperature)
+            .chat_with_history(&history, &state.model, state.temperature)
             .await?;
-        Ok(GatewayChatOutcome { response })
+        Ok(GatewayChatOutcome {
+            response,
+            #[cfg(any(
+                feature = "channel-whatsapp-cloud",
+                feature = "channel-linq",
+                feature = "channel-wati",
+                feature = "channel-nextcloud"
+            ))]
+            generated_history: Vec::new(),
+        })
     }
 
     #[cfg(not(test))]
@@ -2612,21 +2660,403 @@ pub(crate) async fn run_gateway_chat_with_tools(
                 zeroclaw_runtime::agent::cost::TurnUsage::default(),
             ))
         });
-        let response = Box::pin(zeroclaw_runtime::agent::cost::TOOL_LOOP_TURN_USAGE.scope(
+        let channel_sessions = cancellation_token
+            .is_some()
+            .then(|| Arc::clone(&state.channel_sessions));
+        let outcome = Box::pin(zeroclaw_runtime::agent::cost::TOOL_LOOP_TURN_USAGE.scope(
             turn_usage.clone(),
             zeroclaw_runtime::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                 cost_tracking_context,
-                zeroclaw_runtime::agent::process_message(
+                zeroclaw_runtime::agent::process_message_with_history(
                     config,
                     &agent_alias,
                     message,
-                    session_id,
+                    memory_session_id,
                     zeroclaw_api::ingress::TurnOrigin::Interactive,
+                    conversation_id,
+                    prior_history,
+                    cancellation_token,
+                    channel_sessions,
                 ),
             ),
         ))
         .await?;
-        Ok(GatewayChatOutcome { response })
+        Ok(GatewayChatOutcome {
+            response: outcome.response,
+            #[cfg(any(
+                feature = "channel-whatsapp-cloud",
+                feature = "channel-linq",
+                feature = "channel-wati",
+                feature = "channel-nextcloud"
+            ))]
+            generated_history: outcome.history,
+        })
+    }
+}
+
+/// Mint a fresh, caller-owned conversation id for a per-request HTTP entry
+/// point (generic webhook, A2A). These handlers bypass the Channel
+/// orchestrator AND have no shared `ChannelConversationStore` record, so each
+/// request owns a brand-new UUID v4 that is reused only within that single
+/// request. It is deliberately NOT derived from `X-Session-Id`, a
+/// sender/thread key, the `gw_`/`a2a_` storage prefix, or the request body -
+/// those feed the separate memory-session id, not the conversation
+/// attribution.
+///
+/// The four Channel webhooks (WhatsApp/Linq/WATI/Nextcloud Talk) do NOT call
+/// this: they resolve their conversation id through the shared
+/// `ChannelConversationStore` so a re-delivered or follow-up message reuses
+/// one id per `conversation_history_key`.
+pub(crate) fn mint_request_conversation_id() -> String {
+    Uuid::new_v4().to_string()
+}
+
+/// Resolve the opaque cross-turn conversation id for a Channel webhook message
+/// through the shared [`ChannelConversationStore`]. Two inbound messages that share
+/// a `conversation_history_key` (same channel/alias/room/sender/thread) reuse
+/// one id; different senders or threads isolate. The returned id is never the
+/// `history_key` or any routing/sender value. On backend failure the error is
+/// propagated so the caller fails closed rather than minting a fresh id.
+///
+/// The four Channel webhooks now open the full record via
+/// [`open_webhook_channel_conversation`] (capturing id + prior history for the
+/// lifecycle fence). This thin resolver is retained for the key-isolation
+/// contract tests below, which exercise `conversation_history_key` +
+/// `resolve_conversation_id` end-to-end without constructing a full webhook
+/// payload.
+#[cfg(any(
+    feature = "channel-whatsapp-cloud",
+    feature = "channel-linq",
+    feature = "channel-wati",
+    feature = "channel-nextcloud"
+))]
+#[cfg(test)]
+fn resolve_webhook_channel_conversation_id(
+    state: &AppState,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> std::io::Result<String> {
+    let history_key = zeroclaw_channels::orchestrator::conversation_history_key(msg);
+    state.channel_sessions.resolve_conversation_id(&history_key)
+}
+
+/// Open the shared Channel conversation record for a webhook message and return
+/// the captured id + prior history. The id fences every history mutation for
+/// this turn; the history is passed into [`run_gateway_chat_with_tools`] so the
+/// chat sees the same view the lifecycle captured without re-opening the record
+/// or building a webhook-specific cache. Fail CLOSED on `open`: the caller
+/// returns the platform ACK (or 500 for the sync handlers) without calling the
+/// model or persisting anything, and never mints a fresh-id fallback.
+#[cfg(any(
+    feature = "channel-whatsapp-cloud",
+    feature = "channel-linq",
+    feature = "channel-wati",
+    feature = "channel-nextcloud"
+))]
+async fn open_webhook_channel_conversation(
+    state: &AppState,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> std::io::Result<zeroclaw_infra::session_backend::ChannelConversationRecord> {
+    let history_key = zeroclaw_channels::orchestrator::conversation_history_key(msg);
+    let record = state.channel_sessions.open(&history_key).await?;
+    if let Some(backend) = state.channel_sessions.backend() {
+        let channel_id = msg
+            .channel_alias
+            .as_deref()
+            .map(|alias| format!("{}.{alias}", msg.channel));
+        let room_id = msg
+            .thread_ts
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                let target = msg.reply_target.trim();
+                (!target.is_empty()).then_some(target)
+            });
+        backend.set_session_context(
+            &history_key,
+            zeroclaw_infra::session_backend::SessionContext {
+                channel_id: channel_id.as_deref(),
+                room_id,
+                sender_id: Some(msg.sender.as_str()).filter(|value| !value.is_empty()),
+            },
+        )?;
+    }
+    Ok(record)
+}
+
+/// Outcome of a Channel webhook turn dispatched through the shared
+/// [`ChannelConversationStore`] lifecycle. The caller owns the platform reply
+/// send; this enum tells it what to send (or whether to stay silent).
+#[cfg(any(
+    feature = "channel-whatsapp-cloud",
+    feature = "channel-linq",
+    feature = "channel-wati",
+    feature = "channel-nextcloud"
+))]
+#[derive(Debug)]
+enum ChannelWebhookTurn {
+    /// The record was stale (rotated) or deleted at the post-preprocess fence.
+    /// ACK only: do not call the model and do not send a platform reply.
+    StaleAck,
+    /// The model replied. The user + assistant turns were persisted through the
+    /// shared store (conditional on the captured id); send `response` to the
+    /// platform.
+    Replied { response: String },
+    /// The model call failed. `reply` is the canned platform text (needs-
+    /// quickstart or generic error) the caller should send.
+    Failed { reply: String },
+}
+
+/// Run one Channel webhook message through the shared conversation lifecycle,
+/// starting from an already-opened record. The caller opens the record first
+/// (via [`open_webhook_channel_conversation`]) so it can map an open failure to
+/// its handler-specific fail-closed response (sync handlers return 500; the
+/// Nextcloud Talk fast-ack task logs and bails).
+///
+/// This helper: fences with `is_current` after `preprocess`, persists the user
+/// turn through `mutate_if_current`, dispatches the chat with the captured prior
+/// history, fences again before the reply, and persists the assistant turn. A
+/// stale or deleted record at either fence ends the turn immediately with a
+/// protocol ACK and no model call. The caller still owns the platform reply
+/// send.
+///
+/// `memory_session_id` is the sender-scoped memory key (distinct from the
+/// conversation id). `preprocess` runs any channel-specific async work (audio
+/// transcription, autosave, approval routing) BEFORE the `is_current` fence so a
+/// rotated/deleted record short-circuits before the model is touched.
+#[cfg(any(
+    feature = "channel-whatsapp-cloud",
+    feature = "channel-linq",
+    feature = "channel-wati",
+    feature = "channel-nextcloud"
+))]
+async fn run_channel_webhook_turn<F>(
+    state: &AppState,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    memory_session_id: &str,
+    agent_override: Option<&str>,
+    record: zeroclaw_infra::session_backend::ChannelConversationRecord,
+    preprocess: F,
+) -> ChannelWebhookTurn
+where
+    F: std::future::Future<Output = ()>,
+{
+    let history_key = zeroclaw_channels::orchestrator::conversation_history_key(msg);
+    let cancellation_token = tokio_util::sync::CancellationToken::new();
+    state
+        .channel_sessions
+        .register_in_flight(&history_key, cancellation_token.clone())
+        .await;
+    let outcome = run_registered_channel_webhook_turn(
+        state,
+        msg,
+        memory_session_id,
+        agent_override,
+        record,
+        cancellation_token.clone(),
+        preprocess,
+    )
+    .await;
+    state
+        .channel_sessions
+        .unregister_in_flight(&history_key, &cancellation_token)
+        .await;
+    outcome
+}
+
+#[cfg(any(
+    feature = "channel-whatsapp-cloud",
+    feature = "channel-linq",
+    feature = "channel-wati",
+    feature = "channel-nextcloud"
+))]
+async fn persist_generated_channel_history(
+    state: &AppState,
+    history_key: &str,
+    conversation_id: &str,
+    messages: &[zeroclaw_api::model_provider::ChatMessage],
+) -> bool {
+    for message in messages {
+        match state
+            .channel_sessions
+            .mutate_if_current(
+                history_key,
+                conversation_id,
+                zeroclaw_infra::SessionMutation::Append(message),
+            )
+            .await
+        {
+            Ok(zeroclaw_infra::ConditionalSessionWrite::Applied) => {}
+            Ok(
+                zeroclaw_infra::ConditionalSessionWrite::Stale
+                | zeroclaw_infra::ConditionalSessionWrite::Deleted,
+            )
+            | Err(_) => return false,
+        }
+    }
+    true
+}
+
+#[cfg(any(
+    feature = "channel-whatsapp-cloud",
+    feature = "channel-linq",
+    feature = "channel-wati",
+    feature = "channel-nextcloud"
+))]
+async fn run_registered_channel_webhook_turn<F>(
+    state: &AppState,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    memory_session_id: &str,
+    agent_override: Option<&str>,
+    record: zeroclaw_infra::session_backend::ChannelConversationRecord,
+    cancellation_token: tokio_util::sync::CancellationToken,
+    preprocess: F,
+) -> ChannelWebhookTurn
+where
+    F: std::future::Future<Output = ()>,
+{
+    use zeroclaw_infra::session_backend::ConditionalSessionWrite;
+
+    let history_key = zeroclaw_channels::orchestrator::conversation_history_key(msg);
+    let conversation_id = record.conversation_id;
+    let prior_history = record.history;
+
+    // Channel-specific async preprocessing (autosave, transcription, approval
+    // routing). Runs before the fence so a stale/deleted record skips the model.
+    preprocess.await;
+
+    // Post-preprocess fence: if the record was rotated (/new) or deleted while
+    // preprocessing ran, ACK only and do not call the model.
+    match state
+        .channel_sessions
+        .is_current(&history_key, &conversation_id)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return ChannelWebhookTurn::StaleAck,
+        Err(error) => {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "channel": msg.channel.as_str(),
+                        "error_kind": error.kind().to_string(),
+                    })),
+                "CHANNEL_CONVERSATION_FENCE_FAILED"
+            );
+            return ChannelWebhookTurn::StaleAck;
+        }
+    }
+
+    let user_turn = zeroclaw_api::model_provider::ChatMessage::user(&msg.content);
+    // Persist the inbound user turn through the shared store before the model
+    // call. Stale/Deleted or a real storage error ends the turn before the
+    // provider so no unpersisted user turn can acquire assistant/tool history.
+    match state
+        .channel_sessions
+        .mutate_if_current(
+            &history_key,
+            &conversation_id,
+            zeroclaw_infra::SessionMutation::Append(&user_turn),
+        )
+        .await
+    {
+        Ok(ConditionalSessionWrite::Applied) => {}
+        Ok(ConditionalSessionWrite::Stale | ConditionalSessionWrite::Deleted) => {
+            return ChannelWebhookTurn::StaleAck;
+        }
+        Err(error) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "channel": msg.channel.as_str(),
+                        "error_kind": error.kind().to_string(),
+                    })),
+                "CHANNEL_CONVERSATION_USER_PERSIST_FAILED"
+            );
+            return ChannelWebhookTurn::StaleAck;
+        }
+    }
+
+    match Box::pin(run_gateway_chat_with_tools(
+        state,
+        &msg.content,
+        Some(memory_session_id),
+        agent_override,
+        Some(&conversation_id),
+        &prior_history,
+        Some(cancellation_token),
+    ))
+    .await
+    {
+        Ok(GatewayChatOutcome {
+            response,
+            generated_history,
+        }) => {
+            // Persist runtime-generated assistant tool-call, tool-result, and
+            // final assistant messages in provider order. Every append is fenced
+            // by the id captured before preprocessing; stale/deleted/error ends
+            // the turn without a platform reply.
+            let generated_history = if generated_history.is_empty() {
+                vec![zeroclaw_api::model_provider::ChatMessage::assistant(
+                    &response,
+                )]
+            } else {
+                generated_history
+            };
+            if !persist_generated_channel_history(
+                state,
+                &history_key,
+                &conversation_id,
+                &generated_history,
+            )
+            .await
+            {
+                return ChannelWebhookTurn::StaleAck;
+            }
+            match state
+                .channel_sessions
+                .is_current(&history_key, &conversation_id)
+                .await
+            {
+                Ok(true) => ChannelWebhookTurn::Replied { response },
+                Ok(false) | Err(_) => ChannelWebhookTurn::StaleAck,
+            }
+        }
+        Err(e) => {
+            let reply = if is_needs_quickstart_err(&e) {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    "Channel chat refused: gateway has no model configured; \
+                     visit /quickstart"
+                );
+                needs_quickstart_channel_reply()
+            } else {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "channel": msg.channel.as_str(),
+                            "error": format!("{e}")
+                        })),
+                    "LLM error"
+                );
+                "Sorry, I couldn't process your message right now.".to_string()
+            };
+            match state
+                .channel_sessions
+                .is_current(&history_key, &conversation_id)
+                .await
+            {
+                Ok(true) => ChannelWebhookTurn::Failed { reply },
+                Ok(false) | Err(_) => ChannelWebhookTurn::StaleAck,
+            }
+        }
     }
 }
 
@@ -2892,8 +3322,21 @@ async fn handle_webhook(
     // sole owner of lifecycle and LLM events. Emitting another bracket here
     // gives one webhook prompt two unrelated turn IDs.
     let started_at = Instant::now();
+    // Each webhook request owns a fresh conversation id, distinct from the
+    // memory-scoped `X-Session-Id`. The reject path above returns before this
+    // mint, so a duplicate idempotency key never produces a turn attribution.
+    let conversation_id = mint_request_conversation_id();
 
-    match run_gateway_chat_with_tools(&state, message, session_id.as_deref(), agent_override).await
+    match run_gateway_chat_with_tools(
+        &state,
+        message,
+        session_id.as_deref(),
+        agent_override,
+        Some(&conversation_id),
+        &[],
+        None,
+    )
+    .await
     {
         Ok(GatewayChatOutcome { response, .. }) => {
             let duration = started_at.elapsed();
@@ -3150,9 +3593,36 @@ async fn process_whatsapp_message(
     for msg in &messages {
         ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"channel": "whatsapp", "sender": msg.sender, "content": msg.content})), "inbound webhook message");
 
-        // Route approval replies to pending approval requests before dispatching to agent
-        if let Some((token, response)) = zeroclaw_channels::util::parse_approval_reply(&msg.content)
-        {
+        // Parse the approval command synchronously. Any async pending-approval
+        // lookup happens only after the shared record is opened below.
+        let approval_reply = zeroclaw_channels::util::parse_approval_reply(&msg.content);
+        let session_id = sender_session_id("whatsapp", msg);
+
+        // Open the shared Channel conversation record BEFORE any async
+        // preprocessing so the captured id fences every history mutation and
+        // the prior history flows into the chat turn. Fail CLOSED on open: no
+        // model call, no fake reply, no fresh-id fallback.
+        let record = match open_webhook_channel_conversation(state, msg).await {
+            Ok(record) => record,
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "channel": msg.channel.as_str(),
+                            "error_kind": error.kind().to_string(),
+                        })),
+                    "CHANNEL_CONVERSATION_OPEN_FAILED"
+                );
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "Conversation session unavailable"})),
+                );
+            }
+        };
+
+        if let Some((token, response)) = approval_reply {
             let mut map = wa.pending_approvals().lock().await;
             if let Some(sender) = map.remove(&token) {
                 let _ = sender.send(response);
@@ -3160,32 +3630,31 @@ async fn process_whatsapp_message(
             }
         }
 
-        let session_id = sender_session_id("whatsapp", msg);
+        let msg_for_preprocess = msg.clone();
+        let turn = run_channel_webhook_turn(state, msg, &session_id, None, record, async move {
+            // Auto-save to memory (sender-scoped key, distinct from the
+            // shared conversation id).
+            if state.auto_save
+                && !zeroclaw_memory::should_skip_autosave_content(&msg_for_preprocess.content)
+            {
+                let key = whatsapp_memory_key(&msg_for_preprocess);
+                let memory_session_id = sender_session_id("whatsapp", &msg_for_preprocess);
+                let _ = state
+                    .mem
+                    .store(
+                        &key,
+                        &msg_for_preprocess.content,
+                        MemoryCategory::Conversation,
+                        Some(&memory_session_id),
+                    )
+                    .await;
+            }
+        })
+        .await;
 
-        // Auto-save to memory
-        if state.auto_save && !zeroclaw_memory::should_skip_autosave_content(&msg.content) {
-            let key = whatsapp_memory_key(msg);
-            let _ = state
-                .mem
-                .store(
-                    &key,
-                    &msg.content,
-                    MemoryCategory::Conversation,
-                    Some(&session_id),
-                )
-                .await;
-        }
-
-        match Box::pin(run_gateway_chat_with_tools(
-            state,
-            &msg.content,
-            Some(&session_id),
-            None,
-        ))
-        .await
-        {
-            Ok(GatewayChatOutcome { response, .. }) => {
-                // Send reply via WhatsApp
+        match turn {
+            ChannelWebhookTurn::StaleAck => continue,
+            ChannelWebhookTurn::Replied { response } => {
                 if let Err(e) = wa
                     .send(&SendMessage::new(response, &msg.reply_target))
                     .await
@@ -3194,33 +3663,12 @@ async fn process_whatsapp_message(
                         ERROR,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            .with_attrs(::serde_json::json!({"error": format!("{e}")})),
                         "Failed to send WhatsApp reply"
                     );
                 }
             }
-            Err(e) => {
-                let reply = if is_needs_quickstart_err(&e) {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                        "WhatsApp chat refused: gateway has no model configured; \
-                         visit /quickstart"
-                    );
-                    needs_quickstart_channel_reply()
-                } else {
-                    ::zeroclaw_log::record!(
-                        ERROR,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(
-                                ::serde_json::json!({"channel": "whatsapp", "error": format!("{}", e)})
-                            ),
-                        "LLM error"
-                    );
-                    "Sorry, I couldn't process your message right now.".to_string()
-                };
+            ChannelWebhookTurn::Failed { reply } => {
                 let _ = wa.send(&SendMessage::new(reply, &msg.reply_target)).await;
             }
         }
@@ -3386,37 +3834,59 @@ async fn process_linq_webhook(
         let session_id =
             zeroclaw_api::session_keys::sanitize_session_key(&sender_session_id(&channel_ref, msg));
 
-        // Auto-save to memory
-        if state.auto_save && !zeroclaw_memory::should_skip_autosave_content(&msg.content) {
-            let key = linq_memory_key(msg);
-            let _ = state
-                .mem
-                .store(
-                    &key,
-                    &msg.content,
-                    MemoryCategory::Conversation,
-                    Some(&session_id),
-                )
-                .await;
-        }
+        // Open the shared Channel conversation record BEFORE any async
+        // preprocessing so the captured id fences every history mutation and
+        // the prior history flows into the chat turn. Fail CLOSED on open.
+        let record = match open_webhook_channel_conversation(state, msg).await {
+            Ok(record) => record,
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "channel": msg.channel.as_str(),
+                            "error_kind": error.kind().to_string(),
+                        })),
+                    "CHANNEL_CONVERSATION_OPEN_FAILED"
+                );
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "Conversation session unavailable"})),
+                );
+            }
+        };
 
-        // Call the LLM
-        match Box::pin(run_gateway_chat_with_tools(
+        let msg_for_preprocess = msg.clone();
+        let turn = run_channel_webhook_turn(
             state,
-            &msg.content,
-            Some(&session_id),
+            msg,
+            &session_id,
             agent_override.as_deref(),
-        ))
-        .await
-        {
-            Ok(GatewayChatOutcome { response, .. }) => {
-                #[cfg(test)]
+            record,
+            async move {
+                if state.auto_save
+                    && !zeroclaw_memory::should_skip_autosave_content(&msg_for_preprocess.content)
                 {
-                    let _ = response;
+                    let key = linq_memory_key(&msg_for_preprocess);
+                    let memory_session_id = sender_session_id("linq", &msg_for_preprocess);
+                    let _ = state
+                        .mem
+                        .store(
+                            &key,
+                            &msg_for_preprocess.content,
+                            MemoryCategory::Conversation,
+                            Some(&memory_session_id),
+                        )
+                        .await;
                 }
+            },
+        )
+        .await;
 
-                // Send reply via Linq
-                #[cfg(not(test))]
+        match turn {
+            ChannelWebhookTurn::StaleAck => continue,
+            ChannelWebhookTurn::Replied { response } => {
                 if let Err(e) = linq
                     .send(&SendMessage::new(response, &msg.reply_target))
                     .await
@@ -3425,33 +3895,12 @@ async fn process_linq_webhook(
                         ERROR,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            .with_attrs(::serde_json::json!({"error": format!("{e}")})),
                         "Failed to send Linq reply"
                     );
                 }
             }
-            Err(e) => {
-                let reply = if is_needs_quickstart_err(&e) {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                        "Linq chat refused: gateway has no model configured; \
-                         visit /quickstart"
-                    );
-                    needs_quickstart_channel_reply()
-                } else {
-                    ::zeroclaw_log::record!(
-                        ERROR,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(
-                                ::serde_json::json!({"channel": "linq", "error": format!("{}", e)})
-                            ),
-                        "LLM error"
-                    );
-                    "Sorry, I couldn't process your message right now.".to_string()
-                };
+            ChannelWebhookTurn::Failed { reply } => {
                 let _ = linq.send(&SendMessage::new(reply, &msg.reply_target)).await;
             }
         }
@@ -3576,31 +4025,52 @@ async fn process_wati_webhook(
         ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"channel": "wati", "sender": msg.sender, "content": msg.content})), "inbound webhook message");
         let session_id = sender_session_id("wati", msg);
 
-        // Auto-save to memory
-        if state.auto_save && !zeroclaw_memory::should_skip_autosave_content(&msg.content) {
-            let key = wati_memory_key(msg);
-            let _ = state
-                .mem
-                .store(
-                    &key,
-                    &msg.content,
-                    MemoryCategory::Conversation,
-                    Some(&session_id),
-                )
-                .await;
-        }
+        // Open the shared Channel conversation record BEFORE any async
+        // preprocessing so the captured id fences every history mutation and
+        // the prior history flows into the chat turn. Fail CLOSED on open.
+        let record = match open_webhook_channel_conversation(state, msg).await {
+            Ok(record) => record,
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "channel": msg.channel.as_str(),
+                            "error_kind": error.kind().to_string(),
+                        })),
+                    "CHANNEL_CONVERSATION_OPEN_FAILED"
+                );
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "Conversation session unavailable"})),
+                );
+            }
+        };
 
-        // Call the LLM
-        match Box::pin(run_gateway_chat_with_tools(
-            state,
-            &msg.content,
-            Some(&session_id),
-            None,
-        ))
-        .await
-        {
-            Ok(GatewayChatOutcome { response, .. }) => {
-                // Send reply via WATI
+        let msg_for_preprocess = msg.clone();
+        let turn = run_channel_webhook_turn(state, msg, &session_id, None, record, async move {
+            if state.auto_save
+                && !zeroclaw_memory::should_skip_autosave_content(&msg_for_preprocess.content)
+            {
+                let key = wati_memory_key(&msg_for_preprocess);
+                let memory_session_id = sender_session_id("wati", &msg_for_preprocess);
+                let _ = state
+                    .mem
+                    .store(
+                        &key,
+                        &msg_for_preprocess.content,
+                        MemoryCategory::Conversation,
+                        Some(&memory_session_id),
+                    )
+                    .await;
+            }
+        })
+        .await;
+
+        match turn {
+            ChannelWebhookTurn::StaleAck => continue,
+            ChannelWebhookTurn::Replied { response } => {
                 if let Err(e) = wati
                     .send(&SendMessage::new(response, &msg.reply_target))
                     .await
@@ -3609,33 +4079,12 @@ async fn process_wati_webhook(
                         ERROR,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            .with_attrs(::serde_json::json!({"error": format!("{e}")})),
                         "Failed to send WATI reply"
                     );
                 }
             }
-            Err(e) => {
-                let reply = if is_needs_quickstart_err(&e) {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                        "WATI chat refused: gateway has no model configured; \
-                         visit /quickstart"
-                    );
-                    needs_quickstart_channel_reply()
-                } else {
-                    ::zeroclaw_log::record!(
-                        ERROR,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(
-                                ::serde_json::json!({"channel": "wati", "error": format!("{}", e)})
-                            ),
-                        "LLM error"
-                    );
-                    "Sorry, I couldn't process your message right now.".to_string()
-                };
+            ChannelWebhookTurn::Failed { reply } => {
                 let _ = wati.send(&SendMessage::new(reply, &msg.reply_target)).await;
             }
         }
@@ -3777,28 +4226,57 @@ async fn process_nextcloud_talk_webhook(
             ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"channel": "nextcloud_talk", "sender": msg.sender, "content": msg.content})), "inbound webhook message");
             let session_id = sender_session_id("nextcloud_talk", &msg);
 
-            if state.auto_save && !zeroclaw_memory::should_skip_autosave_content(&msg.content) {
-                let key = nextcloud_talk_memory_key(&msg);
-                let _ = state
-                    .mem
-                    .store(
-                        &key,
-                        &msg.content,
-                        MemoryCategory::Conversation,
-                        Some(&session_id),
-                    )
-                    .await;
-            }
+            // Open the shared Channel conversation record BEFORE any async
+            // preprocessing so the captured id fences every history mutation and
+            // the prior history flows into the chat turn. This runs in the
+            // fast-ack background task, so on open failure we only log and bail:
+            // the outer handler already returned HTTP 200 and we must not call
+            // the model or send a fake reply.
+            let record = match open_webhook_channel_conversation(&state, &msg).await {
+                Ok(record) => record,
+                Err(error) => {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "channel": msg.channel.as_str(),
+                                "error_kind": error.kind().to_string(),
+                            })),
+                        "CHANNEL_CONVERSATION_OPEN_FAILED"
+                    );
+                    return;
+                }
+            };
 
-            match Box::pin(run_gateway_chat_with_tools(
-                &state,
-                &msg.content,
-                Some(&session_id),
-                None,
-            ))
-            .await
-            {
-                Ok(GatewayChatOutcome { response, .. }) => {
+            let msg_for_preprocess = msg.clone();
+            let auto_save = state.auto_save;
+            let mem = Arc::clone(&state.mem);
+            let turn =
+                run_channel_webhook_turn(&state, &msg, &session_id, None, record, async move {
+                    if auto_save
+                        && !zeroclaw_memory::should_skip_autosave_content(
+                            &msg_for_preprocess.content,
+                        )
+                    {
+                        let key = nextcloud_talk_memory_key(&msg_for_preprocess);
+                        let memory_session_id =
+                            sender_session_id("nextcloud_talk", &msg_for_preprocess);
+                        let _ = mem
+                            .store(
+                                &key,
+                                &msg_for_preprocess.content,
+                                MemoryCategory::Conversation,
+                                Some(&memory_session_id),
+                            )
+                            .await;
+                    }
+                })
+                .await;
+
+            match turn {
+                ChannelWebhookTurn::StaleAck => (),
+                ChannelWebhookTurn::Replied { response } => {
                     if let Err(e) = nextcloud_talk
                         .send(&SendMessage::new(response, &msg.reply_target))
                         .await
@@ -3810,28 +4288,12 @@ async fn process_nextcloud_talk_webhook(
                                 ::zeroclaw_log::Action::Fail
                             )
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            .with_attrs(::serde_json::json!({"error": format!("{e}")})),
                             "Failed to send Nextcloud Talk reply"
                         );
                     }
                 }
-                Err(e) => {
-                    let reply = if is_needs_quickstart_err(&e) {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                            "Nextcloud Talk chat refused: gateway has no model configured; \
-                             visit /quickstart"
-                        );
-                        needs_quickstart_channel_reply()
-                    } else {
-                        ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"channel": "nextcloud_talk", "error": format!("{}", e)})), "LLM error");
-                        "Sorry, I couldn't process your message right now.".to_string()
-                    };
+                ChannelWebhookTurn::Failed { reply } => {
                     let _ = nextcloud_talk
                         .send(&SendMessage::new(reply, &msg.reply_target))
                         .await;
@@ -4628,6 +5090,9 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
@@ -5033,6 +5498,7 @@ mod tests {
                 None,
                 None,
                 None,
+                Arc::new(zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None)),
             )
             .await
         });
@@ -5101,6 +5567,7 @@ mod tests {
                 None,
                 None,
                 None,
+                Arc::new(zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None)),
             )
             .await
         });
@@ -5154,6 +5621,7 @@ mod tests {
                 None,
                 None,
                 None,
+                Arc::new(zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None)),
             )
             .await
         });
@@ -5219,6 +5687,7 @@ mod tests {
                 None,
                 None,
                 Some(readiness),
+                Arc::new(zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None)),
             )
             .await
         });
@@ -5288,6 +5757,7 @@ mod tests {
             None,
             None,
             Some(readiness),
+            Arc::new(zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None)),
         )
         .await;
 
@@ -5351,6 +5821,9 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
@@ -5440,6 +5913,9 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
@@ -6116,6 +6592,9 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
@@ -6223,6 +6702,9 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
@@ -6345,6 +6827,9 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
@@ -6447,6 +6932,9 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
@@ -6568,6 +7056,9 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
@@ -6655,6 +7146,9 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
@@ -6747,6 +7241,9 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
@@ -6846,6 +7343,9 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
@@ -6941,6 +7441,9 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
@@ -7105,6 +7608,9 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
@@ -7951,6 +8457,9 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
@@ -8039,6 +8548,9 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
@@ -8362,6 +8874,9 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
@@ -8653,6 +9168,1230 @@ mod tests {
              persist; have {:?}",
             state.pairing.tokens()
         );
+    }
+
+    // ── cross-turn conversation attribution (Task 5) ───────────────────────
+    //
+    // The runtime already proves `Agent::set_conversation_id` threads to every
+    // attributed observer event. These tests guard the GATEWAY's choice of
+    // which value owns that slot at each entry point: WS uses the raw protocol
+    // session id (not the `gw_` storage key, not the sanitized memory id a
+    // connect frame may override); per-request HTTP mints a fresh UUID v4 that
+    // is never derived from `X-Session-Id`, a sender key, or a body.
+
+    /// Extract the caller-owned `conversation_id` from any of the nine
+    /// turn-attributed observer events. Returns `None` for events outside
+    /// that set so callers can filter to the attributed subset. Mirrors the
+    /// runtime's test helper.
+    fn attributed_conversation_id(
+        event: &zeroclaw_runtime::observability::ObserverEvent,
+    ) -> Option<Option<&str>> {
+        use zeroclaw_runtime::observability::ObserverEvent;
+        match event {
+            ObserverEvent::AgentStart {
+                conversation_id, ..
+            }
+            | ObserverEvent::AgentEnd {
+                conversation_id, ..
+            }
+            | ObserverEvent::LlmRequest {
+                conversation_id, ..
+            }
+            | ObserverEvent::LlmResponse {
+                conversation_id, ..
+            }
+            | ObserverEvent::ToolCallStart {
+                conversation_id, ..
+            }
+            | ObserverEvent::ToolCall {
+                conversation_id, ..
+            }
+            | ObserverEvent::MemoryRecall {
+                conversation_id, ..
+            }
+            | ObserverEvent::MemoryStore {
+                conversation_id, ..
+            }
+            | ObserverEvent::RagRetrieve {
+                conversation_id, ..
+            } => Some(conversation_id.as_deref()),
+            _ => None,
+        }
+    }
+
+    fn attributed_turn_id(event: &zeroclaw_runtime::observability::ObserverEvent) -> Option<&str> {
+        use zeroclaw_runtime::observability::ObserverEvent;
+        match event {
+            ObserverEvent::AgentStart { turn_id, .. }
+            | ObserverEvent::AgentEnd { turn_id, .. }
+            | ObserverEvent::LlmRequest { turn_id, .. }
+            | ObserverEvent::LlmResponse { turn_id, .. }
+            | ObserverEvent::ToolCallStart { turn_id, .. }
+            | ObserverEvent::ToolCall { turn_id, .. }
+            | ObserverEvent::MemoryRecall { turn_id, .. }
+            | ObserverEvent::MemoryStore { turn_id, .. }
+            | ObserverEvent::RagRetrieve { turn_id, .. } => turn_id.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Minimal agent for the WS contract tests. Built WITHOUT conversation or
+    /// memory-session ids so the test can exercise the same post-build mutator
+    /// sequence `handle_socket` uses (`set_channel_name` / `set_memory_session_id`
+    /// / `set_conversation_id`). The mock model provider returns `"ok"` via the
+    /// default `chat()` -> `chat_with_system` chain, so a no-tool turn completes
+    /// in one LLM call.
+    fn build_minimal_ws_agent(capturing: Arc<CapturingObserver>) -> zeroclaw_runtime::agent::Agent {
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let model_provider: Box<dyn ModelProvider> = Box::new(MockModelProvider::default());
+        let observer: Arc<dyn zeroclaw_runtime::observability::Observer> = capturing;
+        zeroclaw_runtime::agent::Agent::builder()
+            .model_provider(model_provider)
+            .tools(vec![])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(
+                zeroclaw_runtime::agent::dispatcher::NativeToolDispatcher,
+            ))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .agent_alias("ws-test-agent".into())
+            .build()
+            .expect("agent builder should succeed with valid config")
+    }
+
+    #[test]
+    fn mint_request_conversation_id_is_fresh_uuid_v4() {
+        let a = mint_request_conversation_id();
+        let b = mint_request_conversation_id();
+        assert_ne!(a, b, "each request must mint a distinct conversation id");
+        let parsed_a =
+            uuid::Uuid::parse_str(&a).expect("conversation id must be a valid UUID: {a}");
+        let parsed_b =
+            uuid::Uuid::parse_str(&b).expect("conversation id must be a valid UUID: {b}");
+        assert_eq!(
+            parsed_a.get_version(),
+            Some(uuid::Version::Random),
+            "conversation id must be UUID v4: {a}"
+        );
+        assert_eq!(
+            parsed_b.get_version(),
+            Some(uuid::Version::Random),
+            "conversation id must be UUID v4: {b}"
+        );
+        // Must NOT carry the storage/channel prefixes or resemble a
+        // sender/thread-derived key - those feed the separate memory-session id.
+        for id in [a.as_str(), b.as_str()] {
+            assert!(!id.starts_with("gw_"), "gw_ storage prefix leaked: {id}");
+            assert!(!id.starts_with("a2a_"), "a2a_ channel prefix leaked: {id}");
+            assert!(!id.contains(':'), "sender/thread key shape leaked: {id}");
+        }
+    }
+
+    /// Build a `ChannelMessage` with sender-scoped history and the given
+    /// routing fields, so tests can assert on `conversation_history_key`
+    /// isolation without constructing a real channel payload.
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    fn channel_message(
+        channel: &str,
+        alias: &str,
+        sender: &str,
+        reply_target: &str,
+        thread_ts: Option<&str>,
+    ) -> zeroclaw_api::channel::ChannelMessage {
+        zeroclaw_api::channel::ChannelMessage {
+            id: "m1".into(),
+            sender: sender.into(),
+            reply_target: reply_target.into(),
+            content: "hi".into(),
+            channel: channel.into(),
+            channel_alias: Some(alias.into()),
+            timestamp: 1,
+            thread_ts: thread_ts.map(str::to_string),
+            interruption_scope_id: None,
+            attachments: vec![],
+            subject: None,
+            internal_sop_event: None,
+            passive_context: false,
+            explicitly_addressed: false,
+            conversation_scope: zeroclaw_api::channel::ChannelConversationScope::Sender,
+        }
+    }
+
+    /// Build an `AppState` whose `channel_sessions` is the given shared state,
+    /// so the webhook resolver helper is observable in isolation.
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    fn test_app_state_with_channel_sessions(
+        channel_sessions: zeroclaw_infra::channel_conversation::ChannelConversationStore,
+    ) -> AppState {
+        let mut state = webhook_baseline_state();
+        state.channel_sessions = Arc::new(channel_sessions);
+        state
+    }
+
+    /// Minimal `SessionBackend` whose `open_conversation` always fails, so a
+    /// webhook's `conversation_history_key` routes through the fail-closed
+    /// open-error arm. `open_calls` lets the Nextcloud fast-ack test observe
+    /// that the spawned task actually reached the open before asserting the
+    /// model was never invoked.
+    #[cfg(any(
+        feature = "channel-whatsapp-cloud",
+        feature = "channel-linq",
+        feature = "channel-wati",
+        feature = "channel-nextcloud"
+    ))]
+    #[derive(Default)]
+    struct FailingChannelSessionBackend {
+        open_calls: AtomicUsize,
+    }
+
+    #[cfg(any(
+        feature = "channel-whatsapp-cloud",
+        feature = "channel-linq",
+        feature = "channel-wati",
+        feature = "channel-nextcloud"
+    ))]
+    impl SessionBackend for FailingChannelSessionBackend {
+        fn load(&self, _: &str) -> Vec<zeroclaw_api::model_provider::ChatMessage> {
+            Vec::new()
+        }
+        fn append(
+            &self,
+            _: &str,
+            _: &zeroclaw_api::model_provider::ChatMessage,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn remove_last(&self, _: &str) -> std::io::Result<bool> {
+            Ok(false)
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn open_conversation(
+            &self,
+            _: &str,
+        ) -> std::io::Result<zeroclaw_infra::session_backend::ChannelConversationRecord> {
+            self.open_calls.fetch_add(1, Ordering::SeqCst);
+            Err(std::io::Error::other(
+                "injected channel conversation open failure",
+            ))
+        }
+        fn resolve_or_create_conversation_id(&self, _: &str) -> std::io::Result<String> {
+            Err(std::io::Error::other(
+                "injected channel session resolve failure",
+            ))
+        }
+        fn clear_and_rotate_conversation(&self, _: &str) -> std::io::Result<String> {
+            Err(std::io::Error::other(
+                "injected channel session rotate failure",
+            ))
+        }
+        // This mock exists to inject a resolve failure; the conditional writers
+        // are unreachable once resolve fails, so a fixed `Applied` is a
+        // compile-only placeholder that no test asserts against.
+        fn append_if_conversation_matches(
+            &self,
+            _: &str,
+            _: &str,
+            _: &zeroclaw_api::model_provider::ChatMessage,
+        ) -> std::io::Result<zeroclaw_infra::session_backend::ConditionalSessionWrite> {
+            Ok(zeroclaw_infra::session_backend::ConditionalSessionWrite::Applied)
+        }
+        fn remove_last_if_conversation_matches(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> std::io::Result<zeroclaw_infra::session_backend::ConditionalSessionWrite> {
+            Ok(zeroclaw_infra::session_backend::ConditionalSessionWrite::Applied)
+        }
+        fn update_last_if_conversation_matches(
+            &self,
+            _: &str,
+            _: &str,
+            _: &zeroclaw_api::model_provider::ChatMessage,
+        ) -> std::io::Result<zeroclaw_infra::session_backend::ConditionalSessionWrite> {
+            Ok(zeroclaw_infra::session_backend::ConditionalSessionWrite::Applied)
+        }
+    }
+
+    /// A Channel webhook whose `conversation_history_key` routes through a
+    /// failing session backend must fail CLOSED: the sync WhatsApp handler
+    /// returns HTTP 500 with the `Conversation session unavailable` body and
+    /// never reaches the model.
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    #[tokio::test]
+    async fn webhook_channel_conversation_resolve_failure_whatsapp_returns_500() {
+        let mut state = test_app_state_with_channel_sessions(
+            zeroclaw_infra::channel_conversation::ChannelConversationStore::new(Some(Arc::new(
+                FailingChannelSessionBackend::default(),
+            )
+                as Arc<dyn SessionBackend>)),
+        );
+        // An allow-any peer resolver is required so the payload actually parses
+        // to an inbound message (and reaches the resolve) instead of being
+        // dropped by the sender allowlist.
+        let allow_any: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
+            Arc::new(|| vec!["*".to_string()]);
+        let wa = Arc::new(WhatsAppChannel::new(
+            "access-token".into(),
+            "phone-number-id".into(),
+            "verify-token".into(),
+            "work".to_string(),
+            allow_any,
+        ));
+        state.whatsapp = HashMap::from([("work".to_string(), wa)]);
+        state.whatsapp_app_secret =
+            HashMap::from([("work".to_string(), Arc::<str>::from("app-secret"))]);
+
+        // Payload parses to exactly one inbound message so the handler reaches
+        // the conversation-id resolve instead of early-acking with 200.
+        let body = br#"{"entry":[{"changes":[{"value":{"messages":[{"from":"+15551234567","text":{"body":"Hello"}}]}}]}]}"#;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Hub-Signature-256",
+            HeaderValue::from_str(&whatsapp_signature("app-secret", body)).unwrap(),
+        );
+
+        let response = Box::pin(handle_whatsapp_message_alias(
+            State(state),
+            Path("work".to_string()),
+            headers,
+            Bytes::from_static(body),
+        ))
+        .await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("whatsapp webhook response body")
+            .to_bytes();
+        let body_json: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("whatsapp webhook response is JSON");
+        assert_eq!(
+            body_json,
+            serde_json::json!({"error": "Conversation session unavailable"}),
+            "sync webhook resolve failure must return the fail-closed body"
+        );
+    }
+
+    /// The Nextcloud Talk webhook fast-acks (HTTP 200) and processes each
+    /// message in a detached background task. When the conversation-id resolve
+    /// fails there, the task must log + bail WITHOUT invoking the model or
+    /// sending a fake reply - the outer handler already returned 200.
+    #[cfg(feature = "channel-nextcloud")]
+    #[tokio::test]
+    async fn webhook_channel_conversation_resolve_failure_nextcloud_fast_acks_without_model() {
+        let provider_impl = Arc::new(MockModelProvider::default());
+        let backend = Arc::new(FailingChannelSessionBackend::default());
+
+        // Obviously-fake placeholder, never a real credential.
+        let secret = "fake-nextcloud-webhook-secret-not-real";
+        let random = "0123456789abcdef0123456789abcdef";
+        let channel = Arc::new(NextcloudTalkChannel::new(
+            "https://cloud.example.com".into(),
+            Some(secret.to_string()),
+            String::new(),
+            "default",
+            Arc::new(|| vec!["*".to_string()]),
+        ));
+        let body = r#"{"type":"message","object":{"token":"room-token"},"actor":{"id":"user_a","name":"User A"},"message":{"actorType":"users","actorId":"user_a","message":"hello"}}"#;
+        let signature = compute_nextcloud_signature_hex(secret, random, body);
+
+        let mut state = webhook_baseline_state();
+        state.model_provider = provider_impl.clone();
+        state.nextcloud_talk = HashMap::from([("default".to_string(), channel)]);
+        state.nextcloud_talk_webhook_secret =
+            HashMap::from([("default".to_string(), Arc::<str>::from(secret))]);
+        state.channel_sessions = Arc::new(
+            zeroclaw_infra::channel_conversation::ChannelConversationStore::new(Some(
+                backend.clone() as Arc<dyn SessionBackend>,
+            )),
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Nextcloud-Talk-Random",
+            HeaderValue::from_str(random).unwrap(),
+        );
+        headers.insert(
+            "X-Nextcloud-Talk-Signature",
+            HeaderValue::from_str(&signature).unwrap(),
+        );
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            Box::pin(handle_nextcloud_talk_webhook(
+                State(state),
+                headers,
+                Bytes::from(body),
+            )),
+        )
+        .await
+        .expect("nextcloud webhook must fast-ack within 2s")
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Wait for the spawned fast-ack task to reach the (failing) open so
+        // "zero model calls" is a meaningful assertion rather than a race on
+        // the detached task not having started yet.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while backend.open_calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("spawned task must attempt the conversation open within 2s");
+        assert_eq!(
+            provider_impl.calls.load(Ordering::SeqCst),
+            0,
+            "model provider must not be invoked when the open fails"
+        );
+    }
+
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    #[test]
+    fn webhook_channel_conversation_resolver_reuses_id_and_isolates_sender_and_thread() {
+        let state = test_app_state_with_channel_sessions(
+            zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+        );
+        let same_a = channel_message("whatsapp", "main", "alice@example.test", "room", None);
+        let same_b = channel_message("whatsapp", "main", "alice@example.test", "room", None);
+        let other_sender = channel_message("whatsapp", "main", "token-shaped-bob", "room", None);
+        let other_thread = channel_message(
+            "whatsapp",
+            "main",
+            "alice@example.test",
+            "room",
+            Some("/private/thread/token"),
+        );
+
+        let a = resolve_webhook_channel_conversation_id(&state, &same_a).unwrap();
+        let b = resolve_webhook_channel_conversation_id(&state, &same_b).unwrap();
+        let c = resolve_webhook_channel_conversation_id(&state, &other_sender).unwrap();
+        let d = resolve_webhook_channel_conversation_id(&state, &other_thread).unwrap();
+
+        assert_eq!(a, b, "same history key must reuse one conversation id");
+        assert_ne!(a, c, "different sender must isolate the conversation id");
+        assert_ne!(a, d, "different thread must isolate the conversation id");
+        for id in [&a, &b, &c, &d] {
+            assert_eq!(
+                uuid::Uuid::parse_str(id).unwrap().get_version(),
+                Some(uuid::Version::Random),
+                "conversation id must be a UUID v4: {id}"
+            );
+            assert!(!id.contains("example.test"), "sender leaked into id: {id}");
+            assert!(
+                !id.contains("token"),
+                "thread/sender token leaked into id: {id}"
+            );
+            assert!(!id.contains("/private"), "thread path leaked into id: {id}");
+        }
+    }
+
+    /// The four Channel webhook parsers must produce `ChannelMessage`s whose
+    /// `conversation_history_key` flows through the shared resolver. Two parses
+    /// of the same payload share one key, so they must reuse one id (not mint a
+    /// fresh UUID per call).
+    #[cfg(all(
+        feature = "channel-whatsapp-cloud",
+        feature = "channel-linq",
+        feature = "channel-wati",
+        feature = "channel-nextcloud"
+    ))]
+    #[test]
+    fn webhook_channel_conversation_table_reuses_id_per_history_key() {
+        let state = test_app_state_with_channel_sessions(
+            zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+        );
+        let allow_any: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
+            Arc::new(|| vec!["*".to_string()]);
+        let mut pairs: Vec<(
+            zeroclaw_api::channel::ChannelMessage,
+            zeroclaw_api::channel::ChannelMessage,
+        )> = Vec::new();
+
+        let wa = WhatsAppChannel::new(
+            "access-token".into(),
+            "phone-number-id".into(),
+            "verify-token".into(),
+            "main".to_string(),
+            allow_any.clone(),
+        );
+        let wa_payload = serde_json::json!({
+            "entry": [{"changes": [{"value": {"messages": [
+                {"from": "+15551234567", "text": {"body": "Hello"}}
+            ]}}]}]
+        });
+        let wa_first = wa.parse_webhook_payload(&wa_payload);
+        let wa_second = wa.parse_webhook_payload(&wa_payload);
+        assert_eq!(
+            wa_first.len(),
+            1,
+            "whatsapp payload must parse to one message"
+        );
+        pairs.push((wa_first[0].clone(), wa_second[0].clone()));
+
+        let linq = LinqChannel::new(
+            "test-token".into(),
+            "+15550000000".into(),
+            "main",
+            allow_any.clone(),
+        );
+        let linq_payload = serde_json::json!({
+            "event_type": "message.received",
+            "data": {
+                "from": "+15551234567",
+                "message": {"parts": [{"type": "text", "value": "hello"}]}
+            }
+        });
+        let linq_first = linq.parse_webhook_payload(&linq_payload);
+        let linq_second = linq.parse_webhook_payload(&linq_payload);
+        assert_eq!(
+            linq_first.len(),
+            1,
+            "linq payload must parse to one message"
+        );
+        pairs.push((linq_first[0].clone(), linq_second[0].clone()));
+
+        let wati = WatiChannel::new(
+            "token".into(),
+            "https://wati.test".into(),
+            None,
+            "main",
+            allow_any.clone(),
+        );
+        let wati_payload = serde_json::json!({"text": "hello", "waId": "+15551234567"});
+        let wati_first = wati.parse_webhook_payload(&wati_payload);
+        let wati_second = wati.parse_webhook_payload(&wati_payload);
+        assert_eq!(
+            wati_first.len(),
+            1,
+            "wati payload must parse to one message"
+        );
+        pairs.push((wati_first[0].clone(), wati_second[0].clone()));
+
+        let nextcloud = NextcloudTalkChannel::new(
+            "https://cloud.example.com".into(),
+            None,
+            String::new(),
+            "main",
+            allow_any,
+        );
+        let nc_payload = serde_json::json!({
+            "type": "message",
+            "object": {"token": "room-token"},
+            "message": {"actorType": "users", "actorId": "user_a", "message": "hello"}
+        });
+        let nc_first = nextcloud.parse_webhook_payload(&nc_payload);
+        let nc_second = nextcloud.parse_webhook_payload(&nc_payload);
+        assert_eq!(
+            nc_first.len(),
+            1,
+            "nextcloud talk payload must parse to one message"
+        );
+        pairs.push((nc_first[0].clone(), nc_second[0].clone()));
+
+        for (first, second) in pairs {
+            assert_eq!(
+                resolve_webhook_channel_conversation_id(&state, &first).unwrap(),
+                resolve_webhook_channel_conversation_id(&state, &second).unwrap(),
+                "two parses of the same payload must reuse one conversation id"
+            );
+        }
+    }
+
+    #[cfg(all(
+        feature = "channel-whatsapp-cloud",
+        feature = "channel-linq",
+        feature = "channel-wati",
+        feature = "channel-nextcloud"
+    ))]
+    fn contract_channel_messages() -> Vec<(&'static str, ChannelMessage, ChannelMessage)> {
+        let allow_any: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
+            Arc::new(|| vec!["*".to_string()]);
+        let mut messages = Vec::new();
+
+        let whatsapp = WhatsAppChannel::new(
+            "access-token".into(),
+            "phone-number-id".into(),
+            "verify-token".into(),
+            "main".to_string(),
+            allow_any.clone(),
+        );
+        let payload = serde_json::json!({
+            "entry": [{"changes": [{"value": {"messages": [
+                {"from": "+15551234567", "text": {"body": "hello"}}
+            ]}}]}]
+        });
+        let first = whatsapp.parse_webhook_payload(&payload);
+        let second = whatsapp.parse_webhook_payload(&payload);
+        messages.push(("whatsapp", first[0].clone(), second[0].clone()));
+
+        let linq = LinqChannel::new(
+            "test-token".into(),
+            "+15550000000".into(),
+            "main",
+            allow_any.clone(),
+        );
+        let payload = serde_json::json!({
+            "event_type": "message.received",
+            "data": {
+                "from": "+15551234567",
+                "message": {"parts": [{"type": "text", "value": "hello"}]}
+            }
+        });
+        let first = linq.parse_webhook_payload(&payload);
+        let second = linq.parse_webhook_payload(&payload);
+        messages.push(("linq", first[0].clone(), second[0].clone()));
+
+        let wati = WatiChannel::new(
+            "token".into(),
+            "https://wati.test".into(),
+            None,
+            "main",
+            allow_any.clone(),
+        );
+        let payload = serde_json::json!({"text": "hello", "waId": "+15551234567"});
+        let first = wati.parse_webhook_payload(&payload);
+        let second = wati.parse_webhook_payload(&payload);
+        messages.push(("wati", first[0].clone(), second[0].clone()));
+
+        let nextcloud = NextcloudTalkChannel::new(
+            "https://cloud.example.com".into(),
+            None,
+            String::new(),
+            "main",
+            allow_any,
+        );
+        let payload = serde_json::json!({
+            "type": "message",
+            "object": {"token": "room-token"},
+            "message": {"actorType": "users", "actorId": "user_a", "message": "hello"}
+        });
+        let first = nextcloud.parse_webhook_payload(&payload);
+        let second = nextcloud.parse_webhook_payload(&payload);
+        messages.push(("nextcloud_talk", first[0].clone(), second[0].clone()));
+        messages
+    }
+
+    #[cfg(all(
+        feature = "channel-whatsapp-cloud",
+        feature = "channel-linq",
+        feature = "channel-wati",
+        feature = "channel-nextcloud"
+    ))]
+    struct FailingMutationBackend {
+        conversation_id: String,
+    }
+
+    #[cfg(all(
+        feature = "channel-whatsapp-cloud",
+        feature = "channel-linq",
+        feature = "channel-wati",
+        feature = "channel-nextcloud"
+    ))]
+    impl SessionBackend for FailingMutationBackend {
+        fn load(&self, _: &str) -> Vec<zeroclaw_api::model_provider::ChatMessage> {
+            Vec::new()
+        }
+        fn append(
+            &self,
+            _: &str,
+            _: &zeroclaw_api::model_provider::ChatMessage,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn remove_last(&self, _: &str) -> std::io::Result<bool> {
+            Ok(false)
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn open_conversation(
+            &self,
+            _: &str,
+        ) -> std::io::Result<zeroclaw_infra::ChannelConversationRecord> {
+            Ok(zeroclaw_infra::ChannelConversationRecord {
+                conversation_id: self.conversation_id.clone(),
+                history: Vec::new(),
+            })
+        }
+        fn current_conversation_id(&self, _: &str) -> std::io::Result<Option<String>> {
+            Ok(Some(self.conversation_id.clone()))
+        }
+        fn mutate_conversation_if_current(
+            &self,
+            _: &str,
+            _: &str,
+            _: zeroclaw_infra::SessionMutation<'_>,
+        ) -> std::io::Result<zeroclaw_infra::ConditionalSessionWrite> {
+            Err(std::io::Error::other("injected mutation failure"))
+        }
+    }
+
+    #[cfg(all(
+        feature = "channel-whatsapp-cloud",
+        feature = "channel-linq",
+        feature = "channel-wati",
+        feature = "channel-nextcloud"
+    ))]
+    struct ContractHistoryProvider {
+        calls: AtomicUsize,
+        histories: Mutex<Vec<Vec<zeroclaw_api::model_provider::ChatMessage>>>,
+        block_on_call: usize,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[cfg(all(
+        feature = "channel-whatsapp-cloud",
+        feature = "channel-linq",
+        feature = "channel-wati",
+        feature = "channel-nextcloud"
+    ))]
+    #[async_trait]
+    impl ModelProvider for ContractHistoryProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.chat_with_history(
+                &[zeroclaw_api::model_provider::ChatMessage::user(message)],
+                "test-model",
+                None,
+            )
+            .await
+        }
+
+        async fn chat_with_history(
+            &self,
+            messages: &[zeroclaw_api::model_provider::ChatMessage],
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.histories.lock().push(messages.to_vec());
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call == self.block_on_call {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            Ok("ok".into())
+        }
+    }
+
+    #[cfg(all(
+        feature = "channel-whatsapp-cloud",
+        feature = "channel-linq",
+        feature = "channel-wati",
+        feature = "channel-nextcloud"
+    ))]
+    impl ::zeroclaw_api::attribution::Attributable for ContractHistoryProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "contract-history"
+        }
+    }
+
+    /// The four Channel webhooks share one conversation lifecycle
+    /// (`run_channel_webhook_turn`): open the record before preprocessing,
+    /// fence with `is_current`, persist the user turn, run the model, fence
+    /// again, persist the assistant turn. This parametrized contract asserts
+    /// that one helper drives all four channels to the same end state: the
+    /// shared store record ends with a user + assistant pair, and a rotated
+    /// record short-circuits the model (`StaleAck`).
+    #[cfg(all(
+        feature = "channel-whatsapp-cloud",
+        feature = "channel-linq",
+        feature = "channel-wati",
+        feature = "channel-nextcloud"
+    ))]
+    #[tokio::test]
+    async fn channel_webhook_conversation_contract() {
+        for (channel, first, second) in contract_channel_messages() {
+            let provider = Arc::new(ContractHistoryProvider {
+                calls: AtomicUsize::new(0),
+                histories: Mutex::new(Vec::new()),
+                block_on_call: 3,
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+            });
+            let store = zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None);
+            let mut state = test_app_state_with_channel_sessions(store);
+            state.model_provider = provider.clone();
+            let history_key = zeroclaw_channels::orchestrator::conversation_history_key(&first);
+
+            let first_record = open_webhook_channel_conversation(&state, &first)
+                .await
+                .expect("first adapter message opens");
+            let conversation_id = first_record.conversation_id.clone();
+            let first_session = sender_session_id(channel, &first);
+            assert!(matches!(
+                run_channel_webhook_turn(
+                    &state,
+                    &first,
+                    &first_session,
+                    None,
+                    first_record,
+                    async {}
+                )
+                .await,
+                ChannelWebhookTurn::Replied { .. }
+            ));
+
+            let second_record = open_webhook_channel_conversation(&state, &second)
+                .await
+                .expect("second adapter message reopens");
+            assert_eq!(second_record.conversation_id, conversation_id);
+            let second_session = sender_session_id(channel, &second);
+            assert!(matches!(
+                run_channel_webhook_turn(
+                    &state,
+                    &second,
+                    &second_session,
+                    None,
+                    second_record,
+                    async {}
+                )
+                .await,
+                ChannelWebhookTurn::Replied { .. }
+            ));
+
+            {
+                let histories = provider.histories.lock();
+                assert_eq!(histories.len(), 2, "two model calls for {channel}");
+                assert_eq!(
+                    histories[1]
+                        .iter()
+                        .map(|message| message.role.as_str())
+                        .collect::<Vec<_>>(),
+                    vec!["user", "assistant", "user"],
+                    "second {channel} turn must receive prior history"
+                );
+            }
+
+            let state_for_turn = state.clone();
+            let third = second.clone();
+            let third_record = open_webhook_channel_conversation(&state, &third)
+                .await
+                .expect("third adapter message opens");
+            let third_session = sender_session_id(channel, &third);
+            let blocked = zeroclaw_spawn::spawn!(async move {
+                run_channel_webhook_turn(
+                    &state_for_turn,
+                    &third,
+                    &third_session,
+                    None,
+                    third_record,
+                    async {},
+                )
+                .await
+            });
+            provider.entered.notified().await;
+            assert!(state.channel_sessions.delete(&history_key).await.unwrap());
+            provider.release.notify_one();
+            assert!(matches!(
+                blocked.await.unwrap(),
+                ChannelWebhookTurn::StaleAck
+            ));
+            assert!(
+                state
+                    .channel_sessions
+                    .existing_record(&history_key)
+                    .await
+                    .is_none(),
+                "delete during blocked {channel} provider must leave no stale writes"
+            );
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+        }
+    }
+
+    #[cfg(all(
+        feature = "channel-whatsapp-cloud",
+        feature = "channel-linq",
+        feature = "channel-wati",
+        feature = "channel-nextcloud"
+    ))]
+    #[tokio::test]
+    async fn channel_webhook_persists_generated_tool_history_in_order_and_stops_stale() {
+        let state = test_app_state_with_channel_sessions(
+            zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+        );
+        let (_, message, _) = contract_channel_messages().remove(0);
+        let history_key = zeroclaw_channels::orchestrator::conversation_history_key(&message);
+        let record = state.channel_sessions.open(&history_key).await.unwrap();
+        let generated = vec![
+            zeroclaw_api::model_provider::ChatMessage::assistant("tool-call"),
+            zeroclaw_api::model_provider::ChatMessage::tool("tool-result"),
+            zeroclaw_api::model_provider::ChatMessage::assistant("final"),
+        ];
+        assert!(
+            persist_generated_channel_history(
+                &state,
+                &history_key,
+                &record.conversation_id,
+                &generated,
+            )
+            .await
+        );
+        let stored = state
+            .channel_sessions
+            .existing_record(&history_key)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored
+                .history
+                .iter()
+                .map(|message| (message.role.as_str(), message.content.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("assistant", "tool-call"),
+                ("tool", "tool-result"),
+                ("assistant", "final"),
+            ]
+        );
+
+        state.channel_sessions.delete(&history_key).await.unwrap();
+        assert!(
+            !persist_generated_channel_history(
+                &state,
+                &history_key,
+                &record.conversation_id,
+                &[zeroclaw_api::model_provider::ChatMessage::tool("stale")],
+            )
+            .await
+        );
+        assert!(
+            state
+                .channel_sessions
+                .existing_record(&history_key)
+                .await
+                .is_none(),
+            "stale mutation must not recreate the deleted record"
+        );
+    }
+
+    #[cfg(all(
+        feature = "channel-whatsapp-cloud",
+        feature = "channel-linq",
+        feature = "channel-wati",
+        feature = "channel-nextcloud"
+    ))]
+    #[tokio::test]
+    async fn channel_webhook_user_persist_error_aborts_before_provider() {
+        let provider = Arc::new(MockModelProvider::default());
+        let backend: Arc<dyn SessionBackend> = Arc::new(FailingMutationBackend {
+            conversation_id: uuid::Uuid::new_v4().to_string(),
+        });
+        let mut state = test_app_state_with_channel_sessions(
+            zeroclaw_infra::channel_conversation::ChannelConversationStore::new(Some(backend)),
+        );
+        state.model_provider = provider.clone();
+        let (_, message, _) = contract_channel_messages().remove(0);
+        let record = open_webhook_channel_conversation(&state, &message)
+            .await
+            .expect("open succeeds before injected mutation failure");
+        let session_id = sender_session_id("whatsapp", &message);
+        assert!(matches!(
+            run_channel_webhook_turn(&state, &message, &session_id, None, record, async {}).await,
+            ChannelWebhookTurn::StaleAck
+        ));
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            0,
+            "provider must not run after user persistence fails"
+        );
+    }
+
+    /// When the record is rotated (`/new`) between `open` and the post-
+    /// preprocess fence, `run_channel_webhook_turn` must short-circuit with
+    /// `StaleAck` and never call the model or persist the assistant turn.
+    #[cfg(all(
+        feature = "channel-whatsapp-cloud",
+        feature = "channel-linq",
+        feature = "channel-wati",
+        feature = "channel-nextcloud"
+    ))]
+    #[tokio::test]
+    async fn channel_webhook_turn_stale_record_acks_without_model() {
+        let provider_impl = Arc::new(MockModelProvider::default());
+        let store = zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None);
+        let mut state = test_app_state_with_channel_sessions(store);
+        state.model_provider = provider_impl.clone();
+        let (_, msg, _) = contract_channel_messages().remove(0);
+
+        let record = open_webhook_channel_conversation(&state, &msg)
+            .await
+            .expect("open must succeed");
+        // Delete AFTER open so the post-preprocess fence sees a stale turn.
+        state
+            .channel_sessions
+            .delete(&zeroclaw_channels::orchestrator::conversation_history_key(
+                &msg,
+            ))
+            .await
+            .expect("delete must succeed");
+
+        let session_id = sender_session_id("whatsapp", &msg);
+        let turn =
+            run_channel_webhook_turn(&state, &msg, &session_id, None, record, async {}).await;
+        assert!(
+            matches!(turn, ChannelWebhookTurn::StaleAck),
+            "a deleted record must short-circuit with StaleAck"
+        );
+        assert_eq!(
+            provider_impl.calls.load(Ordering::SeqCst),
+            0,
+            "model must not be invoked when the record is stale"
+        );
+    }
+
+    /// WS sets the conversation id to the RAW protocol session id and reuses it
+    /// across turns. The `gw_`-prefixed storage key and the connect-frame
+    /// memory override must never be attributed as the conversation id.
+    #[tokio::test]
+    async fn ws_conversation_id_is_raw_session_not_storage_or_memory() {
+        let capturing = Arc::new(CapturingObserver::default());
+        let mut agent = build_minimal_ws_agent(capturing.clone());
+
+        // Mimic ws.rs handle_socket's derivation (ws.rs:315-318, 483-485).
+        let raw_session_id = Uuid::new_v4().to_string();
+        let session_key = format!("gw_{raw_session_id}"); // storage only (GW_SESSION_PREFIX)
+        let memory_session_id = zeroclaw_api::session_keys::sanitize_session_key(&raw_session_id);
+        // A UUID is already alnum + '-', so sanitize is a no-op here:
+        // memory_session_id starts EQUAL to the raw session id. The
+        // discriminator is the connect override below - if handle_socket had
+        // attributed memory_session_id (instead of the raw id) as the
+        // conversation id, the override would change the attribution.
+
+        agent.set_channel_name("wss".to_string());
+        agent.set_memory_session_id(Some(memory_session_id.clone()));
+        agent.set_conversation_id(Some(raw_session_id.clone()));
+
+        let _ = agent
+            .turn("first")
+            .await
+            .expect("first turn should succeed");
+
+        // A connect frame may OVERRIDE memory_session_id (ws.rs:388-399). The
+        // conversation id is the raw session id and must NOT follow it.
+        let override_memory =
+            zeroclaw_api::session_keys::sanitize_session_key("client-supplied-override");
+        assert_ne!(override_memory, memory_session_id);
+        agent.set_memory_session_id(Some(override_memory.clone()));
+        let _ = agent
+            .turn("second")
+            .await
+            .expect("second turn should succeed");
+
+        let events = capturing.events.lock();
+        let conv_ids: Vec<Option<&str>> = events
+            .iter()
+            .filter_map(attributed_conversation_id)
+            .collect();
+        assert!(
+            !conv_ids.is_empty(),
+            "expected attributed events carrying conversation_id"
+        );
+        assert!(
+            conv_ids
+                .iter()
+                .all(|id| *id == Some(raw_session_id.as_str())),
+            "every attributed event must carry the RAW session id (reused across both turns): {conv_ids:?}"
+        );
+        assert!(
+            !conv_ids.contains(&Some(session_key.as_str())),
+            "the gw_-prefixed storage key must never be attributed: {conv_ids:?}"
+        );
+        // The connect override changed memory_session_id but NOT the
+        // conversation id - this is the guard that handle_socket uses the raw
+        // session id rather than the (overrideable) memory-session id.
+        assert!(
+            !conv_ids.contains(&Some(override_memory.as_str())),
+            "the connect-frame memory override must not leak into the conversation id: {conv_ids:?}"
+        );
+
+        // Multi-turn reuse: same conversation id, but a fresh turn_id per turn.
+        let turn_ids: Vec<String> = events
+            .iter()
+            .filter_map(attributed_turn_id)
+            .map(str::to_string)
+            .collect();
+        let unique_turn_ids: std::collections::HashSet<&str> =
+            turn_ids.iter().map(String::as_str).collect();
+        assert!(
+            unique_turn_ids.len() >= 2,
+            "two turns must produce at least two distinct turn_ids, got {unique_turn_ids:?}"
+        );
+    }
+
+    /// A new WS session mints a fresh UUID; two concurrent agents must not cross
+    /// conversation ids.
+    #[tokio::test]
+    async fn ws_new_session_isolates_conversation_id() {
+        let cap_a = Arc::new(CapturingObserver::default());
+        let cap_b = Arc::new(CapturingObserver::default());
+        let mut agent_a = build_minimal_ws_agent(cap_a.clone());
+        let mut agent_b = build_minimal_ws_agent(cap_b.clone());
+
+        let raw_a = Uuid::new_v4().to_string();
+        let raw_b = Uuid::new_v4().to_string();
+        assert_ne!(raw_a, raw_b, "two new sessions must mint distinct ids");
+
+        agent_a.set_conversation_id(Some(raw_a.clone()));
+        agent_b.set_conversation_id(Some(raw_b.clone()));
+
+        let (a, b) = tokio::join!(agent_a.turn("a"), agent_b.turn("b"));
+        let _ = a.expect("agent A turn should succeed");
+        let _ = b.expect("agent B turn should succeed");
+
+        for (cap, expected, other, label) in [
+            (cap_a.clone(), raw_a.as_str(), raw_b.as_str(), "agent A"),
+            (cap_b.clone(), raw_b.as_str(), raw_a.as_str(), "agent B"),
+        ] {
+            let events = cap.events.lock();
+            let conv_ids: Vec<Option<&str>> = events
+                .iter()
+                .filter_map(attributed_conversation_id)
+                .collect();
+            assert!(
+                !conv_ids.is_empty(),
+                "{label} should emit attributed events"
+            );
+            assert!(
+                conv_ids.iter().all(|id| *id == Some(expected)),
+                "{label} must carry only its own conversation id: {conv_ids:?}"
+            );
+            assert!(
+                !conv_ids.contains(&Some(other)),
+                "{label} must not see the other session's conversation id: {conv_ids:?}"
+            );
+        }
+    }
+
+    /// `run_gateway_chat_with_tools` accepts an independent `conversation_id`
+    /// alongside the memory-scoped `session_id`. In the test build the mock
+    /// provider bypasses `process_message`, so this guards the seam compiles
+    /// and the two distinct ids coexist without fallback or panic; the
+    /// production branch (verified by the type system + code review) forwards
+    /// `conversation_id` straight to `process_message`.
+    #[tokio::test]
+    async fn run_gateway_chat_with_tools_accepts_independent_conversation_id() {
+        let provider_impl = Arc::new(MockModelProvider::default());
+        let model_provider: Arc<dyn ModelProvider> = provider_impl.clone();
+        let state = AppState {
+            config: Arc::new(RwLock::new(Config::default())),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            model_provider,
+            model: "test-model".into(),
+            temperature: None,
+            mem: Arc::new(MockMemory),
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::new(MockMemory),
+                zeroclaw_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp: HashMap::new(),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp_app_secret: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq_signing_secrets: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk_webhook_secret: HashMap::new(),
+            #[cfg(feature = "channel-wati")]
+            wati: HashMap::new(),
+            #[cfg(feature = "channel-email")]
+            gmail_push: None,
+            observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+            event_buffer: Arc::new(sse::EventBuffer::new(16)),
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
+            path_prefix: String::new(),
+            web_dist_dir: None,
+            session_backend: None,
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
+            session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
+                8, 30, 600,
+            )),
+            device_registry: None,
+            pending_pairings: None,
+            canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
+        };
+
+        // Distinct memory-session id and conversation id coexist.
+        let outcome = run_gateway_chat_with_tools(
+            &state,
+            "hi",
+            Some("memory-session-id"),
+            None,
+            Some("distinct-conversation-id"),
+            &[],
+            None,
+        )
+        .await
+        .expect("dispatch with an independent conversation id should succeed");
+        assert_eq!(outcome.response, "ok");
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
+
+        // `conversation_id = None` is also accepted (no fallback to session_id
+        // required on this path).
+        let outcome_none = run_gateway_chat_with_tools(
+            &state,
+            "hi",
+            Some("memory-session-id"),
+            None,
+            None,
+            &[],
+            None,
+        )
+        .await
+        .expect("dispatch with no conversation id should succeed");
+        assert_eq!(outcome_none.response, "ok");
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 2);
     }
 }
 

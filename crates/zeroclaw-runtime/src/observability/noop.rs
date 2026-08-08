@@ -40,6 +40,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::AgentEnd {
             model_provider: "test".into(),
@@ -50,6 +51,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::AgentEnd {
             model_provider: "test".into(),
@@ -60,6 +62,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             parent_agent_alias: None,
@@ -72,6 +75,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::ChannelMessage {
             channel: "cli".into(),

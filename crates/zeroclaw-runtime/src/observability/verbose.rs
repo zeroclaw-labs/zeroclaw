@@ -29,6 +29,7 @@ impl Observer for VerboseObserver {
                 agent_alias: _,
                 parent_agent_alias: _,
                 turn_id: _,
+                conversation_id: _,
             } => {
                 eprintln!("> Thinking");
                 eprintln!(
@@ -94,6 +95,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::LlmResponse {
             parent_agent_alias: None,
@@ -108,6 +110,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCallStart {
             parent_agent_alias: None,
@@ -117,6 +120,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             parent_agent_alias: None,
@@ -129,6 +133,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::TurnComplete);
     }

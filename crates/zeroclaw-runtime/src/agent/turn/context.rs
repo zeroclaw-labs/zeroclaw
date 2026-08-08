@@ -27,6 +27,14 @@ pub(crate) struct TurnCtx<'a> {
     pub(crate) strict_tool_parsing: bool,
     pub(crate) channel: Option<&'a dyn Channel>,
     pub(crate) turn_id: &'a str,
+    /// Caller-owned cross-turn conversation attribution. Threaded verbatim
+    /// from the turn's mint site (`Agent`/`process_message`) through the
+    /// `ToolLoop` -> `TurnCtx` -> `TurnMeta` chain so every turn-level
+    /// observer event carries one stable id across turns. `None` for nested
+    /// sub-loops and paths without a conversation owner. Deliberately
+    /// independent of `memory_session_id` (which selects the memory
+    /// partition only) - never a fallback between the two.
+    pub(crate) conversation_id: Option<&'a str>,
     pub(crate) agent_alias: Option<&'a str>,
     /// The delegating agent's alias when this loop is a nested cross-agent
     /// execution (a live SOP step naming a different agent): `agent_alias` is
@@ -44,6 +52,7 @@ pub struct TurnMeta<'a> {
     pub agent_alias: Option<&'a str>,
     pub parent_agent_alias: Option<&'a str>,
     pub turn_id: &'a str,
+    pub conversation_id: Option<&'a str>,
     pub channel_name: &'a str,
 }
 
@@ -53,6 +62,7 @@ impl<'a> TurnCtx<'a> {
             agent_alias: self.agent_alias,
             parent_agent_alias: self.parent_agent_alias,
             turn_id: self.turn_id,
+            conversation_id: self.conversation_id,
             channel_name: self.channel_name,
         }
     }

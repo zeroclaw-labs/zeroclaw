@@ -33,6 +33,7 @@ pub struct AcpSessionStore {
 
 pub struct AcpSessionData {
     pub session_uuid: String,
+    pub conversation_id: String,
     pub agent_alias: String,
     pub workspace_dir: String,
     pub token_count: u64,
@@ -83,6 +84,7 @@ impl AcpSessionStore {
             "CREATE TABLE IF NOT EXISTS acp_sessions (
                  id            INTEGER PRIMARY KEY AUTOINCREMENT,
                  session_uuid  TEXT NOT NULL UNIQUE,
+                 conversation_id TEXT NOT NULL,
                  agent_alias   TEXT NOT NULL,
                  workspace_dir TEXT NOT NULL,
                  token_count   INTEGER NOT NULL DEFAULT 0,
@@ -133,6 +135,9 @@ impl AcpSessionStore {
 
         Self::ensure_plan_json_column(&conn)
             .context("Failed to migrate ACP session plan column")?;
+
+        Self::ensure_conversation_id_column(&conn)
+            .context("Failed to migrate ACP session conversation identity")?;
 
         Ok(Self {
             conn: Mutex::new(conn),
@@ -207,6 +212,56 @@ impl AcpSessionStore {
         }
     }
 
+    fn ensure_conversation_id_column(conn: &Connection) -> Result<()> {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(acp_sessions)")
+            .context("Failed to inspect ACP session schema")?;
+        let mut rows = stmt
+            .query([])
+            .context("Failed to read ACP session schema")?;
+        let mut present = false;
+        while let Some(row) = rows
+            .next()
+            .context("Failed to read ACP session schema row")?
+        {
+            let column: String = row
+                .get(1)
+                .context("Failed to read ACP session column name")?;
+            if column == "conversation_id" {
+                present = true;
+                break;
+            }
+        }
+        drop(rows);
+        drop(stmt);
+
+        if !present {
+            conn.execute(
+                "ALTER TABLE acp_sessions ADD COLUMN conversation_id TEXT",
+                [],
+            )
+            .context("Failed to add ACP session conversation identity")?;
+        }
+
+        let tx = conn
+            .unchecked_transaction()
+            .context("Failed to begin ACP conversation identity migration")?;
+        let mut stmt = tx.prepare("SELECT id FROM acp_sessions WHERE conversation_id IS NULL")?;
+        let ids: Vec<i64> = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        for id in ids {
+            tx.execute(
+                "UPDATE acp_sessions SET conversation_id = ?1 WHERE id = ?2 AND conversation_id IS NULL",
+                params![uuid::Uuid::new_v4().to_string(), id],
+            )?;
+        }
+        tx.commit()
+            .context("Failed to commit ACP conversation identity migration")?;
+        Ok(())
+    }
+
     /// Record a new session. Returns the integer `id` assigned by SQLite.
     pub fn create_session(
         &self,
@@ -218,12 +273,30 @@ impl AcpSessionStore {
         let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO acp_sessions
-               (session_uuid, agent_alias, workspace_dir, token_count, created_at, last_activity)
-             VALUES (?1, ?2, ?3, 0, ?4, ?4)",
-            params![session_uuid, agent_alias, workspace_dir, now],
+               (session_uuid, conversation_id, agent_alias, workspace_dir, token_count, created_at, last_activity)
+             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?5)",
+            params![
+                session_uuid,
+                uuid::Uuid::new_v4().to_string(),
+                agent_alias,
+                workspace_dir,
+                now
+            ],
         )
         .context("Failed to create ACP session")?;
         Ok(conn.last_insert_rowid())
+    }
+
+    /// Return the server-owned conversation identity for an ACP session.
+    pub fn conversation_id(&self, session_uuid: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT conversation_id FROM acp_sessions WHERE session_uuid = ?1",
+            params![session_uuid],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("Failed to query ACP conversation identity")
     }
 
     /// Load session metadata and full message history for restore.
@@ -232,27 +305,35 @@ impl AcpSessionStore {
         let conn = self.conn.lock();
 
         let row = conn.query_row(
-            "SELECT id, agent_alias, workspace_dir, token_count, created_at, last_activity
+            "SELECT id, conversation_id, agent_alias, workspace_dir, token_count, created_at, last_activity
              FROM acp_sessions WHERE session_uuid = ?1",
             params![session_uuid],
             |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(1)?,
                     row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
                     row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
                 ))
             },
         );
 
-        let (session_id, agent_alias, workspace_dir, token_count, created_at_s, last_activity_s) =
-            match row {
-                Ok(r) => r,
-                Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
-                Err(e) => return Err(e).context("Failed to query ACP session"),
-            };
+        let (
+            session_id,
+            conversation_id,
+            agent_alias,
+            workspace_dir,
+            token_count,
+            created_at_s,
+            last_activity_s,
+        ) = match row {
+            Ok(r) => r,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+            Err(e) => return Err(e).context("Failed to query ACP session"),
+        };
 
         let created_at = parse_ts(&created_at_s, "created_at", session_uuid);
         let last_activity = parse_ts(&last_activity_s, "last_activity", session_uuid);
@@ -261,6 +342,18 @@ impl AcpSessionStore {
 
         Ok(Some(AcpSessionData {
             session_uuid: session_uuid.to_string(),
+            conversation_id: conversation_id.ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Read,)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "session_uuid": session_uuid,
+                        })),
+                    "ACP session conversation identity is missing"
+                );
+                anyhow::Error::msg("ACP session conversation identity is missing")
+            })?,
             agent_alias,
             workspace_dir,
             token_count: token_count.max(0) as u64,
@@ -277,24 +370,26 @@ impl AcpSessionStore {
         let conn = self.conn.lock();
 
         let row = conn.query_row(
-            "SELECT id, agent_alias, workspace_dir, token_count, created_at, last_activity, killed_at
+            "SELECT id, conversation_id, agent_alias, workspace_dir, token_count, created_at, last_activity, killed_at
              FROM acp_sessions WHERE session_uuid = ?1",
             params![session_uuid],
             |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(1)?,
                     row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
                     row.get::<_, String>(5)?,
-                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
                 ))
             },
         );
 
         let (
             session_id,
+            conversation_id,
             agent_alias,
             workspace_dir,
             token_count,
@@ -317,6 +412,18 @@ impl AcpSessionStore {
 
         Ok(AcpSessionRestore::Restorable(AcpSessionData {
             session_uuid: session_uuid.to_string(),
+            conversation_id: conversation_id.ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Read,)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "session_uuid": session_uuid,
+                        })),
+                    "ACP session conversation identity is missing"
+                );
+                anyhow::Error::msg("ACP session conversation identity is missing")
+            })?,
             agent_alias,
             workspace_dir,
             token_count: token_count.max(0) as u64,
@@ -960,6 +1067,64 @@ mod tests {
         assert_eq!(data.workspace_dir, "/home/user/project");
         assert_eq!(data.token_count, 0);
         assert!(data.messages.is_empty());
+    }
+
+    #[test]
+    fn conversation_id_survives_store_reopen() {
+        let (tmp, store) = open_store();
+        store
+            .create_session("sess-conversation", "alpha", "/tmp/proj")
+            .unwrap();
+        let conversation_id = store.conversation_id("sess-conversation").unwrap().unwrap();
+        assert!(uuid::Uuid::parse_str(&conversation_id).is_ok());
+        assert_ne!(conversation_id, "sess-conversation");
+
+        drop(store);
+        let reopened = AcpSessionStore::new(tmp.path()).unwrap();
+        assert_eq!(
+            reopened
+                .conversation_id("sess-conversation")
+                .unwrap()
+                .unwrap(),
+            conversation_id
+        );
+    }
+
+    #[test]
+    fn legacy_session_gets_one_persistent_conversation_id() {
+        let tmp = TempDir::new().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let conn = Connection::open(sessions_dir.join("acp-sessions.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE acp_sessions (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 session_uuid TEXT NOT NULL UNIQUE,
+                 agent_alias TEXT NOT NULL,
+                 workspace_dir TEXT NOT NULL,
+                 token_count INTEGER NOT NULL DEFAULT 0,
+                 created_at TEXT NOT NULL,
+                 last_activity TEXT NOT NULL
+             );
+             INSERT INTO acp_sessions
+                 (session_uuid, agent_alias, workspace_dir, token_count, created_at, last_activity)
+             VALUES ('legacy-session', 'alpha', '/tmp/proj', 0,
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = AcpSessionStore::new(tmp.path()).unwrap();
+        let conversation_id = store.conversation_id("legacy-session").unwrap().unwrap();
+        assert!(uuid::Uuid::parse_str(&conversation_id).is_ok());
+        assert_ne!(conversation_id, "legacy-session");
+
+        drop(store);
+        let reopened = AcpSessionStore::new(tmp.path()).unwrap();
+        assert_eq!(
+            reopened.conversation_id("legacy-session").unwrap().unwrap(),
+            conversation_id
+        );
     }
 
     #[test]

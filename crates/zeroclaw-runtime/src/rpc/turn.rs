@@ -38,9 +38,23 @@ impl std::error::Error for TurnError {}
 
 /// Attribution fields attached to the tracing span for the duration of a turn.
 /// All fields appear on every `record!()` emitted inside the turn.
+///
+/// `session_key` is the bare session identifier fed to the tracing span
+/// and the `scope_session_key` task-local; in Chat mode the persistence
+/// layer derives the `rpc_<sid>` storage key from it downstream.
+/// `conversation_id` is the caller-owned cross-turn telemetry identity
+/// stamped onto the agent so every attributed observer event carries it.
+/// The two are semantically independent even when they happen to carry
+/// the same bare `sid` - the `rpc_`-prefixed storage key must NEVER be
+/// stored in `conversation_id`.
 #[derive(Clone, Default)]
 pub struct TurnAttribution {
     pub session_key: Option<String>,
+    /// Caller-owned cross-turn conversation id. Stamped onto the agent in
+    /// [`execute_turn`] so the streamed turn's `AgentTurnGuard` / `ToolLoop`
+    /// attribute every observer event with it. `None` for non-RPC or
+    /// test paths.
+    pub conversation_id: Option<String>,
     pub agent_alias: String,
     pub model_provider: String,
     pub model: String,
@@ -65,6 +79,16 @@ where
 
     let mut turn_handle = zeroclaw_spawn::spawn!(async move {
         let mut guard = agent.lock().await;
+        // Stamp the caller-owned conversation id onto the agent before the
+        // streamed turn starts; the agent threads it through its
+        // `AgentTurnGuard` / `ToolLoop` / `TurnCtx` / `TurnMeta` so every
+        // attributed observer event carries it. `execute_turn` is the single
+        // unified entry for ordinary prompt turns, resume, and reaper
+        // rehydrate - all reach here via `handle_session_prompt` - so the id
+        // does not need to be copied into `RpcSession`. `conversation_id` is
+        // distinct from `session_key` (the history/storage key) and must never
+        // carry the `rpc_`-prefixed form.
+        guard.set_conversation_id(attribution.conversation_id.clone());
         let sk = attribution.session_key.clone();
         crate::agent::loop_::scope_session_key(attribution.session_key, async move {
             use ::zeroclaw_log::Instrument as _;
@@ -470,6 +494,7 @@ mod tests {
             CancellationToken::new(),
             TurnAttribution {
                 session_key: Some("s1".into()),
+                conversation_id: None,
                 agent_alias: "rpc-agent".into(),
                 model_provider: "mock-provider".into(),
                 model: "test-model".into(),
@@ -499,5 +524,343 @@ mod tests {
             agent_summary.request_count, 1,
             "the agent alias must flow through to the persisted cost record"
         );
+    }
+
+    /// Captures every `ObserverEvent` so the `conversation_id` stamped onto the
+    /// agent by `execute_turn` can be asserted against the attributed events a
+    /// real turn emits.
+    #[derive(Default)]
+    struct CapturingObserver {
+        events: parking_lot::Mutex<Vec<crate::observability::ObserverEvent>>,
+    }
+
+    impl crate::observability::Observer for CapturingObserver {
+        fn record_event(&self, event: &crate::observability::ObserverEvent) {
+            self.events.lock().push(event.clone());
+        }
+        fn record_metric(&self, _metric: &zeroclaw_api::observability_traits::ObserverMetric) {}
+        fn name(&self) -> &str {
+            "rpc-capturing"
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn flush(&self) {}
+    }
+
+    /// The `conversation_id` carried by an attributed observer event, wrapped
+    /// in a double `Option`: the outer `None` marks events without the field
+    /// (so `filter_map` drops them), the inner `Option` is the event's own
+    /// `conversation_id` (`None` when the field is present but unset).
+    fn attributed_conversation_id(
+        event: &crate::observability::ObserverEvent,
+    ) -> Option<Option<&str>> {
+        match event {
+            crate::observability::ObserverEvent::AgentStart {
+                conversation_id, ..
+            }
+            | crate::observability::ObserverEvent::AgentEnd {
+                conversation_id, ..
+            }
+            | crate::observability::ObserverEvent::LlmRequest {
+                conversation_id, ..
+            }
+            | crate::observability::ObserverEvent::LlmResponse {
+                conversation_id, ..
+            }
+            | crate::observability::ObserverEvent::ToolCallStart {
+                conversation_id, ..
+            }
+            | crate::observability::ObserverEvent::ToolCall {
+                conversation_id, ..
+            }
+            | crate::observability::ObserverEvent::MemoryRecall {
+                conversation_id, ..
+            }
+            | crate::observability::ObserverEvent::MemoryStore {
+                conversation_id, ..
+            }
+            | crate::observability::ObserverEvent::RagRetrieve {
+                conversation_id, ..
+            } => Some(conversation_id.as_deref()),
+            _ => None,
+        }
+    }
+
+    /// A model provider that returns one canned final answer per `chat` call,
+    /// so RPC turn tests can drive real `execute_turn` turns without a live
+    /// model. The non-streaming `chat` path is the default the engine takes
+    /// when the provider does not advertise streaming.
+    struct CannedProvider;
+
+    #[async_trait::async_trait]
+    impl zeroclaw_api::model_provider::ModelProvider for CannedProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".into())
+        }
+        async fn chat(
+            &self,
+            _request: zeroclaw_providers::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some("done".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl zeroclaw_api::attribution::Attributable for CannedProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "mock-provider"
+        }
+    }
+
+    /// Build an agent wired to `observer` whose model provider hands back a
+    /// canned final answer, wrapped in the `Arc<Mutex<Agent>>` shape that
+    /// `execute_turn` consumes.
+    fn rpc_turn_agent(
+        observer: Arc<dyn crate::observability::Observer>,
+    ) -> Arc<tokio::sync::Mutex<Agent>> {
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn zeroclaw_memory::Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed"),
+        );
+        let agent = Agent::builder()
+            .model_provider(Box::new(CannedProvider))
+            .tools(vec![])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .model_name("test-model".into())
+            .model_provider_name("mock-provider".into())
+            .agent_alias("rpc-agent".into())
+            .build()
+            .expect("agent builder should succeed");
+        Arc::new(tokio::sync::Mutex::new(agent))
+    }
+
+    /// To prove the stamp uses `conversation_id` (not `session_key`), this
+    /// test passes them as distinct values - modeling the `rpc_`-prefixed
+    /// storage key in `session_key` to assert it never leaks into the
+    /// conversation slot. In production both fields carry the same bare sid;
+    /// the `rpc_` prefix is applied downstream in the persistence layer.
+    #[tokio::test]
+    async fn rpc_reuses_protocol_session_id_stamps_bare_sid_not_rpc_prefixed_key() {
+        let capturing = Arc::new(CapturingObserver::default());
+        let agent =
+            rpc_turn_agent(Arc::clone(&capturing) as Arc<dyn crate::observability::Observer>);
+
+        let outcome = execute_turn(
+            agent.clone(),
+            "hello".to_string(),
+            CancellationToken::new(),
+            TurnAttribution {
+                // The history/storage key carries the `rpc_` prefix; this is the
+                // value that must NOT surface as the conversation id.
+                session_key: Some("rpc_abc-123".into()),
+                conversation_id: Some("abc-123".into()),
+                agent_alias: "rpc-agent".into(),
+                model_provider: "mock-provider".into(),
+                model: "test-model".into(),
+                channel: "rpc",
+            },
+            None,
+            noop,
+        )
+        .await
+        .expect("turn should complete");
+        assert!(
+            matches!(outcome, TurnOutcome::Completed { .. }),
+            "turn should complete normally"
+        );
+
+        // The agent is stamped with the BARE protocol sid, never the
+        // `rpc_`-prefixed history key.
+        let stamped = agent.lock().await.conversation_id().map(str::to_string);
+        assert_eq!(
+            stamped.as_deref(),
+            Some("abc-123"),
+            "execute_turn must stamp the bare conversation id, not the rpc_-prefixed session_key"
+        );
+        assert!(
+            !stamped.as_deref().unwrap_or("").starts_with("rpc_"),
+            "the rpc_-prefixed history key leaked into the conversation slot: {stamped:?}"
+        );
+
+        // Every attributed observer event carries the bare id; none carry the
+        // `rpc_`-prefixed form.
+        let events = capturing.events.lock();
+        let conv_ids: Vec<Option<&str>> = events
+            .iter()
+            .filter_map(attributed_conversation_id)
+            .collect();
+        assert!(
+            !conv_ids.is_empty(),
+            "execute_turn should emit attributed observer events"
+        );
+        assert!(
+            conv_ids.iter().all(|id| *id == Some("abc-123")),
+            "every attributed event must carry the bare sid abc-123, got {conv_ids:?}"
+        );
+        assert!(
+            !conv_ids
+                .iter()
+                .any(|id| id.map(|s| s.starts_with("rpc_")).unwrap_or(false)),
+            "a rpc_-prefixed history key leaked onto an observer event: {conv_ids:?}"
+        );
+    }
+
+    /// Two turns on the same RPC session reuse the same protocol `session_id`,
+    /// so the conversation id stamped by `execute_turn` must be identical across
+    /// both turns - the cross-turn telemetry grouping the id provides.
+    #[tokio::test]
+    async fn rpc_reuses_protocol_session_id_two_turns_share_same_id() {
+        let capturing = Arc::new(CapturingObserver::default());
+        let agent =
+            rpc_turn_agent(Arc::clone(&capturing) as Arc<dyn crate::observability::Observer>);
+
+        for prompt in ["first", "second"] {
+            let outcome = execute_turn(
+                agent.clone(),
+                prompt.to_string(),
+                CancellationToken::new(),
+                TurnAttribution {
+                    // Both turns carry the same bare sid; `session_key` keeps
+                    // the `rpc_` prefix to model the real Chat split.
+                    session_key: Some("rpc_shared-sid".into()),
+                    conversation_id: Some("shared-sid".into()),
+                    agent_alias: "rpc-agent".into(),
+                    model_provider: "mock-provider".into(),
+                    model: "test-model".into(),
+                    channel: "rpc",
+                },
+                None,
+                noop,
+            )
+            .await
+            .expect("turn should complete");
+            assert!(
+                matches!(outcome, TurnOutcome::Completed { .. }),
+                "each turn should complete normally"
+            );
+        }
+
+        let stamped = agent.lock().await.conversation_id().map(str::to_string);
+        assert_eq!(
+            stamped.as_deref(),
+            Some("shared-sid"),
+            "the agent must retain the conversation id across turns"
+        );
+
+        let events = capturing.events.lock();
+        let conv_ids: Vec<Option<&str>> = events
+            .iter()
+            .filter_map(attributed_conversation_id)
+            .collect();
+        assert!(
+            conv_ids.iter().all(|id| *id == Some("shared-sid")),
+            "both turns' events must carry the shared conversation id, got {conv_ids:?}"
+        );
+    }
+
+    /// A fresh `session/new` mints a fresh protocol `session_id`. Two separate
+    /// RPC sessions (distinct agents) must therefore carry distinct conversation
+    /// ids, and each session's observer events carry only its own id - never the
+    /// other session's.
+    #[tokio::test]
+    async fn rpc_reuses_protocol_session_id_fresh_session_yields_distinct_id() {
+        let cap_a = Arc::new(CapturingObserver::default());
+        let cap_b = Arc::new(CapturingObserver::default());
+        let agent_a = rpc_turn_agent(Arc::clone(&cap_a) as Arc<dyn crate::observability::Observer>);
+        let agent_b = rpc_turn_agent(Arc::clone(&cap_b) as Arc<dyn crate::observability::Observer>);
+
+        for (agent, sid) in [(agent_a.clone(), "sid-a"), (agent_b.clone(), "sid-b")] {
+            let outcome = execute_turn(
+                agent.clone(),
+                "hello".to_string(),
+                CancellationToken::new(),
+                TurnAttribution {
+                    session_key: Some(format!("rpc_{sid}")),
+                    conversation_id: Some(sid.to_string()),
+                    agent_alias: "rpc-agent".into(),
+                    model_provider: "mock-provider".into(),
+                    model: "test-model".into(),
+                    channel: "rpc",
+                },
+                None,
+                noop,
+            )
+            .await
+            .expect("turn should complete");
+            assert!(
+                matches!(outcome, TurnOutcome::Completed { .. }),
+                "turn should complete normally"
+            );
+        }
+
+        let stamped_a = agent_a.lock().await.conversation_id().map(str::to_string);
+        let stamped_b = agent_b.lock().await.conversation_id().map(str::to_string);
+        assert_eq!(
+            stamped_a.as_deref(),
+            Some("sid-a"),
+            "session A is stamped with its own sid"
+        );
+        assert_eq!(
+            stamped_b.as_deref(),
+            Some("sid-b"),
+            "session B is stamped with its own, distinct sid"
+        );
+        assert_ne!(
+            stamped_a, stamped_b,
+            "fresh sessions must carry distinct conversation ids"
+        );
+
+        // Each session's events carry only its own id.
+        for (cap, expected) in [(cap_a.clone(), "sid-a"), (cap_b.clone(), "sid-b")] {
+            let events = cap.events.lock();
+            let conv_ids: Vec<Option<&str>> = events
+                .iter()
+                .filter_map(attributed_conversation_id)
+                .collect();
+            assert!(
+                !conv_ids.is_empty(),
+                "session {expected} should emit attributed events"
+            );
+            assert!(
+                conv_ids.iter().all(|id| *id == Some(expected)),
+                "session {expected} events must carry only {expected}, got {conv_ids:?}"
+            );
+            let other = if expected == "sid-a" {
+                "sid-b"
+            } else {
+                "sid-a"
+            };
+            assert!(
+                !conv_ids.contains(&Some(other)),
+                "session {expected} leaked the other session's id {other}: {conv_ids:?}"
+            );
+        }
     }
 }

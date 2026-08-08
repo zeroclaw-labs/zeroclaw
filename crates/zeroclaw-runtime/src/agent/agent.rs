@@ -344,6 +344,13 @@ pub struct Agent {
     skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
     auto_save: bool,
     memory_session_id: Option<String>,
+    /// Caller-owned cross-turn conversation attribution. Threaded onto the
+    /// turn's `AgentStart`/`AgentEnd` brackets and into every `ToolLoop`
+    /// round so the 9 turn-level observer events carry one stable id across
+    /// turns. Deliberately independent of `memory_session_id` (which selects
+    /// the memory partition only); never a fallback between the two.
+    /// Normalized so `Some("")` is stored as `None`.
+    conversation_id: Option<String>,
     history: Vec<ConversationMessage>,
     /// True only when `history` contains the synthetic trim breadcrumb inserted
     /// by this Agent. User text is never inferred to be synthetic by content.
@@ -502,6 +509,7 @@ pub struct AgentBuilder {
     skills_prompt_mode: Option<zeroclaw_config::schema::SkillsPromptInjectionMode>,
     auto_save: Option<bool>,
     memory_session_id: Option<String>,
+    conversation_id: Option<String>,
     classification_config: Option<zeroclaw_config::schema::QueryClassificationConfig>,
     available_hints: Option<Vec<String>>,
     route_model_by_hint: Option<HashMap<String, String>>,
@@ -552,6 +560,7 @@ impl AgentBuilder {
             skills_prompt_mode: None,
             auto_save: None,
             memory_session_id: None,
+            conversation_id: None,
             classification_config: None,
             available_hints: None,
             route_model_by_hint: None,
@@ -694,6 +703,14 @@ impl AgentBuilder {
 
     pub fn memory_session_id(mut self, memory_session_id: Option<String>) -> Self {
         self.memory_session_id = memory_session_id;
+        self
+    }
+
+    /// Set the caller-owned cross-turn conversation attribution. An empty
+    /// string is normalized to `None` so a defaulting caller cannot mint a
+    /// non-id that still occupies the attribution slot.
+    pub fn conversation_id(mut self, conversation_id: Option<String>) -> Self {
+        self.conversation_id = conversation_id.filter(|id| !id.trim().is_empty());
         self
     }
 
@@ -912,6 +929,7 @@ impl AgentBuilder {
                 self.auto_save.unwrap_or(false)
             },
             memory_session_id: self.memory_session_id,
+            conversation_id: self.conversation_id,
             history: Vec::new(),
             history_has_trim_breadcrumb: false,
             classification_config: self.classification_config.unwrap_or_default(),
@@ -1121,6 +1139,7 @@ impl Agent {
                 channel: Some(self.channel_name.clone()),
                 agent_alias: self.observer_agent_alias(),
                 turn_id: Some(turn_id.to_string()),
+                conversation_id: self.conversation_id.clone(),
             });
         }
 
@@ -1134,6 +1153,19 @@ impl Agent {
 
     pub fn set_memory_session_id(&mut self, session_id: Option<String>) {
         self.memory_session_id = session_id;
+    }
+
+    /// Set the caller-owned cross-turn conversation attribution. An empty
+    /// string is normalized to `None`. Use this (not `set_memory_session_id`)
+    /// for the telemetry identity slot.
+    pub fn set_conversation_id(&mut self, conversation_id: Option<String>) {
+        self.conversation_id = conversation_id.filter(|id| !id.trim().is_empty());
+    }
+
+    /// The caller-owned cross-turn conversation attribution, when one has
+    /// been minted. `None` for agents without a conversation owner.
+    pub fn conversation_id(&self) -> Option<&str> {
+        self.conversation_id.as_deref()
     }
 
     pub fn set_temperature(&mut self, temperature: Option<f64>) {
@@ -1566,6 +1598,7 @@ impl Agent {
             tui_env,
             sop_engine,
             sop_audit,
+            None,
             None,
         );
         // Skills are loaded here and handed to `assemble`, which owns skill
@@ -2257,6 +2290,7 @@ impl Agent {
             effective_model.clone(),
             Some(self.channel_name.clone()),
             self.observer_agent_alias(),
+            self.conversation_id.clone(),
             Some(turn_id.clone()),
         );
 
@@ -2281,6 +2315,7 @@ impl Agent {
                 channel: Some(self.channel_name.clone()),
                 agent_alias: self.observer_agent_alias(),
                 turn_id: Some(turn_id.clone()),
+                conversation_id: self.conversation_id.clone(),
             });
         }
 
@@ -2452,6 +2487,7 @@ impl Agent {
                         agent_alias: agent_alias_for_loop.as_deref(),
                         parent_agent_alias: None,
                         turn_id: &turn_id,
+                        conversation_id: self.conversation_id.as_deref(),
                         // Live-daemon SOP path: re-assemble a nested step's agent
                         // when it delegates elsewhere. Config survives only via
                         // `provider_switch_config`; with `None` (test builder) a
@@ -2613,6 +2649,7 @@ impl Agent {
             effective_model.clone(),
             Some(self.channel_name.clone()),
             self.observer_agent_alias(),
+            self.conversation_id.clone(),
             Some(turn_id.clone()),
         );
         self.append_streamed_user_message_to_history(user_message, &mut new_msgs, &turn_id)
@@ -2775,6 +2812,7 @@ impl Agent {
                         channel: Some(self.channel_name.clone()),
                         agent_alias: self.observer_agent_alias(),
                         turn_id: Some(turn_id.clone()),
+                        conversation_id: self.conversation_id.clone(),
                     });
                 }
                 let now = self.current_turn_datetime().format("%Y-%m-%d %H:%M:%S %Z");
@@ -2860,6 +2898,7 @@ impl Agent {
                         agent_alias: agent_alias_for_loop.as_deref(),
                         parent_agent_alias: None,
                         turn_id: &turn_id,
+                        conversation_id: self.conversation_id.as_deref(),
                         // Live-daemon SOP path: re-assemble a nested step's
                         // agent when it delegates elsewhere. Config survives
                         // only via `provider_switch_config`; with `None`
@@ -9187,6 +9226,270 @@ mod tests {
             "auto_save(true) must cause the streamed turn to emit a MemoryStore event"
         );
         assert_all_events_share_turn_id(&events, Some("test-agent"), Some("agent"));
+    }
+
+    /// Extract the caller-owned `conversation_id` (and `turn_id`) from any of
+    /// the nine turn-attributed observer events. Returns `None` for events
+    /// outside that set so callers can filter to the attributed subset.
+    fn attributed_conversation_id(event: &ObserverEvent) -> Option<Option<&str>> {
+        match event {
+            ObserverEvent::AgentStart {
+                conversation_id, ..
+            }
+            | ObserverEvent::AgentEnd {
+                conversation_id, ..
+            }
+            | ObserverEvent::LlmRequest {
+                conversation_id, ..
+            }
+            | ObserverEvent::LlmResponse {
+                conversation_id, ..
+            }
+            | ObserverEvent::ToolCallStart {
+                conversation_id, ..
+            }
+            | ObserverEvent::ToolCall {
+                conversation_id, ..
+            }
+            | ObserverEvent::MemoryRecall {
+                conversation_id, ..
+            }
+            | ObserverEvent::MemoryStore {
+                conversation_id, ..
+            }
+            | ObserverEvent::RagRetrieve {
+                conversation_id, ..
+            } => Some(conversation_id.as_deref()),
+            _ => None,
+        }
+    }
+
+    fn attributed_turn_id(event: &ObserverEvent) -> Option<&str> {
+        match event {
+            ObserverEvent::AgentStart { turn_id, .. }
+            | ObserverEvent::AgentEnd { turn_id, .. }
+            | ObserverEvent::LlmRequest { turn_id, .. }
+            | ObserverEvent::LlmResponse { turn_id, .. }
+            | ObserverEvent::ToolCallStart { turn_id, .. }
+            | ObserverEvent::ToolCall { turn_id, .. }
+            | ObserverEvent::MemoryRecall { turn_id, .. }
+            | ObserverEvent::MemoryStore { turn_id, .. }
+            | ObserverEvent::RagRetrieve { turn_id, .. } => turn_id.as_deref(),
+            _ => None,
+        }
+    }
+
+    fn build_conversation_test_agent(
+        conversation_id: Option<&str>,
+        memory_session_id: Option<&str>,
+        responses: Vec<zeroclaw_providers::ChatResponse>,
+        capturing: Arc<CapturingObserver>,
+    ) -> Agent {
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let model_provider = Box::new(MockModelProvider {
+            responses: Mutex::new(responses),
+        });
+        let observer: Arc<dyn Observer> = capturing.clone();
+        Agent::builder()
+            .model_provider(model_provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .agent_alias("test-agent".into())
+            .auto_save(true)
+            .memory_session_id(memory_session_id.map(str::to_string))
+            .conversation_id(conversation_id.map(str::to_string))
+            .build()
+            .expect("agent builder should succeed with valid config")
+    }
+
+    fn one_turn_response() -> zeroclaw_providers::ChatResponse {
+        zeroclaw_providers::ChatResponse {
+            text: Some("done".into()),
+            tool_calls: vec![],
+            usage: None,
+            reasoning_content: None,
+        }
+    }
+
+    /// One Agent, two turns: the same caller-owned `conversation_id` must be
+    /// stamped on every attributed event of BOTH turns, while `turn_id` changes
+    /// per turn. Guards the single propagation chain end-to-end.
+    #[tokio::test]
+    async fn conversation_id_consistent_across_two_turns() {
+        let capturing = Arc::new(CapturingObserver::default());
+        let mut agent = build_conversation_test_agent(
+            Some("conv-stable"),
+            None,
+            vec![one_turn_response(), one_turn_response()],
+            capturing.clone(),
+        );
+
+        let _ = agent
+            .turn("first")
+            .await
+            .expect("first turn should succeed");
+        let _ = agent
+            .turn("second")
+            .await
+            .expect("second turn should succeed");
+
+        let events = capturing.events.lock();
+        let conv_ids: Vec<Option<&str>> = events
+            .iter()
+            .filter_map(attributed_conversation_id)
+            .collect();
+        assert!(
+            !conv_ids.is_empty(),
+            "expected attributed events carrying conversation_id"
+        );
+        assert!(
+            conv_ids.iter().all(|id| *id == Some("conv-stable")),
+            "every attributed event must carry conv-stable, got {conv_ids:?}"
+        );
+
+        // The turn id is per-turn: the two turns must mint two distinct ids.
+        let turn_ids: Vec<String> = events
+            .iter()
+            .filter_map(attributed_turn_id)
+            .map(str::to_string)
+            .collect();
+        let unique_turn_ids: std::collections::HashSet<&str> =
+            turn_ids.iter().map(String::as_str).collect();
+        assert!(
+            unique_turn_ids.len() >= 2,
+            "two turns must produce at least two distinct turn_ids, got {unique_turn_ids:?}"
+        );
+    }
+
+    /// Two Agents with different conversation ids run concurrently: each
+    /// observer sees ONLY its own id. Guards against a task-local or
+    /// process-global current-conversation cache crossing the agents.
+    #[tokio::test]
+    async fn conversation_ids_do_not_cross_between_concurrent_agents() {
+        let cap_a = Arc::new(CapturingObserver::default());
+        let cap_b = Arc::new(CapturingObserver::default());
+        let mut agent_a = build_conversation_test_agent(
+            Some("conv-a"),
+            None,
+            vec![one_turn_response()],
+            cap_a.clone(),
+        );
+        let mut agent_b = build_conversation_test_agent(
+            Some("conv-b"),
+            None,
+            vec![one_turn_response()],
+            cap_b.clone(),
+        );
+
+        let (a, b) = tokio::join!(agent_a.turn("a"), agent_b.turn("b"));
+        let _ = a.expect("agent A turn should succeed");
+        let _ = b.expect("agent B turn should succeed");
+
+        for (cap, expected, label) in [
+            (cap_a.clone(), "conv-a", "agent A"),
+            (cap_b.clone(), "conv-b", "agent B"),
+        ] {
+            let events = cap.events.lock();
+            let conv_ids: Vec<Option<&str>> = events
+                .iter()
+                .filter_map(attributed_conversation_id)
+                .collect();
+            assert!(
+                !conv_ids.is_empty(),
+                "{label} should emit attributed events"
+            );
+            assert!(
+                conv_ids.iter().all(|id| *id == Some(expected)),
+                "{label} events must carry only {expected}, got {conv_ids:?}"
+            );
+            assert!(
+                !conv_ids
+                    .iter()
+                    .any(|id| *id == Some("conv-a") && expected != "conv-a"),
+                "{label} must not see conv-a"
+            );
+            assert!(
+                !conv_ids
+                    .iter()
+                    .any(|id| *id == Some("conv-b") && expected != "conv-b"),
+                "{label} must not see conv-b"
+            );
+        }
+    }
+
+    /// An Agent with no `conversation_id` set must emit `None` on every
+    /// attributed event - the runtime never mints a fallback id.
+    #[tokio::test]
+    async fn no_conversation_id_means_none_on_events() {
+        let capturing = Arc::new(CapturingObserver::default());
+        let mut agent =
+            build_conversation_test_agent(None, None, vec![one_turn_response()], capturing.clone());
+
+        let _ = agent.turn("solo").await.expect("turn should succeed");
+
+        let events = capturing.events.lock();
+        let conv_ids: Vec<Option<&str>> = events
+            .iter()
+            .filter_map(attributed_conversation_id)
+            .collect();
+        assert!(!conv_ids.is_empty(), "expected attributed events");
+        assert!(
+            conv_ids.iter().all(|id| id.is_none()),
+            "events for an agent without a conversation id must carry None, got {conv_ids:?}"
+        );
+    }
+
+    /// The memory session id selects the memory partition only; it must NEVER
+    /// leak into the telemetry `conversation_id` slot. Drive an Agent whose
+    /// `memory_session_id` is set to a distinct poison value and assert no
+    /// attributed event reports that value as its `conversation_id`, while the
+    /// real caller-owned id is the one that appears.
+    #[tokio::test]
+    async fn conversation_id_does_not_leak_from_memory_session_id() {
+        let capturing = Arc::new(CapturingObserver::default());
+        let mut agent = build_conversation_test_agent(
+            Some("conv-real"),
+            Some("mem-session-poison"),
+            vec![one_turn_response()],
+            capturing.clone(),
+        );
+
+        let _ = agent.turn("poisoned").await.expect("turn should succeed");
+
+        let events = capturing.events.lock();
+        // auto_save(true) fires a MemoryStore using the memory session for the
+        // store call but the conversation id for telemetry - the guarantee is
+        // that the two never cross.
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ObserverEvent::MemoryStore { .. })),
+            "auto_save(true) must emit MemoryStore so the isolation is exercised"
+        );
+        for event in events.iter() {
+            if let Some(conv) = attributed_conversation_id(event) {
+                assert_ne!(
+                    conv,
+                    Some("mem-session-poison"),
+                    "memory session id must not leak into conversation_id: {event:?}"
+                );
+                assert_eq!(
+                    conv,
+                    Some("conv-real"),
+                    "attributed event must carry conv-real: {event:?}"
+                );
+            }
+        }
     }
 
     fn build_test_agent(

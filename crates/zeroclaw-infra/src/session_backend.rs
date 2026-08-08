@@ -31,6 +31,12 @@ pub struct SessionMetadata {
     /// Inbound sender id verbatim (Discord username, phone number, ...).
     /// Not an FK — sessions can survive deletion of the upstream user.
     pub sender_id: Option<String>,
+    /// Cross-turn conversation identity. This is a FACT of record creation,
+    /// generated server-side and persisted by the backend (NOT computed from
+    /// `session_key` - the key only LOCATES the record). `None` for legacy
+    /// rows that predate the column / sidecar and have not yet been resolved.
+    /// In durable mode the backend record is the single source of truth.
+    pub conversation_id: Option<String>,
 }
 
 /// Structured routing context recorded alongside a session. Mirrors the
@@ -65,11 +71,75 @@ pub struct TimestampedMessage {
     pub created_at: Option<DateTime<Utc>>,
 }
 
+/// A channel conversation and its persisted identity.
+#[derive(Debug, Clone)]
+pub struct ChannelConversationRecord {
+    pub conversation_id: String,
+    pub history: Vec<ChatMessage>,
+}
+
+impl PartialEq for ChannelConversationRecord {
+    fn eq(&self, other: &Self) -> bool {
+        self.conversation_id == other.conversation_id
+            && self.history.len() == other.history.len()
+            && self
+                .history
+                .iter()
+                .zip(&other.history)
+                .all(|(left, right)| left.role == right.role && left.content == right.content)
+    }
+}
+
+impl Eq for ChannelConversationRecord {}
+
+/// One atomic mutation of a channel conversation.
+#[derive(Debug, Clone, Copy)]
+pub enum SessionMutation<'a> {
+    Append(&'a ChatMessage),
+    RemoveLast {
+        expected_role: &'a str,
+        expected_content: &'a str,
+    },
+    UpdateLast(&'a ChatMessage),
+}
+
+/// Outcome of a conversation-id-fenced session write.
+///
+/// A history append / update / rollback / compaction is conditional on the
+/// session record still carrying the conversation id the turn captured before
+/// any async work began. The result distinguishes the three lifecycle states a
+/// stale writer can observe, so a real storage error (`Err`) is never confused
+/// with an expected lifecycle race:
+///
+/// - `Applied`: the record still carried the expected id; the mutation landed.
+/// - `Stale`: the record still exists but its id was rotated (`/new`/`/clear`);
+///   the caller's captured id no longer matches. An expected race, not retried,
+///   and must not recreate a record.
+/// - `Deleted`: the record was removed; same non-retry, non-recreate contract.
+///
+/// `bool` is intentionally avoided: `false` cannot tell stale from deleted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionalSessionWrite {
+    Applied,
+    Stale,
+    Deleted,
+}
+
 /// Trait for session persistence backends.
 /// Implementations must be `Send + Sync` for sharing across async tasks.
 pub trait SessionBackend: Send + Sync {
     /// Load all messages for a session. Returns empty vec if session doesn't exist.
     fn load(&self, session_key: &str) -> Vec<ChatMessage>;
+
+    /// Load all messages for a durable Channel conversation without hiding
+    /// backend failures. Backends that do not support Channel conversation
+    /// records retain source compatibility through the default implementation.
+    fn load_fallible(&self, _session_key: &str) -> std::io::Result<Vec<ChatMessage>> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "fallible channel history reads are unsupported",
+        ))
+    }
 
     /// Same as `load`, but each row carries its persisted `created_at`
     /// when the backend has one. Default impl falls back to `load`
@@ -119,6 +189,7 @@ pub trait SessionBackend: Send + Sync {
                     channel_id: None,
                     room_id: None,
                     sender_id: None,
+                    conversation_id: None,
                 }
             })
             .collect()
@@ -217,6 +288,7 @@ pub trait SessionBackend: Send + Sync {
             channel_id: None,
             room_id: None,
             sender_id: None,
+            conversation_id: None,
         })
     }
 
@@ -245,6 +317,91 @@ pub trait SessionBackend: Send + Sync {
     fn list_stuck_sessions(&self, _threshold_secs: u64) -> Vec<SessionMetadata> {
         Vec::new()
     }
+
+    /// Open the current conversation record, creating an empty UUID-v4 record
+    /// when it is absent. Backends without channel-record support return
+    /// `Unsupported` by default so third-party implementations remain source
+    /// compatible.
+    fn open_conversation(&self, _session_key: &str) -> std::io::Result<ChannelConversationRecord> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "channel conversation records are unsupported",
+        ))
+    }
+
+    /// Apply one mutation only while the record carries the expected identity.
+    fn mutate_conversation_if_current(
+        &self,
+        _session_key: &str,
+        _expected_conversation_id: &str,
+        _mutation: SessionMutation<'_>,
+    ) -> std::io::Result<ConditionalSessionWrite> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "conditional channel conversation writes are unsupported",
+        ))
+    }
+
+    /// Read the current conversation id for `session_key` WITHOUT creating a
+    /// record on miss. Returns `None` when the record is absent. Implementations
+    /// MUST be independent of `get_session_metadata` (whose trait default leaves
+    /// `conversation_id` unset for backends like JSONL), otherwise durable
+    /// `is_current`/`existing_record_for_test` checks silently drop every turn.
+    fn current_conversation_id(&self, _session_key: &str) -> std::io::Result<Option<String>> {
+        Ok(self
+            .get_session_metadata(_session_key)
+            .and_then(|metadata| metadata.conversation_id))
+    }
+
+    #[doc(hidden)]
+    fn resolve_or_create_conversation_id(&self, _key: &str) -> std::io::Result<String> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "legacy conversation identity API is unsupported",
+        ))
+    }
+    #[doc(hidden)]
+    fn clear_and_rotate_conversation(&self, _key: &str) -> std::io::Result<String> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "legacy conversation rotation API is unsupported",
+        ))
+    }
+    #[doc(hidden)]
+    fn append_if_conversation_matches(
+        &self,
+        _key: &str,
+        _id: &str,
+        _message: &ChatMessage,
+    ) -> std::io::Result<ConditionalSessionWrite> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "legacy conditional conversation API is unsupported",
+        ))
+    }
+    #[doc(hidden)]
+    fn remove_last_if_conversation_matches(
+        &self,
+        _key: &str,
+        _id: &str,
+    ) -> std::io::Result<ConditionalSessionWrite> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "legacy conditional conversation API is unsupported",
+        ))
+    }
+    #[doc(hidden)]
+    fn update_last_if_conversation_matches(
+        &self,
+        _key: &str,
+        _id: &str,
+        _message: &ChatMessage,
+    ) -> std::io::Result<ConditionalSessionWrite> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "legacy conditional conversation API is unsupported",
+        ))
+    }
 }
 
 /// Session state information.
@@ -256,6 +413,123 @@ pub struct SessionState {
     pub turn_id: Option<String>,
     /// When the current state was entered.
     pub turn_started_at: Option<DateTime<Utc>>,
+}
+
+/// Shared contract every `SessionBackend` conditional-write impl must
+/// satisfy. Lives at module level (not in each backend's test module) so the
+/// JSONL and SQLite backends are pinned to ONE identical semantics. Both call
+/// this from their own test modules plus a backend-specific error test.
+#[cfg(test)]
+pub(crate) fn assert_channel_conversation_contract(backend: &dyn SessionBackend) {
+    let key = "channel.main_room_alice";
+    let opened = backend.open_conversation(key).unwrap();
+    let parsed = uuid::Uuid::parse_str(&opened.conversation_id).unwrap();
+    assert_eq!(parsed.get_version_num(), 4);
+    assert!(opened.history.is_empty());
+
+    let reopened = backend.open_conversation(key).unwrap();
+    assert_eq!(reopened.conversation_id, opened.conversation_id);
+    assert!(reopened.history.is_empty());
+
+    let user = ChatMessage::user("before");
+    assert_eq!(
+        backend
+            .mutate_conversation_if_current(
+                key,
+                &opened.conversation_id,
+                SessionMutation::Append(&user),
+            )
+            .unwrap(),
+        ConditionalSessionWrite::Applied,
+    );
+    let assistant = ChatMessage::assistant("draft");
+    backend
+        .mutate_conversation_if_current(
+            key,
+            &opened.conversation_id,
+            SessionMutation::Append(&assistant),
+        )
+        .unwrap();
+    backend
+        .mutate_conversation_if_current(
+            key,
+            &opened.conversation_id,
+            SessionMutation::RemoveLast {
+                expected_role: "assistant",
+                expected_content: "mismatch",
+            },
+        )
+        .unwrap();
+    assert_eq!(backend.open_conversation(key).unwrap().history.len(), 2);
+    backend
+        .mutate_conversation_if_current(
+            key,
+            &opened.conversation_id,
+            SessionMutation::RemoveLast {
+                expected_role: "assistant",
+                expected_content: "draft",
+            },
+        )
+        .unwrap();
+    let updated = ChatMessage::user("updated");
+    backend
+        .mutate_conversation_if_current(
+            key,
+            &opened.conversation_id,
+            SessionMutation::UpdateLast(&updated),
+        )
+        .unwrap();
+    let record = backend.open_conversation(key).unwrap();
+    assert_eq!(record.conversation_id, opened.conversation_id);
+    assert_eq!(record.history.len(), 1);
+    assert_eq!(record.history[0].content, "updated");
+
+    let stale_id = uuid::Uuid::new_v4().to_string();
+    assert_eq!(
+        backend
+            .mutate_conversation_if_current(
+                key,
+                &stale_id,
+                SessionMutation::Append(&ChatMessage::assistant("stale")),
+            )
+            .unwrap(),
+        ConditionalSessionWrite::Stale,
+    );
+    backend.delete_session(key).unwrap();
+    assert_eq!(
+        backend
+            .mutate_conversation_if_current(
+                key,
+                &opened.conversation_id,
+                SessionMutation::RemoveLast {
+                    expected_role: "user",
+                    expected_content: "updated",
+                },
+            )
+            .unwrap(),
+        ConditionalSessionWrite::Deleted,
+    );
+    assert!(!backend.session_exists(key));
+
+    let fresh = backend.open_conversation(key).unwrap();
+    assert_ne!(fresh.conversation_id, opened.conversation_id);
+    assert_eq!(
+        backend
+            .mutate_conversation_if_current(
+                key,
+                &opened.conversation_id,
+                SessionMutation::Append(&ChatMessage::assistant("stale")),
+            )
+            .unwrap(),
+        ConditionalSessionWrite::Stale,
+    );
+    assert_eq!(
+        uuid::Uuid::parse_str(&fresh.conversation_id)
+            .unwrap()
+            .get_version_num(),
+        4
+    );
+    assert!(fresh.history.is_empty());
 }
 
 #[cfg(test)]
@@ -274,6 +548,7 @@ mod tests {
             channel_id: None,
             room_id: None,
             sender_id: None,
+            conversation_id: None,
         };
         assert_eq!(meta.key, "test");
         assert_eq!(meta.message_count, 5);

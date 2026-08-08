@@ -502,6 +502,7 @@ pub fn all_tools(
     canvas_store: Option<CanvasStore>,
     is_subagent_caller: bool,
     tui_env: Option<HashMap<String, String>>,
+    channel_sessions: Option<Arc<zeroclaw_infra::channel_conversation::ChannelConversationStore>>,
 ) -> AllToolsResult {
     all_tools_with_runtime(
         config,
@@ -525,6 +526,7 @@ pub fn all_tools(
         None,
         None,
         None,
+        channel_sessions,
     )
 }
 
@@ -573,6 +575,11 @@ pub fn all_tools_with_runtime(
     // channel daemon (so reloads take effect); `None` for one-shot / non-channel
     // callers, which fall back to a snapshot of `root_config`.
     live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    // Shared Channel session lifecycle for `sessions_reset`/`sessions_delete`.
+    // `Some` from the channel orchestrator (so a Channel-owned target key resets
+    // / deletes through the fenced lifecycle); `None` for non-channel callers,
+    // which keep the backend-only behavior.
+    channel_sessions: Option<Arc<zeroclaw_infra::channel_conversation::ChannelConversationStore>>,
 ) -> AllToolsResult {
     let has_shell_access = runtime.has_shell_access();
     let persistent_writes = runtime.has_filesystem_access();
@@ -1139,7 +1146,21 @@ pub fn all_tools_with_runtime(
             backend.clone(),
             security.clone(),
         )));
-        tool_arcs.push(Arc::new(SessionsSendTool::new(backend, security.clone())));
+        tool_arcs.push(Arc::new(SessionsSendTool::new(
+            backend.clone(),
+            security.clone(),
+        )));
+        // Reset/delete route through the shared Channel lifecycle when the
+        // handle is wired (channel orchestrator); otherwise they clear/delete
+        // the backend record directly.
+        let mut reset = SessionResetTool::new(backend.clone(), security.clone());
+        let mut delete = SessionDeleteTool::new(backend.clone(), security.clone());
+        if let Some(ref channel_sessions) = channel_sessions {
+            reset = reset.with_channel_sessions(Arc::clone(channel_sessions));
+            delete = delete.with_channel_sessions(Arc::clone(channel_sessions));
+        }
+        tool_arcs.push(Arc::new(reset));
+        tool_arcs.push(Arc::new(delete));
     }
 
     // LinkedIn integration (config-gated)
@@ -1744,6 +1765,7 @@ mod tests {
             None,
             false,
             None,
+            None,
         )
         .tools;
 
@@ -1790,6 +1812,7 @@ mod tests {
             &cfg,
             None,
             false,
+            None,
             None,
         )
         .tools;
@@ -1855,6 +1878,7 @@ mod tests {
             false,
             None,
             Some(engine),
+            None,
             None,
             None,
         )
@@ -1927,6 +1951,7 @@ mod tests {
             Some(engine),
             None,
             None,
+            None,
         )
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -1984,6 +2009,7 @@ mod tests {
             Some(shared_engine.clone()),
             Some(shared_audit.clone()),
             None,
+            None,
         );
         let session_b = all_tools_with_runtime(
             Arc::new(Config::default()),
@@ -2006,6 +2032,7 @@ mod tests {
             None,
             Some(shared_engine.clone()),
             Some(shared_audit.clone()),
+            None,
             None,
         );
 
@@ -2133,6 +2160,7 @@ mod tests {
                 Some(shared_engine.clone()),
                 None,
                 None,
+                None,
             )
             .tools
         };
@@ -2225,6 +2253,7 @@ mod tests {
             &root_config,
             None,
             false,
+            None,
             None,
             None,
             None,
@@ -2435,6 +2464,7 @@ mod tests {
             None,
             false,
             None,
+            None,
         )
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -2482,6 +2512,7 @@ mod tests {
             &cfg,
             None,
             false,
+            None,
             None,
         )
         .tools;
@@ -2547,6 +2578,7 @@ mod tests {
                 None,
                 Some(sop_engine),
                 Some(sop_audit),
+                None,
                 None,
             )
             .tools
@@ -2706,6 +2738,7 @@ mod tests {
             None,
             false,
             None,
+            None,
         )
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -2744,6 +2777,7 @@ mod tests {
             &cfg,
             None,
             false,
+            None,
             None,
         )
         .tools;
@@ -2786,6 +2820,7 @@ mod tests {
             None,
             false,
             None,
+            None,
         )
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -2826,6 +2861,7 @@ mod tests {
             None,
             false,
             None,
+            None,
         )
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -2859,6 +2895,7 @@ mod tests {
             &cfg,
             None,
             is_subagent_caller,
+            None,
             None,
         )
         .tools
@@ -2934,6 +2971,7 @@ mod tests {
             None,
             false,
             None,
+            None,
         )
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -2997,6 +3035,7 @@ mod tests {
             None,
             false,
             None,
+            None,
         )
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -3041,6 +3080,7 @@ mod tests {
             &cfg,
             None,
             false,
+            None,
             None,
         )
         .tools;

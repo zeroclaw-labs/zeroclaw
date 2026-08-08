@@ -146,6 +146,35 @@ pub enum DaemonExit {
 
 const EPHEMERAL_GRACE_SECS: u64 = 1;
 
+fn session_persistence_disabled_event(
+    backend: &str,
+    error_kind: std::io::ErrorKind,
+) -> zeroclaw_log::Event {
+    zeroclaw_log::Event::new(module_path!(), zeroclaw_log::Action::Fail)
+        .with_outcome(zeroclaw_log::EventOutcome::Failure)
+        .with_attrs(serde_json::json!({
+            "backend": backend,
+            "error_kind": error_kind.to_string(),
+        }))
+}
+
+fn session_backend_or_memory_only(
+    backend: &str,
+    result: std::io::Result<std::sync::Arc<dyn zeroclaw_infra::session_backend::SessionBackend>>,
+) -> Option<std::sync::Arc<dyn zeroclaw_infra::session_backend::SessionBackend>> {
+    match result {
+        Ok(backend) => Some(backend),
+        Err(error) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                session_persistence_disabled_event(backend, error.kind()),
+                "SESSION_PERSISTENCE_DISABLED"
+            );
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 static SCHEDULER_CLEAN_SHUTDOWN_OBSERVED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -628,11 +657,13 @@ pub async fn run(
                 }
             });
         }
-        let session_backend = zeroclaw_infra::make_session_backend(
-            &config.data_dir,
+        let session_backend = session_backend_or_memory_only(
             &config.channels.session_backend,
-        )
-        .ok();
+            zeroclaw_infra::make_session_backend(
+                &config.data_dir,
+                &config.channels.session_backend,
+            ),
+        );
 
         // Wire the memory subsystem so `memory/list` and `memory/search`
         // work over RPC transports (same pattern as the gateway).
@@ -2350,6 +2381,29 @@ mod tests {
         };
         std::fs::create_dir_all(&config.data_dir).unwrap();
         config
+    }
+
+    #[test]
+    fn session_backend_failure_disables_persistence_without_logging_sensitive_details() {
+        let error = std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "/sensitive/data/sessions.db: session-key sender",
+        );
+        let event = session_persistence_disabled_event("sqlite", error.kind());
+        let result: std::io::Result<
+            std::sync::Arc<dyn zeroclaw_infra::session_backend::SessionBackend>,
+        > = Err(error);
+
+        assert!(session_backend_or_memory_only("sqlite", result).is_none());
+        assert_eq!(event.action, zeroclaw_log::Action::Fail);
+        assert_eq!(event.outcome, zeroclaw_log::EventOutcome::Failure);
+        let attributes = event.attrs.expect("disabled event should have attributes");
+        assert_eq!(attributes["backend"], "sqlite");
+        assert_eq!(attributes["error_kind"], "invalid data");
+        let rendered = attributes.to_string();
+        assert!(!rendered.contains("/sensitive/data/sessions.db"));
+        assert!(!rendered.contains("session-key"));
+        assert!(!rendered.contains("sender"));
     }
 
     #[test]

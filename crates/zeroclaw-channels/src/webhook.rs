@@ -44,6 +44,45 @@ struct OutgoingWebhook {
     recipient: Option<String>,
 }
 
+/// Build the inbound [`ChannelMessage`] for a decoded webhook payload.
+/// Extracted from the HTTP handler so the alias-stamping (the cross-alias
+/// record-isolation contract) is unit-testable without spinning up the
+/// server. The adapter sets `channel_alias` but does NOT mint a
+/// `conversation_id` - the orchestrator resolver mints that from the
+/// `conversation_history_key` derived (in part) from this alias.
+fn build_inbound_webhook_message(
+    alias: &str,
+    seq: u64,
+    payload: IncomingWebhook,
+) -> ChannelMessage {
+    #[allow(clippy::cast_possible_truncation)]
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let reply_target = payload
+        .thread_id
+        .clone()
+        .unwrap_or_else(|| payload.sender.clone());
+    ChannelMessage {
+        id: format!("webhook_{seq}"),
+        sender: payload.sender,
+        reply_target,
+        content: payload.content,
+        channel: "webhook".to_string(),
+        // Stamp the alias so two webhook aliases (`webhook.alpha` vs
+        // `webhook.beta`) compute distinct conversation_history_keys and never
+        // merge records.
+        channel_alias: Some(alias.to_string()),
+        timestamp,
+        thread_ts: payload.thread_id,
+        interruption_scope_id: None,
+        attachments: vec![],
+        subject: None,
+        ..Default::default()
+    }
+}
+
 impl WebhookChannel {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -370,12 +409,14 @@ impl Channel for WebhookChannel {
             tx: tokio::sync::mpsc::Sender<ChannelMessage>,
             secret: Option<String>,
             counter: Arc<AtomicU64>,
+            alias: String,
         }
 
         let state = Arc::new(WebhookState {
             tx: tx.clone(),
             secret: self.secret.clone(),
             counter: counter.clone(),
+            alias: self.alias.clone(),
         });
 
         let listen_path = self.listen_path.clone();
@@ -438,33 +479,7 @@ impl Channel for WebhookChannel {
             }
 
             let seq = state.counter.fetch_add(1, Ordering::Relaxed);
-
-            #[allow(clippy::cast_possible_truncation)]
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-
-            let reply_target = payload
-                .thread_id
-                .clone()
-                .unwrap_or_else(|| payload.sender.clone());
-
-            let msg = ChannelMessage {
-                id: format!("webhook_{seq}"),
-                sender: payload.sender,
-                reply_target,
-                content: payload.content,
-                channel: "webhook".to_string(),
-                channel_alias: None,
-                timestamp,
-                thread_ts: payload.thread_id,
-                interruption_scope_id: None,
-                attachments: vec![],
-                subject: None,
-
-                ..Default::default()
-            };
+            let msg = build_inbound_webhook_message(&state.alias, seq, payload);
 
             if state.tx.send(msg).await.is_err() {
                 return StatusCode::SERVICE_UNAVAILABLE;
@@ -1100,5 +1115,69 @@ mod tests {
             Some(100),
         );
         assert!(ch.send(&test_message()).await.is_err());
+    }
+
+    // ── cross-alias record isolation (Task 4, Step 5) ────────────────────
+    //
+    // The adapter stamps `channel_alias` so two webhook aliases
+    // (`webhook.alpha` vs `webhook.beta`) compute distinct
+    // `conversation_history_key`s and never merge records. The adapter does
+    // NOT mint a conversation_id - the orchestrator resolver does that.
+
+    fn incoming(sender: &str, content: &str, thread_id: Option<&str>) -> IncomingWebhook {
+        IncomingWebhook {
+            sender: sender.into(),
+            content: content.into(),
+            thread_id: thread_id.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn webhook_alias_stamped_on_inbound_message() {
+        let msg = build_inbound_webhook_message("alpha", 1, incoming("alice", "hi", None));
+        assert_eq!(msg.channel, "webhook");
+        assert_eq!(
+            msg.channel_alias.as_deref(),
+            Some("alpha"),
+            "adapter must stamp its alias so records are isolated per alias"
+        );
+        // The adapter mints no conversation id itself - that is the
+        // orchestrator resolver's job. ChannelMessage has no such field, so
+        // the only identity signal here is the alias.
+        assert_eq!(msg.sender, "alice");
+    }
+
+    #[test]
+    fn webhook_alias_same_sender_reuses_record() {
+        // Two inbound messages from the same alias + sender (different seq)
+        // must route to the SAME record (conversation_history_key), so the
+        // turn resolver reuses one conversation id across the turns.
+        let m1 = build_inbound_webhook_message("alpha", 1, incoming("alice", "hi", None));
+        let m2 = build_inbound_webhook_message("alpha", 2, incoming("alice", "again", None));
+        assert_ne!(m1.id, m2.id, "test premise: distinct message ids");
+        let key1 = crate::orchestrator::conversation_history_key(&m1);
+        let key2 = crate::orchestrator::conversation_history_key(&m2);
+        assert_eq!(key1, key2, "same alias+sender must reuse one record");
+    }
+
+    #[test]
+    fn webhook_alias_isolation_between_aliases() {
+        // Same sender, different alias -> different record (no merge). This is
+        // the regression guard: before alias stamping, two webhook aliases
+        // collapsed into one shared record.
+        let m_alpha = build_inbound_webhook_message("alpha", 1, incoming("alice", "hi", None));
+        let m_beta = build_inbound_webhook_message("beta", 2, incoming("alice", "hi", None));
+        let key_alpha = crate::orchestrator::conversation_history_key(&m_alpha);
+        let key_beta = crate::orchestrator::conversation_history_key(&m_beta);
+        assert_ne!(
+            key_alpha, key_beta,
+            "different webhook aliases must not merge records"
+        );
+        // Each alias is internally stable.
+        let m_alpha2 = build_inbound_webhook_message("alpha", 3, incoming("alice", "more", None));
+        assert_eq!(
+            crate::orchestrator::conversation_history_key(&m_alpha2),
+            key_alpha
+        );
     }
 }

@@ -72,6 +72,7 @@ pub enum ObserverEvent {
         channel: Option<String>,
         agent_alias: Option<String>,
         turn_id: Option<String>,
+        conversation_id: Option<String>,
     },
     /// A request is about to be sent to an LLM model_provider.
     ///
@@ -90,6 +91,7 @@ pub enum ObserverEvent {
         /// `None` for ordinary single-agent turns.
         parent_agent_alias: Option<String>,
         turn_id: Option<String>,
+        conversation_id: Option<String>,
     },
     /// Result of a single LLM model_provider call.
     LlmResponse {
@@ -115,6 +117,7 @@ pub enum ObserverEvent {
         /// `None` for ordinary single-agent turns.
         parent_agent_alias: Option<String>,
         turn_id: Option<String>,
+        conversation_id: Option<String>,
     },
     /// The agent session has finished.
     ///
@@ -128,6 +131,7 @@ pub enum ObserverEvent {
         channel: Option<String>,
         agent_alias: Option<String>,
         turn_id: Option<String>,
+        conversation_id: Option<String>,
     },
     /// A tool call is about to be executed.
     ToolCallStart {
@@ -152,6 +156,7 @@ pub enum ObserverEvent {
         /// `None` for ordinary single-agent turns.
         parent_agent_alias: Option<String>,
         turn_id: Option<String>,
+        conversation_id: Option<String>,
     },
     /// A tool call has completed with a success/failure outcome.
     ToolCall {
@@ -182,6 +187,7 @@ pub enum ObserverEvent {
         /// `None` for ordinary single-agent turns.
         parent_agent_alias: Option<String>,
         turn_id: Option<String>,
+        conversation_id: Option<String>,
     },
     /// A memory recall (search) operation has completed.
     ///
@@ -204,6 +210,7 @@ pub enum ObserverEvent {
         channel: Option<String>,
         agent_alias: Option<String>,
         turn_id: Option<String>,
+        conversation_id: Option<String>,
     },
     /// A memory store (write) operation has completed.
     ///
@@ -223,6 +230,7 @@ pub enum ObserverEvent {
         channel: Option<String>,
         agent_alias: Option<String>,
         turn_id: Option<String>,
+        conversation_id: Option<String>,
     },
     /// A memory audit/operator action was recorded on the audit trail.
     ///
@@ -252,6 +260,7 @@ pub enum ObserverEvent {
         channel: Option<String>,
         agent_alias: Option<String>,
         turn_id: Option<String>,
+        conversation_id: Option<String>,
     },
     /// The agent produced a final answer for the current user message.
     TurnComplete,
@@ -480,6 +489,7 @@ mod tests {
             channel: Some("wss".into()),
             agent_alias: Some("default".into()),
             turn_id: Some("turn-1".into()),
+            conversation_id: None,
         };
 
         match event {
@@ -514,6 +524,7 @@ mod tests {
             agent_alias: None,
             parent_agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         };
         let metric = ObserverMetric::RequestLatency(Duration::from_millis(8));
 
@@ -535,6 +546,7 @@ mod tests {
             channel: Some("cli".into()),
             agent_alias: Some("default".into()),
             turn_id: Some("turn-1".into()),
+            conversation_id: None,
         };
         let store = ObserverEvent::MemoryStore {
             category: "conversation".into(),
@@ -544,6 +556,7 @@ mod tests {
             channel: Some("cli".into()),
             agent_alias: Some("default".into()),
             turn_id: Some("turn-1".into()),
+            conversation_id: None,
         };
         let rag = ObserverEvent::RagRetrieve {
             query_summary: None,
@@ -553,6 +566,7 @@ mod tests {
             channel: Some("cli".into()),
             agent_alias: Some("default".into()),
             turn_id: Some("turn-1".into()),
+            conversation_id: None,
         };
         let audit = ObserverEvent::MemoryAudit {
             action: "store".into(),
@@ -570,5 +584,171 @@ mod tests {
         assert!(matches!(store.clone(), ObserverEvent::MemoryStore { .. }));
         assert!(matches!(rag.clone(), ObserverEvent::RagRetrieve { .. }));
         assert!(matches!(audit.clone(), ObserverEvent::MemoryAudit { .. }));
+    }
+
+    /// Extracts the `conversation_id` from the nine turn-attributed event
+    /// variants, returning `None` for root/non-attributed events. This is the
+    /// public contract surface for cross-turn conversation attribution: every
+    /// turn-scoped lifecycle event carries an opaque conversation id alongside
+    /// its `turn_id`.
+    fn conversation_id(event: &ObserverEvent) -> Option<&str> {
+        match event {
+            ObserverEvent::AgentStart {
+                conversation_id, ..
+            }
+            | ObserverEvent::AgentEnd {
+                conversation_id, ..
+            }
+            | ObserverEvent::LlmRequest {
+                conversation_id, ..
+            }
+            | ObserverEvent::LlmResponse {
+                conversation_id, ..
+            }
+            | ObserverEvent::ToolCallStart {
+                conversation_id, ..
+            }
+            | ObserverEvent::ToolCall {
+                conversation_id, ..
+            }
+            | ObserverEvent::MemoryRecall {
+                conversation_id, ..
+            }
+            | ObserverEvent::MemoryStore {
+                conversation_id, ..
+            }
+            | ObserverEvent::RagRetrieve {
+                conversation_id, ..
+            } => conversation_id.as_deref(),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn turn_events_carry_conversation_id() {
+        let expected = "conversation-opaque-1";
+        let events: Vec<ObserverEvent> = vec![
+            ObserverEvent::AgentStart {
+                model_provider: "anthropic".into(),
+                model: "claude-sonnet-4-6".into(),
+                channel: None,
+                agent_alias: None,
+                turn_id: None,
+                conversation_id: Some(expected.into()),
+            },
+            ObserverEvent::LlmRequest {
+                model_provider: "anthropic".into(),
+                model: "claude-sonnet-4-6".into(),
+                messages_count: 1,
+                channel: None,
+                agent_alias: None,
+                parent_agent_alias: None,
+                turn_id: None,
+                conversation_id: Some(expected.into()),
+            },
+            ObserverEvent::LlmResponse {
+                model_provider: "anthropic".into(),
+                model: "claude-sonnet-4-6".into(),
+                duration: Duration::from_millis(10),
+                success: true,
+                error_message: None,
+                input_tokens: None,
+                output_tokens: None,
+                messages: None,
+                channel: None,
+                agent_alias: None,
+                parent_agent_alias: None,
+                turn_id: None,
+                conversation_id: Some(expected.into()),
+            },
+            ObserverEvent::AgentEnd {
+                model_provider: "anthropic".into(),
+                model: "claude-sonnet-4-6".into(),
+                duration: Duration::from_millis(10),
+                tokens_used: None,
+                cost_usd: None,
+                channel: None,
+                agent_alias: None,
+                turn_id: None,
+                conversation_id: Some(expected.into()),
+            },
+            ObserverEvent::ToolCallStart {
+                tool: "shell".into(),
+                tool_call_id: None,
+                arguments: None,
+                channel: None,
+                agent_alias: None,
+                parent_agent_alias: None,
+                turn_id: None,
+                conversation_id: Some(expected.into()),
+            },
+            ObserverEvent::ToolCall {
+                tool: "shell".into(),
+                tool_call_id: None,
+                duration: Duration::from_millis(5),
+                success: true,
+                arguments: None,
+                result: None,
+                channel: None,
+                agent_alias: None,
+                parent_agent_alias: None,
+                turn_id: None,
+                conversation_id: Some(expected.into()),
+            },
+            ObserverEvent::MemoryRecall {
+                query_summary: None,
+                duration: Duration::from_millis(5),
+                num_entries: 0,
+                backend: "sqlite".into(),
+                success: true,
+                channel: None,
+                agent_alias: None,
+                turn_id: None,
+                conversation_id: Some(expected.into()),
+            },
+            ObserverEvent::MemoryStore {
+                category: "core".into(),
+                backend: "sqlite".into(),
+                duration: Duration::from_millis(5),
+                success: true,
+                channel: None,
+                agent_alias: None,
+                turn_id: None,
+                conversation_id: Some(expected.into()),
+            },
+            ObserverEvent::RagRetrieve {
+                query_summary: None,
+                duration: Duration::from_millis(5),
+                num_chunks: 0,
+                num_boards: 0,
+                channel: None,
+                agent_alias: None,
+                turn_id: None,
+                conversation_id: Some(expected.into()),
+            },
+        ];
+
+        for event in &events {
+            assert_eq!(
+                conversation_id(event),
+                Some(expected),
+                "turn event {:?} must carry conversation_id",
+                event,
+            );
+        }
+    }
+
+    #[test]
+    fn root_events_do_not_carry_conversation_id() {
+        // `MemoryAudit` is a root audit event and must NOT gain the field.
+        let audit = ObserverEvent::MemoryAudit {
+            action: "store".into(),
+            backend: "sqlite".into(),
+            duration: Duration::from_millis(2),
+            success: true,
+        };
+        assert_eq!(conversation_id(&audit), None);
+        assert_eq!(conversation_id(&ObserverEvent::TurnComplete), None);
+        assert_eq!(conversation_id(&ObserverEvent::HeartbeatTick), None);
     }
 }

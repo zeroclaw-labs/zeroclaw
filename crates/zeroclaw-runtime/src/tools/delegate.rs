@@ -28,8 +28,17 @@ use zeroclaw_tools::memory_purge::MemoryPurgeTool;
 use zeroclaw_tools::memory_recall::MemoryRecallTool;
 use zeroclaw_tools::memory_store::MemoryStoreTool;
 
+use crate::agent::loop_::current_tool_loop_conversation_id;
+
 fn current_tool_loop_session_key() -> Option<String> {
     TOOL_LOOP_SESSION_KEY.try_with(Clone::clone).ok().flatten()
+}
+
+async fn scope_delegate_conversation_id<F>(conversation_id: Option<String>, future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    crate::agent::loop_::scope_conversation_id(conversation_id, future).await
 }
 
 async fn scope_delegate_session_key<F>(session_key: Option<String>, future: F) -> F::Output
@@ -146,6 +155,8 @@ pub struct DelegateTool {
     /// advertised roster so an agent is never offered itself as a
     /// delegation target. Empty when unset (legacy unit-test constructors).
     caller_alias: String,
+    #[cfg(test)]
+    test_observer: Option<Arc<dyn Observer>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -258,6 +269,8 @@ impl DelegateTool {
             skill_bundles: Arc::new(HashMap::new()),
             root_config: None,
             caller_alias: String::new(),
+            #[cfg(test)]
+            test_observer: None,
         }
     }
 
@@ -305,6 +318,8 @@ impl DelegateTool {
             skill_bundles: Arc::new(HashMap::new()),
             root_config: None,
             caller_alias: String::new(),
+            #[cfg(test)]
+            test_observer: None,
         }
     }
 
@@ -746,6 +761,7 @@ impl DelegateTool {
             config,
             None,
             false,
+            None,
             None,
             None,
             None,
@@ -1540,11 +1556,16 @@ impl DelegateTool {
         let root_config = self.root_config.clone();
         let caller_alias = self.caller_alias.clone();
         let memory = self.memory.clone();
+        #[cfg(test)]
+        let test_observer = self.test_observer.clone();
         let parent_session_key = current_tool_loop_session_key();
+        let parent_conversation_id = current_tool_loop_conversation_id();
         let __zc_delegate_alias = agent_name_owned.clone();
 
         zeroclaw_spawn::spawn!(
-            scope_delegate_session_key(parent_session_key, async move {
+            scope_delegate_conversation_id(
+                parent_conversation_id,
+                scope_delegate_session_key(parent_session_key, async move {
                 let inner = DelegateTool {
                     agents,
                     security,
@@ -1564,6 +1585,8 @@ impl DelegateTool {
                     skill_bundles,
                     root_config,
                     caller_alias,
+                    #[cfg(test)]
+                    test_observer,
                 };
 
                 let args_inner = json!({
@@ -1653,7 +1676,8 @@ impl DelegateTool {
                 Self::background_task_cancels()
                     .lock()
                     .remove(&task_id_clone);
-            })
+                }),
+            )
             .instrument(::zeroclaw_log::attribution_span!(
                 &crate::agent::AgentAttribution(__zc_delegate_alias.as_str())
             ))
@@ -1759,6 +1783,7 @@ impl DelegateTool {
             .ok()
             .flatten();
         let parent_session_key = current_tool_loop_session_key();
+        let parent_conversation_id = current_tool_loop_conversation_id();
 
         // Spawn all agents concurrently
         let mut handles = Vec::with_capacity(agent_names.len());
@@ -1788,7 +1813,10 @@ impl DelegateTool {
             let root_config = self.root_config.clone();
             let caller_alias = self.caller_alias.clone();
             let session_key = parent_session_key.clone();
+            let conversation_id = parent_conversation_id.clone();
             let memory = self.memory.clone();
+            #[cfg(test)]
+            let test_observer = self.test_observer.clone();
             let __zc_delegate_alias = agent_name.clone();
 
             handles.push(zeroclaw_spawn::spawn!(
@@ -1812,16 +1840,21 @@ impl DelegateTool {
                         skill_bundles,
                         root_config,
                         caller_alias,
+                        #[cfg(test)]
+                        test_observer,
                     };
                     let agent_name_for_return = agent_name.clone();
-                    let result = scope_delegate_session_key(session_key, async move {
-                        crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
-                            .scope(receipt_scope, async move {
-                                Box::pin(inner.execute_sync(&agent_name, &prompt, &args_clone))
-                                    .await
-                            })
-                            .await
-                    })
+                    let result = scope_delegate_conversation_id(
+                        conversation_id,
+                        scope_delegate_session_key(session_key, async move {
+                            crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
+                                .scope(receipt_scope, async move {
+                                    Box::pin(inner.execute_sync(&agent_name, &prompt, &args_clone))
+                                        .await
+                                })
+                                .await
+                        }),
+                    )
                     .await;
                     (agent_name_for_return, result)
                 }
@@ -2613,6 +2646,10 @@ impl DelegateTool {
         history.push(ChatMessage::user(full_prompt.to_string()));
 
         let noop_observer = NoopObserver;
+        #[cfg(test)]
+        let child_observer = self.test_observer.as_deref().unwrap_or(&noop_observer);
+        #[cfg(not(test))]
+        let child_observer: &dyn Observer = &noop_observer;
 
         let agentic_timeout_secs = self
             .resolve_agentic_timeout_secs(&agent_config.runtime_profile)
@@ -2624,6 +2661,7 @@ impl DelegateTool {
         let receipt_generator = receipt_scope.as_ref().map(|s| &s.generator);
         let collected_receipts = receipt_scope.as_ref().map(|s| s.collector.as_ref());
         let turn_id = uuid::Uuid::new_v4().to_string();
+        let parent_conversation_id = current_tool_loop_conversation_id();
         let result = tokio::time::timeout(
             Duration::from_secs(agentic_timeout_secs),
             run_tool_call_loop(ToolLoop {
@@ -2637,7 +2675,7 @@ impl DelegateTool {
                     },
                     ResolvedIo {
                         tools_registry: &sub_tools,
-                        observer: &noop_observer,
+                        observer: child_observer,
                         silent: true,
                         approval: None,
                         multimodal_config: &self.multimodal_config,
@@ -2690,6 +2728,7 @@ impl DelegateTool {
                 agent_alias: Some(agent_name),
                 parent_agent_alias: None,
                 turn_id: &turn_id,
+                conversation_id: parent_conversation_id.as_deref(),
             })
             .instrument(::zeroclaw_log::attribution_span!(
                 &crate::agent::AgentAttribution(agent_name)
@@ -3416,6 +3455,69 @@ mod tests {
         target_config: AliasedAgentConfig,
     }
 
+    #[derive(Default)]
+    struct CapturingObserver {
+        events: parking_lot::Mutex<Vec<ObserverEvent>>,
+    }
+
+    impl Observer for CapturingObserver {
+        fn record_event(&self, event: &ObserverEvent) {
+            self.events.lock().push(event.clone());
+        }
+
+        fn record_metric(&self, _metric: &ObserverMetric) {}
+
+        fn name(&self) -> &str {
+            "delegate-capturing"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    fn attributed_conversation_id(event: &ObserverEvent) -> Option<Option<&str>> {
+        match event {
+            ObserverEvent::AgentStart {
+                conversation_id, ..
+            }
+            | ObserverEvent::AgentEnd {
+                conversation_id, ..
+            }
+            | ObserverEvent::LlmRequest {
+                conversation_id, ..
+            }
+            | ObserverEvent::LlmResponse {
+                conversation_id, ..
+            }
+            | ObserverEvent::ToolCallStart {
+                conversation_id, ..
+            }
+            | ObserverEvent::ToolCall {
+                conversation_id, ..
+            }
+            | ObserverEvent::MemoryRecall {
+                conversation_id, ..
+            }
+            | ObserverEvent::MemoryStore {
+                conversation_id, ..
+            }
+            | ObserverEvent::RagRetrieve {
+                conversation_id, ..
+            } => Some(conversation_id.as_deref()),
+            _ => None,
+        }
+    }
+
+    fn take_attributed_conversation_ids(observer: &CapturingObserver) -> Vec<Option<String>> {
+        observer
+            .events
+            .lock()
+            .drain(..)
+            .filter_map(|event| attributed_conversation_id(&event).map(|id| id.map(str::to_string)))
+            .collect()
+    }
+
     fn scoped_sqlite_memory(inner: Arc<SqliteMemory>, agent_id: &str) -> Arc<dyn Memory> {
         let inner_dyn: Arc<dyn Memory> = inner;
         Arc::new(AgentScopedMemory::new(
@@ -4064,6 +4166,128 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(desc.contains("none configured"));
+    }
+
+    #[tokio::test]
+    async fn internal_delegate_inherits_parent_conversation_id() {
+        let server = start_final_chat_server(vec![
+            "foreground-ok",
+            "parallel-a-ok",
+            "parallel-b-ok",
+            "background-ok",
+            "unscoped-ok",
+        ])
+        .await;
+        let mut fixture = delegate_memory_fixture(Some(server.uri.clone())).await;
+        let observer = Arc::new(CapturingObserver::default());
+        fixture.tool.test_observer = Some(observer.clone());
+        let expected = "parent-conversation-id";
+
+        let foreground = scope_delegate_conversation_id(
+            Some(expected.to_string()),
+            fixture.tool.execute(json!({
+                "agent": "target",
+                "prompt": "run in foreground"
+            })),
+        )
+        .await
+        .unwrap();
+        assert!(
+            foreground.success,
+            "foreground delegate failed: {foreground:?}"
+        );
+        let foreground_ids = take_attributed_conversation_ids(&observer);
+        assert!(
+            !foreground_ids.is_empty(),
+            "foreground child loop emitted no attributed events"
+        );
+        assert!(
+            foreground_ids
+                .iter()
+                .all(|id| id.as_deref() == Some(expected)),
+            "foreground child events did not inherit the parent id: {foreground_ids:?}"
+        );
+
+        let parallel = scope_delegate_conversation_id(
+            Some(expected.to_string()),
+            fixture.tool.execute(json!({
+                "parallel": ["target", "target"],
+                "prompt": "run in parallel"
+            })),
+        )
+        .await
+        .unwrap();
+        assert!(parallel.success, "parallel delegate failed: {parallel:?}");
+        let parallel_ids = take_attributed_conversation_ids(&observer);
+        assert!(
+            !parallel_ids.is_empty(),
+            "parallel child loops emitted no attributed events"
+        );
+        assert!(
+            parallel_ids
+                .iter()
+                .all(|id| id.as_deref() == Some(expected)),
+            "parallel child events did not inherit the parent id: {parallel_ids:?}"
+        );
+
+        let background = scope_delegate_conversation_id(
+            Some(expected.to_string()),
+            fixture.tool.execute(json!({
+                "agent": "target",
+                "prompt": "run in background",
+                "background": true
+            })),
+        )
+        .await
+        .unwrap();
+        assert!(
+            background.success,
+            "background delegate failed: {background:?}"
+        );
+        let task_id = background
+            .output
+            .lines()
+            .find(|line| line.starts_with("task_id:"))
+            .unwrap()
+            .trim_start_matches("task_id: ")
+            .trim();
+        let background_result =
+            wait_for_terminal_background_result(&fixture.workspace_dir, task_id).await;
+        assert_eq!(
+            background_result.status,
+            BackgroundTaskStatus::Completed,
+            "{background_result:?}"
+        );
+        let background_ids = take_attributed_conversation_ids(&observer);
+        assert!(
+            !background_ids.is_empty(),
+            "background child loop emitted no attributed events"
+        );
+        assert!(
+            background_ids
+                .iter()
+                .all(|id| id.as_deref() == Some(expected)),
+            "background child events did not inherit the parent id: {background_ids:?}"
+        );
+
+        let unscoped = fixture
+            .tool
+            .execute(json!({
+                "agent": "target",
+                "prompt": "run without a parent scope"
+            }))
+            .await
+            .unwrap();
+        assert!(unscoped.success, "unscoped delegate failed: {unscoped:?}");
+        let unscoped_ids = take_attributed_conversation_ids(&observer);
+        assert!(
+            !unscoped_ids.is_empty(),
+            "unscoped child loop emitted no attributed events"
+        );
+        assert!(
+            unscoped_ids.iter().all(Option::is_none),
+            "unscoped child events unexpectedly had conversation ids: {unscoped_ids:?}"
+        );
     }
 
     #[tokio::test]

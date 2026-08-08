@@ -25,6 +25,7 @@ impl Observer for LogObserver {
                 channel: _,
                 agent_alias: _,
                 turn_id: _,
+                conversation_id: _,
             } => {
                 ::zeroclaw_log::record!(
                     INFO,
@@ -44,6 +45,7 @@ impl Observer for LogObserver {
                 channel: _,
                 agent_alias: _,
                 turn_id: _,
+                conversation_id: _,
             } => {
                 let ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
                 ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"model_provider": model_provider, "model": model, "duration_ms": ms, "tokens": tokens_used, "cost_usd": cost_usd})), "agent.end");
@@ -206,6 +208,7 @@ impl Observer for LogObserver {
                 agent_alias: _,
                 parent_agent_alias: _,
                 turn_id: _,
+                conversation_id: _,
             } => {
                 ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"model_provider": model_provider, "model": model, "messages_count": messages_count})), "llm.request");
             }
@@ -344,6 +347,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::AgentEnd {
             model_provider: "openrouter".into(),
@@ -354,6 +358,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::AgentEnd {
             model_provider: "openrouter".into(),
@@ -364,6 +369,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::LlmResponse {
             parent_agent_alias: None,
@@ -378,6 +384,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::LlmResponse {
             parent_agent_alias: None,
@@ -392,6 +399,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             parent_agent_alias: None,
@@ -404,6 +412,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::ChannelMessage {
             channel: "telegram".into(),

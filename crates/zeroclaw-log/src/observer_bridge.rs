@@ -106,6 +106,7 @@ fn project(event: &LogEvent) -> Option<ObserverEvent> {
             channel: channel_opt,
             agent_alias: agent_alias_opt,
             turn_id: turn_id_opt,
+            conversation_id: None,
         }),
         "agent_end" => Some(ObserverEvent::AgentEnd {
             model_provider,
@@ -135,6 +136,7 @@ fn project(event: &LogEvent) -> Option<ObserverEvent> {
             channel: channel_opt,
             agent_alias: agent_alias_opt,
             turn_id: turn_id_opt,
+            conversation_id: None,
         }),
         "llm_request" => Some(ObserverEvent::LlmRequest {
             model_provider,
@@ -148,6 +150,7 @@ fn project(event: &LogEvent) -> Option<ObserverEvent> {
             agent_alias: agent_alias_opt,
             parent_agent_alias: parent_agent_alias_opt.clone(),
             turn_id: turn_id_opt,
+            conversation_id: None,
         }),
         "llm_response" => Some(ObserverEvent::LlmResponse {
             model_provider,
@@ -172,6 +175,7 @@ fn project(event: &LogEvent) -> Option<ObserverEvent> {
             agent_alias: agent_alias_opt,
             parent_agent_alias: parent_agent_alias_opt.clone(),
             turn_id: turn_id_opt,
+            conversation_id: None,
         }),
         "tool_call_start" => Some(ObserverEvent::ToolCallStart {
             tool,
@@ -181,6 +185,7 @@ fn project(event: &LogEvent) -> Option<ObserverEvent> {
             agent_alias: agent_alias_opt,
             parent_agent_alias: parent_agent_alias_opt.clone(),
             turn_id: turn_id_opt,
+            conversation_id: None,
         }),
         "tool_call" | "tool_call_result" => Some(ObserverEvent::ToolCall {
             tool,
@@ -193,6 +198,7 @@ fn project(event: &LogEvent) -> Option<ObserverEvent> {
             agent_alias: agent_alias_opt,
             parent_agent_alias: parent_agent_alias_opt.clone(),
             turn_id: turn_id_opt,
+            conversation_id: None,
         }),
         "memory_audit" => Some(ObserverEvent::MemoryAudit {
             action: event
@@ -410,6 +416,7 @@ mod tests {
                 agent_alias,
                 parent_agent_alias: _,
                 turn_id,
+                ..
             } => {
                 assert_eq!(model_provider, "anthropic");
                 assert_eq!(model, "claude-sonnet-4-6");
@@ -461,5 +468,82 @@ mod tests {
         }
 
         clear_observer_bridge();
+    }
+
+    /// A `LogEvent` carrying canary values in every session-bearing field a
+    /// naive fallback might reach for (`session_key`, `session_id`,
+    /// `trace_id`, `memory_session_id`, `sender`, `path`, plus an explicit
+    /// `conversation_id` attribute - the most likely future regression) must
+    /// still project to an `ObserverEvent` whose `conversation_id` is
+    /// `None`. The bridge is the only producer of `ObserverEvent`s from the
+    /// log stream, so this guards that the conversation id is sourced
+    /// explicitly rather than inferred from a transport identifier, which
+    /// would be a cardinality hazard across long-lived sessions.
+    #[test]
+    fn observer_bridge_conversation_id_none_for_poisoned_session_fields() {
+        let canary = "poison-conv-id";
+        for (action, category) in [
+            ("agent_start", EventCategory::Agent),
+            ("agent_end", EventCategory::Agent),
+            ("llm_request", EventCategory::Agent),
+            ("llm_response", EventCategory::Agent),
+            ("tool_call_start", EventCategory::Tool),
+            ("tool_call", EventCategory::Tool),
+        ] {
+            let mut event = LogEvent::new(Severity::Info, action, category);
+            event.zeroclaw.set("session_key", canary);
+            event
+                .zeroclaw
+                .set_composite("model_provider", "anthropic.default");
+            event.zeroclaw.set("model", "claude-sonnet-4-6");
+            event.zeroclaw.set("tool", "shell");
+            event.zeroclaw.set_composite("channel", "wss.default");
+            event.zeroclaw.set("agent_alias", "default");
+            event.zeroclaw.duration_ms = Some(10);
+            // Promoted trace id on the row itself.
+            event.trace_id = Some(canary.into());
+            // Free-form attributes a fallback might reach for, including an
+            // explicit `conversation_id` key alongside the session-bearing
+            // identifiers.
+            event.attributes = serde_json::json!({
+                "conversation_id": canary,
+                "session_id": canary,
+                "trace_id": canary,
+                "memory_session_id": canary,
+                "sender": canary,
+                "path": canary,
+                "messages_count": 2,
+                "input_tokens": 10,
+                "output_tokens": 5,
+            });
+            event.set_outcome(EventOutcome::Success);
+
+            let projected = project(&event).expect("action should project to a typed variant");
+            let conversation_id = match projected {
+                ObserverEvent::AgentStart {
+                    conversation_id, ..
+                }
+                | ObserverEvent::AgentEnd {
+                    conversation_id, ..
+                }
+                | ObserverEvent::LlmRequest {
+                    conversation_id, ..
+                }
+                | ObserverEvent::LlmResponse {
+                    conversation_id, ..
+                }
+                | ObserverEvent::ToolCallStart {
+                    conversation_id, ..
+                }
+                | ObserverEvent::ToolCall {
+                    conversation_id, ..
+                } => conversation_id,
+                other => panic!("unexpected projected variant for `{action}`: {other:?}"),
+            };
+            assert_eq!(
+                conversation_id, None,
+                "conversation_id leaked from a session-bearing field for action `{action}`"
+            );
+        }
     }
 }

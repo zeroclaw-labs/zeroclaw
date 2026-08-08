@@ -49,6 +49,7 @@ pub struct AgentTurnGuard<'a> {
     model: String,
     channel: Option<String>,
     agent_alias: Option<String>,
+    conversation_id: Option<String>,
     turn_id: Option<String>,
     turn_started_at: Instant,
     tokens_used: Option<zeroclaw_api::observability_traits::TurnTokenUsage>,
@@ -58,12 +59,19 @@ pub struct AgentTurnGuard<'a> {
 
 impl<'a> AgentTurnGuard<'a> {
     /// Open a lifecycle bracket and emit its start event.
+    ///
+    /// `conversation_id` is caller-owned cross-turn attribution, stored on the
+    /// guard so the matching `AgentEnd` (on `finish` or drop) emits the SAME
+    /// value as `AgentStart` - never re-derived. `None` for paths without a
+    /// conversation owner. It comes BEFORE `turn_id` to match the mint-site
+    /// signature used by `agent_turn`/`Agent::turn`.
     pub fn start(
         observer: &'a dyn Observer,
         model_provider: impl Into<String>,
         model: impl Into<String>,
         channel: Option<String>,
         agent_alias: Option<String>,
+        conversation_id: Option<String>,
         turn_id: Option<String>,
     ) -> Self {
         let model_provider = model_provider.into();
@@ -74,6 +82,7 @@ impl<'a> AgentTurnGuard<'a> {
             channel: channel.clone(),
             agent_alias: agent_alias.clone(),
             turn_id: turn_id.clone(),
+            conversation_id: conversation_id.clone(),
         });
         Self {
             observer,
@@ -81,6 +90,7 @@ impl<'a> AgentTurnGuard<'a> {
             model,
             channel,
             agent_alias,
+            conversation_id,
             turn_id,
             turn_started_at: Instant::now(),
             tokens_used: None,
@@ -120,6 +130,7 @@ impl<'a> AgentTurnGuard<'a> {
             channel: self.channel.clone(),
             agent_alias: self.agent_alias.clone(),
             turn_id: self.turn_id.clone(),
+            conversation_id: self.conversation_id.clone(),
         });
     }
 }
@@ -422,19 +433,19 @@ fn create_primary_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
     }
 }
 
-/// Serializes tests (in this module and elsewhere in the crate, e.g. the
-/// `agent::loop_` lifecycle-bracket tests that drive `run()` end to end)
-/// that install the process-wide broadcast hook, so concurrent test runs
-/// don't observe each other's installations. A `tokio::sync::Mutex` (not
-/// `parking_lot`) so async tests can hold the guard across the `.await` on
-/// `run()` without tripping `clippy::await_holding_lock`; plain `#[test]`s
-/// use [`tokio::sync::Mutex::blocking_lock`].
+/// Serializes tests that modify process-wide observer state, including the
+/// broadcast hook and `agent::loop_`'s test-only observer override. Those
+/// globals affect the same observer-selection path and must not be changed by
+/// concurrent tests. A `tokio::sync::Mutex` (not `parking_lot`) lets async tests
+/// hold the guard across `.await`; plain `#[test]`s use
+/// [`tokio::sync::Mutex::blocking_lock`].
 #[cfg(test)]
 pub(crate) static HOOK_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use parking_lot::Mutex as PlMutex;
 
     #[test]
     fn factory_none_returns_noop() {
@@ -771,6 +782,7 @@ mod tests {
                 "model",
                 Some("channel".into()),
                 Some("agent".into()),
+                None,
                 Some("turn".into()),
             );
             panic!("test unwind");
@@ -793,6 +805,7 @@ mod tests {
             "model",
             Some("channel".into()),
             Some("agent".into()),
+            None,
             Some("turn".into()),
         );
         guard.finish();
@@ -803,6 +816,168 @@ mod tests {
             observer.events.load(Ordering::SeqCst),
             2,
             "explicit finish and drop must still emit one matched pair"
+        );
+    }
+
+    #[test]
+    fn agent_turn_guard_model_route_updates_only_the_closing_event() {
+        #[derive(Default)]
+        struct CapturingObserver(PlMutex<Vec<ObserverEvent>>);
+
+        impl Observer for CapturingObserver {
+            fn record_event(&self, event: &ObserverEvent) {
+                self.0.lock().push(event.clone());
+            }
+
+            fn record_metric(&self, _metric: &ObserverMetric) {}
+
+            fn name(&self) -> &str {
+                "capturing"
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let observer = CapturingObserver::default();
+        let mut guard = AgentTurnGuard::start(
+            &observer,
+            "provider-a",
+            "model-a",
+            Some("cli".into()),
+            Some("agent".into()),
+            Some("conversation".into()),
+            Some("turn".into()),
+        );
+        guard.set_model_route("provider-b", "model-b");
+        guard.finish();
+
+        let events = observer.0.lock();
+        assert_eq!(events.len(), 2, "route changes must not reopen the bracket");
+        assert!(matches!(
+            &events[0],
+            ObserverEvent::AgentStart {
+                model_provider,
+                model,
+                ..
+            } if model_provider == "provider-a" && model == "model-a"
+        ));
+        assert!(matches!(
+            &events[1],
+            ObserverEvent::AgentEnd {
+                model_provider,
+                model,
+                ..
+            } if model_provider == "provider-b" && model == "model-b"
+        ));
+    }
+
+    /// Capture the `conversation_id` of each `AgentStart`/`AgentEnd` so the
+    /// drop-safe bracket can be asserted to carry the SAME caller-owned id on
+    /// both ends - including the panic-unwind path that only runs `Drop`.
+    #[derive(Default)]
+    struct ConversationCapturingObserver {
+        ids: parking_lot::Mutex<Vec<Option<String>>>,
+    }
+
+    impl Observer for ConversationCapturingObserver {
+        fn record_event(&self, event: &ObserverEvent) {
+            let conv = match event {
+                ObserverEvent::AgentStart {
+                    conversation_id, ..
+                }
+                | ObserverEvent::AgentEnd {
+                    conversation_id, ..
+                }
+                | ObserverEvent::LlmRequest {
+                    conversation_id, ..
+                }
+                | ObserverEvent::LlmResponse {
+                    conversation_id, ..
+                }
+                | ObserverEvent::ToolCallStart {
+                    conversation_id, ..
+                }
+                | ObserverEvent::ToolCall {
+                    conversation_id, ..
+                }
+                | ObserverEvent::MemoryRecall {
+                    conversation_id, ..
+                }
+                | ObserverEvent::MemoryStore {
+                    conversation_id, ..
+                }
+                | ObserverEvent::RagRetrieve {
+                    conversation_id, ..
+                } => conversation_id.clone(),
+                _ => return,
+            };
+            self.ids.lock().push(conv);
+        }
+        fn record_metric(&self, _metric: &ObserverMetric) {}
+        fn name(&self) -> &str {
+            "conv-capturing"
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn flush(&self) {}
+    }
+
+    #[test]
+    fn agent_turn_guard_carries_conversation_id_on_start_and_finish() {
+        let observer = ConversationCapturingObserver::default();
+        let mut guard = AgentTurnGuard::start(
+            &observer,
+            "provider",
+            "model",
+            Some("channel".into()),
+            Some("agent".into()),
+            Some("conv-finish".into()),
+            Some("turn".into()),
+        );
+        guard.finish();
+        drop(guard);
+
+        let ids = observer.ids.lock();
+        assert_eq!(
+            ids.len(),
+            2,
+            "exactly one AgentStart + one AgentEnd must be captured, got {ids:?}"
+        );
+        assert!(
+            ids.iter().all(|id| id.as_deref() == Some("conv-finish")),
+            "start and finish must both carry conv-finish, got {ids:?}"
+        );
+    }
+
+    #[test]
+    fn agent_turn_guard_carries_conversation_id_through_panic_unwind() {
+        let observer = ConversationCapturingObserver::default();
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = AgentTurnGuard::start(
+                &observer,
+                "provider",
+                "model",
+                Some("channel".into()),
+                Some("agent".into()),
+                Some("conv-unwind".into()),
+                Some("turn".into()),
+            );
+            panic!("test unwind with a live conversation id");
+        }));
+
+        assert!(unwind.is_err());
+        let ids = observer.ids.lock();
+        assert_eq!(
+            ids.len(),
+            2,
+            "panic unwind must still emit a matched AgentStart/AgentEnd pair, got {ids:?}"
+        );
+        assert!(
+            ids.iter().all(|id| id.as_deref() == Some("conv-unwind")),
+            "drop on unwind must carry the same conversation id as start, got {ids:?}"
         );
     }
 }

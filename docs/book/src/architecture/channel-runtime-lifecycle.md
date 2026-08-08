@@ -97,6 +97,24 @@ If a PR changes one of those responsibilities for only one channel, reviewers
 should ask whether it belongs in the shared lifecycle or in typed channel
 capability metadata.
 
+### Session identity and lifecycle fencing
+
+A Channel turn resolves its opaque conversation UUID from the Channel session
+record before modifying hooks, SOP dispatch, media/link enrichment, or provider
+work begins. That captured UUID is immutable for the turn and is attached to all
+turn observer events and history mutations.
+
+Reset rotates the record to a fresh UUID; delete removes the record. History
+append, update, rollback, and compaction are conditional on the record still
+carrying the UUID captured by the turn. A stale or deleted result is an expected
+lifecycle race: it is not retried and must not recreate a record. Worker
+cancellation reduces wasted work, while the conditional write is the final
+correctness boundary.
+
+In memory-only mode, history and UUID occupy one LRU record and are evicted
+together. Durable mode keeps the backend session record as the sole source of
+conversation identity.
+
 ## Gateway webhooks
 
 Gateway webhooks have one legitimate special requirement: the HTTP request may

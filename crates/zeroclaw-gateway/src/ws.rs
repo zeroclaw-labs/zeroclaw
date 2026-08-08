@@ -502,6 +502,51 @@ async fn handle_socket(
     // what lets ask_user/poll/escalate_to_human default to this conversation.
     agent.set_channel_name(WS_CHANNEL_KEY.to_string());
     agent.set_memory_session_id(Some(memory_session_id));
+    // The cross-turn conversation id must be an opaque, server-minted UUID -
+    // NEVER the caller-supplied `session_id` (which may be an email, a
+    // routing token, or any other identity string the client chooses to
+    // send). When a session backend is configured, resolve-or-create the
+    // durable id keyed on the existing `gw_<session_id>` storage key so it
+    // persists and converges across reconnects. A backend error MUST
+    // propagate (close the connection with a stable error code) rather than
+    // silently degrading to a random UUID - otherwise a transient storage
+    // failure would split one session's observability across distinct ids
+    // without the caller knowing. Without a backend (session persistence
+    // disabled), mint a one-shot UUID per connection instead - still a
+    // valid, exportable UUID, just not durable across reconnects/processes.
+    let conversation_id = match state.session_backend.as_ref() {
+        Some(backend) => match backend.resolve_or_create_conversation_id(&session_key) {
+            Ok(id) => id,
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(
+                            ::serde_json::json!({"agent": &agent_alias, "error": e.to_string()})
+                        ),
+                    "session backend resolve_or_create_conversation_id failed; closing WS"
+                );
+                let err = serde_json::json!({
+                    "type": "error",
+                    "message": "Failed to resolve conversation identity",
+                    "code": "CONVERSATION_ID_RESOLVE_FAILED"
+                });
+                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                let _ = sender
+                    .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                        code: 1011,
+                        reason: axum::extract::ws::Utf8Bytes::from_static(
+                            "conversation identity resolution failed",
+                        ),
+                    })))
+                    .await;
+                return;
+            }
+        },
+        None => uuid::Uuid::new_v4().to_string(),
+    };
+    agent.set_conversation_id(Some(conversation_id));
     let restore_trim_event = if stored_messages.is_empty() {
         None
     } else {
@@ -2068,6 +2113,39 @@ mod tests {
             // The user deleted the session between cancel and append.
             false
         }
+        // This mock is about append-resurrection, not conversation identity.
+        // A fresh id per call is fine - it just needs to compile.
+        fn resolve_or_create_conversation_id(&self, _session_key: &str) -> std::io::Result<String> {
+            Ok(uuid::Uuid::new_v4().to_string())
+        }
+        fn clear_and_rotate_conversation(&self, _session_key: &str) -> std::io::Result<String> {
+            Ok(uuid::Uuid::new_v4().to_string())
+        }
+        // This mock is about append-resurrection, not conditional writes.
+        // A fixed `Applied` is a compile-only placeholder; no test asserts on it.
+        fn append_if_conversation_matches(
+            &self,
+            _session_key: &str,
+            _expected_conversation_id: &str,
+            _message: &zeroclaw_providers::ChatMessage,
+        ) -> std::io::Result<zeroclaw_infra::session_backend::ConditionalSessionWrite> {
+            Ok(zeroclaw_infra::session_backend::ConditionalSessionWrite::Applied)
+        }
+        fn remove_last_if_conversation_matches(
+            &self,
+            _session_key: &str,
+            _expected_conversation_id: &str,
+        ) -> std::io::Result<zeroclaw_infra::session_backend::ConditionalSessionWrite> {
+            Ok(zeroclaw_infra::session_backend::ConditionalSessionWrite::Applied)
+        }
+        fn update_last_if_conversation_matches(
+            &self,
+            _session_key: &str,
+            _expected_conversation_id: &str,
+            _message: &zeroclaw_providers::ChatMessage,
+        ) -> std::io::Result<zeroclaw_infra::session_backend::ConditionalSessionWrite> {
+            Ok(zeroclaw_infra::session_backend::ConditionalSessionWrite::Applied)
+        }
     }
 
     #[test]
@@ -2174,5 +2252,427 @@ mod tests {
             Some("WaitingApproval"),
             "the gate is cleared once an authorized WS member approves"
         );
+    }
+
+    /// Wraps a real `SqliteSessionBackend` and records every
+    /// `resolve_or_create_conversation_id` call (its `session_key` argument and
+    /// the returned id) so a test can prove `handle_socket` itself drove the
+    /// resolution through the production path - not the test calling the
+    /// backend directly. All other trait methods delegate to the inner backend.
+    struct RecordingBackend {
+        inner: zeroclaw_infra::session_sqlite::SqliteSessionBackend,
+        resolve_calls: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl zeroclaw_infra::session_backend::SessionBackend for RecordingBackend {
+        fn resolve_or_create_conversation_id(&self, session_key: &str) -> std::io::Result<String> {
+            let id = self.inner.resolve_or_create_conversation_id(session_key)?;
+            self.resolve_calls
+                .lock()
+                .unwrap()
+                .push((session_key.to_string(), id.clone()));
+            Ok(id)
+        }
+        fn load(&self, session_key: &str) -> Vec<zeroclaw_providers::ChatMessage> {
+            self.inner.load(session_key)
+        }
+        fn append(
+            &self,
+            session_key: &str,
+            message: &zeroclaw_providers::ChatMessage,
+        ) -> std::io::Result<()> {
+            self.inner.append(session_key, message)
+        }
+        fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
+            self.inner.remove_last(session_key)
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            self.inner.list_sessions()
+        }
+        fn session_exists(&self, session_key: &str) -> bool {
+            self.inner.session_exists(session_key)
+        }
+        fn set_session_name(&self, session_key: &str, name: &str) -> std::io::Result<()> {
+            self.inner.set_session_name(session_key, name)
+        }
+        fn get_session_name(&self, session_key: &str) -> std::io::Result<Option<String>> {
+            self.inner.get_session_name(session_key)
+        }
+        fn set_session_agent_alias(
+            &self,
+            session_key: &str,
+            agent_alias: &str,
+        ) -> std::io::Result<()> {
+            self.inner.set_session_agent_alias(session_key, agent_alias)
+        }
+        fn set_session_state(
+            &self,
+            session_key: &str,
+            state: &str,
+            turn_id: Option<&str>,
+        ) -> std::io::Result<()> {
+            self.inner.set_session_state(session_key, state, turn_id)
+        }
+        fn clear_and_rotate_conversation(&self, session_key: &str) -> std::io::Result<String> {
+            self.inner.clear_and_rotate_conversation(session_key)
+        }
+        fn append_if_conversation_matches(
+            &self,
+            session_key: &str,
+            expected_conversation_id: &str,
+            message: &zeroclaw_providers::ChatMessage,
+        ) -> std::io::Result<zeroclaw_infra::session_backend::ConditionalSessionWrite> {
+            self.inner.append_if_conversation_matches(
+                session_key,
+                expected_conversation_id,
+                message,
+            )
+        }
+        fn remove_last_if_conversation_matches(
+            &self,
+            session_key: &str,
+            expected_conversation_id: &str,
+        ) -> std::io::Result<zeroclaw_infra::session_backend::ConditionalSessionWrite> {
+            self.inner
+                .remove_last_if_conversation_matches(session_key, expected_conversation_id)
+        }
+        fn update_last_if_conversation_matches(
+            &self,
+            session_key: &str,
+            expected_conversation_id: &str,
+            message: &zeroclaw_providers::ChatMessage,
+        ) -> std::io::Result<zeroclaw_infra::session_backend::ConditionalSessionWrite> {
+            self.inner.update_last_if_conversation_matches(
+                session_key,
+                expected_conversation_id,
+                message,
+            )
+        }
+    }
+
+    /// Wraps a real `SqliteSessionBackend` but injects a failure from
+    /// `resolve_or_create_conversation_id`, so a test can prove a backend error
+    /// propagates (WS closes 1011 + `CONVERSATION_ID_RESOLVE_FAILED`) instead of
+    /// silently degrading to a random UUID. All other trait methods delegate to
+    /// the inner backend.
+    struct FailingBackend {
+        inner: zeroclaw_infra::session_sqlite::SqliteSessionBackend,
+    }
+
+    impl zeroclaw_infra::session_backend::SessionBackend for FailingBackend {
+        fn resolve_or_create_conversation_id(&self, _session_key: &str) -> std::io::Result<String> {
+            Err(std::io::Error::other("injected resolve failure"))
+        }
+        fn load(&self, session_key: &str) -> Vec<zeroclaw_providers::ChatMessage> {
+            self.inner.load(session_key)
+        }
+        fn append(
+            &self,
+            session_key: &str,
+            message: &zeroclaw_providers::ChatMessage,
+        ) -> std::io::Result<()> {
+            self.inner.append(session_key, message)
+        }
+        fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
+            self.inner.remove_last(session_key)
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            self.inner.list_sessions()
+        }
+        fn session_exists(&self, session_key: &str) -> bool {
+            self.inner.session_exists(session_key)
+        }
+        fn set_session_name(&self, session_key: &str, name: &str) -> std::io::Result<()> {
+            self.inner.set_session_name(session_key, name)
+        }
+        fn get_session_name(&self, session_key: &str) -> std::io::Result<Option<String>> {
+            self.inner.get_session_name(session_key)
+        }
+        fn set_session_agent_alias(
+            &self,
+            session_key: &str,
+            agent_alias: &str,
+        ) -> std::io::Result<()> {
+            self.inner.set_session_agent_alias(session_key, agent_alias)
+        }
+        fn set_session_state(
+            &self,
+            session_key: &str,
+            state: &str,
+            turn_id: Option<&str>,
+        ) -> std::io::Result<()> {
+            self.inner.set_session_state(session_key, state, turn_id)
+        }
+        fn clear_and_rotate_conversation(&self, session_key: &str) -> std::io::Result<String> {
+            self.inner.clear_and_rotate_conversation(session_key)
+        }
+        fn append_if_conversation_matches(
+            &self,
+            session_key: &str,
+            expected_conversation_id: &str,
+            message: &zeroclaw_providers::ChatMessage,
+        ) -> std::io::Result<zeroclaw_infra::session_backend::ConditionalSessionWrite> {
+            self.inner.append_if_conversation_matches(
+                session_key,
+                expected_conversation_id,
+                message,
+            )
+        }
+        fn remove_last_if_conversation_matches(
+            &self,
+            session_key: &str,
+            expected_conversation_id: &str,
+        ) -> std::io::Result<zeroclaw_infra::session_backend::ConditionalSessionWrite> {
+            self.inner
+                .remove_last_if_conversation_matches(session_key, expected_conversation_id)
+        }
+        fn update_last_if_conversation_matches(
+            &self,
+            session_key: &str,
+            expected_conversation_id: &str,
+            message: &zeroclaw_providers::ChatMessage,
+        ) -> std::io::Result<zeroclaw_infra::session_backend::ConditionalSessionWrite> {
+            self.inner.update_last_if_conversation_matches(
+                session_key,
+                expected_conversation_id,
+                message,
+            )
+        }
+    }
+
+    /// Serve `/ws/chat` on an ephemeral port backed by `state`, returning the
+    /// bound address and a handle to abort the server when the test is done.
+    async fn ws_serve(state: AppState) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let app = axum::Router::new()
+            .route("/ws/chat", axum::routing::get(handle_ws_chat))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+        (addr, server)
+    }
+
+    /// Connect to the served endpoint with the given email-form `session_id`
+    /// and complete the `session_start` -> `connect` -> `connected` handshake.
+    /// Returns the live WS stream so the caller can drive a turn or assert on
+    /// subsequent frames.
+    async fn ws_connect_and_handshake(
+        addr: std::net::SocketAddr,
+        session_id: &str,
+    ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>
+    {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        use tokio_tungstenite::tungstenite::Message as TMessage;
+        // This test server is loopback-only and intentionally has no TLS listener.
+        let test_scheme = "ws";
+        let url =
+            format!("{test_scheme}://{addr}/ws/chat?agent=cid-test-agent&session_id={session_id}");
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("client must connect to the WS endpoint");
+        // session_start frame precedes any turn work. Use `match`, not a blanket
+        // expect on a timeout: an `Ok(None)` (stream closed) must not be mistaken
+        // for success.
+        match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
+            Ok(Some(Ok(TMessage::Text(text)))) => {
+                let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(parsed["type"], "session_start");
+            }
+            other => panic!("expected session_start text frame, got {other:?}"),
+        }
+        // connect frame + connected ack.
+        ws.send(TMessage::Text(
+            serde_json::json!({"type": "connect"}).to_string().into(),
+        ))
+        .await
+        .unwrap();
+        match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
+            Ok(Some(Ok(TMessage::Text(text)))) => {
+                let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(parsed["type"], "connected");
+            }
+            other => panic!("expected connected ack, got {other:?}"),
+        }
+        ws
+    }
+
+    /// Minimal gateway config whose agent builds successfully and points at an
+    /// unreachable ollama endpoint (1s timeout). Conversation identity is
+    /// resolved during connection setup, before any message is read, so these
+    /// tests never need the model to answer - the endpoint only has to exist in
+    /// config for the agent to construct. Mirrors the runtime CLI
+    /// `cid_test_config` pattern.
+    fn ws_cid_test_config(data_dir: std::path::PathBuf) -> zeroclaw_config::schema::Config {
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, MemoryConfig, ModelProviderConfig,
+            OllamaModelProviderConfig, RiskProfileConfig,
+        };
+        let mut config = Config {
+            data_dir: data_dir.clone(),
+            config_path: data_dir.join("config.toml"),
+            ..Config::default()
+        };
+        config.providers.models.ollama.insert(
+            "default".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("cid-test".to_string()),
+                    timeout_secs: Some(1),
+                    uri: Some("http://127.0.0.1:9".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "cid-test-agent".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "ollama.default".into(),
+                risk_profile: "default".into(),
+                memory: zeroclaw_config::multi_agent::AgentMemoryConfig {
+                    backend: zeroclaw_config::multi_agent::MemoryBackendKind::None,
+                },
+                ..Default::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("default".to_string(), RiskProfileConfig::default());
+        config.memory = MemoryConfig {
+            backend: "none".into(),
+            ..MemoryConfig::default()
+        };
+        config
+    }
+
+    /// A caller-supplied `session_id` is untrusted input that may be an email,
+    /// a routing token, or any other identity string. It must never become the
+    /// exported conversation id; `handle_socket` has to resolve an opaque
+    /// server-minted UUID v4 through the session backend instead.
+    ///
+    /// `handle_socket` resolves the id during connection setup, right after the
+    /// agent is built and before the first message is read, so completing the
+    /// handshake is enough to exercise the contract - no turn has to run and no
+    /// model has to be reachable. Assertions read what the backend recorded
+    /// rather than calling it directly, which is what proves the production path
+    /// performed the resolution.
+    #[tokio::test]
+    async fn handle_socket_resolves_opaque_conversation_id_not_raw_session_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = ws_cid_test_config(tmp.path().join("workspace"));
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+
+        let recording = Arc::new(RecordingBackend {
+            inner: zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(&config.data_dir)
+                .unwrap(),
+            resolve_calls: std::sync::Mutex::new(Vec::new()),
+        });
+
+        let mut state = crate::api::tests::test_state(config);
+        state.session_backend = Some(recording.clone());
+
+        let (addr, server) = ws_serve(state).await;
+        let ws = ws_connect_and_handshake(addr, "attacker@example.com").await;
+
+        // Agent construction sits between the handshake ack and the resolve, so
+        // poll for the recorded call instead of assuming it already landed.
+        let expected_key = format!("{GW_SESSION_PREFIX}attacker@example.com");
+        let resolved = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some((_, id)) = recording
+                    .resolve_calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|(key, _)| key == &expected_key)
+                    .cloned()
+                {
+                    return id;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("handle_socket must call resolve_or_create_conversation_id with the gw_ key");
+
+        let parsed = uuid::Uuid::parse_str(&resolved)
+            .expect("resolved conversation id must be a valid UUID");
+        assert_eq!(parsed.get_version_num(), 4, "must be UUID v4: {resolved}");
+        assert_ne!(
+            resolved, "attacker@example.com",
+            "raw caller-supplied session_id must never become the conversation_id"
+        );
+
+        drop(ws);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ws_backend_resolve_failure_closes_connection_not_silently_degrades() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = ws_cid_test_config(tmp.path().join("workspace"));
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+
+        let failing = Arc::new(FailingBackend {
+            inner: zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(&config.data_dir)
+                .unwrap(),
+        });
+
+        let mut state = crate::api::tests::test_state(config);
+        state.session_backend = Some(failing);
+
+        let (addr, server) = ws_serve(state).await;
+        // Complete the handshake (session_start -> connect -> connected ack) so
+        // `handle_socket` advances past the connect-frame wait and builds the
+        // agent; the resolve failure fires right after, sending the error frame
+        // + Close(1011) - NOT a silent degrade to a random UUID.
+        let mut ws = ws_connect_and_handshake(addr, "attacker@example.com").await;
+
+        use futures_util::StreamExt as _;
+        use tokio_tungstenite::tungstenite::Message as TMessage;
+
+        let mut got_resolve_failed_frame = false;
+        let mut got_close_1011 = false;
+        // The server sends the error frame then the Close frame and returns;
+        // the stream then yields the Close and ends. Bound the wait so a
+        // silent-degrade regression (no close, turn proceeds) fails fast.
+        for _ in 0..20 {
+            match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
+                Ok(Some(Ok(TMessage::Text(text)))) => {
+                    let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    if parsed["type"].as_str() == Some("error")
+                        && parsed["code"].as_str() == Some("CONVERSATION_ID_RESOLVE_FAILED")
+                    {
+                        got_resolve_failed_frame = true;
+                    }
+                }
+                Ok(Some(Ok(TMessage::Close(Some(frame))))) => {
+                    if u16::from(&frame.code) == 1011 {
+                        got_close_1011 = true;
+                    }
+                    break;
+                }
+                Ok(Some(Ok(_))) => continue,
+                _ => break,
+            }
+        }
+
+        assert!(
+            got_resolve_failed_frame,
+            "a backend resolve failure must surface a CONVERSATION_ID_RESOLVE_FAILED error frame, \
+             not silently degrade"
+        );
+        assert!(
+            got_close_1011,
+            "a backend resolve failure must close the connection with code 1011"
+        );
+
+        drop(ws);
+        server.abort();
     }
 }

@@ -202,7 +202,7 @@ impl LlmGenerateAdapter for ProviderLlmAdapter {
         let prompt = prompt.to_string();
         super::bridge::run_bridged(
             async move {
-                provider
+                zeroclaw_providers::ProviderDispatch::new(provider)
                     .chat_with_system(system.as_deref(), &prompt, &model, None)
                     .await
                     .map_err(|e| e.to_string())

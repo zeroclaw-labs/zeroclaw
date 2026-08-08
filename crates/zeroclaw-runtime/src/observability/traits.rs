@@ -72,6 +72,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         };
         let metric = ObserverMetric::RequestLatency(Duration::from_millis(8));
 

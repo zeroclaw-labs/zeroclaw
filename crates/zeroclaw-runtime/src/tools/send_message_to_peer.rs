@@ -24,6 +24,10 @@ pub struct SendMessageToPeerTool {
     description: String,
 }
 
+fn detached_peer_conversation_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
 impl SendMessageToPeerTool {
     pub fn new(config: Arc<Config>, sender_alias: impl Into<String>) -> Self {
         let sender_alias = sender_alias.into();
@@ -201,12 +205,19 @@ impl Tool for SendMessageToPeerTool {
                 .as_ref()
                 .map(|_| Arc::new(Mutex::new(TurnUsage::default())));
             zeroclaw_spawn::spawn!(async move {
+                // An independent caller mints its own one-shot conversation
+                // id for a detached delivery, so it is never `None`. Peer
+                // delivery has no cross-turn reuse contract (the recipient's
+                // turn is unrelated to the sender's), so a fresh UUID per
+                // call is correct rather than a reused or durable id.
+                let peer_conversation_id = detached_peer_conversation_id();
                 let turn = crate::agent::loop_::process_message(
                     cfg,
                     &recipient_alias,
                     &body,
                     None,
                     zeroclaw_api::ingress::TurnOrigin::AgentDirect,
+                    Some(&peer_conversation_id),
                 );
                 if let Err(e) = deliver_peer_turn_with_cost_scope(cost_ctx, turn_usage, turn).await
                 {
@@ -1088,5 +1099,26 @@ mod tests {
         );
 
         server.abort();
+    }
+
+    fn assert_valid_v4_conversation_id(cid: &str) {
+        let parsed = uuid::Uuid::parse_str(cid).unwrap_or_else(|err| {
+            panic!("conversation_id should be a valid UUID, got {cid:?}: {err}")
+        });
+        assert_eq!(
+            parsed.get_version(),
+            Some(uuid::Version::Random),
+            "conversation_id should be a random UUID v4, got {cid:?}"
+        );
+    }
+
+    #[test]
+    fn detached_peer_delivery_mints_fresh_conversation_ids() {
+        let first = detached_peer_conversation_id();
+        let second = detached_peer_conversation_id();
+
+        assert_valid_v4_conversation_id(&first);
+        assert_valid_v4_conversation_id(&second);
+        assert_ne!(first, second);
     }
 }

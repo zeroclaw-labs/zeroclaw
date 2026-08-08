@@ -275,6 +275,7 @@ impl Observer for OtelObserver {
                 channel,
                 agent_alias,
                 turn_id,
+                conversation_id,
             } => {
                 self.agent_starts.add(
                     1,
@@ -284,19 +285,23 @@ impl Observer for OtelObserver {
                     ],
                 );
 
+                // Span attributes are owned by the span only; the agent_starts
+                // counter above keeps its bounded label set (no conversation id).
+                let mut span_attrs = vec![
+                    KeyValue::new("gen_ai.provider.name", model_provider.clone()),
+                    KeyValue::new("gen_ai.request.model", model.clone()),
+                    KeyValue::new("zeroclaw.channel", channel.clone().unwrap_or_default()),
+                    KeyValue::new("gen_ai.agent.name", agent_alias.clone().unwrap_or_default()),
+                    KeyValue::new("zeroclaw.turn_id", turn_id.clone().unwrap_or_default()),
+                ];
+                if let Some(attr) = conversation_attr(conversation_id.as_deref()) {
+                    span_attrs.push(attr);
+                }
+
                 let span = tracer.build(
                     opentelemetry::trace::SpanBuilder::from_name("gen_ai.agent.invoke")
                         .with_kind(SpanKind::Internal)
-                        .with_attributes(vec![
-                            KeyValue::new("gen_ai.provider.name", model_provider.clone()),
-                            KeyValue::new("gen_ai.request.model", model.clone()),
-                            KeyValue::new("zeroclaw.channel", channel.clone().unwrap_or_default()),
-                            KeyValue::new(
-                                "gen_ai.agent.name",
-                                agent_alias.clone().unwrap_or_default(),
-                            ),
-                            KeyValue::new("zeroclaw.turn_id", turn_id.clone().unwrap_or_default()),
-                        ]),
+                        .with_attributes(span_attrs),
                 );
 
                 if let Some(tid) = turn_id {
@@ -324,30 +329,32 @@ impl Observer for OtelObserver {
                 agent_alias,
                 parent_agent_alias,
                 turn_id,
+                conversation_id,
             } => {
                 let parent_cx = self.parent_cx_for(turn_id.as_deref());
+                let mut span_attrs = vec![
+                    KeyValue::new("gen_ai.provider.name", model_provider.clone()),
+                    KeyValue::new("gen_ai.request.model", model.clone()),
+                    KeyValue::new("gen_ai.operation.name", "llm.request"),
+                    KeyValue::new(
+                        "zeroclaw.messages_count",
+                        i64::try_from(*messages_count).unwrap_or(i64::MAX),
+                    ),
+                    KeyValue::new("zeroclaw.channel", channel.clone().unwrap_or_default()),
+                    KeyValue::new("gen_ai.agent.name", agent_alias.clone().unwrap_or_default()),
+                    KeyValue::new(
+                        "zeroclaw.parent_agent_alias",
+                        parent_agent_alias.clone().unwrap_or_default(),
+                    ),
+                    KeyValue::new("zeroclaw.turn_id", turn_id.clone().unwrap_or_default()),
+                ];
+                if let Some(attr) = conversation_attr(conversation_id.as_deref()) {
+                    span_attrs.push(attr);
+                }
                 let mut span = tracer.build_with_context(
                     opentelemetry::trace::SpanBuilder::from_name("llm.request")
                         .with_kind(SpanKind::Client)
-                        .with_attributes(vec![
-                            KeyValue::new("gen_ai.provider.name", model_provider.clone()),
-                            KeyValue::new("gen_ai.request.model", model.clone()),
-                            KeyValue::new("gen_ai.operation.name", "llm.request"),
-                            KeyValue::new(
-                                "zeroclaw.messages_count",
-                                i64::try_from(*messages_count).unwrap_or(i64::MAX),
-                            ),
-                            KeyValue::new("zeroclaw.channel", channel.clone().unwrap_or_default()),
-                            KeyValue::new(
-                                "gen_ai.agent.name",
-                                agent_alias.clone().unwrap_or_default(),
-                            ),
-                            KeyValue::new(
-                                "zeroclaw.parent_agent_alias",
-                                parent_agent_alias.clone().unwrap_or_default(),
-                            ),
-                            KeyValue::new("zeroclaw.turn_id", turn_id.clone().unwrap_or_default()),
-                        ]),
+                        .with_attributes(span_attrs),
                     &parent_cx,
                 );
                 span.end();
@@ -360,6 +367,7 @@ impl Observer for OtelObserver {
                 agent_alias,
                 parent_agent_alias,
                 turn_id,
+                conversation_id,
             } => {
                 let mut span_attrs = vec![
                     KeyValue::new("gen_ai.operation.name", "execute_tool"),
@@ -374,6 +382,9 @@ impl Observer for OtelObserver {
                 ];
                 if let Some(id) = tool_call_id {
                     span_attrs.push(KeyValue::new("gen_ai.tool.call.id", id.clone()));
+                }
+                if let Some(attr) = conversation_attr(conversation_id.as_deref()) {
+                    span_attrs.push(attr);
                 }
 
                 // OTel-only content processing: scrub + truncate based on this
@@ -404,6 +415,7 @@ impl Observer for OtelObserver {
                 channel,
                 agent_alias,
                 turn_id,
+                conversation_id,
             } => {
                 let secs = duration.as_secs_f64();
                 let start_time = SystemTime::now()
@@ -433,6 +445,9 @@ impl Observer for OtelObserver {
                         format!("{} hits", num_entries),
                     ));
                 }
+                if let Some(attr) = conversation_attr(conversation_id.as_deref()) {
+                    span_attrs.push(attr);
+                }
 
                 let parent_cx = self.parent_cx_for(turn_id.as_deref());
                 let mut span = tracer.build_with_context(
@@ -449,6 +464,7 @@ impl Observer for OtelObserver {
                 }
                 span.end();
 
+                // Metric labels stay bounded; the conversation id is span-only.
                 let metric_attrs = [KeyValue::new("backend", backend.clone())];
                 self.memory_recall_count.add(1, &metric_attrs);
                 self.memory_recall_duration.record(secs, &metric_attrs);
@@ -461,6 +477,7 @@ impl Observer for OtelObserver {
                 channel,
                 agent_alias,
                 turn_id,
+                conversation_id,
             } => {
                 let secs = duration.as_secs_f64();
                 let start_time = SystemTime::now()
@@ -483,6 +500,9 @@ impl Observer for OtelObserver {
                         "output.value",
                         format!("{} chunks across {} boards", num_chunks, num_boards),
                     ));
+                }
+                if let Some(attr) = conversation_attr(conversation_id.as_deref()) {
+                    span_attrs.push(attr);
                 }
 
                 let parent_cx = self.parent_cx_for(turn_id.as_deref());
@@ -507,13 +527,14 @@ impl Observer for OtelObserver {
                 channel,
                 agent_alias,
                 turn_id,
+                conversation_id,
             } => {
                 let secs = duration.as_secs_f64();
                 let start_time = SystemTime::now()
                     .checked_sub(*duration)
                     .unwrap_or(SystemTime::now());
 
-                let span_attrs = vec![
+                let mut span_attrs = vec![
                     KeyValue::new("memory.category", category.clone()),
                     KeyValue::new("memory.backend", backend.clone()),
                     KeyValue::new("memory.success", *success),
@@ -524,6 +545,9 @@ impl Observer for OtelObserver {
                     KeyValue::new("gen_ai.agent.name", agent_alias.clone().unwrap_or_default()),
                     KeyValue::new("zeroclaw.turn_id", turn_id.clone().unwrap_or_default()),
                 ];
+                if let Some(attr) = conversation_attr(conversation_id.as_deref()) {
+                    span_attrs.push(attr);
+                }
 
                 let parent_cx = self.parent_cx_for(turn_id.as_deref());
                 let mut span = tracer.build_with_context(
@@ -540,6 +564,7 @@ impl Observer for OtelObserver {
                 }
                 span.end();
 
+                // Metric labels stay bounded; the conversation id is span-only.
                 let metric_attrs = [
                     KeyValue::new("category", category.clone()),
                     KeyValue::new("backend", backend.clone()),
@@ -599,6 +624,7 @@ impl Observer for OtelObserver {
                 parent_agent_alias,
                 turn_id,
                 messages,
+                conversation_id,
             } => {
                 let secs = duration.as_secs_f64();
                 let attrs = [
@@ -641,6 +667,9 @@ impl Observer for OtelObserver {
                     span_attrs.push(KeyValue::new("gen_ai.usage.output_tokens", *output as i64));
                 }
                 span_attrs.extend(message_attrs(messages, self.content_config));
+                if let Some(attr) = conversation_attr(conversation_id.as_deref()) {
+                    span_attrs.push(attr);
+                }
 
                 // Update agent span aggregation for turn-level gen_ai.input.messages / gen_ai.output.messages
                 if let Some(tid) = turn_id
@@ -689,6 +718,7 @@ impl Observer for OtelObserver {
                 channel,
                 agent_alias,
                 turn_id,
+                conversation_id: _,
             } => {
                 if let Some(tid) = turn_id {
                     let entry = self
@@ -780,6 +810,7 @@ impl Observer for OtelObserver {
                 agent_alias,
                 parent_agent_alias,
                 turn_id,
+                conversation_id,
             } => {
                 let secs = duration.as_secs_f64();
 
@@ -805,6 +836,9 @@ impl Observer for OtelObserver {
                 if let Some(id) = tool_call_id {
                     span_attrs.push(KeyValue::new("gen_ai.tool.call.id", id.clone()));
                 }
+                if let Some(attr) = conversation_attr(conversation_id.as_deref()) {
+                    span_attrs.push(attr);
+                }
 
                 // OTel-only content processing: scrub + truncate based on this
                 // observer's instance-owned tool I/O policy.
@@ -823,6 +857,7 @@ impl Observer for OtelObserver {
                 span.set_status(status);
                 span.end();
 
+                // Metric labels stay bounded; the conversation id is span-only.
                 let metric_attrs = [
                     KeyValue::new("tool", tool.clone()),
                     KeyValue::new("success", success.to_string()),
@@ -931,6 +966,19 @@ impl Observer for OtelObserver {
     fn as_any(&self) -> &dyn Any {
         self
     }
+}
+
+/// Build the GenAI semconv `gen_ai.conversation.id` span attribute from the
+/// caller-owned conversation id, omitting it entirely when the id is absent or
+/// empty so spans stay label-free for unattributed turns. Returned as an
+/// `Option<KeyValue>` so each span-building arm can conditionally push it
+/// without polluting the metric attribute arrays (metrics never carry this
+/// label - cross-turn correlation is span-only).
+fn conversation_attr(conversation_id: Option<&str>) -> Option<KeyValue> {
+    conversation_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(|id| KeyValue::new("gen_ai.conversation.id", id.to_string()))
 }
 
 fn strip_first_complete_block(content: &mut String, start_marker: &str, end_marker: &str) {
@@ -1310,6 +1358,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::LlmRequest {
             parent_agent_alias: None,
@@ -1319,6 +1368,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::LlmResponse {
             parent_agent_alias: None,
@@ -1333,6 +1383,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::AgentEnd {
             model_provider: "openrouter".into(),
@@ -1343,6 +1394,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::AgentEnd {
             model_provider: "openrouter".into(),
@@ -1353,6 +1405,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCallStart {
             parent_agent_alias: None,
@@ -1362,6 +1415,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             parent_agent_alias: None,
@@ -1374,6 +1428,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             parent_agent_alias: None,
@@ -1386,6 +1441,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::TurnComplete);
         obs.record_event(&ObserverEvent::ChannelMessage {
@@ -1430,6 +1486,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         // MemoryRecall failure path with query_summary: None.
         obs.record_event(&ObserverEvent::MemoryRecall {
@@ -1441,6 +1498,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
 
         // RagRetrieve with populated query_summary.
@@ -1452,6 +1510,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         // RagRetrieve with query_summary: None.
         obs.record_event(&ObserverEvent::RagRetrieve {
@@ -1462,6 +1521,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
 
         // MemoryStore success path.
@@ -1473,6 +1533,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         // MemoryStore failure path.
         obs.record_event(&ObserverEvent::MemoryStore {
@@ -1483,6 +1544,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::MemoryAudit {
             action: "store".into(),
@@ -1509,6 +1571,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             parent_agent_alias: None,
@@ -1521,6 +1584,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         // Failure case — the issue author specifically wants to see *why*
         // a tool call failed, so the result field is the error text.
@@ -1535,6 +1599,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
     }
 
@@ -1566,6 +1631,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
     }
 
@@ -1596,6 +1662,7 @@ mod tests {
             channel: Some("wss".into()),
             agent_alias: Some("default".into()),
             turn_id: Some("turn-1".into()),
+            conversation_id: None,
         });
 
         assert!(
@@ -1614,6 +1681,7 @@ mod tests {
             channel: Some("wss".into()),
             agent_alias: Some("default".into()),
             turn_id: Some("turn-1".into()),
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::LlmResponse {
             parent_agent_alias: None,
@@ -1628,6 +1696,7 @@ mod tests {
             agent_alias: Some("default".into()),
             turn_id: Some("turn-1".into()),
             messages: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCallStart {
             parent_agent_alias: None,
@@ -1637,6 +1706,7 @@ mod tests {
             channel: Some("wss".into()),
             agent_alias: Some("default".into()),
             turn_id: Some("turn-1".into()),
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             parent_agent_alias: None,
@@ -1649,6 +1719,7 @@ mod tests {
             channel: Some("wss".into()),
             agent_alias: Some("default".into()),
             turn_id: Some("turn-1".into()),
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::AgentEnd {
             model_provider: "anthropic".into(),
@@ -1662,6 +1733,7 @@ mod tests {
             channel: Some("wss".into()),
             agent_alias: Some("default".into()),
             turn_id: Some("turn-1".into()),
+            conversation_id: None,
         });
 
         assert!(
@@ -1687,6 +1759,7 @@ mod tests {
             channel: Some("cli".into()),
             agent_alias: Some("default".into()),
             turn_id: Some("turn-m1".into()),
+            conversation_id: None,
         });
         assert!(
             obs.active_agent_spans
@@ -1705,6 +1778,7 @@ mod tests {
             channel: Some("cli".into()),
             agent_alias: Some("default".into()),
             turn_id: Some("turn-m1".into()),
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::RagRetrieve {
             query_summary: Some("ESP32 pinout".into()),
@@ -1714,6 +1788,7 @@ mod tests {
             channel: Some("cli".into()),
             agent_alias: Some("default".into()),
             turn_id: Some("turn-m1".into()),
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::MemoryStore {
             category: "conversation".into(),
@@ -1723,6 +1798,7 @@ mod tests {
             channel: Some("cli".into()),
             agent_alias: Some("default".into()),
             turn_id: Some("turn-m1".into()),
+            conversation_id: None,
         });
 
         assert!(
@@ -1742,6 +1818,7 @@ mod tests {
             channel: Some("cli".into()),
             agent_alias: Some("default".into()),
             turn_id: Some("turn-m1".into()),
+            conversation_id: None,
         });
         assert!(
             !obs.active_agent_spans
@@ -1761,6 +1838,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: Some("no-such-turn".into()),
+            conversation_id: None,
         });
     }
 
@@ -1820,6 +1898,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             parent_agent_alias: None,
@@ -1832,6 +1911,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
     }
 
@@ -2075,6 +2155,205 @@ mod tests {
         let input = "Result<tool_result>some tool output";
         let cleaned = clean_for_display(input);
         assert_eq!(cleaned, "Result<tool_result>some tool output");
+    }
+
+    // ── conversation id span-attribute hygiene ──────────────────────────
+
+    /// The helper emits the GenAI semconv key with the exact caller-owned
+    /// value when an id is present, so attributed turns correlate across
+    /// spans in trace backends.
+    #[test]
+    fn conversation_attr_emits_genai_conversation_id_for_non_empty() {
+        let attr =
+            conversation_attr(Some("cid-xyz")).expect("a non-empty id must produce an attribute");
+        assert_eq!(attr.key.as_str(), "gen_ai.conversation.id");
+        assert_eq!(attr.value.as_str(), "cid-xyz");
+    }
+
+    /// An absent id yields no attribute so unattributed turns stay label-free.
+    #[test]
+    fn conversation_attr_omits_when_none() {
+        assert!(conversation_attr(None).is_none());
+    }
+
+    /// An empty id is treated like an absent one so spans never carry an
+    /// empty `gen_ai.conversation.id` label.
+    #[test]
+    fn conversation_attr_omits_when_empty() {
+        assert!(conversation_attr(Some("")).is_none());
+        assert!(conversation_attr(Some("   \t\n")).is_none());
+    }
+
+    #[test]
+    fn conversation_attr_trims_non_empty_id() {
+        let attr = conversation_attr(Some("  cid-trimmed  ")).unwrap();
+        assert_eq!(attr.value.as_str(), "cid-trimmed");
+    }
+
+    /// Every turn-scoped lifecycle variant that carries a `conversation_id`
+    /// field still records through the observer when an id is present, and
+    /// the turn-span lifecycle (open on `AgentStart`, close on `AgentEnd`)
+    /// is unaffected. This also drives the inline metric-recording arms
+    /// (agent starts, llm calls, tool calls, memory/RAG counts and
+    /// durations) with a conversation id in scope: those metric attribute
+    /// arrays are inline literals that never reference the id, so they keep
+    /// their bounded label sets. The OTLP exporter is asynchronous and the
+    /// test observer targets an unreachable endpoint, so exported metric
+    /// attributes cannot be captured in-process; the `conversation_attr`
+    /// unit tests above plus this recording path guard the span-only
+    /// contract together with the sibling Prometheus `encode()` check.
+    #[test]
+    fn conversation_attr_records_all_nine_attributed_variants() {
+        let obs = test_observer();
+        let turn = "turn-cid";
+        let cid = "cid-xyz";
+
+        obs.record_event(&ObserverEvent::AgentStart {
+            model_provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            channel: Some("cli".into()),
+            agent_alias: Some("default".into()),
+            turn_id: Some(turn.into()),
+            conversation_id: Some(cid.into()),
+        });
+        assert!(
+            obs.active_agent_spans
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(turn),
+            "AgentStart should open a live span keyed by turn_id"
+        );
+
+        obs.record_event(&ObserverEvent::LlmRequest {
+            parent_agent_alias: None,
+            model_provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            messages_count: 2,
+            channel: Some("cli".into()),
+            agent_alias: Some("default".into()),
+            turn_id: Some(turn.into()),
+            conversation_id: Some(cid.into()),
+        });
+        obs.record_event(&ObserverEvent::LlmResponse {
+            parent_agent_alias: None,
+            model_provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            duration: Duration::from_millis(25),
+            success: true,
+            error_message: None,
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            messages: None,
+            channel: Some("cli".into()),
+            agent_alias: Some("default".into()),
+            turn_id: Some(turn.into()),
+            conversation_id: Some(cid.into()),
+        });
+        obs.record_event(&ObserverEvent::ToolCallStart {
+            parent_agent_alias: None,
+            tool: "shell".into(),
+            tool_call_id: Some("call-1".into()),
+            arguments: None,
+            channel: Some("cli".into()),
+            agent_alias: Some("default".into()),
+            turn_id: Some(turn.into()),
+            conversation_id: Some(cid.into()),
+        });
+        obs.record_event(&ObserverEvent::ToolCall {
+            parent_agent_alias: None,
+            tool: "shell".into(),
+            tool_call_id: Some("call-1".into()),
+            duration: Duration::from_millis(5),
+            success: true,
+            arguments: None,
+            result: None,
+            channel: Some("cli".into()),
+            agent_alias: Some("default".into()),
+            turn_id: Some(turn.into()),
+            conversation_id: Some(cid.into()),
+        });
+        obs.record_event(&ObserverEvent::MemoryRecall {
+            query_summary: Some("coffee preferences".into()),
+            duration: Duration::from_millis(9),
+            num_entries: 2,
+            backend: "sqlite".into(),
+            success: true,
+            channel: Some("cli".into()),
+            agent_alias: Some("default".into()),
+            turn_id: Some(turn.into()),
+            conversation_id: Some(cid.into()),
+        });
+        obs.record_event(&ObserverEvent::MemoryStore {
+            category: "conversation".into(),
+            backend: "sqlite".into(),
+            duration: Duration::from_millis(4),
+            success: true,
+            channel: Some("cli".into()),
+            agent_alias: Some("default".into()),
+            turn_id: Some(turn.into()),
+            conversation_id: Some(cid.into()),
+        });
+        obs.record_event(&ObserverEvent::RagRetrieve {
+            query_summary: Some("ESP32 pinout".into()),
+            duration: Duration::from_millis(7),
+            num_chunks: 3,
+            num_boards: 1,
+            channel: Some("cli".into()),
+            agent_alias: Some("default".into()),
+            turn_id: Some(turn.into()),
+            conversation_id: Some(cid.into()),
+        });
+
+        // Child spans must not evict the live turn entry.
+        assert!(
+            obs.active_agent_spans
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(turn),
+            "child spans must not remove the live turn entry"
+        );
+
+        obs.record_event(&ObserverEvent::AgentEnd {
+            model_provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            duration: Duration::from_millis(50),
+            tokens_used: None,
+            cost_usd: None,
+            channel: Some("cli".into()),
+            agent_alias: Some("default".into()),
+            turn_id: Some(turn.into()),
+            conversation_id: Some(cid.into()),
+        });
+        assert!(
+            !obs.active_agent_spans
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(turn),
+            "AgentEnd should close the live turn span"
+        );
+    }
+
+    /// `MemoryAudit` is a root audit event whose variant carries no
+    /// `conversation_id` field, so its span is built from an inline
+    /// attribute vec that never calls `conversation_attr`. Constructing the
+    /// variant without a `conversation_id` (below) is itself the
+    /// compile-time proof that the field does not exist; recording both the
+    /// success and failure paths must not panic.
+    #[test]
+    fn conversation_attr_memory_audit_has_no_conversation_id_field() {
+        let obs = test_observer();
+        obs.record_event(&ObserverEvent::MemoryAudit {
+            action: "store".into(),
+            backend: "sqlite".into(),
+            duration: Duration::from_millis(3),
+            success: true,
+        });
+        obs.record_event(&ObserverEvent::MemoryAudit {
+            action: "purge".into(),
+            backend: "qdrant".into(),
+            duration: Duration::from_millis(1),
+            success: false,
+        });
     }
 
     #[test]

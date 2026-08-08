@@ -1129,6 +1129,30 @@ impl RpcDispatcher {
         agent.set_channel_name("rpc".to_string());
         agent.channel_handles().register_channel("rpc", approval_ch);
 
+        // Resolve the opaque, server-minted conversation id ONCE at session
+        // creation and stamp it onto the agent. `handle_session_prompt` reads
+        // this value back rather than re-resolving, so every prompt in the
+        // same RPC session shares one id (the cross-turn stability contract).
+        // NEVER use the raw caller-supplied `session_id` here - it may be an
+        // email, routing token, or any other string. A backend error MUST
+        // propagate as INTERNAL_ERROR, not silently degrade - otherwise a
+        // transient storage failure would split one session's observability
+        // across distinct ids. Without a backend, mint a one-shot UUID once
+        // here (not per-prompt).
+        let rpc_session_key = format!("rpc_{session_id}");
+        let conversation_id = match self.ctx.session_backend.as_ref() {
+            Some(backend) => backend
+                .resolve_or_create_conversation_id(&rpc_session_key)
+                .map_err(|e| {
+                    rpc_err(
+                        INTERNAL_ERROR,
+                        format!("Failed to resolve conversation identity: {e}"),
+                    )
+                })?,
+            None => uuid::Uuid::new_v4().to_string(),
+        };
+        agent.set_conversation_id(Some(conversation_id));
+
         self.ctx
             .sessions
             .insert(
@@ -1594,6 +1618,44 @@ impl RpcDispatcher {
         agent.set_channel_name("rpc".to_string());
         agent.channel_handles().register_channel("rpc", approval_ch);
 
+        // Reaped sessions are rebuilt fresh here, so re-resolve the SAME
+        // opaque conversation id (keyed on `rpc_<sid>`, identical to
+        // `handle_session_new`) and stamp it back onto the rebuilt agent.
+        // Without this, the rehydrated prompt would read back `None` from the
+        // agent in `handle_session_prompt` and go unattributed. Reuse the
+        // durable backend value so the id survives the reap/rehydrate cycle
+        // (cross-turn stability). A backend error MUST propagate; without a
+        // backend, mint a one-shot UUID (matches the `handle_session_new`
+        // degradation, not per-prompt).
+        let rehydrate_session_key = format!("rpc_{sid}");
+        let conversation_id = match self.ctx.session_backend.as_ref() {
+            Some(backend) => {
+                match backend.resolve_or_create_conversation_id(&rehydrate_session_key) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_category(::zeroclaw_log::EventCategory::Agent)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "session_id": sid,
+                                "error": e.to_string(),
+                            })),
+                            "session/prompt: rehydrate resolve_or_create_conversation_id failed; \
+                         giving up on rehydrate"
+                        );
+                        return None;
+                    }
+                }
+            }
+            None => uuid::Uuid::new_v4().to_string(),
+        };
+        agent.set_conversation_id(Some(conversation_id));
+
         let message_count = data.messages.len();
         self.ctx
             .sessions
@@ -1778,12 +1840,21 @@ impl RpcDispatcher {
             )
             .with_agent_alias(&attribution_agent_alias)
         });
+        // Read the conversation id that `handle_session_new` stamped onto
+        // the agent - do NOT re-resolve or re-mint here, so every prompt in
+        // the same RPC session shares one id (cross-turn stability). The
+        // `rpc_<sid>`-prefixed history key must NEVER enter this field.
+        let conversation_id = {
+            let g = agent.lock().await;
+            g.conversation_id().map(str::to_string)
+        };
         let outcome = execute_turn(
             agent,
             prompt.clone(),
             cancel,
             TurnAttribution {
                 session_key: Some(sid.to_string()),
+                conversation_id,
                 agent_alias,
                 model_provider,
                 model,
@@ -7877,6 +7948,327 @@ mod tests {
             sessions.get_agent(sid).await.is_some(),
             "after rehydrate the session must be live in memory again so the \
              next prompt lands on a working session"
+        );
+    }
+
+    /// Wraps a real `SqliteSessionBackend` but injects a failure from
+    /// `resolve_or_create_conversation_id`, so a test can prove a backend error
+    /// propagates from `session/new` as `INTERNAL_ERROR` instead of silently
+    /// degrading to a random UUID. All other trait methods delegate to the inner
+    /// backend.
+    struct FailingBackend {
+        inner: zeroclaw_infra::session_sqlite::SqliteSessionBackend,
+    }
+
+    impl SessionBackend for FailingBackend {
+        fn resolve_or_create_conversation_id(&self, _session_key: &str) -> std::io::Result<String> {
+            Err(std::io::Error::other("injected resolve failure"))
+        }
+        fn load(&self, session_key: &str) -> Vec<zeroclaw_providers::ChatMessage> {
+            self.inner.load(session_key)
+        }
+        fn append(
+            &self,
+            session_key: &str,
+            message: &zeroclaw_providers::ChatMessage,
+        ) -> std::io::Result<()> {
+            self.inner.append(session_key, message)
+        }
+        fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
+            self.inner.remove_last(session_key)
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            self.inner.list_sessions()
+        }
+        fn session_exists(&self, session_key: &str) -> bool {
+            self.inner.session_exists(session_key)
+        }
+        fn clear_and_rotate_conversation(&self, session_key: &str) -> std::io::Result<String> {
+            self.inner.clear_and_rotate_conversation(session_key)
+        }
+        fn append_if_conversation_matches(
+            &self,
+            session_key: &str,
+            expected_conversation_id: &str,
+            message: &zeroclaw_providers::ChatMessage,
+        ) -> std::io::Result<zeroclaw_infra::session_backend::ConditionalSessionWrite> {
+            self.inner.append_if_conversation_matches(
+                session_key,
+                expected_conversation_id,
+                message,
+            )
+        }
+        fn remove_last_if_conversation_matches(
+            &self,
+            session_key: &str,
+            expected_conversation_id: &str,
+        ) -> std::io::Result<zeroclaw_infra::session_backend::ConditionalSessionWrite> {
+            self.inner
+                .remove_last_if_conversation_matches(session_key, expected_conversation_id)
+        }
+        fn update_last_if_conversation_matches(
+            &self,
+            session_key: &str,
+            expected_conversation_id: &str,
+            message: &zeroclaw_providers::ChatMessage,
+        ) -> std::io::Result<zeroclaw_infra::session_backend::ConditionalSessionWrite> {
+            self.inner.update_last_if_conversation_matches(
+                session_key,
+                expected_conversation_id,
+                message,
+            )
+        }
+    }
+
+    /// Build a dispatcher whose context wires a specific `session_backend`,
+    /// so failure-injection and degradation tests can swap the backend without
+    /// touching the persistence-test ACP store wiring.
+    fn make_dispatcher_with_backend(
+        config: zeroclaw_config::schema::Config,
+        backend: Option<Arc<dyn SessionBackend>>,
+    ) -> (RpcDispatcher, Arc<crate::rpc::session::SessionStore>) {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::for_persistence_tests(config, Arc::clone(&sessions), backend, None);
+        let mut ctx = Arc::try_unwrap(ctx)
+            .ok()
+            .expect("for_persistence_tests should return a uniquely-owned context");
+        ctx.event_tx = None;
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(Arc::new(ctx), tx, "test-peer".into());
+        (dispatcher, sessions)
+    }
+
+    #[tokio::test]
+    async fn rpc_session_new_backend_resolve_failure_returns_internal_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let backend: Arc<dyn SessionBackend> = Arc::new(FailingBackend {
+            inner: zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(&config.data_dir)
+                .unwrap(),
+        });
+        let (dispatcher, _sessions) = make_dispatcher_with_backend(config, Some(backend));
+
+        // A backend resolve failure must propagate from session/new as
+        // INTERNAL_ERROR - NOT succeed, NOT silently degrade to a random UUID.
+        let result = dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "exclude_memory": true,
+                "chat_mode": "acp",
+                "session_id": "attacker@example.com",
+            }))
+            .await;
+        let err = result
+            .expect_err("a backend resolve failure must surface as an RPC error, not success");
+        assert_eq!(
+            err.code, INTERNAL_ERROR,
+            "the error code must be INTERNAL_ERROR (got {:?}): {}",
+            err.code, err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn rpc_session_new_without_backend_mints_oneshot_uuid_v4() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        // `make_acp_test_dispatcher` wires `session_backend = None` (persistence
+        // disabled), exercising the no-backend degradation arm.
+        let (dispatcher, sessions) = make_acp_test_dispatcher(config);
+
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "exclude_memory": true,
+                "chat_mode": "chat",
+                "session_id": "attacker@example.com",
+            }))
+            .await
+            .expect("session/new must succeed without a backend (one-shot UUID)");
+
+        // The no-backend arm mints a single one-shot UUID v4 - a valid,
+        // exportable id, never `None` and never the raw session_id.
+        let id = {
+            let agent = sessions
+                .get_agent("attacker@example.com")
+                .await
+                .expect("session must be live after session/new");
+            agent
+                .lock()
+                .await
+                .conversation_id()
+                .map(str::to_string)
+                .expect("conversation_id must be minted even without a backend")
+        };
+        let parsed = uuid::Uuid::parse_str(&id).expect("conversation_id must be a valid UUID");
+        assert_eq!(parsed.get_version_num(), 4, "must be UUID v4: {id}");
+        assert_ne!(
+            id, "attacker@example.com",
+            "the raw caller-supplied session_id must never become the conversation_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn rpc_session_prompt_resolves_opaque_stable_conversation_id_not_raw_session_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        let sid = "attacker@example.com";
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "exclude_memory": true,
+                "chat_mode": "acp",
+                "session_id": sid,
+            }))
+            .await
+            .expect("session/new should succeed");
+
+        // The conversation id is resolved ONCE at session/new and stamped onto
+        // the agent - NEVER the raw caller-supplied email session_id.
+        let id1 = {
+            let agent = sessions
+                .get_agent(sid)
+                .await
+                .expect("session must be live after session/new");
+            agent
+                .lock()
+                .await
+                .conversation_id()
+                .map(str::to_string)
+                .expect("conversation_id must be stamped at session/new")
+        };
+        let parsed = uuid::Uuid::parse_str(&id1).expect("conversation_id must be a valid UUID");
+        assert_eq!(parsed.get_version_num(), 4, "must be UUID v4: {id1}");
+        assert_ne!(
+            id1, sid,
+            "the raw caller-supplied session_id must never become the conversation_id"
+        );
+
+        // session/prompt must READ the stamped id back, not re-resolve/re-mint.
+        // The turn errors at the unreachable provider, but the id is unchanged.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            dispatcher.handle_session_prompt(&json!({
+                "session_id": sid,
+                "prompt": "turn one",
+            })),
+        )
+        .await
+        .expect("session/prompt must not hang");
+        let id2 = {
+            let agent = sessions
+                .get_agent(sid)
+                .await
+                .expect("session must remain live after a failed prompt");
+            agent
+                .lock()
+                .await
+                .conversation_id()
+                .map(str::to_string)
+                .expect("conversation_id must survive the prompt")
+        };
+        assert_eq!(
+            id2, id1,
+            "conversation_id must be stable across prompts (cross-turn stability)"
+        );
+
+        // A second prompt must still share the same id - never re-minted.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            dispatcher.handle_session_prompt(&json!({
+                "session_id": sid,
+                "prompt": "turn two",
+            })),
+        )
+        .await
+        .expect("second session/prompt must not hang");
+        let id3 = {
+            let agent = sessions
+                .get_agent(sid)
+                .await
+                .expect("session must remain live after the second prompt");
+            agent
+                .lock()
+                .await
+                .conversation_id()
+                .map(str::to_string)
+                .expect("conversation_id must survive the second prompt")
+        };
+        assert_eq!(
+            id3, id1,
+            "conversation_id must be stable across many prompts"
+        );
+    }
+
+    #[tokio::test]
+    async fn reaped_session_rehydration_keeps_stable_conversation_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        let sid = "attacker@example.com";
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "exclude_memory": true,
+                "chat_mode": "acp",
+                "session_id": sid,
+            }))
+            .await
+            .expect("session/new should succeed");
+
+        let id1 = {
+            let agent = sessions
+                .get_agent(sid)
+                .await
+                .expect("session must be live after session/new");
+            agent
+                .lock()
+                .await
+                .conversation_id()
+                .map(str::to_string)
+                .expect("conversation_id must be stamped at session/new")
+        };
+        let parsed = uuid::Uuid::parse_str(&id1).expect("conversation_id must be a valid UUID");
+        assert_eq!(parsed.get_version_num(), 4, "must be UUID v4: {id1}");
+        assert_ne!(
+            id1, sid,
+            "the raw caller-supplied session_id must never become the conversation_id"
+        );
+
+        // Reaper tears down the in-memory session; the durable row survives.
+        assert!(sessions.remove(sid).await, "reap must remove the session");
+        assert!(
+            sessions.get_agent(sid).await.is_none(),
+            "post-reap the session must be absent from memory"
+        );
+
+        // Rebuild from the durable store. The rehydrated agent must carry the
+        // SAME opaque conversation id (cross-reap stability) - resolved from
+        // the durable backend, not None and not a fresh mint.
+        let recovered = dispatcher
+            .rehydrate_reaped_session(sid)
+            .await
+            .expect("a reaped session with a live durable row must rehydrate");
+        let id2 = recovered
+            .lock()
+            .await
+            .conversation_id()
+            .map(str::to_string)
+            .expect("rehydrated agent must carry a conversation_id");
+        let parsed =
+            uuid::Uuid::parse_str(&id2).expect("rehydrated conversation_id must be a valid UUID");
+        assert_eq!(parsed.get_version_num(), 4, "must be UUID v4: {id2}");
+        assert_eq!(
+            id2, id1,
+            "rehydrate must restore the SAME durable conversation id, not re-mint"
         );
     }
 

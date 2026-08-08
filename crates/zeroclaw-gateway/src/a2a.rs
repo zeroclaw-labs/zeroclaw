@@ -540,8 +540,22 @@ async fn handle_alias_task(
             .into_response();
     }
 
+    // `session_id` is the memory-scoped key (also surfaced as the A2A task's
+    // `context_id`). The conversation id is a separate bare UUID v4 - the
+    // `a2a_` prefix must not enter the conversation attribution slot.
     let session_id = format!("a2a_{alias}_{}", Uuid::new_v4());
-    match run_gateway_chat_with_tools(&state, &prompt, Some(&session_id), Some(&alias)).await {
+    let conversation_id = crate::mint_request_conversation_id();
+    match run_gateway_chat_with_tools(
+        &state,
+        &prompt,
+        Some(&session_id),
+        Some(&alias),
+        Some(&conversation_id),
+        &[],
+        None,
+    )
+    .await
+    {
         Ok(outcome) => {
             let task = OutTask {
                 id: Uuid::new_v4().to_string(),

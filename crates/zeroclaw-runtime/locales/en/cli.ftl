@@ -942,6 +942,7 @@ channel-runtime-progress-running-tool = Running tool
 channel-runtime-progress-compacting-context = Compacting context
 channel-runtime-progress-finalizing-response = Finalizing response
 channel-runtime-new-session = Conversation history cleared. Starting fresh.
+channel-runtime-session-reset-failed = Could not reset the conversation session. The previous history is still active; please try again.
 channel-runtime-stop-sent = Stop signal sent.
 channel-runtime-stop-no-task = No in-flight task for this sender scope.
 channel-runtime-model-empty = Model ID cannot be empty. Use `/model <model-id>`.
