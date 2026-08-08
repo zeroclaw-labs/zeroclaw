@@ -25,12 +25,18 @@ pub mod openrouter_catalog;
 pub mod pricing;
 pub mod reliable;
 pub mod router;
+pub mod safeguard_notice;
 pub(crate) mod stream_guard;
 pub mod telnyx;
 pub mod traits;
 pub mod vision_override;
 
+pub use anthropic::AnthropicRefusalError;
 pub use dispatch::{ProviderDispatch, ProviderDispatchRef};
+pub use safeguard_notice::{
+    SafeguardFallbackKind, SafeguardFallbackNotice, record_safeguard_fallback,
+    scope_safeguard_fallback, take_last_safeguard_fallback,
+};
 
 mod request_payload;
 
