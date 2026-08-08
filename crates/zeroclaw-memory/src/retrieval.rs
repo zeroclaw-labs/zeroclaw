@@ -308,6 +308,18 @@ impl Memory for RetrievalPipeline {
         self.memory.name()
     }
 
+    fn as_shared_writable(&self) -> Option<&dyn crate::traits::SharedWritable> {
+        // Transparent forward is correct here: this decorator only adds an
+        // optional read-side hot cache, so it has no write-path policy of its
+        // own to apply. The shared/system content scan, redaction, policy gate,
+        // and audit all live on the inner handles (`ScannedMemory` /
+        // `AuditedMemory`), which now OWN the capability rather than forward it.
+        // Forwarding the accessor keeps the composed handle's shared write
+        // routed through that inner policy chain while still exposing the tool
+        // on a pipeline-wrapped hindsight agent.
+        self.memory.as_shared_writable()
+    }
+
     async fn store(
         &self,
         key: &str,
@@ -429,6 +441,20 @@ impl Memory for RetrievalPipeline {
 
     async fn count(&self) -> anyhow::Result<usize> {
         self.memory.count().await
+    }
+
+    async fn count_own(&self) -> anyhow::Result<u64> {
+        // Pure pass-through: this decorator only adds an optional read-side hot
+        // cache and never caches counts, so it has no own policy to apply.
+        // Forwarding preserves the inner backend's native own-footprint count
+        // (visibility-correct, uncapped) instead of the trait defaults.
+        self.memory.count_own().await
+    }
+
+    async fn count_by_agent_id(&self, agent_id: &str) -> anyhow::Result<u64> {
+        // Pure pass-through: see `count_own`. Reaches the backend's native
+        // uncapped COUNT rather than the list+filter default.
+        self.memory.count_by_agent_id(agent_id).await
     }
 
     async fn health_check(&self) -> bool {

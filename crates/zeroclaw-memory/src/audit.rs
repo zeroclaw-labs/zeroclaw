@@ -3,6 +3,7 @@
 use super::traits::{
     ExportFilter, Memory, MemoryCategory, MemoryEntry, MemoryStats, ProceduralMessage, StoreOptions,
 };
+use anyhow::Context as _;
 use async_trait::async_trait;
 use chrono::Local;
 use parking_lot::Mutex;
@@ -242,6 +243,20 @@ impl<M: Memory> Memory for AuditedMemory<M> {
         self.inner.name()
     }
 
+    fn as_shared_writable(&self) -> Option<&dyn crate::traits::SharedWritable> {
+        // Own the capability when the wrapped backend supports it: returning
+        // `Some(self)` routes shared/system writes through this decorator's
+        // `SharedWritable` impl, which records an audit row for each write in
+        // the same way private writes are audited before delegating inward. A
+        // bare forward would let a shared/system write reach the backend
+        // unaudited.
+        if self.inner.as_shared_writable().is_some() {
+            Some(self)
+        } else {
+            None
+        }
+    }
+
     fn refresh_embedder(
         &self,
         model_provider: &str,
@@ -383,6 +398,14 @@ impl<M: Memory> Memory for AuditedMemory<M> {
 
     async fn count(&self) -> anyhow::Result<usize> {
         self.inner.count().await
+    }
+
+    async fn count_own(&self) -> anyhow::Result<u64> {
+        self.inner.count_own().await
+    }
+
+    async fn count_by_agent_id(&self, agent_id: &str) -> anyhow::Result<u64> {
+        self.inner.count_by_agent_id(agent_id).await
     }
 
     async fn health_check(&self) -> bool {
@@ -546,6 +569,56 @@ impl<M: Memory> Memory for AuditedMemory<M> {
 
     async fn ensure_agent_uuid(&self, alias: &str) -> anyhow::Result<String> {
         self.inner.ensure_agent_uuid(alias).await
+    }
+}
+
+/// Shared/system tier writes are audited the same way private writes are.
+///
+/// The composed handle owns this capability (`AuditedMemory::as_shared_writable`
+/// returns `Some(self)`), so a `shared_memory_store` / `system_memory_store`
+/// write logs a `store` audit row (mirroring the private `store*` methods'
+/// `log_audit`) before delegating to the wrapped tier write. This keeps the
+/// audit trail complete for shared/system writes instead of only private ones.
+#[async_trait]
+impl<M: Memory> crate::traits::SharedWritable for AuditedMemory<M> {
+    fn shared_bank(&self) -> Option<&str> {
+        self.inner
+            .as_shared_writable()
+            .and_then(|w| w.shared_bank())
+    }
+
+    fn system_bank(&self) -> Option<&str> {
+        self.inner
+            .as_shared_writable()
+            .and_then(|w| w.system_bank())
+    }
+
+    async fn store_to_shared(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+    ) -> anyhow::Result<()> {
+        let inner = self
+            .inner
+            .as_shared_writable()
+            .context("backend does not support shared-tier writes")?;
+        self.log_audit(AuditOp::Store, Some(key), None, None, Some("tier=shared"));
+        inner.store_to_shared(key, content, category).await
+    }
+
+    async fn store_to_system(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+    ) -> anyhow::Result<()> {
+        let inner = self
+            .inner
+            .as_shared_writable()
+            .context("backend does not support system-tier writes")?;
+        self.log_audit(AuditOp::Store, Some(key), None, None, Some("tier=system"));
+        inner.store_to_system(key, content, category).await
     }
 }
 

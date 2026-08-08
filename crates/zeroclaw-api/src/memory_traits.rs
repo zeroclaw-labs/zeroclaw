@@ -240,11 +240,72 @@ pub enum MemoryPolicyDecision {
     Deny { reason: String },
 }
 
+/// Controlled write access to shared/system memory tiers.
+///
+/// This is a small, backend-specific capability (only the hindsight backend
+/// implements it) kept OFF the generic [`Memory`] trait on purpose: most
+/// backends have no concept of a "shared bank", and the write PERMISSION is
+/// gated per agent by tool name rather than by the trait. The native
+/// `shared_memory_store` / `system_memory_store` tools obtain a
+/// `&dyn SharedWritable` via [`Memory::as_shared_writable`] and call
+/// [`SharedWritable::store_to_shared`] / [`SharedWritable::store_to_system`].
+///
+/// Reads of the shared/system tiers need no special trait: they already merge
+/// into ordinary `recall`/`list`.
+///
+/// Composed-chain routing: the raw `HindsightMemory` implements this trait, but
+/// the per-agent handle returned by the memory factory is wrapped in the
+/// `ScannedMemory` -> `AuditedMemory` -> retrieval decorator chain. Those
+/// decorators OWN this capability (their `as_shared_writable` returns
+/// `Some(self)` when the inner backend supports the tier) so a shared/system
+/// write passes the same fail-closed content scan, redaction, memory policy,
+/// and audit as a private write before reaching the backend - it is never
+/// forwarded raw around the composed chain.
+#[async_trait]
+pub trait SharedWritable: Send + Sync {
+    /// The configured shared/family bank id, or `None` when no shared tier is
+    /// configured. When `None`, the shared write tool degrades gracefully.
+    fn shared_bank(&self) -> Option<&str>;
+
+    /// The configured system bank id, or `None` when no system tier is
+    /// configured. When `None`, the system write tool degrades gracefully.
+    fn system_bank(&self) -> Option<&str>;
+
+    /// Explicitly write a memory into the shared/family tier. Fails if no
+    /// shared bank is configured (callers should check [`Self::shared_bank`]
+    /// first and degrade gracefully).
+    async fn store_to_shared(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+    ) -> anyhow::Result<()>;
+
+    /// Explicitly write a memory into the system tier. Fails if no system bank
+    /// is configured (callers should check [`Self::system_bank`] first).
+    async fn store_to_system(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+    ) -> anyhow::Result<()>;
+}
+
 /// Core memory trait — implement for any persistence backend
 #[async_trait]
 pub trait Memory: Send + Sync + crate::attribution::Attributable {
     /// Backend name
     fn name(&self) -> &str;
+
+    /// Downcast to the shared/system write capability when this backend
+    /// supports controlled shared-tier writes (only hindsight does today).
+    ///
+    /// Default `None`: backends without a shared/system tier expose no shared
+    /// write path, so the `shared_memory_store` / `system_memory_store` tools
+    /// are simply never constructed for them.
+    fn as_shared_writable(&self) -> Option<&dyn SharedWritable> {
+        None
+    }
 
     /// Store a memory entry, optionally scoped to a session
     async fn store(
@@ -301,6 +362,20 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
         category: Option<&MemoryCategory>,
         session_id: Option<&str>,
     ) -> anyhow::Result<Vec<MemoryEntry>>;
+
+    /// List THIS agent's OWN Daily-history rows, scoped to the private store
+    /// BEFORE any limit, for the per-turn Daily dedup gate.
+    ///
+    /// Default: `list(Some(Daily), None)` - correct for single-store backends
+    /// (SQLite/markdown/none) where `list` already returns only this store's
+    /// rows. Backends that MERGE other scopes into ordinary reads (hindsight
+    /// merges the shared/system tiers into `recall`/`list`) MUST override this
+    /// to return only the agent's PRIVATE Daily rows, so a shared/system Daily
+    /// row can never suppress a private Daily write and unrelated categories can
+    /// never crowd the private duplicate out of a truncated candidate set.
+    async fn list_own_daily_history(&self) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.list(Some(&MemoryCategory::Daily), None).await
+    }
 
     /// Remove a memory by key. Deletes every row matching `key`, regardless
     /// of agent attribution. Agent-scoped callers (the `AgentScopedMemory`
@@ -389,6 +464,56 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
 
     /// Count total memories
     async fn count(&self) -> anyhow::Result<usize>;
+
+    /// Count THIS agent's own footprint: rows it owns, never rows it merely
+    /// has read visibility into via `workspace.read_memory_from`.
+    ///
+    /// This is deliberately NOT the same as `count()` on a wrapper that
+    /// composes multiple agents' read visibility into one handle (e.g. an
+    /// agent-scoped decorator around a shared SQL/Qdrant backend), which is
+    /// visibility-scoped (includes allowlisted peers) for the recall/list
+    /// use case. Own-count is a distinct, narrower metric for dashboards:
+    /// "how many rows does this agent actually own", independent of who
+    /// else it can currently see.
+    ///
+    /// Default: delegates to [`Self::count`] — correct for every backend
+    /// whose bare handle already represents exactly one agent's storage
+    /// (SQLite/Postgres/Qdrant's raw backend, Hindsight's private bank,
+    /// Markdown's per-agent dir, the `none` stub). Only a wrapper composing
+    /// MULTIPLE agents' visibility into one handle needs to override this to
+    /// a narrower, natively-scoped count instead of inheriting the
+    /// wrapper's merged `count()`.
+    async fn count_own(&self) -> anyhow::Result<u64> {
+        let n = self.count().await?;
+        Ok(u64::try_from(n).unwrap_or(u64::MAX))
+    }
+
+    /// Count memory rows natively attributed to a specific `agent_id`,
+    /// without visibility merging (no allowlisted-peer inclusion) and
+    /// without the `list()` read cap (1,000 rows on SQLite/Qdrant) that
+    /// backs the default filter-based implementation below.
+    ///
+    /// This is the backend-native seam an agent-scoped wrapper composing
+    /// multiple agents' visibility into one handle uses to implement
+    /// [`Self::count_own`] correctly: such a wrapper's own `count()` is
+    /// visibility-scoped and cannot serve as an own-footprint count. Only
+    /// backends actually wrapped that way (SQLite, PostgreSQL, Qdrant) need
+    /// an efficient override; single-agent backends (Hindsight, Markdown,
+    /// `none`) are never wrapped that way and keep the default.
+    ///
+    /// Default: composes [`Self::list`] and filters by `agent_id` —
+    /// functionally correct but inherits `list`'s row cap on backends that
+    /// have one, so it undercounts a single agent with more rows than that
+    /// cap. Backends wrapped by a multi-agent visibility decorator MUST
+    /// override this with a native, uncapped `COUNT` query.
+    async fn count_by_agent_id(&self, agent_id: &str) -> anyhow::Result<u64> {
+        let entries = self.list(None, None).await?;
+        let n = entries
+            .into_iter()
+            .filter(|e| e.agent_id.as_deref() == Some(agent_id))
+            .count();
+        Ok(u64::try_from(n).unwrap_or(u64::MAX))
+    }
 
     /// Health check
     async fn health_check(&self) -> bool;

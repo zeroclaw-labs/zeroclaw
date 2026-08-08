@@ -173,6 +173,7 @@ pub enum MemoryBackendKind {
     Qdrant,
     Markdown,
     Lucid,
+    Hindsight,
 }
 
 // ── Quickstart state / step / surface ──────────────────────────
