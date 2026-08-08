@@ -28,20 +28,27 @@ fn configured_model_provider_profiles(config: &Config) -> Vec<String> {
     profiles
 }
 
-fn resolve_model_provider_profile_ref(config: &Config, raw: &str) -> Result<String, String> {
+/// Resolve a `model_provider` argument into the normalized two-segment
+/// profile ref plus, when the argument was a three-segment
+/// `<type>.<alias>.<model_alias>` ref, the model id that entry selects.
+fn resolve_model_provider_profile_ref(
+    config: &Config,
+    raw: &str,
+) -> Result<(String, Option<String>), String> {
     let raw = raw.trim();
-    let Some((family, alias)) = raw.split_once('.') else {
-        return Err(format!(
-            "model_provider must be a dotted `<type>.<alias>` provider profile reference, got `{raw}`"
-        ));
+    let mut parts = raw.splitn(3, '.');
+    let (family, alias, model_alias) = match (parts.next(), parts.next(), parts.next()) {
+        (Some(f), Some(a), model_seg)
+            if !f.trim().is_empty() && !a.trim().is_empty() && model_seg != Some("") =>
+        {
+            (f.trim(), a.trim(), model_seg)
+        }
+        _ => {
+            return Err(format!(
+                "model_provider must be a dotted `<type>.<alias>` or `<type>.<alias>.<model>` provider profile reference, got `{raw}`"
+            ));
+        }
     };
-    let family = family.trim();
-    let alias = alias.trim();
-    if family.is_empty() || alias.is_empty() {
-        return Err(format!(
-            "model_provider must be a dotted `<type>.<alias>` provider profile reference, got `{raw}`"
-        ));
-    }
 
     if config.providers.models.find(family, alias).is_none() {
         let available = configured_model_provider_profiles(config);
@@ -55,7 +62,31 @@ fn resolve_model_provider_profile_ref(config: &Config, raw: &str) -> Result<Stri
         ));
     }
 
-    Ok(format!("{family}.{alias}"))
+    // Three-segment ref: the model entry must exist; derive its id.
+    let derived_model = if let Some(model_alias) = model_alias {
+        match config.providers.models.find_model(family, alias, model_alias) {
+            Some(entry) => Some(
+                entry
+                    .id
+                    .clone()
+                    .or_else(|| config.providers.models.find(family, alias).and_then(|p| p.model.clone()))
+                    .ok_or_else(|| {
+                        format!(
+                            "model entry `{raw}` has no `id` and its provider profile has no `model`"
+                        )
+                    })?,
+            ),
+            None => {
+                return Err(format!(
+                    "model_provider `{raw}` names model `{model_alias}` but [providers.models.{family}.{alias}.models.{model_alias}] is not configured"
+                ));
+            }
+        }
+    } else {
+        None
+    };
+
+    Ok((format!("{family}.{alias}"), derived_model))
 }
 
 pub struct ModelSwitchTool {
@@ -174,36 +205,48 @@ impl ModelSwitchTool {
 
         let model = args.get("model").and_then(|v| v.as_str());
 
-        let model = match model {
+        let (model_provider, derived_model) = match resolve_model_provider_profile_ref(
+            &self.config,
+            model_provider,
+        ) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                let known_model_providers = zeroclaw_providers::list_model_providers();
+                let configured_profiles = configured_model_provider_profiles(&self.config);
+                return Ok(ToolResult {
+                        success: false,
+                        output: serde_json::to_string_pretty(&json!({
+                            "provider_ref_shape": "<type>.<alias> or <type>.<alias>.<model>",
+                            "available_provider_families": known_model_providers.iter().map(|p| p.name).collect::<Vec<_>>(),
+                            "configured_provider_profiles": configured_profiles
+                        }))?.into(),
+                        error: Some(error),
+                    });
+            }
+        };
+
+        // Explicit `model` wins; otherwise a three-segment ref supplies it.
+        let model = match model
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(str::to_string)
+            .or(derived_model)
+        {
             Some(m) => m,
             None => {
                 return Ok(ToolResult {
                     success: false,
                     output: ToolOutput::default(),
-                    error: Some("Missing 'model' parameter for 'set' action".to_string()),
+                    error: Some(
+                        "Missing 'model' parameter for 'set' action (or use a \
+                         `<type>.<alias>.<model>` model_provider ref)"
+                            .to_string(),
+                    ),
                 });
             }
         };
 
-        let model_provider = match resolve_model_provider_profile_ref(&self.config, model_provider)
-        {
-            Ok(model_provider) => model_provider,
-            Err(error) => {
-                let known_model_providers = zeroclaw_providers::list_model_providers();
-                let configured_profiles = configured_model_provider_profiles(&self.config);
-                return Ok(ToolResult {
-                    success: false,
-                    output: serde_json::to_string_pretty(&json!({
-                        "provider_ref_shape": "<type>.<alias>",
-                        "available_provider_families": known_model_providers.iter().map(|p| p.name).collect::<Vec<_>>(),
-                        "configured_provider_profiles": configured_profiles
-                    }))?.into(),
-                    error: Some(error),
-                });
-            }
-        };
-
-        let model = model.trim();
+        let model = model.trim().to_string();
         if model.is_empty() {
             return Ok(ToolResult {
                 success: false,
@@ -213,7 +256,7 @@ impl ModelSwitchTool {
         }
 
         let switch_state = current_model_switch_state()?;
-        *switch_state.lock().unwrap() = Some((model_provider.clone(), model.to_string()));
+        *switch_state.lock().unwrap() = Some((model_provider.clone(), model.clone()));
 
         Ok(ToolResult {
             success: true,
@@ -283,12 +326,12 @@ impl ModelSwitchTool {
 
         let model_provider = match resolve_model_provider_profile_ref(&self.config, model_provider)
         {
-            Ok(model_provider) => model_provider,
+            Ok((model_provider, _derived_model)) => model_provider,
             Err(error) => {
                 return Ok(ToolResult {
                     success: false,
                     output: serde_json::to_string_pretty(&json!({
-                        "provider_ref_shape": "<type>.<alias>",
+                        "provider_ref_shape": "<type>.<alias> or <type>.<alias>.<model>",
                         "configured_provider_profiles": configured_model_provider_profiles(&self.config)
                     }))?.into(),
                     error: Some(error),

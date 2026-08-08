@@ -357,11 +357,11 @@ nohup python3 ~/sensor_loop.py &
 ### Start ZeroClaw Agent
 
 ```bash
-# Configure ZeroClaw to use robot tools. The four-section V3 shape
+# Configure ZeroClaw to use robot tools. The four-section shape
 # (provider entry, agent, risk profile, optional memory) is documented at
 # https://github.com/zeroclaw-labs/zeroclaw/blob/master/docs/book/src/providers/configuration.md#minimal-working-example
 cat > ~/.zeroclaw/config.toml << 'EOF'
-schema_version = 3
+schema_version = 4
 
 [providers.models.ollama.local]    # type = ollama; alias = local (you choose)
 model = "llama3.2:3b"

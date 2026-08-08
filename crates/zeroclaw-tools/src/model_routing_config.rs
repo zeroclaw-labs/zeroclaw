@@ -544,10 +544,11 @@ impl ModelRoutingConfigTool {
 
         // Determine which models entry to update.
         let (type_k, alias_k) = match &provider_update {
-            MaybeSet::Set(model_provider) => model_provider
-                .split_once('.')
-                .map(|(t, a)| (t.to_string(), a.to_string()))
-                .unwrap_or_else(|| (model_provider.clone(), "default".to_string())),
+            MaybeSet::Set(model_provider) => {
+                zeroclaw_config::schema::provider_profile_ref(model_provider)
+                    .map(|(t, a)| (t.to_string(), a.to_string()))
+                    .unwrap_or_else(|| (model_provider.clone(), "default".to_string()))
+            }
             MaybeSet::Null | MaybeSet::Unset => {
                 // Update whichever entry already exists, or create a placeholder.
                 cfg.providers
@@ -658,8 +659,7 @@ impl ModelRoutingConfigTool {
     async fn probe_model(&self, provider_name: &str, model: &str) -> anyhow::Result<()> {
         // Use the runtime config's API key (which includes env-sourced keys),
         // not the on-disk config (which may have no key at all).
-        let (family, alias) = provider_name
-            .split_once('.')
+        let (family, alias) = zeroclaw_config::schema::provider_profile_ref(provider_name)
             .unwrap_or((provider_name, "default"));
         let entry = self.config.providers.models.find(family, alias);
         let api_key = entry.and_then(|e| e.api_key.as_deref());

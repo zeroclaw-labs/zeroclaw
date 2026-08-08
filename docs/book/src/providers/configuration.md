@@ -25,6 +25,31 @@ Almost every family also takes the shared fields from `ModelProviderConfig`:
 
 Family-specific entries add their own typed fields on top of these shared fields.
 
+## Hosting multiple models on one provider entry
+
+A single provider entry is a connection + credential unit. To serve several models over the same endpoint and credential without duplicating the entry, add a `[providers.models.<type>.<alias>.models.<model_alias>]` subtable per model. Each subtable carries its own `id` (the model identifier sent to the provider) plus optional model-side tuning that overlays the entry-level fields: `temperature`, `max_tokens`, `context_window`, `fallback_models`, `think`, `vision`, `native_tools`, `replay_assistant_reasoning`, `provider_extra`, `chat_template_kwargs`, and `pricing`. Any field left unset falls back to the entry-level value.
+
+An agent addresses a specific model with a three-segment ref `<type>.<alias>.<model_alias>`:
+
+```toml
+[providers.models.openai.gw]
+uri = "https://gateway.internal/v1"
+api_key = "sk-..."
+
+[providers.models.openai.gw.models.fast]
+id = "gpt-4o-mini"
+temperature = 0.3
+
+[providers.models.openai.gw.models.big]
+id = "gpt-4o"
+max_tokens = 8192
+
+[agents.assistant]
+model_provider = "openai.gw.fast"
+```
+
+The legacy two-segment ref `<type>.<alias>` still works. It resolves to `models.default` if present, otherwise to the sole model entry, otherwise to the entry-level `model` field — so existing single-model configs need no change.
+
 ## Field resolution order
 
 For most families, the URL is resolved in this order:
@@ -178,9 +203,9 @@ The `custom` slot requires `uri`. See [Custom providers](./custom.md).
 
 ## Picking which provider an agent uses
 
-Agents reference a provider by dotted alias. Provider entries on their own do nothing.
+Agents reference a provider by dotted alias — two-segment `<type>.<alias>` for the profile, or three-segment `<type>.<alias>.<model_alias>` to select a model in its `models` subtable. Provider entries on their own do nothing.
 
-`risk_profile` and `runtime_profile` reference independent alias maps, so their names need not match (`runtime_profile` is also optional). `Config::validate()` fails loud at startup if `model_provider` doesn't resolve to a configured `[providers.models.<type>.<alias>]` entry, or if `risk_profile` doesn't resolve to a configured `[risk_profiles.<alias>]` entry.
+`risk_profile` and `runtime_profile` reference independent alias maps, so their names need not match (`runtime_profile` is also optional). `Config::validate()` fails loud at startup if `model_provider` doesn't resolve to a configured `[providers.models.<type>.<alias>]` entry (or, for a three-segment ref, to a configured `[providers.models.<type>.<alias>.models.<model_alias>]` model entry), or if `risk_profile` doesn't resolve to a configured `[risk_profiles.<alias>]` entry.
 
 For multiple agents pointing at different providers, see [Routing](./routing.md).
 

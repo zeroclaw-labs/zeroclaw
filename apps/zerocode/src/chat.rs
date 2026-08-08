@@ -1906,7 +1906,15 @@ impl Chat {
     /// (`providers.models.<family>.<alias>.model`), used to pre-select the
     /// current model in the picker.
     async fn configured_model(rpc: &RpcClient, model_provider_ref: &str) -> Option<String> {
-        let prop = format!("providers.models.{model_provider_ref}.model");
+        // A three-segment ref `<family>.<alias>.<model_alias>` reads the model
+        // entry's `id`; a two-segment ref reads the profile's flat `model`.
+        let mut segs = model_provider_ref.splitn(3, '.');
+        let prop = match (segs.next(), segs.next(), segs.next()) {
+            (Some(family), Some(alias), Some(model_alias)) => {
+                format!("providers.models.{family}.{alias}.models.{model_alias}.id")
+            }
+            _ => format!("providers.models.{model_provider_ref}.model"),
+        };
         let entries = rpc.config_list(Some(&prop)).await.ok()?;
         entries.into_iter().find(|e| e.path == prop).and_then(|e| {
             e.value

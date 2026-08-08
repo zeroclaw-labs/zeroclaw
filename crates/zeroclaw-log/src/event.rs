@@ -227,16 +227,23 @@ impl ZeroclawAttribution {
         self.fields.insert(key.into(), value.into());
     }
 
-    /// Set a composite-prefixed attribution by splitting `composite` at
-    /// the first `.` — populates `<prefix>`, `<prefix>_type`, and
-    /// (when the dotted form is present) `<prefix>_alias` in one call.
+    /// Set a composite-prefixed attribution by taking the first two dotted
+    /// segments — populates `<prefix>`, `<prefix>_type`, and (when a dotted
+    /// form is present) `<prefix>_alias` in one call. `<prefix>` keeps the
+    /// full composite. A `model_provider` ref may be three-segment
+    /// (`<type>.<alias>.<model>`); the `_alias` field records the profile
+    /// alias (second segment), never `alias.model`.
     pub fn set_composite(&mut self, prefix: &str, composite: &str) {
         self.set(prefix.to_string(), composite.to_string());
-        if let Some((ty, alias)) = composite.split_once('.') {
-            self.set(type_field(prefix), ty.to_string());
-            self.set(alias_field(prefix), alias.to_string());
-        } else {
-            self.set(type_field(prefix), composite.to_string());
+        let mut parts = composite.splitn(3, '.');
+        match (parts.next(), parts.next()) {
+            (Some(ty), Some(alias)) => {
+                self.set(type_field(prefix), ty.to_string());
+                self.set(alias_field(prefix), alias.to_string());
+            }
+            _ => {
+                self.set(type_field(prefix), composite.to_string());
+            }
         }
     }
 
@@ -597,6 +604,20 @@ mod tests {
         let mut attribution = ZeroclawAttribution::default();
         attribution.set_composite("model_provider", "anthropic.clamps");
         assert_eq!(attribution.get("model_provider"), Some("anthropic.clamps"));
+        assert_eq!(attribution.get("model_provider_type"), Some("anthropic"));
+        assert_eq!(attribution.get("model_provider_alias"), Some("clamps"));
+    }
+
+    #[test]
+    fn set_composite_three_segment_model_provider_keeps_profile_alias() {
+        // A three-segment `<type>.<alias>.<model>` ref must record the profile
+        // alias (second segment) in `_alias`, not `alias.model`.
+        let mut attribution = ZeroclawAttribution::default();
+        attribution.set_composite("model_provider", "anthropic.clamps.fast");
+        assert_eq!(
+            attribution.get("model_provider"),
+            Some("anthropic.clamps.fast")
+        );
         assert_eq!(attribution.get("model_provider_type"), Some("anthropic"));
         assert_eq!(attribution.get("model_provider_alias"), Some("clamps"));
     }

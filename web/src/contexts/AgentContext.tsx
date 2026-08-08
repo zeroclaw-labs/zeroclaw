@@ -95,7 +95,7 @@ const MODEL_SWITCH_TIMEOUT_MS = 10_000;
 function friendlyAgentError(message?: string): string {
   const raw = message?.trim() || t('agent.unknown_error');
   const localConnectFailure = raw.match(
-    /model_provider=(\w+)\s+model=([^\s]+).*?url \((https?:\/\/[^)]+)\).*?(?:Connection refused|tcp connect error)/i,
+    /model_provider=([\w.]+)\s+model=([^\s]+).*?url \((https?:\/\/[^)]+)\).*?(?:Connection refused|tcp connect error)/i,
   );
   if (localConnectFailure) {
     const provider = localConnectFailure[1] ?? '';
@@ -600,16 +600,29 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
         // falling back to the daemon status model only if unset.
         setCurrentModel(activeRef ?? activeModel);
 
-        // Available switch targets = every configured provider ref
-        // (`providers.models.<family>.<alias>`), discovered via config/list.
+        // Available switch targets = every configured provider ref. Two-segment
+        // profile refs come from `providers.models.<type>.<alias>.model`;
+        // three-segment refs come from a multi-model subtable entry
+        // `providers.models.<type>.<alias>.models.<sub>.id`.
         try {
           const list = await listProps('providers.models');
           if (cancelled) return;
-          const refs = (list.entries ?? [])
-            .map((e) => e.path)
+          const paths = (list.entries ?? []).map((e) => e.path);
+          const twoSeg = paths
             .filter((p) => /^providers\.models\.[^.]+\.[^.]+\.model$/.test(p))
-            .map((p) => p.replace(/^providers\.models\./, '').replace(/\.model$/, ''));
-          const unique = Array.from(new Set(refs));
+            .map((p) =>
+              p.replace(/^providers\.models\./, '').replace(/\.model$/, ''),
+            );
+          const threeSeg = paths
+            .filter((p) =>
+              /^providers\.models\.[^.]+\.[^.]+\.models\.[^.]+\.id$/.test(p),
+            )
+            .map((p) =>
+              p
+                .replace(/^providers\.models\./, '')
+                .replace(/\.models\.([^.]+)\.id$/, '.$1'),
+            );
+          const unique = Array.from(new Set([...twoSeg, ...threeSeg]));
           setAvailableModels(unique.length > 0 ? unique : activeRef ? [activeRef] : []);
         } catch {
           setAvailableModels(activeRef ? [activeRef] : []);

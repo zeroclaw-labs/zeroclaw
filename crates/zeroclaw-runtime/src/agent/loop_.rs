@@ -1119,7 +1119,7 @@ fn api_key_and_uri_for_provider(
     provider_name: &str,
     fallback: Option<&zeroclaw_config::schema::ModelProviderConfig>,
 ) -> (Option<String>, Option<String>) {
-    if let Some((fam, al)) = provider_name.split_once('.')
+    if let Some((fam, al)) = zeroclaw_config::schema::provider_profile_ref(provider_name)
         && let Some(entry) = config.providers.models.find(fam, al)
     {
         return (entry.api_key.clone(), entry.uri.clone());
@@ -1399,9 +1399,19 @@ pub async fn run(
             })?
             .to_string();
 
+        // Resolve the model selection from the reference actually in effect
+        // (a `--provider` override wins over the agent's configured ref). This
+        // honors three-segment `<family>.<alias>.<model_alias>` refs, picking
+        // the model entry's `id` (and its per-model tuning below) rather than
+        // the profile's base `model`.
+        let model_selection = config.resolve_model_selection(
+            provider_override
+                .as_deref()
+                .unwrap_or_else(|| agent.model_provider.as_str()),
+        );
         let mut model_name = match model_override
             .as_deref()
-            .or(agent_model_provider.and_then(|e| e.model.as_deref()))
+            .or_else(|| model_selection.as_ref().and_then(|s| s.model_id.as_deref()))
         {
             Some(m) => m.to_string(),
             None => anyhow::bail!(
@@ -1429,10 +1439,16 @@ pub async fn run(
         // Resolve every alias-owned option, including vision, through the shared
         // provider-ref resolver. This keeps a --provider override isolated from
         // the agent alias without a second capability-specific lookup.
-        let provider_runtime_options = zeroclaw_providers::options_for_provider_ref(
+        let mut provider_runtime_options = zeroclaw_providers::options_for_provider_ref(
             &config,
             &provider_name,
             &agent_runtime_options,
+        );
+        // Overlay per-model tuning (max_tokens/think/vision/native_tools/…)
+        // for the selected model entry on top of the profile-level options.
+        zeroclaw_providers::apply_model_entry_options(
+            &mut provider_runtime_options,
+            model_selection.as_ref().and_then(|s| s.model_entry),
         );
 
         // Resolve api_key and uri from the actual provider being constructed.
@@ -1714,11 +1730,15 @@ pub async fn run(
                 thinking_level,
                 &agent.resolved.thinking,
             );
-            let effective_temperature: Option<f64> = temperature.map(|t| {
-                crate::agent::thinking::clamp_temperature(
-                    t + thinking_params.temperature_adjustment,
-                )
-            });
+            let effective_temperature: Option<f64> = model_selection
+                .as_ref()
+                .and_then(|s| s.model_entry.and_then(|m| m.temperature))
+                .or(temperature)
+                .map(|t| {
+                    crate::agent::thinking::clamp_temperature(
+                        t + thinking_params.temperature_adjustment,
+                    )
+                });
 
             // Compute per-turn excluded MCP tools from tool_filter_groups before
             // building the turn prompt so tool availability matches the specs
@@ -2847,6 +2867,10 @@ pub async fn process_message(
                 );
             }
         };
+        // Resolve the (possibly three-segment) model selection so a
+        // `<family>.<alias>.<model_alias>` ref picks the model entry's `id`
+        // and per-model tuning rather than the profile base `model`.
+        let model_selection = config.resolve_model_selection(agent.model_provider.as_str());
         let approval_manager = ApprovalManager::for_non_interactive(&risk_profile);
         let mem: Arc<dyn Memory> = zeroclaw_memory::create_memory_for_agent(
             &config,
@@ -2969,9 +2993,14 @@ pub async fn process_message(
             );
         }
 
-        let model_name = match agent_model_provider
+        let model_name = match model_selection
             .as_ref()
-            .and_then(|e| e.model.as_deref())
+            .and_then(|s| s.model_id.as_deref())
+            .or_else(|| {
+                agent_model_provider
+                    .as_ref()
+                    .and_then(|e| e.model.as_deref())
+            })
             .map(str::trim)
             .filter(|m| !m.is_empty())
         {
@@ -2981,10 +3010,14 @@ pub async fn process_message(
              `model` set. Configure [providers.models.{provider_name}.<alias>] model = \"...\"."
             ),
         };
-        let provider_runtime_options = zeroclaw_providers::provider_runtime_options_for_alias(
+        let mut provider_runtime_options = zeroclaw_providers::provider_runtime_options_for_alias(
             &config,
             provider_name,
             provider_alias.as_str(),
+        );
+        zeroclaw_providers::apply_model_entry_options(
+            &mut provider_runtime_options,
+            model_selection.as_ref().and_then(|s| s.model_entry),
         );
         let model_provider: Box<dyn ModelProvider> =
             zeroclaw_providers::create_routed_model_provider_with_options(
@@ -3181,9 +3214,10 @@ pub async fn process_message(
             thinking_level,
             &agent.resolved.thinking,
         );
-        let effective_temperature: Option<f64> = agent_model_provider
+        let effective_temperature: Option<f64> = model_selection
             .as_ref()
-            .and_then(|e| e.temperature)
+            .and_then(|s| s.model_entry.and_then(|m| m.temperature))
+            .or_else(|| agent_model_provider.as_ref().and_then(|e| e.temperature))
             .map(|t| {
                 crate::agent::thinking::clamp_temperature(
                     t + thinking_params.temperature_adjustment,

@@ -373,8 +373,7 @@ fn configured_model_provider_api_key<'a>(
     config: &'a Config,
     provider_name: &str,
 ) -> Option<&'a str> {
-    let (family, alias) = provider_name
-        .split_once('.')
+    let (family, alias) = zeroclaw_config::schema::provider_profile_ref(provider_name)
         .unwrap_or((provider_name, "default"));
 
     config
@@ -395,7 +394,7 @@ fn create_doctor_model_provider(
         &zeroclaw_providers::ModelProviderRuntimeOptions::default(),
     );
 
-    match provider_name.split_once('.') {
+    match zeroclaw_config::schema::provider_profile_ref(provider_name) {
         Some((family, alias)) => zeroclaw_providers::create_model_provider_for_alias(
             config, family, alias, api_key, &options,
         ),

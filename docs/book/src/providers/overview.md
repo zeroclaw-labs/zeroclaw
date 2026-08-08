@@ -10,7 +10,7 @@ Why "model" provider? We use the phrase "model provider" consistently, there are
 
 Providers are typed by family, addressed as `providers.models.<type>.<alias>`. `<type>` is a canonical family slot (see the [Catalog](./catalog.md#all-slots) for every slot). There is one slot per vendor, with no synonyms: `azure_openai`, `azure-openai`, and `claude` (for Anthropic) are not accepted.
 
-`<alias>` is your operator-assigned instance name, and you can define **as many aliases per type as you want**. Run several profiles of the same vendor family side by side: same `type`, different aliases, each with its own key, model, and settings. For example, two Anthropic accounts as `anthropic.personal` and `anthropic.work` (each with its own `api_key` and `model`), where an agent picks one with `model_provider = "anthropic.personal"` (or `"anthropic.work"`). Add and edit these through the surfaces below, not by hand:
+`<alias>` is your operator-assigned instance name, and you can define **as many aliases per type as you want**. Run several profiles of the same vendor family side by side: same `type`, different aliases, each with its own key and settings. For example, two Anthropic accounts as `anthropic.personal` and `anthropic.work` (each with its own `api_key`), where an agent picks one with `model_provider = "anthropic.personal"` (or `"anthropic.work"`). A single profile can also host multiple models under a `models` subtable, selected with a three-segment ref — see [Configuration → multiple models per profile](./configuration.md#hosting-multiple-models-on-one-provider-entry). Add and edit these through the surfaces below, not by hand:
 
 {{#config-where providers.models}}
 

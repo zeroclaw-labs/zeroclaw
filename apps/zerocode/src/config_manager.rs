@@ -2921,8 +2921,17 @@ impl App {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        if field_path.ends_with(".model") && field_path.starts_with("providers.models.") {
-            // providers.models.<family>.<alias>.model → segment at index 2
+        // Model field inside a provider alias → fetch available models. Matches
+        // both the profile-level `...<alias>.model` and a model entry's
+        // `...<alias>.models.<model_alias>.id`.
+        let is_profile_model =
+            field_path.ends_with(".model") && field_path.starts_with("providers.models.");
+        let is_model_entry_id = field_path.ends_with(".id")
+            && field_path.starts_with("providers.models.")
+            && field_path.contains(".models.");
+        if is_profile_model || is_model_entry_id {
+            // providers.models.<family>.<alias>[.models.<model_alias>].{model,id}
+            // → family is always segment index 2.
             let segments: Vec<&str> = field_path.split('.').collect();
             if segments.len() >= 4 {
                 let family = segments[2].to_string();

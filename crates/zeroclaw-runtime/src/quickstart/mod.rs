@@ -530,7 +530,19 @@ pub fn snapshot_state(cfg: &Config) -> QuickstartState {
             .providers
             .models
             .iter_entries()
-            .map(|(family, alias, _)| format!("{family}.{alias}"))
+            .flat_map(|(family, alias, cfg)| {
+                // The two-segment profile ref, plus one three-segment ref per
+                // model entry so pickers can target a specific model on the
+                // same provider profile.
+                let base = format!("{family}.{alias}");
+                let mut model_aliases: Vec<String> = cfg.models.keys().cloned().collect();
+                model_aliases.sort();
+                std::iter::once(base.clone()).chain(
+                    model_aliases
+                        .into_iter()
+                        .map(move |m| format!("{base}.{m}")),
+                )
+            })
             .collect(),
         channels: collect_aliased_refs(&cfg.channels),
         unassigned_channels: collect_aliased_refs(&cfg.channels)
