@@ -172,6 +172,8 @@ pub enum ToolKind {
     SopHistory,
     Wait,
     Plugin,
+    /// A tool supplied by a WebAssembly plugin rather than the native registry.
+    WasmPlugin,
 }
 
 /// Cron schedule shapes.

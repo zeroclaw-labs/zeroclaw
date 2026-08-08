@@ -77,6 +77,10 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 
 # 1. Copy manifests to cache dependencies
 COPY Cargo.toml Cargo.lock ./
+# The optional WASM plugin host generates bindings from the repository-owned
+# WIT contract during compilation. Keep this before the dependency prefetch so
+# plugin-enabled builds have the same ABI input in both builder invocations.
+COPY wit/ wit/
 # Copy every workspace-member manifest in one glob — adding or removing a crate
 # no longer requires editing this file.  --parents preserves the
 # crates/<name>/Cargo.toml directory structure.

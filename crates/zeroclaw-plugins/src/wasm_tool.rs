@@ -24,7 +24,7 @@ pub struct WasmTool {
 
 impl Attributable for WasmTool {
     fn role(&self) -> Role {
-        Role::Tool(ToolKind::Plugin)
+        Role::Tool(ToolKind::WasmPlugin)
     }
 
     fn alias(&self) -> &str {
@@ -136,6 +136,7 @@ impl Tool for WasmTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zeroclaw_api::attribution::{Attributable, Role, ToolKind};
 
     fn tool_scope() -> PluginInstanceScope {
         crate::instance::test_scope(PluginCapability::Tool, "redaction-primary", [])
@@ -157,6 +158,7 @@ mod tests {
         assert_eq!(tool.name(), "redact");
         assert_eq!(tool.description(), "does things");
         assert_eq!(tool.parameters_schema(), schema);
+        assert_eq!(tool.role(), Role::Tool(ToolKind::WasmPlugin));
         assert_eq!(tool.alias(), "redact");
         assert_eq!(tool.scope.id().package(), "fixture");
         assert_eq!(tool.scope.id().capability(), PluginCapability::Tool);
