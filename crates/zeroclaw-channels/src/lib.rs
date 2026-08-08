@@ -48,6 +48,7 @@ pub mod filesystem;
 pub mod git;
 #[cfg(feature = "channel-email")]
 pub mod gmail_push;
+pub mod ict;
 #[cfg(feature = "channel-imessage")]
 pub mod imessage;
 #[cfg(feature = "channel-irc")]
