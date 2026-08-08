@@ -433,10 +433,20 @@ fn should_normalize_message_images(
     message.role == "user"
 }
 
-fn stripped_image_marker_text(content: &str) -> String {
+/// Drop up to `to_drop` image markers from the start of `content`, retaining
+/// any newer markers in their original order. The text is cleaned with the
+/// same semantics as full marker removal, including the history placeholder
+/// for an image-only message whose final marker is removed.
+fn trim_oldest_image_markers_from_content(content: &str, to_drop: usize) -> String {
     let (cleaned, refs) = parse_image_markers(content);
-    if refs.is_empty() {
+    if refs.is_empty() || to_drop == 0 {
         return content.to_string();
+    }
+
+    let keep_from = to_drop.min(refs.len());
+    let retained = &refs[keep_from..];
+    if !retained.is_empty() {
+        return compose_multimodal_message(&cleaned, retained);
     }
 
     if cleaned.trim().is_empty() {
@@ -446,22 +456,20 @@ fn stripped_image_marker_text(content: &str) -> String {
     }
 }
 
-fn strip_tool_result_image_markers(message: &ChatMessage) -> ChatMessage {
-    if !message.content.contains(IMAGE_MARKER_PREFIX) {
-        return message.clone();
-    }
-
+/// Trim image markers from a message while preserving the native tool-result
+/// JSON envelope used by provider adapters to recover `tool_call_id`.
+fn trim_oldest_message_images(message: &ChatMessage, to_drop: usize) -> ChatMessage {
     if message.role == "tool"
         && let Ok(serde_json::Value::Object(mut obj)) =
             serde_json::from_str::<serde_json::Value>(&message.content)
         && let Some(serde_json::Value::String(inner)) = obj.get("content").cloned()
     {
-        let stripped = stripped_image_marker_text(&inner);
-        if stripped == inner {
+        let trimmed = trim_oldest_image_markers_from_content(&inner, to_drop);
+        if trimmed == inner {
             return message.clone();
         }
 
-        obj.insert("content".to_string(), serde_json::Value::String(stripped));
+        obj.insert("content".to_string(), serde_json::Value::String(trimmed));
         return ChatMessage {
             role: message.role.clone(),
             content: serde_json::Value::Object(obj).to_string(),
@@ -470,8 +478,16 @@ fn strip_tool_result_image_markers(message: &ChatMessage) -> ChatMessage {
 
     ChatMessage {
         role: message.role.clone(),
-        content: stripped_image_marker_text(&message.content),
+        content: trim_oldest_image_markers_from_content(&message.content, to_drop),
     }
+}
+
+fn strip_tool_result_image_markers(message: &ChatMessage) -> ChatMessage {
+    if !message.content.contains(IMAGE_MARKER_PREFIX) {
+        return message.clone();
+    }
+
+    trim_oldest_message_images(message, usize::MAX)
 }
 
 fn replay_message_without_stale_tool_images(
@@ -745,8 +761,9 @@ fn trim_images_by_age(messages: &[ChatMessage], max_turns: usize) -> Vec<ChatMes
         .collect()
 }
 
-/// Strip image markers from older messages (oldest first) until total image
-/// count is within `max_images`. Keeps the text content of each message.
+/// Strip individual image markers from older messages (oldest first) until
+/// the total image count is within `max_images`. Keeps each message's text and
+/// retains newer markers when the cap boundary falls inside one message.
 fn trim_old_images(messages: &[ChatMessage], max_images: usize) -> Vec<ChatMessage> {
     let latest_tool_indices = latest_tool_result_indices(messages);
     // Find which messages (by index) contain images, oldest first.
@@ -766,31 +783,24 @@ fn trim_old_images(messages: &[ChatMessage], max_images: usize) -> Vec<ChatMessa
     let total: usize = image_positions.iter().map(|(_, c)| c).sum();
     let mut to_drop = total.saturating_sub(max_images);
 
-    // Collect indices of messages whose images should be stripped.
-    let mut strip_indices = std::collections::HashSet::new();
+    // Record how many oldest markers to remove from each message. Counting at
+    // marker granularity avoids over-trimming an album carried by one message.
+    let mut drop_counts = HashMap::new();
     for &(idx, count) in &image_positions {
         if to_drop == 0 {
             break;
         }
-        strip_indices.insert(idx);
-        to_drop = to_drop.saturating_sub(count);
+        let drop_count = to_drop.min(count);
+        drop_counts.insert(idx, drop_count);
+        to_drop -= drop_count;
     }
 
     messages
         .iter()
         .enumerate()
         .map(|(i, m)| {
-            if strip_indices.contains(&i) {
-                let (cleaned, _) = parse_image_markers(&m.content);
-                let text = if cleaned.trim().is_empty() {
-                    "[image removed from history]".to_string()
-                } else {
-                    cleaned
-                };
-                ChatMessage {
-                    role: m.role.clone(),
-                    content: text,
-                }
+            if let Some(&drop_count) = drop_counts.get(&i) {
+                trim_oldest_message_images(m, drop_count)
             } else {
                 replay_message_without_stale_tool_images(i, m, &latest_tool_indices)
             }
@@ -2053,11 +2063,10 @@ mod tests {
     }
 
     #[test]
-    fn trim_old_images_multi_image_message_stripped_as_unit() {
+    fn trim_old_images_partially_trims_multi_image_message() {
         // A single message has 3 images. We need to drop 2 to reach max=1.
-        // But trimming works at message granularity — the entire message gets
-        // stripped (all 3 images removed), which over-trims to 0. The newest
-        // message (text-only) is untouched.
+        // The newest image in that message must survive rather than the whole
+        // message being stripped as one unit.
         let messages = vec![
             ChatMessage::user(
                 "[IMAGE:/tmp/a.png]\n[IMAGE:/tmp/b.png]\n[IMAGE:/tmp/c.png]\nThree pics"
@@ -2068,12 +2077,59 @@ mod tests {
 
         let trimmed = trim_old_images(&messages, 1);
         assert_eq!(trimmed.len(), 2);
-        // All images in the first message are gone, but text remains
-        let (_, refs0) = parse_image_markers(&trimmed[0].content);
-        assert!(refs0.is_empty());
-        assert!(trimmed[0].content.contains("Three pics"));
+        let (cleaned, refs0) = parse_image_markers(&trimmed[0].content);
+        assert_eq!(cleaned, "Three pics");
+        assert_eq!(refs0, vec!["/tmp/c.png"]);
+        assert!(!trimmed[0].content.contains("/tmp/a.png"));
+        assert!(!trimmed[0].content.contains("/tmp/b.png"));
         // Second message unchanged
         assert_eq!(trimmed[1].content, "Just text, no images");
+    }
+
+    #[test]
+    fn trim_old_images_caps_exactly_when_boundary_splits_a_message() {
+        // Four images span two messages and the cap boundary lands between
+        // the two markers in the oldest message. Exactly the oldest marker is
+        // removed, leaving the newest three overall.
+        let messages = vec![
+            ChatMessage::user("[IMAGE:/tmp/a.png]\n[IMAGE:/tmp/b.png]\nFirst album".to_string()),
+            ChatMessage::user("[IMAGE:/tmp/c.png]\n[IMAGE:/tmp/d.png]\nSecond album".to_string()),
+        ];
+
+        let trimmed = trim_old_images(&messages, 3);
+        let (first_text, first_refs) = parse_image_markers(&trimmed[0].content);
+        let (second_text, second_refs) = parse_image_markers(&trimmed[1].content);
+
+        assert_eq!(first_text, "First album");
+        assert_eq!(first_refs, vec!["/tmp/b.png"]);
+        assert_eq!(second_text, "Second album");
+        assert_eq!(second_refs, vec!["/tmp/c.png", "/tmp/d.png"]);
+        assert_eq!(count_image_markers(&trimmed), 3);
+    }
+
+    #[test]
+    fn trim_old_images_partially_trims_native_tool_result_json() {
+        let content = serde_json::json!({
+            "tool_call_id": "tc1",
+            "content": "Generated [IMAGE:/tmp/a.png] and [IMAGE:/tmp/b.png]",
+        })
+        .to_string();
+
+        let trimmed = trim_old_images(&[ChatMessage::tool(content)], 1);
+        let value: serde_json::Value = serde_json::from_str(&trimmed[0].content)
+            .expect("trimmed native tool result should remain valid JSON");
+        assert_eq!(
+            value.get("tool_call_id").and_then(|value| value.as_str()),
+            Some("tc1")
+        );
+
+        let inner = value
+            .get("content")
+            .and_then(|value| value.as_str())
+            .expect("content should remain a JSON string");
+        let (cleaned, refs) = parse_image_markers(inner);
+        assert_eq!(cleaned, "Generated  and");
+        assert_eq!(refs, vec!["/tmp/b.png"]);
     }
 
     #[test]
