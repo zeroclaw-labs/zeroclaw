@@ -8990,8 +8990,11 @@ pub struct FileDownloadConfig {
     /// every host. Empty (the default) rejects all private/local hosts so a
     /// misconfigured `url` cannot quietly turn the download tool into an SSRF
     /// probe. Lifting the private-host rejection never lifts the cloud-metadata
-    /// exclusion: the documented provider metadata addresses (169.254.169.254,
-    /// `fd00:ec2::254`, Alibaba Cloud's 100.100.100.200) are always rejected.
+    /// exclusion: the documented provider metadata and credential-delivery
+    /// addresses (169.254.169.254 / `fd00:ec2::254` for EC2 IMDS, Alibaba
+    /// Cloud's 100.100.100.200, and AWS 169.254.170.2 / 169.254.170.23 /
+    /// `fd00:ec2::23` for ECS task and EKS Pod Identity credentials) are
+    /// always rejected.
     /// A malformed entry in this list fails the whole list closed to empty, so
     /// an invalid value cannot silently widen the gate. It does not change
     /// which endpoint is used, and redirects remain disabled.

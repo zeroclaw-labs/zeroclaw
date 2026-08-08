@@ -1409,6 +1409,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_rejects_ecs_credentials_endpoint_without_opt_in() {
+        // AWS ECS task credentials (169.254.170.2) are credential-delivery
+        // endpoints. Even though they sit in the 169.254.0.0/16 link-local
+        // range and would be rejected as private, the SSRF gate must also
+        // classify them as cloud metadata so a future allowlist that lifts
+        // the private check cannot re-admit them.
+        let tmp = TempDir::new().unwrap();
+        let tool = FileDownloadTool::new(
+            test_security(tmp.path().to_path_buf(), AutonomyLevel::Full),
+            cfg(Some("http://169.254.170.2/credentials".into())),
+        );
+
+        let result = tool
+            .execute(json!({ "document_id": "doc-1", "dest_path": "out.bin" }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("private"));
+    }
+
+    #[tokio::test]
     async fn execute_rejects_rfc1918_endpoint_without_opt_in() {
         // 10.0.0.0/8 private range. No mock — the rejection is a string
         // comparison and must happen before any TCP connect.
@@ -1561,23 +1582,39 @@ mod tests {
     /// the shared SSRF policy.
     #[tokio::test]
     async fn validate_endpoint_host_wildcard_does_not_lift_metadata_block() {
-        let tmp = TempDir::new().unwrap();
-        let tool_with_wildcard = FileDownloadTool::new(
-            test_security(tmp.path().to_path_buf(), AutonomyLevel::Full),
-            FileDownloadConfig {
-                url: Some("http://169.254.169.254/latest/meta-data/".into()),
-                allowed_private_hosts: vec!["*".into()],
-                ..FileDownloadConfig::default()
-            },
-        );
-        let rejected = tool_with_wildcard
-            .validate_endpoint_host("http://169.254.169.254/latest/meta-data/")
-            .await
-            .expect_err("wildcard must NOT lift the metadata-IP block");
-        assert!(
-            rejected.contains("169.254.169.254") || rejected.contains("metadata"),
-            "expected the metadata rejection string, got: {rejected}"
-        );
+        // The private-host carve-out must never lift the metadata / credential
+        // delivery exclusion. Covers EC2 IMDS plus the AWS ECS task and EKS
+        // Pod Identity credential-delivery endpoints introduced with the
+        // shared `is_cloud_metadata_ip` classification.
+        let cases = [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://169.254.170.2/credentials",
+            "http://169.254.170.23/credentials",
+        ];
+        for url in cases {
+            let tmp = TempDir::new().unwrap();
+            let tool_with_wildcard = FileDownloadTool::new(
+                test_security(tmp.path().to_path_buf(), AutonomyLevel::Full),
+                FileDownloadConfig {
+                    url: Some(url.into()),
+                    allowed_private_hosts: vec!["*".into()],
+                    ..FileDownloadConfig::default()
+                },
+            );
+            let rejected = tool_with_wildcard
+                .validate_endpoint_host(url)
+                .await
+                .expect_err("wildcard must NOT lift the metadata-IP block");
+            // `ssrf_check_endpoint` wraps every rejection in the operator-facing
+            // private-host message keyed by the host, so the host string is the
+            // stable marker. The metadata-IP classification itself is pinned at
+            // the `domain_guard::validate_resolved_ips_exclude_metadata` layer
+            // (see `validate_resolved_ips_blocks_*_metadata_even_for_private_opt_in`).
+            assert!(
+                rejected.contains("169.254") || rejected.contains("cloud metadata"),
+                "expected the metadata rejection string for {url}, got: {rejected}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2092,6 +2129,51 @@ mod tests {
              if it is, resolve_to_addrs was dropped or miskeyed; saw {} request(s)",
             received.len()
         );
+    }
+
+    /// Prove that `build_secure_download_client` keys `resolve_to_addrs` by
+    /// the exact dotted transport host. A request to `files.corp.invalid.`
+    /// must reach the bound address set (the wiremock) — if the terminal dot
+    /// were stripped before the override, the request host would not match
+    /// the override key and real DNS would NXDOMAIN, leaving the mock unhit.
+    ///
+    /// This is the production-client half of the policy/transport hostname
+    /// split: `parse_endpoint_url` returns a dotted `transport_host` for
+    /// reqwest binding while `policy_host` strips the dot for allowlist
+    /// comparison. `.invalid` is a reserved TLD (RFC 2606), so real DNS can
+    /// never resolve the host — only the `resolve_to_addrs` override can.
+    #[tokio::test]
+    async fn build_secure_download_client_binds_dotted_transport_host() {
+        let server = MockServer::start().await;
+
+        // Mock expects exactly 1 hit — if resolve_to_addrs binds the dotted
+        // host to the mock's real address, the request lands here.
+        Mock::given(method("GET"))
+            .and(path("/probe"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"hit".to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Bind the dotted transport host to the mock's real address. The
+        // bound set is the connection authority; the port comes from the URL.
+        let transport_host = "files.corp.invalid.";
+        let bound_addrs = [*server.address()];
+
+        let client = build_secure_download_client(transport_host, &bound_addrs, 30)
+            .await
+            .expect("client build must succeed");
+
+        let url = format!("http://{transport_host}:{}/probe", server.address().port());
+        let result = client.get(&url).send().await;
+        assert!(
+            result.is_ok(),
+            "dotted transport host must connect through the resolve_to_addrs override"
+        );
+
+        // The wiremock's expect(1) is the authoritative detector: if the
+        // terminal dot were stripped from the override key, the request host
+        // would NXDOMAIN in real DNS and the mock would see zero requests.
     }
 
     /// DNS resolution must defer until after the can_act() check.
