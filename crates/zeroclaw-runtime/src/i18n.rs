@@ -351,6 +351,53 @@ pub fn normalize_locale(raw: &str) -> String {
     raw.split('.').next().unwrap_or(raw).replace('_', "-")
 }
 
+/// Render a structured provider-failure lead into a concise, localized,
+/// user-facing sentence. The provider edge crate emits only the
+/// structured `ProviderFailureLeadView`; this function projects it through
+/// the runtime's Fluent catalog so the owning presentation surface (CLI /
+/// ZeroCode / gateway) does not receive English hard-coded below its
+/// localization boundary. The full retry envelope stays in structured logs.
+///
+/// Returns `None` only when `lead` is `None` (no provider failure to render).
+pub fn render_provider_failure_lead(
+    lead: Option<&zeroclaw_providers::reliable::ProviderFailureLeadView>,
+) -> Option<String> {
+    let lead = lead?;
+    let provider = lead.provider.as_str();
+    let at_endpoint = lead
+        .endpoint
+        .as_deref()
+        .map(|endpoint| format!(" at {endpoint}"))
+        .unwrap_or_default();
+    let endpoint_str = at_endpoint.as_str();
+
+    // For connect/dns, pick local vs remote guidance by endpoint so a cloud
+    // API outage is never told to "start its local server".
+    let key = match lead.kind.as_str() {
+        "auth_missing" => "provider-fail-auth-missing",
+        "auth_rejected" => "provider-fail-auth-rejected",
+        "auth" => "provider-fail-auth",
+        "connect" | "dns" => {
+            if zeroclaw_providers::reliable::is_localhost_endpoint(lead.endpoint.as_deref()) {
+                "provider-fail-connect-local"
+            } else {
+                "provider-fail-connect-remote"
+            }
+        }
+        "connect_timeout" | "timeout" => "provider-fail-timeout",
+        "rate_limited" => "provider-fail-rate-limited",
+        "model_not_found" => "provider-fail-model-not-found",
+        "context_window" => "provider-fail-context-window",
+        "provider_server" => "provider-fail-provider-server",
+        _ => "provider-fail-generic",
+    };
+
+    Some(get_required_cli_string_with_args(
+        key,
+        &[("provider", provider), ("at_endpoint", endpoint_str)],
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1110,7 +1157,7 @@ mod tests {
 
     #[test]
     fn detect_locale_defaults_to_en_without_config() {
-        // Locale is config-only. read_config_table() is pure parsing over a
+        // Locale is config-only. read_config_table is pure parsing over a
         // string; verify the fallback contract without touching the real
         // filesystem or env. An absent/locale-less table must yield "en".
         assert_eq!(locale_from_table(None), None);
@@ -1475,5 +1522,74 @@ mod tests {
                 "{key} resolved to the missing-string sentinel"
             );
         }
+    }
+
+    // --- keep retry envelope out of user-facing turn content ---------
+
+    #[test]
+    fn provider_failure_lead_renders_without_retry_envelope() {
+        // Simulate the exact bail! shape emitted by the reliable provider:
+        // a structured lead line, then the full retry envelope below it.
+        let provider_error = format!(
+            "{}\nAll model_providers/models failed. Attempts:\n\
+             model_provider=anthropic model=claude-sonnet-4-6 attempt 1/3: retryable; \
+             error=Anthropic credentials not set.; kind=auth_missing; ...",
+            "provider-failure|kind=auth_missing|provider=anthropic"
+        );
+
+        let view = zeroclaw_providers::reliable::ProviderFailureLead::extract_from(&provider_error)
+            .expect("lead should parse from bail message");
+        let rendered = render_provider_failure_lead(Some(&view)).expect("should render a lead");
+
+        // The user-facing content must NOT carry the retry envelope.
+        assert!(
+            !rendered.contains("All model_providers/models failed"),
+            "envelope leaked into user content: {rendered}"
+        );
+        assert!(
+            !rendered.contains("Attempts:"),
+            "attempts leaked into user content: {rendered}"
+        );
+        // It must name the provider and point at credentials (en or zh).
+        assert!(rendered.contains("anthropic"), "rendered: {rendered}");
+        assert!(
+            rendered.to_lowercase().contains("credentials")
+                || rendered.to_lowercase().contains("api key")
+                || rendered.contains("密钥")
+                || rendered.contains("凭据"),
+            "rendered should be actionable: {rendered}"
+        );
+    }
+
+    #[test]
+    fn provider_failure_lead_connect_remote_does_not_prescribe_local_server() {
+        // A remote endpoint must not be told to "start its local server".
+        let provider_error = format!(
+            "{}\nAll model_providers/models failed. Attempts:\n...",
+            "provider-failure|kind=connect|provider=custom|endpoint=https://api.openai.com/v1/chat/completions"
+        );
+        let view = zeroclaw_providers::reliable::ProviderFailureLead::extract_from(&provider_error)
+            .expect("lead should parse");
+        let rendered = render_provider_failure_lead(Some(&view)).expect("should render a lead");
+        assert!(
+            !rendered.contains("local server") && !rendered.contains("本地服务"),
+            "remote endpoint told to start a local server: {rendered}"
+        );
+        assert!(rendered.contains("api.openai.com"), "rendered: {rendered}");
+    }
+
+    #[test]
+    fn provider_failure_lead_connect_local_prescribes_local_server() {
+        let provider_error = format!(
+            "{}\nAll model_providers/models failed. Attempts:\n...",
+            "provider-failure|kind=connect|provider=custom|endpoint=http://127.0.0.1:1234/v1/chat/completions"
+        );
+        let view = zeroclaw_providers::reliable::ProviderFailureLead::extract_from(&provider_error)
+            .expect("lead should parse");
+        let rendered = render_provider_failure_lead(Some(&view)).expect("should render a lead");
+        assert!(
+            rendered.contains("local server") || rendered.contains("本地服务"),
+            "local endpoint should mention local server: {rendered}"
+        );
     }
 }

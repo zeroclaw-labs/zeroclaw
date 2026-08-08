@@ -1091,6 +1091,22 @@ cli-doctor-ctxwin-none = No updates needed.
 cli-doctor-ctxwin-write-failed = {$provider_ref}: failed to write context_window: {$error}
 cli-doctor-cache-write-failed = Failed to persist model cache: {$error}
 
+# ── Provider failure leads (#9001) ───────────────────────────────────
+# Concise, actionable cause rendered at the user-facing boundary. The full
+# retry envelope stays in structured logs only. Rendered from the structured
+# ProviderFailureLead, not formatted inside the provider edge crate.
+provider-fail-auth-missing = No API key is configured for {$provider}. Add credentials for the selected provider.
+provider-fail-auth-rejected = The configured credentials for {$provider} were rejected.
+provider-fail-auth = The configured credentials for {$provider} were rejected or missing. Add or check the API key for the selected provider.
+provider-fail-connect-local = {$provider} is not reachable{$at_endpoint}. Start its local server or update the endpoint.
+provider-fail-connect-remote = {$provider} is not reachable{$at_endpoint}. Check the network, VPN, or firewall, or update the endpoint.
+provider-fail-timeout = {$provider} did not respond in time{$at_endpoint}. Retry, check the network, or switch provider.
+provider-fail-rate-limited = {$provider} rate-limited the request. Wait, change key/quota, or switch provider.
+provider-fail-model-not-found = The configured model was not found by {$provider}. Check the model id for the selected provider.
+provider-fail-context-window = The request exceeds the context window for {$provider}. Reduce context or use a larger-context model.
+provider-fail-provider-server = {$provider} returned a server error. Retry or switch provider.
+provider-fail-generic = The request to {$provider} failed. See the logs for details.
+
 # ── Degraded config sections (doctor diagnose, #8835) ──
 cli-doctor-degraded-security = SECURITY-CRITICAL config section `{$path}` is invalid and was reset to its default so the daemon can boot; the running posture may be WEAKER than intended. Run `zeroclaw config migrate` to see the parse error, then repair the file.
 cli-doctor-degraded-section = config section `{$path}` is malformed and was reset to defaults; values in that section are NOT in effect. Run `zeroclaw config migrate` to see the parse error, then repair the file.

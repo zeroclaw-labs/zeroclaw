@@ -2004,13 +2004,22 @@ impl RpcDispatcher {
                         })),
                     "turn failed; emitting TurnComplete so the client exits the working state"
                 );
+                // project a concise, localized provider-failure lead into
+                // the user-facing TurnComplete content AND the RPC error
+                // message; keep the full retry envelope in structured logs only
+                // (recorded above) so it does not dominate chat or leak via any
+                // surface that stringifies the RPC error.
+                let lead_view =
+                    zeroclaw_providers::reliable::ProviderFailureLead::extract_from(&e.to_string());
+                let user_message = crate::i18n::render_provider_failure_lead(lead_view.as_ref())
+                    .unwrap_or_else(|| format!("turn failed: {e}"));
                 self.emit_turn_complete(
                     &req.session_id,
                     crate::rpc::types::TurnCompletionOutcome::Failed,
-                    format!("turn failed: {e}"),
+                    user_message.clone(),
                 )
                 .await;
-                Err(rpc_err(INTERNAL_ERROR, e.to_string()))
+                Err(rpc_err(INTERNAL_ERROR, user_message))
             }
         }
     }

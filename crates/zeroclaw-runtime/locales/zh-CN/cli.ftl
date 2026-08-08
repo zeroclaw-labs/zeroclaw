@@ -990,3 +990,16 @@ channel-approval-opt-allow-once = 仅本次允许
 channel-approval-opt-allow-always = 始终允许
 channel-approval-opt-reject = 拒绝
 channel-approval-opt-reject-with-edit = 编辑后拒绝
+
+# ── Provider failure leads (#9001) ───────────────────────────────────
+provider-fail-auth-missing = 未为 {$provider} 配置 API 密钥。请为所选 provider 添加凭据。
+provider-fail-auth-rejected = {$provider} 的凭据被拒绝。
+provider-fail-auth = {$provider} 的凭据被拒绝或缺失。请添加或检查所选 provider 的 API 密钥。
+provider-fail-connect-local = 无法连接到 {$provider}{$at_endpoint}。请启动其本地服务或更新端点。
+provider-fail-connect-remote = 无法连接到 {$provider}{$at_endpoint}。请检查网络、VPN 或防火墙，或更新端点。
+provider-fail-timeout = {$provider} 未在规定时间内响应{$at_endpoint}。请重试、检查网络或更换 provider。
+provider-fail-rate-limited = {$provider} 对请求限流。请等待、更换密钥/配额或更换 provider。
+provider-fail-model-not-found = {$provider} 未找到所配置的模型。请检查所选 provider 的模型 id。
+provider-fail-context-window = 请求超出 {$provider} 的上下文窗口。请减少上下文或使用更大上下文的模型。
+provider-fail-provider-server = {$provider} 返回服务器错误。请重试或更换 provider。
+provider-fail-generic = 向 {$provider} 的请求失败。详见日志。
