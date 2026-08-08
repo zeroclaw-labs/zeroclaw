@@ -313,6 +313,17 @@ pub enum ObserverEvent {
         channel: Option<String>,
         agent_alias: Option<String>,
         turn_id: Option<String>,
+        /// Configured context token budget in effect at trim time. `None` for
+        /// message-limit trims, which carry no token accounting.
+        token_budget: Option<u64>,
+        /// Token count before trimming.
+        tokens_before: Option<u64>,
+        /// Token count after trimming.
+        tokens_after: Option<u64>,
+        /// Provenance of `tokens_before`.
+        tokens_before_source: Option<crate::agent::TokenCountSource>,
+        /// Provenance of `tokens_after`.
+        tokens_after_source: Option<crate::agent::TokenCountSource>,
     },
 }
 

@@ -13,6 +13,7 @@ import {
   type TurnStreamFrame,
   type TurnStreamState,
 } from '@/contexts/turnStream.logic';
+import { buildHistoryTrimmedNotice } from '@/contexts/historyTrimNotices.logic';
 import {
   loadChatHistory,
   mapServerMessagesToPersisted,
@@ -409,11 +410,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
       }
 
       case 'history_trimmed': {
-        const reason = msg.reason || t('agent.history_trimmed_unknown_reason');
-        const content = t('agent.history_trimmed')
-          .replace('{reason}', reason)
-          .replace('{dropped}', String(msg.dropped_messages ?? 0))
-          .replace('{kept}', String(msg.kept_turns ?? 0));
+        const content = buildHistoryTrimmedNotice(msg, t);
         localMessageMutationVersionRef.current += 1;
         setMessages((prev) => [
           ...prev,

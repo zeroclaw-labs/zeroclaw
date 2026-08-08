@@ -806,6 +806,7 @@ turn-model-fallback-notice = ⚡ { $requested_model } ({ $requested_provider }) 
 history-trim-breadcrumb = [earlier turns omitted to fit the context window]
 history-trim-reason-budget = context token budget exceeded
 history-trim-reason-message-cap = limite de messages de l’historique dépassée
+history-trim-reason-recovery = récupération après dépassement de la fenêtre de contexte
 history-trim-floor-exceeds-budget = system prompt and tool definitions ({$floor} tokens) alone meet or exceed the context budget ({$budget} tokens); raise [runtime_profiles.<name>] max_context_tokens or reduce the tool surface by disabling unused integrations
 turn-ingress-dropped = Cette requête n'a pas été traitée : { $reason }
 turn-tool-interrupted-before-result = [interrompu par l'utilisateur avant que cet outil ne produise un résultat]

@@ -332,6 +332,11 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
                 channel,
                 agent_alias,
                 turn_id,
+                token_budget,
+                tokens_before,
+                tokens_after,
+                tokens_before_source,
+                tokens_after_source,
             } => {
                 let mut json = serde_json::json!({
                     "type": "history_trimmed",
@@ -341,6 +346,21 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
                     "reason": reason,
                     "timestamp": chrono::Utc::now().to_rfc3339(),
                 });
+                if let Some(token_budget) = token_budget {
+                    json["token_budget"] = (*token_budget).into();
+                }
+                if let Some(tokens_before) = tokens_before {
+                    json["tokens_before"] = (*tokens_before).into();
+                }
+                if let Some(tokens_after) = tokens_after {
+                    json["tokens_after"] = (*tokens_after).into();
+                }
+                if let Some(tokens_before_source) = tokens_before_source {
+                    json["tokens_before_source"] = tokens_before_source.as_str().into();
+                }
+                if let Some(tokens_after_source) = tokens_after_source {
+                    json["tokens_after_source"] = tokens_after_source.as_str().into();
+                }
                 add_optional_string(&mut json, "channel", channel);
                 add_optional_string(&mut json, "agent_alias", agent_alias);
                 add_optional_string(&mut json, "turn_id", turn_id);
@@ -443,6 +463,11 @@ mod tests {
             channel: Some("wss".into()),
             agent_alias: Some("trimtest".into()),
             turn_id: Some("turn-1".into()),
+            token_budget: Some(500_000),
+            tokens_before: Some(612_000),
+            tokens_after: Some(117_000),
+            tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Provider),
+            tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
         });
 
         let value = rx.try_recv().expect("history_trimmed must broadcast");
@@ -451,10 +476,44 @@ mod tests {
         assert_eq!(value["dropped_messages"], 12);
         assert_eq!(value["kept_turns"], 1);
         assert_eq!(value["reason"], "context token budget exceeded");
+        assert_eq!(value["token_budget"], 500_000);
+        assert_eq!(value["tokens_before"], 612_000);
+        assert_eq!(value["tokens_after"], 117_000);
+        assert_eq!(value["tokens_before_source"], "provider");
+        assert_eq!(value["tokens_after_source"], "calibrated");
         assert_eq!(value["channel"], "wss");
         assert_eq!(value["agent_alias"], "trimtest");
         assert_eq!(value["turn_id"], "turn-1");
         assert!(is_public_sse_event(&value));
+    }
+
+    #[test]
+    fn history_trimmed_without_token_accounting_omits_token_fields() {
+        // Message-limit trims carry no token data; the broadcast must not emit
+        // null placeholder keys, so older clients keep parsing the frame.
+        let (obs, mut rx, _buffer) = make_broadcast();
+
+        obs.record_event(&ObserverEvent::HistoryTrimmed {
+            dropped_messages: 12,
+            kept_turns: 1,
+            reason: "history message limit exceeded".into(),
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
+            token_budget: None,
+            tokens_before: None,
+            tokens_after: None,
+            tokens_before_source: None,
+            tokens_after_source: None,
+        });
+
+        let value = rx.try_recv().expect("history_trimmed must broadcast");
+        assert_eq!(value["type"], "history_trimmed");
+        assert!(value.get("token_budget").is_none());
+        assert!(value.get("tokens_before").is_none());
+        assert!(value.get("tokens_after").is_none());
+        assert!(value.get("tokens_before_source").is_none());
+        assert!(value.get("tokens_after_source").is_none());
     }
 
     #[test]
