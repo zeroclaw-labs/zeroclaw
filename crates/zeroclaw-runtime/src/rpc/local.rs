@@ -44,11 +44,15 @@ fn is_recoverable_accept_error(e: &std::io::Error) -> bool {
     false
 }
 
-pub fn socket_path(config: &Config) -> PathBuf {
+fn configured_socket_path(config: &Config) -> (PathBuf, bool) {
     if let Ok(p) = std::env::var("ZEROCLAW_SOCKET") {
-        return PathBuf::from(p);
+        return (PathBuf::from(p), true);
     }
-    platform::default_endpoint(&config.data_dir)
+    (platform::default_endpoint(&config.data_dir), false)
+}
+
+pub fn socket_path(config: &Config) -> PathBuf {
+    configured_socket_path(config).0
 }
 
 // ── Transport ────────────────────────────────────────────────────
@@ -127,17 +131,17 @@ pub async fn run_local_listener(
     client_count: Arc<AtomicUsize>,
     readiness: Option<crate::daemon::SocketReadinessReporter>,
 ) -> Result<()> {
-    let path = {
+    let (path, socket_override) = {
         let config = ctx.config.read();
-        socket_path(&config)
+        configured_socket_path(&config)
     };
 
-    platform::prepare_parent(&path).await?;
+    platform::prepare_parent(&path, socket_override).await?;
     platform::remove_stale(&path).await?;
 
     let mut listener = platform::bind(&path).context("binding local IPC endpoint")?;
 
-    platform::secure_endpoint(&path).await;
+    platform::secure_endpoint(&path).context("securing local IPC endpoint")?;
 
     if let Some(readiness) = readiness {
         readiness.report_ready();
@@ -229,7 +233,7 @@ pub async fn run_local_listener(
 
 #[cfg(unix)]
 mod platform {
-    use anyhow::{Context, Result};
+    use anyhow::{Context, Result, bail};
     use std::path::{Path, PathBuf};
     use tokio::net::{UnixListener, UnixStream};
 
@@ -240,13 +244,38 @@ mod platform {
         data_dir.join("daemon.sock")
     }
 
-    pub async fn prepare_parent(path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
+    pub(super) fn parent_dir(path: &Path) -> &Path {
+        path.parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+    }
+
+    pub async fn prepare_parent(path: &Path, socket_override: bool) -> Result<()> {
+        let parent = parent_dir(path);
+        if !socket_override {
             tokio::fs::create_dir_all(parent).await?;
-            use std::os::unix::fs::PermissionsExt;
+        }
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let metadata = tokio::fs::metadata(parent)
+            .await
+            .context("reading local IPC parent metadata")?;
+        let mode = metadata.permissions().mode();
+        // SAFETY: `geteuid` takes no arguments, has no caller preconditions,
+        // and returns a scalar effective UID.
+        let uid = unsafe { libc::geteuid() };
+        if metadata.uid() != uid {
+            bail!("local IPC parent must be owned by the daemon user");
+        }
+        if socket_override && mode & 0o7777 != 0o700 {
+            bail!(
+                "ZEROCLAW_SOCKET parent must already be a private daemon-owned directory \
+                 with mode 0o700; shared paths such as /tmp are not supported"
+            );
+        }
+        if !socket_override {
             tokio::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
                 .await
-                .ok();
+                .context("restricting local IPC parent permissions")?;
         }
         Ok(())
     }
@@ -264,11 +293,10 @@ mod platform {
         UnixListener::bind(path).context("binding unix socket")
     }
 
-    pub async fn secure_endpoint(path: &Path) {
+    pub fn secure_endpoint(path: &Path) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
-        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .await
-            .ok();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .context("restricting unix socket permissions")
     }
 
     pub async fn accept(listener: &mut LocalListener, _path: &Path) -> Result<LocalStream> {
@@ -315,7 +343,7 @@ mod platform {
         PathBuf::from(format!(r"\\.\pipe\zeroclaw-{:x}", hasher.finish()))
     }
 
-    pub async fn prepare_parent(_path: &Path) -> Result<()> {
+    pub async fn prepare_parent(_path: &Path, _socket_override: bool) -> Result<()> {
         // Named pipes live in the kernel object namespace, not the
         // filesystem — no parent directory to create.
         Ok(())
@@ -335,10 +363,11 @@ mod platform {
             .with_context(|| format!("creating named pipe {name}"))
     }
 
-    pub async fn secure_endpoint(_path: &Path) {
+    pub fn secure_endpoint(_path: &Path) -> Result<()> {
         // The default ServerOptions ACL grants access to the creating user
         // and SYSTEM, matching the spirit of Unix 0o600. Stricter SDDL is
         // a separate hardening pass.
+        Ok(())
     }
 
     pub async fn accept(listener: &mut LocalListener, path: &Path) -> Result<LocalStream> {
@@ -610,6 +639,51 @@ mod tests {
         );
 
         cancel.cancel();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shared_socket_parent_is_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        for (name, mode) in [("sticky", 0o1777), ("group_writable", 0o770)] {
+            let shared = tmp.path().join(name);
+            std::fs::create_dir(&shared).unwrap();
+            std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(mode)).unwrap();
+
+            let error = platform::prepare_parent(&shared.join("daemon.sock"), true)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("private daemon-owned directory"));
+            assert_eq!(
+                std::fs::metadata(&shared).unwrap().permissions().mode() & 0o7777,
+                mode,
+                "a rejected shared parent must not be modified"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn missing_override_parent_is_rejected_without_creation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("missing");
+
+        let error = platform::prepare_parent(&parent.join("daemon.sock"), true)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("local IPC parent metadata"));
+        assert!(!parent.exists(), "an override parent must not be created");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relative_socket_path_uses_current_directory_as_parent() {
+        assert_eq!(
+            platform::parent_dir(std::path::Path::new("daemon.sock")),
+            "."
+        );
     }
 
     #[cfg(unix)]

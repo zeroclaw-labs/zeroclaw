@@ -17,14 +17,20 @@ same machine do not collide. The data dir is derived from the config dir
 | macOS | `<data_dir>/daemon.sock` (Unix domain socket) |
 | Windows | `\\.\pipe\zeroclaw-<hash>` where `<hash>` is derived from `data_dir` |
 
-Override with the `ZEROCLAW_SOCKET` environment variable on either platform:
+Override with the `ZEROCLAW_SOCKET` environment variable on either platform.
+On Unix, an override's parent must already be a private directory owned by the
+daemon user (mode `0o700`). Shared locations such as `/tmp` are rejected
+rather than altered because they cannot preserve the owner-only access
+guarantee during socket creation.
 
 <div class="os-tabs-src">
 
 #### sh
 
 ```sh
-export ZEROCLAW_SOCKET=/tmp/my-zeroclaw.sock
+mkdir -p "$HOME/.local/share/zeroclaw/ipc"
+chmod 700 "$HOME/.local/share/zeroclaw/ipc"
+export ZEROCLAW_SOCKET="$HOME/.local/share/zeroclaw/ipc/my-zeroclaw.sock"
 zeroclaw daemon
 ```
 

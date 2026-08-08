@@ -171,12 +171,17 @@ If the target agent's `[runtime_profiles.<target>].agentic = true`, `delegate` b
 
 This policy lives on the target, not the caller. Same-profile peers use the shared risk profile. Explicit cross-profile delegates use the target's risk profile after the reachability and delegation-policy gates. Bounded agentic delegates receive only the caller-capped tool registry intersected with the target's tool policy; independent agentic delegates receive the target-owned tool registry. A missing target risk profile refuses before the sub-loop starts. A configured profile that leaves zero executable child tools still permits a normal model turn with no tools.
 
+When the target's configured Reliable provider chain mixes native-tool-capable and text-only candidates, the whole agentic turn uses the text/XML tool protocol. This ensures any fallback can execute tools after a primary failure; native tool transport is used only when every reachable candidate supports it.
+
 ### `delegate`: output strings the model sees
 
-Exact, sourced from `crates/zeroclaw-runtime/src/tools/delegate.rs`.
+The literal outputs below are sourced from `crates/zeroclaw-runtime/src/tools/delegate.rs`.
+The provider-recovery warning is localized through the
+`delegate-provider-fallback-warning` Fluent key; its English rendering is shown
+where relevant.
 
-1. Synchronous success: output begins with `[Agent '<target>' (<provider_type>/<model>)]\n` followed by the target agent's response. If the target returned an empty string, the body is the literal `[Empty response]`.
-2. Synchronous failure: error field begins with `Agent '<target>' failed: <wrapped error>`.
+1. Synchronous success: output begins with `[Agent '<target>' (<provider_type>/<model>)]\n` followed by the target agent's response. If the target returned an empty string, the body is the literal `[Empty response]`. When the target recovers through a configured provider fallback, its header instead identifies the requested and served provider/model, for example `[Agent 'reviewer' (requested: anthropic.primary/claude; served: openai.terra/gpt-5.6-terra, agentic)]`. For an agentic target, this attribution describes the model request that produced the final response, not an earlier request that only produced a tool call. The result also ends with the localized provider-recovery warning. In English: `Warning: The delegated agent recovered through a provider fallback. Provider failure details were logged and omitted from this result.` This attribution and warning belong to the delegated result; they must not be presented as a fallback of the calling agent. They intentionally omit rejected-provider error details, endpoints, and credentials. Retrying the same configured candidate does not produce this warning; reaching a later configured candidate does, even when its provider and model labels match the first candidate.
+2. Synchronous failure: error field begins with `Agent '<target>' failed: <wrapped error>`. If every configured provider candidate fails, `<wrapped error>` is Reliable's ordered safe summary of the attempt sequence, retry count, failure class, phase, and fixed remediation hint. Provider response bodies, endpoints, aliases, models, and credentials are not returned to the calling agent; investigate provider-attempt logs through the installation's normal operator logging policy when more detail is needed. The result remains an error, not a recovery warning.
 3. Synchronous timeout (when the target's runtime profile sets `delegation_timeout_secs`): error field is `Agent '<target>' timed out after <N>s`.
 4. Background spawn success: output is the three-line literal
    ```text
@@ -184,10 +189,10 @@ Exact, sourced from `crates/zeroclaw-runtime/src/tools/delegate.rs`.
    task_id: <uuid>
    Use action='check_result' with task_id='<uuid>' to retrieve the result.
    ```
-   The result file lives at `<workspace>/delegate_results/<uuid>.json`. While running, the file's `status` field is `running`; terminal states are `completed`, `failed`, or `cancelled`.
+   The result file lives at `<workspace>/delegate_results/<uuid>.json`. While running, the file's `status` field is `running`; terminal states are `completed`, `failed`, or `cancelled`. A completed task that recovered through a configured provider fallback stores the same requested-versus-served attribution and generic recovery warning in its `output`; retrieve it with `check_result` or `await_sessions`. A failed task stores the same safe terminal summary as synchronous delegation, not provider response details.
 5. `action="check_result"` with an unknown task id: error is `No result found for task_id '<uuid>'`.
 6. `action="await_sessions"` with `task_ids: [<uuid>, ...]` waits for multiple background result files at once. The output is a JSON object with `status` (`complete` or `timeout`), `completed`, `pending`, `missing`, `failed`, and `results`. `timeout_ms` defaults to 30000 and is capped at 120000; on timeout the tool returns partial results and an error saying one or more tasks are still pending or missing. Duplicate task IDs are rejected.
-7. Parallel fan-out output: begins with `[Parallel delegation: <N> agents]\n\n`, followed by per-agent blocks separated by `\n\n`, each block beginning with `--- <target> (success=<bool>) ---\n`. On per-agent failure the inner block is `--- <target> (success=false) ---\nError: <wrapped error>`.
+7. Parallel fan-out output: begins with `[Parallel delegation: <N> agents]\n\n`, followed by per-agent blocks separated by `\n\n`, each block beginning with `--- <target> (success=<bool>) ---\n`. A recovered target keeps its requested-versus-served attribution and generic fallback warning inside its own block. On per-agent failure the inner block is `--- <target> (success=false) ---\nError: <wrapped error>`.
 8. Unknown target agent: error is `Unknown agent '<target>'. Available agents: <comma-separated list>`.
 9. Depth exceeded (controlled by the parent's `runtime_profile.max_delegation_depth`, default 3): error is `Delegation depth limit reached (<depth>/<max>).`
 10. Unknown action: error is `Unknown action '<value>'. Use delegate/check_result/list_results/cancel_task/await_sessions.`
