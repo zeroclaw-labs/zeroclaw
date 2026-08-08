@@ -21,107 +21,108 @@ pub(crate) async fn resolve_vision_provider(
     let image_marker_count = multimodal::count_image_markers(history);
     let latest_user_image_marker_count = multimodal::count_latest_user_image_markers(history);
 
-    // Warm the PRIMARY provider's capability metadata before the synchronous
-    // per-model capability check below. This makes warm-then-query one ordered
-    // operation for EVERY caller — including the direct `Agent::turn` and
-    // streamed entry points that call this resolver before the tool-loop warm
-    // (which runs later and cannot help a capability decision made now). A
-    // credentialed compatible provider then resolves per-model vision instead
-    // of silently classifying from the family default before its catalog is
-    // loaded. No-op once warmed; the tool-loop's earlier warm on the same
-    // provider is idempotent.
-    model_provider.warm_capabilities_metadata().await;
-
     let mut degrade_strip_images = false;
-    let vision_model_provider: Option<ResolvedVisionProvider> = if image_marker_count > 0
-        && !model_provider.capabilities_for_model(model).vision
-    {
-        if let Some(ref vp) = multimodal_config.vision_model_provider {
-            // Resolve the configured vision provider through the alias-aware
-            // factory so its per-alias `vision` override and typed config
-            // (endpoint URI, credentials) are honored - the legacy
-            // `create_model_provider(vp, None)` passed `config = None` and could
-            // not see them, so a text-family alias forced to `vision = true`
-            // for this route would have been ignored. `config` is `None` only on
-            // configless (test-builder) agents - every production agent/loop path
-            // threads `Some`; that fallback keeps the prior legacy behavior.
-            let (vp_instance, alias_model) = match config {
-                Some(config) => {
-                    zeroclaw_providers::create_model_provider_from_ref_with_model(config, vp)
-                        .map(|resolved| (resolved.provider, resolved.model))
+    let vision_model_provider: Option<ResolvedVisionProvider> = if image_marker_count > 0 {
+        // Warm the PRIMARY provider's capability metadata before the synchronous
+        // per-model capability check below. This makes warm-then-query one
+        // ordered operation for the image-bearing path ONLY — a text-only turn
+        // never reaches the catalog-backed warm, so an ordinary message does not
+        // wait on a models.dev request (fnd-001 zero-overhead constraint). The
+        // direct `Agent::turn` and streamed entry points call this resolver
+        // before the tool-loop warm (which runs later and cannot help a
+        // capability decision made now). No-op once warmed; an earlier warm on
+        // the same provider is idempotent.
+        model_provider.warm_capabilities_metadata().await;
+        if !model_provider.capabilities_for_model(model).vision {
+            if let Some(ref vp) = multimodal_config.vision_model_provider {
+                // Resolve the configured vision provider through the alias-aware
+                // factory so its per-alias `vision` override and typed config
+                // (endpoint URI, credentials) are honored - the legacy
+                // `create_model_provider(vp, None)` passed `config = None` and could
+                // not see them, so a text-family alias forced to `vision = true`
+                // for this route would have been ignored. `config` is `None` only on
+                // configless (test-builder) agents - every production agent/loop path
+                // threads `Some`; that fallback keeps the prior legacy behavior.
+                let (vp_instance, alias_model) = match config {
+                    Some(config) => {
+                        zeroclaw_providers::create_model_provider_from_ref_with_model(config, vp)
+                            .map(|resolved| (resolved.provider, resolved.model))
+                    }
+                    None => zeroclaw_providers::create_model_provider(vp, None)
+                        .map(|provider| (provider, None)),
                 }
-                None => zeroclaw_providers::create_model_provider(vp, None)
-                    .map(|provider| (provider, None)),
-            }
-            .map_err(|error| {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_category(::zeroclaw_log::EventCategory::Provider)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "vision_provider": vp,
-                            "error": format!("{error}"),
-                        })),
-                    "vision model_provider construction failed"
-                );
-                anyhow::Error::msg(format!(
-                    "failed to create vision model_provider '{vp}': {error}"
-                ))
-            })?;
-            let vision_model = multimodal_config
-                .vision_model
-                .as_deref()
-                .map(str::trim)
-                .filter(|model| !model.is_empty())
-                .map(ToString::to_string)
-                .or(alias_model)
-                .unwrap_or_else(|| model.to_string());
-            // Warm the vision provider's capability metadata (e.g. its
-            // models.dev catalog) before the synchronous capability check, so
-            // a credentialed compatible vision provider resolves per-model
-            // vision instead of silently falling back to the family default.
-            vp_instance.warm_capabilities_metadata().await;
-            if !vp_instance.capabilities_for_model(&vision_model).vision {
-                // Operator misconfiguration (named a non-vision provider as
-                // the vision route) — surface it loudly rather than silently
-                // degrading.
-                return Err(ProviderCapabilityError {
-                    model_provider: vp.clone(),
-                    capability: "vision".to_string(),
-                    message: format!(
-                        "configured vision_model_provider '{vp}' does not support vision input"
-                    ),
-                }
-                .into());
-            }
-            Some(ResolvedVisionProvider {
-                provider: vp_instance,
-                provider_name: vp.clone(),
-                model: vision_model,
-            })
-        } else if latest_user_image_marker_count > 0 {
-            return Err(ProviderCapabilityError {
-                        model_provider: provider_name.to_string(),
+                .map_err(|error| {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_category(::zeroclaw_log::EventCategory::Provider)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "vision_provider": vp,
+                                "error": format!("{error}"),
+                            })),
+                        "vision model_provider construction failed"
+                    );
+                    anyhow::Error::msg(format!(
+                        "failed to create vision model_provider '{vp}': {error}"
+                    ))
+                })?;
+                let vision_model = multimodal_config
+                    .vision_model
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|model| !model.is_empty())
+                    .map(ToString::to_string)
+                    .or(alias_model)
+                    .unwrap_or_else(|| model.to_string());
+                // Warm the vision provider's capability metadata (e.g. its
+                // models.dev catalog) before the synchronous capability check, so
+                // a credentialed compatible vision provider resolves per-model
+                // vision instead of silently falling back to the family default.
+                vp_instance.warm_capabilities_metadata().await;
+                if !vp_instance.capabilities_for_model(&vision_model).vision {
+                    // Operator misconfiguration (named a non-vision provider as
+                    // the vision route) — surface it loudly rather than silently
+                    // degrading.
+                    return Err(ProviderCapabilityError {
+                        model_provider: vp.clone(),
                         capability: "vision".to_string(),
                         message: format!(
-                            "received {latest_user_image_marker_count} image marker(s), but this model_provider does not support vision input"
+                            "configured vision_model_provider '{vp}' does not support vision input"
                         ),
                     }
                     .into());
+                }
+                Some(ResolvedVisionProvider {
+                    provider: vp_instance,
+                    provider_name: vp.clone(),
+                    model: vision_model,
+                })
+            } else if latest_user_image_marker_count > 0 {
+                return Err(ProviderCapabilityError {
+                    model_provider: provider_name.to_string(),
+                    capability: "vision".to_string(),
+                    message: format!(
+                        "received {latest_user_image_marker_count} image marker(s), but this model_provider does not support vision input"
+                    ),
+                }
+                .into());
+            } else {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Provider)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "model_provider": provider_name,
+                            "image_marker_count": image_marker_count,
+                        })),
+                    "no vision route for carried-over/tool-result image marker(s); degrading to text-only (markers stripped)"
+                );
+                degrade_strip_images = true;
+                None
+            }
         } else {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_category(::zeroclaw_log::EventCategory::Provider)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({
-                        "model_provider": provider_name,
-                        "image_marker_count": image_marker_count,
-                    })),
-                "no vision route for carried-over/tool-result image marker(s); degrading to text-only (markers stripped)"
-            );
-            degrade_strip_images = true;
             None
         }
     } else {
@@ -622,5 +623,44 @@ model = "vision-model"
             !degrade,
             "images must NOT be stripped when the warmed primary supports vision"
         );
+    }
+
+    /// Regression for the 2026-08-08 review (fnd-001 zero-overhead): a turn
+    /// with NO image markers must never warm the provider's capability
+    /// metadata. The catalog-backed warm is lazy to an actual image decision —
+    /// an ordinary text turn does not wait on a models.dev request. If the
+    /// warm were hoisted back to the top of the resolver (before the marker
+    /// count check), this test fails with `warm_calls == 1`.
+    #[tokio::test]
+    async fn resolve_vision_provider_does_not_warm_on_text_only_history() {
+        let warm_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = WarmThenVisionProvider {
+            warm_calls: std::sync::Arc::clone(&warm_calls),
+        };
+
+        let multimodal = zeroclaw_config::schema::MultimodalConfig::default();
+        let history = vec![ChatMessage::user("just text, no media".to_string())];
+
+        let (vision_provider, degrade) = resolve_vision_provider(
+            None,
+            &provider,
+            &history,
+            &multimodal,
+            "primary",
+            "primary-model",
+        )
+        .await
+        .expect("a text-only turn must resolve without any warm or capability query");
+
+        assert_eq!(
+            warm_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a text-only turn must not invoke the catalog-backed capability warm"
+        );
+        assert!(
+            vision_provider.is_none(),
+            "no image markers means no vision route is needed"
+        );
+        assert!(!degrade, "no image markers means nothing is stripped");
     }
 }

@@ -4940,8 +4940,16 @@ async fn process_channel_message_body(
     // image-marker decision uses the selected provider/model, not the startup
     // default. The catalog is warmed first so a credentialed compatible
     // provider resolves per-model vision instead of the family default.
-    // Audio transcription already ran in phase 1 (before route selection).
-    if ctx.media_pipeline.enabled && !msg.attachments.is_empty() {
+    // Audio transcription already ran in phase 1 (before route selection);
+    // an audio-only message never reaches the image warm (fnd-001
+    // zero-overhead constraint — a transcript-only turn does not wait on a
+    // catalog-backed request).
+    if ctx.media_pipeline.enabled
+        && msg
+            .attachments
+            .iter()
+            .any(|a| a.kind() == media_pipeline::MediaKind::Image)
+    {
         // Warm the effective provider's capability metadata (e.g. the models.dev
         // catalog) so the image-preservation decision below resolves per-model
         // vision instead of silently falling back to the family default. The
@@ -26735,48 +26743,156 @@ This is an example JSON object for profile settings."#;
         );
     }
 
-    /// Mock transcription provider returning a fixed transcript that carries a
-    /// route-classification keyword. Proves the media pipeline's
-    /// route-independent phase feeds route classification.
-    struct RouteKeywordTranscriptionProvider {
-        text: String,
-    }
+    #[tokio::test]
+    async fn media_pipeline_does_not_warm_capabilities_for_audio_only_message() {
+        // Regression for the 2026-08-08 review (fnd-001 zero-overhead): an
+        // audio-only channel message must never invoke the catalog-backed
+        // capability warm. Before the fix, phase 2 warmed the effective
+        // provider whenever ANY attachment existed; it now fires only when an
+        // IMAGE attachment is present. The cataloged leaf records warm calls,
+        // so an unexpected warm is directly observable.
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
 
-    #[async_trait::async_trait]
-    impl crate::transcription::TranscriptionProvider for RouteKeywordTranscriptionProvider {
-        fn name(&self) -> &str {
-            "route-keyword"
-        }
+        let leaf = Arc::new(CatalogOnlyVisionModelProvider {
+            calls: Default::default(),
+            warm_calls: Arc::new(AtomicUsize::new(0)),
+            catalog_loaded: AtomicBool::new(false),
+        });
+        // Production shape: the effective provider is the resilient composite
+        // returned by the factory; it must delegate warm to the cataloged leaf.
+        let wrapper: Arc<dyn ModelProvider> =
+            Arc::new(zeroclaw_providers::reliable::ReliableModelProvider::new(
+                "test",
+                vec![(
+                    "primary".into(),
+                    Box::new(Arc::clone(&leaf)) as Box<dyn ModelProvider>,
+                )],
+                0,
+                0,
+            ));
 
-        async fn transcribe(&self, _audio_data: &[u8], _file_name: &str) -> anyhow::Result<String> {
-            Ok(self.text.clone())
-        }
-    }
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            wrapper,
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            model: Arc::new("catalog-image-model".to_string()),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig {
+                enabled: true,
+                transcribe_audio: false, // focus the test on the image warm
+                describe_images: true,
+                ..Default::default()
+            },
+            ..(*runtime_ctx).clone()
+        });
 
-    impl ::zeroclaw_api::attribution::Attributable for RouteKeywordTranscriptionProvider {
-        fn role(&self) -> ::zeroclaw_api::attribution::Role {
-            ::zeroclaw_api::attribution::Role::Provider(
-                ::zeroclaw_api::attribution::ProviderKind::Transcription(
-                    ::zeroclaw_api::attribution::TranscriptionProviderKind::Groq,
-                ),
-            )
-        }
-        fn alias(&self) -> &str {
-            "route-keyword"
-        }
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-audio-only".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-audio-only".to_string(),
+                content: "please handle this".to_string(),
+                channel: "test-channel".into(),
+                channel_alias: None,
+                timestamp: 1,
+                passive_context: false,
+                explicitly_addressed: false,
+                conversation_scope: zeroclaw_api::channel::ChannelConversationScope::Sender,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![zeroclaw_api::media::MediaAttachment {
+                    file_name: "voice.ogg".to_string(),
+                    data: vec![0u8; 16],
+                    mime_type: Some("audio/ogg".to_string()),
+                }],
+                subject: None,
+                internal_sop_event: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(
+            leaf.warm_calls.load(Ordering::SeqCst),
+            0,
+            "an audio-only message must not invoke the catalog-backed capability warm"
+        );
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert!(
+            !sent_messages.is_empty(),
+            "the audio-only turn should still complete and produce an assistant reply"
+        );
     }
 
     #[tokio::test]
     async fn media_transcription_feeds_route_classification_before_route_selection() {
-        // Regression for the 2026-08-05 review: the media pipeline's
-        // transcription phase is route-independent and must run BEFORE route
-        // classification. A routing keyword that appears only in an audio
-        // transcript must participate in route selection. This drives the
-        // orchestrator's phase-1 pipeline (the code path `process_channel_message_body`
-        // runs before `get_route_selection`/`classify`) and asserts the
-        // transcript content is what the classifier sees.
+        // Regression for the 2026-08-05 review, production-shaped per the
+        // 2026-08-08 follow-up: the media pipeline's transcription phase is
+        // route-independent and must run BEFORE route classification. A routing
+        // keyword that appears only in an audio transcript must drive route
+        // selection through the REAL `process_channel_message` path — not by
+        // manually calling `process_route_independent` and the classifier. The
+        // transcript is produced by a wiremock-backed local_whisper provider
+        // (the production typed-provider registration path), and the matched
+        // route's provider is what receives the turn.
+
+        // 1. Mock transcription endpoint (local_whisper wire format).
+        let transcribe_server = wiremock::MockServer::start().await;
+        let _transcribe_mock = wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/transcribe"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "text": "use-fast-model from transcript" })),
+            )
+            .expect(1)
+            .mount(&transcribe_server)
+            .await;
+
+        // 2. Typed local_whisper provider pointing at the mock.
+        let mut prompt_config = zeroclaw_config::schema::Config::default();
+        prompt_config.providers.transcription.local_whisper.insert(
+            "mock".to_string(),
+            zeroclaw_config::schema::LocalWhisperTranscriptionProviderConfig {
+                uri: format!("{}/v1/transcribe", transcribe_server.uri()),
+                // `LocalWhisperProvider::from_config` requires a non-empty
+                // bearer token even for local endpoints; the mock never
+                // verifies it.
+                bearer_token: Some("test-token".to_string()),
+                language: None,
+                max_audio_bytes: 25 * 1024 * 1024,
+                timeout_secs: 5,
+            },
+        );
+
+        // 3. The matched route must be distinguishable from the default:
+        //    hint -> fast-provider / fast-model.
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        // Provider injected into the cache under the route's provider ref, so
+        // `get_or_create_provider` returns IT (not the default) and we can
+        // observe the routed provider receiving the turn.
+        let routed_provider = Arc::new(HistoryCaptureModelProvider {
+            calls: Default::default(),
+            vision: false,
+        });
+        let routed: Arc<dyn ModelProvider> = routed_provider.clone();
+        let provider_cache: Arc<Mutex<HashMap<String, Arc<dyn ModelProvider>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        // The cache key is generation-0 provider name (see
+        // `provider_cache_key(_, None, 0)`), so the route's provider ref is
+        // the exact lookup key.
+        provider_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert("fast-provider".to_string(), routed);
 
         let query_classification = zeroclaw_config::schema::QueryClassificationConfig {
             enabled: true,
@@ -26790,64 +26906,103 @@ This is an example JSON object for profile settings."#;
         let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
             channel,
             Arc::new(DummyModelProvider),
-            zeroclaw_config::schema::Config::default(),
+            prompt_config,
             zeroclaw_config::schema::AliasedAgentConfig::default(),
             "test-provider",
             None,
         );
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            model_routes: Arc::new(vec![zeroclaw_config::schema::ModelRouteConfig {
+                hint: "use-fast-model".to_string(),
+                model_provider: "fast-provider".to_string(),
+                model: "fast-model".to_string(),
+                ..Default::default()
+            }]),
+            provider_cache,
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig {
                 enabled: true,
                 transcribe_audio: true,
                 ..Default::default()
             },
             query_classification,
+            agent_transcription_provider: "local_whisper.mock".to_string(),
             ..(*runtime_ctx).clone()
         });
 
-        let manager = crate::transcription::TranscriptionManager::empty()
-            .with_mock_provider(Box::new(RouteKeywordTranscriptionProvider {
-                text: "please use-fast-model for this message".to_string(),
-            }))
-            .with_agent_transcription_provider("route-keyword");
-        let pipeline =
-            media_pipeline::MediaPipeline::new(&runtime_ctx.media_pipeline, Some(&manager), false);
-
-        let audio = zeroclaw_api::media::MediaAttachment {
-            file_name: "voice.ogg".to_string(),
-            data: vec![0u8; 16],
-            mime_type: Some("audio/ogg".to_string()),
-        };
-
-        // Phase 1 (route-independent) transcription output must carry the
-        // keyword into the message; route classification over that content then
-        // selects the matched hint — the observable contract that was broken
-        // when the whole pipeline ran after route resolution.
-        let phase1_content = pipeline
-            .process_route_independent("", std::slice::from_ref(&audio))
-            .await;
+        // Sanity: the production transcription-manager builder must register
+        // the typed local_whisper provider under the dotted alias. (The actual
+        // transcribe round-trip is exercised by the orchestrator path below —
+        // the wiremock `.expect(1)` proves it.)
+        let mgr =
+            crate::transcription::TranscriptionManager::new(&runtime_ctx.transcription_config)
+                .unwrap_or_else(|_| crate::transcription::TranscriptionManager::empty())
+                .with_typed_providers(&runtime_ctx.prompt_config.providers.transcription)
+                .with_agent_transcription_provider("local_whisper.mock");
+        let available = mgr.available_providers();
         assert!(
-            phase1_content.contains("use-fast-model"),
-            "transcript must surface in the message content: {phase1_content}"
+            available.contains(&"local_whisper.mock"),
+            "typed local_whisper.mock must register; got {available:?}"
         );
 
-        let hint = zeroclaw_runtime::agent::classifier::classify(
-            &runtime_ctx.query_classification,
-            &phase1_content,
-        );
-        assert_eq!(
-            hint.as_deref(),
-            Some("use-fast-model"),
-            "a keyword that appears only in the audio transcript must participate in route classification"
+        // 4. Drive the real orchestrator path with an audio-only attachment.
+        //    The transcript keyword is present ONLY in the audio bytes — the
+        //    textual content carries nothing the classifier would match.
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-transcript-route".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-transcript-route".to_string(),
+                content: "please handle this".to_string(),
+                channel: "test-channel".into(),
+                channel_alias: None,
+                timestamp: 1,
+                passive_context: false,
+                explicitly_addressed: false,
+                conversation_scope: zeroclaw_api::channel::ChannelConversationScope::Sender,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![zeroclaw_api::media::MediaAttachment {
+                    file_name: "voice.ogg".to_string(),
+                    data: vec![0u8; 16],
+                    mime_type: Some("audio/ogg".to_string()),
+                }],
+                subject: None,
+                internal_sop_event: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        // 5. The matched route's provider received the turn — proving the
+        //    transcript (not the visible text) drove route selection.
+        let joined = {
+            let routed_calls = routed_provider
+                .calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            assert!(
+                !routed_calls.is_empty(),
+                "the route matched via the transcript keyword must dispatch to the routed provider"
+            );
+            let turn_messages = routed_calls
+                .last()
+                .expect("a turn reached the routed provider");
+            turn_messages
+                .iter()
+                .map(|(role, content)| format!("{role}:{content}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(
+            joined.contains("use-fast-model"),
+            "the transcribed routing keyword must reach the routed provider's turn: {joined}"
         );
 
-        // Control: without the phase-1 transcription the keyword is absent and
-        // no hint matches, proving the transcript is what drives the match.
-        let no_transcript =
-            zeroclaw_runtime::agent::classifier::classify(&runtime_ctx.query_classification, "");
-        assert_eq!(
-            no_transcript, None,
-            "without the transcript the route hint must not match"
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert!(
+            !sent_messages.is_empty(),
+            "the routed turn should complete and produce an assistant reply"
         );
     }
 
