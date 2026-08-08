@@ -6892,6 +6892,17 @@ pub struct GatewayConfig {
     #[serde(default = "default_webhook_rate_limit")]
     pub webhook_rate_limit_per_minute: u32,
 
+    /// Optional shared secret for the gateway's generic `POST /webhook` and
+    /// `POST /sop/*` routes. Requests must send the exact value in
+    /// `X-Webhook-Secret`. This is intentionally separate from
+    /// `[channels.webhook.<alias>].secret`, which authenticates that channel's
+    /// own listener with an HMAC signature.
+    #[serde(default)]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub webhook_secret: Option<String>,
+
     /// Trust proxy-forwarded client IP headers (`X-Forwarded-For`, `X-Real-IP`).
     /// Disabled by default; enable only behind a trusted reverse proxy.
     #[serde(default)]
@@ -7030,6 +7041,7 @@ impl Default for GatewayConfig {
             paired_tokens: Vec::new(),
             pair_rate_limit_per_minute: default_pair_rate_limit(),
             webhook_rate_limit_per_minute: default_webhook_rate_limit(),
+            webhook_secret: None,
             trust_forwarded_headers: false,
             path_prefix: None,
             rate_limit_max_keys: default_gateway_rate_limit_max_keys(),
@@ -27085,6 +27097,7 @@ default_temperature = 0.7
                 ..Default::default()
             },
         );
+        config.gateway.webhook_secret = Some("gateway-ingress-credential".into());
 
         // MCP server: HTTP headers map carries an Authorization Bearer
         // token; the new `#[secret]` on `HashMap<String, String>` must
@@ -27122,6 +27135,7 @@ default_temperature = 0.7
             "Bearer otel-credential",
             "Bearer upload-credential",
             "Bearer http-request-credential",
+            "gateway-ingress-credential",
             "mcp-env-credential",
             "Bearer mcp-cred",
             "tenant-42",
@@ -27309,6 +27323,14 @@ default_temperature = 0.7
         assert_eq!(
             store.decrypt(webhook_secret).unwrap(),
             "webhook-shared-secret"
+        );
+        let gateway_webhook_secret = stored.gateway.webhook_secret.as_deref().unwrap();
+        assert!(crate::secrets::SecretStore::is_encrypted(
+            gateway_webhook_secret
+        ));
+        assert_eq!(
+            store.decrypt(gateway_webhook_secret).unwrap(),
+            "gateway-ingress-credential"
         );
 
         // MCP server headers — every value must be encrypted; the keys
@@ -28393,6 +28415,7 @@ allowed_numbers = ["+1", "+2"]
             paired_tokens: vec!["zc_test_token".into()],
             pair_rate_limit_per_minute: 12,
             webhook_rate_limit_per_minute: 80,
+            webhook_secret: None,
             trust_forwarded_headers: true,
             path_prefix: Some("/zeroclaw".into()),
             rate_limit_max_keys: 2048,

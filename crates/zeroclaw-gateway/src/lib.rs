@@ -21,6 +21,7 @@ pub mod api_sections;
 pub mod api_skills;
 pub mod api_sop;
 pub mod api_sop_author;
+mod api_sop_webhook;
 #[cfg(feature = "webauthn")]
 pub mod api_webauthn;
 #[cfg(any(
@@ -481,8 +482,6 @@ pub struct AppState {
     pub mem: Arc<dyn Memory>,
     pub memory_strategy: Arc<dyn MemoryStrategy>,
     pub auto_save: bool,
-    /// SHA-256 hash of `X-Webhook-Secret` (hex-encoded), never plaintext.
-    pub webhook_secret_hash: Option<Arc<str>>,
     pub pairing: Arc<PairingGuard>,
     pub trust_forwarded_headers: bool,
     pub rate_limiter: Arc<GatewayRateLimiter>,
@@ -1018,16 +1017,6 @@ pub async fn run_gateway(
         tx
     });
     let event_buffer = Arc::new(sse::EventBuffer::new(500));
-    // Extract webhook secret for authentication
-    let webhook_secret_hash: Option<Arc<str>> =
-        config.channels.webhook.values().next().and_then(|webhook| {
-            webhook.secret.as_ref().and_then(|raw_secret| {
-                let trimmed_secret = raw_secret.trim();
-                (!trimmed_secret.is_empty())
-                    .then(|| Arc::<str>::from(hash_webhook_secret(trimmed_secret)))
-            })
-        });
-
     // WhatsApp channel instances (one per cloud-configured alias), keyed by
     // alias so `/whatsapp/{alias}` webhooks reach the matching instance
     #[cfg(feature = "channel-whatsapp-cloud")]
@@ -1586,7 +1575,6 @@ pub async fn run_gateway(
         mem,
         memory_strategy,
         auto_save: config.memory.auto_save,
-        webhook_secret_hash,
         pairing,
         trust_forwarded_headers: config.gateway.trust_forwarded_headers,
         rate_limiter,
@@ -1672,6 +1660,7 @@ pub async fn run_gateway(
         .route("/pair", post(handle_pair))
         .route("/pair/code", get(handle_pair_code))
         .route("/webhook", post(handle_webhook))
+        .merge(sop_webhook_routes())
         .merge(optional_channel_routes())
         // ── Claude Code runner hooks ──
         .route("/hooks/claude-code", post(api::handle_claude_code_hook))
@@ -2685,6 +2674,10 @@ fn optional_channel_routes() -> Router<AppState> {
     router
 }
 
+fn sop_webhook_routes() -> Router<AppState> {
+    Router::new().route("/sop/{*rest}", post(api_sop_webhook::handle_sop_webhook))
+}
+
 /// Webhook request body
 #[derive(serde::Deserialize)]
 pub struct WebhookBody {
@@ -2702,16 +2695,29 @@ pub struct WebhookQuery {
     pub agent: Option<String>,
 }
 
-/// POST /webhook — main webhook endpoint
-async fn handle_webhook(
-    State(state): State<AppState>,
-    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
-    Query(query): Query<WebhookQuery>,
-    headers: HeaderMap,
-    body: Result<Json<WebhookBody>, axum::extract::rejection::JsonRejection>,
-) -> impl IntoResponse {
-    let rate_key =
-        client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
+type WebhookJsonResponse = (StatusCode, Json<serde_json::Value>);
+
+/// Resolve the gateway webhook credential from its canonical live config.
+/// Channel webhook aliases own separate HMAC listeners and never participate
+/// in authorization for the gateway's `/webhook` or `/sop/*` routes.
+fn configured_gateway_webhook_secret_hash(state: &AppState) -> Option<String> {
+    state
+        .config
+        .read()
+        .gateway
+        .webhook_secret
+        .as_deref()
+        .map(str::trim)
+        .filter(|secret| !secret.is_empty())
+        .map(hash_webhook_secret)
+}
+
+fn authorize_webhook_request(
+    state: &AppState,
+    peer_addr: SocketAddr,
+    headers: &HeaderMap,
+) -> Result<(), WebhookJsonResponse> {
+    let rate_key = client_key_from_request(Some(peer_addr), headers, state.trust_forwarded_headers);
     if !state.rate_limiter.allow_webhook(&rate_key) {
         ::zeroclaw_log::record!(
             WARN,
@@ -2723,10 +2729,9 @@ async fn handle_webhook(
             "error": "Too many webhook requests. Please retry later.",
             "retry_after": RATE_LIMIT_WINDOW_SECS,
         });
-        return (StatusCode::TOO_MANY_REQUESTS, Json(err));
+        return Err((StatusCode::TOO_MANY_REQUESTS, Json(err)));
     }
 
-    // ── Bearer token auth (pairing) with auth rate limiting ──
     if state.pairing.require_pairing() {
         if let Err(e) = state.auth_limiter.check_rate_limit(&rate_key) {
             ::zeroclaw_log::record!(
@@ -2740,7 +2745,7 @@ async fn handle_webhook(
                 "error": format!("Too many auth attempts. Try again in {}s.", e.retry_after_secs),
                 "retry_after": e.retry_after_secs,
             });
-            return (StatusCode::TOO_MANY_REQUESTS, Json(err));
+            return Err((StatusCode::TOO_MANY_REQUESTS, Json(err)));
         }
         let auth = headers
             .get(header::AUTHORIZATION)
@@ -2758,12 +2763,11 @@ async fn handle_webhook(
             let err = serde_json::json!({
                 "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
             });
-            return (StatusCode::UNAUTHORIZED, Json(err));
+            return Err((StatusCode::UNAUTHORIZED, Json(err)));
         }
     }
 
-    // ── Webhook secret auth (optional, additional layer) ──
-    if let Some(ref secret_hash) = state.webhook_secret_hash {
+    if let Some(secret_hash) = configured_gateway_webhook_secret_hash(state) {
         let header_hash = headers
             .get("X-Webhook-Secret")
             .and_then(|v| v.to_str().ok())
@@ -2771,7 +2775,7 @@ async fn handle_webhook(
             .filter(|value| !value.is_empty())
             .map(hash_webhook_secret);
         match header_hash {
-            Some(val) if constant_time_eq(&val, secret_hash.as_ref()) => {}
+            Some(val) if constant_time_eq(&val, &secret_hash) => {}
             _ => {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -2780,9 +2784,91 @@ async fn handle_webhook(
                     "webhook: rejected request — invalid or missing X-Webhook-Secret"
                 );
                 let err = serde_json::json!({"error": "Unauthorized — invalid or missing X-Webhook-Secret header"});
-                return (StatusCode::UNAUTHORIZED, Json(err));
+                return Err((StatusCode::UNAUTHORIZED, Json(err)));
             }
         }
+    }
+
+    Ok(())
+}
+
+fn check_webhook_idempotency(
+    state: &AppState,
+    headers: &HeaderMap,
+    namespace: Option<&str>,
+) -> Option<WebhookJsonResponse> {
+    let idempotency_key = headers
+        .get("X-Idempotency-Key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let storage_key = namespace
+        .map(|namespace| format!("{namespace}:{idempotency_key}"))
+        .unwrap_or_else(|| idempotency_key.to_string());
+    if state.idempotency_store.record_if_new(&storage_key) {
+        return None;
+    }
+
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_attrs(::serde_json::json!({"idempotency_key": idempotency_key})),
+        "webhook duplicate ignored"
+    );
+    Some((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "duplicate",
+            "idempotent": true,
+            "message": "A prior request already reserved this idempotency key; no new dispatch was started"
+        })),
+    ))
+}
+
+/// Whether the gateway has at least one webhook credential control
+/// configured (pairing bearer or a webhook secret). `authorize_webhook_request`
+/// above already rejects the request if a *configured* control's check
+/// fails, so by the time callers reach this point "configured" implies
+/// "already verified for this request".
+fn has_configured_webhook_credential(state: &AppState) -> bool {
+    state.pairing.require_pairing() || configured_gateway_webhook_secret_hash(state).is_some()
+}
+
+/// Fail closed before a SOP run starts. Starting a SOP run authorizes real
+/// side effects, so — unlike the chat-only `/webhook` fallback, which keeps
+/// its existing default-open policy — dispatch must not proceed when both
+/// `gateway.require_pairing` and the webhook secret are unset (the official
+/// container's default configuration). Repo policy is "new external surfaces
+/// default closed".
+fn require_sop_dispatch_credentials(state: &AppState) -> Result<(), WebhookJsonResponse> {
+    if has_configured_webhook_credential(state) {
+        return Ok(());
+    }
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+        "sop webhook dispatch rejected — no credential configured"
+    );
+    let err = serde_json::json!({
+        "error": "SOP webhook dispatch requires a configured credential: set \
+                  `gateway.require_pairing = true` and authenticate with \
+                  `Authorization: Bearer <paired-token>` (pair first via POST /pair), or set \
+                  `gateway.webhook_secret` and send X-Webhook-Secret."
+    });
+    Err((StatusCode::UNAUTHORIZED, Json(err)))
+}
+
+/// POST /webhook — main webhook endpoint
+async fn handle_webhook(
+    State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    Query(query): Query<WebhookQuery>,
+    headers: HeaderMap,
+    body: Result<Json<WebhookBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if let Err(response) = authorize_webhook_request(&state, peer_addr, &headers) {
+        return response;
     }
 
     // ── Parse body ──
@@ -2803,9 +2889,40 @@ async fn handle_webhook(
         }
     };
 
+    // ── SOP dispatch first ──
+    // A matching `/webhook` SOP trigger takes the request before any
+    // chat-only routing (query params, agent aliases) is even inspected —
+    // the advertised contract is SOP dispatch first, chat fallback second,
+    // so a chat-only param must never block a matching SOP.
+    let sop_payload = serde_json::json!({ "message": &webhook_body.message }).to_string();
+    let has_matching_sop = match api_sop_webhook::has_matching_webhook_sop(&state, "/webhook") {
+        Ok(matches) => matches,
+        Err(response) => return response,
+    };
+
+    if has_matching_sop {
+        if let Err(response) = require_sop_dispatch_credentials(&state) {
+            return response;
+        }
+        if let Some(response) = check_webhook_idempotency(&state, &headers, None) {
+            return response;
+        }
+        if let api_sop_webhook::SopWebhookOutcome::Handled(response) =
+            api_sop_webhook::dispatch_webhook_sop(&state, "/webhook", Some(&sop_payload)).await
+        {
+            return response;
+        }
+        // The engine reported no match after all (e.g. a trigger was
+        // unloaded between the pre-check above and dispatch); fall through
+        // to chat. The idempotency key above is already consumed for this
+        // attempt.
+    }
+
     // ── Per-request agent dispatch (optional `?agent=` query param) ──
-    // Validate before idempotency / autosave so a typo'd alias doesn't
-    // consume the caller's idempotency key. Mirrors the `/ws/chat`
+    // Chat-only routing: only reached when no SOP trigger matched
+    // `/webhook`, so a bogus `?agent=` can never block a matching SOP
+    // dispatch. Validated before idempotency / autosave so a typo'd alias
+    // doesn't consume the caller's idempotency key. Mirrors the `/ws/chat`
     // unknown-agent rejection.
     let agent_override = query
         .agent
@@ -2831,26 +2948,8 @@ async fn handle_webhook(
         }
     }
 
-    // ── Idempotency (optional) ──
-    if let Some(idempotency_key) = headers
-        .get("X-Idempotency-Key")
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        && !state.idempotency_store.record_if_new(idempotency_key)
-    {
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_attrs(::serde_json::json!({"idempotency_key": idempotency_key})),
-            "webhook duplicate ignored"
-        );
-        let body = serde_json::json!({
-            "status": "duplicate",
-            "idempotent": true,
-            "message": "Request already processed for this idempotency key"
-        });
-        return (StatusCode::OK, Json(body));
+    if !has_matching_sop && let Some(response) = check_webhook_idempotency(&state, &headers, None) {
+        return response;
     }
 
     let message = &webhook_body.message;
@@ -4314,6 +4413,7 @@ mod tests {
     use http_body_util::BodyExt;
     use parking_lot::{Mutex, RwLock};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tower::ServiceExt;
     #[cfg(feature = "channel-whatsapp-cloud")]
     use zeroclaw_api::channel::ChannelMessage;
     use zeroclaw_memory::{Memory, MemoryCategory, MemoryEntry};
@@ -4593,7 +4693,6 @@ mod tests {
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(require_pairing, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -4642,6 +4741,124 @@ mod tests {
             #[cfg(feature = "webauthn")]
             webauthn: None,
         }
+    }
+
+    fn webhook_sop_state(
+        tmp: &tempfile::TempDir,
+        trigger_path: &str,
+    ) -> (AppState, Arc<MockModelProvider>) {
+        let mut state = admin_paircode_state(tmp, false, false);
+        let provider = Arc::new(MockModelProvider::default());
+        state.model_provider = provider.clone();
+
+        let sops_dir = tmp.path().join("sops");
+        let sop_dir = sops_dir.join("webhook-test");
+        std::fs::create_dir_all(&sop_dir).unwrap();
+        std::fs::write(
+            sop_dir.join("SOP.toml"),
+            format!(
+                r#"[sop]
+name = "webhook-test"
+description = "Gateway webhook fan-in test"
+execution_mode = "auto"
+
+[[triggers]]
+type = "webhook"
+path = "{trigger_path}"
+"#,
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            sop_dir.join("SOP.md"),
+            "## Steps\n\n1. **Handle webhook** — Process the webhook payload.\n",
+        )
+        .unwrap();
+
+        let mut sop_config = state.config.read().sop.clone();
+        sop_config.sops_dir = Some(sops_dir.to_string_lossy().into_owned());
+        sop_config.persist_runs = false;
+        state.config.write().sop = sop_config.clone();
+        let data_dir = state.config.read().data_dir.clone();
+        let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
+            sop_config,
+            &data_dir,
+            Arc::clone(&state.mem),
+            Default::default(),
+        );
+        state.sop_engine = Some(engine);
+        state.sop_audit = Some(audit);
+        (state, provider)
+    }
+
+    /// Same as [`webhook_sop_state`] but loads two SOPs, each with its own
+    /// distinct webhook trigger path — used to prove idempotency keys are
+    /// namespaced per SOP path rather than shared across all of `/sop/*`.
+    fn webhook_two_sop_state(
+        tmp: &tempfile::TempDir,
+        path_a: &str,
+        path_b: &str,
+    ) -> (AppState, Arc<MockModelProvider>) {
+        let mut state = admin_paircode_state(tmp, false, false);
+        let provider = Arc::new(MockModelProvider::default());
+        state.model_provider = provider.clone();
+
+        let sops_dir = tmp.path().join("sops");
+        for (name, trigger_path) in [("sop-a", path_a), ("sop-b", path_b)] {
+            let sop_dir = sops_dir.join(name);
+            std::fs::create_dir_all(&sop_dir).unwrap();
+            std::fs::write(
+                sop_dir.join("SOP.toml"),
+                format!(
+                    r#"[sop]
+name = "{name}"
+description = "Gateway webhook fan-in test"
+execution_mode = "auto"
+
+[[triggers]]
+type = "webhook"
+path = "{trigger_path}"
+"#,
+                ),
+            )
+            .unwrap();
+            std::fs::write(
+                sop_dir.join("SOP.md"),
+                "## Steps\n\n1. **Handle webhook** — Process the webhook payload.\n",
+            )
+            .unwrap();
+        }
+
+        let mut sop_config = state.config.read().sop.clone();
+        sop_config.sops_dir = Some(sops_dir.to_string_lossy().into_owned());
+        sop_config.persist_runs = false;
+        state.config.write().sop = sop_config.clone();
+        let data_dir = state.config.read().data_dir.clone();
+        let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
+            sop_config,
+            &data_dir,
+            Arc::clone(&state.mem),
+            Default::default(),
+        );
+        state.sop_engine = Some(engine);
+        state.sop_audit = Some(audit);
+        (state, provider)
+    }
+
+    /// Attach a webhook-secret credential to `state`; returns the plaintext
+    /// secret to send back as `X-Webhook-Secret`. Item 2's fail-closed SOP
+    /// dispatch policy requires a configured-and-verified credential before
+    /// a SOP run can start.
+    fn with_webhook_secret(state: AppState) -> (AppState, String) {
+        let secret = generate_test_secret();
+        state.config.write().gateway.webhook_secret = Some(secret.clone());
+        (state, secret)
+    }
+
+    fn webhook_secret_header(secret: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Webhook-Secret", HeaderValue::from_str(secret).unwrap());
+        headers
     }
 
     fn spa_fallback_state(tmp: &tempfile::TempDir) -> AppState {
@@ -5316,7 +5533,6 @@ mod tests {
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -5405,7 +5621,6 @@ mod tests {
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -6081,7 +6296,6 @@ mod tests {
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -6170,6 +6384,426 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sop_webhook_dispatches_matching_path_without_provider_call() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, provider) = webhook_sop_state(&tmp, "/sop/deploy");
+        let (state, secret) = with_webhook_secret(state);
+        let response = api_sop_webhook::handle_sop_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            axum::extract::Path("deploy".to_string()),
+            webhook_secret_header(&secret),
+            axum::body::Bytes::from_static(br#"{"revision":"abc123"}"#),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(parsed["status"], "accepted");
+        assert_eq!(parsed["path"], "/sop/deploy");
+        assert_eq!(parsed["results"][0]["sop"], "webhook-test");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+
+        let run_id = parsed["results"][0]["run_id"].as_str().unwrap();
+        let engine = state.sop_engine.as_ref().unwrap().lock().unwrap();
+        let run = engine.get_run(run_id).unwrap();
+        assert_eq!(
+            run.trigger_event.source,
+            zeroclaw_runtime::sop::SopTriggerSource::Webhook
+        );
+        assert_eq!(run.trigger_event.topic.as_deref(), Some("/sop/deploy"));
+        assert_eq!(
+            run.trigger_event.payload.as_deref(),
+            Some(r#"{"revision":"abc123"}"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn sop_webhook_route_reaches_the_shared_dispatch_handler() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, provider) = webhook_sop_state(&tmp, "/sop/deploy");
+        let (state, secret) = with_webhook_secret(state);
+        let app = sop_webhook_routes().with_state(state);
+        let mut request = axum::http::Request::post("/sop/deploy")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .header("X-Webhook-Secret", secret)
+            .body(axum::body::Body::from(r#"{"revision":"abc123"}"#))
+            .unwrap();
+        request.extensions_mut().insert(test_connect_info());
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+
+    async fn post_sop_route_without_credentials(
+        state: AppState,
+        path: &'static str,
+        body: &'static [u8],
+    ) -> (StatusCode, serde_json::Value) {
+        let app = sop_webhook_routes().with_state(state);
+        let mut request = axum::http::Request::post(path)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        request.extensions_mut().insert(test_connect_info());
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&payload).unwrap())
+    }
+
+    #[tokio::test]
+    async fn sop_route_without_credentials_hides_body_and_engine_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (matching, provider) = webhook_sop_state(&tmp, "/sop/deploy");
+        let unavailable_tmp = tempfile::tempdir().unwrap();
+        let unavailable = admin_paircode_state(&unavailable_tmp, false, false);
+
+        let cases = [
+            post_sop_route_without_credentials(
+                matching.clone(),
+                "/sop/deploy",
+                br#"{"revision":"abc123"}"#,
+            )
+            .await,
+            post_sop_route_without_credentials(
+                matching.clone(),
+                "/sop/missing",
+                br#"{"revision":"abc123"}"#,
+            )
+            .await,
+            post_sop_route_without_credentials(matching, "/sop/deploy", b"not-json").await,
+            post_sop_route_without_credentials(unavailable, "/sop/deploy", br#"{}"#).await,
+        ];
+
+        let expected_error = cases[0].1["error"].clone();
+        for (status, payload) in cases {
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                payload["error"], expected_error,
+                "credential failure must not reveal JSON validity, trigger matches, or engine availability"
+            );
+        }
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn sop_webhook_rejects_unmatched_and_invalid_requests_without_chat_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, provider) = webhook_sop_state(&tmp, "/sop/deploy");
+        let (state, secret) = with_webhook_secret(state);
+
+        let unmatched = api_sop_webhook::handle_sop_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            axum::extract::Path("missing".to_string()),
+            webhook_secret_header(&secret),
+            axum::body::Bytes::from_static(br#"{}"#),
+        )
+        .await;
+        assert_eq!(unmatched.status(), StatusCode::NOT_FOUND);
+
+        let invalid = api_sop_webhook::handle_sop_webhook(
+            State(state),
+            test_connect_info(),
+            axum::extract::Path("deploy".to_string()),
+            webhook_secret_header(&secret),
+            axum::body::Bytes::from_static(b"not-json"),
+        )
+        .await;
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn sop_webhook_requires_shared_engine_and_webhook_auth() {
+        let disabled_tmp = tempfile::tempdir().unwrap();
+        let disabled = admin_paircode_state(&disabled_tmp, false, false);
+        let (disabled, secret) = with_webhook_secret(disabled);
+        let unavailable = api_sop_webhook::handle_sop_webhook(
+            State(disabled),
+            test_connect_info(),
+            axum::extract::Path("deploy".to_string()),
+            webhook_secret_header(&secret),
+            axum::body::Bytes::from_static(br#"{}"#),
+        )
+        .await;
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let protected_tmp = tempfile::tempdir().unwrap();
+        let (protected, provider) = webhook_sop_state(&protected_tmp, "/sop/deploy");
+        let secret = generate_test_secret();
+        protected.config.write().gateway.webhook_secret = Some(secret);
+        let unauthorized = api_sop_webhook::handle_sop_webhook(
+            State(protected),
+            test_connect_info(),
+            axum::extract::Path("deploy".to_string()),
+            HeaderMap::new(),
+            axum::body::Bytes::from_static(br#"{}"#),
+        )
+        .await;
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn webhook_dispatches_sop_first_then_falls_back_to_chat_on_no_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, provider) = webhook_sop_state(&tmp, "/webhook");
+        let (state, secret) = with_webhook_secret(state);
+        let sop_response = handle_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            webhook_secret_header(&secret),
+            Ok(Json(WebhookBody {
+                message: "deploy".into(),
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(sop_response.status(), StatusCode::OK);
+        let payload = sop_response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(parsed["status"], "accepted");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+
+        let no_match_tmp = tempfile::tempdir().unwrap();
+        let (no_match_state, fallback_provider) = webhook_sop_state(&no_match_tmp, "/sop/only");
+        let fallback_response = handle_webhook(
+            State(no_match_state),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            HeaderMap::new(),
+            Ok(Json(WebhookBody {
+                message: "chat instead".into(),
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(fallback_response.status(), StatusCode::OK);
+        assert_eq!(fallback_provider.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn sop_and_chat_webhook_idempotency_namespaces_do_not_collide() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, provider) = webhook_sop_state(&tmp, "/sop/deploy");
+        let (state, secret) = with_webhook_secret(state);
+        let mut headers = webhook_secret_header(&secret);
+        headers.insert("X-Idempotency-Key", HeaderValue::from_static("same-key"));
+
+        let sop_response = api_sop_webhook::handle_sop_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            axum::extract::Path("deploy".to_string()),
+            headers.clone(),
+            axum::body::Bytes::from_static(br#"{}"#),
+        )
+        .await;
+        assert_eq!(sop_response.status(), StatusCode::OK);
+
+        let chat_response = handle_webhook(
+            State(state),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            headers,
+            Ok(Json(WebhookBody {
+                message: "chat".into(),
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(chat_response.status(), StatusCode::OK);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn sop_idempotency_namespaced_per_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, provider) = webhook_two_sop_state(&tmp, "/sop/deploy", "/sop/rollback");
+        let (state, secret) = with_webhook_secret(state);
+        let mut headers = webhook_secret_header(&secret);
+        headers.insert("X-Idempotency-Key", HeaderValue::from_static("same-key"));
+
+        // Same key, two different SOP paths: both execute.
+        let deploy_response = api_sop_webhook::handle_sop_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            axum::extract::Path("deploy".to_string()),
+            headers.clone(),
+            axum::body::Bytes::from_static(br#"{}"#),
+        )
+        .await;
+        assert_eq!(deploy_response.status(), StatusCode::OK);
+        let deploy_payload = deploy_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let deploy_parsed: serde_json::Value = serde_json::from_slice(&deploy_payload).unwrap();
+        assert_eq!(deploy_parsed["status"], "accepted");
+
+        let rollback_response = api_sop_webhook::handle_sop_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            axum::extract::Path("rollback".to_string()),
+            headers.clone(),
+            axum::body::Bytes::from_static(br#"{}"#),
+        )
+        .await;
+        assert_eq!(rollback_response.status(), StatusCode::OK);
+        let rollback_payload = rollback_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let rollback_parsed: serde_json::Value = serde_json::from_slice(&rollback_payload).unwrap();
+        assert_eq!(rollback_parsed["status"], "accepted");
+
+        // Same key, same path again: the second call is suppressed as a duplicate.
+        let repeat_response = api_sop_webhook::handle_sop_webhook(
+            State(state),
+            test_connect_info(),
+            axum::extract::Path("deploy".to_string()),
+            headers,
+            axum::body::Bytes::from_static(br#"{}"#),
+        )
+        .await;
+        assert_eq!(repeat_response.status(), StatusCode::OK);
+        let repeat_payload = repeat_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let repeat_parsed: serde_json::Value = serde_json::from_slice(&repeat_payload).unwrap();
+        assert_eq!(repeat_parsed["status"], "duplicate");
+        assert_eq!(repeat_parsed["idempotent"], true);
+        assert!(
+            repeat_parsed["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("no new dispatch was started"),
+            "duplicate response must describe reservation, not claim successful processing"
+        );
+
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn sop_dispatch_rejected_when_no_credentials_configured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, provider) = webhook_sop_state(&tmp, "/sop/deploy");
+
+        let response = api_sop_webhook::handle_sop_webhook(
+            State(state),
+            test_connect_info(),
+            axum::extract::Path("deploy".to_string()),
+            HeaderMap::new(),
+            axum::body::Bytes::from_static(br#"{}"#),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        let error = parsed["error"].as_str().unwrap_or_default();
+        assert!(error.contains("require_pairing"), "error was: {error}");
+        assert!(error.contains("X-Webhook-Secret"), "error was: {error}");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn webhook_sop_dispatch_rejected_when_no_credentials_configured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, provider) = webhook_sop_state(&tmp, "/webhook");
+
+        let response = handle_webhook(
+            State(state),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            HeaderMap::new(),
+            Ok(Json(WebhookBody {
+                message: "deploy".into(),
+            })),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        let error = parsed["error"].as_str().unwrap_or_default();
+        assert!(error.contains("require_pairing"), "error was: {error}");
+        assert!(error.contains("X-Webhook-Secret"), "error was: {error}");
+        // Rejected outright — a matching SOP with no configured credential
+        // must never silently fall back to the chat/model path.
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn sop_dispatch_succeeds_with_paired_bearer_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut state, provider) = webhook_sop_state(&tmp, "/sop/deploy");
+        // A plaintext (not pre-hashed) token: `PairingGuard::new` treats a
+        // bare 64-hex-char value as an already-hashed token, so a "zc_"
+        // prefix keeps this one unambiguously plaintext.
+        let token = format!("zc_{}", generate_test_secret());
+        state.pairing = Arc::new(PairingGuard::new(true, std::slice::from_ref(&token)));
+
+        let response = api_sop_webhook::handle_sop_webhook(
+            State(state),
+            test_connect_info(),
+            axum::extract::Path("deploy".to_string()),
+            bearer_headers(&token),
+            axum::body::Bytes::from_static(br#"{}"#),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(parsed["status"], "accepted");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn webhook_sop_first_ignores_bogus_chat_agent_query_param() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, provider) = webhook_sop_state(&tmp, "/webhook");
+        let (state, secret) = with_webhook_secret(state);
+
+        let response = handle_webhook(
+            State(state),
+            test_connect_info(),
+            Query(WebhookQuery {
+                agent: Some("missing".into()),
+            }),
+            webhook_secret_header(&secret),
+            Ok(Json(WebhookBody {
+                message: "deploy".into(),
+            })),
+        )
+        .await
+        .into_response();
+
+        // A matching SOP dispatches even though `?agent=missing` has no
+        // `[agents.missing]` entry — the chat-only param is never inspected.
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(parsed["status"], "accepted");
+        assert_eq!(parsed["source"], "webhook");
+        // The model provider is never touched.
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn webhook_unknown_agent_rejected_before_dispatch() {
         let provider_impl = Arc::new(MockModelProvider::default());
         let model_provider: Arc<dyn ModelProvider> = provider_impl.clone();
@@ -6188,7 +6822,6 @@ mod tests {
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -6310,7 +6943,6 @@ mod tests {
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -6412,7 +7044,6 @@ mod tests {
                 std::path::PathBuf::new(),
             )),
             auto_save: true,
-            webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -6513,15 +7144,100 @@ mod tests {
         assert_eq!(one.len(), 64);
     }
 
+    #[test]
+    fn gateway_webhook_secret_uses_one_live_config_owner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = admin_paircode_state(&tmp, false, false);
+        {
+            let mut config = state.config.write();
+            config.channels.webhook.insert(
+                "enabled-a".into(),
+                zeroclaw_config::schema::WebhookConfig {
+                    enabled: true,
+                    secret: Some("channel-secret-a".into()),
+                    ..Default::default()
+                },
+            );
+            config.channels.webhook.insert(
+                "enabled-b".into(),
+                zeroclaw_config::schema::WebhookConfig {
+                    enabled: true,
+                    secret: Some("channel-secret-b".into()),
+                    ..Default::default()
+                },
+            );
+            config.channels.webhook.insert(
+                "disabled".into(),
+                zeroclaw_config::schema::WebhookConfig {
+                    enabled: false,
+                    secret: Some("disabled-channel-secret".into()),
+                    ..Default::default()
+                },
+            );
+        }
+        assert_eq!(
+            configured_gateway_webhook_secret_hash(&state),
+            None,
+            "channel listener aliases must never become gateway credentials"
+        );
+        assert!(
+            require_sop_dispatch_credentials(&state).is_err(),
+            "multiple channel aliases without a gateway credential must fail closed"
+        );
+
+        let startup_secret = "synthetic-startup-gateway-secret".to_string();
+        state.config.write().gateway.webhook_secret = Some(startup_secret.clone());
+        assert!(
+            authorize_webhook_request(
+                &state,
+                test_connect_info().0,
+                &webhook_secret_header("channel-secret-a"),
+            )
+            .is_err(),
+            "an enabled channel alias secret must not authorize the gateway"
+        );
+        assert!(
+            authorize_webhook_request(
+                &state,
+                test_connect_info().0,
+                &webhook_secret_header(&startup_secret),
+            )
+            .is_ok()
+        );
+
+        let rotated_secret = "synthetic-rotated-gateway-secret".to_string();
+        state.config.write().gateway.webhook_secret = Some(rotated_secret.clone());
+        assert!(
+            authorize_webhook_request(
+                &state,
+                test_connect_info().0,
+                &webhook_secret_header(&startup_secret),
+            )
+            .is_err(),
+            "authorization must not retain a startup snapshot after config replacement"
+        );
+        assert!(
+            authorize_webhook_request(
+                &state,
+                test_connect_info().0,
+                &webhook_secret_header(&rotated_secret),
+            )
+            .is_ok(),
+            "the live canonical gateway credential must take effect"
+        );
+    }
+
     #[tokio::test]
     async fn webhook_secret_hash_rejects_missing_header() {
         let provider_impl = Arc::new(MockModelProvider::default());
         let model_provider: Arc<dyn ModelProvider> = provider_impl.clone();
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
         let secret = generate_test_secret();
+        let mut config = Config::default();
+        config.gateway.webhook_secret = Some(secret.clone());
 
         let state = AppState {
-            config: Arc::new(RwLock::new(Config::default())),
+            config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
             model: "test-model".into(),
@@ -6533,7 +7249,6 @@ mod tests {
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&secret))),
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -6606,9 +7321,11 @@ mod tests {
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
         let valid_secret = generate_test_secret();
         let wrong_secret = generate_test_secret();
+        let mut config = Config::default();
+        config.gateway.webhook_secret = Some(valid_secret.clone());
 
         let state = AppState {
-            config: Arc::new(RwLock::new(Config::default())),
+            config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
             model: "test-model".into(),
@@ -6620,7 +7337,6 @@ mod tests {
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&valid_secret))),
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -6698,9 +7414,11 @@ mod tests {
         let model_provider: Arc<dyn ModelProvider> = provider_impl.clone();
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
         let secret = generate_test_secret();
+        let mut config = Config::default();
+        config.gateway.webhook_secret = Some(secret.clone());
 
         let state = AppState {
-            config: Arc::new(RwLock::new(Config::default())),
+            config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
             model: "test-model".into(),
@@ -6712,7 +7430,6 @@ mod tests {
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&secret))),
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -6811,7 +7528,6 @@ mod tests {
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -6908,7 +7624,6 @@ mod tests {
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -7061,7 +7776,6 @@ mod tests {
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -7916,7 +8630,6 @@ mod tests {
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -8004,7 +8717,6 @@ mod tests {
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -8327,7 +9039,6 @@ mod tests {
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
