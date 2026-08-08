@@ -542,6 +542,27 @@ fn filter_agent_peer_groups(
         .collect()
 }
 
+/// Assemble the shell tool with the sandbox selected for the configured
+/// runtime. This is the single seam that pairs `root_config.runtime.kind`
+/// with the risk profile's sandbox selection; `all_tools_with_runtime` and
+/// integration tests both go through it so a wrong runtime-kind wiring here
+/// cannot pass unnoticed.
+#[must_use]
+pub fn shell_tool_for_runtime(
+    security: Arc<SecurityPolicy>,
+    runtime: Arc<dyn RuntimeAdapter>,
+    risk_profile: &zeroclaw_config::schema::RiskProfileConfig,
+    root_config: &Config,
+) -> ShellTool {
+    let sandbox_cfg = risk_profile.sandbox_config();
+    let sandbox = create_sandbox(
+        &sandbox_cfg,
+        root_config.runtime.kind,
+        Some(&security.workspace_dir),
+    );
+    ShellTool::new_with_sandbox(security, runtime, sandbox)
+}
+
 /// Create full tool registry including memory tools and optional Composio.
 #[allow(
     clippy::implicit_hasher,
@@ -576,9 +597,6 @@ pub fn all_tools_with_runtime(
 ) -> AllToolsResult {
     let has_shell_access = runtime.has_shell_access();
     let persistent_writes = runtime.has_filesystem_access();
-    let runtime_kind = root_config.runtime.kind.as_wire();
-    let sandbox_cfg = risk_profile.sandbox_config();
-    let sandbox = create_sandbox(&sandbox_cfg, runtime_kind, Some(&security.workspace_dir));
     // Keep a shared runtime adapter available after constructing ShellTool.
     // Independent agentic delegates use it later to build the target-owned tool
     // registry; bounded delegates continue to use the parent `tool_arcs`
@@ -586,14 +604,19 @@ pub fn all_tools_with_runtime(
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(RateLimitedTool::new(
             PathGuardedTool::new(
-                ShellTool::new_with_sandbox(security.clone(), runtime.clone(), sandbox)
-                    .with_timeout_secs(if security.shell_timeout_secs > 0 {
-                        security.shell_timeout_secs
-                    } else {
-                        root_config.shell_tool.timeout_secs
-                    })
-                    .with_tui_env(tui_env)
-                    .with_persistent_writes(persistent_writes),
+                shell_tool_for_runtime(
+                    security.clone(),
+                    runtime.clone(),
+                    risk_profile,
+                    root_config,
+                )
+                .with_timeout_secs(if security.shell_timeout_secs > 0 {
+                    security.shell_timeout_secs
+                } else {
+                    root_config.shell_tool.timeout_secs
+                })
+                .with_tui_env(tui_env)
+                .with_persistent_writes(persistent_writes),
                 security.clone(),
             ),
             security.clone(),
