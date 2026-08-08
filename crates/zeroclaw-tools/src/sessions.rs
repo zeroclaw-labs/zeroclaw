@@ -4,11 +4,15 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::collections::BTreeSet;
 use std::fmt::Write;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
-use zeroclaw_infra::session_backend::SessionBackend;
+use zeroclaw_infra::session_backend::{SessionBackend, SessionMetadata};
+
+static SESSIONS_LIST_DESCRIPTION: OnceLock<String> = OnceLock::new();
+static SESSIONS_HISTORY_DESCRIPTION: OnceLock<String> = OnceLock::new();
+static SESSIONS_SEND_DESCRIPTION: OnceLock<String> = OnceLock::new();
 
 /// Validate that a session ID is non-empty and contains at least one
 /// alphanumeric character (prevents blank keys after sanitization).
@@ -94,7 +98,7 @@ impl SessionOwnershipScope {
 
         let Some(metadata) = backend.get_session_metadata(&session_key) else {
             return Err(format!(
-                "Session '{session_id}' exists but has no ownership metadata; refusing destructive session operation from agent '{}'.",
+                "Session '{session_id}' exists but has no ownership metadata; refusing session operation from agent '{}'.",
                 self.agent_alias
             ));
         };
@@ -120,9 +124,22 @@ impl SessionOwnershipScope {
         }
 
         Err(format!(
-            "Session '{session_id}' has no agent or channel ownership metadata; refusing destructive session operation from agent '{}'.",
+            "Session '{session_id}' has no agent or channel ownership metadata; refusing session operation from agent '{}'.",
             self.agent_alias
         ))
+    }
+
+    /// Non-erroring form of the same three-tier ownership predicate, for
+    /// filtering listings: agent match, else owned-channel match, else not
+    /// owned (unattributed sessions are not owned by anyone).
+    fn owns_metadata(&self, metadata: &SessionMetadata) -> bool {
+        if let Some(owner) = metadata.agent_alias.as_deref() {
+            return owner == self.agent_alias;
+        }
+        if let Some(channel_id) = metadata.channel_id.as_deref() {
+            return self.channel_ids.contains(channel_id);
+        }
+        false
     }
 }
 
@@ -131,11 +148,29 @@ impl SessionOwnershipScope {
 /// Lists active sessions with their channel, last activity time, and message count.
 pub struct SessionsListTool {
     backend: Arc<dyn SessionBackend>,
+    security: Arc<SecurityPolicy>,
+    ownership_scope: Option<SessionOwnershipScope>,
 }
 
 impl SessionsListTool {
-    pub fn new(backend: Arc<dyn SessionBackend>) -> Self {
-        Self { backend }
+    pub fn new(backend: Arc<dyn SessionBackend>, security: Arc<SecurityPolicy>) -> Self {
+        Self {
+            backend,
+            security,
+            ownership_scope: None,
+        }
+    }
+
+    pub fn for_agent(
+        backend: Arc<dyn SessionBackend>,
+        security: Arc<SecurityPolicy>,
+        ownership_scope: SessionOwnershipScope,
+    ) -> Self {
+        Self {
+            backend,
+            security,
+            ownership_scope: Some(ownership_scope),
+        }
     }
 }
 
@@ -146,7 +181,9 @@ impl Tool for SessionsListTool {
     }
 
     fn description(&self) -> &str {
-        "List all active conversation sessions with their channel, last activity time, and message count."
+        SESSIONS_LIST_DESCRIPTION
+            .get_or_init(|| crate::i18n::get_required_tool_string("tool-sessions-list"))
+            .as_str()
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -162,13 +199,35 @@ impl Tool for SessionsListTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        if let Err(error) = self
+            .security
+            .enforce_tool_operation(ToolOperation::Read, "sessions_list")
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(error),
+            });
+        }
+
         #[allow(clippy::cast_possible_truncation)]
         let limit = args
             .get("limit")
             .and_then(serde_json::Value::as_u64)
             .map_or(50, |v| v as usize);
 
-        let metadata = self.backend.list_sessions_with_metadata();
+        // Ownership-filter before the limit so foreign sessions cannot
+        // crowd owned sessions out of a capped listing.
+        let metadata: Vec<_> = self
+            .backend
+            .list_sessions_with_metadata()
+            .into_iter()
+            .filter(|meta| {
+                self.ownership_scope
+                    .as_ref()
+                    .is_none_or(|scope| scope.owns_metadata(meta))
+            })
+            .collect();
 
         if metadata.is_empty() {
             return Ok(ToolResult {
@@ -204,11 +263,28 @@ impl Tool for SessionsListTool {
 pub struct SessionsHistoryTool {
     backend: Arc<dyn SessionBackend>,
     security: Arc<SecurityPolicy>,
+    ownership_scope: Option<SessionOwnershipScope>,
 }
 
 impl SessionsHistoryTool {
     pub fn new(backend: Arc<dyn SessionBackend>, security: Arc<SecurityPolicy>) -> Self {
-        Self { backend, security }
+        Self {
+            backend,
+            security,
+            ownership_scope: None,
+        }
+    }
+
+    pub fn for_agent(
+        backend: Arc<dyn SessionBackend>,
+        security: Arc<SecurityPolicy>,
+        ownership_scope: SessionOwnershipScope,
+    ) -> Self {
+        Self {
+            backend,
+            security,
+            ownership_scope: Some(ownership_scope),
+        }
     }
 }
 
@@ -219,7 +295,9 @@ impl Tool for SessionsHistoryTool {
     }
 
     fn description(&self) -> &str {
-        "Read the message history of a specific session by its session ID. Returns the last N messages."
+        SESSIONS_HISTORY_DESCRIPTION
+            .get_or_init(|| crate::i18n::get_required_tool_string("tool-sessions-history"))
+            .as_str()
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -275,7 +353,21 @@ impl Tool for SessionsHistoryTool {
             .and_then(serde_json::Value::as_u64)
             .map_or(20, |v| v as usize);
 
-        let messages = self.backend.load(session_id);
+        let target_session_key = match &self.ownership_scope {
+            Some(scope) => match scope.authorize(self.backend.as_ref(), session_id) {
+                Ok(key) => key,
+                Err(error) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(error),
+                    });
+                }
+            },
+            None => session_id.to_string(),
+        };
+
+        let messages = self.backend.load(&target_session_key);
 
         if messages.is_empty() {
             return Ok(ToolResult {
@@ -313,11 +405,28 @@ impl Tool for SessionsHistoryTool {
 pub struct SessionsSendTool {
     backend: Arc<dyn SessionBackend>,
     security: Arc<SecurityPolicy>,
+    ownership_scope: Option<SessionOwnershipScope>,
 }
 
 impl SessionsSendTool {
     pub fn new(backend: Arc<dyn SessionBackend>, security: Arc<SecurityPolicy>) -> Self {
-        Self { backend, security }
+        Self {
+            backend,
+            security,
+            ownership_scope: None,
+        }
+    }
+
+    pub fn for_agent(
+        backend: Arc<dyn SessionBackend>,
+        security: Arc<SecurityPolicy>,
+        ownership_scope: SessionOwnershipScope,
+    ) -> Self {
+        Self {
+            backend,
+            security,
+            ownership_scope: Some(ownership_scope),
+        }
     }
 }
 
@@ -328,7 +437,9 @@ impl Tool for SessionsSendTool {
     }
 
     fn description(&self) -> &str {
-        "Send a message to a specific session by its session ID. The message is appended to the session's conversation history as a 'user' message, enabling inter-agent communication."
+        SESSIONS_SEND_DESCRIPTION
+            .get_or_init(|| crate::i18n::get_required_tool_string("tool-sessions-send"))
+            .as_str()
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -397,6 +508,19 @@ impl Tool for SessionsSendTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("Message content must not be empty.".into()),
+            });
+        }
+
+        // Authorize before resolving so a foreign session is denied with an
+        // ownership error rather than written to. Nonexistent sessions pass
+        // authorization untouched and keep the not-found error below.
+        if let Some(scope) = &self.ownership_scope
+            && let Err(error) = scope.authorize(self.backend.as_ref(), session_id)
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(error),
             });
         }
 
@@ -834,6 +958,23 @@ mod tests {
             self.inner.list_sessions()
         }
 
+        fn list_sessions_with_metadata(&self) -> Vec<SessionMetadata> {
+            // Serve injected metadata like the SQLite backend serves its
+            // attribution columns; fall through for unattributed keys.
+            self.inner
+                .list_sessions_with_metadata()
+                .into_iter()
+                .map(|meta| {
+                    self.metadata
+                        .lock()
+                        .unwrap()
+                        .get(&meta.key)
+                        .cloned()
+                        .unwrap_or(meta)
+                })
+                .collect()
+        }
+
         fn clear_messages(&self, session_key: &str) -> std::io::Result<usize> {
             self.inner.clear_messages(session_key)
         }
@@ -934,7 +1075,7 @@ mod tests {
     #[tokio::test]
     async fn list_empty_sessions() {
         let (_tmp, backend) = test_backend();
-        let tool = SessionsListTool::new(backend);
+        let tool = SessionsListTool::new(backend, test_security());
         let result = tool.execute(json!({})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("No active sessions"));
@@ -943,7 +1084,7 @@ mod tests {
     #[tokio::test]
     async fn list_sessions_shows_all() {
         let (_tmp, backend) = seeded_backend();
-        let tool = SessionsListTool::new(backend);
+        let tool = SessionsListTool::new(backend, test_security());
         let result = tool.execute(json!({})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("2 session(s)"));
@@ -954,7 +1095,7 @@ mod tests {
     #[tokio::test]
     async fn list_sessions_respects_limit() {
         let (_tmp, backend) = seeded_backend();
-        let tool = SessionsListTool::new(backend);
+        let tool = SessionsListTool::new(backend, test_security());
         let result = tool.execute(json!({"limit": 1})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("1 session(s)"));
@@ -963,7 +1104,7 @@ mod tests {
     #[tokio::test]
     async fn list_sessions_extracts_channel() {
         let (_tmp, backend) = seeded_backend();
-        let tool = SessionsListTool::new(backend);
+        let tool = SessionsListTool::new(backend, test_security());
         let result = tool.execute(json!({})).await.unwrap();
         assert!(result.output.contains("channel=telegram"));
         assert!(result.output.contains("channel=discord"));
@@ -972,9 +1113,88 @@ mod tests {
     #[test]
     fn list_tool_name_and_schema() {
         let (_tmp, backend) = test_backend();
-        let tool = SessionsListTool::new(backend);
+        let tool = SessionsListTool::new(backend, test_security());
         assert_eq!(tool.name(), "sessions_list");
+        assert!(tool.description().contains("this agent's active"));
         assert!(tool.parameters_schema()["properties"]["limit"].is_object());
+    }
+
+    #[tokio::test]
+    async fn list_scoped_shows_only_owned_sessions() {
+        let (_tmp, backend) = seeded_metadata_backend(vec![
+            session_metadata("telegram__alice", Some("rowan"), None, 2),
+            session_metadata("discord__bob", Some("sable"), None, 1),
+        ]);
+        let tool = SessionsListTool::for_agent(
+            backend,
+            test_security(),
+            SessionOwnershipScope::for_agent("rowan"),
+        );
+
+        let result = tool.execute(json!({})).await.unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("1 session(s)"));
+        assert!(result.output.contains("telegram__alice"));
+        assert!(!result.output.contains("discord__bob"));
+    }
+
+    #[tokio::test]
+    async fn list_scoped_includes_owned_channel_sessions() {
+        let (_tmp, backend) = seeded_metadata_backend(vec![
+            session_metadata("telegram__alice", None, Some("telegram.default"), 2),
+            session_metadata("discord__bob", None, Some("discord.default"), 1),
+        ]);
+        let tool = SessionsListTool::for_agent(
+            backend,
+            test_security(),
+            SessionOwnershipScope::with_channels("rowan", ["telegram.default"]),
+        );
+
+        let result = tool.execute(json!({})).await.unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("telegram__alice"));
+        assert!(!result.output.contains("discord__bob"));
+    }
+
+    #[tokio::test]
+    async fn list_scoped_hides_unattributed_sessions() {
+        // seeded_backend has no metadata rows: every session is legacy.
+        let (_tmp, backend) = seeded_backend();
+        let tool = SessionsListTool::for_agent(
+            backend,
+            test_security(),
+            SessionOwnershipScope::for_agent("rowan"),
+        );
+
+        let result = tool.execute(json!({})).await.unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("No active sessions"));
+    }
+
+    #[tokio::test]
+    async fn list_scoped_filters_before_limit() {
+        // Foreign sessions must not consume limit slots: with limit 1 and
+        // the owned session sorted after the foreign ones, the owned
+        // session must still be the one returned.
+        let (_tmp, backend) = seeded_metadata_backend(vec![
+            session_metadata("telegram__alice", Some("sable"), None, 2),
+            session_metadata("discord__bob", Some("rowan"), None, 1),
+        ]);
+        let tool = SessionsListTool::for_agent(
+            backend,
+            test_security(),
+            SessionOwnershipScope::for_agent("rowan"),
+        );
+
+        let result = tool.execute(json!({"limit": 1})).await.unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("1 session(s)"));
+        assert!(result.output.contains("discord__bob"));
+        assert!(!result.output.contains("telegram__alice"));
     }
 
     // ── SessionsHistoryTool tests ───────────────────────────────────
@@ -1051,6 +1271,148 @@ mod tests {
                 .unwrap()
                 .contains(&json!("session_id"))
         );
+    }
+
+    #[tokio::test]
+    async fn history_scoped_allows_own_agent_session() {
+        let (_tmp, backend) = seeded_metadata_backend(vec![session_metadata(
+            "telegram__alice",
+            Some("rowan"),
+            None,
+            2,
+        )]);
+        let tool = SessionsHistoryTool::for_agent(
+            backend,
+            test_security(),
+            SessionOwnershipScope::for_agent("rowan"),
+        );
+
+        let result = tool
+            .execute(json!({"session_id": "telegram__alice"}))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("[user] Hello from Alice"));
+    }
+
+    #[tokio::test]
+    async fn history_scoped_denies_other_agent_session() {
+        let (_tmp, backend) = seeded_metadata_backend(vec![session_metadata(
+            "telegram__alice",
+            Some("sable"),
+            None,
+            2,
+        )]);
+        let tool = SessionsHistoryTool::for_agent(
+            backend,
+            test_security(),
+            SessionOwnershipScope::for_agent("rowan"),
+        );
+
+        let result = tool
+            .execute(json!({"session_id": "telegram__alice"}))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("owned by agent 'sable'"));
+        assert!(!result.output.contains("Hello from Alice"));
+    }
+
+    #[tokio::test]
+    async fn history_scoped_allows_owned_channel_session() {
+        let (_tmp, backend) = seeded_metadata_backend(vec![session_metadata(
+            "telegram__alice",
+            None,
+            Some("telegram.default"),
+            2,
+        )]);
+        let tool = SessionsHistoryTool::for_agent(
+            backend,
+            test_security(),
+            SessionOwnershipScope::with_channels("rowan", ["telegram.default"]),
+        );
+
+        let result = tool
+            .execute(json!({"session_id": "telegram__alice"}))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("[user] Hello from Alice"));
+    }
+
+    #[tokio::test]
+    async fn history_scoped_denies_unowned_channel_session() {
+        let (_tmp, backend) = seeded_metadata_backend(vec![session_metadata(
+            "telegram__alice",
+            None,
+            Some("telegram.default"),
+            2,
+        )]);
+        let tool = SessionsHistoryTool::for_agent(
+            backend,
+            test_security(),
+            SessionOwnershipScope::with_channels("rowan", ["discord.default"]),
+        );
+
+        let result = tool
+            .execute(json!({"session_id": "telegram__alice"}))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("not owned by agent 'rowan'"));
+    }
+
+    #[tokio::test]
+    async fn history_scoped_denies_legacy_unattributed_session() {
+        let (_tmp, backend) = seeded_backend();
+        let tool = SessionsHistoryTool::for_agent(
+            backend,
+            test_security(),
+            SessionOwnershipScope::for_agent("rowan"),
+        );
+
+        let result = tool
+            .execute(json!({"session_id": "telegram__alice"}))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .unwrap()
+                .contains("no agent or channel ownership metadata")
+        );
+        assert!(!result.output.contains("Hello from Alice"));
+    }
+
+    #[tokio::test]
+    async fn history_scoped_resolves_gateway_prefix_for_owned_session() {
+        let (_tmp, inner) = test_backend();
+        inner
+            .append("gw_operator-1", &ChatMessage::user("dashboard turn"))
+            .unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(MetadataBackend::new(
+            inner,
+            vec![session_metadata("gw_operator-1", Some("rowan"), None, 1)],
+        ));
+        let tool = SessionsHistoryTool::for_agent(
+            backend,
+            test_security(),
+            SessionOwnershipScope::for_agent("rowan"),
+        );
+
+        let result = tool
+            .execute(json!({"session_id": "operator-1"}))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("[user] dashboard turn"));
     }
 
     // ── SessionsSendTool tests ──────────────────────────────────────
@@ -1232,6 +1594,142 @@ mod tests {
                 .unwrap()
                 .contains(&json!("message"))
         );
+    }
+
+    #[tokio::test]
+    async fn send_scoped_allows_own_agent_session() {
+        let (_tmp, backend) = seeded_metadata_backend(vec![session_metadata(
+            "telegram__alice",
+            Some("rowan"),
+            None,
+            2,
+        )]);
+        let tool = SessionsSendTool::for_agent(
+            backend.clone(),
+            test_security(),
+            SessionOwnershipScope::for_agent("rowan"),
+        );
+
+        let result = tool
+            .execute(json!({
+                "session_id": "telegram__alice",
+                "message": "own-session message"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        let messages = backend.load("telegram__alice");
+        assert_eq!(messages.last().unwrap().content, "own-session message");
+    }
+
+    #[tokio::test]
+    async fn send_scoped_denies_other_agent_session() {
+        let (_tmp, backend) = seeded_metadata_backend(vec![session_metadata(
+            "telegram__alice",
+            Some("sable"),
+            None,
+            2,
+        )]);
+        let tool = SessionsSendTool::for_agent(
+            backend.clone(),
+            test_security(),
+            SessionOwnershipScope::for_agent("rowan"),
+        );
+
+        let result = tool
+            .execute(json!({
+                "session_id": "telegram__alice",
+                "message": "injected"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("owned by agent 'sable'"));
+        // The foreign session must not receive the message.
+        assert_eq!(backend.load("telegram__alice").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn send_scoped_allows_owned_channel_session() {
+        let (_tmp, backend) = seeded_metadata_backend(vec![session_metadata(
+            "telegram__alice",
+            None,
+            Some("telegram.default"),
+            2,
+        )]);
+        let tool = SessionsSendTool::for_agent(
+            backend.clone(),
+            test_security(),
+            SessionOwnershipScope::with_channels("rowan", ["telegram.default"]),
+        );
+
+        let result = tool
+            .execute(json!({
+                "session_id": "telegram__alice",
+                "message": "channel-owned message"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert_eq!(backend.load("telegram__alice").len(), 3);
+    }
+
+    #[tokio::test]
+    async fn send_scoped_denies_legacy_unattributed_session() {
+        let (_tmp, backend) = seeded_backend();
+        let tool = SessionsSendTool::for_agent(
+            backend.clone(),
+            test_security(),
+            SessionOwnershipScope::for_agent("rowan"),
+        );
+
+        let result = tool
+            .execute(json!({
+                "session_id": "telegram__alice",
+                "message": "injected"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .unwrap()
+                .contains("no agent or channel ownership metadata")
+        );
+        assert_eq!(backend.load("telegram__alice").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn send_scoped_unknown_session_reports_not_found() {
+        let (_tmp, backend) = test_backend();
+        let tool = SessionsSendTool::for_agent(
+            backend.clone(),
+            test_security(),
+            SessionOwnershipScope::for_agent("rowan"),
+        );
+
+        let result = tool
+            .execute(json!({
+                "session_id": "operator-1",
+                "message": "hello"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("not found")
+        );
+        assert!(backend.load("operator-1").is_empty());
     }
 
     // ── SessionsCurrentTool tests ──────────────────────────────────

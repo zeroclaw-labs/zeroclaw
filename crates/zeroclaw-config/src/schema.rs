@@ -3826,6 +3826,67 @@ pub struct ChannelAliasInfo {
     pub enabled: bool,
 }
 
+/// Canonical config-derived view of agent/channel ownership.
+///
+/// This view owns the binding-mode decision used by both channel collection
+/// and per-agent tool authorization. It deliberately keeps SOP approval-route
+/// liveness out of agent ownership: approval routes may start an adapter, but
+/// do not grant ordinary message or archive access to an agent.
+#[derive(Debug, Clone)]
+pub struct ActiveAgentChannelBindings {
+    enabled_bindings: std::collections::BTreeSet<String>,
+    all_known_bindings: std::collections::BTreeSet<String>,
+    owner_by_channel_key: HashMap<String, String>,
+}
+
+impl ActiveAgentChannelBindings {
+    /// Whether agent binding policy permits collection of `channel_ref`.
+    /// Channel-level `enabled` remains a separate adapter check.
+    #[must_use]
+    pub fn contains(&self, channel_ref: &str) -> bool {
+        self.all_known_bindings.is_empty() || self.enabled_bindings.contains(channel_ref)
+    }
+
+    /// True when bindings exist but every declaring agent is disabled.
+    #[must_use]
+    pub fn disabled_owners_exist(&self) -> bool {
+        !self.all_known_bindings.is_empty() && self.enabled_bindings.is_empty()
+    }
+
+    /// All bindings declared anywhere, including disabled agents.
+    #[must_use]
+    pub fn all_known_bindings(&self) -> &std::collections::BTreeSet<String> {
+        &self.all_known_bindings
+    }
+
+    /// Bindings declared by enabled agents.
+    #[must_use]
+    pub fn enabled_bindings(&self) -> &std::collections::BTreeSet<String> {
+        &self.enabled_bindings
+    }
+
+    /// Active `<type>.<alias>` refs owned by `agent_alias`.
+    #[must_use]
+    pub fn refs_owned_by_agent(&self, agent_alias: &str) -> Vec<String> {
+        let mut refs: Vec<String> = self
+            .owner_by_channel_key
+            .iter()
+            .filter(|(channel_ref, owner)| {
+                channel_ref.contains('.') && owner.as_str() == agent_alias
+            })
+            .map(|(channel_ref, _)| channel_ref.clone())
+            .collect();
+        refs.sort();
+        refs
+    }
+
+    /// Router-ready ownership map, including bare compatibility keys.
+    #[must_use]
+    pub fn owner_by_channel_key(&self) -> HashMap<String, String> {
+        self.owner_by_channel_key.clone()
+    }
+}
+
 impl Config {
     /// Resolve the configured alias values valid for an [`crate::traits::AliasSource`].
     /// Two-tier sources return dotted `<type>.<alias>` keys; flat sources
@@ -4270,6 +4331,104 @@ impl Config {
             .map(|(alias, _)| alias.as_str())
     }
 
+    /// Compute the single agent/channel ownership view consumed by channel
+    /// collection, routing, session tools, and archive tools.
+    ///
+    /// Explicit binding mode admits only refs declared by enabled agents.
+    /// Legacy mode (no bindings anywhere) assigns every enabled configured
+    /// channel to the deterministic runtime fallback agent. Disabled channel
+    /// blocks never enter the ownership map in either mode.
+    #[must_use]
+    pub fn active_agent_channel_bindings(&self) -> ActiveAgentChannelBindings {
+        use std::collections::BTreeSet;
+
+        let all_known_bindings: BTreeSet<String> = self
+            .agents
+            .values()
+            .flat_map(|agent| {
+                agent
+                    .channels
+                    .iter()
+                    .map(|channel| channel.as_str().to_string())
+            })
+            .collect();
+        let enabled_bindings: BTreeSet<String> = self
+            .agents
+            .values()
+            .filter(|agent| agent.enabled)
+            .flat_map(|agent| {
+                agent
+                    .channels
+                    .iter()
+                    .map(|channel| channel.as_str().to_string())
+            })
+            .collect();
+        let enabled_channel_refs: BTreeSet<String> = self
+            .channels_by_alias()
+            .into_iter()
+            .filter(|channel| channel.enabled)
+            .map(|channel| format!("{}.{}", channel.channel_type, channel.alias))
+            .collect();
+
+        let mut owner_by_channel_key = HashMap::new();
+        let mut insert_owner = |channel_ref: &str, owner: &str| {
+            owner_by_channel_key.insert(channel_ref.to_string(), owner.to_string());
+            if let Some((bare, _)) = channel_ref.split_once('.') {
+                owner_by_channel_key
+                    .entry(bare.to_string())
+                    .or_insert_with(|| owner.to_string());
+            }
+        };
+
+        if all_known_bindings.is_empty() {
+            let fallback_owner = self
+                .resolved_runtime_agent_alias()
+                .filter(|alias| self.agents.get(*alias).is_some_and(|agent| agent.enabled))
+                .map(str::to_string)
+                .or_else(|| {
+                    self.agents
+                        .iter()
+                        .filter(|(_, agent)| agent.enabled)
+                        .map(|(alias, _)| alias.clone())
+                        .min()
+                });
+            if let Some(owner) = fallback_owner {
+                for channel_ref in &enabled_channel_refs {
+                    insert_owner(channel_ref, &owner);
+                }
+            }
+        } else {
+            let mut enabled_agents: Vec<_> = self
+                .agents
+                .iter()
+                .filter(|(_, agent)| agent.enabled)
+                .collect();
+            enabled_agents.sort_by_key(|(alias, _)| alias.as_str());
+            for (owner, agent) in enabled_agents {
+                for channel_ref in &agent.channels {
+                    let channel_ref = channel_ref.as_str();
+                    if enabled_channel_refs.contains(channel_ref) {
+                        insert_owner(channel_ref, owner);
+                    }
+                }
+            }
+        }
+
+        ActiveAgentChannelBindings {
+            enabled_bindings,
+            all_known_bindings,
+            owner_by_channel_key,
+        }
+    }
+
+    /// Active channel refs owned by `agent_alias`, derived from the canonical
+    /// binding view used by the router.
+    #[must_use]
+    pub fn channel_refs_owned_by_agent(&self, agent_alias: &str) -> Vec<String> {
+        self.active_agent_channel_bindings()
+            .refs_owned_by_agent(agent_alias)
+    }
+
     /// Workspace dir a channel's inbound-media handler writes into. Resolves
     /// the channel's owning agent and returns `<install>/agents/<alias>/workspace/`;
     /// falls back to `data_dir` for orphan channels (no owning agent enabled).
@@ -4279,38 +4438,42 @@ impl Config {
             .map_or_else(|| self.data_dir.clone(), |a| self.agent_workspace_dir(a))
     }
 
-    /// Schema-walk: every populated `[channels.<type>.<alias>]` block.
-    /// Type names come from the `prop_fields()` enumeration (kebab as the
-    /// macro emits them) so adding a new channel type via the macro
-    /// surfaces here without touching this code. Alias keys are HashMap
-    /// keys; not kebab-converted.
+    /// On-demand view of every populated `[channels.<type>.<alias>]` block.
+    ///
+    /// The typed `ChannelsConfig` is serialized only to walk its map-shaped
+    /// fields generically; the returned enabled bit therefore comes from the
+    /// live config value rather than schema metadata. Adding a new channel map
+    /// surfaces here without a parallel channel-type lookup table.
     #[must_use]
     pub fn channels_by_alias(&self) -> Vec<ChannelAliasInfo> {
-        use std::collections::BTreeMap;
-        let mut seen: BTreeMap<(String, String), bool> = BTreeMap::new();
-        for field in self.prop_fields() {
-            let parts: Vec<&str> = field.name.split('.').collect();
-            if parts.len() < 4 || parts[0] != "channels" {
+        let Ok(serde_json::Value::Object(channel_types)) = serde_json::to_value(&self.channels)
+        else {
+            return Vec::new();
+        };
+        let mut aliases = Vec::new();
+        for (channel_type, value) in channel_types {
+            let Some(alias_map) = value.as_object() else {
                 continue;
-            }
-            let key = (parts[1].to_string(), parts[2].to_string());
-            let entry = seen.entry(key).or_insert(false);
-            if parts.len() == 4 && parts[3] == "enabled" {
-                *entry = field.display_value == "true";
-            }
-        }
-        seen.into_iter()
-            .map(|((channel_type, alias), enabled)| {
+            };
+            for (alias, value) in alias_map {
+                let Some(enabled) = value.get("enabled").and_then(serde_json::Value::as_bool)
+                else {
+                    continue;
+                };
                 let composite = format!("{channel_type}.{alias}");
                 let owning_agent = self.agent_for_channel(&composite).map(str::to_string);
-                ChannelAliasInfo {
-                    channel_type,
-                    alias,
+                aliases.push(ChannelAliasInfo {
+                    channel_type: channel_type.clone(),
+                    alias: alias.clone(),
                     owning_agent,
                     enabled,
-                }
-            })
-            .collect()
+                });
+            }
+        }
+        aliases.sort_by(|left, right| {
+            (&left.channel_type, &left.alias).cmp(&(&right.channel_type, &right.alias))
+        });
+        aliases
     }
 
     /// Reverse-lookup the agent alias that owns a declaratively-configured
@@ -38677,6 +38840,194 @@ model_provider = \"ollama.default\"
         let from_empty: BuiltinHooksConfig = toml::from_str("").unwrap();
         let default = BuiltinHooksConfig::default();
         assert_eq!(from_empty.command_logger, default.command_logger);
+    }
+
+    // ── Canonical active agent/channel ownership view shared by routing and
+    // per-agent tool scoping (sessions_*, discord_search). ──
+
+    fn agent_with_channels(enabled: bool, channels: &[&str]) -> AliasedAgentConfig {
+        AliasedAgentConfig {
+            enabled,
+            channels: channels
+                .iter()
+                .map(|c| crate::providers::ChannelRef::new(*c))
+                .collect(),
+            ..AliasedAgentConfig::default()
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn channel_refs_owned_by_agent_declared_mode_returns_own_bindings_only() {
+        let mut config = Config::default();
+        config.agents.insert(
+            "rowan".to_string(),
+            agent_with_channels(true, &["telegram.main", "discord.ops"]),
+        );
+        config.agents.insert(
+            "sable".to_string(),
+            agent_with_channels(true, &["telegram.secondary"]),
+        );
+        config.channels.telegram.insert(
+            "main".to_string(),
+            TelegramConfig {
+                enabled: true,
+                ..TelegramConfig::default()
+            },
+        );
+        config.channels.telegram.insert(
+            "secondary".to_string(),
+            TelegramConfig {
+                enabled: true,
+                ..TelegramConfig::default()
+            },
+        );
+        config.channels.discord.insert(
+            "ops".to_string(),
+            DiscordConfig {
+                enabled: true,
+                ..DiscordConfig::default()
+            },
+        );
+
+        let rowan = config.channel_refs_owned_by_agent("rowan");
+        assert_eq!(rowan, vec!["discord.ops", "telegram.main"]);
+        assert_eq!(
+            config.channel_refs_owned_by_agent("sable"),
+            vec!["telegram.secondary"]
+        );
+        assert!(config.channel_refs_owned_by_agent("missing").is_empty());
+    }
+
+    #[::core::prelude::v1::test]
+    fn channel_refs_owned_by_agent_declared_mode_disabled_agent_owns_nothing() {
+        let mut config = Config::default();
+        config.agents.insert(
+            "rowan".to_string(),
+            agent_with_channels(false, &["telegram.main"]),
+        );
+        config.agents.insert(
+            "sable".to_string(),
+            agent_with_channels(true, &["slack.hq"]),
+        );
+        config.channels.telegram.insert(
+            "main".to_string(),
+            TelegramConfig {
+                enabled: true,
+                ..TelegramConfig::default()
+            },
+        );
+
+        assert!(config.channel_refs_owned_by_agent("rowan").is_empty());
+    }
+
+    #[::core::prelude::v1::test]
+    fn channel_refs_owned_by_agent_legacy_mode_fallback_owner_gets_all_channels() {
+        let mut config = Config::default();
+        // No agent declares any binding -> true legacy mode.
+        config
+            .agents
+            .insert("zeta".to_string(), agent_with_channels(true, &[]));
+        config
+            .agents
+            .insert("alpha".to_string(), agent_with_channels(true, &[]));
+        config.channels.telegram.insert(
+            "main".to_string(),
+            TelegramConfig {
+                enabled: true,
+                ..TelegramConfig::default()
+            },
+        );
+        config.channels.discord.insert(
+            "ops".to_string(),
+            DiscordConfig {
+                enabled: true,
+                ..DiscordConfig::default()
+            },
+        );
+
+        // Lexicographically first enabled alias wins when no `default` agent.
+        let alpha = config.channel_refs_owned_by_agent("alpha");
+        assert!(alpha.contains(&"telegram.main".to_string()), "{alpha:?}");
+        assert!(alpha.contains(&"discord.ops".to_string()), "{alpha:?}");
+        assert!(config.channel_refs_owned_by_agent("zeta").is_empty());
+    }
+
+    #[::core::prelude::v1::test]
+    fn channel_refs_owned_by_agent_legacy_mode_prefers_enabled_default_agent() {
+        let mut config = Config::default();
+        config
+            .agents
+            .insert("alpha".to_string(), agent_with_channels(true, &[]));
+        config
+            .agents
+            .insert("default".to_string(), agent_with_channels(true, &[]));
+        config.channels.telegram.insert(
+            "main".to_string(),
+            TelegramConfig {
+                enabled: true,
+                ..TelegramConfig::default()
+            },
+        );
+
+        assert_eq!(
+            config.channel_refs_owned_by_agent("default"),
+            vec!["telegram.main"]
+        );
+        assert!(config.channel_refs_owned_by_agent("alpha").is_empty());
+    }
+
+    #[::core::prelude::v1::test]
+    fn channel_refs_owned_by_agent_legacy_mode_skips_disabled_default_agent() {
+        let mut config = Config::default();
+        config
+            .agents
+            .insert("alpha".to_string(), agent_with_channels(true, &[]));
+        config
+            .agents
+            .insert("default".to_string(), agent_with_channels(false, &[]));
+        config.channels.telegram.insert(
+            "main".to_string(),
+            TelegramConfig {
+                enabled: true,
+                ..TelegramConfig::default()
+            },
+        );
+
+        assert_eq!(
+            config.channel_refs_owned_by_agent("alpha"),
+            vec!["telegram.main"]
+        );
+        assert!(config.channel_refs_owned_by_agent("default").is_empty());
+    }
+
+    #[::core::prelude::v1::test]
+    fn active_channel_ownership_excludes_disabled_channels_for_router_and_tools() {
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "rowan".to_string(),
+            agent_with_channels(true, &["discord.live", "discord.disabled"]),
+        );
+        config.channels.discord.insert(
+            "live".to_string(),
+            DiscordConfig {
+                enabled: true,
+                ..DiscordConfig::default()
+            },
+        );
+        config
+            .channels
+            .discord
+            .insert("disabled".to_string(), DiscordConfig::default());
+
+        let bindings = config.active_agent_channel_bindings();
+        assert_eq!(bindings.refs_owned_by_agent("rowan"), vec!["discord.live"]);
+        let owners = bindings.owner_by_channel_key();
+        assert_eq!(
+            owners.get("discord.live").map(String::as_str),
+            Some("rowan")
+        );
+        assert!(!owners.contains_key("discord.disabled"));
     }
 
     #[test]
