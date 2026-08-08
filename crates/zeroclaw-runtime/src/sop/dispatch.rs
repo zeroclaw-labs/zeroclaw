@@ -815,7 +815,7 @@ async fn dispatch_sop_event_filtered(
             let mut remaining = reservations.into_iter();
             for reservation in remaining.by_ref() {
                 let sop_name = reservation.sop_name().to_string();
-                match eng.activate_reserved_run(reservation, event.clone()) {
+                match eng.activate_reserved_run(reservation, event.clone(), None) {
                     Ok(action) => activated.push((sop_name, action)),
                     Err(e) => {
                         activation_failure = Some((sop_name, e.to_string()));
