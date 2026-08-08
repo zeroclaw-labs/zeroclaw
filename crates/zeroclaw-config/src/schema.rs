@@ -11753,7 +11753,11 @@ pub fn default_auto_approve() -> Vec<String> {
     vec![
         "file_read".into(),
         "memory_recall".into(),
-        "web_search_tool".into(),
+        // `web_research` replaces raw `web_search_tool` here: the raw tool is
+        // no longer registered into the main agent loop by default, so
+        // auto-approving it would grant nothing. Operators who resurrect the
+        // raw tool via `allowed_tools` can add it back to `auto_approve`.
+        "web_research".into(),
         "web_fetch".into(),
         "calculator".into(),
         "glob_search".into(),
@@ -26224,6 +26228,58 @@ auto_approve = ["my_custom_tool", "another_tool"]
     async fn default_auto_approve_includes_tool_search() {
         let defaults = default_auto_approve();
         assert!(defaults.contains(&"tool_search".to_string()));
+    }
+
+    /// Web search is reached through the `web_research` delegate, so that is
+    /// what gets auto-approved. The raw `web_search_tool` is no longer
+    /// registered into the main loop by default, so auto-approving it would
+    /// grant nothing — and leaving it here would imply a surface that is gone.
+    #[test]
+    async fn default_auto_approve_has_web_research_and_not_raw_web_search() {
+        let defaults = default_auto_approve();
+        assert!(
+            defaults.contains(&"web_research".to_string()),
+            "web_research must be auto-approved by default, got {defaults:?}"
+        );
+        assert!(
+            !defaults.contains(&"web_search_tool".to_string()),
+            "raw web_search_tool must not be auto-approved by default, got {defaults:?}"
+        );
+    }
+
+    /// The delegate reaches the network the same way the raw tool did, so
+    /// `web_fetch` must keep its auto-approve entry: dropping it would make
+    /// every page read inside a research run prompt for approval.
+    #[test]
+    async fn default_auto_approve_still_includes_web_fetch() {
+        assert!(default_auto_approve().contains(&"web_fetch".to_string()));
+    }
+
+    /// A config that pre-dates the demotion still lists `web_search_tool`.
+    /// The merge must leave that entry alone (operators can resurrect the raw
+    /// tool via `allowed_tools`) while adding `web_research` alongside it.
+    #[test]
+    async fn legacy_auto_approve_entry_survives_the_web_research_merge() {
+        let raw = r#"
+default_temperature = 0.7
+
+[risk_profiles.default]
+auto_approve = ["web_search_tool"]
+"#;
+        let parsed = parse_test_config(raw);
+        let profile = parsed.risk_profiles.get("default").unwrap();
+        assert!(
+            profile
+                .auto_approve
+                .contains(&"web_search_tool".to_string()),
+            "a user-supplied legacy entry must be preserved, got {:?}",
+            profile.auto_approve
+        );
+        assert!(
+            profile.auto_approve.contains(&"web_research".to_string()),
+            "the new default must be merged in, got {:?}",
+            profile.auto_approve
+        );
     }
 
     /// Regression test: empty auto_approve still gets defaults merged.

@@ -15752,6 +15752,19 @@ Let me check the result."#;
         );
     }
 
+    /// Characterization of the unified `process_message` built-in filter
+    /// (replaces the deleted `filter_channel_builtin_tools` safe-defaults tests). `process_message` now routes its real eager registry through
+    /// `ScopedToolRegistry::assemble` with `caller_allowed: None` - the plain
+    /// `allowed_tools`/`excluded_tools` policy filter. At non-Full autonomy a
+    /// canonical read-only default (`web_fetch`) that is NOT in a
+    /// restrictive `allowed_tools` is now DROPPED, where the removed admit
+    /// retained it. This positively pins the narrowing this path lands: on the
+    /// gateway-chat and peer paths `allowed_tools` is honored strictly.
+    ///
+    /// The probe was `web_search_tool` until that tool was demoted behind the
+    /// `web_research` delegate and stopped being registered by default;
+    /// `web_fetch` is the equivalent read-only `default_auto_approve` member
+    /// still present in the eager registry.
     #[tokio::test]
     async fn process_message_seam_narrows_safe_defaults_outside_allowed_tools() {
         let config = zeroclaw_config::schema::Config::default();
@@ -15786,8 +15799,8 @@ Let me check the result."#;
 
         let before = tool_names(&built.tools);
         assert!(
-            before.contains(&"web_search_tool"),
-            "precondition: web_search_tool in the eager registry, got {before:?}"
+            before.contains(&"web_fetch"),
+            "precondition: web_fetch in the eager registry, got {before:?}"
         );
         assert!(
             before.contains(&"shell"),
@@ -15825,7 +15838,7 @@ Let me check the result."#;
 
         let filtered: Vec<&str> = assembled.registry.iter().map(|t| t.name()).collect();
         assert!(
-            !filtered.contains(&"web_search_tool"),
+            !filtered.contains(&"web_fetch"),
             "unified filter must DROP a read-only default outside allowed_tools \
              (the removed safe-defaults admit retained it), got {filtered:?}"
         );

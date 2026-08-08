@@ -26,7 +26,8 @@ A minimal build ships with:
 | `glob_search` | List files matching a glob pattern within the workspace |
 | `content_search` | Search file contents by regex within the workspace (ripgrep with grep fallback) |
 | `http_request` | HTTP GET/POST/PUT/DELETE/PATCH/HEAD/OPTIONS to allowlisted domains |
-| `web_search_tool` | Web search. Provider is configurable: DuckDuckGo (default, no key), Brave, Tavily, SearXNG, Jina, or Bocha |
+| `web_research` | Research a question on the live web and return a written briefing ending in a `Sources:` list. A bounded sub-agent decomposes the question, searches, reads the pages worth reading, and distills the result, so raw search output never enters the main conversation. Registered whenever `[web_search] enabled = true`. Parameters: `question` (required), `url` (optional starting page) |
+| `web_search_tool` | Raw web search. **Not registered by default**; it is scoped inside `web_research` (see below). Provider is configurable: DuckDuckGo (default, no key), Brave, Tavily, SearXNG, Jina, or Bocha |
 | `web_fetch` | Fetch a page and return clean plain text |
 | `browser` | Headless-browser automation. See [Browser automation](./browser.md) |
 | `memory_recall` | Search long-term memory for relevant facts, preferences, or context |
@@ -51,6 +52,64 @@ Conditionally registered:
 | Hardware probes | `--features hardware`: GPIO, I2C, SPI reads/writes |
 | `sop_*` tools | Registered when `sop.sops_dir` is configured: run and inspect SOPs |
 | `discord_search` | Registered when a Discord alias has `archive` enabled |
+
+## Web research and the demoted `web_search_tool`
+
+Web search reaches the agent through the **`web_research`** delegate rather than
+as a raw search tool. The main agent asks a question; a bounded sub-agent runs
+search → fetch → distill against whatever backend `[web_search]` configures, and
+returns a summary with a mandatory `Sources:` list.
+
+The point is context hygiene: raw search-engine result text (titles, blurbs,
+SEO noise, and every URL on the results page) no longer lands in the primary
+context window. Only the distilled briefing does.
+
+Your `[web_search]` configuration is unchanged. It still selects the provider
+and holds the keys; it configures the *backend*, not the surface. Setting
+`[web_search] enabled = true` now registers `web_research`.
+
+The sub-agent's scope is deliberately narrow: search and `web_fetch` only, no
+shell and no write tools. Every run is capped on two axes: at most 8 tool
+calls and a hard wall-clock ceiling that bounds nested tool calls as well as
+model calls. Hitting either returns a best-effort partial briefing, marked
+`[partial: outcome=...]`, with whatever sources were gathered, rather than an
+error.
+
+Three further properties are worth knowing:
+
+- **The denylist reaches inside.** `excluded_tools` applies to the sub-agent's
+  scope exactly as it applies to a registered tool, so excluding `web_fetch` or
+  `web_search_tool` degrades a research run to fetch-only, search-only, or a
+  refusal. Approving a `web_research` call covers the read-only searches and
+  fetches inside it; they do not prompt separately.
+- **Delegation is metered.** The sub-agent's model calls are checked against
+  the shared spend budget before each request and recorded against it after,
+  so a research run cannot spend past a limit that would have stopped the main
+  agent loop.
+- **`Sources:` means retrieved.** The list is rebuilt from pages the run
+  actually fetched successfully. A URL the model cites that was not retrieved
+  is listed separately under `Model-cited (unverified):` rather than being
+  silently kept or dropped.
+
+Both scoped tools are read-only, so `web_research` is available at the
+`readonly` autonomy level, which is what keeps [web search permitted in
+`readonly`](../security/autonomy.md) now that the raw tool is scoped behind the
+delegate.
+
+### Getting the raw tool back
+
+`allowed_tools` can only narrow the registry, so the raw tool is registered
+exactly when you name it explicitly:
+
+```toml
+[risk_profiles.default]
+allowed_tools = ["web_search_tool", "web_research", "file_read"]
+auto_approve = ["web_search_tool", "web_research", "file_read"]
+```
+
+Naming `web_search_tool` in `allowed_tools` puts it back in the main registry
+alongside `web_research`. Note that an `allowed_tools` list is an allowlist for
+*everything*; listing only these three tools restricts the agent to them.
 
 ## Extension protocols
 

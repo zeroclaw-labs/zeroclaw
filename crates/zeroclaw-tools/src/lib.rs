@@ -84,6 +84,7 @@ pub mod text_browser;
 pub mod tool_search;
 pub mod weather_tool;
 pub mod web_fetch;
+pub mod web_research;
 pub mod web_search_provider_routing;
 pub mod web_search_tool;
 pub mod wrappers;
