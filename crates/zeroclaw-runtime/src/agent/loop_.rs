@@ -15028,6 +15028,109 @@ Let me check the result."#;
         );
     }
 
+    /// Real-boundary regression: `maybe_run_skill_review` builds its own
+    /// fork history from the `history` argument and, after the fork's tool
+    /// loop returns, reads it back for the summary. The fork's tool loop can
+    /// trim that working history IN PLACE mid-fork (via the reported-token-
+    /// budget path in `turn/mod.rs::enforce_reported_budget`, which runs
+    /// right after a tool round is appended). A bulk seed history plus a
+    /// tiny `max_context_tokens` against a huge scripted reported-token
+    /// count forces exactly that: the fork's working history shrinks below
+    /// the length it had before the loop ran. Reaching the end of this
+    /// `.await` without panicking is the assertion — the old code captured
+    /// that pre-loop length and sliced the (now shorter) history with it,
+    /// which panics with a slice-out-of-range message.
+    #[tokio::test]
+    async fn skill_review_fork_survives_history_trim_without_panic() {
+        use crate::observability::noop::NoopObserver;
+
+        // Three big user/assistant pairs plus one completed tool call (so
+        // `should_trigger` at threshold 1 fires). The old code captured
+        // `history.len()` == 8 here as `fork_start_len` before the fork's
+        // loop ran.
+        let big = "x".repeat(2000);
+        let history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user(format!("turn1 {big}")),
+            ChatMessage::assistant("a1".to_string()),
+            ChatMessage::user(format!("turn2 {big}")),
+            ChatMessage::assistant("a2".to_string()),
+            ChatMessage::user(format!("turn3 {big}")),
+            ChatMessage::assistant("a3".to_string()),
+            ChatMessage {
+                role: "tool".to_string(),
+                content: "ok".to_string(),
+            },
+        ];
+
+        // Turn 1: one native tool call against a real review tool, reporting
+        // vastly more input tokens than the fork's configured budget so
+        // `enforce_reported_budget` trims the fork's working history in
+        // place right after the tool round lands. Turn 2: a plain
+        // final-text response that ends the fork.
+        let model_provider = ScriptedModelProvider {
+            responses: Arc::new(Mutex::new(VecDeque::from([
+                ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call-1".to_string(),
+                        name: "skills_list".to_string(),
+                        arguments: "{}".to_string(),
+                        extra_content: None,
+                    }],
+                    usage: Some(zeroclaw_providers::traits::TokenUsage {
+                        input_tokens: Some(1_000_000),
+                        output_tokens: Some(10),
+                        cached_input_tokens: None,
+                    }),
+                    reasoning_content: None,
+                },
+                ChatResponse {
+                    text: Some("Nothing to save.".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                },
+            ]))),
+            capabilities: ProviderCapabilities {
+                native_tool_calling: true,
+                ..ProviderCapabilities::default()
+            },
+        };
+
+        let observer = NoopObserver;
+        let workspace = tempfile::TempDir::new().unwrap();
+        let review_config = zeroclaw_config::schema::SkillImprovementConfig {
+            enabled: true,
+            cooldown_secs: 0,
+            nudge_interval_iterations: 1,
+            max_review_iterations: 2,
+        };
+
+        crate::skills::review::maybe_run_skill_review(
+            None,
+            workspace.path().to_path_buf(),
+            review_config,
+            false,
+            history,
+            Vec::new(),
+            &model_provider,
+            "mock-provider",
+            "mock-model",
+            &observer,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            &zeroclaw_config::schema::PacingConfig::default(),
+            0,
+            // max_context_tokens: tiny against the scripted 1_000_000
+            // reported input tokens, so the tool round trips the
+            // reported-budget trim mid-fork.
+            100,
+            None,
+            None, // agent_alias — no parent alias in the review-fork test fixture
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn reflected_skill_creation_records_cost_usage_under_parent_scope() {
         use super::{TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext};

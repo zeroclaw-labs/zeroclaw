@@ -71,11 +71,17 @@ pub async fn maybe_run_skill_review(
     let review_input = build_review_input(&failed_slugs);
 
     let mut review_history = history;
-    let fork_start_len = review_history.len();
     review_history.push(ChatMessage::user(&review_input));
 
     let receipts: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let turn_id = uuid::Uuid::new_v4().to_string();
+
+    // The tool loop can compact/trim `review_history` in place (hard-cap and
+    // reported-budget trimming both shrink the history vec during the loop).
+    // A slice taken from a pre-loop length would then be out of range, so we
+    // capture the fork's appended messages into a separate, append-only vec
+    // instead of slicing `review_history` after the fact.
+    let mut fork_messages: Vec<ChatMessage> = Vec::new();
 
     let result = SKILL_REVIEW_ACTIVE
         .scope((), async {
@@ -126,7 +132,7 @@ pub async fn maybe_run_skill_review(
                 collected_receipts: Some(&receipts),
                 event_tx: None,
                 steering: None,
-                new_messages_out: None,
+                new_messages_out: Some(&mut fork_messages),
                 image_cache: None,
                 // Phase 1: stamp Internal/Trusted. Per-transport
                 // stamping lands in a later phase.
@@ -142,8 +148,7 @@ pub async fn maybe_run_skill_review(
 
     match result {
         Ok(final_text) => {
-            let summary =
-                summarize_actions(&receipts, &review_history[fork_start_len..], &final_text);
+            let summary = summarize_actions(&receipts, &fork_messages, &final_text);
             if !summary.is_empty() {
                 println!(
                     "{}",
