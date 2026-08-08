@@ -35566,6 +35566,116 @@ allowed_users = []
         );
     }
 
+    /// Regression: a bare `zeroclaw config init` (no
+    /// section — `init_defaults(None)`) must produce a config.toml that
+    /// strictly reloads. Before the fix, `init_defaults` unconditionally
+    /// scaffolded every `#[nested] Option<T>` field from
+    /// `T::default()`, including structs with a required non-defaulted
+    /// `String` leaf (`GatewayTlsConfig::cert_path`/`key_path`,
+    /// `LocalWhisperConfig::url`, `OpenVpnTunnelConfig::config_file`).
+    /// Those leaves default to `""`, which `prune_empty_leaves` strips
+    /// on save, leaving a partial sub-table (kept alive by a non-empty
+    /// sibling like `enabled`/`max_audio_bytes`/`connect_timeout_secs`)
+    /// that fails strict deserialization with `missing field ...` — the
+    /// exact failure `zeroclaw config migrate` hits and exits 1 on.
+    ///
+    /// Mirrors the production boundary of
+    /// `local_whisper_config_init_preserves_transcription_section`
+    /// (crates/zeroclaw-channels/src/transcription.rs) but drives a bare
+    /// full init instead of an exact-prefix one.
+    #[test]
+    async fn config_init_full_produces_strict_roundtrippable_config() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        // Pre-create config.toml (mirrors `load_or_init`) so `save_dirty`
+        // below takes the incremental existing-document path, not the
+        // full-save fallback for a missing file.
+        Config {
+            config_path: config_path.clone(),
+            ..Config::default()
+        }
+        .save()
+        .await
+        .unwrap();
+
+        // The real scaffold: bare `config init`, no section targeted —
+        // the exact call `ConfigCommands::Init { section: None }` makes.
+        let mut config = Config {
+            config_path: config_path.clone(),
+            ..Config::default()
+        };
+        let initialized = config.init_defaults(None);
+
+        // The three required-field sections must be omitted by a bare
+        // init (that is the fix); the fully-defaulted siblings must still
+        // be scaffolded. Asserting both sides here catches an over-broad
+        // `init_requires_explicit_config` predicate that skips too much —
+        // which the strict-reload assert below would otherwise pass
+        // silently (a missing section only looks "even more absent").
+        assert!(
+            !initialized.iter().any(|s| {
+                *s == "gateway.tls" || *s == "transcription.local_whisper" || *s == "tunnel.openvpn"
+            }),
+            "required-field sections must be omitted by bare init, got: {initialized:?}"
+        );
+        assert!(
+            initialized.contains(&"transcription.openai")
+                && initialized.contains(&"tunnel.tailscale"),
+            "fully-defaulted sibling sections must still scaffold on bare init, got: {initialized:?}"
+        );
+
+        for s in &initialized {
+            config.mark_dirty(s);
+        }
+        config.save_dirty().await.unwrap();
+
+        let contents = std::fs::read_to_string(&config_path).unwrap();
+
+        // STRICT assert — this is what `config migrate` runs; it exits 1
+        // today on unpatched code.
+        assert!(
+            crate::migration::migrate_to_current(&contents).is_ok(),
+            "fresh full `config init` must strictly deserialize; err: {:?}",
+            crate::migration::migrate_to_current(&contents).err()
+        );
+
+        // RESILIENT assert — even the salvage path must not have to drop
+        // an entire parent section on a fresh, untouched init.
+        let salv = crate::migration::migrate_to_current_salvaged(&contents);
+        assert!(
+            !salv
+                .dropped
+                .iter()
+                .any(|p| p == "gateway" || p == "transcription" || p == "tunnel"),
+            "no parent section may be salvage-reset on a fresh init, dropped: {:?}",
+            salv.dropped
+        );
+    }
+
+    /// The gate's other side: explicitly targeting a required-field
+    /// section (as `zeroclaw config init <section>` and the dashboard
+    /// section picker both do) must still scaffold it so the operator can
+    /// fill in the required fields. `transcription.local_whisper` already
+    /// has this coverage via the channels-crate test
+    /// `local_whisper_config_init_preserves_transcription_section`; this
+    /// locks the same behavior for the two remaining sections.
+    #[test]
+    async fn config_init_explicit_prefix_still_scaffolds_required_field_sections() {
+        for section in ["gateway.tls", "tunnel.openvpn"] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let mut config = Config {
+                config_path: tmp.path().join("config.toml"),
+                ..Config::default()
+            };
+            let initialized = config.init_defaults(Some(section));
+            assert!(
+                initialized.contains(&section),
+                "explicit `config init {section}` must scaffold the section, got: {initialized:?}"
+            );
+        }
+    }
+
     #[test]
     async fn nested_get_set_prop_traverses_config_tree() {
         let mut config = Config::default();

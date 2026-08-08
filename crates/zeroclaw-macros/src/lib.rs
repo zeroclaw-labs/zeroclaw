@@ -25,8 +25,23 @@ fn has_serde_flatten(field: &syn::Field) -> bool {
     has_serde_meta(field, "flatten")
 }
 
+/// Check if any `#[serde(...)]` attribute on the field contains `default`
+/// (bare `default` or `default = "fn"`).
+fn has_serde_default(field: &syn::Field) -> bool {
+    has_serde_meta(field, "default")
+}
+
 fn has_serde_meta(field: &syn::Field, ident: &str) -> bool {
-    for attr in &field.attrs {
+    attrs_have_serde_meta(&field.attrs, ident)
+}
+
+/// Check if any `#[serde(...)]` attribute in `attrs` contains `ident`
+/// (bare `ident` or `ident = "fn"`). Shared by field-level checks
+/// (`has_serde_meta`) and struct/container-level checks (e.g. a struct
+/// carrying `#[serde(default)]` on itself, which makes all its fields
+/// optional at deserialize time regardless of their own attributes).
+fn attrs_have_serde_meta(attrs: &[syn::Attribute], ident: &str) -> bool {
+    for attr in attrs {
         if attr.path().is_ident("serde")
             && let Ok(nested) = attr.parse_args_with(
                 syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated,
@@ -1166,7 +1181,11 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                             let dominated = prefix.map_or(true, |p| {
                                 child_prefix.starts_with(p) || p.starts_with(child_prefix)
                             });
-                            if dominated {
+                            let explicitly_targeted = prefix.is_some_and(|p| p.starts_with(child_prefix));
+                            if dominated
+                                && (explicitly_targeted
+                                    || !<#inner_ty_tokens>::init_requires_explicit_config())
+                            {
                                 let mut probe = <#inner_ty_tokens as Default>::default();
                                 let child_results = probe.init_defaults(prefix);
                                 initialized.push(child_prefix);
@@ -2025,11 +2044,46 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
 
     let prefix_lit = &prefix;
 
+    // True when this struct has a required leaf field that would break a
+    // scaffolded round-trip: a non-`#[nested]`, non-`Option<_>` field with
+    // no `#[serde(skip...)]`/`#[serde(flatten)]`/`#[serde(default...)]`,
+    // and the struct itself doesn't carry a container-level
+    // `#[serde(default)]` (which would make every field optional at
+    // deserialize time regardless of the field's own attributes).
+    //
+    // Used by `init_defaults` to gate whether a `#[nested] Option<T>`
+    // field may be scaffolded from `T::default()` when the caller did not
+    // explicitly target this section: scaffolding a struct like this
+    // fills the required field with its Rust `Default` (typically `""`
+    // for `String`), which `prune_empty_leaves` then strips on save,
+    // leaving a partial sub-table that fails strict reload. The scaffold
+    // site that consumes this flag is the `init_defaults_ops` gate above.
+    let init_requires_explicit_config: bool = !attrs_have_serde_meta(&input.attrs, "default")
+        && fields.iter().any(|f| {
+            !has_attr(f, "nested")
+                && !has_serde_skip(f)
+                && !has_serde_flatten(f)
+                && extract_option_inner(&f.ty).is_none()
+                && !has_serde_default(f)
+        });
+
     let expanded = quote! {
         impl #struct_name {
             /// Returns the `#[prefix]` value for this Configurable struct.
             pub fn configurable_prefix() -> &'static str {
                 #prefix_lit
+            }
+
+            /// True when this struct has a required leaf field that a
+            /// bare/ancestor-prefix `init_defaults` scaffold must not
+            /// materialize (it would fill the field with its Rust
+            /// `Default`, which `prune_empty_leaves` then strips on save,
+            /// leaving a partial sub-table that fails strict reload).
+            /// Explicitly targeting this section (or a descendant of it)
+            /// still scaffolds regardless of this flag, so the section can
+            /// be materialized for the operator to fill in.
+            pub fn init_requires_explicit_config() -> bool {
+                #init_requires_explicit_config
             }
 
             #integration_descriptor_method
