@@ -21523,6 +21523,18 @@ impl Config {
     /// the path is not a map-keyed entry). The bool is advisory; statement-callers
     /// that do not distinguish the reserved case may ignore it.
     ///
+    /// When it newly creates the alias, it also guarantees no phantom is left
+    /// behind: if `path` still doesn't resolve afterward (e.g. an unknown tail
+    /// field), the just-created alias is rolled back before returning, so the
+    /// caller never observes a half-materialized entry from this probe alone.
+    ///
+    /// Failures that happen *after* this returns (value coercion, a masked
+    /// secret, or a `set_prop` parse error) are the caller's to contain. The
+    /// RPC `config_set` path does so by mutating a cloned `Config` and only
+    /// committing it on full success, so a discarded attempt drops the alias
+    /// with the clone — no tracked-tuple mirror of config transaction state is
+    /// exposed to the runtime.
+    ///
     /// `#[resource_key]` sections are excluded. Their keys are values drawn from
     /// another domain (model id, voice, tool name) and may themselves contain
     /// dots, so the first-dot split below would read
@@ -21584,7 +21596,21 @@ impl Config {
             );
             return true;
         }
-        let _ = self.create_map_key(section, alias);
+        // Roll back on the same `Ok(true)` == "newly created" signal the CLI
+        // helper `ensure_map_key_for_prop_path` (src/main.rs) uses: never gate
+        // this on the earlier `get_map_keys` pre-check, or a bogus tail field
+        // on an already-existing alias would delete a legitimate config entry.
+        if matches!(self.create_map_key(section, alias), Ok(true))
+            && self.get_prop(path).is_err()
+            // A missing entry under a dynamic secret map is a valid first
+            // write, not an unknown schema tail. `get_prop` can only read
+            // keys that already exist, while the generated `set_prop`
+            // intentionally inserts them. The static secret classifier
+            // recognizes the map prefix without requiring the key to exist.
+            && !Self::prop_is_secret(path)
+        {
+            let _ = self.delete_map_key(section, alias);
+        }
         false
     }
 
@@ -21822,8 +21848,78 @@ fn restore_onepassword_references_for_save(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy)]
+enum PostReplaceSync {
+    Real,
+    #[cfg(any(test, feature = "test-helpers"))]
+    FailForTest,
+}
+
+/// Test-only fault injection: when armed for a specific config path, the
+/// next atomic write to that path simulates a post-rename directory sync
+/// failure. This lets downstream crates (e.g. the runtime's `config/set`
+/// RPC tests) drive the injected fault through the full production save
+/// path instead of calling the write helper directly. Keying by path keeps
+/// concurrently running tests from consuming each other's fault.
+/// Unreachable from production builds: the hook only exists under `test`
+/// or the `test-helpers` feature, which no production dependency enables.
+#[cfg(any(test, feature = "test-helpers"))]
+static FAIL_POST_REPLACE_SYNC_FOR_PATHS: std::sync::Mutex<Vec<std::path::PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Arm a one-shot post-rename sync failure for the next atomic write to
+/// `config_path`.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn arm_post_replace_sync_failure_for_test(config_path: &Path) {
+    FAIL_POST_REPLACE_SYNC_FOR_PATHS
+        .lock()
+        .unwrap()
+        .push(config_path.to_path_buf());
+}
+
+/// Whether an armed post-rename sync failure is still pending for
+/// `config_path`. Tests use this to prove the fault actually fired (the
+/// entry is consumed) rather than being bypassed by a save path that never
+/// reached the atomic writer.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn post_replace_sync_failure_armed(config_path: &Path) -> bool {
+    FAIL_POST_REPLACE_SYNC_FOR_PATHS
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|p| p == config_path)
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+fn take_post_replace_sync_failure(config_path: &Path) -> bool {
+    let mut armed = FAIL_POST_REPLACE_SYNC_FOR_PATHS.lock().unwrap();
+    if let Some(idx) = armed.iter().position(|p| p == config_path) {
+        armed.swap_remove(idx);
+        true
+    } else {
+        false
+    }
+}
+
 /// Atomic write shared by `save()` and `save_dirty()`.
 async fn write_config_atomically(config_path: &Path, toml_str: &str) -> Result<()> {
+    #[cfg(any(test, feature = "test-helpers"))]
+    if take_post_replace_sync_failure(config_path) {
+        return write_config_atomically_with_sync(
+            config_path,
+            toml_str,
+            PostReplaceSync::FailForTest,
+        )
+        .await;
+    }
+    write_config_atomically_with_sync(config_path, toml_str, PostReplaceSync::Real).await
+}
+
+async fn write_config_atomically_with_sync(
+    config_path: &Path,
+    toml_str: &str,
+    post_replace_sync: PostReplaceSync,
+) -> Result<()> {
     let parent_dir = config_path
         .parent()
         .context("Config path must have a parent directory")?;
@@ -21834,6 +21930,11 @@ async fn write_config_atomically(config_path: &Path, toml_str: &str) -> Result<(
             parent_dir.display()
         )
     })?;
+
+    // Open and sync the directory before replacement so permission, handle,
+    // and platform failures are reported while disk and live config are still
+    // unchanged. A second sync after rename establishes rename durability.
+    sync_directory(parent_dir).await?;
 
     let file_name = config_path
         .file_name()
@@ -21900,9 +22001,34 @@ async fn write_config_atomically(config_path: &Path, toml_str: &str) -> Result<(
         }
     }
 
-    sync_directory(parent_dir).await?;
-
-    if had_existing_config {
+    let post_replace_sync_result = match post_replace_sync {
+        PostReplaceSync::Real => sync_directory(parent_dir).await,
+        #[cfg(any(test, feature = "test-helpers"))]
+        PostReplaceSync::FailForTest => Err(anyhow::Error::msg(
+            "injected post-replace directory sync failure",
+        )),
+    };
+    if let Err(err) = post_replace_sync_result {
+        // The rename is already visible and the replacement file itself was
+        // fsynced before it moved. Returning an error here would make callers
+        // keep the old live snapshot even though disk contains the new one.
+        // Report the durability uncertainty, keep the backup for recovery,
+        // and classify the save as committed so save-then-swap callers install
+        // the matching snapshot.
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "error_key": "config.directory_sync_after_replace_failed",
+                    "path": config_path.display().to_string(),
+                    "backup_path": had_existing_config
+                        .then(|| backup_path.display().to_string()),
+                    "error": err.to_string(),
+                })),
+            "Config replacement committed but directory durability sync failed; keeping backup"
+        );
+    } else if had_existing_config {
         let _ = fs::remove_file(&backup_path).await;
     }
 
@@ -26735,6 +26861,44 @@ default_temperature = 0.7
         fs::create_dir_all(&dir).await.unwrap();
 
         sync_directory(&dir).await.unwrap();
+
+        let _ = fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn post_replace_sync_failure_keeps_disk_commit_and_backup() {
+        let dir = std::env::temp_dir().join(format!(
+            "zeroclaw_test_post_replace_sync_failure_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).await.unwrap();
+        let config_path = dir.join("config.toml");
+        let backup_path = dir.join("config.toml.bak");
+        fs::write(&config_path, "schema_version = 1\n")
+            .await
+            .unwrap();
+
+        let result = write_config_atomically_with_sync(
+            &config_path,
+            "schema_version = 2\n",
+            PostReplaceSync::FailForTest,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "a post-replace sync fault must report a committed save: {result:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(&config_path).await.unwrap(),
+            "schema_version = 2\n",
+            "the successful rename is the canonical on-disk result"
+        );
+        assert_eq!(
+            fs::read_to_string(&backup_path).await.unwrap(),
+            "schema_version = 1\n",
+            "durability uncertainty must retain the pre-replace backup"
+        );
 
         let _ = fs::remove_dir_all(&dir).await;
     }
@@ -34815,6 +34979,70 @@ api_key = "op://zeroclaw/provider/openai-api-key"
         assert!(
             config.cost.rates.tools.is_empty(),
             "`cost.rates.tools` is resource-keyed by the tool's registered name"
+        );
+    }
+
+    #[test]
+    async fn ensure_map_key_for_path_rolls_back_alias_when_tail_field_unknown() {
+        let mut config = Config::default();
+        let path = "providers.models.anthropic.default.not_a_real_field";
+        assert!(
+            config
+                .get_map_keys("providers.models.anthropic")
+                .is_some_and(|keys| !keys.iter().any(|k| k == "default")),
+            "precondition: alias must not exist yet"
+        );
+
+        let refused = config.ensure_map_key_for_path(path);
+
+        assert!(!refused, "not the reserved-agent refusal path");
+        assert!(
+            config
+                .get_map_keys("providers.models.anthropic")
+                .is_some_and(|keys| !keys.iter().any(|k| k == "default")),
+            "the just-created alias must be rolled back when the tail field can't resolve"
+        );
+    }
+
+    #[test]
+    async fn ensure_map_key_for_path_keeps_preexisting_alias_on_unknown_tail_field() {
+        let mut config = Config::default();
+        config
+            .create_map_key("providers.models.anthropic", "default")
+            .expect("seed a pre-existing alias");
+
+        let refused =
+            config.ensure_map_key_for_path("providers.models.anthropic.default.not_a_real_field");
+
+        assert!(!refused, "not the reserved-agent refusal path");
+        assert!(
+            config
+                .get_map_keys("providers.models.anthropic")
+                .is_some_and(|keys| keys.iter().any(|k| k == "default")),
+            "a pre-existing alias must never be deleted for a typo'd tail field"
+        );
+    }
+
+    #[test]
+    async fn ensure_map_key_for_path_preserves_first_dynamic_secret_map_write() {
+        let mut config = Config::default();
+        let path = "providers.models.openai.fresh.extra_headers.X-Foo";
+
+        let refused = config.ensure_map_key_for_path(path);
+
+        assert!(!refused, "not the reserved-agent refusal path");
+        config
+            .set_prop(path, "bar")
+            .expect("a new dynamic secret-map key must be insertable");
+        assert_eq!(
+            config
+                .providers
+                .models
+                .openai
+                .get("fresh")
+                .and_then(|provider| provider.base.extra_headers.get("X-Foo"))
+                .map(String::as_str),
+            Some("bar")
         );
     }
 
