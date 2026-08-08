@@ -574,14 +574,8 @@ pub struct TelegramChannel {
     tool_command_specs: Vec<(String, String)>,
     /// Pending approval requests: callback_data key → oneshot sender.
     /// `listen()` resolves these when a matching `callback_query` arrives.
-    pending_approvals: Arc<
-        tokio::sync::Mutex<
-            std::collections::HashMap<
-                String,
-                tokio::sync::oneshot::Sender<zeroclaw_api::channel::ChannelApprovalResponse>,
-            >,
-        >,
-    >,
+    pending_approvals:
+        Arc<tokio::sync::Mutex<std::collections::HashMap<String, crate::util::PendingApproval>>>,
     /// Seconds to wait for the operator to tap an inline-keyboard button on a
     /// tool approval prompt before auto-denying. Configurable via
     /// `channels.telegram.approval_timeout_secs`. Default: 120.
@@ -1511,6 +1505,28 @@ impl TelegramChannel {
         I: IntoIterator<Item = &'a str>,
     {
         identities.into_iter().any(|id| self.is_user_allowed(id))
+    }
+
+    fn approval_callback_context(callback: &serde_json::Value) -> (Vec<String>, Option<String>) {
+        let mut identities = Vec::with_capacity(2);
+        if let Some(username) = callback
+            .pointer("/from/username")
+            .and_then(serde_json::Value::as_str)
+            .filter(|username| !username.is_empty())
+        {
+            identities.push(username.to_string());
+        }
+        if let Some(user_id) = callback
+            .pointer("/from/id")
+            .and_then(serde_json::Value::as_i64)
+        {
+            identities.push(user_id.to_string());
+        }
+        let chat_id = callback
+            .pointer("/message/chat/id")
+            .and_then(serde_json::Value::as_i64)
+            .map(|id| id.to_string());
+        (identities, chat_id)
     }
 
     async fn handle_unauthorized_message(&self, update: &serde_json::Value) {
@@ -3933,31 +3949,65 @@ Ensure only one `zeroclaw` process is using this bot token."
                                 }
                             };
 
-                            if let Some(resp) = response
-                                && let Some(sender) =
-                                    self.pending_approvals.lock().await.remove(approval_id)
-                            {
-                                let _ = sender.send(resp);
+                            let (identities, callback_chat_id) =
+                                Self::approval_callback_context(cb);
+                            let responder_allowed =
+                                self.is_any_user_allowed(identities.iter().map(String::as_str));
+                            let resolution = match (response, callback_chat_id.as_deref()) {
+                                (Some(resp), Some(chat_id)) => {
+                                    crate::util::resolve_pending_approval(
+                                        &self.pending_approvals,
+                                        approval_id,
+                                        resp,
+                                        responder_allowed,
+                                        chat_id,
+                                    )
+                                    .await
+                                }
+                                _ => crate::util::PendingApprovalResolution::NotFound,
+                            };
+                            let resolved = matches!(
+                                resolution,
+                                crate::util::PendingApprovalResolution::Resolved
+                            );
+
+                            if !resolved && matches!(action, "approve" | "always" | "deny") {
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Reject
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                    .with_attrs(::serde_json::json!({"approval_id": approval_id})),
+                                    "Telegram approval callback was not accepted"
+                                );
                             }
 
                             // Answer the callback query to dismiss the spinner.
-                            let answer_text = match action {
-                                "approve" => format!(
+                            let answer_text = match (action, resolved) {
+                                ("approve", true) => format!(
                                     "✅ {}",
                                     i18n::get_required_cli_string(
                                         "channel-telegram-approval-ack-approved"
                                     )
                                 ),
-                                "always" => format!(
+                                ("always", true) => format!(
                                     "✅✅ {}",
                                     i18n::get_required_cli_string(
                                         "channel-telegram-approval-ack-always-approved"
                                     )
                                 ),
-                                "deny" => format!(
+                                ("deny", true) => format!(
                                     "❌ {}",
                                     i18n::get_required_cli_string(
                                         "channel-telegram-approval-ack-denied"
+                                    )
+                                ),
+                                ("approve" | "always" | "deny", false) => format!(
+                                    "⚠️ {}",
+                                    i18n::get_required_cli_string(
+                                        "channel-telegram-approval-ack-not-accepted"
                                     )
                                 ),
                                 _ => format!(
@@ -4163,10 +4213,13 @@ Ensure only one `zeroclaw` process is using this bot token."
         // Register the oneshot BEFORE sending the message to avoid a race
         // where the user taps the button before the sender is in the map.
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.pending_approvals
-            .lock()
-            .await
-            .insert(approval_id.clone(), tx);
+        self.pending_approvals.lock().await.insert(
+            approval_id.clone(),
+            crate::util::PendingApproval {
+                sender: tx,
+                destination: chat_id.to_string(),
+            },
+        );
 
         let resp = self
             .http_client()
@@ -8230,31 +8283,256 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_approval_oneshot_delivers_response() {
+    async fn pending_approval_requires_allowed_user_and_origin_chat() {
         use zeroclaw_api::channel::ChannelApprovalResponse;
 
         let mention_only = false;
         let ch = TelegramChannel::new(
             "token".into(),
             "telegram_test_alias",
-            Arc::new(|| vec!["*".into()]),
+            Arc::new(|| vec!["operator".into(), "1001".into()]),
             mention_only,
         );
         let approval_id = "test-approval-123".to_string();
         let (tx, rx) = tokio::sync::oneshot::channel();
 
-        ch.pending_approvals
-            .lock()
-            .await
-            .insert(approval_id.clone(), tx);
+        ch.pending_approvals.lock().await.insert(
+            approval_id.clone(),
+            crate::util::PendingApproval {
+                sender: tx,
+                destination: "-2001".to_string(),
+            },
+        );
 
-        // Simulate what listen() does when a callback_query arrives
-        if let Some(sender) = ch.pending_approvals.lock().await.remove(&approval_id) {
-            sender.send(ChannelApprovalResponse::Approve).unwrap();
+        for response in [
+            ChannelApprovalResponse::Approve,
+            ChannelApprovalResponse::Deny,
+            ChannelApprovalResponse::AlwaysApprove,
+        ] {
+            assert_eq!(
+                crate::util::resolve_pending_approval(
+                    &ch.pending_approvals,
+                    &approval_id,
+                    response,
+                    ch.is_any_user_allowed(["other-user", "1002"]),
+                    "-2001",
+                )
+                .await,
+                crate::util::PendingApprovalResolution::Rejected,
+            );
+            assert!(ch.pending_approvals.lock().await.contains_key(&approval_id));
         }
 
-        let result = rx.await.unwrap();
-        assert_eq!(result, ChannelApprovalResponse::Approve);
+        assert_eq!(
+            crate::util::resolve_pending_approval(
+                &ch.pending_approvals,
+                &approval_id,
+                ChannelApprovalResponse::Approve,
+                ch.is_any_user_allowed(["operator", "1001"]),
+                "-2002",
+            )
+            .await,
+            crate::util::PendingApprovalResolution::Rejected,
+        );
+        assert!(ch.pending_approvals.lock().await.contains_key(&approval_id));
+
+        assert_eq!(
+            crate::util::resolve_pending_approval(
+                &ch.pending_approvals,
+                &approval_id,
+                ChannelApprovalResponse::AlwaysApprove,
+                ch.is_any_user_allowed(["operator", "1001"]),
+                "-2001",
+            )
+            .await,
+            crate::util::PendingApprovalResolution::Resolved,
+        );
+        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::AlwaysApprove);
+
+        let (approve_tx, approve_rx) = tokio::sync::oneshot::channel();
+        ch.pending_approvals.lock().await.insert(
+            "approve-id".to_string(),
+            crate::util::PendingApproval {
+                sender: approve_tx,
+                destination: "-2001".to_string(),
+            },
+        );
+        assert_eq!(
+            crate::util::resolve_pending_approval(
+                &ch.pending_approvals,
+                "approve-id",
+                ChannelApprovalResponse::Approve,
+                ch.is_any_user_allowed(["operator", "1001"]),
+                "-2001",
+            )
+            .await,
+            crate::util::PendingApprovalResolution::Resolved,
+        );
+        assert_eq!(approve_rx.await.unwrap(), ChannelApprovalResponse::Approve);
+    }
+
+    #[test]
+    fn approval_callback_context_reads_username_numeric_id_and_chat() {
+        let callback = serde_json::json!({
+            "from": { "id": 1001, "username": "operator" },
+            "message": { "chat": { "id": -2001 } }
+        });
+        let (identities, chat_id) = TelegramChannel::approval_callback_context(&callback);
+        assert_eq!(identities, vec!["operator", "1001"]);
+        assert_eq!(chat_id.as_deref(), Some("-2001"));
+    }
+
+    #[tokio::test]
+    async fn listener_rejects_known_approval_callbacks_from_wrong_user_or_chat() {
+        use wiremock::matchers::{body_json, method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let get_updates_path = r"/bot[^/]+/getUpdates$";
+        let allowed_updates = serde_json::json!(["message", "callback_query"]);
+
+        Mock::given(method("POST"))
+            .and(path_regex(get_updates_path))
+            .and(body_json(serde_json::json!({
+                "offset": 0,
+                "timeout": 0,
+                "allowed_updates": allowed_updates.clone(),
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": [],
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(get_updates_path))
+            .and(body_json(serde_json::json!({
+                "offset": 0,
+                "timeout": 30,
+                "allowed_updates": allowed_updates,
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": [
+                    {
+                        "update_id": 1,
+                        "callback_query": {
+                            "id": "wrong-user",
+                            "from": { "id": 1002, "username": "other" },
+                            "message": { "chat": { "id": -2001 } },
+                            "data": "approval:approval-id:approve"
+                        }
+                    },
+                    {
+                        "update_id": 2,
+                        "callback_query": {
+                            "id": "wrong-chat",
+                            "from": { "id": 1001, "username": "operator" },
+                            "message": { "chat": { "id": -2002 } },
+                            "data": "approval:approval-id:deny"
+                        }
+                    }
+                ],
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/answerCallbackQuery$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true,
+            })))
+            .expect(2)
+            .mount(&mock_server)
+            .await;
+
+        let channel = Arc::new(
+            TelegramChannel::new(
+                "fake-token".into(),
+                "telegram_test_alias",
+                Arc::new(|| vec!["operator".into(), "1001".into()]),
+                false,
+            )
+            .with_api_base(mock_server.uri()),
+        );
+        let (approval_tx, mut approval_rx) = tokio::sync::oneshot::channel();
+        channel.pending_approvals.lock().await.insert(
+            "approval-id".to_string(),
+            crate::util::PendingApproval {
+                sender: approval_tx,
+                destination: "-2001".to_string(),
+            },
+        );
+        let (message_tx, mut message_rx) = tokio::sync::mpsc::channel(1);
+        let listener = channel.clone();
+        let listener_task =
+            zeroclaw_spawn::spawn!(async move { listener.listen(message_tx).await });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let requests = mock_server
+                    .received_requests()
+                    .await
+                    .expect("mock server should record requests");
+                let answers = requests
+                    .iter()
+                    .filter(|request| request.url.path().ends_with("/answerCallbackQuery"))
+                    .count();
+                if answers == 2 {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("both rejected callbacks should be acknowledged");
+
+        assert!(
+            channel
+                .pending_approvals
+                .lock()
+                .await
+                .contains_key("approval-id"),
+            "rejected callbacks must leave the pending approval available to its owner"
+        );
+        assert!(
+            approval_rx.try_recv().is_err(),
+            "no approval decision may be sent"
+        );
+        assert!(
+            message_rx.try_recv().is_err(),
+            "known rejected approval replies must not enter normal message dispatch"
+        );
+
+        let expected_text = format!(
+            "⚠️ {}",
+            i18n::get_required_cli_string("channel-telegram-approval-ack-not-accepted")
+        );
+        let requests = mock_server
+            .received_requests()
+            .await
+            .expect("mock server should retain callback acknowledgements");
+        let answer_ids: Vec<_> = requests
+            .iter()
+            .filter(|request| request.url.path().ends_with("/answerCallbackQuery"))
+            .map(|request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body)
+                    .expect("callback acknowledgement must be JSON");
+                assert_eq!(body["text"], expected_text);
+                body["callback_query_id"]
+                    .as_str()
+                    .expect("callback acknowledgement needs an id")
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(answer_ids, vec!["wrong-user", "wrong-chat"]);
+
+        listener_task.abort();
+        let _ = listener_task.await;
     }
 
     #[tokio::test]
