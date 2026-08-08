@@ -198,6 +198,8 @@ struct NativeChatResponse {
     #[serde(default)]
     content: Vec<NativeContentIn>,
     #[serde(default)]
+    stop_reason: Option<String>,
+    #[serde(default)]
     usage: Option<AnthropicUsage>,
 }
 
@@ -736,6 +738,9 @@ impl AnthropicModelProvider {
     }
 
     fn parse_native_response(response: NativeChatResponse) -> ProviderChatResponse {
+        let stop_reason = response.stop_reason.as_deref().unwrap_or("unknown");
+        let content_block_count = response.content.len();
+        let mut content_block_types = Vec::with_capacity(content_block_count);
         let mut text_parts = Vec::new();
         let mut thinking_parts = Vec::new();
         let mut tool_calls = Vec::new();
@@ -758,7 +763,8 @@ impl AnthropicModelProvider {
         });
 
         for block in response.content {
-            match block.kind.as_str() {
+            let kind = block.kind;
+            match kind.as_str() {
                 "text" => {
                     if let Some(text) = block.text.map(|t| t.trim().to_string())
                         && !text.is_empty()
@@ -779,21 +785,21 @@ impl AnthropicModelProvider {
                 }
                 "tool_use" => {
                     let name = block.name.unwrap_or_default();
-                    if name.is_empty() {
-                        continue;
+                    if !name.is_empty() {
+                        let arguments = block
+                            .input
+                            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+                        tool_calls.push(ProviderToolCall {
+                            id: block.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                            name,
+                            arguments: arguments.to_string(),
+                            extra_content: None,
+                        });
                     }
-                    let arguments = block
-                        .input
-                        .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
-                    tool_calls.push(ProviderToolCall {
-                        id: block.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                        name,
-                        arguments: arguments.to_string(),
-                        extra_content: None,
-                    });
                 }
                 _ => {}
             }
+            content_block_types.push(kind);
         }
 
         let reasoning_content = if thinking_parts.is_empty() {
@@ -802,7 +808,7 @@ impl AnthropicModelProvider {
             Some(thinking_parts.join("\n"))
         };
 
-        ProviderChatResponse {
+        let parsed = ProviderChatResponse {
             text: if text_parts.is_empty() {
                 None
             } else {
@@ -811,7 +817,47 @@ impl AnthropicModelProvider {
             tool_calls,
             usage,
             reasoning_content,
+        };
+
+        if parsed.is_semantically_empty_terminal() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_category(::zeroclaw_log::EventCategory::Provider)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "provider": "anthropic",
+                        "stop_reason": stop_reason,
+                        "content_block_count": content_block_count,
+                        "content_block_types": content_block_types,
+                        "native_tool_call_count": parsed.tool_calls.len(),
+                        "has_reasoning": parsed.reasoning_content.is_some(),
+                    })),
+                "Anthropic response completed without final text or tool calls"
+            );
         }
+
+        parsed
+    }
+
+    /// Project a native completion into the legacy string-only API without
+    /// erasing the terminal semantic cause required by Reliable and SOP
+    /// delivery boundaries.
+    fn require_terminal_text(parsed: ProviderChatResponse) -> anyhow::Result<String> {
+        if parsed.is_semantically_empty_terminal() {
+            return Err(anyhow::Error::new(
+                zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion,
+            ));
+        }
+        parsed.text.ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "anthropic: empty text in response"
+            );
+            anyhow::Error::msg("No response from Anthropic")
+        })
     }
 
     /// Resolve thinking parameters for an API request. Returns the effective
@@ -926,6 +972,13 @@ impl AnthropicModelProvider {
         let mut cached_input_tokens: Option<u64> = None;
         let mut cache_creation_input_tokens: Option<u64> = None;
 
+        // The block summary only feeds the DEBUG `message_stop` event. Avoid
+        // per-block String and map allocations when that event is disabled.
+        let collect_debug_metadata = ::zeroclaw_log::debug_enabled();
+        let mut last_stop_reason: Option<String> = None;
+        let mut content_block_count = 0usize;
+        let mut content_block_types =
+            collect_debug_metadata.then(std::collections::BTreeMap::<String, usize>::new);
         loop {
             let line = match lines.next_line().await {
                 Ok(Some(line)) => line,
@@ -997,6 +1050,12 @@ impl AnthropicModelProvider {
                             .get("type")
                             .and_then(|t| t.as_str())
                             .unwrap_or_default();
+                        if let Some(content_block_types) = content_block_types.as_mut() {
+                            content_block_count = content_block_count.saturating_add(1);
+                            *content_block_types
+                                .entry(block_type.to_string())
+                                .or_default() += 1;
+                        }
                         if block_type == "tool_use" {
                             if let Some(id) = tool_id.take() {
                                 let name = tool_name.take().unwrap_or_default();
@@ -1076,6 +1135,9 @@ impl AnthropicModelProvider {
                         .and_then(|d| d.get("stop_reason"))
                         .and_then(|s| s.as_str())
                         .unwrap_or("none");
+                    if stop_reason != "none" && collect_debug_metadata {
+                        last_stop_reason = Some(stop_reason.to_string());
+                    }
                     // Anthropic's running-total: each `message_delta`
                     // supersedes the previous one, so we always overwrite.
                     let observed_output = event
@@ -1101,11 +1163,21 @@ impl AnthropicModelProvider {
                     }
                 }
                 "message_stop" => {
-                    ::zeroclaw_log::record!(
-                        DEBUG,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                        "stream: message_stop"
-                    );
+                    if collect_debug_metadata {
+                        ::zeroclaw_log::record!(
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_attrs(::serde_json::json!({
+                                "stop_reason": last_stop_reason.as_deref().unwrap_or("unknown"),
+                                "content_block_count": content_block_count,
+                                "content_block_types": content_block_types,
+                            })),
+                            "stream: message_stop"
+                        );
+                    }
                     if input_tokens.is_some()
                         || output_tokens.is_some()
                         || cached_input_tokens.is_some()
@@ -1227,15 +1299,7 @@ impl ModelProvider for AnthropicModelProvider {
 
         let chat_response: NativeChatResponse = response.json().await?;
         let parsed = Self::parse_native_response(chat_response);
-        parsed.text.ok_or_else(|| {
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                "anthropic: empty text in response"
-            );
-            anyhow::Error::msg("No response from Anthropic")
-        })
+        Self::require_terminal_text(parsed)
     }
 
     async fn chat(
@@ -3092,6 +3156,39 @@ data: {\"type\":\"message_stop\"}\n\n";
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
         let result = AnthropicModelProvider::parse_native_response(resp);
         assert!(result.usage.is_none());
+    }
+
+    #[test]
+    fn string_projection_preserves_semantic_empty_terminal_cause() {
+        let json = r#"{
+            "stop_reason": "end_turn",
+            "content": [{"type": "thinking", "thinking": "internal only"}]
+        }"#;
+        let response: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let error = AnthropicModelProvider::require_terminal_text(
+            AnthropicModelProvider::parse_native_response(response),
+        )
+        .expect_err("thinking alone is not a string-only final answer");
+
+        assert!(error.chain().any(|cause| {
+            cause.is::<zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion>()
+        }));
+    }
+
+    #[test]
+    fn native_response_with_only_nonterminal_blocks_is_semantically_empty() {
+        let json = r#"{
+            "stop_reason": "end_turn",
+            "content": [
+                {"type": "thinking", "thinking": "internal only", "signature": "sig"},
+                {"type": "unknown_future_block"}
+            ]
+        }"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let result = AnthropicModelProvider::parse_native_response(resp);
+
+        assert!(result.is_semantically_empty_terminal());
+        assert!(result.reasoning_content.is_some());
     }
 
     #[test]

@@ -2323,6 +2323,16 @@ fn should_rollback_failed_user_turn(error: &anyhow::Error) -> bool {
     zeroclaw_providers::reliable::is_non_retryable(error)
 }
 
+/// Select the user-facing channel failure after preserving the typed terminal
+/// cause. Substring-based transient hints remain a fallback only: an earlier
+/// transport failure in an aggregate must not mask the final terminal cause.
+fn channel_user_error_message(error: &anyhow::Error, safe_error: &str) -> String {
+    zeroclaw_runtime::agent::terminal_completion_error_message(error, None)
+        .map(|message| format!("⚠️ Error: {message}"))
+        .or_else(|| zeroclaw_providers::reliable::transient_error_hint(error).map(str::to_string))
+        .unwrap_or_else(|| format!("⚠️ Error: {safe_error}"))
+}
+
 fn is_context_window_overflow_error(err: &anyhow::Error) -> bool {
     let lower = err.to_string().to_lowercase();
     [
@@ -6401,9 +6411,7 @@ async fn process_channel_message_body(
                     );
                 }
                 if let Some(channel) = target_channel.as_ref() {
-                    let user_msg = zeroclaw_providers::reliable::transient_error_hint(&e)
-                        .map(str::to_string)
-                        .unwrap_or_else(|| format!("⚠️ Error: {safe_error}"));
+                    let user_msg = channel_user_error_message(&e, &safe_error);
                     // Cancel any in-progress draft (don't finalize it with the
                     // error text, which would trigger TTS on the error message)
                     // then deliver the error as a plain suppressed send.
@@ -11982,6 +11990,27 @@ mod tests {
     const ASSEMBLY_HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(30);
     use zeroclaw_runtime::agent::loop_::apply_policy_tool_filter;
     use zeroclaw_runtime::agent::loop_::build_tool_instructions;
+
+    #[test]
+    fn channel_terminal_cause_precedes_transient_hint_from_earlier_attempt() {
+        let error =
+            anyhow::Error::new(zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion)
+                .context("earlier attempt returned HTTP 503 unavailable");
+
+        let delivered = channel_user_error_message(&error, "safe fallback");
+
+        assert_eq!(
+            delivered,
+            format!(
+                "⚠️ Error: {}",
+                zeroclaw_runtime::agent::semantic_empty_terminal_completion_message(None)
+            )
+        );
+        assert!(
+            !delivered.contains("temporarily unavailable"),
+            "an aggregate's earlier transient hint must not mask terminal completion failure"
+        );
+    }
 
     #[test]
     fn load_cached_model_preview_reads_from_data_dir_not_install_root() {

@@ -30,7 +30,8 @@ pub mod telnyx;
 pub mod traits;
 pub mod vision_override;
 
-pub use dispatch::{ProviderDispatch, ProviderDispatchRef};
+pub use dispatch::{AccountedChatResponse, ProviderDispatch, ProviderDispatchRef};
+pub use reliable::{ReliableRejectedCompletionUsage, ReliableSemanticEmptyCompletion};
 
 mod request_payload;
 

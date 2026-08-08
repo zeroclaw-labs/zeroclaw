@@ -113,6 +113,23 @@ pub(crate) fn get_english_cli_string_with_args(key: &str, args: &[(&str, &str)])
     format_cli_string_with_args(&english, key, args).unwrap_or_else(|| missing_cli_string(key))
 }
 
+/// Render a key from a caller-supplied disk override without changing the
+/// process-global locale. This keeps locale-sensitive boundary tests isolated.
+#[cfg(test)]
+pub(crate) fn get_disk_override_cli_string_for_test(
+    locale: &str,
+    disk_ftl: &str,
+    key: &str,
+    args: &[(&str, &str)],
+) -> String {
+    let sources = CliFtlSources {
+        locale: locale.to_string(),
+        disk: Some(disk_ftl.to_string()),
+        builtin: builtin_cli_ftl_source(locale),
+    };
+    format_cli_string_with_args(&sources, key, args).unwrap_or_else(|| missing_cli_string(key))
+}
+
 fn missing_cli_string(key: &str) -> String {
     ::zeroclaw_log::record!(
         WARN,
