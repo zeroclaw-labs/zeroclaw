@@ -8285,6 +8285,11 @@ pub struct KnowledgeConfig {
     /// Maximum number of knowledge nodes. Default: 100000.
     #[serde(default = "default_knowledge_max_nodes")]
     pub max_nodes: usize,
+    /// Agent that receives unattributed rows from a pre-attribution database.
+    /// Required only when more than one agent is enabled and legacy rows exist;
+    /// a sole enabled agent is selected automatically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_owner_agent: Option<crate::multi_agent::AgentAlias>,
     /// Automatically capture knowledge from conversations. Default: false.
     #[serde(default)]
     pub auto_capture: bool,
@@ -8307,9 +8312,19 @@ impl Default for KnowledgeConfig {
             enabled: false,
             db_path: default_knowledge_db_path(),
             max_nodes: default_knowledge_max_nodes(),
+            legacy_owner_agent: None,
             auto_capture: false,
             suggest_on_query: true,
         }
+    }
+}
+
+impl KnowledgeConfig {
+    /// Resolve the configured SQLite path once for every runtime and
+    /// lifecycle consumer.
+    #[must_use]
+    pub fn resolved_db_path(&self) -> PathBuf {
+        expand_tilde_path(&self.db_path)
     }
 }
 
@@ -20731,6 +20746,23 @@ impl Config {
                     "knowledge.db_path must not be empty"
                 );
             }
+            if let Some(owner) = self.knowledge.legacy_owner_agent.as_ref() {
+                let owner = owner.as_str();
+                let Some(agent) = self.agents.get(owner) else {
+                    validation_bail!(
+                        DanglingReference,
+                        "knowledge.legacy_owner_agent",
+                        "knowledge.legacy_owner_agent points at agents.{owner}, which is not configured"
+                    );
+                };
+                if !agent.enabled {
+                    validation_bail!(
+                        InvalidFormat,
+                        "knowledge.legacy_owner_agent",
+                        "knowledge.legacy_owner_agent points at agents.{owner}, which is disabled"
+                    );
+                }
+            }
         }
 
         // Google Workspace allowed_services validation
@@ -21379,6 +21411,28 @@ impl Config {
                         InvalidFormat,
                         format!("agents.{alias}.workspace.read_memory_from[{i}]"),
                         "agents.{alias}.workspace.read_memory_from[{i}] points at agents.{target_str} which uses memory backend {target_backend:?}, but agents.{alias} uses {agent_backend:?}; the allowlist must point at same-backend siblings only",
+                    );
+                }
+            }
+
+            // workspace.read_knowledge_from: every alias must exist as a
+            // configured agent. No backend compatibility check applies:
+            // the knowledge graph is one install-wide store shared by
+            // all agents.
+            for (i, target) in agent.workspace.read_knowledge_from.iter().enumerate() {
+                let target_str = target.as_str();
+                if target_str == alias.as_str() {
+                    validation_bail!(
+                        InvalidFormat,
+                        format!("agents.{alias}.workspace.read_knowledge_from[{i}]"),
+                        "agents.{alias}.workspace.read_knowledge_from[{i}] = {target_str:?} but {target_str} is this agent itself; an agent always sees its own knowledge rows, so self-references in the cross-agent allowlist are not permitted",
+                    );
+                }
+                if !self.agents.contains_key(target_str) {
+                    validation_bail!(
+                        DanglingReference,
+                        format!("agents.{alias}.workspace.read_knowledge_from[{i}]"),
+                        "agents.{alias}.workspace.read_knowledge_from[{i}] = {target_str:?} but agents.{target_str} is not configured",
                     );
                 }
             }
@@ -33570,6 +33624,11 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             ".read_memory_from",
             "Cross-agent memory allowlist",
         );
+        assert_description(
+            &workspace,
+            ".read_knowledge_from",
+            "Cross-agent knowledge allowlist",
+        );
 
         let a2a = crate::multi_agent::A2aServerConfig::default().prop_fields();
         assert_description(&a2a, ".public_base_url", "operator-supplied base URL");
@@ -36358,6 +36417,100 @@ allowed_users = []
             msg.contains("same-backend siblings only"),
             "expected cross-backend explanation, got: {msg}"
         );
+    }
+
+    #[test]
+    async fn validate_rejects_read_knowledge_from_self_reference() {
+        let mut config = multi_agent_test_config();
+        let alpha = config.agents.get_mut("alpha").unwrap();
+        alpha
+            .workspace
+            .read_knowledge_from
+            .push(crate::multi_agent::AgentAlias::new("alpha"));
+        let err = config
+            .validate()
+            .expect_err("self-reference must fail validation");
+        assert!(
+            err.to_string().contains("read_knowledge_from[0]"),
+            "expected indexed field path, got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_read_knowledge_from_dangling_reference() {
+        let mut config = multi_agent_test_config();
+        let alpha = config.agents.get_mut("alpha").unwrap();
+        alpha
+            .workspace
+            .read_knowledge_from
+            .push(crate::multi_agent::AgentAlias::new("ghost"));
+        let err = config
+            .validate()
+            .expect_err("dangling target must fail validation");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("read_knowledge_from[0]")
+                && msg.contains("agents.ghost is not configured"),
+            "expected dangling-ref explanation, got: {msg}"
+        );
+    }
+
+    #[test]
+    async fn validate_accepts_read_knowledge_from_across_memory_backends() {
+        let mut config = multi_agent_test_config();
+
+        // The knowledge graph is one install-wide store, so unlike
+        // read_memory_from the allowlist is valid across differing
+        // per-agent memory backends.
+        let beta = AliasedAgentConfig {
+            channels: vec![crate::providers::ChannelRef::new("telegram.draft")],
+            model_provider: crate::providers::ModelProviderRef::new("anthropic.default"),
+            risk_profile: "default".into(),
+            memory: crate::multi_agent::AgentMemoryConfig {
+                backend: crate::multi_agent::MemoryBackendKind::Postgres,
+            },
+            ..AliasedAgentConfig::default()
+        };
+        config.agents.insert("beta".to_string(), beta);
+
+        let alpha = config.agents.get_mut("alpha").unwrap();
+        alpha
+            .workspace
+            .read_knowledge_from
+            .push(crate::multi_agent::AgentAlias::new("beta"));
+
+        config
+            .validate()
+            .expect("sibling grant must pass validation regardless of memory backend");
+    }
+
+    #[test]
+    async fn validate_rejects_dangling_legacy_knowledge_owner() {
+        let mut config = multi_agent_test_config();
+        config.knowledge.enabled = true;
+        config.knowledge.legacy_owner_agent = Some(crate::multi_agent::AgentAlias::new("ghost"));
+        let err = config
+            .validate()
+            .expect_err("legacy owner must resolve to a configured agent");
+        assert!(err.to_string().contains("knowledge.legacy_owner_agent"));
+    }
+
+    #[test]
+    async fn validate_rejects_disabled_legacy_knowledge_owner() {
+        let mut config = multi_agent_test_config();
+        config.knowledge.enabled = true;
+        config.agents.insert(
+            "sleeping".to_string(),
+            AliasedAgentConfig {
+                enabled: false,
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.knowledge.legacy_owner_agent = Some(crate::multi_agent::AgentAlias::new("sleeping"));
+        let err = config
+            .validate()
+            .expect_err("legacy owner must be runtime-enabled");
+        assert!(err.to_string().contains("which is disabled"));
     }
 
     #[test]

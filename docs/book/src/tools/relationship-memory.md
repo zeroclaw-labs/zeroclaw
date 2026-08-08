@@ -17,6 +17,46 @@ enabled = true
 
 Relationship capture is explicit today. Agents store graph entries through `knowledge` actions such as `capture` and `relate`; enabling the tool does not turn on automatic ingestion. Relationship memory can hold sensitive operational or business context, so operators should choose what gets stored.
 
+## Per-agent scoping
+
+The store is one install-wide database, but entries are attributed per agent. Every `capture` and `relate` is stamped with the calling agent's alias, taken from the runtime registration rather than tool arguments, and every action (search, suggest, expert lookup, stats, neighbors, client network, interaction log) only sees:
+
+- rows the calling agent wrote,
+- rows owned by agents the operator explicitly shares via the workspace allowlist:
+
+```toml
+[agents.rowan.workspace]
+read_knowledge_from = ["sable"]
+```
+
+The grant is directional and read-only: `rowan` can read (and privately annotate) `sable`'s entries, while `sable` learns nothing about `rowan`'s. Writes always attribute to the caller. A node another agent owns behaves exactly like a node that does not exist, including in `relate` errors.
+
+### Assign pre-attribution rows during upgrade
+
+Rows created by older releases have no owner. They are never visible through an
+agent-scoped tool until startup assigns them to one agent:
+
+- With exactly one enabled agent, startup assigns the legacy graph to that agent.
+- With multiple enabled agents, the `knowledge` tool stays unavailable until the
+  operator selects an enabled owner:
+
+```toml
+[knowledge]
+enabled = true
+legacy_owner_agent = "rowan"
+```
+
+The assignment is transactional and idempotent. After it succeeds, the rows obey
+the same directional `read_knowledge_from` rules as newly captured knowledge.
+Agent rename and delete operations rewrite or archive and purge this durable
+ownership through the standard owned-state cascade.
+
+The migrated edge schema retains the old three-column uniqueness rule for
+owner-less inserts, so temporarily rolling back to a pre-attribution binary does
+not make repeated `INSERT OR IGNORE` operations duplicate legacy edges. Rows
+written by that old binary are unowned and fail closed again when a scoped binary
+restarts.
+
 ## Concepts
 
 The graph stores nodes and directed edges.
