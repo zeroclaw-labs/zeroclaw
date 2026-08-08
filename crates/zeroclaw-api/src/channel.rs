@@ -600,6 +600,31 @@ pub struct ForgeApiResponse {
     pub body: serde_json::Value,
 }
 
+/// Error a [`Channel::finalize_draft`] implementation returns when it posted
+/// part of a chunked final answer and could not deliver the remainder. The
+/// accepted prefix is already on the wire, so a caller that falls back to
+/// resending the whole answer would duplicate the delivered chunks. Callers must
+/// treat this as degraded-but-committed delivery: do NOT resend the full answer;
+/// the undelivered suffix is lost. `delivered` is the number of physical chunks
+/// accepted before the failure, for logging only.
+#[derive(Debug)]
+pub struct FinalizePartialDelivery {
+    pub delivered: usize,
+}
+
+impl fmt::Display for FinalizePartialDelivery {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "final answer partially delivered ({} chunk(s) accepted); \
+             remainder undelivered and must not be resent",
+            self.delivered
+        )
+    }
+}
+
+impl std::error::Error for FinalizePartialDelivery {}
+
 /// Core channel trait — implement for any messaging platform.
 ///
 /// Every `Channel` is `Attributable`: the orchestrator's spawn site opens
@@ -764,7 +789,24 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         false
     }
 
-    /// Minimum delay (ms) between sending each paragraph in multi-message mode.
+    /// Whether this channel implements the turn-flush narration contract:
+    /// `flush_draft_turn` delivers each completed agent text turn as a permanent
+    /// outbound message, and the orchestrator therefore routes that narration
+    /// through the outbound hook + leak-detection boundary and orders it ahead of
+    /// the approval prompt via a flush barrier.
+    ///
+    /// Distinct from [`supports_multi_message_streaming`]: a channel can stream
+    /// multiple messages another way (e.g. paragraph edits via `update_draft`)
+    /// without implementing `flush_draft_turn`. Only channels that override
+    /// `flush_draft_turn` may return `true` here, otherwise the orchestrator runs
+    /// outbound policy on phantom flushes that deliver nothing. Default `false`.
+    fn supports_turn_flush_narration(&self) -> bool {
+        false
+    }
+
+    /// Minimum delay (ms) between successive messages in multi-message mode.
+    /// The message boundary is channel-specific (for example, Telegram uses
+    /// completed agent turns).
     fn multi_message_delay_ms(&self) -> u64 {
         800
     }
@@ -805,8 +847,42 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         Ok(())
     }
 
+    /// Flush the current agent text turn as an outbound message in multi-message
+    /// streaming mode. Called when an LLM turn completes (e.g. before tool
+    /// execution). Default: no-op.
+    async fn flush_draft_turn(
+        &self,
+        _recipient: &str,
+        _message_id: &str,
+        _text: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Discard a completed agent text turn WITHOUT sending it, marking that
+    /// narration consumed for this draft. Called when the outbound hook cancels a
+    /// narration flush: the cancelled turn must never be re-offered (no
+    /// resurrection), but narration produced by a *later* turn must still be
+    /// deliverable. Advancing the channel's delivered-prefix bookkeeping over the
+    /// cancelled text achieves both. Default: no-op.
+    async fn discard_draft_turn(
+        &self,
+        _recipient: &str,
+        _message_id: &str,
+        _text: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Finalize a draft with the complete response (e.g. apply Markdown formatting).
     /// `suppress_voice` forces text delivery even on voice-only peers.
+    ///
+    /// If finalization must chunk a long answer and a later chunk fails after an
+    /// earlier one was accepted, return [`FinalizePartialDelivery`] rather than a
+    /// generic error: it tells the caller the accepted prefix is already posted
+    /// so it must not resend the whole answer (which would duplicate the
+    /// delivered chunks). A generic `Err` still means nothing was committed and a
+    /// full-message fallback is safe.
     async fn finalize_draft(
         &self,
         _recipient: &str,

@@ -355,6 +355,10 @@ impl Channel for PacedChannel {
         self.inner.supports_multi_message_streaming()
     }
 
+    fn supports_turn_flush_narration(&self) -> bool {
+        self.inner.supports_turn_flush_narration()
+    }
+
     fn multi_message_delay_ms(&self) -> u64 {
         self.inner.multi_message_delay_ms()
     }
@@ -388,6 +392,23 @@ impl Channel for PacedChannel {
     ) -> Result<()> {
         self.inner
             .update_draft_lifecycle(recipient, message_id, event)
+            .await
+    }
+
+    async fn flush_draft_turn(&self, recipient: &str, message_id: &str, text: &str) -> Result<()> {
+        self.inner
+            .flush_draft_turn(recipient, message_id, text)
+            .await
+    }
+
+    async fn discard_draft_turn(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> Result<()> {
+        self.inner
+            .discard_draft_turn(recipient, message_id, text)
             .await
     }
 

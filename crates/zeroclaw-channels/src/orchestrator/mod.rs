@@ -3652,6 +3652,186 @@ fn sanitize_channel_response_for_format_with_leak_detection(
     redact_channel_outbound_leaks(&sanitized, leak_detection, content_format)
 }
 
+/// Apply the same outbound security/operator boundary the final reply crosses to
+/// one permanent multi-message narration send: the `on_message_sending` hook
+/// (cancellation + content modification, reusing the final reply's routing-rewrite
+/// warning and length cap) followed by credential leak-detection. Returns `None`
+/// when a hook cancels the send; otherwise the guarded narration text.
+///
+/// Unlike the final reply this deliberately does NOT run the tool-protocol
+/// sanitizer: that path's `strip_tool_narration` would delete the pre-tool
+/// narration this feature exists to deliver. Only the hook and
+/// `redact_channel_outbound_leaks` apply to intermediate narration, so a
+/// credential can never leave the process ahead of the guarded final reply and a
+/// hook that cancels/rewrites the send is honored before anything is posted.
+async fn apply_multi_message_narration_policy(
+    hooks: Option<&zeroclaw_runtime::hooks::HookRunner>,
+    leak_detection: &zeroclaw_config::schema::LeakDetectionConfig,
+    channel: &str,
+    reply_target: &str,
+    prior_tail: &str,
+    content: String,
+) -> Option<String> {
+    let mut outbound = content;
+    if let Some(hooks) = hooks {
+        match hooks
+            .run_on_message_sending(
+                channel.to_string(),
+                reply_target.to_string(),
+                outbound.clone(),
+            )
+            .await
+        {
+            zeroclaw_runtime::hooks::HookResult::Cancel(reason) => {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"reason": reason.to_string()})),
+                    "outgoing narration suppressed by hook"
+                );
+                return None;
+            }
+            zeroclaw_runtime::hooks::HookResult::Continue((
+                hook_channel,
+                hook_recipient,
+                mut modified_content,
+            )) => {
+                if hook_channel != channel || hook_recipient != reply_target {
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"from_channel": channel, "from_recipient": reply_target, "to_channel": hook_channel, "to_recipient": hook_recipient})), "on_message_sending attempted to rewrite narration routing; only content mutation is applied");
+                }
+                let modified_len = modified_content.chars().count();
+                if modified_len > CHANNEL_HOOK_MAX_OUTBOUND_CHARS {
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"limit": CHANNEL_HOOK_MAX_OUTBOUND_CHARS, "attempted": modified_len})), "hook-modified narration exceeded limit; truncating");
+                    modified_content =
+                        truncate_with_ellipsis(&modified_content, CHANNEL_HOOK_MAX_OUTBOUND_CHARS);
+                }
+                outbound = modified_content;
+            }
+        }
+    }
+    Some(redact_channel_outbound_leaks_with_prior_context(
+        prior_tail,
+        &outbound,
+        leak_detection,
+        outbound_content_format_for_channel(channel),
+    ))
+}
+
+/// Run one completed narration turn through outbound policy and flush it to the
+/// channel **exactly once**.
+///
+/// `last_flushed` is the watermark of narration already processed on this stream.
+/// The outbound hook (`run_on_message_sending`) is not idempotent — a stateful
+/// hook can allow the first pass and cancel or rewrite a second — so the same
+/// completed turn must cross it only once. For an approval-requiring tool turn
+/// the runtime emits both a `Status` delta and a following `FlushBarrier`; this
+/// gives the first event that observes the content ownership of the policy+flush,
+/// and lets the approval barrier merely acknowledge a turn already owned rather
+/// than repeating the operation. When the barrier is the first to observe new
+/// narration (no preceding `Status`), it still flushes it — once.
+#[allow(clippy::too_many_arguments)]
+async fn flush_completed_narration_turn(
+    channel: &Arc<dyn Channel>,
+    hooks: Option<&zeroclaw_runtime::hooks::HookRunner>,
+    leak_detection: &zeroclaw_config::schema::LeakDetectionConfig,
+    outbound_channel: &str,
+    reply_target: &str,
+    draft_id: &str,
+    visible: &str,
+    last_flushed: &mut String,
+    owned_guarded: &mut String,
+) {
+    // Outbound policy owns the newly completed turn, NOT the whole accumulated
+    // history. Narration is append-only, so `last_flushed` (the raw watermark of
+    // everything already run through policy) is a prefix of `visible`; the suffix
+    // is exactly the turn that just completed. Running policy over only that
+    // suffix keeps a non-idempotent `on_message_sending` hook from re-processing
+    // an earlier turn every time a later turn expands the snapshot. A defensive
+    // `unwrap_or` treats the whole snapshot as new if the prefix invariant ever
+    // fails to hold.
+    let new_turn = visible
+        .strip_prefix(last_flushed.as_str())
+        .unwrap_or(visible);
+    // No new narration (e.g. an approval `FlushBarrier` acknowledging a turn a
+    // preceding `Status` already owned): nothing to cross the hook.
+    if new_turn.trim().is_empty() {
+        *last_flushed = visible.to_string();
+        return;
+    }
+    // Bounded context from already-delivered narration so a credential split
+    // across this turn boundary is still caught. This must be the GUARDED history
+    // the channel actually received (`owned_guarded`), NOT the raw watermark
+    // (`last_flushed`): the outbound hook and leak-redaction can rewrite a turn,
+    // so a credential fragment the hook CREATES lives only in `owned_guarded`
+    // (a raw scan would miss the split), while a credential the prior turn
+    // already had redacted is absent from `owned_guarded` (a raw scan would
+    // false-redact the clean turn that follows). At this point `owned_guarded`
+    // holds only prior delivered turns — this turn is appended after policy runs
+    // below — so its bounded suffix is the correct cross-turn context. (A turn
+    // whose channel flush failed is still present here; that only makes the
+    // context over-inclusive, which over-redacts rather than leaks, and the
+    // channel re-delivers the failed suffix via prefix reconciliation.)
+    // `last_flushed` stays raw purely for the exactly-once watermark above. The
+    // per-turn scan alone is blind to a secret whose halves land in adjacent
+    // turns.
+    let prior_tail =
+        bounded_char_suffix(owned_guarded.as_str(), NARRATION_LEAK_CONTEXT_CHARS).to_string();
+    // `None` => a hook cancelled this narration turn. Policy (hook +
+    // leak-redaction) runs per turn, so the "narration before approval"
+    // guarantee holds per delivered turn, and the prior-context scan closes the
+    // split-secret gap across turn boundaries.
+    match apply_multi_message_narration_policy(
+        hooks,
+        leak_detection,
+        outbound_channel,
+        reply_target,
+        &prior_tail,
+        new_turn.to_string(),
+    )
+    .await
+    {
+        Some(guarded_turn) => {
+            // Append this turn's guarded text to the owned narration and hand the
+            // channel the full owned snapshot; its prefix reconciliation then
+            // sends only this turn's suffix. The channel never sees an earlier
+            // turn re-guarded, and a stateful hook rewrite cannot retroactively
+            // alter an already-owned turn.
+            owned_guarded.push_str(&guarded_turn);
+            if let Err(e) = channel
+                .flush_draft_turn(reply_target, draft_id, owned_guarded)
+                .await
+            {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "Draft turn flush failed"
+                );
+            }
+        }
+        // The cancelled turn is simply never added to the owned narration, so a
+        // later turn's flush excludes it without resurrection. Sync the channel's
+        // delivered-prefix bookkeeping to the unchanged owned snapshot so its
+        // suffix accounting stays aligned with what policy has approved.
+        None => {
+            if let Err(e) = channel
+                .discard_draft_turn(reply_target, draft_id, owned_guarded)
+                .await
+            {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "Draft turn discard failed"
+                );
+            }
+        }
+    }
+    // Advance the watermark whether we sent or discarded: either way this exact
+    // content has now crossed outbound policy and must not be processed again.
+    *last_flushed = visible.to_string();
+}
+
 fn redact_channel_outbound_leaks(
     content: &str,
     leak_detection: &zeroclaw_config::schema::LeakDetectionConfig,
@@ -3679,6 +3859,78 @@ fn redact_channel_outbound_leaks(
             redacted
         }
     }
+}
+
+/// Bounded raw narration context (chars) carried across completed turns so a
+/// credential split across a turn boundary is still detected. Large enough to
+/// span the structured secrets [`redact_channel_outbound_leaks`] recognizes.
+const NARRATION_LEAK_CONTEXT_CHARS: usize = 512;
+
+/// Redact outbound leaks in `content`, additionally catching a credential that
+/// only completes once the previously delivered narration (`prior_tail`, a
+/// bounded raw suffix) is prepended.
+///
+/// The per-turn narration boundary makes a plain per-turn scan blind to a secret
+/// split as e.g. `AKIA…` in one permanent send and `…MNOP` in the next: neither
+/// fragment matches alone, so both would reach the channel and reconstruct the
+/// full value. A secret fully inside this turn is redacted as usual; a secret
+/// that only appears with `prior_tail` prepended has this turn's participating
+/// fragment scrubbed, so the delivered messages cannot be concatenated back into
+/// the credential. `prior_tail` is detection context only and is never delivered.
+fn redact_channel_outbound_leaks_with_prior_context(
+    prior_tail: &str,
+    content: &str,
+    leak_detection: &zeroclaw_config::schema::LeakDetectionConfig,
+    content_format: OutboundContentFormat,
+) -> String {
+    // First redact secrets contained entirely within this turn.
+    let self_redacted = redact_channel_outbound_leaks(content, leak_detection, content_format);
+    if !leak_detection.enabled || prior_tail.is_empty() {
+        return self_redacted;
+    }
+    // Then look for a secret that only appears once the prior tail is prepended.
+    // `prior_tail` is already-delivered narration, so on its own it holds no
+    // complete secret; a change here means one spans the boundary.
+    let combined = format!("{prior_tail}{self_redacted}");
+    let combined_redacted =
+        redact_channel_outbound_leaks(&combined, leak_detection, content_format);
+    if combined_redacted == combined {
+        return self_redacted;
+    }
+    // A credential spans the boundary. The prior turn is already delivered and
+    // cannot be retracted; scrub this turn's participating fragment. The suffix
+    // the detector left intact is exactly the part of this turn NOT in the
+    // credential, so deliver only that behind a redaction marker.
+    let safe_suffix = longest_common_char_suffix(&combined_redacted, &self_redacted);
+    format!("[REDACTED_CREDENTIAL]{safe_suffix}")
+}
+
+/// Last `max_chars` characters of `s` as a char-boundary slice (all of `s` when
+/// shorter). Used to bound the cross-turn leak-detection context.
+fn bounded_char_suffix(s: &str, max_chars: usize) -> &str {
+    let total = s.chars().count();
+    if total <= max_chars {
+        return s;
+    }
+    let start = s
+        .char_indices()
+        .nth(total - max_chars)
+        .map_or(0, |(i, _)| i);
+    &s[start..]
+}
+
+/// Longest common suffix of `a` and `b`, returned as a char-boundary slice of `b`.
+fn longest_common_char_suffix<'b>(a: &str, b: &'b str) -> &'b str {
+    let mut split = b.len();
+    let mut a_chars = a.char_indices().rev();
+    let mut b_chars = b.char_indices().rev();
+    loop {
+        match (a_chars.next(), b_chars.next()) {
+            (Some((_, ca)), Some((pos, cb))) if ca == cb => split = pos,
+            _ => break,
+        }
+    }
+    &b[split..]
 }
 
 fn channel_outbound_protected_spans(
@@ -5370,9 +5622,29 @@ async fn process_channel_message_body(
             let channel = Arc::clone(channel_ref);
             let reply_target = msg.reply_target.clone();
             let draft_id = draft_id_ref.to_string();
+            let turn_flush_narration = channel.supports_turn_flush_narration();
+            // Each permanent narration flush must cross the same outbound hook +
+            // leak-detection boundary as the final reply; capture the pieces the
+            // policy needs since `ctx`/`msg` are not moved into this task.
+            let outbound_hooks = ctx.hooks.clone();
+            let outbound_leak_detection = ctx.prompt_config.security.leak_detection.clone();
+            let outbound_channel = msg.channel.clone();
             Some(zeroclaw_spawn::spawn!(async move {
                 use zeroclaw_runtime::agent::loop_::StreamDelta;
                 let mut accumulated = String::new();
+                // Watermark of narration already run through outbound policy this
+                // stream, so a completed turn crosses the (non-idempotent) hook
+                // exactly once across the `Status` and `FlushBarrier` events.
+                let mut last_flushed = String::new();
+                // The guarded narration already owned + flushed this stream: each
+                // completed turn's policy-checked text, concatenated. The channel
+                // is handed this (never the raw accumulation) so a later turn
+                // cannot re-guard or rewrite an earlier one.
+                let mut owned_guarded = String::new();
+                // Hook cancellation is scoped to the narration turn it cancelled:
+                // the `None` arms `discard_draft_turn` that turn so it is never
+                // re-offered or resurrected, while a later turn's narration still
+                // flushes independently through outbound policy.
                 while let Some(event) = rx.recv().await {
                     match event {
                         StreamDelta::Lifecycle(event) => {
@@ -5392,6 +5664,21 @@ async fn process_channel_message_body(
                             }
                         }
                         StreamDelta::Status(text) => {
+                            if turn_flush_narration {
+                                let visible = strip_think_tags_inline(&accumulated);
+                                flush_completed_narration_turn(
+                                    &channel,
+                                    outbound_hooks.as_deref(),
+                                    &outbound_leak_detection,
+                                    &outbound_channel,
+                                    &reply_target,
+                                    &draft_id,
+                                    &visible,
+                                    &mut last_flushed,
+                                    &mut owned_guarded,
+                                )
+                                .await;
+                            }
                             let visible = strip_think_tags_inline(&text);
                             if let Err(e) = channel
                                 .update_draft_progress(&reply_target, &draft_id, &visible)
@@ -5425,6 +5712,28 @@ async fn process_channel_message_body(
                                     "Draft update failed"
                                 );
                             }
+                        }
+                        StreamDelta::FlushBarrier(ack) => {
+                            // Queue FIFO guarantees all prior Text deltas were
+                            // consumed above; flush the turn narration, then
+                            // release the agent loop (approval gate) waiting
+                            // on the ack.
+                            if turn_flush_narration {
+                                let visible = strip_think_tags_inline(&accumulated);
+                                flush_completed_narration_turn(
+                                    &channel,
+                                    outbound_hooks.as_deref(),
+                                    &outbound_leak_detection,
+                                    &outbound_channel,
+                                    &reply_target,
+                                    &draft_id,
+                                    &visible,
+                                    &mut last_flushed,
+                                    &mut owned_guarded,
+                                )
+                                .await;
+                            }
+                            StreamDelta::ack_flush_barrier(&ack);
                         }
                     }
                 }
@@ -6193,6 +6502,34 @@ async fn process_channel_message_body(
                             .await
                         {
                             Ok(()) => true,
+                            Err(e)
+                                if e
+                                    .downcast_ref::<zeroclaw_api::channel::FinalizePartialDelivery>(
+                                    )
+                                    .is_some() =>
+                            {
+                                // The channel already posted part of the chunked
+                                // final answer and could not finish. Resending the
+                                // full answer here would duplicate the delivered
+                                // prefix, so accept degraded delivery instead of
+                                // restarting from chunk zero.
+                                let delivered = e
+                                    .downcast_ref::<zeroclaw_api::channel::FinalizePartialDelivery>()
+                                    .map(|p| p.delivered)
+                                    .unwrap_or(0);
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                    .with_attrs(::serde_json::json!({"delivered_chunks": delivered})),
+                                    "Final answer partially delivered; not resending to avoid \
+                                     duplicating the accepted prefix"
+                                );
+                                true
+                            }
                             Err(e) => {
                                 ::zeroclaw_log::record!(
                                     WARN,
@@ -15593,6 +15930,262 @@ api_key = "anthropic-key"
         }
     }
 
+    /// Native-tools provider that narrates before requesting a tool call
+    /// (first turn), then finishes with plain text (second turn). Drives the
+    /// multi_message approval-order regression test end to end.
+    #[cfg(feature = "channel-telegram")]
+    struct NarratingNativeToolProvider {
+        calls: AtomicUsize,
+    }
+
+    #[cfg(feature = "channel-telegram")]
+    #[async_trait::async_trait]
+    impl ModelProvider for NarratingNativeToolProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        async fn chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        fn capabilities(&self) -> zeroclaw_api::model_provider::ProviderCapabilities {
+            zeroclaw_api::model_provider::ProviderCapabilities {
+                native_tool_calling: true,
+                vision: false,
+                prompt_caching: false,
+                extended_thinking: false,
+            }
+        }
+
+        async fn chat(
+            &self,
+            _request: zeroclaw_providers::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(zeroclaw_providers::ChatResponse {
+                    text: Some("Понял, запускаю инструмент".to_string()),
+                    tool_calls: vec![zeroclaw_providers::ToolCall {
+                        id: "call-1".to_string(),
+                        name: "mock_price".to_string(),
+                        arguments: r#"{"symbol":"BTC"}"#.to_string(),
+                        extra_content: None,
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            } else {
+                Ok(zeroclaw_providers::ChatResponse {
+                    text: Some("Инструмент отклонён, завершаю ход.".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+    }
+
+    #[cfg(feature = "channel-telegram")]
+    impl ::zeroclaw_api::attribution::Attributable for NarratingNativeToolProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "NarratingNativeToolProvider"
+        }
+    }
+
+    /// Like `NarratingNativeToolProvider`, but the pre-tool narration embeds a
+    /// credential so a regression can prove leak detection runs before the
+    /// permanent intermediate send.
+    #[cfg(feature = "channel-telegram")]
+    struct LeakingNarratingToolProvider {
+        calls: AtomicUsize,
+    }
+
+    #[cfg(feature = "channel-telegram")]
+    pub(crate) const LEAKING_NARRATION_SECRET: &str = "AKIAABCDEFGHIJKLMNOP"; // gitleaks:allow
+
+    #[cfg(feature = "channel-telegram")]
+    #[async_trait::async_trait]
+    impl ModelProvider for LeakingNarratingToolProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        async fn chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        fn capabilities(&self) -> zeroclaw_api::model_provider::ProviderCapabilities {
+            zeroclaw_api::model_provider::ProviderCapabilities {
+                native_tool_calling: true,
+                vision: false,
+                prompt_caching: false,
+                extended_thinking: false,
+            }
+        }
+
+        async fn chat(
+            &self,
+            _request: zeroclaw_providers::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(zeroclaw_providers::ChatResponse {
+                    text: Some(format!(
+                        "Ключ {LEAKING_NARRATION_SECRET}, запускаю инструмент"
+                    )),
+                    tool_calls: vec![zeroclaw_providers::ToolCall {
+                        id: "call-1".to_string(),
+                        name: "mock_price".to_string(),
+                        arguments: r#"{"symbol":"BTC"}"#.to_string(),
+                        extra_content: None,
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            } else {
+                Ok(zeroclaw_providers::ChatResponse {
+                    text: Some("Инструмент отклонён, завершаю ход.".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+    }
+
+    #[cfg(feature = "channel-telegram")]
+    impl ::zeroclaw_api::attribution::Attributable for LeakingNarratingToolProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "LeakingNarratingToolProvider"
+        }
+    }
+
+    /// Rewrites every outbound send via `on_message_sending`, so a regression can
+    /// prove the hook's modification reaches the permanent narration send instead
+    /// of the raw pre-hook text.
+    // Markdown-inert (no `_`/`*`/backticks) so the assertion matches the text
+    // verbatim after Telegram Markdown→HTML conversion.
+    #[cfg(feature = "channel-telegram")]
+    pub(crate) const HOOK_REWRITTEN_NARRATION: &str = "HOOK REWROTE THE NARRATION";
+
+    #[cfg(feature = "channel-telegram")]
+    struct RewritingSendHook;
+
+    #[cfg(feature = "channel-telegram")]
+    #[async_trait::async_trait]
+    impl zeroclaw_runtime::hooks::HookHandler for RewritingSendHook {
+        fn name(&self) -> &str {
+            "rewriting-send"
+        }
+
+        async fn on_message_sending(
+            &self,
+            channel: String,
+            recipient: String,
+            _content: String,
+        ) -> zeroclaw_runtime::hooks::HookResult<(String, String, String)> {
+            zeroclaw_runtime::hooks::HookResult::Continue((
+                channel,
+                recipient,
+                HOOK_REWRITTEN_NARRATION.to_string(),
+            ))
+        }
+    }
+
+    /// Cancels the FIRST `on_message_sending` invocation and allows every later
+    /// one — a stateful hook that permits one turn and cancels another. Once a
+    /// narration flush is cancelled, a subsequent flush must never resurrect it.
+    #[cfg(feature = "channel-telegram")]
+    struct CancellingSendHook {
+        calls: AtomicUsize,
+    }
+
+    #[cfg(feature = "channel-telegram")]
+    #[async_trait::async_trait]
+    impl zeroclaw_runtime::hooks::HookHandler for CancellingSendHook {
+        fn name(&self) -> &str {
+            "cancelling-send"
+        }
+
+        async fn on_message_sending(
+            &self,
+            channel: String,
+            recipient: String,
+            content: String,
+        ) -> zeroclaw_runtime::hooks::HookResult<(String, String, String)> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                zeroclaw_runtime::hooks::HookResult::Cancel("suppress first narration".to_string())
+            } else {
+                zeroclaw_runtime::hooks::HookResult::Continue((channel, recipient, content))
+            }
+        }
+    }
+
+    /// Records every `on_message_sending` content it observes and passes it
+    /// through unchanged, so a test can assert exactly how many times a given
+    /// narration crosses the (non-idempotent) outbound hook.
+    #[cfg(feature = "channel-telegram")]
+    struct RecordingSendHook {
+        seen: std::sync::Arc<parking_lot::Mutex<Vec<String>>>,
+    }
+
+    #[cfg(feature = "channel-telegram")]
+    #[async_trait::async_trait]
+    impl zeroclaw_runtime::hooks::HookHandler for RecordingSendHook {
+        fn name(&self) -> &str {
+            "recording-send"
+        }
+
+        async fn on_message_sending(
+            &self,
+            channel: String,
+            recipient: String,
+            content: String,
+        ) -> zeroclaw_runtime::hooks::HookResult<(String, String, String)> {
+            self.seen.lock().push(content.clone());
+            zeroclaw_runtime::hooks::HookResult::Continue((channel, recipient, content))
+        }
+    }
+
     struct SessionsCurrentModelProvider;
 
     #[async_trait::async_trait]
@@ -17030,6 +17623,1313 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(reply.contains("BTC is currently around"));
         assert!(!reply.contains("\"tool_calls\""));
         assert!(!reply.contains("mock_price"));
+    }
+
+    /// End-to-end multi_message regression: in MultiMessage stream mode the
+    /// turn's pre-tool narration must reach Telegram *before* the tool-approval
+    /// inline keyboard. The narration rides the async delta queue into the
+    /// draft updater while `request_approval` goes to the channel directly; the
+    /// approval gate's flush barrier (zeroclaw-runtime `turn/approval_gate.rs`)
+    /// makes the gate wait until the updater consumed and flushed the
+    /// narration, so the `sendMessage` order on the wire is narration then
+    /// approval prompt.
+    #[cfg(feature = "channel-telegram")]
+    #[tokio::test]
+    async fn multi_message_narration_reaches_telegram_before_approval_prompt() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        // Catch-all for every Bot API POST the flow hits (sendMessage,
+        // sendChatAction, setMessageReaction, ...). The test asserts on the
+        // chronological *order* of recorded requests, not on mock matching.
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": true, "result": { "message_id": 1 } }),
+                ),
+            )
+            .mount(&mock_server)
+            .await;
+
+        use parking_lot::RwLock;
+        use std::sync::Arc;
+        use zeroclaw_config::schema::{Config, TelegramConfig};
+
+        let mut cfg = Config::default();
+        cfg.channels.telegram.insert(
+            "telegram_test_alias".to_string(),
+            TelegramConfig {
+                bot_token: "fake-token".into(),
+                multi_message_delay_ms: 0,
+                ..TelegramConfig::default()
+            },
+        );
+        let config_arc = Arc::new(RwLock::new(cfg));
+
+        let telegram: Arc<dyn Channel> = Arc::new(
+            TelegramChannel::new(
+                "fake-token".into(),
+                "telegram_test_alias",
+                Arc::new(|| vec!["*".into()]),
+                false,
+            )
+            .with_persistence(config_arc)
+            .with_streaming(zeroclaw_config::schema::StreamMode::MultiMessage, 750)
+            .with_api_base(mock_server.uri())
+            .with_approval_timeout_secs(0),
+        );
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(telegram.name().to_string(), telegram);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            model_provider: Arc::new(NarratingNativeToolProvider {
+                calls: AtomicUsize::new(0),
+            }),
+            model_provider_ref: Arc::new("test-provider".to_string()),
+            agent_alias: Arc::new("test-agent".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
+            memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
+            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: Some(0.0),
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
+            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+            provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+                whatsapp: false,
+            },
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+            agent_transcription_provider: String::new(),
+            hooks: None,
+            model_routes: Arc::new(Vec::new()),
+            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: zeroclaw_config::schema::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+                Duration::ZERO,
+            )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
+            last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-1".to_string(),
+                sender: "zeroclaw_user".to_string(),
+                reply_target: "123".to_string(),
+                content: "Запусти инструмент".to_string(),
+                channel: "telegram".into(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let requests = mock_server
+            .received_requests()
+            .await
+            .expect("wiremock records requests");
+        let send_message_bodies: Vec<String> = requests
+            .iter()
+            .filter(|r| r.url.path().ends_with("/sendMessage"))
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+
+        let narration_idx = send_message_bodies
+            .iter()
+            .position(|body| body.contains("Понял, запускаю инструмент"))
+            .unwrap_or_else(|| {
+                panic!("narration sendMessage missing; bodies: {send_message_bodies:?}")
+            });
+        let approval_idx = send_message_bodies
+            .iter()
+            .position(|body| body.contains("Tool approval required"))
+            .unwrap_or_else(|| {
+                panic!("approval sendMessage missing; bodies: {send_message_bodies:?}")
+            });
+        assert!(
+            narration_idx < approval_idx,
+            "narration (sendMessage #{narration_idx}) must reach Telegram before \
+             the approval prompt (sendMessage #{approval_idx}); bodies: \
+             {send_message_bodies:?}"
+        );
+    }
+
+    /// Regression: pre-tool narration is a permanent
+    /// external send, so it must cross the same leak-detection boundary as the
+    /// final reply. A credential in the narration must be redacted before it
+    /// reaches Telegram — never posted raw ahead of the guarded final response.
+    #[cfg(feature = "channel-telegram")]
+    #[tokio::test]
+    async fn multi_message_narration_applies_leak_detection_before_send() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": true, "result": { "message_id": 1 } }),
+                ),
+            )
+            .mount(&mock_server)
+            .await;
+
+        use parking_lot::RwLock;
+        use std::sync::Arc;
+        use zeroclaw_config::schema::{Config, TelegramConfig};
+
+        let mut cfg = Config::default();
+        cfg.channels.telegram.insert(
+            "telegram_test_alias".to_string(),
+            TelegramConfig {
+                bot_token: "fake-token".into(),
+                multi_message_delay_ms: 0,
+                ..TelegramConfig::default()
+            },
+        );
+        let config_arc = Arc::new(RwLock::new(cfg));
+
+        let telegram: Arc<dyn Channel> = Arc::new(
+            TelegramChannel::new(
+                "fake-token".into(),
+                "telegram_test_alias",
+                Arc::new(|| vec!["*".into()]),
+                false,
+            )
+            .with_persistence(config_arc)
+            .with_streaming(zeroclaw_config::schema::StreamMode::MultiMessage, 750)
+            .with_api_base(mock_server.uri())
+            .with_approval_timeout_secs(0),
+        );
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(telegram.name().to_string(), telegram);
+
+        // Leak detection is on by default; assert it actually guards the
+        // intermediate narration send, not just the final reply.
+        let mut prompt_config = zeroclaw_config::schema::Config::default();
+        assert!(
+            prompt_config.security.leak_detection.enabled,
+            "test premise: leak detection must be enabled by default"
+        );
+        prompt_config
+            .channels
+            .telegram
+            .insert("telegram_test_alias".to_string(), TelegramConfig::default());
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            model_provider: Arc::new(LeakingNarratingToolProvider {
+                calls: AtomicUsize::new(0),
+            }),
+            model_provider_ref: Arc::new("test-provider".to_string()),
+            agent_alias: Arc::new("test-agent".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
+            memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
+            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: Some(0.0),
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
+            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+            provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(prompt_config),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+                whatsapp: false,
+            },
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+            agent_transcription_provider: String::new(),
+            hooks: None,
+            model_routes: Arc::new(Vec::new()),
+            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: zeroclaw_config::schema::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+                Duration::ZERO,
+            )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
+            last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-1".to_string(),
+                sender: "zeroclaw_user".to_string(),
+                reply_target: "123".to_string(),
+                content: "Запусти инструмент".to_string(),
+                channel: "telegram".into(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let requests = mock_server
+            .received_requests()
+            .await
+            .expect("wiremock records requests");
+        let send_message_bodies: Vec<String> = requests
+            .iter()
+            .filter(|r| r.url.path().ends_with("/sendMessage"))
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+
+        assert!(
+            !send_message_bodies
+                .iter()
+                .any(|body| body.contains(LEAKING_NARRATION_SECRET)),
+            "the credential in pre-tool narration must be redacted before reaching \
+             Telegram; bodies: {send_message_bodies:?}"
+        );
+        assert!(
+            send_message_bodies
+                .iter()
+                .any(|body| body.contains("запускаю инструмент")),
+            "the narration itself must still be delivered (redacted), proving the \
+             guard ran on a real send; bodies: {send_message_bodies:?}"
+        );
+    }
+
+    /// Regression: an `on_message_sending` hook that
+    /// rewrites the outbound content must apply to the permanent narration send —
+    /// the raw pre-hook narration must never reach Telegram, since the hook cannot
+    /// retract an already-posted message.
+    #[cfg(feature = "channel-telegram")]
+    #[tokio::test]
+    async fn multi_message_narration_applies_send_hook_before_send() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": true, "result": { "message_id": 1 } }),
+                ),
+            )
+            .mount(&mock_server)
+            .await;
+
+        use parking_lot::RwLock;
+        use std::sync::Arc;
+        use zeroclaw_config::schema::{Config, TelegramConfig};
+
+        let mut cfg = Config::default();
+        cfg.channels.telegram.insert(
+            "telegram_test_alias".to_string(),
+            TelegramConfig {
+                bot_token: "fake-token".into(),
+                multi_message_delay_ms: 0,
+                ..TelegramConfig::default()
+            },
+        );
+        let config_arc = Arc::new(RwLock::new(cfg));
+
+        let telegram: Arc<dyn Channel> = Arc::new(
+            TelegramChannel::new(
+                "fake-token".into(),
+                "telegram_test_alias",
+                Arc::new(|| vec!["*".into()]),
+                false,
+            )
+            .with_persistence(config_arc)
+            .with_streaming(zeroclaw_config::schema::StreamMode::MultiMessage, 750)
+            .with_api_base(mock_server.uri())
+            .with_approval_timeout_secs(0),
+        );
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(telegram.name().to_string(), telegram);
+
+        let mut hook_runner = zeroclaw_runtime::hooks::HookRunner::new();
+        hook_runner.register(Box::new(RewritingSendHook));
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            model_provider: Arc::new(NarratingNativeToolProvider {
+                calls: AtomicUsize::new(0),
+            }),
+            model_provider_ref: Arc::new("test-provider".to_string()),
+            agent_alias: Arc::new("test-agent".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
+            memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
+            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: Some(0.0),
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
+            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+            provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+                whatsapp: false,
+            },
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+            agent_transcription_provider: String::new(),
+            hooks: Some(Arc::new(hook_runner)),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: zeroclaw_config::schema::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+                Duration::ZERO,
+            )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
+            last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-1".to_string(),
+                sender: "zeroclaw_user".to_string(),
+                reply_target: "123".to_string(),
+                content: "Запусти инструмент".to_string(),
+                channel: "telegram".into(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let requests = mock_server
+            .received_requests()
+            .await
+            .expect("wiremock records requests");
+        let send_message_bodies: Vec<String> = requests
+            .iter()
+            .filter(|r| r.url.path().ends_with("/sendMessage"))
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+
+        assert!(
+            !send_message_bodies
+                .iter()
+                .any(|body| body.contains("Понял, запускаю инструмент")),
+            "the raw pre-hook narration must never reach Telegram; \
+             bodies: {send_message_bodies:?}"
+        );
+        assert!(
+            send_message_bodies
+                .iter()
+                .any(|body| body.contains(HOOK_REWRITTEN_NARRATION)),
+            "the hook-rewritten narration must be the text actually sent; \
+             bodies: {send_message_bodies:?}"
+        );
+    }
+
+    /// Regression: for an
+    /// approval-requiring tool turn the runtime emits both a `StreamDelta::Status`
+    /// and a following `StreamDelta::FlushBarrier`. The completed narration turn
+    /// must cross the (non-idempotent) `on_message_sending` outbound hook EXACTLY
+    /// ONCE — the barrier only acknowledges a turn a preceding `Status` already
+    /// owned, rather than re-running policy on the same buffer. Before the fix the
+    /// draft updater processed the same accumulated narration twice (once per
+    /// event); Telegram's prefix bookkeeping hid the duplicate *send*, but the
+    /// hook still saw the content twice, so a stateful hook could allow the first
+    /// pass and cancel/rewrite the second.
+    #[cfg(feature = "channel-telegram")]
+    #[tokio::test]
+    async fn multi_message_approval_narration_crosses_outbound_hook_once() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": true, "result": { "message_id": 1 } }),
+                ),
+            )
+            .mount(&mock_server)
+            .await;
+
+        use parking_lot::RwLock;
+        use std::sync::Arc;
+        use zeroclaw_config::schema::{Config, TelegramConfig};
+
+        let mut cfg = Config::default();
+        cfg.channels.telegram.insert(
+            "telegram_test_alias".to_string(),
+            TelegramConfig {
+                bot_token: "fake-token".into(),
+                multi_message_delay_ms: 0,
+                ..TelegramConfig::default()
+            },
+        );
+        let config_arc = Arc::new(RwLock::new(cfg));
+
+        let telegram: Arc<dyn Channel> = Arc::new(
+            TelegramChannel::new(
+                "fake-token".into(),
+                "telegram_test_alias",
+                Arc::new(|| vec!["*".into()]),
+                false,
+            )
+            .with_persistence(config_arc)
+            .with_streaming(zeroclaw_config::schema::StreamMode::MultiMessage, 750)
+            .with_api_base(mock_server.uri())
+            .with_approval_timeout_secs(0),
+        );
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(telegram.name().to_string(), telegram);
+
+        // Record every outbound-hook crossing so we can count how many times the
+        // completed narration turn passes through it.
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let mut hook_runner = zeroclaw_runtime::hooks::HookRunner::new();
+        hook_runner.register(Box::new(RecordingSendHook { seen: seen.clone() }));
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            model_provider: Arc::new(NarratingNativeToolProvider {
+                calls: AtomicUsize::new(0),
+            }),
+            model_provider_ref: Arc::new("test-provider".to_string()),
+            agent_alias: Arc::new("test-agent".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
+            memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
+            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: Some(0.0),
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
+            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+            provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+                whatsapp: false,
+            },
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+            agent_transcription_provider: String::new(),
+            hooks: Some(Arc::new(hook_runner)),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: zeroclaw_config::schema::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+                Duration::ZERO,
+            )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
+            last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-1".to_string(),
+                sender: "zeroclaw_user".to_string(),
+                reply_target: "123".to_string(),
+                content: "Запусти инструмент".to_string(),
+                channel: "telegram".into(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        // The completed narration turn ("Понял, запускаю инструмент") must cross
+        // the outbound hook exactly once, even though both `Status` and
+        // `FlushBarrier` observe the same accumulated buffer before the approval
+        // prompt. Before the fix this was 2.
+        let crossings = seen
+            .lock()
+            .iter()
+            .filter(|c| c.contains("запускаю инструмент"))
+            .count();
+        assert_eq!(
+            crossings,
+            1,
+            "completed narration must cross the outbound hook exactly once before \
+             the approval prompt; saw {crossings}. All crossings: {:?}",
+            seen.lock()
+        );
+    }
+
+    /// Regression: outbound policy owns each completed narration turn, not the
+    /// whole accumulated history. Narration is append-only, so a later turn
+    /// arrives as a superset snapshot ("AAA", then "AAABBB"). The non-idempotent
+    /// `on_message_sending` hook must observe the first turn EXACTLY ONCE — not
+    /// again when the second turn expands the snapshot — and the second turn must
+    /// cross as just its own delta. Before the per-turn fix,
+    /// `flush_completed_narration_turn` ran policy over the whole superset each
+    /// time, so the hook saw the first turn twice and a stateful hook could allow
+    /// it the first time then cancel or rewrite it the second.
+    #[cfg(feature = "channel-telegram")]
+    #[tokio::test]
+    async fn each_completed_narration_turn_crosses_outbound_hook_once() {
+        // A channel whose draft hooks are the trait defaults (no-op): the
+        // outbound hook fires before any channel flush, so what the channel does
+        // with the flushed text is irrelevant to counting hook crossings.
+        struct NoopFlushChannel;
+        impl ::zeroclaw_api::attribution::Attributable for NoopFlushChannel {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Channel(
+                    ::zeroclaw_api::attribution::ChannelKind::Webhook,
+                )
+            }
+            fn alias(&self) -> &str {
+                "test"
+            }
+        }
+        #[async_trait::async_trait]
+        impl Channel for NoopFlushChannel {
+            fn name(&self) -> &str {
+                "test-channel"
+            }
+            async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn listen(
+                &self,
+                _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let seen = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let mut hook_runner = zeroclaw_runtime::hooks::HookRunner::new();
+        hook_runner.register(Box::new(RecordingSendHook { seen: seen.clone() }));
+
+        let channel: Arc<dyn Channel> = Arc::new(NoopFlushChannel);
+        let leak = zeroclaw_config::schema::LeakDetectionConfig::default();
+        let mut last_flushed = String::new();
+        let mut owned_guarded = String::new();
+
+        // Turn 1 completes: the visible narration buffer is "AAA".
+        flush_completed_narration_turn(
+            &channel,
+            Some(&hook_runner),
+            &leak,
+            "telegram",
+            "123",
+            "draft-1",
+            "AAA",
+            &mut last_flushed,
+            &mut owned_guarded,
+        )
+        .await;
+        // Turn 2 completes: the append-only buffer is now the superset "AAABBB".
+        flush_completed_narration_turn(
+            &channel,
+            Some(&hook_runner),
+            &leak,
+            "telegram",
+            "123",
+            "draft-1",
+            "AAABBB",
+            &mut last_flushed,
+            &mut owned_guarded,
+        )
+        .await;
+
+        let seen = seen.lock();
+        let first_turn_crossings = seen.iter().filter(|c| c.contains("AAA")).count();
+        assert_eq!(
+            first_turn_crossings, 1,
+            "turn 1 must cross the outbound hook exactly once, not again when turn 2 \
+             expands the snapshot; crossings: {:?}",
+            *seen
+        );
+        assert!(
+            seen.iter().any(|c| c == "BBB"),
+            "turn 2 must cross as just its own delta 'BBB', not the whole 'AAABBB' \
+             snapshot; crossings: {:?}",
+            *seen
+        );
+    }
+
+    /// Regression: a credential split across two completed narration turns must
+    /// not be reconstructable from what the channel receives. The per-turn scan
+    /// is blind to a secret whose halves land in adjacent permanent sends; the
+    /// bounded prior-context scan must scrub this turn's fragment so the
+    /// delivered snapshot cannot be concatenated back into the full value.
+    #[cfg(feature = "channel-telegram")]
+    #[tokio::test]
+    async fn multi_message_split_credential_across_turns_is_not_reconstructable() {
+        struct NoopFlushChannel;
+        impl ::zeroclaw_api::attribution::Attributable for NoopFlushChannel {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Channel(
+                    ::zeroclaw_api::attribution::ChannelKind::Webhook,
+                )
+            }
+            fn alias(&self) -> &str {
+                "test"
+            }
+        }
+        #[async_trait::async_trait]
+        impl Channel for NoopFlushChannel {
+            fn name(&self) -> &str {
+                "telegram"
+            }
+            async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn listen(
+                &self,
+                _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let channel: Arc<dyn Channel> = Arc::new(NoopFlushChannel);
+        // Leak detection is on by default; the AWS deterministic pattern runs.
+        let leak = zeroclaw_config::schema::LeakDetectionConfig::default();
+        let mut last_flushed = String::new();
+        let mut owned_guarded = String::new();
+
+        // Turn 1: the first half of an AWS access key id (`AKIA` + 8 chars).
+        // Incomplete on its own — the detector does not match it in isolation.
+        flush_completed_narration_turn(
+            &channel,
+            None,
+            &leak,
+            "telegram",
+            "123",
+            "draft-1",
+            "AKIAABCDEFGH",
+            &mut last_flushed,
+            &mut owned_guarded,
+        )
+        .await;
+        // Turn 2 appends the remaining 8 chars, completing `AKIA` + 16 across the
+        // turn boundary.
+        flush_completed_narration_turn(
+            &channel,
+            None,
+            &leak,
+            "telegram",
+            "123",
+            "draft-1",
+            "AKIAABCDEFGHIJKLMNOP",
+            &mut last_flushed,
+            &mut owned_guarded,
+        )
+        .await;
+
+        // `owned_guarded` is exactly the guarded snapshot handed to the channel,
+        // i.e. the concatenation of what Telegram receives across the turns.
+        assert!(
+            !owned_guarded.contains("AKIAABCDEFGHIJKLMNOP"),
+            "the full split credential must not be reconstructable from the \
+             delivered snapshot; guarded: {owned_guarded:?}"
+        );
+        assert!(
+            !owned_guarded.contains("IJKLMNOP"),
+            "the second fragment must be scrubbed so concatenation cannot rebuild \
+             the credential; guarded: {owned_guarded:?}"
+        );
+        assert!(
+            owned_guarded.contains("[REDACTED"),
+            "a redaction marker must mark the scrubbed fragment; guarded: {owned_guarded:?}"
+        );
+    }
+
+    /// Regression: cross-turn leak detection must use the GUARDED delivered
+    /// history (`owned_guarded`), not the raw watermark (`last_flushed`). When an
+    /// outbound hook CREATES a credential fragment that exists only in the
+    /// guarded output, a raw-history scan is blind to it and the fragment
+    /// completed by the next turn reconstructs the secret. Feeding the guarded
+    /// tail as prior context catches it. (This exact command fails if the
+    /// detector reads `last_flushed`.)
+    #[cfg(feature = "channel-telegram")]
+    #[tokio::test]
+    async fn cross_turn_leak_uses_hook_created_guarded_fragment() {
+        struct NoopFlushChannel;
+        impl ::zeroclaw_api::attribution::Attributable for NoopFlushChannel {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Channel(
+                    ::zeroclaw_api::attribution::ChannelKind::Webhook,
+                )
+            }
+            fn alias(&self) -> &str {
+                "test"
+            }
+        }
+        #[async_trait::async_trait]
+        impl Channel for NoopFlushChannel {
+            fn name(&self) -> &str {
+                "telegram"
+            }
+            async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn listen(
+                &self,
+                _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        // A stateful hook that REWRITES the first narration turn into an AWS key
+        // ID prefix (`AKIA` + 8 chars — incomplete on its own) and passes the
+        // second turn through. The prefix therefore lives only in the guarded
+        // delivered output, never in the raw model narration.
+        struct HookCreatesCredentialPrefix {
+            calls: AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl zeroclaw_runtime::hooks::HookHandler for HookCreatesCredentialPrefix {
+            fn name(&self) -> &str {
+                "hook-creates-credential-prefix"
+            }
+            async fn on_message_sending(
+                &self,
+                channel: String,
+                recipient: String,
+                content: String,
+            ) -> zeroclaw_runtime::hooks::HookResult<(String, String, String)> {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    zeroclaw_runtime::hooks::HookResult::Continue((
+                        channel,
+                        recipient,
+                        "AKIAABCDEFGH".to_string(),
+                    ))
+                } else {
+                    zeroclaw_runtime::hooks::HookResult::Continue((channel, recipient, content))
+                }
+            }
+        }
+
+        let mut hook_runner = zeroclaw_runtime::hooks::HookRunner::new();
+        hook_runner.register(Box::new(HookCreatesCredentialPrefix {
+            calls: AtomicUsize::new(0),
+        }));
+
+        let channel: Arc<dyn Channel> = Arc::new(NoopFlushChannel);
+        let leak = zeroclaw_config::schema::LeakDetectionConfig::default();
+        let mut last_flushed = String::new();
+        let mut owned_guarded = String::new();
+
+        // Turn 1: raw narration the hook rewrites to the credential prefix.
+        flush_completed_narration_turn(
+            &channel,
+            Some(&hook_runner),
+            &leak,
+            "telegram",
+            "123",
+            "draft-1",
+            "narration one",
+            &mut last_flushed,
+            &mut owned_guarded,
+        )
+        .await;
+        // Turn 2 appends the 8 chars that complete the key across the boundary.
+        // The raw watermark for turn 2 is the append-only `"narration one" + suffix`.
+        flush_completed_narration_turn(
+            &channel,
+            Some(&hook_runner),
+            &leak,
+            "telegram",
+            "123",
+            "draft-1",
+            "narration oneIJKLMNOP",
+            &mut last_flushed,
+            &mut owned_guarded,
+        )
+        .await;
+
+        // `owned_guarded` is exactly what Telegram received across the turns.
+        assert!(
+            !owned_guarded.contains("AKIAABCDEFGHIJKLMNOP"),
+            "a hook-created credential prefix completed by the next turn must not \
+             be reconstructable from the delivered guarded snapshot; guarded: {owned_guarded:?}"
+        );
+        assert!(
+            !owned_guarded.contains("IJKLMNOP"),
+            "the completing fragment must be scrubbed; guarded: {owned_guarded:?}"
+        );
+    }
+
+    /// Regression: the opposite direction. A credential fully contained in turn 1
+    /// is redacted before delivery, so it is absent from the guarded history. A
+    /// clean turn 2 must therefore be delivered UNCHANGED. Reading the raw
+    /// watermark instead would re-find the credential in the raw prior tail and
+    /// falsely prepend a redaction marker to the clean turn.
+    #[cfg(feature = "channel-telegram")]
+    #[tokio::test]
+    async fn cross_turn_clean_turn_after_redacted_credential_is_unchanged() {
+        struct NoopFlushChannel;
+        impl ::zeroclaw_api::attribution::Attributable for NoopFlushChannel {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Channel(
+                    ::zeroclaw_api::attribution::ChannelKind::Webhook,
+                )
+            }
+            fn alias(&self) -> &str {
+                "test"
+            }
+        }
+        #[async_trait::async_trait]
+        impl Channel for NoopFlushChannel {
+            fn name(&self) -> &str {
+                "telegram"
+            }
+            async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn listen(
+                &self,
+                _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let channel: Arc<dyn Channel> = Arc::new(NoopFlushChannel);
+        let leak = zeroclaw_config::schema::LeakDetectionConfig::default();
+        let mut last_flushed = String::new();
+        let mut owned_guarded = String::new();
+
+        // Turn 1: a COMPLETE AWS key id, redacted before delivery.
+        flush_completed_narration_turn(
+            &channel,
+            None,
+            &leak,
+            "telegram",
+            "123",
+            "draft-1",
+            "AKIAABCDEFGHIJKLMNOP",
+            &mut last_flushed,
+            &mut owned_guarded,
+        )
+        .await;
+        let after_turn1 = owned_guarded.clone();
+
+        // Turn 2 appends clean narration (no secret).
+        flush_completed_narration_turn(
+            &channel,
+            None,
+            &leak,
+            "telegram",
+            "123",
+            "draft-1",
+            "AKIAABCDEFGHIJKLMNOP hello world",
+            &mut last_flushed,
+            &mut owned_guarded,
+        )
+        .await;
+
+        // Turn 1's guarded fragment must not leak the raw key.
+        assert!(
+            !after_turn1.contains("AKIAABCDEFGHIJKLMNOP"),
+            "turn 1 must redact the complete credential; guarded: {after_turn1:?}"
+        );
+        // Turn 2's delivered delta must be the clean text verbatim — no false
+        // redaction marker introduced by a stale raw prior tail.
+        let turn2_delivered = owned_guarded
+            .strip_prefix(after_turn1.as_str())
+            .unwrap_or(owned_guarded.as_str());
+        assert_eq!(
+            turn2_delivered, " hello world",
+            "a clean turn after an already-redacted credential must be delivered \
+             unchanged; delivered: {turn2_delivered:?}"
+        );
+    }
+
+    /// Regression: a stateful
+    /// `on_message_sending` hook that cancels a narration flush must never let that
+    /// same cancelled narration reach Telegram via a later flush of the same buffer.
+    /// Cancellation is turn-scoped — the channel `discard_draft_turn`s the cancelled
+    /// text so a later flush of the unchanged buffer finds no unsent suffix — rather
+    /// than a stream-wide latch that would also gag a genuinely later turn. The
+    /// later-turn liveness direction is covered at the channel layer by
+    /// `discard_draft_turn_excludes_cancelled_turn_without_dropping_prior_delivery`.
+    #[cfg(feature = "channel-telegram")]
+    #[tokio::test]
+    async fn multi_message_cancelled_narration_is_not_resurrected_by_a_later_flush() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": true, "result": { "message_id": 1 } }),
+                ),
+            )
+            .mount(&mock_server)
+            .await;
+
+        use parking_lot::RwLock;
+        use std::sync::Arc;
+        use zeroclaw_config::schema::{Config, TelegramConfig};
+
+        let mut cfg = Config::default();
+        cfg.channels.telegram.insert(
+            "telegram_test_alias".to_string(),
+            TelegramConfig {
+                bot_token: "fake-token".into(),
+                multi_message_delay_ms: 0,
+                ..TelegramConfig::default()
+            },
+        );
+        let config_arc = Arc::new(RwLock::new(cfg));
+
+        let telegram: Arc<dyn Channel> = Arc::new(
+            TelegramChannel::new(
+                "fake-token".into(),
+                "telegram_test_alias",
+                Arc::new(|| vec!["*".into()]),
+                false,
+            )
+            .with_persistence(config_arc)
+            .with_streaming(zeroclaw_config::schema::StreamMode::MultiMessage, 750)
+            .with_api_base(mock_server.uri())
+            .with_approval_timeout_secs(0),
+        );
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(telegram.name().to_string(), telegram);
+
+        let mut hook_runner = zeroclaw_runtime::hooks::HookRunner::new();
+        hook_runner.register(Box::new(CancellingSendHook {
+            calls: AtomicUsize::new(0),
+        }));
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            model_provider: Arc::new(NarratingNativeToolProvider {
+                calls: AtomicUsize::new(0),
+            }),
+            model_provider_ref: Arc::new("test-provider".to_string()),
+            agent_alias: Arc::new("test-agent".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
+            memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
+            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: Some(0.0),
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
+            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+            provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+                whatsapp: false,
+            },
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+            agent_transcription_provider: String::new(),
+            hooks: Some(Arc::new(hook_runner)),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: zeroclaw_config::schema::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+                Duration::ZERO,
+            )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
+            last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-1".to_string(),
+                sender: "zeroclaw_user".to_string(),
+                reply_target: "123".to_string(),
+                content: "Запусти инструмент".to_string(),
+                channel: "telegram".into(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let requests = mock_server
+            .received_requests()
+            .await
+            .expect("wiremock records requests");
+        let send_message_bodies: Vec<String> = requests
+            .iter()
+            .filter(|r| r.url.path().ends_with("/sendMessage"))
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+
+        assert!(
+            !send_message_bodies
+                .iter()
+                .any(|body| body.contains("Понял, запускаю инструмент")),
+            "narration cancelled at the first flush must never reach Telegram via a \
+             later flush; bodies: {send_message_bodies:?}"
+        );
+        // Liveness: the final answer (a separate, later on_message_sending call that
+        // the hook allows) still reaches Telegram, proving the latch suppressed only
+        // the cancelled narration rather than gagging the whole turn.
+        assert!(
+            send_message_bodies
+                .iter()
+                .any(|body| body.contains("Инструмент отклонён, завершаю ход.")),
+            "the allowed final answer must still be delivered; \
+             bodies: {send_message_bodies:?}"
+        );
     }
 
     #[tokio::test]
@@ -27713,6 +29613,7 @@ This is an example JSON object for profile settings."#;
                 api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
                 stream_mode: zeroclaw_config::schema::StreamMode::Off,
                 draft_update_interval_ms: 1000,
+                multi_message_delay_ms: 800,
                 interrupt_on_new_message: false,
                 mention_only: false,
                 ack_reactions: None,
@@ -27742,6 +29643,7 @@ This is an example JSON object for profile settings."#;
                 api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
                 stream_mode: zeroclaw_config::schema::StreamMode::Off,
                 draft_update_interval_ms: 1000,
+                multi_message_delay_ms: 800,
                 interrupt_on_new_message: false,
                 mention_only: false,
                 ack_reactions: None,

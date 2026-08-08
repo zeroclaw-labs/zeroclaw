@@ -2378,6 +2378,11 @@ pub async fn run(
                                 print!("{text}");
                                 let _ = std::io::stdout().flush();
                             }
+                            StreamDelta::FlushBarrier(ack) => {
+                                // CLI prints deltas immediately; nothing is
+                                // buffered, so release the barrier right away.
+                                StreamDelta::ack_flush_barrier(&ack);
+                            }
                         }
                     }
                 });
@@ -10101,6 +10106,7 @@ This is an example, not an invocation."#;
                 StreamDelta::Status(text) | StreamDelta::Text(text) =>
                     !text.contains("private chain of thought") && !text.contains("<think>"),
                 StreamDelta::Lifecycle(_) => true,
+                StreamDelta::FlushBarrier(_) => true,
             }),
             "draft deltas must not expose inline think tags: {deltas:?}"
         );
@@ -10195,7 +10201,9 @@ This is an example, not an invocation."#;
         let mut visible_deltas = String::new();
         while let Some(delta) = rx.recv().await {
             match delta {
-                StreamDelta::Status(_) | StreamDelta::Lifecycle(_) => {}
+                StreamDelta::Status(_)
+                | StreamDelta::Lifecycle(_)
+                | StreamDelta::FlushBarrier(_) => {}
                 StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
@@ -10287,7 +10295,9 @@ This is an example, not an invocation."#;
         let mut visible_deltas = String::new();
         while let Some(delta) = rx.recv().await {
             match delta {
-                StreamDelta::Status(_) | StreamDelta::Lifecycle(_) => {}
+                StreamDelta::Status(_)
+                | StreamDelta::Lifecycle(_)
+                | StreamDelta::FlushBarrier(_) => {}
                 StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
@@ -11273,7 +11283,9 @@ This is an example, not an invocation."#;
         let mut visible_deltas = String::new();
         while let Some(delta) = rx.recv().await {
             match delta {
-                StreamDelta::Status(_) | StreamDelta::Lifecycle(_) => {}
+                StreamDelta::Status(_)
+                | StreamDelta::Lifecycle(_)
+                | StreamDelta::FlushBarrier(_) => {}
                 StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
@@ -11745,7 +11757,9 @@ This is an example, not an invocation."#;
         let mut visible_deltas = String::new();
         while let Some(delta) = rx.recv().await {
             match delta {
-                StreamDelta::Status(_) | StreamDelta::Lifecycle(_) => {}
+                StreamDelta::Status(_)
+                | StreamDelta::Lifecycle(_)
+                | StreamDelta::FlushBarrier(_) => {}
                 StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
@@ -14161,6 +14175,7 @@ Let me check the result."#;
             .map(|d| match d {
                 StreamDelta::Status(t) | StreamDelta::Text(t) => t.as_str(),
                 StreamDelta::Lifecycle(_) => "",
+                StreamDelta::FlushBarrier(_) => "",
             })
             .collect();
 

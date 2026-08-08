@@ -3869,6 +3869,44 @@ fn streaming_key(recipient: &str, message_id: &str) -> Result<streaming::DraftKe
 // ─── tests ─────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
+    /// Regression: Matrix
+    /// streams paragraphs via `update_draft` and does NOT implement the
+    /// `flush_draft_turn` narration contract, so it must NOT opt into the
+    /// orchestrator's narration-policy + flush-barrier path. Otherwise outbound
+    /// hooks fire on phantom flushes that deliver nothing while Matrix's real
+    /// paragraph sends bypass the policy. `supports_multi_message_streaming` stays
+    /// true (its own paragraph streaming); only the turn-flush capability is off.
+    #[test]
+    fn matrix_does_not_opt_into_turn_flush_narration() {
+        use super::MatrixChannel;
+        use std::sync::Arc;
+        use zeroclaw_api::channel::Channel;
+        use zeroclaw_config::schema::{MatrixConfig, StreamMode};
+
+        let config = MatrixConfig {
+            homeserver: "https://matrix.example".to_string(),
+            access_token: Some("token".to_string()),
+            stream_mode: StreamMode::MultiMessage,
+            ..MatrixConfig::default()
+        };
+        let ch = MatrixChannel::new(
+            config,
+            "alias",
+            Arc::new(Vec::<String>::new),
+            std::env::temp_dir(),
+        )
+        .expect("matrix channel constructs from valid config");
+
+        assert!(
+            ch.supports_multi_message_streaming(),
+            "Matrix still streams paragraphs in multi_message mode"
+        );
+        assert!(
+            !ch.supports_turn_flush_narration(),
+            "Matrix must not run the orchestrator narration-policy path on phantom flushes"
+        );
+    }
+
     mod transcription_provider_resolution {
         use super::super::inbound::build_transcription_manager;
         use zeroclaw_config::schema::TranscriptionConfig;
