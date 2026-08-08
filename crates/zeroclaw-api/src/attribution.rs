@@ -484,4 +484,16 @@ mod tests {
         );
         assert_eq!(Role::System.attribution_field(), Some("system_alias"));
     }
+
+    #[test]
+    fn role_family_str_returns_stable_tags() {
+        assert_eq!(Role::Agent.family_str(), "agent");
+        assert_eq!(Role::Swarm.family_str(), "swarm");
+        assert_eq!(Role::Channel(ChannelKind::Discord).family_str(), "channel");
+        assert_eq!(Role::Tool(ToolKind::Shell).family_str(), "tool");
+        assert_eq!(Role::Cron(CronKind::Interval).family_str(), "cron");
+        assert_eq!(Role::Memory(MemoryKind::Sqlite).family_str(), "memory");
+        assert_eq!(Role::Session.family_str(), "session");
+        assert_eq!(Role::System.family_str(), "system");
+    }
 }
