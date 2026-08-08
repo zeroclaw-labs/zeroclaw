@@ -3,8 +3,9 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use crate::pricing::{ModelRates, sane_mtok};
 use anyhow::Result;
@@ -18,33 +19,20 @@ const FETCH_TIMEOUT_SECS: u64 = 10;
 /// iteration that runs the per-turn warm call.
 const CATALOG_FETCH_RETRY_BACKOFF_SECS: i64 = 60;
 
-/// UNIX seconds of the last failed catalog fetch, or `0` if none failed yet.
-/// Consulted by [`ensure_catalog_loaded`] to bound retry frequency; the
-/// `get_or_try_init` path used by explicit listings is unaffected.
-static LAST_CATALOG_FETCH_FAILURE_UNIX: AtomicI64 = AtomicI64::new(0);
-
-/// Serializes catalog fetches: at most one in-flight network attempt at any
-/// time. Concurrent [`ensure_catalog_loaded`] callers wait on this lock, so an
-/// outage cannot start multiple 10-second fetch attempts in parallel. The
-/// retry-deadline check runs both before and inside the lock, so a caller that
-/// waited for a failed fetch re-evaluates the deadline that fetch recorded
-/// before starting its own attempt.
-static CATALOG_FETCH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 /// Serializes the tests that mutate the process-global catalog state
-/// (`CACHED_CATALOG` / `LAST_CATALOG_FETCH_FAILURE_UNIX`). Shared by the
-/// lifecycle tests in this module and the catalog-injection tests in
-/// `compatible.rs` / `reliable.rs`, so a lifecycle test that seeds
-/// `TINY_CATALOG` cannot race an injection test's `CACHED_CATALOG.set` in the
-/// same test binary (OnceCell `set` fails on an already-populated cell and the
-/// injection then silently looks up the wrong catalog).
+/// (`CACHED_CATALOG` and the global lifecycle). Shared by the lifecycle tests
+/// in this module and the catalog-injection tests in `compatible.rs` /
+/// `reliable.rs`, so a lifecycle test that seeds `TINY_CATALOG` cannot race an
+/// injection test's `CACHED_CATALOG.set` in the same test binary (OnceCell
+/// `set` fails on an already-populated cell and the injection then silently
+/// looks up the wrong catalog).
 #[cfg(test)]
 static CATALOG_LIFECYCLE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Test-only: acquire the process-global catalog-state lock before mutating
-/// `CACHED_CATALOG` / `LAST_CATALOG_FETCH_FAILURE_UNIX`. Catalog-injection
-/// tests in sibling modules share the same global state as this module's
-/// lifecycle tests and must serialize on the same lock.
+/// `CACHED_CATALOG`. Catalog-injection tests in sibling modules share the same
+/// global state as this module's lifecycle tests and must serialize on the
+/// same lock.
 #[cfg(test)]
 pub(crate) async fn __private_test_catalog_lock() -> tokio::sync::MutexGuard<'static, ()> {
     CATALOG_LIFECYCLE_TEST_LOCK.lock().await
@@ -74,11 +62,109 @@ async fn run_catalog_fetch() -> Result<Arc<Catalog>> {
     fetch_catalog().await
 }
 
-fn now_unix_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
-        .unwrap_or(0)
+/// Monotonic clock reading in seconds, offset away from zero. Uses a
+/// process-start anchor (`std::time::Instant`, which is unaffected by
+/// wall-clock adjustments), so the retry deadline is genuinely monotonic — a
+/// system clock jump cannot extend or bypass the backoff window. The offset
+/// guarantees the reading is never `0` (which is the "no prior failure"
+/// sentinel in `LAST_CATALOG_FETCH_FAILURE_UNIX`): at process start, elapsed
+/// is `0s`, which would falsely read as "no failure". Offsetting both `now`
+/// and recorded deadlines by the same constant keeps the relative backoff
+/// comparison unchanged. The production lifecycle uses this clock; lifecycle
+/// tests inject a manual clock via [`CatalogLifecycle`] instead.
+const CATALOG_CLOCK_OFFSET_SECS: i64 = 1_000_000_000;
+
+fn now_monotonic_secs() -> i64 {
+    static PROCESS_START: OnceLock<Instant> = OnceLock::new();
+    let start = *PROCESS_START.get_or_init(Instant::now);
+    i64::try_from(start.elapsed().as_secs())
+        .map(|elapsed| elapsed + CATALOG_CLOCK_OFFSET_SECS)
+        .unwrap_or(i64::MAX)
+}
+
+/// The catalog lifecycle: one fetch/retry policy owned by every caller
+/// (warming via `ensure_catalog_loaded`, listings via `list_models_for` /
+/// `list_models_with_context_for`). The single-flight lock, the monotonic
+/// retry deadline, the clock, and the fetcher are all injectable, so a test
+/// can construct an isolated lifecycle (its own cache + clock + fetcher) and
+/// every transition test always runs — no dependency on the process-global
+/// cache state.
+struct CatalogLifecycle {
+    in_flight: tokio::sync::Mutex<()>,
+    last_failure: AtomicI64,
+    clock: Box<dyn Fn() -> i64 + Send + Sync>,
+    fetcher: Box<dyn Fn() -> CatalogFetchFuture + Send + Sync>,
+}
+
+impl CatalogLifecycle {
+    fn production() -> Self {
+        Self {
+            in_flight: tokio::sync::Mutex::const_new(()),
+            last_failure: AtomicI64::new(0),
+            clock: Box::new(now_monotonic_secs),
+            fetcher: Box::new(|| Box::pin(run_catalog_fetch())),
+        }
+    }
+
+    /// Populate `cache` following the single lifecycle policy: populated
+    /// cache wins over any stale deadline; a fresh failure deadline rejects
+    /// the fetch inside the backoff window; concurrent callers share one
+    /// in-flight fetch via `in_flight`; a failed fetch records the deadline.
+    async fn ensure_loaded(&self, cache: &OnceCell<Arc<Catalog>>) -> Result<()> {
+        // 1. Already populated (possibly by another path) — success regardless
+        //    of any stale backoff deadline. Checking this before the deadline
+        //    means a stale failure timestamp can never reject warming when the
+        //    catalog actually loaded via another path.
+        if cache.get().is_some() {
+            return Ok(());
+        }
+
+        // Monotonic retry deadline: within `CATALOG_FETCH_RETRY_BACKOFF_SECS`
+        // of a failure, reject the fetch so a models.dev outage does not add a
+        // 10-second timeout to every tool-loop iteration's warm call.
+        let in_retry_backoff = || {
+            let last_failure = self.last_failure.load(Ordering::Acquire);
+            last_failure != 0 && (self.clock)() < last_failure + CATALOG_FETCH_RETRY_BACKOFF_SECS
+        };
+        if in_retry_backoff() {
+            anyhow::bail!("models.dev catalog fetch is in retry backoff after a recent failure");
+        }
+
+        // 2. Single-flight: serialize fetches so an outage cannot start
+        //    multiple network attempts concurrently. A caller that waited for
+        //    a failed fetch re-evaluates the deadline that fetch just recorded
+        //    before starting its own attempt (the check inside the lock).
+        let _guard = self.in_flight.lock().await;
+        if cache.get().is_some() {
+            return Ok(());
+        }
+        if in_retry_backoff() {
+            anyhow::bail!("models.dev catalog fetch is in retry backoff after a recent failure");
+        }
+
+        // 3. Own the only in-flight slot: fetch, cache the result, and record
+        //    the failure deadline if it failed.
+        match (self.fetcher)().await {
+            Ok(catalog) => {
+                let _ = cache.set(catalog);
+                Ok(())
+            }
+            Err(err) => {
+                self.last_failure.store((self.clock)(), Ordering::Release);
+                Err(err)
+            }
+        }
+    }
+}
+
+/// Process-wide lifecycle used by production (`ensure_catalog_loaded` and the
+/// listing functions). Its fetcher honors `CATALOG_FETCH_OVERRIDE`, so tests
+/// that exercise the global path can still avoid network access; tests that
+/// need full isolation construct their own `CatalogLifecycle`.
+static GLOBAL_CATALOG_LIFECYCLE: OnceLock<CatalogLifecycle> = OnceLock::new();
+
+fn global_catalog_lifecycle() -> &'static CatalogLifecycle {
+    GLOBAL_CATALOG_LIFECYCLE.get_or_init(CatalogLifecycle::production)
 }
 
 #[derive(Debug, Deserialize)]
@@ -204,49 +290,9 @@ pub(crate) fn filter_models(catalog: &Catalog, provider_key: &str) -> Result<Vec
 /// through their native `/models` endpoint). No-op once loaded.
 /// Called from async agent-turn context before the capability query.
 pub(crate) async fn ensure_catalog_loaded() -> Result<()> {
-    // 1. Already populated (possibly by the explicit-listing path) — success
-    //    regardless of any stale backoff deadline. Checking this before the
-    //    deadline means a stale failure timestamp can never reject warming
-    //    when the catalog actually loaded via another path.
-    if CACHED_CATALOG.get().is_some() {
-        return Ok(());
-    }
-
-    // Monotonic retry deadline: within `CATALOG_FETCH_RETRY_BACKOFF_SECS` of a
-    // failure, reject the fetch so a models.dev outage does not add a
-    // 10-second timeout to every tool-loop iteration's warm call.
-    let in_retry_backoff = || {
-        let last_failure = LAST_CATALOG_FETCH_FAILURE_UNIX.load(Ordering::Acquire);
-        last_failure != 0 && now_unix_secs() < last_failure + CATALOG_FETCH_RETRY_BACKOFF_SECS
-    };
-    if in_retry_backoff() {
-        anyhow::bail!("models.dev catalog fetch is in retry backoff after a recent failure");
-    }
-
-    // 2. Single-flight: serialize fetches so an outage cannot start multiple
-    //    network attempts concurrently. A caller that waited for a failed
-    //    fetch re-evaluates the deadline that fetch just recorded before
-    //    starting its own attempt (the check inside the lock).
-    let _guard = CATALOG_FETCH_LOCK.lock().await;
-    if CACHED_CATALOG.get().is_some() {
-        return Ok(());
-    }
-    if in_retry_backoff() {
-        anyhow::bail!("models.dev catalog fetch is in retry backoff after a recent failure");
-    }
-
-    // 3. Own the only in-flight slot: fetch, cache the result, and record the
-    //    failure deadline if it failed.
-    match run_catalog_fetch().await {
-        Ok(catalog) => {
-            let _ = CACHED_CATALOG.set(catalog);
-            Ok(())
-        }
-        Err(err) => {
-            LAST_CATALOG_FETCH_FAILURE_UNIX.store(now_unix_secs(), Ordering::Release);
-            Err(err)
-        }
-    }
+    global_catalog_lifecycle()
+        .ensure_loaded(&CACHED_CATALOG)
+        .await
 }
 
 /// Look up model IDs for a model_provider, keyed by `models.dev`'s model_provider name.
@@ -265,7 +311,15 @@ pub async fn list_models_for(provider_key: &str) -> Result<Vec<String>> {
         model_provider_type: "models_dev",
         model_provider_alias: "catalog",
         => async move {
-            let catalog = CACHED_CATALOG.get_or_try_init(fetch_catalog).await?;
+            // Route through the shared lifecycle owner (`ensure_catalog_loaded`)
+            // so listing and warming share ONE fetch/retry policy: the same
+            // single-flight lock and monotonic backoff deadline. The old
+            // `get_or_try_init` path bypassed the backoff and could start a
+            // parallel fetch while a warm was in retry backoff.
+            ensure_catalog_loaded().await?;
+            let catalog = CACHED_CATALOG.get().expect(
+                "ensure_catalog_loaded populated the catalog or returned Err",
+            );
             filter_models(catalog, provider_key)
         }
     )
@@ -282,7 +336,11 @@ pub async fn list_models_with_context_for(
         model_provider_type: "models_dev",
         model_provider_alias: "catalog",
         => async move {
-            let catalog = CACHED_CATALOG.get_or_try_init(fetch_catalog).await?;
+            // Same shared lifecycle owner as `list_models_for` (see there).
+            ensure_catalog_loaded().await?;
+            let catalog = CACHED_CATALOG.get().expect(
+                "ensure_catalog_loaded populated the catalog or returned Err",
+            );
             let ids = filter_models(catalog, provider_key)?;
             let windows = context_windows_from_catalog(catalog, provider_key);
             Ok(ids
@@ -405,40 +463,21 @@ mod tests {
         "empty": { "models": {} }
     }"#;
 
-    /// RAII guard that installs a catalog-fetch override for a test and
-    /// restores the previous override (normally `None`) on drop — including on
-    /// panic, so a failing lifecycle test cannot leak its fetcher into
-    /// sibling tests.
-    struct CatalogFetchOverrideGuard(Option<Arc<dyn Fn() -> CatalogFetchFuture + Send + Sync>>);
-
-    impl CatalogFetchOverrideGuard {
-        fn install(fetch: Arc<dyn Fn() -> CatalogFetchFuture + Send + Sync>) -> Self {
-            let mut guard = CATALOG_FETCH_OVERRIDE
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let previous = guard.replace(fetch);
-            drop(guard);
-            Self(previous)
-        }
-    }
-
-    impl Drop for CatalogFetchOverrideGuard {
-        fn drop(&mut self) {
-            let mut guard = CATALOG_FETCH_OVERRIDE
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            *guard = self.0.take();
-        }
-    }
-
-    /// RAII guard that clears the process-global failure timestamp on drop, so
-    /// a lifecycle test that records a failure cannot put sibling tests into
-    /// backoff.
-    struct CatalogFailureTimestampGuard;
-
-    impl Drop for CatalogFailureTimestampGuard {
-        fn drop(&mut self) {
-            LAST_CATALOG_FETCH_FAILURE_UNIX.store(0, Ordering::Release);
+    /// Build an isolated catalog lifecycle for a transition test: its own
+    /// cache, a manually-advanceable clock, and a fetch function that counts
+    /// calls and lets the test decide success/failure. Because every field is
+    /// owned by the instance, tests never depend on the process-global cache
+    /// state — every transition test always runs. The clock is an `Arc` so the
+    /// closure can own it for the `'static` bound on `CatalogLifecycle`.
+    fn test_lifecycle(
+        now: Arc<std::sync::Mutex<i64>>,
+        fetch: impl Fn() -> CatalogFetchFuture + Send + Sync + 'static,
+    ) -> CatalogLifecycle {
+        CatalogLifecycle {
+            in_flight: tokio::sync::Mutex::const_new(()),
+            last_failure: AtomicI64::new(0),
+            clock: Box::new(move || *now.lock().unwrap_or_else(|e| e.into_inner())),
+            fetcher: Box::new(fetch),
         }
     }
 
@@ -656,33 +695,28 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_catalog_loaded_respects_retry_backoff() {
-        let _serial = __private_test_catalog_lock().await;
-        // If another lifecycle test already populated the process-global
-        // cache, the backoff branch is unreachable (the cached path wins) —
-        // assert that and return rather than fail spuriously.
-        if CACHED_CATALOG.get().is_some() {
-            assert!(ensure_catalog_loaded().await.is_ok());
-            return;
-        }
-
-        // Install a fetch override that must never run: inside the backoff
-        // window the warm call bails before any fetch attempt.
+        // Isolated lifecycle: a failure recorded 5s ago, clock frozen now, so
+        // the fetch must be suppressed (it would otherwise add a 10-second
+        // timeout to every tool-loop iteration's warm call). No process-global
+        // state — this always runs.
+        let now = Arc::new(std::sync::Mutex::new(CATALOG_CLOCK_OFFSET_SECS));
         let calls = Arc::new(AtomicUsize::new(0));
-        let _fetch = CatalogFetchOverrideGuard::install(Arc::new({
+        let cache = OnceCell::const_new();
+        let lifecycle = test_lifecycle(Arc::clone(&now), {
             let calls = Arc::clone(&calls);
             move || {
                 calls.fetch_add(1, Ordering::SeqCst);
                 Box::pin(async { Err(anyhow::Error::msg("fetch must not run inside backoff")) })
                     as CatalogFetchFuture
             }
-        }));
-        let _ts = CatalogFailureTimestampGuard;
+        });
+        lifecycle.last_failure.store(
+            *now.lock().unwrap_or_else(|e| e.into_inner()) - 5,
+            Ordering::Relaxed,
+        );
 
-        // Regression for the tool-loop retry gap: after a failed fetch, a
-        // models.dev outage must not add a 10-second timeout to every
-        // iteration's warm call.
-        LAST_CATALOG_FETCH_FAILURE_UNIX.store(now_unix_secs() - 5, Ordering::Relaxed);
-        let err = ensure_catalog_loaded()
+        let err = lifecycle
+            .ensure_loaded(&cache)
             .await
             .expect_err("a recent fetch failure must put the warm call in backoff");
         assert!(
@@ -698,27 +732,22 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_catalog_loaded_does_not_backoff_without_prior_failure() {
-        let _serial = __private_test_catalog_lock().await;
-        if CACHED_CATALOG.get().is_some() {
-            assert!(ensure_catalog_loaded().await.is_ok());
-            return;
-        }
-
         // No prior failure recorded (the default state) must never trigger the
-        // backoff branch — the fetch runs (via the override, so no network).
+        // backoff branch — the fetch runs and surfaces its error.
+        let now = Arc::new(std::sync::Mutex::new(CATALOG_CLOCK_OFFSET_SECS));
         let calls = Arc::new(AtomicUsize::new(0));
-        let _fetch = CatalogFetchOverrideGuard::install(Arc::new({
+        let cache = OnceCell::const_new();
+        let lifecycle = test_lifecycle(Arc::clone(&now), {
             let calls = Arc::clone(&calls);
             move || {
                 calls.fetch_add(1, Ordering::SeqCst);
                 Box::pin(async { Err(anyhow::Error::msg("simulated outage")) })
                     as CatalogFetchFuture
             }
-        }));
-        let _ts = CatalogFailureTimestampGuard;
+        });
 
-        LAST_CATALOG_FETCH_FAILURE_UNIX.store(0, Ordering::Relaxed);
-        let err = ensure_catalog_loaded()
+        let err = lifecycle
+            .ensure_loaded(&cache)
             .await
             .expect_err("with no prior failure the fetch must run and surface its error");
         assert!(
@@ -734,28 +763,26 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_catalog_loaded_serializes_concurrent_fetches() {
-        let _serial = __private_test_catalog_lock().await;
-        if CACHED_CATALOG.get().is_some() {
-            assert!(ensure_catalog_loaded().await.is_ok());
-            return;
-        }
-
         // Two concurrent warm calls must share one in-flight fetch: the second
         // caller waits on the fetch lock and then observes the failure deadline
         // the first fetch recorded, so it bails in backoff instead of starting
-        // a second network attempt.
+        // a second network attempt. Isolated lifecycle — always runs.
+        let now = Arc::new(std::sync::Mutex::new(CATALOG_CLOCK_OFFSET_SECS));
         let calls = Arc::new(AtomicUsize::new(0));
-        let _fetch = CatalogFetchOverrideGuard::install(Arc::new({
+        let cache = OnceCell::const_new();
+        let lifecycle = test_lifecycle(Arc::clone(&now), {
             let calls = Arc::clone(&calls);
             move || {
                 calls.fetch_add(1, Ordering::SeqCst);
                 Box::pin(async { Err(anyhow::Error::msg("simulated outage")) })
                     as CatalogFetchFuture
             }
-        }));
-        let _ts = CatalogFailureTimestampGuard;
+        });
 
-        let (r1, r2) = tokio::join!(ensure_catalog_loaded(), ensure_catalog_loaded());
+        let (r1, r2) = tokio::join!(
+            lifecycle.ensure_loaded(&cache),
+            lifecycle.ensure_loaded(&cache)
+        );
         assert!(
             r1.is_err() && r2.is_err(),
             "a failing fetch must surface an error to every concurrent caller"
@@ -769,18 +796,14 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_catalog_loaded_recovers_after_backoff_window() {
-        let _serial = __private_test_catalog_lock().await;
-        if CACHED_CATALOG.get().is_some() {
-            assert!(ensure_catalog_loaded().await.is_ok());
-            return;
-        }
-
         // First fetch fails (records the deadline); the second attempt inside
-        // the window is suppressed by backoff; once the window expires the
-        // third attempt runs and succeeds. Exercises the full lifecycle
-        // without network access.
+        // the window is suppressed by backoff; advancing the clock past the
+        // window makes the third attempt run and succeed. Isolated lifecycle
+        // with a manually-advanced clock — every transition always runs.
+        let now = Arc::new(std::sync::Mutex::new(CATALOG_CLOCK_OFFSET_SECS));
         let calls = Arc::new(AtomicUsize::new(0));
-        let _fetch = CatalogFetchOverrideGuard::install(Arc::new({
+        let cache = OnceCell::const_new();
+        let lifecycle = test_lifecycle(Arc::clone(&now), {
             let calls = Arc::clone(&calls);
             move || {
                 let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
@@ -792,16 +815,16 @@ mod tests {
                     Box::pin(async move { Ok(catalog) }) as CatalogFetchFuture
                 }
             }
-        }));
-        let _ts = CatalogFailureTimestampGuard;
+        });
 
         assert!(
-            ensure_catalog_loaded().await.is_err(),
+            lifecycle.ensure_loaded(&cache).await.is_err(),
             "the first fetch must fail and record the retry deadline"
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-        let err = ensure_catalog_loaded()
+        let err = lifecycle
+            .ensure_loaded(&cache)
             .await
             .expect_err("inside the backoff window the retry must be suppressed");
         assert!(err.to_string().contains("backoff"));
@@ -811,13 +834,10 @@ mod tests {
             "no fetch may run inside the backoff window"
         );
 
-        // Expire the deadline and observe recovery.
-        LAST_CATALOG_FETCH_FAILURE_UNIX.store(
-            now_unix_secs() - CATALOG_FETCH_RETRY_BACKOFF_SECS - 1,
-            Ordering::Release,
-        );
+        // Advance the clock past the window and observe recovery.
+        *now.lock().unwrap_or_else(|e| e.into_inner()) += CATALOG_FETCH_RETRY_BACKOFF_SECS + 1;
         assert!(
-            ensure_catalog_loaded().await.is_ok(),
+            lifecycle.ensure_loaded(&cache).await.is_ok(),
             "once the backoff window expires the fetch must retry and recover"
         );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
@@ -825,20 +845,26 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_catalog_loaded_skips_backoff_when_cache_populated() {
-        let _serial = __private_test_catalog_lock().await;
-        // Populate the cache (if a sibling test has not already), then set a
-        // fresh failure timestamp inside the backoff window. The populated
-        // cache must win over the stale deadline: warming must never be
-        // rejected when the catalog actually loaded via another path.
-        if CACHED_CATALOG.get().is_none() {
-            let catalog = Arc::new(parse_catalog(TINY_CATALOG.as_bytes()).unwrap());
-            let _ = CACHED_CATALOG.set(catalog);
-        }
-        let _ts = CatalogFailureTimestampGuard;
-        LAST_CATALOG_FETCH_FAILURE_UNIX.store(now_unix_secs(), Ordering::Release);
+        // A populated catalog must win over a fresh failure timestamp inside
+        // the backoff window: warming must never be rejected when the catalog
+        // actually loaded via another path. Isolated cache seeded first.
+        let now = Arc::new(std::sync::Mutex::new(CATALOG_CLOCK_OFFSET_SECS));
+        let cache = OnceCell::const_new();
+        let catalog = Arc::new(parse_catalog(TINY_CATALOG.as_bytes()).unwrap());
+        let _ = cache.set(catalog);
+        let lifecycle = test_lifecycle(Arc::clone(&now), {
+            move || {
+                Box::pin(async { Err(anyhow::Error::msg("fetch must not run")) })
+                    as CatalogFetchFuture
+            }
+        });
+        lifecycle.last_failure.store(
+            *now.lock().unwrap_or_else(|e| e.into_inner()),
+            Ordering::Release,
+        );
 
         assert!(
-            ensure_catalog_loaded().await.is_ok(),
+            lifecycle.ensure_loaded(&cache).await.is_ok(),
             "a populated catalog must not be rejected by a stale backoff deadline"
         );
     }
