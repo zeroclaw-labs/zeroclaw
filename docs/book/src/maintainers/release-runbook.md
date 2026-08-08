@@ -528,6 +528,19 @@ manually-triggerable sub-workflow. Re-run the specific one with `dry_run: true`
 first to confirm the fix, then `dry_run: false`. These are nice-to-have: a
 failed distribution job does not invalidate the release itself.
 
+**The `scoop` job failed with `remote: Permission ... denied to <account>` (403):**
+A permissions problem, not a manifest problem: the bucket token is dead or
+under-scoped. This is not urgent, because the bucket's excavator republishes
+from the bucket side within its schedule without a credential. Rotate the token
+per [Rotating `SCOOP_BUCKET_TOKEN`](./ci-and-actions.md#rotating-scoop_bucket_token),
+then dispatch Scoop Bucket Canary to confirm the fix without writing to the
+bucket. Confirm the bucket landed the new version either way, since excavator
+covering for a dead token is easy to miss.
+
+**Weekly `Scoop Bucket Canary` went red:** The token has expired or lost write.
+Same rotation path. Fix it before the next release so layer 1 still works rather
+than leaning on excavator indefinitely.
+
 **Homebrew Core is stale:** Homebrew is not a release-workflow job. Check the
 [Homebrew autobump status and documented manual bump
 path](https://docs.brew.sh/Autobump) instead of adding a repository fork token.

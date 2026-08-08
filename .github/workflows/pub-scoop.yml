@@ -48,25 +48,45 @@ jobs:
           fetch-depth: 0
 
       - name: Validate Scoop publish configuration
-        if: inputs.dry_run == false
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}
+          GIT_TERMINAL_PROMPT: "0"
         run: |
           set -euo pipefail
 
-          if [[ -z "${SCOOP_BUCKET_REPO:-}" ]]; then
-            echo "::error::Repository variable SCOOP_BUCKET_REPO is required when dry_run=false."
-            exit 1
-          fi
-          if [[ -z "${GH_TOKEN:-}" ]]; then
-            echo "::error::Repository secret SCOOP_BUCKET_TOKEN is required when dry_run=false."
-            exit 1
+          # This probe runs for dry runs too, so a rehearsal exercises the same
+          # credential the publish path uses. A token that has expired or lost
+          # write on the bucket then surfaces between releases rather than after
+          # the release is already published and announced.
+          if [[ -z "${SCOOP_BUCKET_REPO:-}" || -z "${GH_TOKEN:-}" ]]; then
+            if [[ "$DRY_RUN" != "true" ]]; then
+              echo "::error::Repository variable SCOOP_BUCKET_REPO and secret SCOOP_BUCKET_TOKEN are both required when dry_run=false."
+              exit 1
+            fi
+            echo "::warning::Scoop bucket credentials are unavailable; skipping the push-access probe."
+            exit 0
           fi
           if [[ "$SCOOP_BUCKET_REPO" != */* ]]; then
             echo "::error::SCOOP_BUCKET_REPO must be in owner/repo format."
             exit 1
           fi
+
+          probe_dir="$(mktemp -d)"
+          trap 'rm -rf "$probe_dir"' EXIT
+          gh auth setup-git
+          git clone --depth=1 "https://github.com/${SCOOP_BUCKET_REPO}.git" "$probe_dir/bucket"
+
+          # Exercise GitHub's receive-pack authorization without changing the
+          # bucket. REST repository metadata is not an authoritative push test
+          # for every token type.
+          if ! git -C "$probe_dir/bucket" push --dry-run origin HEAD; then
+            echo "::error::SCOOP_BUCKET_TOKEN cannot push to ${SCOOP_BUCKET_REPO}."
+            echo "::error::Use a fine-grained token scoped to this repository with Contents: Read and write."
+            exit 1
+          fi
+
+          echo "SCOOP_BUCKET_TOKEN can push to ${SCOOP_BUCKET_REPO}."
 
       - name: Validate and compute metadata
         id: meta
@@ -166,19 +186,12 @@ jobs:
             exit 1
           fi
 
+          # Push access was already proven by the authoritative probe in
+          # "Validate Scoop publish configuration" earlier in this job.
           tmp_dir="$(mktemp -d)"
           trap 'rm -rf "$tmp_dir"' EXIT
           gh auth setup-git
           git clone --depth=1 "https://github.com/${SCOOP_BUCKET_REPO}.git" "$tmp_dir/bucket"
-
-          # Exercise GitHub's receive-pack authorization without changing the
-          # bucket. REST repository metadata is not an authoritative push test
-          # for every token type.
-          if ! git -C "$tmp_dir/bucket" push --dry-run origin HEAD; then
-            echo "::error::SCOOP_BUCKET_TOKEN cannot push to ${SCOOP_BUCKET_REPO}."
-            echo "::error::Use a fine-grained token scoped to this repository with Contents: Read and write."
-            exit 1
-          fi
 
           mkdir -p "$tmp_dir/bucket/bucket"
           cp "$MANIFEST_FILE" "$tmp_dir/bucket/bucket/zeroclaw.json"
