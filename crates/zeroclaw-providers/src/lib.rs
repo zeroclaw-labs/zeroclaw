@@ -30,6 +30,7 @@ pub mod telnyx;
 pub mod traits;
 pub mod vision_override;
 
+pub use anthropic::AnthropicRefusalError;
 pub use dispatch::{ProviderDispatch, ProviderDispatchRef};
 
 mod request_payload;
