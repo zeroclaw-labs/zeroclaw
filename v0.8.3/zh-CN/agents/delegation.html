@@ -1,0 +1,566 @@
+<!DOCTYPE HTML>
+<html lang="zh-CN" class="default-dark sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>委派与子代理 - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Documentation for the ZeroClaw personal AI assistant.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../../../_shared/favicon.svg">
+        <link rel="shortcut icon" href="../../../_shared/favicon.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-2459343d.css">
+        <link rel="stylesheet" href="../../../_shared/css/chrome.css">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets (pc-themes.css generated; ordered first) -->
+        <link rel="stylesheet" href="../../../_shared/theme/pc-themes.css">
+        <link rel="stylesheet" href="../../../_shared/theme/custom.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "default-dark";
+            const default_dark_theme = "default-dark";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-a22b4832.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('default-dark')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                sidebar_toggle.checked = false;
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <!-- PC_THEME_LIST_START: generated from themes.json by `cargo xtask mdbook themes`; do not edit between markers -->
+                            <li role="none" class="pc-theme-group">Dark</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0c0e12;--s1:#38bdf8;--s2:#7dd3fc;--s3:#9aa0aa"></span><span class="pc-theme-name">Operator Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-ayu-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e14;--s1:#39bae6;--s2:#d2a6ff;--s3:#ffb454"></span><span class="pc-theme-name">Ayu Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-mocha"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e2e;--s1:#89b4fa;--s2:#cba6f7;--s3:#f9e2af"></span><span class="pc-theme-name">Catppuccin Mocha</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282828;--s1:#83a598;--s2:#d3869b;--s3:#fabd2f"></span><span class="pc-theme-name">Gruvbox Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hacker-green"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e0a;--s1:#00ff41;--s2:#00cc33;--s3:#008f11"></span><span class="pc-theme-name">Hacker Green</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hazard"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#16140a;--s1:#ffd60a;--s2:#ffb454;--s3:#ff8a5c"></span><span class="pc-theme-name">Hazard</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#ffffff;--s2:#ff00ff;--s3:#ffff00"></span><span class="pc-theme-name">High Contrast Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-dragon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#181616;--s1:#8ba4b0;--s2:#a292a3;--s3:#c4b28a"></span><span class="pc-theme-name">Kanagawa Dragon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-wave"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1f1f28;--s1:#7e9cd8;--s2:#957fb8;--s3:#e6c384"></span><span class="pc-theme-name">Kanagawa Wave</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#212121;--s1:#89ddff;--s2:#c792ea;--s3:#ffcb6b"></span><span class="pc-theme-name">Material Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-monokai"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#272822;--s1:#f92672;--s2:#a6e22e;--s3:#e6db74"></span><span class="pc-theme-name">Monokai</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-night-owl"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#011627;--s1:#82aaff;--s2:#c792ea;--s3:#addb67"></span><span class="pc-theme-name">Night Owl</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2e3440;--s1:#88c0d0;--s2:#81a1c1;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-oled-black"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#22d3ee;--s2:#8b5cf6;--s3:#10b981"></span><span class="pc-theme-name">OLED Black</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282c34;--s1:#61afef;--s2:#c678dd;--s3:#e5c07b"></span><span class="pc-theme-name">One Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#191724;--s1:#ebbcba;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-moon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#232136;--s1:#ea9a97;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine Moon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#002b36;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1a1b26;--s1:#7aa2f7;--s2:#bb9af7;--s3:#e0af68"></span><span class="pc-theme-name">Tokyo Night</span></button></li>
+                            <li role="none" class="pc-theme-group">Light</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#0284c7;--s2:#0ea5e9;--s3:#475569"></span><span class="pc-theme-name">Operator Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-latte"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eff1f5;--s1:#1e66f5;--s2:#8839ef;--s3:#df8e1d"></span><span class="pc-theme-name">Catppuccin Latte</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f4f4f5;--s1:#22d3ee;--s2:#8b5cf6;--s3:#f59e0b"></span><span class="pc-theme-name">Default Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#8da101;--s2:#35a77c;--s3:#dfa000"></span><span class="pc-theme-name">Everforest Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fffcf0;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fbf1c7;--s1:#076678;--s2:#8f3f71;--s3:#b57614"></span><span class="pc-theme-name">Gruvbox Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-white"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#000000;--s2:#600080;--s3:#806000"></span><span class="pc-theme-name">High Contrast White</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-lotus"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f2ecbc;--s1:#4d699b;--s2:#b35b79;--s3:#836f4a"></span><span class="pc-theme-name">Kanagawa Lotus</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#6182b8;--s2:#7c4dff;--s3:#f76d47"></span><span class="pc-theme-name">Material Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eceff4;--s1:#5e81ac;--s2:#88c0d0;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#4078f2;--s2:#a626a4;--s3:#c18401"></span><span class="pc-theme-name">One Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-dawn"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#faf4ed;--s1:#d7827e;--s2:#907aa9;--s3:#ea9d34"></span><span class="pc-theme-name">Rosé Pine Dawn</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night-day"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#e1e2e7;--s1:#2e7de9;--s2:#9854f1;--s3:#8c6c3e"></span><span class="pc-theme-name">Tokyo Night Day</span></button></li>
+                            <!-- PC_THEME_LIST_END -->
+                        </ul>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://discord.gg/tQ88WUkPyJ" title="Join our Discord" aria-label="Join our Discord" rel="external noopener" target="_blank">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M524.531,69.836a1.5,1.5,0,0,0-.764-.7A485.065,485.065,0,0,0,404.081,32.03a1.816,1.816,0,0,0-1.923.91,337.461,337.461,0,0,0-14.9,30.6,447.848,447.848,0,0,0-134.426,0,309.541,309.541,0,0,0-15.135-30.6,1.89,1.89,0,0,0-1.924-.91A483.689,483.689,0,0,0,116.085,69.137a1.712,1.712,0,0,0-.788.676C39.068,183.651,18.186,294.69,28.43,404.354a2.016,2.016,0,0,0,.765,1.375A487.666,487.666,0,0,0,176.02,479.918a1.9,1.9,0,0,0,2.063-.676A348.2,348.2,0,0,0,208.12,430.4a1.86,1.86,0,0,0-1.019-2.588,321.173,321.173,0,0,1-45.868-21.853,1.885,1.885,0,0,1-.185-3.126c3.082-2.309,6.166-4.711,9.109-7.137a1.819,1.819,0,0,1,1.9-.256c96.229,43.917,200.41,43.917,295.5,0a1.812,1.812,0,0,1,1.924.233c2.944,2.426,6.027,4.851,9.132,7.16a1.884,1.884,0,0,1-.162,3.126,301.407,301.407,0,0,1-45.89,21.83,1.875,1.875,0,0,0-1,2.611,391.055,391.055,0,0,0,30.014,48.815,1.864,1.864,0,0,0,2.063.7A486.048,486.048,0,0,0,610.7,405.729a1.882,1.882,0,0,0,.765-1.352C623.729,277.594,590.933,167.465,524.531,69.836ZM222.491,337.58c-28.972,0-52.844-26.587-52.844-59.239S193.056,219.1,222.491,219.1c29.665,0,53.306,26.82,52.843,59.239C275.334,310.993,251.924,337.58,222.491,337.58Zm195.38,0c-28.971,0-52.843-26.587-52.843-59.239S388.437,219.1,417.871,219.1c29.667,0,53.307,26.82,52.844,59.239C470.715,310.993,447.538,337.58,417.871,337.58Z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <aside id="pc-page-toc" class="pc-page-toc" aria-label="On this page"></aside>
+                    <main>
+                        <h1 id="委派与子代理"><a class="header" href="#委派与子代理">委派与子代理</a></h1>
+<p>SubAgent 是由父智能体派生的<strong>临时子运行</strong>，默认继承父智能体的身份：相同的智能体别名、相同的 <code>SecurityPolicy</code>、相同的内存允许列表、相同的已配置模型提供方、相同的工具注册表。可通过追踪 span <code>agent.&lt;alias&gt;.subagent.&lt;run_id&gt;</code> 作为子运行进行审计。</p>
+<p>子智能体不是一个独立的配置概念。schema 中不存在 <code>[subagents.*]</code> 配置块。每个子智能体的身份取决于是哪个父级的智能体循环创建了它。</p>
+<h2 id="何时使用-spawn_subagent-与-delegate"><a class="header" href="#何时使用-spawn_subagent-与-delegate">何时使用 <code>spawn_subagent</code> 与 <code>delegate</code></a></h2>
+<p>两个工具就在旁边，它们不可互换。</p>
+<ul>
+<li><strong><code>spawn_subagent</code></strong>：在其自身身份下再次运行同一个 agent，以执行一个聚焦的子任务。子 agent 会继承父 agent 的完整权限范围，但可能会有所收窄。当父 agent 希望将某个内部子任务从其主对话历史中独立出来，而不改变身份时，可使用此功能。</li>
+<li><strong><code>delegate</code></strong>：将请求交给另一个已配置的 DIFFERENT 代理（通过别名命名）。目标代理以其自身的身份和模型提供方运行，但委派是有门控的：调用方的风险配置文件必须将 <code>delegation_policy mode = "allow"</code>（默认是 <code>"forbidden"</code>），并且目标必须可作为同一配置文件的同级代理或一个显式的 <code>delegates</code> 条目被访问。显式条目选择 <code>mode = "bounded"</code> 或 <code>mode = "independent"</code>，这决定调用方的工具上限是否仍然适用。用于让另一位已配置的专门代理来承担工作。参见下面的 <a href="#delegation-gating">Delegation gating</a>。</li>
+</ul>
+<p>本页面完整记录了 <code>spawn_subagent</code> 的端到端流程。<code>delegate</code> 位于 <code>crates/zeroclaw-runtime/src/tools/delegate.rs</code>，是一个独立的接口。</p>
+<h2 id="subagent-的实例化方式"><a class="header" href="#subagent-的实例化方式">SubAgent 的实例化方式</a></h2>
+<p>两个生成点汇聚于 <code>SubAgentSpawn</code>（<code>crates/zeroclaw-runtime/src/subagent/mod.rs:97</code>）：</p>
+<ol>
+<li><strong>通过 agent 循环</strong>：模型调用 <code>spawn_subagent</code> 工具并传入一个 <code>prompt</code> 字符串。该工具像注册表中的其他工具一样进行注册（<code>crates/zeroclaw-runtime/src/tools/mod.rs</code>，<code>SpawnSubagentTool::new</code>）。</li>
+<li><strong>来自 cron</strong>：<code>JobType::Agent</code> 任务通过 <code>run_agent_job</code>（<code>crates/zeroclaw-runtime/src/cron/scheduler.rs</code>）运行，它构建相同的 <code>SubAgentContext</code>，但将子进程标记为顶层运行（而非 SubAgent），以便它本身可以派生一级 subagent。</li>
+</ol>
+<p>两种路径都会调用：</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>SubAgentSpawn::for_agent(config, parent_alias)?     // 解析父级身份
+    .build(SubAgentOverrides::default())?           // 验证任何收窄
+<span class="boring">}</span></code></pre>
+<p><code>for_agent</code> 读取父级的 <code>risk_profile</code> 和 <code>[agents.&lt;alias&gt;.workspace.read_memory_from]</code> 以构建继承的允许列表；父级自身的别名始终会被添加，因此 SubAgent 总能看到其父级自身的内存行。<code>build</code> 应用可选的范围收窄（参见下方<a href="#permission-inheritance">权限继承</a>）并返回经过验证的 <code>SubAgentContext</code>。</p>
+<h2 id="生命周期"><a class="header" href="#生命周期">生命周期</a></h2>
+<p>同步、进程内、单个 tokio 运行时。任何内容都不会跨越进程边界。</p>
+<ol>
+<li>父级的工具循环会分派 <code>spawn_subagent</code>。该工具读取其 <code>prompt</code> 参数，如果为空则拒绝执行。</li>
+<li>该工具按顺序检查两个守卫：
+<ul>
+<li><strong>深度为 1 的限制。</strong> 如果调用方运行本身就是一个 SubAgent（<code>AgentRunOverrides.is_subagent == true</code>），则拒绝并返回 <code>"spawn_subagent: a subagent may not spawn its own subagents (depth-1 cap)"</code>。SubAgent 不能递归。</li>
+<li><strong>风险配置工具门控。</strong> 如果父级的 <code>[risk_profiles.&lt;alias&gt;].allowed_tools</code> 非空且未列出 <code>spawn_subagent</code>，或 <code>excluded_tools</code> 中列出了它，则拒绝执行并返回一条指明父级别名的消息。</li>
+</ul>
+</li>
+<li>该工具调用 <code>SubAgentSpawn::for_agent</code> + <code>build</code>。失败情况（未知的父级别名、升级覆盖）会以 <code>ToolResult { success: false, error: "subagent spawn failed: ..." }</code> 的形式呈现。</li>
+<li>该工具构造 <code>AgentRunOverrides { security, memory: None, is_subagent: true, suppress_memory_inject: true }</code>（子进程的 <code>SubTurn</code> 来源已经跳过引擎记忆注入；该标志使这一退出选项显式化），并在键为 <code>subagent-&lt;uuid&gt;</code> 的跟踪作用域内等待 <code>crate::agent::run</code>（<code>crates/zeroclaw-runtime/src/agent/loop_.rs</code>，<code>pub async fn run</code>）。父级的 <code>tool</code> 执行会<strong>阻塞</strong>，直到子进程返回。</li>
+<li>子代理循环运行至完成。其工具注册表会重新构建，并将 <code>is_subagent_caller: true</code> 传入它自己的 <code>SpawnSubagentTool</code>，因此任何递归调用的尝试都会在同一个 depth-1 关卡处被拒绝。</li>
+<li>子任务返回 <code>Result&lt;String&gt;</code>。父任务的 <code>spawn_subagent</code> 工具将其包装为：
+<ul>
+<li>成功：<code>ToolResult { success: true, output: &lt;子代理的最终响应&gt;, error: None }</code>。空输出将被替换为字面值 <code>"subagent completed without output"</code>。</li>
+<li>失败：<code>ToolResult { success: false, error: Some("subagent run failed: ...") }</code>。</li>
+</ul>
+</li>
+<li>父级的工具循环会带着该 <code>ToolResult</code> 在其对话上下文中继续运行。子级的中间轮次和工具调用不会重放到父级的历史记录中；只有最终响应会显示出来。</li>
+</ol>
+<h2 id="交付回上游的内容"><a class="header" href="#交付回上游的内容">交付回上游的内容</a></h2>
+<p>一点说明：子代理的<strong>最终助手消息</strong>会以字符串形式包装在 <code>ToolResult.output</code> 中。</p>
+<ul>
+<li>子代理的工具调用、中间推理回合及其执行的所有内存写入操作，均可在该子代理追踪范围（span）下的结构化日志中查看，但不会进入父代理的对话历史。</li>
+<li>子会话存储在路径 <code>subagent-&lt;uuid&gt;</code> 下（对于 cron 触发的运行则为 <code>cron-&lt;uuid&gt;</code>）。这是对话历史记录的键，而非文件系统位置，它将子会话的历史记录与父会话的历史记录隔离开来。</li>
+<li>子进程执行的内存写入会写入父进程的标识（在 SQL/Postgres 后端使用相同的 agent UUID；对于 Markdown 则使用相同的工作区目录）。通过 Cron 启动的运行会禁用 <code>memory.auto_save</code>，因此显式写入仍然有效，但常规的回忆不会累积。</li>
+</ul>
+<p>没有向父级回传的流式传输或部分进度通道。长时间运行的 SubAgent 会在其整个执行期间阻塞父级的工具执行；不存在针对单次调用的超时设置项。</p>
+<h3 id="单轮多次调用"><a class="header" href="#单轮多次调用">单轮多次调用</a></h3>
+<p>智能体循环会应用每轮重复调用防护机制：在同一轮中以相同参数调用两次的工具，通常第二次调用会被跳过。<code>spawn_subagent</code> 和 <code>delegate</code> 不受该防护机制的限制（<strong>exempt</strong>）。使用相同的提示词启动多个调用（用于冗余、采样、扇出）是一种刻意的模式，而非意外的重复，因此每个相同的调用都会执行，每个结果都会被返回。如果没有这项豁免，只有第一个相同的调用会执行，也只有它的输出会传递给模型。</p>
+<p>当启用并行工具执行时（运行时配置文件中的 <code>parallel_tools = true</code>），单轮中的多个 <code>spawn_subagent</code> 调用会并发运行，每个子代理的最终响应都会返回给父代理，并与其各自的工具调用相对应。<code>delegate</code> 通过 <code>parallel: [...]</code> 参数拥有自己显式的分发机制（参见 output-strings 部分）；该路径会在各自独立的任务中生成每个目标，并聚合所有结果。</p>
+<h2 id="权限继承"><a class="header" href="#权限继承">权限继承</a></h2>
+<p>子代理（SubAgent）会逐字继承父级的权限，除非生成位置提供了用于收窄权限的 <code>SubAgentOverrides</code>。目前两个内置的生成位置都传入 <code>SubAgentOverrides::default()</code>（继承全部权限）。覆盖接口已发布并通过验证；未来由调用方提供的收窄路径可直接接入，无需运行时改动。</p>
+<p>沿坐标轴逐一继承：</p>
+<ol>
+<li><strong><code>SecurityPolicy</code></strong>：通过 <code>Arc&lt;SecurityPolicy&gt;</code> 克隆继承。覆盖路径（<code>SubAgentOverrides::policy = Some(policy)</code>）会运行 <code>SecurityPolicy::ensure_no_escalation_beyond</code>（<code>crates/zeroclaw-config/src/policy.rs</code>），并拒绝任何为子代理添加父代理所不具备权限的字段。已验证的维度包括自治级别、allowed_roots（rw + ro + 只写）、allowed_commands、workspace_only、按父 ⊆ 子方向校验的 forbidden_paths、shell_env_passthrough、<code>max_actions_per_hour</code>、<code>max_cost_per_day_cents</code>、<code>shell_timeout_secs</code>、<code>block_high_risk_commands</code> 以及 <code>require_approval_for_medium_risk</code>。被拒绝时会串联一个精确的 <code>EscalationViolation</code>，使诊断信息能够指明违规的字段。</li>
+<li><strong>操作/成本预算</strong>：<code>PerSenderTracker</code> 由父级和子级通过 <code>Arc</code> 克隆共享。逐字继承路径：子级持有相同的 <code>Arc&lt;SecurityPolicy&gt;</code>，因此对 <code>record_action()</code> / <code>record_cost()</code> 的写入会命中同一个桶。覆盖路径：<code>SubAgentSpawn::build</code> 会显式地将父级的 <code>tracker</code> 字段复制到收窄后的子级策略中。<strong>SubAgent 无法通过生成（spawn）来绕过 <code>max_actions_per_hour</code> 或 <code>max_cost_per_day_cents</code></strong>，该限制是共享的。</li>
+<li><strong>工具注册表</strong>：子级注册表由 <code>tools::all_tools_with_runtime</code> 在继承的策略下重新构建。随后该注册表会经过 <code>apply_policy_tool_filter</code>（<code>crates/zeroclaw-runtime/src/agent/loop_.rs</code>）处理，凡名称未能通过任一关卡的工具都会被剔除：
+<ul>
+<li>策略的 <code>allowed_tools</code> / <code>excluded_tools</code>（来源于父级的 <code>risk_profile</code>）。</li>
+<li>调用方传递给 <code>agent::run</code> 的 <code>allowed_tools</code> 参数。<code>spawn_subagent</code> 位于注册表中，但其为子级设置的 <code>is_subagent_caller</code> 标志为 <code>true</code>，因此在任何 spawn 操作之前就会触发深度为 1 的拒绝。同一个 <code>is_subagent_caller</code> 标志会将 <code>model_switch</code> 从子级的注册表中完全移除：SubAgent 会原封不动地继承父级的模型（参见轴 5），并且不得能够在父级不知情的情况下切换正在使用的模型，因此该工具根本不会提供给它。</li>
+</ul>
+</li>
+<li><strong>内存允许列表</strong>：由同级 agent <strong>别名</strong>组成的 <code>HashSet&lt;String&gt;</code>（即 <code>[agents.&lt;alias&gt;]</code> 配置键）。继承自父级的 <code>workspace.read_memory_from</code> 以及父级自身的别名。覆盖路径（<code>SubAgentOverrides::allowed_agent_aliases</code>）会作为子集进行校验；任何不在父级列表中的别名都会按名称被拒绝。父级自身的别名总是会被重新添加，因此 SubAgent 始终能看到其父级的记录。</li>
+<li><strong>模型提供方</strong>：继承自父级的 <code>[agents.&lt;alias&gt;] model_provider</code> 解析结果。Temperature 来自父级的提供方条目（<code>config.model_provider_for_agent(parent_alias).and_then(|e| e.temperature)</code>）。这种继承是强制性的，而不仅仅是默认值：<code>model_switch</code> 已从 SubAgent 的工具注册表中排除（参见 axis 3），因此 SubAgent 无法切换自己的模型。若要在不同的模型上运行子任务，请使用 <code>delegate</code> 委派给某个 <code>model_provider</code> 指向该模型的同级 agent。</li>
+<li><strong>数据层的身份标识</strong>：在 <code>agents</code> 表（SQL 后端）中使用相同的 UUID，对 Markdown 使用相同的工作区目录，使用相同的密钥存储。父级与子级的区别纯粹在于可观测性：单独的追踪 span 和单独的对话历史会话键。</li>
+</ol>
+<h2 id="用户如何引发火灾"><a class="header" href="#用户如何引发火灾">用户如何引发火灾</a></h2>
+<p>这些工具不是你自己调用的，而是机器人在其回合内部进行调用。作为用户，你可以通过表述请求的方式来影响机器人的选择。这里没有特殊命令、没有斜杠语法，用户也无需输入任何 JSON。模型究竟选择 <code>spawn_subagent</code> 还是 <code>delegate</code>，取决于它的系统提示词、工具的 <code>description</code> 文本（对模型可见）以及用户的措辞。<strong>措辞只是施加影响，并不能强制决定。</strong></p>
+<p>可以做到确定性的是<strong>可用性</strong>：不在父代理注册表中的工具无法被选用。风险配置文件门控位于 <code>[risk_profiles.&lt;alias&gt;].allowed_tools</code> 和 <code>[risk_profiles.&lt;alias&gt;].excluded_tools</code>。非空的 <code>allowed_tools</code> 列表必须包含 <code>spawn_subagent</code> 或 <code>delegate</code>，模型才能看到该工具；空的 <code>allowed_tools</code> 列表则不限制工具可用性，除非 <code>excluded_tools</code> 指定了该工具。编辑配置后请重启守护进程。</p>
+<p>端到端可验证的内容：</p>
+<ol>
+<li>工具在每种路径（成功、拒绝、失败）下返回给模型的字面输出字符串。下方逐字引用，来源为 <code>tools/spawn_subagent.rs</code> 和 <code>tools/delegate.rs</code>。</li>
+<li>改变行为的具体配置项（<code>allowed_tools</code>、<code>max_delegation_depth</code> 等）。</li>
+<li>用于限定子运行期间发出的所有内容范围的结构化追踪 span 形态。</li>
+</ol>
+<p>这些文档中无法验证的内容：</p>
+<ol>
+<li>当用户请求“生成一个子代理来……“时，你的特定 bot、特定模型、特定系统提示是否会选用该工具，这取决于具体情况。措辞会影响结果；结果因情况而异。如果 bot 没有选用该工具，最可靠的办法是用明确的指令扩展 bot 的系统提示（“当被要求执行一个聚焦的子任务时，使用 <code>spawn_subagent</code> 工具”）。</li>
+<li>机器人在最终回复中写给你的确切文本。机器人会读取工具的输出，并在此基础上<strong>生成自己的</strong>回复。工具的输出文本可能会被引用、改述或概括。</li>
+</ol>
+<h3 id="spawn_subagent模型看到的拒绝字符串"><a class="header" href="#spawn_subagent模型看到的拒绝字符串"><code>spawn_subagent</code>：模型看到的拒绝字符串</a></h3>
+<p>这些内容是精确的，来源于 <code>crates/zeroclaw-runtime/src/tools/spawn_subagent.rs</code>。模型将其作为该工具的错误字符串接收并作出响应。用户可见的 bot 回复是模型接下来所写的内容；它通常会引用或复述这条拒绝信息。</p>
+<ol>
+<li>空/缺失的 <code>prompt</code> 参数：<code>Missing or empty 'prompt' parameter</code></li>
+<li>调用方本身就是一个 SubAgent（深度上限为 1）：<code>spawn_subagent: a subagent may not spawn its own subagents (depth-1 cap)</code></li>
+<li>父级风险配置工具门控排除了 <code>spawn_subagent</code>：<code>spawn_subagent: refused — agent '&lt;parent_alias&gt;' risk_profile does not list spawn_subagent in allowed_tools</code></li>
+<li>未知父别名 / spawn 构建错误：<code>subagent spawn failed: &lt;wrapped error&gt;</code></li>
+<li>子运行返回错误：<code>subagent run failed: &lt;wrapped error&gt;</code></li>
+</ol>
+<p>工具成功执行后，其输出即为子代理的最终响应文本。如果子代理返回空字符串，则输出为字面占位符：<code>subagent completed without output</code>。成功情况下没有固定的前缀可供 grep 检索。</p>
+<h3 id="spawn_subagent如何验证它确实已触发"><a class="header" href="#spawn_subagent如何验证它确实已触发"><code>spawn_subagent</code>：如何验证它确实已触发</a></h3>
+<p>跟踪你的日志。工具生成的子进程运行在一个 <code>scope!</code> 内部，该作用域会发出一个名为 <code>zeroclaw_scope</code> 的跟踪跨度（目标为 <code>zeroclaw_log_internal_scope</code>），携带 <code>agent_alias=&lt;parent&gt;</code> 和 <code>session_key=&lt;uuid&gt;</code>。子进程运行期间发出的每一行日志都会携带这些字段。父进程自己的回合有其自己的 <code>session_key</code>；对于同一个 <code>agent_alias</code>，在回合中途出现一个新的 <code>session_key</code> 值，就是 SubAgent 已运行的信号。子进程的对话历史会话路径为 <code>subagent-&lt;uuid&gt;</code>（类文件系统标识符，与跟踪字段不同）。</p>
+<p>由 Cron 启动的 agent 作业使用一个不同的、更明确的 span 名称：<code>subagent</code>（字面值），其字段为 <code>category="cron"</code>、<code>agent_alias=&lt;owning agent&gt;</code>、<code>cron_job_id=&lt;id&gt;</code>、<code>run_id=&lt;uuid&gt;</code>、<code>spawn_site="cron"</code>。Cron 路径很容易用 grep 检索：<code>grep 'spawn_site="cron"' zeroclaw.log</code>。请注意，由 cron 启动的运行是顶层的（<code>is_subagent=false</code>）；它们自身可能会调用一次 <code>spawn_subagent</code>。</p>
+<p>这是针对 agent-loop 派生路径的轻量信号。通过 <code>attribution_span!(tool)</code> 路由的专用「subagent started / completed」记录被作为代码侧的后续工作进行跟踪，一旦 agent loop 将工具执行包装在归因 span 中，工具内的每个 <code>record!</code> 都会自动携带 <code>tool=spawn_subagent</code>，于是这个问题就变成了一次简单的 grep。</p>
+<h3 id="委派门控"><a class="header" href="#委派门控">委派门控</a></h3>
+<p><code>delegate</code> 在 <code>crates/zeroclaw-runtime/src/tools/delegate.rs</code> 中会在目标 agent 运行前按以下顺序强制执行两道关卡：</p>
+<ol>
+<li>
+<p><strong><code>delegation_policy.mode</code></strong>：调用方的风险配置文件必须允许委派。<code>[risk_profiles.&lt;alias&gt;].delegation_policy</code> 默认为 <code>{ mode = "forbidden" }</code>；设置 <code>mode = "allow"</code> 才能允许委派。当被禁止时，拒绝信息为：</p>
+<pre><code class="language-text">调用者 "&lt;caller&gt;" 的风险配置文件 "&lt;caller_profile&gt;" 的 delegation_policy 禁止委派；将 [risk_profiles.&lt;caller_profile&gt;].delegation_policy mode 设置为 "allow"
+</code></pre>
+<p>此项可在网关仪表盘和 zerocode 中通过 <strong>Config → Risk profiles → <code>&lt;profile&gt;</code> → <code>delegation_policy.mode</code></strong> 编辑（一个 forbidden/allow 选择项）。</p>
+</li>
+<li>
+<p><strong>可达性</strong>：目标代理必须位于调用方的可达集合中，该集合由 <code>Config::reachable_delegate_target_configs</code> 解析得到。可达集合是 <code>[agents.&lt;caller&gt;]</code> 上两个按代理划分的来源的并集，减去调用方本身：</p>
+<ul>
+<li>
+<p><strong>同档同伴</strong>：所有与调用方共享相同风险档案的其他代理，在 <code>delegate_same_risk_profile = true</code>（默认值）时纳入。将其设为 <code>false</code> 可使调用方退出自动允许同伴的行为。</p>
+</li>
+<li>
+<p><strong>显式名册</strong>：<code>delegates</code>，一个可能为空的目标列表，调用方即使跨风险配置文件也可委派给这些目标。字符串条目便于手动编辑，并表示有界目标。对象条目则使该模式显式化：</p>
+<pre><code class="language-toml">delegates = [
+  "reviewer",
+  { agent = "sysadmin", mode = "independent" },
+]
+</code></pre>
+<p>当配置保存时，每个条目都会以对象形式写入，带有 <code>mode = "bounded"</code> 或 <code>mode = "independent"</code>。在守护进程和 UI 二进制文件升级到支持委托模式的构建版本之前，不要推广这种配置结构。较旧的二进制文件预期 <code>delegates</code> 只包含字符串；对象条目会使该二进制文件中的 <code>agents</code> 部分无效，而弹性加载器会丢弃该部分，因此修复界面仍然可以启动。
+当目标超出该集合时，拒绝会说明原因。例如：</p>
+</li>
+</ul>
+<p>delegate target “<target>” 无法从 “<caller>” 到达：风险配置不同（调用方使用 “&lt;caller_profile&gt;”，目标使用 “&lt;target_profile&gt;”）。delegate_same_risk_profile 仅能到达具有相同风险配置的 agent；请在 [agents.<caller>].delegates 中添加带有所需 mode 的显式条目，或更改其中一个 agent 的 risk_profile。</caller></caller></target></p>
+<pre><code class="language-text">delegate target "&lt;target&gt;" 无法从 "&lt;caller&gt;" 访问：delegate_same_risk_profile 已禁用，且目标未列在 [agents.&lt;caller&gt;].delegates 中
+</code></pre>
+<pre><code class="language-text">委托目标 "&lt;target&gt;" 无法从 "&lt;caller&gt;" 访问：目标代理已禁用
+</code></pre>
+<p>有界目标继承调用方的 action/cost 跟踪器。当有界目标与调用方共享其风险配置文件时，它也会继承调用方的会话工作区边界。只有当有界 <strong>cross-profile</strong> 目标可通过调用方的委派名册和 <code>delegation_policy</code> 访问时才允许；它在目标解析后的策略下运行，而 agentic 工具的可用性则由调用方的工具注册表上限限制。</p>
+<p>只有在使用 <code>mode = "independent"</code> 显式列出时，才可使用独立目标。它仍然需要 <code>delegation_policy.mode = "allow"</code> 并通过 <code>delegates</code> 可达，但一旦被选中，它会在不受调用方的非升级上限、会话工作区覆盖或操作/成本跟踪器影响的情况下，解析目标代理自身的策略。</p>
+</li>
+</ol>
+<p>工具模式中的 <code>agent</code> 参数说明里包含了宣传的 roster。它仅列出这个可达集合，而且只有在 <code>delegation_policy.mode = "allow"</code> 时才会列出。已禁用的 agent（<code>enabled = false</code>）永远不可达，无论是作为同一 profile 的同级节点，还是作为显式的 <code>delegates</code> 条目。</p>
+<p>在有界的代理式委派中，子代理的工具来自调用方已按策略过滤过的注册表，并与目标自身的 <code>allowed_tools</code> 取交集。目标上的 <strong>空</strong> <code>allowed_tools</code> 表示“继承”：子代理以调用方完整的可委派注册表运行，而不会被拒绝。非空列表则与该注册表取交集。无论哪种情况，调用方的注册表都是上限：一个有界的跨配置文件目标，即使其风险配置文件中列出了调用方从未获授的工具，也不会获得它。 因此，有界委派是以工具为边界，而不是完整的 <code>SecurityPolicy::ensure_no_escalation_beyond</code> 检查。如果该交集为空，目标仍会收到一次正常的代理式模型轮次，只是没有任何工具。</p>
+<p>在独立的 agentic 委派中，子代理的工具是根据目标代理自身已配置的策略和运行时注册表构建的，就像为该目标新开一个聊天一样。父级注册表不会作为上限使用。<code>delegate</code> 工具仍会从子注册表中移除，因此 agentic 委派不能通过另一次 <code>delegate</code> 调用递归。</p>
+<p>深度受父级的 <code>runtime_profile.max_delegation_depth</code> 限制。将其设置为 <code>1</code> 可允许顶层 agent 进行一次委派跳转，但不能进一步进行子委派。</p>
+<h4 id="智能体目标工具策略"><a class="header" href="#智能体目标工具策略">智能体目标工具策略</a></h4>
+<p>如果目标代理的 <code>[runtime_profiles.&lt;target&gt;].agentic = true</code>，<code>delegate</code> 会从父级可用工具（<code>mode = "bounded"</code>）或目标自身的运行时注册表（<code>mode = "independent"</code>）构建目标子循环的工具注册表。随后，目标风险配置文件会对该注册表进行过滤：</p>
+<ol>
+<li>已配置的空 <code>[risk_profiles.&lt;target_profile&gt;].allowed_tools</code> 列表会使所选注册表不受限制。</li>
+<li>非空的 <code>allowed_tools</code> 列表仅保留完全匹配的工具名称。</li>
+<li><code>[risk_profiles.&lt;target_profile&gt;].excluded_tools</code> 始终从结果中移除。</li>
+<li><code>delegate</code> 始终会从子注册表中移除，因此代理委托无法通过另一次 <code>delegate</code> 调用进行递归。</li>
+</ol>
+<p>此策略驻留在目标端，而不是调用方。同一配置文件的对等方使用共享风险配置文件。显式跨配置文件委托在可达性和委托策略门控之后使用目标的风险配置文件。受限的代理式委托仅接收与目标工具策略相交的、由调用方上限约束的工具注册表；独立的代理式委托接收目标拥有的工具注册表。缺少目标风险配置文件会在子循环开始前拒绝。一个配置好的配置文件即使使可执行的子工具数量为零，仍然允许一次不使用工具的正常模型轮次。</p>
+<h3 id="delegate模型看到的输出字符串"><a class="header" href="#delegate模型看到的输出字符串"><code>delegate</code>：模型看到的输出字符串</a></h3>
+<p>精确，来源于 <code>crates/zeroclaw-runtime/src/tools/delegate.rs</code>。</p>
+<ol>
+<li>
+<p>同步成功：输出以 <code>[Agent '&lt;target&gt;' (&lt;provider_type&gt;/&lt;model&gt;)]\n</code> 开头，后跟目标 agent 的响应。如果目标返回空字符串，则正文为字面量 <code>[Empty response]</code>。</p>
+</li>
+<li>
+<p>同步失败：错误字段以 <code>Agent '&lt;target&gt;' failed: &lt;wrapped error&gt;</code> 开头。</p>
+</li>
+<li>
+<p>同步超时（当目标的运行时配置文件设置了 <code>delegation_timeout_secs</code> 时）：错误字段为 <code>Agent '&lt;target&gt;' timed out after &lt;N&gt;s</code>。</p>
+</li>
+<li>
+<p>后台生成成功：输出为三行字面量</p>
+<pre><code class="language-text">Background task started for agent '&lt;target&gt;'.
+task_id: &lt;uuid&gt;
+Use action='check_result' with task_id='&lt;uuid&gt;' to retrieve the result.
+</code></pre>
+<p>结果文件位于 <code>&lt;workspace&gt;/delegate_results/&lt;uuid&gt;.json</code>。运行期间，文件的 <code>status</code> 字段为 <code>running</code>；终态为 <code>completed</code>、<code>failed</code> 或 <code>cancelled</code>。</p>
+</li>
+<li>
+<p><code>action="check_result"</code> 使用未知的任务 ID：错误为 <code>No result found for task_id '&lt;uuid&gt;'</code>。</p>
+</li>
+<li>
+<p><code>action="await_sessions"</code> 配合 <code>task_ids: [&lt;uuid&gt;, ...]</code> 一次等待多个后台结果文件。输出是一个 JSON 对象，包含 <code>status</code>（<code>complete</code> 或 <code>timeout</code>）、<code>completed</code>、<code>pending</code>、<code>missing</code>、<code>failed</code> 和 <code>results</code>。<code>timeout_ms</code> 默认值为 30000，且上限为 120000；发生超时时，工具会返回部分结果以及一条错误，说明一个或多个任务仍处于待处理或缺失状态。不允许重复的任务 ID。</p>
+</li>
+<li>
+<p>并行分发输出：以 <code>[Parallel delegation: &lt;N&gt; agents]\n\n</code> 开头，后接以 <code>\n\n</code> 分隔的各代理块，每个块以 <code>--- &lt;target&gt; (success=&lt;bool&gt;) ---\n</code> 开头。当某个代理失败时，其内部块为 <code>--- &lt;target&gt; (success=false) ---\nError: &lt;wrapped error&gt;</code>。</p>
+</li>
+<li>
+<p>未知的目标 agent：错误信息为 <code>Unknown agent '&lt;target&gt;'. Available agents: &lt;comma-separated list&gt;</code>。</p>
+</li>
+<li>
+<p>深度超出限制（由父级的 <code>runtime_profile.max_delegation_depth</code> 控制，默认值为 3）：错误为 <code>Delegation depth limit reached (&lt;depth&gt;/&lt;max&gt;).</code></p>
+</li>
+<li>
+<p>未知操作：错误为 <code>Unknown action '&lt;value&gt;'. Use delegate/check_result/list_results/cancel_task/await_sessions.</code></p>
+</li>
+<li>
+<p>独立目标，其风险配置文件具有 <code>always_ask</code> 条目：错误为 <code>delegate target "&lt;target&gt;" cannot run in independent mode from "&lt;caller&gt;": risk profile "&lt;profile&gt;" has always_ask entries (&lt;list&gt;). See ZeroClaw docs, "Delegation &amp; SubAgents" &gt; "What's not supported".</code></p>
+</li>
+<li>
+<p>智能体目标缺少目标风险配置时：错误为 <code>Agent '&lt;target&gt;' is agentic but risk_profile '&lt;target_profile&gt;' is not configured</code>。</p>
+</li>
+<li>
+<p>Agentic 目标没有可执行的子工具：空工具集本身不会发出错误；目标会接收到一次正常的模型轮次，不带任何工具。</p>
+</li>
+</ol>
+<h3 id="delegate如何验证它确实已触发"><a class="header" href="#delegate如何验证它确实已触发"><code>delegate</code>：如何验证它确实已触发</a></h3>
+<p><code>delegate</code> 目前不会发出专用的追踪跨度（tracing span）。其信号体现为<strong>目标</strong>智能体的循环出现在日志中，并继承父级工具调用调度所处的任意作用域。后台模式的生成更易于带外验证：结果文件 <code>&lt;workspace&gt;/delegate_results/&lt;uuid&gt;.json</code> 存在于磁盘上，并携带目标智能体的 <code>status</code> 与 <code>output</code> 字段；使用 <code>cat</code> 或 <code>jq</code> 即可读取，完全无需查看日志。</p>
+<p>（由 Cron 启动的 agent 作业属于独立的生成位置，使用上文所述的显式 <code>subagent</code> span；<code>delegate</code> 与 cron 并非同一路径。）</p>
+<h3 id="本页未涵盖的内容有意为之"><a class="header" href="#本页未涵盖的内容有意为之">本页未涵盖的内容（有意为之）</a></h3>
+<ol>
+<li>示例对话记录。我在这里所写的任何关于“机器人会说什么”的描述都依赖于具体模型。机器人的回复取决于工具的输出、模型、系统提示词以及当前对话状态，而这些都不在本页面的控制范围之内。可验证的层面是工具返回的内容（如上所示）以及日志所捕获的内容。</li>
+<li>一个专门的 “subagent fired” / “delegate fired” 日志标记。已作为代码侧的后续事项进行跟踪。目前，操作员通过上文描述的 scope 结构（即现有的结构性信号）以及 background-mode 结果文件进行验证。</li>
+</ol>
+<h2 id="在-spawn_subagent-和-delegate-之间进行选择"><a class="header" href="#在-spawn_subagent-和-delegate-之间进行选择">在 <code>spawn_subagent</code> 和 <code>delegate</code> 之间进行选择</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th></th><th><code>spawn_subagent</code></th><th><code>delegate</code></th></tr>
+</thead>
+<tbody>
+<tr><td><strong>身份</strong></td><td>与父级相同（相同 UUID，相同风险概况）</td><td>目标代理的身份（不同的别名；同配置文件的对等代理或明确的跨配置文件委托方）</td></tr>
+<tr><td><strong>权限模型</strong></td><td>父级策略的逐字内容（或缩小后的子集）</td><td>有界目标在目标策略下运行，并以调用方的 agentic 工具注册表为上限；独立目标在目标策略和目标自有注册表下运行</td></tr>
+<tr><td><strong>模型提供商</strong></td><td>父级</td><td>目标智能体配置的提供商</td></tr>
+<tr><td><strong>生成深度</strong></td><td>硬性上限为 1</td><td>最多 <code>runtime_profile.max_delegation_depth</code>（默认值为 3）</td></tr>
+<tr><td><strong>后台模式</strong></td><td>不支持</td><td><code>background: true</code> 返回一个 <code>task_id</code></td></tr>
+<tr><td><strong>并行分发</strong></td><td>无内置参数；当 <code>parallel_tools = true</code> 时，单轮中的多次调用会并发执行</td><td><code>parallel: [...]</code> 并发运行多个目标</td></tr>
+<tr><td><strong>门控</strong></td><td>非空的 <code>risk_profile.allowed_tools</code> 必须列出 <code>spawn_subagent</code>；<code>excluded_tools</code> 不得列出它</td><td>调用方非空的 <code>risk_profile.allowed_tools</code> 必须列出 <code>delegate</code>；<code>excluded_tools</code> 不得列出它；调用方的 <code>delegation_policy mode = "allow"</code>；并且目标位于调用方的可达集合中（同 profile 的对等项或显式的 <code>delegates</code> 条目）</td></tr>
+<tr><td><strong>使用场景</strong></td><td>应保持在同一身份内的内部子任务</td><td>希望由另一个已配置的专员（不同模型、不同别名）在有界或独立委派下负责该任务</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="不支持的内容"><a class="header" href="#不支持的内容">不支持的内容</a></h2>
+<ol>
+<li><strong>超过深度 1 的递归。</strong> SubAgent 无法生成自己的 SubAgent。该限制是工具层面的硬性拒绝，而非预算限制。Cron 启动的运行从深度 0 开始，可以生成一级；由 agent-loop 启动的 SubAgent 处于深度 1，会拒绝进一步生成。</li>
+<li><strong>子代理的独立身份。</strong> 子代理共享父代理的 agent UUID。如需以不同身份运行，请使用 <code>delegate</code> 移交给已配置的同级代理。</li>
+<li><strong>单次生成时间预算。</strong> 没有 <code>timeout_secs</code> 参数。父进程会在子运行的整个持续期间保持阻塞；取消操作必须通过更大范围的中断作用域来传递。</li>
+<li><strong>向父级流式传输进度。</strong> 父级在子级完成后将其最终响应视为单个字符串。</li>
+<li><strong><code>[agents.&lt;alias&gt;].subagent_*</code> 配置块。</strong> 验证器和覆盖类型今日已发布；面向操作员的配置层（用于贯通调用方定义的收窄逻辑）不在本次发布范围内。在该层落地之前，两个生成点均传递 <code>SubAgentOverrides::default()</code>。</li>
+<li><strong>带有 <code>always_ask</code> 的独立 <code>delegate</code> 目标。</strong> 当目标代理的风险配置文件包含非空的 <code>always_ask</code> 条目时，独立委派会被阻止。运行时会在启动目标之前拒绝，包括后台和并行委派。此阻塞将一直保留，直到未来的 ZeroClaw 版本支持为独立子代理转发审批。</li>
+</ol>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../agents/operating.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../agents/internals.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../agents/operating.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../agents/internals.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../../../_shared/theme/version-selector.js"></script>
+        <script src="../../../_shared/theme/lang-switcher.js"></script>
+        <script src="../../../_shared/theme/pc-enhance.js"></script>
+        <script src="../../../_shared/mermaid.min.js"></script>
+        <script src="../../../_shared/mermaid-init.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

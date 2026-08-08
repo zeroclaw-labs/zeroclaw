@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["SYSTEM_PROMPT_ADDENDUM"],"fn":["render_receipts_block","scope_receipts"],"static":["TOOL_LOOP_RECEIPT_CONTEXT"],"struct":["ReceiptGenerator","ReceiptScope"]};

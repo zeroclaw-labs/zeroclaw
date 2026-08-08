@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["MAX_DELIVER_FILE_BYTES"],"fn":["attachment_deliver_uri","read_delivered_artifact_bounded"],"struct":["DeliverFileTool"]};

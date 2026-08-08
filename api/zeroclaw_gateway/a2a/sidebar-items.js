@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["a2a_routes","a2a_task_route","build_agent_card","build_catalog_card"],"struct":["AgentCapabilities","AgentCard","AgentInterface","AgentSkill"]};

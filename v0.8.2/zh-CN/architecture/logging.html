@@ -1,0 +1,549 @@
+<!DOCTYPE HTML>
+<html lang="zh-CN" class="default-dark sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>日志记录 - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Documentation for the ZeroClaw personal AI assistant.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../../../_shared/favicon.svg">
+        <link rel="shortcut icon" href="../../../_shared/favicon.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-2459343d.css">
+        <link rel="stylesheet" href="../../../_shared/css/chrome.css">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets (pc-themes.css generated; ordered first) -->
+        <link rel="stylesheet" href="../../../_shared/theme/pc-themes.css">
+        <link rel="stylesheet" href="../../../_shared/theme/custom.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "default-dark";
+            const default_dark_theme = "default-dark";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-04d9ccb7.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('default-dark')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                sidebar_toggle.checked = false;
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <!-- PC_THEME_LIST_START: generated from themes.json by `cargo xtask mdbook themes`; do not edit between markers -->
+                            <li role="none" class="pc-theme-group">Dark</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0c0e12;--s1:#38bdf8;--s2:#7dd3fc;--s3:#9aa0aa"></span><span class="pc-theme-name">Operator Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-ayu-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e14;--s1:#39bae6;--s2:#d2a6ff;--s3:#ffb454"></span><span class="pc-theme-name">Ayu Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-mocha"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e2e;--s1:#89b4fa;--s2:#cba6f7;--s3:#f9e2af"></span><span class="pc-theme-name">Catppuccin Mocha</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282828;--s1:#83a598;--s2:#d3869b;--s3:#fabd2f"></span><span class="pc-theme-name">Gruvbox Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hacker-green"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e0a;--s1:#00ff41;--s2:#00cc33;--s3:#008f11"></span><span class="pc-theme-name">Hacker Green</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hazard"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#16140a;--s1:#ffd60a;--s2:#ffb454;--s3:#ff8a5c"></span><span class="pc-theme-name">Hazard</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#ffffff;--s2:#ff00ff;--s3:#ffff00"></span><span class="pc-theme-name">High Contrast Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-dragon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#181616;--s1:#8ba4b0;--s2:#a292a3;--s3:#c4b28a"></span><span class="pc-theme-name">Kanagawa Dragon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-wave"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1f1f28;--s1:#7e9cd8;--s2:#957fb8;--s3:#e6c384"></span><span class="pc-theme-name">Kanagawa Wave</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#212121;--s1:#89ddff;--s2:#c792ea;--s3:#ffcb6b"></span><span class="pc-theme-name">Material Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-monokai"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#272822;--s1:#f92672;--s2:#a6e22e;--s3:#e6db74"></span><span class="pc-theme-name">Monokai</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-night-owl"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#011627;--s1:#82aaff;--s2:#c792ea;--s3:#addb67"></span><span class="pc-theme-name">Night Owl</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2e3440;--s1:#88c0d0;--s2:#81a1c1;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-oled-black"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#22d3ee;--s2:#8b5cf6;--s3:#10b981"></span><span class="pc-theme-name">OLED Black</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282c34;--s1:#61afef;--s2:#c678dd;--s3:#e5c07b"></span><span class="pc-theme-name">One Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#191724;--s1:#ebbcba;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-moon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#232136;--s1:#ea9a97;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine Moon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#002b36;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1a1b26;--s1:#7aa2f7;--s2:#bb9af7;--s3:#e0af68"></span><span class="pc-theme-name">Tokyo Night</span></button></li>
+                            <li role="none" class="pc-theme-group">Light</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#0284c7;--s2:#0ea5e9;--s3:#475569"></span><span class="pc-theme-name">Operator Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-latte"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eff1f5;--s1:#1e66f5;--s2:#8839ef;--s3:#df8e1d"></span><span class="pc-theme-name">Catppuccin Latte</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f4f4f5;--s1:#22d3ee;--s2:#8b5cf6;--s3:#f59e0b"></span><span class="pc-theme-name">Default Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#8da101;--s2:#35a77c;--s3:#dfa000"></span><span class="pc-theme-name">Everforest Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fffcf0;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fbf1c7;--s1:#076678;--s2:#8f3f71;--s3:#b57614"></span><span class="pc-theme-name">Gruvbox Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-white"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#000000;--s2:#600080;--s3:#806000"></span><span class="pc-theme-name">High Contrast White</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-lotus"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f2ecbc;--s1:#4d699b;--s2:#b35b79;--s3:#836f4a"></span><span class="pc-theme-name">Kanagawa Lotus</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#6182b8;--s2:#7c4dff;--s3:#f76d47"></span><span class="pc-theme-name">Material Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eceff4;--s1:#5e81ac;--s2:#88c0d0;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#4078f2;--s2:#a626a4;--s3:#c18401"></span><span class="pc-theme-name">One Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-dawn"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#faf4ed;--s1:#d7827e;--s2:#907aa9;--s3:#ea9d34"></span><span class="pc-theme-name">Rosé Pine Dawn</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night-day"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#e1e2e7;--s1:#2e7de9;--s2:#9854f1;--s3:#8c6c3e"></span><span class="pc-theme-name">Tokyo Night Day</span></button></li>
+                            <!-- PC_THEME_LIST_END -->
+                        </ul>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://discord.gg/tQ88WUkPyJ" title="Join our Discord" aria-label="Join our Discord" rel="external noopener" target="_blank">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M524.531,69.836a1.5,1.5,0,0,0-.764-.7A485.065,485.065,0,0,0,404.081,32.03a1.816,1.816,0,0,0-1.923.91,337.461,337.461,0,0,0-14.9,30.6,447.848,447.848,0,0,0-134.426,0,309.541,309.541,0,0,0-15.135-30.6,1.89,1.89,0,0,0-1.924-.91A483.689,483.689,0,0,0,116.085,69.137a1.712,1.712,0,0,0-.788.676C39.068,183.651,18.186,294.69,28.43,404.354a2.016,2.016,0,0,0,.765,1.375A487.666,487.666,0,0,0,176.02,479.918a1.9,1.9,0,0,0,2.063-.676A348.2,348.2,0,0,0,208.12,430.4a1.86,1.86,0,0,0-1.019-2.588,321.173,321.173,0,0,1-45.868-21.853,1.885,1.885,0,0,1-.185-3.126c3.082-2.309,6.166-4.711,9.109-7.137a1.819,1.819,0,0,1,1.9-.256c96.229,43.917,200.41,43.917,295.5,0a1.812,1.812,0,0,1,1.924.233c2.944,2.426,6.027,4.851,9.132,7.16a1.884,1.884,0,0,1-.162,3.126,301.407,301.407,0,0,1-45.89,21.83,1.875,1.875,0,0,0-1,2.611,391.055,391.055,0,0,0,30.014,48.815,1.864,1.864,0,0,0,2.063.7A486.048,486.048,0,0,0,610.7,405.729a1.882,1.882,0,0,0,.765-1.352C623.729,277.594,590.933,167.465,524.531,69.836ZM222.491,337.58c-28.972,0-52.844-26.587-52.844-59.239S193.056,219.1,222.491,219.1c29.665,0,53.306,26.82,52.843,59.239C275.334,310.993,251.924,337.58,222.491,337.58Zm195.38,0c-28.971,0-52.843-26.587-52.843-59.239S388.437,219.1,417.871,219.1c29.667,0,53.307,26.82,52.844,59.239C470.715,310.993,447.538,337.58,417.871,337.58Z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <aside id="pc-page-toc" class="pc-page-toc" aria-label="On this page"></aside>
+                    <main>
+                        <h1 id="日志记录架构"><a class="header" href="#日志记录架构">日志记录架构</a></h1>
+<p>ZeroClaw 只有一个日志记录接口：<code>zeroclaw_log::record!</code> 宏。工作区中的每一次输出——智能体循环活动、通道 I/O、cron 运行、工具调用、内存操作、会话生命周期、错误——都通过它进行。该宏会触发一个 <code>tracing</code> 事件，已安装的订阅者将其传递给两个并列的层：stderr fmt 层（终端输出）和 <code>LogCaptureLayer</code>。fmt 层在 stderr 上打印带颜色、带别名前缀的行（除非使用 <code>--verbose</code>，否则会被静默）。<code>LogCaptureLayer</code> 会生成一个结构化的 <code>LogEvent</code> 并将其分发，经由 <code>writer::record_event</code>，发送到：</p>
+<ol>
+<li>用于 Prometheus / OTel 类型化指标的 Observer 桥接器（<code>observer_bridge::forward</code>）。</li>
+<li>进程级广播通道，使仪表盘的 SSE 流能够实时接收每个事件。</li>
+<li>位于 <code>&lt;workspace&gt;/state/runtime-trace.jsonl</code> 的持久化 JSONL 日志（当 <code>[observability] log_persistence</code> 为 <code>"rolling"</code> 或 <code>"full"</code> 时）。</li>
+</ol>
+<p>磁盘上的 JSONL 追加操作最后执行，且仅在启用持久化时进行；Observer 桥接和广播钩子则无条件触发。</p>
+<h2 id="请先阅读attribution-不是-attrs"><a class="header" href="#请先阅读attribution-不是-attrs">请先阅读：attribution 不是 attrs</a></h2>
+<p>每个日志事件都携带两条完全独立的结构化数据通道。混淆它们是调用点处最常见的错误，因此请在做其他事情之前先牢记这种区分：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th></th><th><strong>归属信息</strong>（<code>zeroclaw.*</code>）</th><th><strong>Attrs</strong> (<code>attributes.*</code>)</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>答案</strong></td><td><em>谁</em> 做的以及 <em>在什么情况下</em></td><td>具体发生了什么</td></tr>
+<tr><td><strong>示例</strong></td><td><code>channel</code>、<code>agent_alias</code>、<code>model_provider</code>、<code>tool</code>、<code>session_key</code>、<code>cron_job_id</code></td><td><code>bytes_received</code>、<code>tokens_used</code>、<code>status_code</code>、错误负载</td></tr>
+<tr><td><strong>源</strong></td><td><strong>Span（跨度）。</strong> 在入口点处打开，由该层遍历。</td><td><strong>调用点。</strong> <code>Event::with_attrs(json!({...}))</code>。</td></tr>
+<tr><td><strong>出现在调用位置？</strong></td><td><strong>永不。</strong> 不是 <code>record!</code> 参数。</td><td>是的，这是它唯一可能的来源。</td></tr>
+</tbody>
+</table>
+</div>
+<p>由此得出的规则：<strong>如果某个值标识了一个事件归属于谁或哪个作用域，那么它应当来自 span，而绝不能出现在调用点。</strong> 归属信息会从调用栈上层打开的 <code>attribution_span!</code> / <code>scope!</code> 包装器中自动流入；当事件触发时，该层会从叶到根遍历 span 作用域，并将每一项贡献合并到该事件的 <code>zeroclaw.*</code> 块中。触发 <code>record!</code> 的调用点不会指明其中任何内容。</p>
+<p>由于归因是这种拆分中起承重作用的那一半，也是最容易让人栽跟头的那一半，所以它排在最前面。</p>
+<h2 id="归因一切都源自-span"><a class="header" href="#归因一切都源自-span">归因：一切都源自 span</a></h2>
+<p><strong>归因属性从来不是调用点参数。</strong> 请再读一遍。Channel composite、agent_alias、model_provider、tool、session_key、cron_job_id：这些都不应被键入到 <code>record!</code> 调用中。它们通过在入口点开启的 tracing span 流入，并在事件触发时由该层遍历获取。如果你发现自己想把 <code>agent_alias</code> 或 <code>tool</code> 传给 <code>record!</code>，请停下：该值已经通过某个 span 处于作用域内，或者本应如此，正确的做法是开启或修复对应的 span，而不是把这个值穿入调用点。</p>
+<p>机制全流程：</p>
+<ol>
+<li>“事物”（通道、提供方、代理、工具、定时任务、内存后端……）在其结构体旁边实现一次 <code>Attributable</code> 即可。</li>
+<li>其入口点将工作封装在 <code>attribution_span!(self)</code> 中，这会打开一个追踪 span，携带该事物的角色和别名。</li>
+<li>在该 span 内任何位置触发的每个 <code>record!</code>，无论是直接触发还是任意深度的嵌套触发，都会自动继承该归属信息。</li>
+<li>当事件触发时，该层会按 <strong>leaf→root</strong>（叶到根）遍历 span 作用域，合并每个 <code>Attributable</code> 的贡献，并写入合并后的 <code>zeroclaw.*</code> 块。调用方对此一无所知。</li>
+</ol>
+<p>这正是该设计的核心要义：针对每个事物的日志代码为零。你只需实现一次该 trait 并对入口点进行一次包装；其下的每一次输出都会被自动归因，无需额外开销。</p>
+<h3 id="attributable-trait"><a class="header" href="#attributable-trait"><code>Attributable</code> trait</a></h3>
+<p>位于 <code>crates/zeroclaw-api/src/attribution.rs</code> 中，因此每个 crate 都可以实现它，而无需依赖 <code>zeroclaw-log</code>：</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>pub trait Attributable {
+    fn role(&amp;self) -&gt; Role;
+    fn alias(&amp;self) -&gt; &amp;str;
+}
+<span class="boring">}</span></code></pre>
+<p>工作区中的每个“事物”（一个 <code>TelegramChannel</code>、一个 <code>AnthropicModelProvider</code>、一个 <code>Agent</code>、一个 cron 作业、一个工具、一个内存后端、一个对等组、一个技能包、一个 MCP 包、一个会话）都在其结构体旁实现了一次 <code>Attributable</code>。</p>
+<h3 id="role-分类法"><a class="header" href="#role-分类法"><code>Role</code> 分类法</a></h3>
+<p>嵌套枚举已关闭：</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>pub enum Role {
+    Swarm,
+    Agent,
+    Channel(ChannelKind),       // Telegram、Discord、Slack、Matrix、Lark……
+    Tool(ToolKind),             // Shell、HttpRequest、FetchUrl 等……
+    Cron(CronKind),             // 间隔、定时、Cron、单次
+    Provider(ProviderKind),     // 模型、Tts、转录、隧道
+    Memory(MemoryKind),         // Sqlite、Json、InMemory、Markdown、Qdrant 等……
+    PeerGroup,
+    Skill,
+    Mcp,
+    Sop,
+    Session,
+    System,
+}
+<span class="boring">}</span></code></pre>
+<p><code>ChannelKind</code>、<code>ToolKind</code>、<code>CronKind</code>、<code>MemoryKind</code> 以及四个 <code>ProviderKind</code> 子枚举（<code>ModelProviderKind</code>、<code>TtsProviderKind</code>、<code>TranscriptionProviderKind</code>、<code>TunnelProviderKind</code>）都是封闭的。通过 <code>strum::IntoStaticStr</code> 得到的变体 snake_case 形式即为 <code>&lt;type&gt;.&lt;alias&gt;</code> 组合中规范的 <code>&lt;type&gt;</code> 部分。添加新实现：扩展相关的 <code>Kind</code> 枚举，仅此而已。</p>
+<h3 id="打开一个跨度在每个入口点执行此操作"><a class="header" href="#打开一个跨度在每个入口点执行此操作">打开一个跨度，在每个入口点执行此操作</a></h3>
+<p>使用 <code>attribution_span!(thing)</code> 包裹入口点的工作。该宏返回一个 <code>Span</code>，以结构化字段携带该 thing 的角色和别名。对 future 调用 <code>.instrument(span)</code>（或在同步代码中使用 <code>let _g = span.entered()</code>）。<strong>未重新建立 span 的派生任务会丢失归属信息</strong>：每个会发出数据的 <code>tokio::spawn</code> 主体都必须携带与父级相同的 <code>attribution_span!</code> / <code>scope!</code>，否则其发出的数据将无法归属。</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use zeroclaw_log::Instrument;
+
+let span = zeroclaw_log::attribution_span!(self);  // self 实现了 Attributable
+async move {
+    // 每条记录！内部自动携带别名绑定的字段
+    record!(INFO, Event::new(module_path!(), Action::Start), 频道在线);
+    self.poll_loop().await
+}.instrument(span).await
+<span class="boring">}</span></code></pre>
+<p>当事件触发时，该层会沿着 span 作用域从叶节点到根节点遍历，将每个 <code>Attributable</code> 的贡献合并到事件的 <code>zeroclaw.*</code> 归因块中，并发出复合属性（<code>channel = "telegram.clamps"</code>、<code>channel_type = "telegram"</code>、<code>channel_alias = "clamps"</code>），而调用方无需指定其中任何键。</p>
+<h3 id="scope-宏非角色上下文"><a class="header" href="#scope-宏非角色上下文"><code>scope!</code> 宏，非角色上下文</a></h3>
+<p><code>attribution_span!</code> 用于带角色的 <code>Attributable</code> 对象。对于不与某个对象绑定的按作用域标识符（发送者 id、消息 id、回合 id、请求 id），请使用 <code>scope!</code>：</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>zeroclaw_log::scope!(
+    sender: msg.sender.as_str(),
+    message_id: msg.id.as_str(),
+    =&gt; async move { process_message(msg).await }
+).await
+<span class="boring">}</span></code></pre>
+<p><code>scope!</code> 刻意横跨 attribution/attrs 这条界线：凡是匹配别名绑定的 <code>ATTRIBUTION_FIELDS</code> / <code>COMPOSITE_PREFIXES</code>（位于 <code>crates/zeroclaw-log/src/event.rs</code>）的字段键，都会进入有类型的 <code>zeroclaw.*</code> 归因槽；其余字段则进入事件的 <code>attributes</code> 映射，应用于每一次后代发射。无论哪种情况，该值都会随每一个嵌套的 <code>record!</code> 一同传递，而无需作为调用点参数。</p>
+<h2 id="record-宏及其调用点约定"><a class="header" href="#record-宏及其调用点约定"><code>record!</code> 宏及其调用点约定</a></h2>
+<p><code>tracing</code> crate 是 <code>zeroclaw-log</code> 的实现细节：<code>record!</code> / <code>scope!</code> / <code>attribution_span!</code> 宏会展开为 <code>zeroclaw_log::__private::tracing</code>，因此调用点永远不会直接引用 tracing 类型。日志事件宏本身（<code>tracing::{trace,debug,info,warn,error}</code>、<code>log::*</code>、<code>std::dbg</code>，以及裸用的 <code>anyhow::anyhow!</code>）在 <code>clippy.toml</code> 中被作为 <code>disallowed-macros</code> <strong>在整个 workspace 范围内硬性禁用</strong>。由于 CI 中启用了 <code>-D warnings</code>，任何直接使用 <code>tracing::info!</code> 等的代码都会<strong>导致构建失败</strong>，并附带一条 clippy 消息，指明应改用 <code>::zeroclaw_log::record!</code>。这并非约定，而是强制执行的规则。</p>
+<p>唯一的例外是 <code>crates/zeroclaw-log/</code> 内少数用于引导流水线的文件，它们带有本地的 <code>#![allow(clippy::disallowed_macros)]</code>。少数几个 crate（<code>zeroclaw-api</code>、<code>zeroclaw-spawn</code>、<code>zeroclaw-providers</code>、<code>zeroclaw-hardware</code>、<code>zeroclaw-log</code>）仍在 <code>Cargo.toml</code> 中列出了 <code>tracing</code> / <code>tracing-subscriber</code>，但仅用于 span 和 subscriber 的底层连接，而非用于发出日志宏。依赖项的存在并不意味着可以调用被禁用的宏。（<code>tokio::spawn</code> 同样通过 <code>disallowed-methods</code> 被禁用；请使用 <code>::zeroclaw_spawn::spawn!</code>，以便派生的任务继承调用方的归因 span。）</p>
+<p>宏是锁定形态的：它接受一个级别、一个 <code>Event</code> 表达式和一个消息字面量。</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use zeroclaw_log::{record, Event, Action, EventCategory, EventOutcome};
+
+record!(INFO, Event::new(module_path!(), Action::Start), 启动步骤);
+record!(WARN, Event::new(module_path!(), Action::Fail).with_outcome(EventOutcome::Failure).with_attrs(serde_json::json!({"exit_code": 137})), 工具失败);
+<span class="boring">}</span></code></pre>
+<p><code>module_path!()</code> 是事件名称的规范来源：它是调用点的 Rust 模块路径（例如 <code>zeroclaw_channels::telegram</code>），因此事件可被搜索、可跳转到源代码，且不可能拼写错误。工作区中的每个 <code>record!</code> 调用点都使用相同的约定。</p>
+<p>宏会自动注入 <code>file!()</code> 和 <code>line!()</code>。<code>LogCaptureLayer</code> 将它们作为 <code>_file</code> 和 <code>_line</code> 附加到事件的 <code>attributes</code> 映射中，以便操作人员从日志查看器跳转到源代码。</p>
+<h3 id="调用点约定"><a class="header" href="#调用点约定">调用点约定</a></h3>
+<p>每次 <code>record!</code> 调用都是一行代码，用于说明<strong>发生了什么</strong>，而不是<strong>谁做的或在什么上下文下做的</strong>。</p>
+<ul>
+<li>级别后的单个位置参数是一个 <code>Event</code> 表达式。</li>
+<li>下一个参数是用于人类可读消息的字符串字面量。</li>
+<li>以上就是全部内容。Channel、agent_alias、provider、tool、session_key、cron_job_id、model：这些都不是调用点参数。它们都从 span 中流入（参见 <a href="#attribution-it-all-comes-from-spans">Attribution: it all comes from spans</a>）。</li>
+</ul>
+<p>形状由 <code>Event</code> 结构体强制约束：未知字段会导致编译错误。</p>
+<h3 id="需要属性时"><a class="header" href="#需要属性时">需要属性时</a></h3>
+<p><code>Event::with_attrs(serde_json::json!({...}))</code> 用于单个事件的测量值，以及周围作用域中不存在的临时数据。具体而言：</p>
+<ul>
+<li>每事件度量：<code>bytes_received</code>、<code>tokens_used</code>、<code>retry_count</code>、<code>status_code</code>、<code>queue_depth</code>。</li>
+<li>当错误本身就是事件时的错误负载：anyhow 链式文本、HTTP 错误正文、解析错误详情。</li>
+<li>外部系统标识符：远程 API 的 <code>request_id</code>、上游跟踪标头。</li>
+<li>此刻捕获的派生状态：进行中的请求数、retry-after 秒数。</li>
+</ul>
+<p><strong>Attrs 不适用于</strong>任何来自周围作用域的内容：channel composite、agent_alias、model_provider、tool、session_key、cron_job_id、sender、message_id 等。这些应放在外层的 <code>attribution_span!</code> 或 <code>scope!</code> 中。</p>
+<p>serde 规则：传递<strong>原始值</strong>，绝不要使用 <code>format!("{}", v)</code> 或 <code>format!("{:?}", v)</code>。<code>serde_json::json!</code> 会将字符串序列化为字符串，数字序列化为数字，<code>Vec&lt;T&gt;</code> 序列化为数组，<code>Option&lt;T&gt;</code> 序列化为 null 或值。仅当类型未实现 <code>impl Serialize</code> 时（例如 <code>anyhow::Error</code>、<code>reqwest::Error</code>、<code>std::io::Error</code>、<code>Path::Display</code>、<code>StatusCode</code>）才使用 <code>.to_string()</code> 包装。</p>
+<h3 id="占位符规则"><a class="header" href="#占位符规则">占位符规则</a></h3>
+<p>Rust 字符串字面量占位符（如 <code>"raw error body: {body}"</code>）禁止在 <code>record!</code> 消息中使用。Rust 2021 的隐式格式字符串捕获不会穿透 <code>record!</code>：每个 <code>{var}</code> 都会变成字面子串，不进行替换。转换规则：</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>// 错误 — {body} 是字面量，绝不会被插值
+record!(WARN, Event::new(module_path!(), Action::Fail), raw error body: {body});
+
+// 正确 —— 正文位于 attrs 中，message 为纯文本说明
+record!(WARN, Event::new(module_path!(), Action::Fail).with_attrs(serde_json::json!({"body": body})), 原始错误正文);
+<span class="boring">}</span></code></pre>
+<h2 id="eventactioneventoutcomeeventcategory"><a class="header" href="#eventactioneventoutcomeeventcategory"><code>Event</code>、<code>Action</code>、<code>EventOutcome</code>、<code>EventCategory</code></a></h2>
+<p>这四个都是定义在 <code>crates/zeroclaw-log/src/event.rs</code> 中的封闭枚举。添加值是唯一的更改点：调用点不会自行创建字符串。</p>
+<ul>
+<li><code>Action</code>：封闭动词集合，通过 <code>strum::IntoStaticStr</code> 以 snake_case 形式存储于磁盘：<code>Start</code>、<code>Complete</code>、<code>Fail</code>、<code>Cancel</code>、<code>Skip</code>、<code>Timeout</code>、<code>Retry</code>、<code>Inbound</code>、<code>Outbound</code>、<code>Send</code>、<code>Receive</code>、<code>Connect</code>、<code>Disconnect</code>、<code>Reconnect</code>、<code>Spawn</code>、<code>Kill</code>、<code>Tick</code>、<code>Trigger</code>、<code>Schedule</code>、<code>Approve</code>、<code>Reject</code>、<code>Defer</code>、<code>Read</code>、<code>Write</code>、<code>Delete</code>、<code>List</code>、<code>Query</code>、<code>Invoke</code>、<code>Dispatch</code>、<code>Resolve</code>、<code>Register</code>、<code>Unregister</code>、<code>Load</code>、<code>Save</code>、<code>Migrate</code>、<code>Validate</code>、<code>Note</code>。</li>
+<li><code>EventOutcome</code>：<code>Success</code>、<code>Failure</code>、<code>Unknown</code>。<code>Unknown</code> 是默认值，在序列化时会被跳过（不会写入磁盘上的 <code>event.outcome</code>），因此没有 <code>outcome</code> 键的行隐式表示 <code>Unknown</code>。</li>
+<li><code>EventCategory</code>：<code>Agent</code>、<code>Channel</code>、<code>Cron</code>、<code>Memory</code>、<code>Tool</code>、<code>Provider</code>、<code>Session</code>、<code>System</code>、<code>Internal</code>。除非通过 <code>Event::with_category(...)</code> 覆盖，否则派生自最内层的角色范围。</li>
+</ul>
+<h2 id="工具输入输出传递"><a class="header" href="#工具输入输出传递">工具输入/输出传递</a></h2>
+<p>中央工具执行器（<code>crates/zeroclaw-runtime/src/agent/tool_execution.rs::execute_one_tool</code>）会用 invoke/complete/fail 事件包裹每一次 <code>Tool::execute(args)</code> 调用。每个事件的名称是 <code>module_path!()</code>（即执行器自身的模块），而非硬编码字符串；通过 <code>Action</code> 和严重程度来区分它们：</p>
+<ol>
+<li>在运行之前：<code>record!(DEBUG, Event::new(module_path!(), Action::Invoke).with_category(EventCategory::Tool).with_attrs(...))</code>，并在 attrs 中包含 <code>tool</code>、<code>tool_call_id</code> 以及完整的 <code>input</code>。</li>
+<li>运行 <code>execute(args).await</code>。</li>
+<li>成功时（<code>r.success</code>）：调用 <code>record!(DEBUG, ... Action::Complete)</code>，并在 attrs 中记录 <code>Outcome::Success</code>、持续时间以及 <code>tool</code> / <code>tool_call_id</code> / <code>input</code> / <code>output</code>。</li>
+<li>工具报告失败时（<code>!r.success</code>）：使用 <code>record!(WARN, ... Action::Fail)</code>，并在 attrs 中记录 <code>Outcome::Failure</code>、持续时间以及 <code>tool</code> / <code>tool_call_id</code> / <code>input</code> / <code>error</code> / <code>output</code>。</li>
+<li>在 <code>execute</code> 返回 <code>Err</code> 时：使用 <code>Outcome::Failure</code>、持续时间以及 attrs 中以 debug 格式化的错误调用 <code>record!(ERROR, ... Action::Fail)</code>。</li>
+</ol>
+<p>这些事件是在围绕调用打开的 <code>scope!</code> 风格的 span 内发出的（<code>target = "zeroclaw_log_internal_scope"</code>，字段 <code>tool = &lt;name&gt;</code>），因此 <code>tool</code> 字段也会随每个后代发出项一同传递。各工具的 <code>Tool::execute</code> 实现无需添加任何日志代码。</p>
+<h2 id="logcapturelayer-与磁盘存储架构"><a class="header" href="#logcapturelayer-与磁盘存储架构"><code>LogCaptureLayer</code> 与磁盘存储架构</a></h2>
+<p><code>crates/zeroclaw-log/src/layer.rs</code> 中的 layer 是一个 <code>tracing-subscriber</code> Layer，它：</p>
+<ol>
+<li>在创建/记录目标为 <code>"zeroclaw_log_internal_attribution"</code> 的 span 时（即 <code>attribution_span!</code> 宏所开启的目标）：将 role 和 alias 字段解析为 <code>ZeroclawAttribution</code> 快照，并存储在该 span 的 extensions 中。</li>
+<li>在以目标 <code>"zeroclaw_log_internal_scope"</code> 创建/记录 span 时（由 <code>scope!</code> 打开）：解析临时 kvp 并以类似方式暂存它们。</li>
+<li>在事件发出时，目标为 <code>"zeroclaw_log_event"</code>（<code>record!</code> 宏触发所经过的目标）：从 <code>zc_*</code> 字段集构建一个 <code>LogEvent</code>，从叶节点到根节点遍历 span 作用域并合并找到的每个归因快照，将 <code>zc_attrs</code> JSON 数据块解析为事件的 <code>attributes</code>，附加来自自动捕获的源代码位置的 <code>_file</code>/<code>_line</code>，然后将最终事件交给 <code>writer::record_event</code>，它按以下顺序进行分发：
+<ul>
+<li>Prometheus / OTel 类型化指标的 Observer 桥接（<code>observer_bridge.rs</code>）（无条件）。</li>
+<li>广播钩子（<code>broadcast.rs</code>），用于 SSE/仪表板订阅者（无条件）。</li>
+<li>JSONL 持久化（<code>writer.rs</code>），仅在启用 <code>log_persistence</code> 时最后追加。</li>
+</ul>
+</li>
+</ol>
+<p>磁盘上的 JSON 结构（<code>event.rs</code> 中的 <code>LogEvent</code>）：</p>
+<pre><code class="language-json">{
+  "id": &lt;uuid&gt;,
+  @timestamp: 2026-05-16T10:08:59.002Z,
+  "severity_number": 9,
+  "severity_text": INFO,
+  事件: { category: channel, action: inbound, 结果: 成功 },
+  service: { "name": zeroclaw, version: "0.8.2" },
+  trace_id: &lt;turn id&gt;,
+  span_id: &lt;sub-span id&gt;,
+  zeroclaw: {
+    channel: telegram.clamps,
+    "channel_type": Telegram,
+    channel_alias: "clamps",
+    agent_alias: "clamps",
+    "model_provider": anthropic.clamps,
+    "model_provider_type": anthropic,
+    model_provider_alias: "clamps",
+    "模型": claude-sonnet-4-6
+  },
+  "消息": 入站消息,
+  attributes: { sender: "...", _file: "...", _line: 42 },
+  schema_version: 2
+}
+</code></pre>
+<p><code>@timestamp</code> 是 <code>chrono::DateTime&lt;Utc&gt;</code>，序列化为带 <code>Z</code> 的 RFC 3339 格式。架构版本为 <code>2</code>；较旧的 <code>version: 1</code> 行会在守护进程启动时由 <code>migrate::migrate_legacy_jsonl_in_place</code> 就地迁移。</p>
+<h2 id="logconfig-与-observabilityconfig"><a class="header" href="#logconfig-与-observabilityconfig"><code>LogConfig</code> 与 <code>ObservabilityConfig</code></a></h2>
+<p><code>zeroclaw-log</code> 定义了自己精简的 <code>LogConfig</code>（位于 <code>crates/zeroclaw-log/src/config.rs</code>）：<code>log_persistence</code>、<code>log_persistence_path</code>、<code>log_persistence_max_entries</code>、<code>log_tool_io</code>、<code>log_tool_io_truncate_bytes</code>、<code>log_tool_io_denylist</code>。这打破了原本会出现的依赖循环：<code>zeroclaw-config::ObservabilityConfig</code> 承载完整的 schema（包含 TOML 反序列化和验证），而运行时在启动时通过 <code>crates/zeroclaw-runtime/src/observability/runtime_trace.rs::to_log_config</code> 将其转换为 <code>LogConfig</code>。其结果是：<code>zeroclaw-config</code> 可以使用 <code>record!</code> 而无需颠倒依赖树。</p>
+<h2 id="订阅者安装"><a class="header" href="#订阅者安装">订阅者安装</a></h2>
+<p>守护进程通过以下方式安装全局订阅者：</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>zeroclaw_log::install_global_subscriber(
+    recording_filter.as_deref(),   // Option&lt;&amp;str&gt; — --log-level 标志（如果已设置）
+    &amp;default_filter,               // &amp;str — 在没有标志和 RUST_LOG 时的后备过滤器
+    cli.verbose,                   // bool — 控制 stderr fmt（终端）层
+);
+<span class="boring">}</span></code></pre>
+<p>两个独立的轴：<strong>录制底线</strong>（到达 <code>LogCaptureLayer</code> 的内容，按 flag → <code>RUST_LOG</code> → 默认值的顺序解析）与<strong>终端显示</strong>（stderr fmt 层，除非 <code>verbose</code> 为 true，否则完全静默）。这一次调用即可在 <code>tracing-subscriber::Registry</code> 之上设置带 agent 别名前缀的终端格式化器以及 <code>LogCaptureLayer</code>。<code>src/main.rs</code> 是唯一调用它的地方。测试使用 <code>zeroclaw_log::try_install_capture_subscriber()</code> + <code>zeroclaw_log::subscribe_or_install()</code>，通过广播钩子抽取已发出的事件，而无需在测试 crate 中命名任何 tracing 类型。</p>
+<h2 id="何时扩展封闭枚举"><a class="header" href="#何时扩展封闭枚举">何时扩展封闭枚举</a></h2>
+<ul>
+<li><strong>新增通道实现</strong>：向 <code>ChannelKind</code> 添加一个变体。其 snake_case 形式即为磁盘上的 <code>channel_type</code> 字符串。仅当变体名称 snake_case 后无法得到期望值时（例如 <code>OpenAi</code> → <code>"openai"</code>），才需添加 <code>#[strum(serialize = "...")]</code>。</li>
+<li><strong>新工具实现</strong>（工作区内置）：添加到 <code>ToolKind</code>。</li>
+<li><strong>新增 cron 调度结构</strong>：添加到 <code>CronKind</code>。</li>
+<li><strong>新模型 / TTS / 转录 / 隧道提供方</strong>：将其添加到 <code>ProviderKind</code> 下相关的 <code>*ProviderKind</code> 子枚举中。</li>
+<li><strong>新增内存后端</strong>：添加到 <code>MemoryKind</code>。</li>
+<li><strong>全新的 <code>Role</code> 系列</strong>（PeerGroup / Skill / Mcp 获得子类型）：随时使用其自身的 <code>Kind</code> 进行嵌套：模式是统一的。</li>
+</ul>
+<p>然后在新结构体旁添加 <code>impl Attributable for X</code>（<code>fn role() -&gt; Role::Family(Kind::Variant)</code>、<code>fn alias() -&gt; &amp;str { &amp;self.alias }</code>），并用 <code>attribution_span!(self)</code> 包裹其入口点。其余部分该层会自动处理。</p>
+<h2 id="操作符注意事项"><a class="header" href="#操作符注意事项">操作符注意事项</a></h2>
+<p>有关配置项（<code>log_persistence</code>、<code>log_tool_io</code>、OTel 导出）和查询语法，请参阅<a href="../ops/observability.html">日志与可观测性</a>。</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../architecture/crates.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../architecture/rpc-socket.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../architecture/crates.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../architecture/rpc-socket.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../../../_shared/theme/version-selector.js"></script>
+        <script src="../../../_shared/theme/lang-switcher.js"></script>
+        <script src="../../../_shared/theme/pc-enhance.js"></script>
+        <script src="../../../_shared/mermaid.min.js"></script>
+        <script src="../../../_shared/mermaid-init.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

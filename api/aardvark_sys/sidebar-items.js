@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["AardvarkError"],"struct":["AardvarkHandle"],"type":["Result"]};

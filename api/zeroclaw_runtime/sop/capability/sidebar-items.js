@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"struct":["CapabilityContext","CapabilityInfo","CapabilityResult","ChannelForgeAdapter","ForgeCommentCapability","LlmGenerateCapability","ProviderLlmAdapter","SopCapabilityRegistry"],"trait":["ForgeCommentAdapter","LlmGenerateAdapter","SopCapability"]};

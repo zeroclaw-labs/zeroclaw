@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"struct":["ChannelMediaSection","DateTimeSection","IdentitySection","PromptContext","RuntimeSection","SafetySection","SkillsSection","SystemPromptBuilder","ToolHonestySection","ToolsSection","WorkspaceSection"],"trait":["PromptSection"]};

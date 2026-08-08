@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["InitSystem"],"fn":["homebrew_var_dir_from_exe","install","is_running","logs","restart","run_capture","start","status","stop","uninstall","xml_escape"]};
