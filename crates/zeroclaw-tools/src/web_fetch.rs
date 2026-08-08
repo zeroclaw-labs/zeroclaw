@@ -1,6 +1,5 @@
 use crate::helpers::domain_guard;
 use async_trait::async_trait;
-use futures_util::StreamExt;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
@@ -82,22 +81,7 @@ impl WebFetchTool {
         &self,
         response: reqwest::Response,
     ) -> anyhow::Result<String> {
-        let mut bytes_stream = response.bytes_stream();
-        let hard_cap = if self.max_response_size == 0 {
-            usize::MAX
-        } else {
-            self.max_response_size.saturating_add(1)
-        };
-        let mut bytes = Vec::new();
-
-        while let Some(chunk_result) = bytes_stream.next().await {
-            let chunk = chunk_result?;
-            if append_chunk_with_cap(&mut bytes, &chunk, hard_cap) {
-                break;
-            }
-        }
-
-        Ok(String::from_utf8_lossy(&bytes).into_owned())
+        crate::http_decode::read_decoded_text_capped(response, self.max_response_size).await
     }
 
     /// Whether the standard fetch result should trigger a Firecrawl fallback.
@@ -405,11 +389,20 @@ impl Tool for WebFetchTool {
             attempt.follow()
         });
 
+        // Negotiate the encodings `http_decode` can decode. reqwest's own
+        // compression features are intentionally disabled (they'd unify across
+        // the whole workspace), so this header is set explicitly here.
+        let mut default_headers = reqwest::header::HeaderMap::new();
+        default_headers.insert(
+            reqwest::header::ACCEPT_ENCODING,
+            reqwest::header::HeaderValue::from_static("gzip, deflate, br"),
+        );
         let builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(timeout_secs))
             .connect_timeout(Duration::from_secs(10))
             .redirect(redirect_policy)
-            .user_agent("ZeroClaw/0.1 (web_fetch)");
+            .user_agent("ZeroClaw/0.1 (web_fetch)")
+            .default_headers(default_headers);
         let builder =
             zeroclaw_config::schema::apply_runtime_proxy_to_builder(builder, "tool.web_fetch");
         let client = match builder.build() {
@@ -563,21 +556,6 @@ fn validate_target_url_with_dns_check(
     }
 
     Ok(url.to_string())
-}
-
-fn append_chunk_with_cap(buffer: &mut Vec<u8>, chunk: &[u8], hard_cap: usize) -> bool {
-    if buffer.len() >= hard_cap {
-        return true;
-    }
-
-    let remaining = hard_cap - buffer.len();
-    if chunk.len() > remaining {
-        buffer.extend_from_slice(&chunk[..remaining]);
-        return true;
-    }
-
-    buffer.extend_from_slice(chunk);
-    buffer.len() >= hard_cap
 }
 
 fn extract_host(url: &str) -> anyhow::Result<String> {
@@ -1100,6 +1078,151 @@ mod tests {
         );
     }
 
+    // ── Transparent decompression regression matrix ─────────────
+    //
+    // Covers the three advertised Content-Encodings, the decoded-size cap, and
+    // malformed input. Fixtures are compressed at test time so the assertions
+    // read as round-trips rather than opaque byte blobs.
+
+    fn gzip_bytes(payload: &[u8]) -> Vec<u8> {
+        use flate2::{Compression, write::GzEncoder};
+        use std::io::Write;
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(payload).unwrap();
+        enc.finish().unwrap()
+    }
+
+    fn deflate_bytes(payload: &[u8]) -> Vec<u8> {
+        // HTTP `deflate` is zlib-wrapped per RFC 7230; reqwest decodes zlib.
+        use flate2::{Compression, write::ZlibEncoder};
+        use std::io::Write;
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(payload).unwrap();
+        enc.finish().unwrap()
+    }
+
+    fn brotli_bytes(payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut r = payload;
+        brotli::BrotliCompress(&mut r, &mut out, &Default::default()).unwrap();
+        out
+    }
+
+    fn test_tool_with_limit(max_response_size: usize) -> WebFetchTool {
+        WebFetchTool::new(
+            Arc::new(SecurityPolicy {
+                autonomy: AutonomyLevel::Supervised,
+                ..SecurityPolicy::default()
+            }),
+            vec!["*".into()],
+            vec![],
+            max_response_size,
+            30,
+            FirecrawlConfig::default(),
+            vec![],
+        )
+        .unwrap()
+    }
+
+    async fn fetch_encoded(encoding: &str, body: Vec<u8>, max_response_size: usize) -> ToolResult {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let addr = server.address();
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-encoding", encoding)
+                    // text/plain keeps the body verbatim (no html2text pass) so
+                    // decoded bytes can be asserted exactly.
+                    .insert_header("content-type", "text/plain")
+                    .set_body_raw(body, "text/plain"),
+            )
+            .mount(&server)
+            .await;
+
+        let tool = test_tool_with_limit(max_response_size);
+        // Call standard_fetch directly so wiremock on 127.0.0.1 is reachable
+        // past the SSRF guard. The client does no decoding; `web_fetch` decodes
+        // the body in `http_decode` from the Content-Encoding header.
+        let url = format!("http://{}:{}/", addr.ip(), addr.port());
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("reqwest client");
+        tool.standard_fetch(&client, &url).await
+    }
+
+    #[tokio::test]
+    async fn standard_fetch_decodes_gzip_brotli_and_deflate() {
+        let payload = "ZEROCLAW_DECOMPRESSED_OK ".repeat(8);
+        let bytes = payload.as_bytes();
+        for (encoding, body) in [
+            ("gzip", gzip_bytes(bytes)),
+            ("br", brotli_bytes(bytes)),
+            ("deflate", deflate_bytes(bytes)),
+        ] {
+            let result = fetch_encoded(encoding, body, 0).await;
+            assert!(
+                result.success,
+                "{encoding} fetch must succeed, got error={:?}",
+                result.error
+            );
+            assert_eq!(
+                result.output, payload,
+                "Content-Encoding: {encoding} body must be decompressed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn standard_fetch_caps_decoded_expansion() {
+        // A tiny gzip body decodes to 10 KiB; the read must stop at the cap so a
+        // compressed response cannot expand without bound in memory.
+        let payload = "a".repeat(10_000);
+        let body = gzip_bytes(payload.as_bytes());
+        assert!(body.len() < 200, "compressed fixture should be small");
+
+        let result = fetch_encoded("gzip", body, 128).await;
+        assert!(result.success, "capped fetch still succeeds");
+        assert!(
+            result.output.starts_with(&"a".repeat(128)),
+            "decoded prefix must be preserved up to the cap"
+        );
+        assert!(
+            result.output.contains("[Response truncated"),
+            "over-cap decoded body must be marked truncated"
+        );
+        // 128 chars + the truncation marker, nowhere near the 10 KiB decoded size.
+        assert!(
+            result.output.len() < 256,
+            "output must stay bounded to the cap, got {} bytes",
+            result.output.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn standard_fetch_reports_malformed_compressed_body() {
+        // Advertise gzip but send bytes that are not a valid gzip stream; the
+        // decoder error must surface as a clean failure, not a panic.
+        let result = fetch_encoded("gzip", b"not a valid gzip stream".to_vec(), 0).await;
+        assert!(
+            !result.success,
+            "malformed compressed body must fail, got output={:?}",
+            result.output
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Failed to read response body"),
+            "error should describe the failed body read, got {:?}",
+            result.error
+        );
+    }
+
     #[test]
     fn truncate_over_limit() {
         let tool = WebFetchTool::new(
@@ -1154,14 +1277,6 @@ mod tests {
     fn blocklist_allows_non_blocked() {
         let tool = test_tool_with_blocklist(vec!["*"], vec!["evil.com"]);
         assert!(tool.validate_url("https://example.com").is_ok());
-    }
-
-    #[test]
-    fn append_chunk_with_cap_truncates_and_stops() {
-        let mut buffer = Vec::new();
-        assert!(!append_chunk_with_cap(&mut buffer, b"hello", 8));
-        assert!(append_chunk_with_cap(&mut buffer, b"world", 8));
-        assert_eq!(buffer, b"hellowor");
     }
 
     #[test]
