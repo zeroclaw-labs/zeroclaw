@@ -29,6 +29,7 @@ pub struct OpenAiModelProvider {
     /// `[providers.models.openai.<alias>]` config-key alias.
     alias: String,
     base_url: String,
+    canonical_base_url: &'static str,
     credential: Option<String>,
     max_tokens: Option<u32>,
     timeout_secs: u64,
@@ -232,6 +233,7 @@ pub struct OpenAiBuilder {
     alias: String,
     credential: Option<String>,
     base_url: Option<String>,
+    canonical_base_url: Option<&'static str>,
     max_tokens: Option<u32>,
     timeout_secs: Option<u64>,
 }
@@ -250,6 +252,11 @@ impl OpenAiBuilder {
     /// Override the API endpoint. Trailing slashes are stripped.
     pub fn base_url(mut self, base_url: &str) -> Self {
         self.base_url = Some(base_url.trim_end_matches('/').to_string());
+        self
+    }
+
+    pub(crate) fn canonical_base_url(mut self, base_url: &'static str) -> Self {
+        self.canonical_base_url = Some(base_url);
         self
     }
 
@@ -273,6 +280,7 @@ impl OpenAiBuilder {
         OpenAiModelProvider {
             alias: self.alias,
             base_url: self.base_url.unwrap_or_else(|| BASE_URL.to_string()),
+            canonical_base_url: self.canonical_base_url.unwrap_or(BASE_URL),
             credential: self.credential,
             max_tokens: self.max_tokens,
             timeout_secs: self.timeout_secs.unwrap_or(120),
@@ -288,6 +296,7 @@ impl OpenAiModelProvider {
             alias: alias.to_string(),
             credential: None,
             base_url: None,
+            canonical_base_url: None,
             max_tokens: None,
             timeout_secs: None,
         }
@@ -453,7 +462,7 @@ impl OpenAiModelProvider {
 impl ModelProvider for OpenAiModelProvider {
     // ── ModelProvider-family defaults ──
     fn default_base_url(&self) -> Option<&str> {
-        Some(BASE_URL)
+        Some(self.canonical_base_url)
     }
 
     async fn chat_with_system(
