@@ -6,6 +6,7 @@
 - CLI `zeroclaw sop` currently manages definitions only: `list`, `validate`, `show`.
 - SOP runs are started by a live event fan-in (MQTT, filesystem, or AMQP), by the daemon's periodic SOP maintenance tick for `cron` triggers, or by the in-agent tool `sop_execute`. The remaining trigger types (webhook, peripheral, calendar) are defined and matched but not yet wired to a live event source (see [SOP Fan-In](./fan-in/overview.md)).
 - Run progression uses tools: `sop_status`, `sop_approve`, `sop_advance`.
+- Steps execute under the SOP's bound agent when the manifest sets `agent = "<alias>"` (a step-level `- agent:` bullet overrides it per step); without a binding, daemon-dispatched runs fall back to the daemon's default agent, whose risk profile may not expose the tools the steps assume. Bind the agent explicitly for any SOP whose steps run shell or file tools.
 - Run state is process-local by default. With `sop.persist_runs = true`, successful initialization of the default SQLite backend stores it under `<data_dir>/sop/runs.db` and restores active runs after restart. Initialization failure logs a warning and falls back to process-local memory.
 - SOP audit records are persisted in the configured Memory backend under category `sop`.
 
