@@ -4737,7 +4737,7 @@ mod tests {
                 Some(mm_config),
             );
 
-            let msg = "describe this image [IMAGE:data:image/png;base64,iVBORw0KGgo=]";
+            let msg = "describe this image [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]";
 
             // The vision provider will fail to connect to localhost:9, but the
             // prompt rebuild and provider-visible transcript happen before the
@@ -4785,7 +4785,7 @@ mod tests {
                 Some(mm_config),
             );
 
-            let msg = "describe this image [IMAGE:data:image/png;base64,iVBORw0KGgo=]";
+            let msg = "describe this image [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]";
             let (event_tx, _event_rx) = tokio::sync::mpsc::channel(16);
 
             let result = agent.turn_streamed(msg, event_tx, None).await;
@@ -6270,9 +6270,17 @@ mod tests {
 
         let temp = tempfile::tempdir().expect("tempdir");
         let image_path = temp.path().join("agent-turn.png");
+        // A real 1x1 PNG: content validation drops undecodable bytes, so a
+        // bare signature would be skipped before reaching the provider.
         std::fs::write(
             &image_path,
-            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+            [
+                0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+                0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+                0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x78,
+                0x9C, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0xC9, 0xFE, 0x92,
+                0xEF, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+            ],
         )
         .expect("write fixture");
 
@@ -6323,9 +6331,17 @@ mod tests {
 
         let temp = tempfile::tempdir().expect("tempdir");
         let image_path = temp.path().join("agent-stream.png");
+        // A real 1x1 PNG: content validation drops undecodable bytes, so a
+        // bare signature would be skipped before reaching the provider.
         std::fs::write(
             &image_path,
-            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+            [
+                0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+                0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+                0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x78,
+                0x9C, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0xC9, 0xFE, 0x92,
+                0xEF, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+            ],
         )
         .expect("write fixture");
 
@@ -6656,7 +6672,7 @@ mod tests {
         seed_old_trim_test_turn(&mut agent);
 
         let error = agent
-            .turn("inspect [IMAGE:data:image/png;base64,iVBORw0KGgo=]")
+            .turn("inspect [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]")
             .await
             .expect_err("missing vision support should fail before provider dispatch");
 
@@ -6683,7 +6699,7 @@ mod tests {
 
         let error = agent
             .turn_streamed(
-                "inspect [IMAGE:data:image/png;base64,iVBORw0KGgo=]",
+                "inspect [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]",
                 event_tx,
                 None,
             )

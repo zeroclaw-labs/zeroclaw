@@ -9,6 +9,13 @@ use zeroclaw_config::schema::{MultimodalConfig, build_runtime_proxy_client_with_
 const IMAGE_MARKER_PREFIX: &str = "[IMAGE:";
 const ALLOWED_IMAGE_MIME_TYPES: &[&str] = &["image/png", "image/jpeg", "image/webp", "image/gif"];
 
+/// Bounds for the content-validation decode in [`validate_image_content`].
+/// Vision providers downscale well below this, so a legitimate attachment is
+/// never rejected by these caps — they exist so a small payload declaring huge
+/// dimensions is refused instead of allocated.
+const MAX_DECODED_IMAGE_DIMENSION: u32 = 16_384;
+const MAX_DECODED_IMAGE_ALLOC_BYTES: u64 = 512 * 1024 * 1024;
+
 /// Per-path cache for resolved local image data URIs. Keyed by absolute
 /// path; stores `(len, mtime)` for freshness checks (`(0, 0)` sentinel
 /// = immutable upload). LRU evicts by both entry count and total bytes.
@@ -109,6 +116,13 @@ pub enum MultimodalError {
 
     #[error("failed to read local image '{input}': {reason}")]
     LocalReadFailed { input: String, reason: String },
+
+    #[error("multimodal image content is not a decodable {mime} image for '{input}': {reason}")]
+    CorruptImage {
+        input: String,
+        mime: String,
+        reason: String,
+    },
 }
 
 fn is_loadable_image_reference(candidate: &str) -> bool {
@@ -876,6 +890,7 @@ async fn normalize_image_references(
                         | "local_read_failed"
                         | "remote_fetch_failed"
                         | "invalid_marker"
+                        | "corrupt_image"
                 );
                 if is_tool_role && is_recoverable_load_failure {
                     ::zeroclaw_log::record!(
@@ -961,6 +976,7 @@ fn multimodal_error_kind(error: &anyhow::Error) -> &'static str {
         Some(MultimodalError::InvalidMarker { .. }) => "invalid_marker",
         Some(MultimodalError::RemoteFetchFailed { .. }) => "remote_fetch_failed",
         Some(MultimodalError::LocalReadFailed { .. }) => "local_read_failed",
+        Some(MultimodalError::CorruptImage { .. }) => "corrupt_image",
         None => "unknown",
     }
 }
@@ -970,6 +986,9 @@ fn multimodal_error_reason(error: &anyhow::Error) -> Option<String> {
         Some(MultimodalError::InvalidMarker { input, reason })
         | Some(MultimodalError::RemoteFetchFailed { input, reason })
         | Some(MultimodalError::LocalReadFailed { input, reason }) => {
+            Some(reason.replace(input, "<source>"))
+        }
+        Some(MultimodalError::CorruptImage { input, reason, .. }) => {
             Some(reason.replace(input, "<source>"))
         }
         _ => None,
@@ -1042,6 +1061,7 @@ fn normalize_data_uri(source: &str, max_bytes: usize) -> anyhow::Result<String> 
         })?;
 
     validate_size(source, decoded.len(), max_bytes)?;
+    validate_image_content(source, &mime, &decoded)?;
 
     Ok(format!("data:{mime};base64,{}", STANDARD.encode(decoded)))
 }
@@ -1096,6 +1116,7 @@ async fn normalize_remote_image(
     })?;
 
     validate_mime(source, &mime)?;
+    validate_image_content(source, &mime, bytes.as_ref())?;
 
     Ok(format!("data:{mime};base64,{}", STANDARD.encode(bytes)))
 }
@@ -1139,6 +1160,7 @@ async fn normalize_local_image(source: &str, max_bytes: usize) -> anyhow::Result
         })?;
 
     validate_mime(source, &mime)?;
+    validate_image_content(source, &mime, &bytes)?;
 
     Ok(format!("data:{mime};base64,{}", STANDARD.encode(bytes)))
 }
@@ -1210,6 +1232,7 @@ async fn normalize_local_image_cached(
         })?;
 
     validate_mime(source, &mime)?;
+    validate_image_content(source, &mime, &bytes)?;
 
     let data_uri = format!("data:{mime};base64,{}", STANDARD.encode(&bytes));
     cache.insert(source.to_string(), cache_len, mtime, data_uri.clone());
@@ -1239,6 +1262,52 @@ fn validate_mime(source: &str, mime: &str) -> anyhow::Result<()> {
         mime: mime.to_string(),
     }
     .into())
+}
+
+/// Decode the image far enough to prove the bytes really are a well-formed
+/// image of the declared type. Header sniffing alone cannot do this: an
+/// 8-byte PNG signature with no IDAT, a truncated JPEG, or arbitrary data
+/// renamed to `.png` all pass a magic-byte check and are only rejected by the
+/// provider — as a hard 400 that fails the whole request, including the
+/// unrelated text and images batched alongside it.
+///
+/// The decode is bounded by `Limits` so this validation cannot itself become a
+/// decompression-bomb sink: a small payload declaring enormous dimensions is
+/// rejected here rather than being allocated.
+fn validate_image_content(source: &str, mime: &str, bytes: &[u8]) -> anyhow::Result<()> {
+    let format = match mime {
+        "image/png" => image::ImageFormat::Png,
+        "image/jpeg" => image::ImageFormat::Jpeg,
+        "image/webp" => image::ImageFormat::WebP,
+        "image/gif" => image::ImageFormat::Gif,
+        _ => {
+            return Err(MultimodalError::UnsupportedMime {
+                input: source.to_string(),
+                mime: mime.to_string(),
+            }
+            .into());
+        }
+    };
+
+    let corrupt = |reason: String| MultimodalError::CorruptImage {
+        input: source.to_string(),
+        mime: mime.to_string(),
+        reason,
+    };
+
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_DECODED_IMAGE_DIMENSION);
+    limits.max_image_height = Some(MAX_DECODED_IMAGE_DIMENSION);
+    limits.max_alloc = Some(MAX_DECODED_IMAGE_ALLOC_BYTES);
+
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes));
+    reader.set_format(format);
+    reader.limits(limits);
+    reader
+        .decode()
+        .map_err(|error| corrupt(error.to_string()))?;
+
+    Ok(())
 }
 
 fn detect_mime(
@@ -1303,6 +1372,21 @@ fn mime_from_magic(bytes: &[u8]) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A real 1x1 PNG. Tests that need a *loadable* image must use this: a
+    /// bare 8-byte PNG signature passes header sniffing but is not decodable,
+    /// which is exactly what `validate_image_content` now rejects.
+    fn valid_png() -> Vec<u8> {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            1,
+            1,
+            image::Rgba([255, 0, 0, 255]),
+        ))
+        .write_to(&mut buf, image::ImageFormat::Png)
+        .expect("test PNG encodes");
+        buf.into_inner()
+    }
 
     #[test]
     fn strip_media_markers_replaces_image_local_path() {
@@ -1492,7 +1576,7 @@ mod tests {
     async fn prepare_messages_strips_audio_but_keeps_image_marker() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("shot.png");
-        std::fs::write(&path, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
+        std::fs::write(&path, valid_png()).unwrap();
         let history = vec![ChatMessage::user(format!(
             "look [IMAGE:{}] and hear [AUDIO:/tmp/clip.wav]",
             path.display()
@@ -1563,6 +1647,116 @@ mod tests {
     }
 
     #[test]
+    fn validate_image_content_accepts_a_real_image() {
+        assert!(validate_image_content("src", "image/png", &valid_png()).is_ok());
+    }
+
+    #[test]
+    fn validate_image_content_rejects_header_only_png() {
+        // The exact shape header sniffing cannot catch: a valid PNG signature
+        // with no IDAT chunk. Produced by truncated downloads and interrupted
+        // writes.
+        let header_only = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        let err = validate_image_content("src", "image/png", &header_only).unwrap_err();
+        assert_eq!(multimodal_error_kind(&err), "corrupt_image");
+    }
+
+    #[test]
+    fn validate_image_content_rejects_truncated_image() {
+        let full = valid_png();
+        let truncated = &full[..full.len() / 2];
+        let err = validate_image_content("src", "image/png", truncated).unwrap_err();
+        assert_eq!(multimodal_error_kind(&err), "corrupt_image");
+    }
+
+    #[test]
+    fn validate_image_content_rejects_empty_payload() {
+        // Zero-byte files pass `validate_size`, which only has an upper bound.
+        let err = validate_image_content("src", "image/png", &[]).unwrap_err();
+        assert_eq!(multimodal_error_kind(&err), "corrupt_image");
+    }
+
+    #[test]
+    fn validate_image_content_rejects_mime_content_mismatch() {
+        // Real PNG bytes declared as JPEG — the case an extension-derived MIME
+        // produces when a file is simply renamed.
+        let err = validate_image_content("src", "image/jpeg", &valid_png()).unwrap_err();
+        assert_eq!(multimodal_error_kind(&err), "corrupt_image");
+    }
+
+    #[tokio::test]
+    async fn corrupt_local_image_is_skipped_without_failing_the_turn() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("truncated.png");
+        std::fs::write(&path, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
+        let history = vec![ChatMessage::user(format!(
+            "what is in this? [IMAGE:{}]",
+            path.display()
+        ))];
+
+        let prepared = prepare_messages_for_provider(&history, &MultimodalConfig::default())
+            .await
+            .expect("a corrupt image must not fail message preparation");
+
+        let content = &prepared.messages[0].content;
+        assert!(
+            !prepared.contains_images,
+            "corrupt image must not be inlined: {content}"
+        );
+        assert!(
+            content.contains("could not be loaded"),
+            "model must be told the image was dropped: {content}"
+        );
+        assert!(
+            content.contains("what is in this?"),
+            "surrounding user text must survive: {content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_image_is_skipped_while_valid_sibling_survives() {
+        let temp = tempfile::tempdir().unwrap();
+        let good = temp.path().join("good.png");
+        let bad = temp.path().join("bad.png");
+        std::fs::write(&good, valid_png()).unwrap();
+        std::fs::write(&bad, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
+        let history = vec![ChatMessage::user(format!(
+            "compare [IMAGE:{}] and [IMAGE:{}]",
+            good.display(),
+            bad.display()
+        ))];
+
+        let prepared = prepare_messages_for_provider(&history, &MultimodalConfig::default())
+            .await
+            .expect("one corrupt image must not discard the valid one");
+
+        let content = &prepared.messages[0].content;
+        assert!(
+            prepared.contains_images,
+            "valid image must survive: {content}"
+        );
+        assert!(
+            content.contains("1 of 2"),
+            "note must report the partial skip: {content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_data_uri_is_skipped() {
+        let b64 = STANDARD.encode([0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']);
+        let history = vec![ChatMessage::user(format!(
+            "look [IMAGE:data:image/png;base64,{b64}]"
+        ))];
+
+        let prepared = prepare_messages_for_provider(&history, &MultimodalConfig::default())
+            .await
+            .expect("corrupt data URI must not fail preparation");
+
+        assert!(!prepared.contains_images);
+        assert!(prepared.messages[0].content.contains("could not be loaded"));
+    }
+
+    #[test]
     fn parse_image_markers_collapses_line_wrapped_path() {
         // Terminal-wrapped paste: a long path split across two rows with
         // leading indentation should be recovered into the original path.
@@ -1617,11 +1811,7 @@ mod tests {
         let image_path = temp.path().join("sample.png");
 
         // Minimal PNG signature bytes are enough for MIME detection.
-        std::fs::write(
-            &image_path,
-            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
-        )
-        .unwrap();
+        std::fs::write(&image_path, valid_png()).unwrap();
 
         let messages = vec![ChatMessage::user(format!(
             "Please inspect this screenshot [IMAGE:{}]",
@@ -1646,11 +1836,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let image_path = temp.path().join("tool-sample.png");
 
-        std::fs::write(
-            &image_path,
-            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
-        )
-        .unwrap();
+        std::fs::write(&image_path, valid_png()).unwrap();
 
         let messages = vec![ChatMessage::tool(format!(
             "<tool_result name=\"image_gen\">\nGenerated image [IMAGE:{}]\n</tool_result>",
@@ -1676,11 +1862,7 @@ mod tests {
     async fn prepare_messages_preserves_native_tool_result_json_shape() {
         let temp = tempfile::tempdir().unwrap();
         let image_path = temp.path().join("native-tool-result.png");
-        std::fs::write(
-            &image_path,
-            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
-        )
-        .unwrap();
+        std::fs::write(&image_path, valid_png()).unwrap();
 
         let native_tool_content = serde_json::json!({
             "tool_call_id": "tc1",
@@ -1764,11 +1946,7 @@ mod tests {
     async fn prepare_messages_preserves_native_tool_json_with_mixed_images() {
         let temp = tempfile::tempdir().unwrap();
         let image_path = temp.path().join("mixed-native-tool-result.png");
-        std::fs::write(
-            &image_path,
-            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
-        )
-        .unwrap();
+        std::fs::write(&image_path, valid_png()).unwrap();
 
         let native_tool_content = serde_json::json!({
             "tool_call_id": "tc1",
@@ -1811,11 +1989,7 @@ mod tests {
     async fn prepare_messages_strips_stale_native_tool_result_images() {
         let temp = tempfile::tempdir().unwrap();
         let image_path = temp.path().join("stale-native-tool-result.png");
-        std::fs::write(
-            &image_path,
-            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
-        )
-        .unwrap();
+        std::fs::write(&image_path, valid_png()).unwrap();
 
         let native_tool_content = serde_json::json!({
             "tool_call_id": "tc1",
@@ -1862,11 +2036,7 @@ mod tests {
     async fn prepare_messages_strips_stale_prompt_tool_result_images() {
         let temp = tempfile::tempdir().unwrap();
         let image_path = temp.path().join("stale-prompt-tool-result.png");
-        std::fs::write(
-            &image_path,
-            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
-        )
-        .unwrap();
+        std::fs::write(&image_path, valid_png()).unwrap();
 
         let messages = vec![
             ChatMessage::user(format!(
@@ -1901,9 +2071,9 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let stale_path = temp.path().join("stale-tool-result.png");
         let fresh_path = temp.path().join("fresh-user-image.png");
-        let png = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
-        std::fs::write(&stale_path, png).unwrap();
-        std::fs::write(&fresh_path, png).unwrap();
+        let png = valid_png();
+        std::fs::write(&stale_path, &png).unwrap();
+        std::fs::write(&fresh_path, &png).unwrap();
 
         let native_tool_content = serde_json::json!({
             "tool_call_id": "tc1",
@@ -2208,19 +2378,7 @@ mod tests {
         let mut paths = Vec::new();
         for name in ["old.png", "mid.png", "new.png"] {
             let p = temp.path().join(name);
-            // Minimal valid PNG (1x1 white pixel)
-            let png_data = [
-                0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, // PNG signature
-                0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52, // IHDR chunk
-                0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90,
-                0x77, 0x53, 0xDE, // 1x1 RGB
-                0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, // IDAT chunk
-                0x08, 0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xE2, 0x21,
-                0xBC, 0x33, // IDAT data + CRC
-                0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, // IEND chunk
-                0xAE, 0x42, 0x60, 0x82,
-            ];
-            std::fs::write(&p, png_data).unwrap();
+            std::fs::write(&p, valid_png()).unwrap();
             paths.push(p);
         }
 
@@ -2254,20 +2412,13 @@ mod tests {
     #[tokio::test]
     async fn prepare_messages_caps_to_newest_successful_images() {
         let temp = tempfile::tempdir().unwrap();
-        // Minimal valid PNG (1x1 RGB pixel).
-        let png_data = [
-            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
-            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
-            0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08,
-            0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xE2, 0x21, 0xBC,
-            0x33, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
-        ];
+        let png_data = valid_png();
 
         // Nine distinct valid image files across nine user messages, max 4.
         let mut messages = Vec::new();
         for i in 0..9 {
             let p = temp.path().join(format!("img{i}.png"));
-            std::fs::write(&p, png_data).unwrap();
+            std::fs::write(&p, &png_data).unwrap();
             messages.push(ChatMessage::user(format!(
                 "[IMAGE:{}]\nImage {i}",
                 p.display()
@@ -2377,11 +2528,7 @@ mod tests {
     async fn prepare_messages_keeps_successful_images_when_some_are_skipped() {
         let temp = tempfile::tempdir().unwrap();
         let image_path = temp.path().join("ok.png");
-        std::fs::write(
-            &image_path,
-            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
-        )
-        .unwrap();
+        std::fs::write(&image_path, valid_png()).unwrap();
 
         let messages = vec![ChatMessage::user(format!(
             "Look [IMAGE:{}] and [IMAGE:https://example.com/missing.png]",
@@ -2414,11 +2561,7 @@ mod tests {
     async fn skipped_images_do_not_consume_image_budget() {
         let temp = tempfile::tempdir().unwrap();
         let image_path = temp.path().join("older-valid.png");
-        std::fs::write(
-            &image_path,
-            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
-        )
-        .unwrap();
+        std::fs::write(&image_path, valid_png()).unwrap();
 
         let messages = vec![
             ChatMessage::user(format!(

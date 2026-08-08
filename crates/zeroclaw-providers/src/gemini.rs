@@ -2554,7 +2554,7 @@ mod tests {
 
     #[test]
     fn build_parts_extracts_data_uri_as_inline_part() {
-        let content = "Check this [IMAGE:data:image/png;base64,iVBORw0KGgo=]";
+        let content = "Check this [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]";
         let parts = build_parts(content);
         assert_eq!(parts.len(), 2);
         // First part is text
@@ -2565,7 +2565,7 @@ mod tests {
         // Second part is inline image
         assert_eq!(
             serde_json::to_value(&parts[1]).unwrap(),
-            serde_json::json!({"inline_data": {"mime_type": "image/png", "data": "iVBORw0KGgo="}})
+            serde_json::json!({"inline_data": {"mime_type": "image/png", "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"}})
         );
     }
 
