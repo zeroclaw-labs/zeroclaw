@@ -23,6 +23,7 @@ pub mod openai_codex;
 pub mod openrouter;
 pub mod openrouter_catalog;
 pub mod pricing;
+pub mod provider_error;
 pub mod reliable;
 pub mod router;
 pub(crate) mod stream_guard;
