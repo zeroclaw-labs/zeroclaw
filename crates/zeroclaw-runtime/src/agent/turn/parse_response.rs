@@ -159,17 +159,43 @@ pub(crate) async fn interpret_chat_response(
 
     // Per-LLM-call usage event, right after the observer success event
     // (upstream E2 parity, agent.rs Usage emission).
-    if let Some(tx) = ctx.event_tx
-        && let Some(ref usage) = resp.usage
-    {
-        let _ = tx
-            .send(TurnEvent::Usage {
-                input_tokens: usage.input_tokens,
-                cached_input_tokens: usage.cached_input_tokens,
-                output_tokens: usage.output_tokens,
-                cost_usd: call_cost_usd,
-            })
-            .await;
+    //
+    // Local OpenAI-compatible servers (llama.cpp, etc.) often omit `usage`
+    // from completions/stream chunks. Without a fallback the daemon never
+    // emits TurnEvent::Usage, so ZeroCode's context meter stays blank even
+    // though max_context_tokens is known from the runtime profile. Prefer
+    // provider-reported counts when present; otherwise estimate from the
+    // request history (~4 chars/token) so the meter still updates.
+    if let Some(tx) = ctx.event_tx {
+        let estimated_input = || {
+            let n = crate::agent::history::estimate_history_tokens(history) as u64;
+            (n > 0).then_some(n)
+        };
+        let usage_event = match resp.usage.as_ref() {
+            Some(usage) => {
+                // Prefer provider counts. If the body carried a usage object
+                // but left prompt/input tokens null (seen on some llama.cpp
+                // builds), fill input from the history estimate so the meter
+                // still has a numerator.
+                let input_tokens = usage.input_tokens.or_else(estimated_input);
+                Some(TurnEvent::Usage {
+                    input_tokens,
+                    cached_input_tokens: usage.cached_input_tokens,
+                    output_tokens: usage.output_tokens,
+                    cost_usd: call_cost_usd,
+                })
+            }
+            None => estimated_input().map(|input_tokens| TurnEvent::Usage {
+                input_tokens: Some(input_tokens),
+                cached_input_tokens: None,
+                output_tokens: None,
+                // Estimated tokens must not invent a dollar cost.
+                cost_usd: None,
+            }),
+        };
+        if let Some(event) = usage_event {
+            let _ = tx.send(event).await;
+        }
     }
 
     let response_text = strip_think_tags(resp.text_or_empty());
@@ -565,5 +591,236 @@ mod cost_usd_regression_tests {
         );
 
         zeroclaw_log::clear_broadcast_hook();
+    }
+
+    /// Local OpenAI-compatible servers (llama.cpp, older ollama, etc.) often
+    /// omit `usage` from chat completions / stream chunks. Without a fallback
+    /// the daemon never emits `TurnEvent::Usage`, so ZeroCode's context meter
+    /// stays blank even though the runtime-profile budget is known.
+    #[tokio::test]
+    async fn missing_provider_usage_emits_estimated_context_usage() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<TurnEvent>(4);
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let dedup_exempt_tools: Vec<String> = Vec::new();
+        let ctx = TurnCtx {
+            parent_agent_alias: None,
+            observer: &crate::observability::NoopObserver,
+            provider_name: "llamacpp",
+            model: "local-model",
+            temperature: None,
+            approval: None,
+            channel_name: "rpc",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: Some(&tx),
+            hooks: None,
+            dedup_exempt_tools: &dedup_exempt_tools,
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            agent_alias: Some("melfina"),
+            turn_id: "turn-no-usage",
+        };
+
+        let specs = IterationToolSpecs {
+            tool_specs: vec![],
+            known_tool_names: HashSet::new(),
+            use_native_tools: false,
+        };
+
+        // History large enough that the ~4 chars/token estimate is > 0.
+        let history = vec![
+            ChatMessage::system("You are a helpful assistant."),
+            ChatMessage::user("Explain how context windows work in local models."),
+        ];
+        let expected_estimate = crate::agent::history::estimate_history_tokens(&history) as u64;
+
+        let resp = ChatResponse {
+            text: Some("Local models often omit usage.".to_string()),
+            tool_calls: vec![],
+            usage: None,
+            reasoning_content: None,
+        };
+
+        interpret_chat_response(
+            &ctx,
+            resp,
+            &history,
+            &specs,
+            false,
+            std::time::Instant::now(),
+            0,
+            false,
+        )
+        .await;
+
+        let event = rx.try_recv().expect(
+            "missing provider usage must still emit TurnEvent::Usage for the context meter",
+        );
+        match event {
+            TurnEvent::Usage {
+                input_tokens,
+                output_tokens,
+                cached_input_tokens,
+                cost_usd,
+            } => {
+                assert_eq!(
+                    input_tokens,
+                    Some(expected_estimate),
+                    "input_tokens should fall back to history estimate"
+                );
+                assert_eq!(output_tokens, None);
+                assert_eq!(cached_input_tokens, None);
+                assert_eq!(cost_usd, None, "estimated usage must not invent a cost");
+            }
+            other => panic!("expected TurnEvent::Usage, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "must emit exactly one Usage event");
+    }
+
+    #[tokio::test]
+    async fn null_input_tokens_in_usage_object_falls_back_to_estimate() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<TurnEvent>(4);
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let dedup_exempt_tools: Vec<String> = Vec::new();
+        let ctx = TurnCtx {
+            parent_agent_alias: None,
+            observer: &crate::observability::NoopObserver,
+            provider_name: "llamacpp",
+            model: "local-model",
+            temperature: None,
+            approval: None,
+            channel_name: "rpc",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: Some(&tx),
+            hooks: None,
+            dedup_exempt_tools: &dedup_exempt_tools,
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            agent_alias: Some("melfina"),
+            turn_id: "turn-null-input",
+        };
+
+        let specs = IterationToolSpecs {
+            tool_specs: vec![],
+            known_tool_names: HashSet::new(),
+            use_native_tools: false,
+        };
+
+        let history = vec![ChatMessage::user(
+            "A somewhat longer prompt so the estimate is non-zero.",
+        )];
+        let expected = crate::agent::history::estimate_history_tokens(&history) as u64;
+
+        let resp = ChatResponse {
+            text: Some("ok".to_string()),
+            tool_calls: vec![],
+            usage: Some(TokenUsage {
+                input_tokens: None,
+                output_tokens: Some(12),
+                cached_input_tokens: None,
+            }),
+            reasoning_content: None,
+        };
+
+        interpret_chat_response(
+            &ctx,
+            resp,
+            &history,
+            &specs,
+            false,
+            std::time::Instant::now(),
+            0,
+            false,
+        )
+        .await;
+
+        match rx.try_recv().expect("must emit Usage") {
+            TurnEvent::Usage {
+                input_tokens,
+                output_tokens,
+                ..
+            } => {
+                assert_eq!(input_tokens, Some(expected));
+                assert_eq!(output_tokens, Some(12));
+            }
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_usage_is_preferred_over_estimate() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<TurnEvent>(4);
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let dedup_exempt_tools: Vec<String> = Vec::new();
+        let ctx = TurnCtx {
+            parent_agent_alias: None,
+            observer: &crate::observability::NoopObserver,
+            provider_name: "openai",
+            model: "gpt-test",
+            temperature: None,
+            approval: None,
+            channel_name: "rpc",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: Some(&tx),
+            hooks: None,
+            dedup_exempt_tools: &dedup_exempt_tools,
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            agent_alias: Some("melfina"),
+            turn_id: "turn-real-usage",
+        };
+
+        let specs = IterationToolSpecs {
+            tool_specs: vec![],
+            known_tool_names: HashSet::new(),
+            use_native_tools: false,
+        };
+
+        let history = vec![ChatMessage::user("hi")];
+        let resp = ChatResponse {
+            text: Some("hello".to_string()),
+            tool_calls: vec![],
+            usage: Some(TokenUsage {
+                input_tokens: Some(1234),
+                output_tokens: Some(56),
+                cached_input_tokens: Some(10),
+            }),
+            reasoning_content: None,
+        };
+
+        interpret_chat_response(
+            &ctx,
+            resp,
+            &history,
+            &specs,
+            false,
+            std::time::Instant::now(),
+            0,
+            false,
+        )
+        .await;
+
+        let event = rx.try_recv().expect("provider usage must emit Usage");
+        match event {
+            TurnEvent::Usage {
+                input_tokens,
+                output_tokens,
+                cached_input_tokens,
+                ..
+            } => {
+                assert_eq!(input_tokens, Some(1234));
+                assert_eq!(output_tokens, Some(56));
+                assert_eq!(cached_input_tokens, Some(10));
+            }
+            other => panic!("expected TurnEvent::Usage, got {other:?}"),
+        }
     }
 }
