@@ -24,6 +24,40 @@ impl CaseReport {
     fn checks_passed(&self) -> usize {
         self.grades.iter().filter(|g| g.passed).count()
     }
+
+    /// Partial-credit score: fraction of checks passed. A case with no checks
+    /// scores 1.0 (it passes vacuously). Informational; the gate is pass/fail.
+    pub fn score(&self) -> f64 {
+        if self.grades.is_empty() {
+            1.0
+        } else {
+            self.checks_passed() as f64 / self.grades.len() as f64
+        }
+    }
+
+    /// Per-category `(passed, total)` tallies, keyed by the category's snake_case
+    /// label. Only categories with at least one grade appear.
+    fn category_totals(&self) -> serde_json::Value {
+        use std::collections::BTreeMap;
+        let mut totals: BTreeMap<&'static str, (usize, usize)> = BTreeMap::new();
+        for g in &self.grades {
+            let entry = totals.entry(g.category.as_str()).or_insert((0, 0));
+            entry.1 += 1;
+            if g.passed {
+                entry.0 += 1;
+            }
+        }
+        let map: serde_json::Map<String, serde_json::Value> = totals
+            .into_iter()
+            .map(|(cat, (passed, total))| {
+                (
+                    cat.to_string(),
+                    serde_json::json!({ "passed": passed, "total": total }),
+                )
+            })
+            .collect();
+        serde_json::Value::Object(map)
+    }
 }
 
 /// Aggregated results for a whole suite.
@@ -43,6 +77,12 @@ impl SuiteReport {
 
     pub fn all_passed(&self) -> bool {
         self.cases.iter().all(CaseReport::passed)
+    }
+
+    /// Process exit code for a completed run: 0 iff every case passed.
+    /// Kept as a pure function so the CLI gate is testable at its real boundary.
+    pub fn exit_code(&self) -> i32 {
+        if self.all_passed() { 0 } else { 1 }
     }
 
     /// Render a human-readable table. Failing checks are listed beneath their case.
@@ -93,6 +133,8 @@ impl SuiteReport {
                     "name": c.name,
                     "source": c.source,
                     "passed": c.passed(),
+                    "score": c.score(),
+                    "category_totals": c.category_totals(),
                     "error": c.error,
                     "grades": c.grades,
                 })
@@ -119,6 +161,7 @@ mod tests {
             check: check.to_string(),
             passed,
             detail: detail.to_string(),
+            category: crate::grader::GradeCategory::Response,
         }
     }
 
@@ -168,6 +211,27 @@ mod tests {
         assert_eq!(suite.passed_count(), 1);
         assert_eq!(suite.failed_count(), 2);
         assert!(!suite.all_passed());
+    }
+
+    #[test]
+    fn exit_code_is_zero_when_all_cases_pass() {
+        let suite = SuiteReport {
+            cases: vec![case("ok", vec![grade("c", true, "")], None)],
+        };
+        assert!(suite.all_passed());
+        assert_eq!(suite.exit_code(), 0);
+    }
+
+    #[test]
+    fn exit_code_is_one_when_any_case_fails() {
+        let suite = SuiteReport {
+            cases: vec![
+                case("ok", vec![grade("c", true, "")], None),
+                case("bad", vec![grade("c", false, "")], None),
+            ],
+        };
+        assert!(!suite.all_passed());
+        assert_eq!(suite.exit_code(), 1);
     }
 
     #[test]
@@ -223,5 +287,42 @@ mod tests {
         assert_eq!(json["cases"].as_array().unwrap().len(), 2);
         assert_eq!(json["cases"][0]["name"].as_str(), Some("ok"));
         assert_eq!(json["cases"][0]["passed"].as_bool(), Some(true));
+        // Each grade now carries its category (snake_case) in the JSON report.
+        assert_eq!(
+            json["cases"][0]["grades"][0]["category"].as_str(),
+            Some("response")
+        );
+    }
+
+    #[test]
+    fn category_totals_aggregate_correctly() {
+        use crate::grader::GradeCategory;
+        let grade_cat = |passed: bool, category: GradeCategory| GradeResult {
+            check: "c".to_string(),
+            passed,
+            detail: String::new(),
+            category,
+        };
+        let report = CaseReport {
+            name: "mixed".to_string(),
+            source: "f.json".to_string(),
+            grades: vec![
+                grade_cat(true, GradeCategory::Response),
+                grade_cat(false, GradeCategory::Response),
+                grade_cat(true, GradeCategory::Tool),
+                grade_cat(true, GradeCategory::SideEffect),
+            ],
+            error: None,
+        };
+        // score = 3/4 passed.
+        assert!((report.score() - 0.75).abs() < f64::EPSILON);
+        let totals = report.category_totals();
+        assert_eq!(totals["response"]["passed"].as_u64(), Some(1));
+        assert_eq!(totals["response"]["total"].as_u64(), Some(2));
+        assert_eq!(totals["tool"]["passed"].as_u64(), Some(1));
+        assert_eq!(totals["tool"]["total"].as_u64(), Some(1));
+        assert_eq!(totals["side_effect"]["total"].as_u64(), Some(1));
+        // Categories with no grades do not appear.
+        assert!(totals.get("budget").is_none());
     }
 }
