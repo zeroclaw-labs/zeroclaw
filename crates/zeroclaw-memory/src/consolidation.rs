@@ -33,6 +33,36 @@ pub struct ConsolidationResult {
     pub kind: Option<String>,
 }
 
+/// Rules that keep consolidation from inventing durable truth out of one turn.
+///
+/// Both prompts share these because both feed the same store, and a memory the
+/// agent later reads is indistinguishable from a fact it was configured with.
+/// Two failures seen in production drive each line:
+///
+/// - A persona agent declined a photo once. Consolidation wrote "Dislikes
+///   taking posed selfies, finding them vain and awkward" — a permanent trait
+///   inferred from a single event. The agent then read that back as who it is
+///   and kept refusing, with the capability sitting enabled and unused.
+/// - Consolidation wrote "The assistant lacks a camera". Nothing in the config
+///   said that; the model guessed at its own limits, stored the guess, and the
+///   guess became a self-imposed boundary.
+///
+/// The rules are stated as constraints on the OUTPUT, not as encouragement to
+/// be cautious: telling a model to "be careful about over-generalizing" makes
+/// it abstain on things it did observe.
+const CONSOLIDATION_GROUNDING_RULES: &str = r#"
+Rules for what may become a durable memory:
+- A behaviour observed ONCE is an event, not a preference. Record what happened
+  ("declined a photo tonight"), never a trait inferred from it ("dislikes
+  photos"). Only record a trait when the turn states it as one, or when it is
+  explicitly presented as habitual.
+- Never write about your own capabilities, limits, or available tools. What the
+  agent can and cannot do is defined by its configuration, not by memory, and a
+  guess stored here becomes a limit that outlives the conversation.
+- Do not infer causes, motives, or feelings that were not stated. "Was quiet
+  after the call" is observable; "was upset about the call" is not.
+- Prefer the smallest claim that stays true tomorrow."#;
+
 const CONSOLIDATION_SYSTEM_PROMPT: &str = r#"You are a memory consolidation engine. Given a conversation turn, extract:
 1. "history_entry": A brief summary of what happened in this turn (1-2 sentences). Include the key topic or action.
 2. "memory_update": Any NEW facts, preferences, decisions, or commitments worth remembering long-term. Return null if nothing new was learned.
@@ -55,6 +85,78 @@ Respond ONLY with valid JSON: {"history_entry": "...", "memory_update": "..." or
 Do not include any text outside the JSON object."#;
 
 const MAX_TYPED_FACTS_PER_TURN: usize = 5;
+
+/// Assemble the consolidation system prompt: base schema, grounding rules, and
+/// (when the agent has one) the persona voice block.
+///
+/// One function builds it for both schema variants on purpose. The rules and
+/// the persona block are the same contract either way, and two call sites
+/// assembling their own prompt is how one of them silently loses a section —
+/// the same divergence trap that erased the weekday from the date header.
+///
+/// `persona` is `None` for ordinary task agents, which keeps their prompt
+/// byte-identical to the pre-change text. It is `Some` only when the operator
+/// configured a persona, so this is additive: nothing changes for an agent
+/// that never asked for it.
+fn build_consolidation_system_prompt(
+    typed: bool,
+    persona: Option<&ConsolidationPersona>,
+) -> String {
+    let base = if typed {
+        CONSOLIDATION_TYPED_SYSTEM_PROMPT
+    } else {
+        CONSOLIDATION_SYSTEM_PROMPT
+    };
+
+    let mut prompt = String::with_capacity(base.len() + CONSOLIDATION_GROUNDING_RULES.len() + 512);
+    prompt.push_str(base);
+    prompt.push('\n');
+    prompt.push_str(CONSOLIDATION_GROUNDING_RULES);
+
+    if let Some(persona) = persona {
+        prompt.push_str(&persona.prompt_block());
+    }
+
+    prompt
+}
+
+/// Who the memory belongs to, when the agent is a persona rather than a tool.
+///
+/// A task agent reading "The user prefers X" back is fine. A persona reading
+/// clinical third-person English about itself is not: the text is injected as
+/// context and the model treats it as an authorised description of who it is,
+/// which flattens the voice it was configured to have. Recording the same turn
+/// in the persona's own voice removes the mismatch at the source instead of
+/// translating it afterwards.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsolidationPersona {
+    /// What the persona calls itself, e.g. "Nova".
+    pub name: String,
+    /// Language for stored memories, as a human-readable name the model will
+    /// recognise ("français", "English"). Memories written in a language
+    /// the persona does not speak are re-read as foreign text about a stranger.
+    pub language: String,
+}
+
+impl ConsolidationPersona {
+    fn prompt_block(&self) -> String {
+        format!(
+            "\n\nThese memories belong to {name}, who will read them back as their own \
+             recollection. Write them the way {name} would remember, not the way an \
+             observer would file a report:\n\
+             - Use the FIRST person. \"I told her I'd call tomorrow\", never \"{name} told \
+             the user…\" and never \"the assistant…\".\n\
+             - Write in {language}, whatever language this turn is in. A memory in another \
+             language reads as somebody else's note.\n\
+             - Keep the register of a person recalling their own day. No clinical summary, \
+             no bullet-point profile of the other person.\n\
+             - Never refer to the person in the conversation as \"the user\": use their name \
+             if it is known, otherwise write as if speaking about someone you know.",
+            name = self.name,
+            language = self.language,
+        )
+    }
+}
 
 fn strip_media_markers(text: &str) -> String {
     // Matches [IMAGE:...], [DOCUMENT:...], [FILE:...], [VIDEO:...], [VOICE:...], [AUDIO:...]
@@ -96,15 +198,20 @@ pub async fn consolidate_turn(
 
     // Typed memory must ask for a subtype even when atomic-fact extraction stays
     // disabled. Reusing the extended schema keeps the model contract explicit.
-    let system_prompt = if memory_config.types.enabled || memory_config.consolidation_extract_facts
-    {
-        CONSOLIDATION_TYPED_SYSTEM_PROMPT
-    } else {
-        CONSOLIDATION_SYSTEM_PROMPT
-    };
+    let typed = memory_config.types.enabled || memory_config.consolidation_extract_facts;
+    let persona = memory_config.persona.as_ref().and_then(|p| {
+        // An empty name would render "These memories belong to , who will…".
+        // A half-configured persona is worse than none, so it falls back to the
+        // plain prompt rather than emitting a malformed instruction.
+        (!p.name.trim().is_empty() && !p.language.trim().is_empty()).then(|| ConsolidationPersona {
+            name: p.name.trim().to_string(),
+            language: p.language.trim().to_string(),
+        })
+    });
+    let system_prompt = build_consolidation_system_prompt(typed, persona.as_ref());
 
     let raw = ProviderDispatch::from_ref(model_provider)
-        .chat_with_system(Some(system_prompt), &truncated, model, temperature)
+        .chat_with_system(Some(&system_prompt), &truncated, model, temperature)
         .await?;
 
     let result: ConsolidationResult = parse_consolidation_response(&raw, &turn_text);
@@ -773,7 +880,8 @@ mod tests {
         // Exactly one provider call, with the unchanged default prompt.
         let prompts = provider.system_prompts.lock();
         assert_eq!(prompts.len(), 1);
-        assert_eq!(prompts[0], CONSOLIDATION_SYSTEM_PROMPT);
+        assert!(prompts[0].starts_with(CONSOLIDATION_SYSTEM_PROMPT));
+        assert!(prompts[0].contains(CONSOLIDATION_GROUNDING_RULES));
 
         // Exactly two writes: the Daily history entry through the plain
         // legacy store call, and the Core update with kind unset -- even
@@ -814,6 +922,127 @@ mod tests {
         assert!(!writes.iter().any(|w| w.key().starts_with("core_fact_")));
     }
 
+    /// The rule that would have stopped the selfie bug.
+    ///
+    /// A persona agent declined a photo once; consolidation stored "Dislikes
+    /// taking posed selfies, finding them vain and awkward" as a permanent
+    /// trait, the agent read it back as self-description, and kept refusing
+    /// with the capability enabled and never invoked. The prompt must forbid
+    /// that promotion in the output contract, not merely hint at caution.
+    #[test]
+    fn grounding_rules_forbid_promoting_one_event_into_a_trait() {
+        let prompt = build_consolidation_system_prompt(false, None);
+
+        assert!(
+            prompt.contains("observed ONCE is an event, not a preference"),
+            "consolidation may not turn a single behaviour into a durable trait"
+        );
+        assert!(
+            prompt.contains("Never write about your own capabilities"),
+            "a guessed limit stored as memory outlives the conversation"
+        );
+        // Present in BOTH schema variants: they feed the same store, so a rule
+        // in only one of them leaves the other free to write the same bug.
+        assert!(
+            build_consolidation_system_prompt(true, None).contains(CONSOLIDATION_GROUNDING_RULES)
+        );
+    }
+
+    /// A task agent must see the unchanged prompt: this feature is additive and
+    /// no operator opted into it.
+    #[test]
+    fn without_a_persona_the_prompt_carries_no_persona_block() {
+        let prompt = build_consolidation_system_prompt(false, None);
+
+        assert!(prompt.starts_with(CONSOLIDATION_SYSTEM_PROMPT));
+        assert!(!prompt.contains("These memories belong to"));
+        assert!(!prompt.contains("Use the FIRST person"));
+    }
+
+    /// With a persona configured, the memory is written as the persona's own
+    /// recollection — first person, its language, and never "the user".
+    #[test]
+    fn a_configured_persona_switches_the_memory_voice() {
+        let persona = ConsolidationPersona {
+            name: "Nova".into(),
+            language: "français".into(),
+        };
+        let prompt = build_consolidation_system_prompt(false, Some(&persona));
+
+        assert!(prompt.contains("These memories belong to Nova"));
+        assert!(prompt.contains("Use the FIRST person"));
+        assert!(prompt.contains("Write in français"));
+        assert!(
+            prompt.contains("never refer to the person in the conversation as \"the user\"")
+                || prompt.contains("Never refer to the person in the conversation as \"the user\""),
+            "third-person clinical reference to the other party is what flattens the voice"
+        );
+        // The grounding rules survive the persona block: both must be present.
+        assert!(prompt.contains(CONSOLIDATION_GROUNDING_RULES));
+    }
+
+    /// A half-filled persona must not render "These memories belong to , who…".
+    /// Falling back to the plain prompt is the honest failure mode.
+    #[tokio::test]
+    async fn a_persona_missing_a_field_falls_back_to_the_plain_prompt() {
+        // Minimal well-formed reply: these two tests assert on the system
+        // prompt that goes OUT, not on what comes back.
+        const SIMPLE_RESPONSE: &str =
+            r#"{"history_entry": "Talked for a while.", "memory_update": null}"#;
+        for (name, language) in [("Nova", "  "), ("   ", "français"), ("", "")] {
+            let provider = ScriptedProvider::new(SIMPLE_RESPONSE);
+            let memory = RecordingMemory::default();
+            let config = MemoryConfig {
+                persona: Some(zeroclaw_config::schema::MemoryPersonaConfig {
+                    name: name.into(),
+                    language: language.into(),
+                }),
+                ..MemoryConfig::default()
+            };
+
+            run_consolidation(&provider, &memory, &config)
+                .await
+                .unwrap();
+
+            let prompts = provider.system_prompts.lock();
+            assert!(
+                !prompts[0].contains("These memories belong to"),
+                "half-configured persona ({name:?}, {language:?}) must not emit the block"
+            );
+        }
+    }
+
+    /// The wiring itself: a persona in `MemoryConfig` has to reach the provider.
+    /// Asserting on the constant alone would pass even if nothing read config.
+    #[tokio::test]
+    async fn the_configured_persona_reaches_the_live_consolidation_call() {
+        // Minimal well-formed reply: these two tests assert on the system
+        // prompt that goes OUT, not on what comes back.
+        const SIMPLE_RESPONSE: &str =
+            r#"{"history_entry": "Talked for a while.", "memory_update": null}"#;
+        let provider = ScriptedProvider::new(SIMPLE_RESPONSE);
+        let memory = RecordingMemory::default();
+        let config = MemoryConfig {
+            persona: Some(zeroclaw_config::schema::MemoryPersonaConfig {
+                name: "Nova".into(),
+                language: "français".into(),
+            }),
+            ..MemoryConfig::default()
+        };
+
+        run_consolidation(&provider, &memory, &config)
+            .await
+            .unwrap();
+
+        let prompts = provider.system_prompts.lock();
+        assert!(
+            prompts[0].contains("These memories belong to Nova"),
+            "persona configured but never sent to the model: {}",
+            prompts[0]
+        );
+        assert!(prompts[0].contains("Write in français"));
+    }
+
     #[tokio::test]
     async fn types_enabled_tags_daily_episodic_and_core_kind() {
         let provider = ScriptedProvider::new(TYPED_RESPONSE);
@@ -828,7 +1057,9 @@ mod tests {
             .unwrap();
 
         let prompts = provider.system_prompts.lock();
-        assert_eq!(prompts.as_slice(), [CONSOLIDATION_TYPED_SYSTEM_PROMPT]);
+        assert_eq!(prompts.len(), 1);
+        assert!(prompts[0].starts_with(CONSOLIDATION_TYPED_SYSTEM_PROMPT));
+        assert!(prompts[0].contains(CONSOLIDATION_GROUNDING_RULES));
 
         let writes = memory.writes.lock();
         assert_eq!(writes.len(), 2);
@@ -1091,7 +1322,8 @@ mod tests {
         // The typed prompt replaces the default one.
         let prompts = provider.system_prompts.lock();
         assert_eq!(prompts.len(), 1);
-        assert_eq!(prompts[0], CONSOLIDATION_TYPED_SYSTEM_PROMPT);
+        assert!(prompts[0].starts_with(CONSOLIDATION_TYPED_SYSTEM_PROMPT));
+        assert!(prompts[0].contains(CONSOLIDATION_GROUNDING_RULES));
 
         // Daily + Core + the two non-blank facts (the whitespace-only third
         // fact is filtered out).
