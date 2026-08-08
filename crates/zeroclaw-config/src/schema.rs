@@ -6405,10 +6405,36 @@ fn default_multimodal_max_image_size_mb() -> usize {
     5
 }
 
+/// Upper bound on `multimodal.max_images`.
+///
+/// This is a sanity rail against a typo (`max_images = 100000` would build a
+/// request no provider accepts), not a product limit: it sits at the order of
+/// magnitude mainstream vision APIs document per request, so a deliberate
+/// configuration is honoured as written. The previous value of 16 was below
+/// what a single user message routinely carries — attaching a batch of photos
+/// silently lost most of them, with nothing in the logs to say why.
+pub const MAX_IMAGES_CEILING: usize = 100;
+
 impl MultimodalConfig {
     /// Clamp configured values to safe runtime bounds.
+    ///
+    /// Clamping is reported: a value silently rewritten is a value the
+    /// operator cannot debug.
     pub fn effective_limits(&self) -> (usize, usize) {
-        let max_images = self.max_images.clamp(1, 16);
+        let max_images = self.max_images.clamp(1, MAX_IMAGES_CEILING);
+        if max_images != self.max_images {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "configured_max_images": self.max_images,
+                        "effective_max_images": max_images,
+                        "ceiling": MAX_IMAGES_CEILING,
+                    })),
+                "multimodal: configured max_images is out of bounds — clamped"
+            );
+        }
         let max_image_size_mb = self.max_image_size_mb.clamp(1, 20);
         (max_images, max_image_size_mb)
     }
@@ -23310,6 +23336,39 @@ mod tests {
             nc_cfg(Some(""), Some("   ")).resolve_bot_secret().unwrap(),
             None
         );
+    }
+
+    // A configured `max_images` above the old hard ceiling of 16 was silently
+    // rewritten to 16: an operator asking for 50 got 16 with nothing said. The
+    // ceiling now sits at the order of magnitude mainstream vision providers
+    // actually accept, so ordinary configurations are honoured as written.
+    #[::core::prelude::v1::test]
+    fn multimodal_effective_limits_honour_a_configured_value() {
+        let config = super::MultimodalConfig {
+            max_images: 50,
+            ..Default::default()
+        };
+        assert_eq!(config.effective_limits().0, 50);
+    }
+
+    #[::core::prelude::v1::test]
+    fn multimodal_effective_limits_keep_a_sanity_ceiling() {
+        let config = super::MultimodalConfig {
+            max_images: 5_000,
+            ..Default::default()
+        };
+        assert_eq!(config.effective_limits().0, super::MAX_IMAGES_CEILING);
+    }
+
+    // Zero images would make every multimodal request pointless: the floor
+    // stays.
+    #[::core::prelude::v1::test]
+    fn multimodal_effective_limits_keep_the_floor_of_one() {
+        let config = super::MultimodalConfig {
+            max_images: 0,
+            ..Default::default()
+        };
+        assert_eq!(config.effective_limits().0, 1);
     }
 
     #[::core::prelude::v1::test]
