@@ -1,6 +1,7 @@
 //! Multi-provider Text-to-Speech (TTS) subsystem.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 
@@ -405,6 +406,129 @@ impl TtsProvider for GoogleTtsProvider {
 pub struct EdgeTtsProvider {
     alias: String,
     binary_path: String,
+    timeout: std::time::Duration,
+}
+
+/// How long the reaper waits for the child to exit after a graceful kill
+/// before escalating to a hard kill, and before the temp file is removed.
+const EDGE_TTS_REAP_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Send a graceful termination request to the child. On Unix this is
+/// `SIGTERM`, which a cooperative child (or a test fixture) can handle or
+/// ignore; Windows has no signal model, so fall back to the hard kill.
+#[cfg(unix)]
+fn graceful_kill(child: &mut tokio::process::Child) {
+    if let Some(pid) = child.id() {
+        let _ = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+    }
+}
+
+#[cfg(not(unix))]
+fn graceful_kill(child: &mut tokio::process::Child) {
+    let _ = child.start_kill();
+}
+
+/// RAII cleanup for the temporary Edge TTS output file, the spawned child, and
+/// its stderr drain. On every path out of [`EdgeTtsProvider::synthesize`] —
+/// success, subprocess failure, timeout, output-read failure, and cancellation
+/// (future drop) — the child is killed and reaped and the stderr reader aborted
+/// before the artifact is removed, so deletion cannot race a still-terminating
+/// process. The child reap and stderr drain never block an executor worker:
+/// `Drop` only requests a graceful `SIGTERM`, checks the child once without
+/// blocking, and if it has not exited hands it to a detached reaper thread that
+/// reaps it (bounded) off any worker thread, escalating to a hard kill after
+/// [`EDGE_TTS_REAP_GRACE`]. The reaper runs on a `std::thread`, so it is
+/// independent of the Tokio runtime's lifetime — it is not cancelled when a
+/// runtime shuts down the way a `tokio::spawn`ed task would be, and it never
+/// panics for lack of an entered runtime. Cleanup failure is swallowed so it
+/// never masks the primary synthesis error. The already-exited and no-child
+/// branches delete the temp file with a single synchronous `remove_file` (fast
+/// local-unlink); the pending-reap branch removes it inside the reaper thread.
+struct EdgeTtsTempArtifact {
+    path: PathBuf,
+    child: Option<tokio::process::Child>,
+    /// The stderr-drain task, owned here so cancellation aborts it instead of
+    /// detaching it (a descendant holding the pipe can otherwise keep the task
+    /// alive after the direct child is gone).
+    stderr_reader: Option<tokio::task::JoinHandle<String>>,
+}
+
+impl Drop for EdgeTtsTempArtifact {
+    fn drop(&mut self) {
+        // Abort the stderr drain first: closing the pipe read end is what lets
+        // a descendant that inherited the pipe stop keeping the task alive.
+        if let Some(reader) = self.stderr_reader.take() {
+            reader.abort();
+        }
+
+        match self.child.take() {
+            // No child: only the temp file needs removing.
+            None => {
+                let _ = std::fs::remove_file(&self.path);
+            }
+            Some(mut child) => {
+                // Graceful first: SIGTERM on Unix. A cooperative child exits
+                // promptly; an uncooperative one keeps running and stays
+                // pending so the reaper below genuinely owns the bounded wait.
+                graceful_kill(&mut child);
+                // Already reaped (e.g. the success path): remove the file
+                // inline — no reaper needed.
+                if let Ok(Some(_)) = child.try_wait() {
+                    let _ = std::fs::remove_file(&self.path);
+                    return;
+                }
+                // Child still terminating: hand it to a detached reaper thread
+                // rather than a `tokio::spawn`ed task. The reap-and-remove must
+                // not depend on the Tokio runtime staying alive: a spawned task
+                // is cancelled when its runtime shuts down (leaving the artifact
+                // behind) and panics when dropped with no runtime entered. A
+                // thread owns the bounded wait, escalates to a hard kill if the
+                // grace window expires, and only then removes the temp file,
+                // preserving the reap-before-delete ordering.
+                let path = self.path.clone();
+                let _ = std::thread::Builder::new()
+                    .name("edge-tts-reaper".to_string())
+                    .spawn(move || reap_and_remove(child, path));
+            }
+        }
+    }
+}
+
+/// Reap the child until it exits or [`EDGE_TTS_REAP_GRACE`] elapses, escalating
+/// to a hard kill on timeout, then remove the temp file. Runs on a detached
+/// [`std::thread`] so it never depends on a Tokio runtime's lifetime and never
+/// blocks an executor worker. Synchronous-only ([`tokio::process::Child::try_wait`]
+/// / [`tokio::process::Child::start_kill`]) so it needs no runtime context.
+fn reap_and_remove(mut child: tokio::process::Child, path: PathBuf) {
+    let grace_started = std::time::Instant::now();
+    let grace = EDGE_TTS_REAP_GRACE;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() - grace_started < grace => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            // Grace expired (or an unrecoverable wait error): hard kill, then
+            // give it a short final window to be reaped before removing the
+            // file, so deletion cannot race the terminating child.
+            _ => {
+                let _ = child.start_kill();
+                let hard_started = std::time::Instant::now();
+                let hard_budget = std::time::Duration::from_millis(500);
+                loop {
+                    if matches!(child.try_wait(), Ok(Some(_))) {
+                        break;
+                    }
+                    if std::time::Instant::now() - hard_started >= hard_budget {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                break;
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&path);
 }
 
 impl EdgeTtsProvider {
@@ -431,7 +555,20 @@ impl EdgeTtsProvider {
         Ok(Self {
             alias: alias.to_string(),
             binary_path: raw_path,
+            timeout: TTS_HTTP_TIMEOUT,
         })
+    }
+
+    /// Test-only constructor that accepts a script path and timeout so tests
+    /// can drive the `edge-tts` subprocess. The production [`new`](Self::new)
+    /// allowlist stays a security boundary; this exists only under `cfg(test)`.
+    #[cfg(test)]
+    fn new_with_binary(alias: &str, binary_path: &str, timeout: std::time::Duration) -> Self {
+        Self {
+            alias: alias.to_string(),
+            binary_path: binary_path.to_string(),
+            timeout,
+        }
     }
 }
 
@@ -445,7 +582,6 @@ impl TtsProvider for EdgeTtsProvider {
         // edge-tts writes an MP3 temp file (see `--write-media …mp3`).
         "mp3"
     }
-
     async fn synthesize(&self, text: &str, voice: &str) -> Result<Vec<u8>> {
         let temp_dir = std::env::temp_dir();
         let output_file = temp_dir.join(format!("zeroclaw_tts_{}.mp3", uuid::Uuid::new_v4()));
@@ -453,34 +589,96 @@ impl TtsProvider for EdgeTtsProvider {
             .to_str()
             .context("Failed to build temp file path for Edge TTS")?;
 
-        let output = tokio::time::timeout(
-            TTS_HTTP_TIMEOUT,
-            tokio::process::Command::new(&self.binary_path)
-                .arg("--text")
-                .arg(text)
-                .arg("--voice")
-                .arg(voice)
-                .arg("--write-media")
-                .arg(output_path)
-                .output(),
-        )
-        .await
-        .context("Edge TTS subprocess timed out")?
-        .context("Failed to spawn edge-tts subprocess")?;
+        // Spawn explicitly and move the child into the artifact guard, which
+        // owns the child through timeout handling AND cancellation: on any path
+        // out of synthesize it kills and reaps the child before removing the
+        // artifact (see EdgeTtsTempArtifact::drop).
+        let child = tokio::process::Command::new(&self.binary_path)
+            .arg("--text")
+            .arg(text)
+            .arg("--voice")
+            .arg(voice)
+            .arg("--write-media")
+            .arg(output_path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .context("Failed to spawn edge-tts subprocess")?;
+        let mut artifact = EdgeTtsTempArtifact {
+            path: output_file.clone(),
+            child: Some(child),
+            stderr_reader: None,
+        };
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // Clean up temp file on failure.
-            let _ = tokio::fs::remove_file(&output_file).await;
-            bail!("edge-tts failed (exit {}): {}", output.status, stderr);
+        // Drain stderr concurrently so a verbose child cannot deadlock on a
+        // full pipe while we wait for it to exit. Bytes are decoded lossily so
+        // non-UTF-8 subprocess output still reaches the failure diagnostic. The
+        // reader task stays owned by the artifact so cancellation aborts it.
+        {
+            use tokio::io::AsyncReadExt;
+            let pipe = artifact
+                .child
+                .as_mut()
+                .expect("child present after spawn")
+                .stderr
+                .take()
+                .expect("stderr piped");
+            artifact.stderr_reader = Some(zeroclaw_spawn::spawn!(async move {
+                let mut buf = Vec::new();
+                let mut pipe = pipe;
+                let _ = pipe.read_to_end(&mut buf).await;
+                String::from_utf8_lossy(&buf).into_owned()
+            }));
+        }
+
+        // One absolute deadline shared by the process wait and the post-exit
+        // pipe drain, so the drain bound cannot double the provider timeout.
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        let (status, stderr) = {
+            let child = artifact.child.as_mut().expect("child present after spawn");
+            let reader = artifact
+                .stderr_reader
+                .as_mut()
+                .expect("stderr reader set above");
+            match tokio::time::timeout_at(deadline, child.wait()).await {
+                Ok(Ok(status)) => {
+                    // Drain stderr; if it never EOFs (a descendant held the
+                    // pipe open) the shared deadline caps the join.
+                    match tokio::time::timeout_at(deadline, &mut *reader).await {
+                        Ok(Ok(stderr)) => (status, stderr),
+                        Ok(Err(_)) => (status, String::new()),
+                        Err(_elapsed) => {
+                            reader.abort();
+                            let _ = reader.await;
+                            (status, String::new())
+                        }
+                    }
+                }
+                Ok(Err(err)) => {
+                    reader.abort();
+                    let _ = reader.await;
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    return Err(err).context("Failed to wait for edge-tts subprocess");
+                }
+                Err(_elapsed) => {
+                    reader.abort();
+                    let _ = reader.await;
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    bail!("Edge TTS subprocess timed out");
+                }
+            }
+        };
+
+        if !status.success() {
+            bail!("edge-tts failed (exit {}): {}", status, stderr);
         }
 
         let bytes = tokio::fs::read(&output_file)
             .await
             .context("Failed to read edge-tts output file")?;
-
-        // Clean up temp file.
-        let _ = tokio::fs::remove_file(&output_file).await;
 
         Ok(bytes)
     }
@@ -1325,5 +1523,423 @@ mod tests {
         let provider = OpenAiTtsProvider::new("test", &cfg).unwrap();
         assert_eq!(provider.base_url, "https://api.openai.com/v1/audio/speech");
         assert_eq!(provider.response_format, "opus");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edge_tts_removes_temp_output_when_read_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Fake `edge-tts`: records the `--write-media` output path, writes an
+        // unreadable artifact there, and exits successfully, forcing the
+        // output-read failure path.
+        let temp_dir = std::env::temp_dir();
+        let script_path =
+            temp_dir.join(format!("zeroclaw_edgetts_test_{}.sh", uuid::Uuid::new_v4()));
+        let out_path_file = temp_dir.join(format!(
+            "zeroclaw_edgetts_path_{}.txt",
+            uuid::Uuid::new_v4()
+        ));
+        let script = script_path.to_str().unwrap();
+        let sidecar = out_path_file.to_str().unwrap();
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\n\
+                 out=\n\
+                 prev=\n\
+                 for a in \"$@\"; do\n\
+                   if [ \"$prev\" = \"--write-media\" ]; then out=\"$a\"; fi\n\
+                   prev=\"$a\"\n\
+                 done\n\
+                 printf '%s' \"$out\" > \"{sidecar}\"\n\
+                 : > \"$out\"\n\
+                 chmod 000 \"$out\"\n\
+                 exit 0\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let provider =
+            EdgeTtsProvider::new_with_binary("test", script, std::time::Duration::from_secs(5));
+        let err = provider
+            .synthesize("hello", "en-US-AriaNeural")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Failed to read edge-tts output file"),
+            "expected output-read failure, got: {err}"
+        );
+
+        let artifact =
+            std::fs::read_to_string(&out_path_file).expect("script must record output path");
+        assert!(
+            !std::path::Path::new(&artifact).exists(),
+            "Edge TTS temp output must be cleaned up after an output-read failure: {artifact}"
+        );
+
+        let _ = std::fs::remove_file(&script_path);
+        let _ = std::fs::remove_file(&out_path_file);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edge_tts_timeout_kills_child_and_removes_temp_output() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Fake `edge-tts`: records the `--write-media` output path, writes an
+        // artifact there, then keeps rewriting it while hanging, so the short
+        // test timeout fires while a partial artifact exists. A live child
+        // would recreate the artifact after our cleanup; kill_on_drop must
+        // stop it so the path stays gone.
+        let temp_dir = std::env::temp_dir();
+        let script_path =
+            temp_dir.join(format!("zeroclaw_edgetts_test_{}.sh", uuid::Uuid::new_v4()));
+        let out_path_file = temp_dir.join(format!(
+            "zeroclaw_edgetts_path_{}.txt",
+            uuid::Uuid::new_v4()
+        ));
+        let script = script_path.to_str().unwrap();
+        let sidecar = out_path_file.to_str().unwrap();
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\n\
+                 out=\n\
+                 prev=\n\
+                 for a in \"$@\"; do\n\
+                   if [ \"$prev\" = \"--write-media\" ]; then out=\"$a\"; fi\n\
+                   prev=\"$a\"\n\
+                 done\n\
+                 printf '%s' \"$out\" > \"{sidecar}\"\n\
+                 : > \"$out\"\n\
+                 while :; do : > \"$out\"; sleep 0.05; done\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Short timeout so the hanging fake binary trips the timeout path fast.
+        let provider =
+            EdgeTtsProvider::new_with_binary("test", script, std::time::Duration::from_millis(250));
+        let err = provider
+            .synthesize("hello", "en-US-AriaNeural")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("timed out"),
+            "expected a timeout error, got: {err}"
+        );
+
+        let artifact =
+            std::fs::read_to_string(&out_path_file).expect("script must record output path");
+        // Give a (wrongly) still-alive child time to recreate the artifact so
+        // the absence assertion below actually distinguishes killed from leaked.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !std::path::Path::new(&artifact).exists(),
+            "Edge TTS temp output must be removed after a timeout and the child killed: {artifact}"
+        );
+
+        let _ = std::fs::remove_file(&script_path);
+        let _ = std::fs::remove_file(&out_path_file);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edge_tts_cancellation_reaps_child_and_removes_temp_output() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Fake `edge-tts` that writes an artifact then hangs, like the timeout
+        // test. The caller aborts synthesis before the provider timeout so the
+        // future is dropped while `child.wait()` is pending; the artifact guard
+        // must still kill and reap the child before removing the artifact.
+        let temp_dir = std::env::temp_dir();
+        let script_path =
+            temp_dir.join(format!("zeroclaw_edgetts_test_{}.sh", uuid::Uuid::new_v4()));
+        let out_path_file = temp_dir.join(format!(
+            "zeroclaw_edgetts_path_{}.txt",
+            uuid::Uuid::new_v4()
+        ));
+        let script = script_path.to_str().unwrap();
+        let sidecar = out_path_file.to_str().unwrap();
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\n\
+                 out=\n\
+                 prev=\n\
+                 for a in \"$@\"; do\n\
+                   if [ \"$prev\" = \"--write-media\" ]; then out=\"$a\"; fi\n\
+                   prev=\"$a\"\n\
+                 done\n\
+                 printf '%s' \"$out\" > \"{sidecar}\"\n\
+                 : > \"$out\"\n\
+                 while :; do : > \"$out\"; sleep 0.05; done\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Generous provider timeout: the abort (not the timeout) must drop the
+        // waiting future, and the child needs time to start under test load.
+        let provider =
+            EdgeTtsProvider::new_with_binary("test", script, std::time::Duration::from_secs(10));
+        let handle = zeroclaw_spawn::spawn!(async move {
+            let _ = provider.synthesize("hello", "en-US-AriaNeural").await;
+        });
+        // Wait until the child has actually started (sidecar written) so the
+        // abort deterministically drops the future while `child.wait()` is
+        // pending.
+        for _ in 0..200 {
+            if out_path_file.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            out_path_file.exists(),
+            "fake child must record its output path before abort"
+        );
+        handle.abort();
+        let _ = handle.await;
+
+        let artifact =
+            std::fs::read_to_string(&out_path_file).expect("script must record output path");
+        // Give a (wrongly) surviving child time to recreate the artifact.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !std::path::Path::new(&artifact).exists(),
+            "Edge TTS temp output must be removed after cancellation: {artifact}"
+        );
+
+        let _ = std::fs::remove_file(&script_path);
+        let _ = std::fs::remove_file(&out_path_file);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn edge_tts_cancellation_cleanup_does_not_block_current_thread_runtime() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // A child that ignores SIGTERM for a few seconds then exits on its
+        // own, so the artifact's bounded reap is genuinely pending while we
+        // probe the runtime. The old `Drop` polled `std::thread::sleep` on the
+        // worker and froze the probe; reaping must keep the worker responsive.
+        let temp_dir = std::env::temp_dir();
+        let script_path =
+            temp_dir.join(format!("zeroclaw_edgetts_test_{}.sh", uuid::Uuid::new_v4()));
+        let artifact_path =
+            temp_dir.join(format!("zeroclaw_edgetts_out_{}.mp3", uuid::Uuid::new_v4()));
+        let script = script_path.to_str().unwrap();
+        let out = artifact_path.to_str().unwrap();
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\n\
+                 : > \"{out}\"\n\
+                 trap '' TERM\n\
+                 sleep 3\n\
+                 exit 0\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+        rt.block_on(async {
+            let child = tokio::process::Command::new(script)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+                .expect("spawn fake child");
+            let artifact = EdgeTtsTempArtifact {
+                path: artifact_path.clone(),
+                child: Some(child),
+                stderr_reader: None,
+            };
+            // Make sure the child is running before the artifact is dropped.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+            // A probe task on the same worker must keep advancing while cleanup
+            // is pending. With a blocking Drop it cannot run until the reap
+            // bound ends (~3 s); with the async reaper it fires on schedule.
+            let probe = zeroclaw_spawn::spawn!(async {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                true
+            });
+
+            drop(artifact);
+
+            let started = std::time::Instant::now();
+            let probe_result = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                probe.await.expect("probe task")
+            })
+            .await
+            .unwrap_or_else(|_| panic!("runtime stalled while Edge TTS cleanup was pending"));
+            assert!(probe_result, "probe task must complete");
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(1),
+                "cleanup must not stall the current-thread runtime"
+            );
+        });
+
+        let _ = std::fs::remove_file(&script_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn edge_tts_cleanup_completes_after_runtime_shutdown() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // A child that ignores SIGTERM for a few seconds then exits on its own,
+        // so the artifact's bounded reap is genuinely pending when the runtime
+        // is torn down. The reaper must finish (reap + remove the temp file)
+        // independently of the Tokio runtime's lifetime: it must not be
+        // cancelled when the runtime that owned the artifact shuts down (a
+        // `tokio::spawn`ed cleanup task would be), nor panic from dropping off
+        // the runtime.
+        let temp_dir = std::env::temp_dir();
+        let script_path =
+            temp_dir.join(format!("zeroclaw_edgetts_test_{}.sh", uuid::Uuid::new_v4()));
+        let artifact_path =
+            temp_dir.join(format!("zeroclaw_edgetts_out_{}.mp3", uuid::Uuid::new_v4()));
+        let script = script_path.to_str().unwrap();
+        let out = artifact_path.to_str().unwrap();
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\n\
+                 : > \"{out}\"\n\
+                 trap '' TERM\n\
+                 sleep 2\n\
+                 exit 0\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("current-thread runtime");
+            rt.block_on(async {
+                let child = tokio::process::Command::new(script)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .kill_on_drop(true)
+                    .spawn()
+                    .expect("spawn fake child");
+                let artifact = EdgeTtsTempArtifact {
+                    path: artifact_path.clone(),
+                    child: Some(child),
+                    stderr_reader: None,
+                };
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+                // Drop hands the still-terminating child to the reaper, then the
+                // runtime is torn down at the end of this block.
+                drop(artifact);
+            });
+            // Runtime is gone; the reaper must still be running on its own
+            // thread, reaping the child and removing the temp file. A
+            // `tokio::spawn`ed reaper would have been cancelled right here (its
+            // task is aborted at runtime shutdown) before removing the file.
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if !std::path::Path::new(&artifact_path).exists() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("Edge TTS temp file was never removed after runtime shutdown");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        let _ = std::fs::remove_file(&script_path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edge_tts_descendant_holding_stderr_is_bounded_and_cleaned() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // The direct `edge-tts` child exits successfully, but a background
+        // descendant keeps the stderr pipe open, so EOF never arrives. The
+        // reader join must be bounded (not hang synthesis) and the artifact
+        // must still be removed.
+        let temp_dir = std::env::temp_dir();
+        let script_path =
+            temp_dir.join(format!("zeroclaw_edgetts_test_{}.sh", uuid::Uuid::new_v4()));
+        let out_path_file = temp_dir.join(format!(
+            "zeroclaw_edgetts_path_{}.txt",
+            uuid::Uuid::new_v4()
+        ));
+        let pid_file = temp_dir.join(format!("zeroclaw_edgetts_pid_{}.txt", uuid::Uuid::new_v4()));
+        let script = script_path.to_str().unwrap();
+        let sidecar = out_path_file.to_str().unwrap();
+        let pidfile = pid_file.to_str().unwrap();
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\n\
+                 out=\n\
+                 prev=\n\
+                 for a in \"$@\"; do\n\
+                   if [ \"$prev\" = \"--write-media\" ]; then out=\"$a\"; fi\n\
+                   prev=\"$a\"\n\
+                 done\n\
+                 printf '%s' \"$out\" > \"{sidecar}\"\n\
+                 : > \"$out\"\n\
+                 sleep 100 &\n\
+                 echo $! > \"{pidfile}\"\n\
+                 exit 0\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // The direct child exits immediately; the provider timeout bounds only
+        // the post-exit stderr drain that never EOFs. A few seconds leaves room
+        // for the child to start under load while keeping the drain bound.
+        let provider =
+            EdgeTtsProvider::new_with_binary("test", script, std::time::Duration::from_secs(2));
+        let bounded = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            provider.synthesize("hello", "en-US-AriaNeural"),
+        )
+        .await;
+        let _ = bounded
+            .unwrap_or_else(|_| panic!("synthesis must not hang on a stderr pipe that never EOFs"));
+
+        // Clean up the descendant that held the pipe open.
+        if let Some(pid) = std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|pid| pid.trim().parse::<i32>().ok())
+        {
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &pid.to_string()])
+                .status();
+        }
+
+        let artifact =
+            std::fs::read_to_string(&out_path_file).expect("script must record output path");
+        assert!(
+            !std::path::Path::new(&artifact).exists(),
+            "artifact must be removed even when stderr never reaches EOF: {artifact}"
+        );
+
+        let _ = std::fs::remove_file(&script_path);
+        let _ = std::fs::remove_file(&out_path_file);
+        let _ = std::fs::remove_file(&pid_file);
     }
 }
