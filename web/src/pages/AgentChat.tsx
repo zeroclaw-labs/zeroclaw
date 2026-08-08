@@ -145,8 +145,10 @@ export function AgentChatInner({
   });
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const messagesContainerRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const modelDropdownRef = useRef<HTMLDivElement>(null);
+  const [userScrolledUp, setUserScrolledUp] = useState(false);
 
   // Persist draft to in-memory store so it survives route changes
   useEffect(() => {
@@ -161,13 +163,14 @@ export function AgentChatInner({
     onStatus?.({ typing, messageCount: messages.length });
   }, [typing, messages.length, onStatus]);
 
-  // Scroll to bottom on new messages / streaming.
-  // Note: WebSocket lifecycle, hydration, and tool_call/tool_result handling
-  // moved to AgentContext (PR #6101). Tool activity is filtered at render
-  // time below using `showToolActivity`, not at the message-handler layer.
+  // Scroll to bottom on new messages / streaming, but only if the user
+  // hasn't scrolled up to read history. When the user manually scrolls
+  // away from the bottom, auto-scroll is suppressed so they can read
+  // without the viewport being pulled back down. #9562
   useEffect(() => {
+    if (userScrolledUp) return;
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, typing, streamingContent]);
+  }, [messages, typing, streamingContent, userScrolledUp]);
 
   // Close model dropdown when clicking outside
   useEffect(() => {
@@ -505,7 +508,15 @@ export function AgentChatInner({
 
       {/* Messages area. */}
       <div
+        ref={messagesContainerRef}
         className={`flex-1 overflow-y-auto p-4 ${compact ? 'space-y-1.5' : 'space-y-4'}`}
+        onScroll={() => {
+          const el = messagesContainerRef.current;
+          if (!el) return;
+          // Consider "near the bottom" if within 150px of the scroll bottom
+          const isNearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 150;
+          setUserScrolledUp(!isNearBottom);
+        }}
       >
         {messages.length === 0 && (
           <div className="flex flex-col items-center justify-center h-full text-center animate-fade-in text-pc-text-muted">
