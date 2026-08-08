@@ -52,6 +52,14 @@ fn retain_direct_children(fields: &mut Vec<ConfigFieldEntry>, prefix: &str) {
     fields.retain(|field| is_direct_child_path(&field.path, prefix));
 }
 
+fn append_uncontrolled_char(buf: &mut String, key: &KeyEvent) {
+    if let KeyCode::Char(c) = key.code
+        && !key.modifiers.contains(KeyModifiers::CONTROL)
+    {
+        buf.push(c);
+    }
+}
+
 pub(crate) fn init_terminal() -> Result<Term> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -2260,14 +2268,7 @@ impl App {
             Some(ConfigEditorAction::Backspace) => {
                 self.edit_buf.pop();
             }
-            None => {
-                if let KeyCode::Char(c) = key.code
-                    && !key.modifiers.contains(KeyModifiers::CONTROL)
-                {
-                    self.edit_buf.push(c);
-                }
-            }
-            _ => {}
+            _ => append_uncontrolled_char(&mut self.edit_buf, &key),
         }
         Ok(())
     }
@@ -2691,14 +2692,7 @@ impl App {
             Some(ConfigEditorAction::Backspace) => {
                 self.personality_content.pop();
             }
-            None => {
-                if let KeyCode::Char(c) = key.code
-                    && !key.modifiers.contains(KeyModifiers::CONTROL)
-                {
-                    self.personality_content.push(c);
-                }
-            }
-            _ => {}
+            _ => append_uncontrolled_char(&mut self.personality_content, &key),
         }
         Ok(())
     }
@@ -2898,14 +2892,7 @@ impl App {
             Some(ConfigEditorAction::Backspace) => {
                 self.skills_body.pop();
             }
-            None => {
-                if let KeyCode::Char(c) = key.code
-                    && !key.modifiers.contains(KeyModifiers::CONTROL)
-                {
-                    self.skills_body.push(c);
-                }
-            }
-            _ => {}
+            _ => append_uncontrolled_char(&mut self.skills_body, &key),
         }
         Ok(())
     }
@@ -4368,6 +4355,7 @@ impl App {
         self.section == ConfigSection::Zeroclaw
             && self.zeroclaw_pane == ZeroclawPane::Detail
             && self.is_scalar_field_edit()
+            && !self.edit_buf.is_empty()
             && matches!(
                 crate::keymap::ConfigEditorAction::from_chord(key),
                 Some(
@@ -4897,31 +4885,75 @@ mod tests {
             field_idx: 0,
         };
         manager.zeroclaw_pane = ZeroclawPane::Detail;
-        let word_left = KeyEvent::new(KeyCode::Left, KeyModifiers::ALT);
+        let word_chords = [
+            KeyEvent::new(KeyCode::Left, KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Right, KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT),
+        ];
 
-        assert!(manager.claims_pane_navigation(&word_left));
+        assert!(
+            word_chords
+                .iter()
+                .all(|key| !manager.claims_pane_navigation(key))
+        );
+
+        manager.edit_buf = "alpha beta".into();
+        assert!(
+            word_chords
+                .iter()
+                .all(|key| manager.claims_pane_navigation(key))
+        );
 
         manager.section = ConfigSection::Zerocode;
-        assert!(!manager.claims_pane_navigation(&word_left));
+        assert!(!manager.claims_pane_navigation(&word_chords[0]));
 
         manager.section = ConfigSection::Zeroclaw;
         manager.zeroclaw_pane = ZeroclawPane::Sections;
-        assert!(!manager.claims_pane_navigation(&word_left));
+        assert!(!manager.claims_pane_navigation(&word_chords[0]));
 
         manager.zeroclaw_pane = ZeroclawPane::Detail;
         manager.select_items = vec!["first".into(), "second".into()];
-        assert!(!manager.claims_pane_navigation(&word_left));
+        assert!(!manager.claims_pane_navigation(&word_chords[0]));
 
         manager.select_items.clear();
         manager.fields[0].kind = PropKind::StringArray;
-        assert!(!manager.claims_pane_navigation(&word_left));
+        assert!(!manager.claims_pane_navigation(&word_chords[0]));
 
         manager.screen = Screen::FieldList {
             section_idx: 0,
             prefix: "example".into(),
             breadcrumb: vec!["example".into()],
         };
-        assert!(!manager.claims_pane_navigation(&word_left));
+        assert!(!manager.claims_pane_navigation(&word_chords[0]));
+    }
+
+    #[tokio::test]
+    async fn append_only_config_editors_preserve_alt_word_characters() {
+        let alt_b = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT);
+        let alt_f = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT);
+
+        let mut alias = test_manager();
+        alias.handle_alias_create(alt_b).await.unwrap();
+        alias.handle_alias_create(alt_f).await.unwrap();
+        assert_eq!(alias.edit_buf, "bf");
+
+        let mut personality = test_manager();
+        let mut term = test_term();
+        personality
+            .handle_personality_editor(alt_b, &mut term)
+            .await
+            .unwrap();
+        personality
+            .handle_personality_editor(alt_f, &mut term)
+            .await
+            .unwrap();
+        assert_eq!(personality.personality_content, "bf");
+
+        let mut skills = test_manager();
+        skills.handle_skills_editor(alt_b, &mut term).await.unwrap();
+        skills.handle_skills_editor(alt_f, &mut term).await.unwrap();
+        assert_eq!(skills.skills_body, "bf");
     }
 
     #[test]
@@ -4978,6 +5010,17 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcClient::with_rpc(Arc::new(RpcOutbound::new(tx))));
         App::new(rpc, std::path::Path::new("/tmp"))
+    }
+
+    fn test_term() -> Term {
+        let backend = WideCellCleanupBackend::new(io::stdout());
+        Terminal::with_options(
+            backend,
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 80, 24)),
+            },
+        )
+        .expect("test terminal")
     }
 
     fn entry_with_cost(key: &str, cost_category: &str) -> ConfigSectionEntry {
