@@ -96,17 +96,36 @@ impl LlmTrace {
     }
 }
 
+/// Collect the `*.json` fixture paths from an iterator of directory entries,
+/// sorted by path for stable ordering.
+///
+/// Every entry error aborts the collection. A suite that silently shrank
+/// because one entry could not be read would let the regression gate report
+/// success while certifying fewer fixtures than it claims, so a partial
+/// listing is never treated as a valid suite.
+fn collect_fixture_paths(
+    entries: impl Iterator<Item = std::io::Result<PathBuf>>,
+    dir: &Path,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for entry in entries {
+        let path = entry.with_context(|| {
+            format!("reading an entry in eval suite directory {}", dir.display())
+        })?;
+        if path.extension().and_then(|e| e.to_str()) == Some("json") {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
 /// Load every `*.json` trace fixture in `dir`, sorted by path for stable ordering.
 pub fn load_suite(dir: &Path) -> anyhow::Result<Vec<(PathBuf, LlmTrace)>> {
     let read = std::fs::read_dir(dir)
         .with_context(|| format!("reading eval suite directory {}", dir.display()))?;
 
-    let mut paths: Vec<PathBuf> = read
-        .filter_map(Result::ok)
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
-        .collect();
-    paths.sort();
+    let paths = collect_fixture_paths(read.map(|entry| entry.map(|e| e.path())), dir)?;
 
     let mut out = Vec::with_capacity(paths.len());
     for path in paths {
@@ -188,5 +207,45 @@ mod tests {
         assert_eq!(suite[0].1.model_name, "a"); // sorted by path
         assert_eq!(suite[1].1.model_name, "b");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn collect_fixture_paths_propagates_entry_errors() {
+        let dir = Path::new("/eval/suite");
+        let entries = vec![
+            Ok(dir.join("a.json")),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "entry unreadable",
+            )),
+            Ok(dir.join("b.json")),
+        ];
+
+        let err = collect_fixture_paths(entries.into_iter(), dir)
+            .expect_err("an unreadable entry must abort the suite, not shrink it");
+
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("reading an entry in eval suite directory /eval/suite"),
+            "error must name the suite directory, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("entry unreadable"),
+            "error must preserve the underlying io cause, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn collect_fixture_paths_keeps_only_sorted_json_on_the_happy_path() {
+        let dir = Path::new("/eval/suite");
+        let entries = vec![
+            Ok(dir.join("b.json")),
+            Ok(dir.join("note.txt")),
+            Ok(dir.join("a.json")),
+        ];
+
+        let paths = collect_fixture_paths(entries.into_iter(), dir).unwrap();
+
+        assert_eq!(paths, vec![dir.join("a.json"), dir.join("b.json")]);
     }
 }
