@@ -2448,6 +2448,7 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<Js
             "TurnEvent::Usage must be filtered before notification_for_turn_event; \
              ACP has no session/update notification for token usage"
         ),
+        _ => return None,
     })
 }
 

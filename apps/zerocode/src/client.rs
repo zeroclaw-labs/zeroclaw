@@ -254,6 +254,7 @@ pub enum SessionUpdate {
         session_id: String,
         input_tokens: Option<u64>,
         max_context_tokens: Option<u64>,
+        model_context_window: Option<u64>,
     },
     /// Older complete turns were removed from structured session history.
     HistoryTrimmed {
@@ -333,6 +334,7 @@ pub fn parse_session_update(params: &serde_json::Value) -> Option<SessionUpdate>
             session_id: sid,
             input_tokens: params.get("input_tokens").and_then(|v| v.as_u64()),
             max_context_tokens: params.get("max_context_tokens").and_then(|v| v.as_u64()),
+            model_context_window: params.get("model_context_window").and_then(|v| v.as_u64()),
         }),
         "history_trimmed" => Some(SessionUpdate::HistoryTrimmed {
             session_id: sid,

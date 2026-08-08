@@ -134,9 +134,20 @@ pub(crate) async fn interpret_chat_response(
         .map(|u| (u.input_tokens, u.output_tokens))
         .unwrap_or((None, None));
 
+    // Per-iteration provider identity: vision routing or a mid-turn
+    // override may have changed which provider served this call.
+    let effective_provider_name = ctx
+        .serving_provider_name
+        .as_deref()
+        .unwrap_or(ctx.provider_name);
+
+    // Per-iteration served model: vision routing or reliable fallback
+    // may have changed which model served this call.
+    let effective_model = ctx.serving_model.as_deref().unwrap_or(ctx.model);
+
     ctx.observer.record_event(&ObserverEvent::LlmResponse {
-        model_provider: ctx.provider_name.to_string(),
-        model: ctx.model.to_string(),
+        model_provider: effective_provider_name.to_string(),
+        model: effective_model.to_string(),
         duration: llm_started_at.elapsed(),
         success: true,
         error_message: None,
@@ -154,20 +165,30 @@ pub(crate) async fn interpret_chat_response(
     let call_cost_usd = resp
         .usage
         .as_ref()
-        .and_then(|usage| record_tool_loop_cost_usage(ctx.provider_name, ctx.model, usage))
+        .and_then(|usage| {
+            record_tool_loop_cost_usage(effective_provider_name, effective_model, usage)
+        })
         .map(|(_total_tokens, cost_usd)| cost_usd);
+
+    let (input_tokens, cached_input_tokens, output_tokens) = resp
+        .usage
+        .as_ref()
+        .map(|u| (u.input_tokens, u.cached_input_tokens, u.output_tokens))
+        .unwrap_or((None, None, None));
 
     // Per-LLM-call usage event, right after the observer success event
     // (upstream E2 parity, agent.rs Usage emission).
-    if let Some(tx) = ctx.event_tx
-        && let Some(ref usage) = resp.usage
-    {
+    // Emitted unconditionally so terminal identity reflects the serving
+    // provider/model even when the provider returns no usage data.
+    if let Some(tx) = ctx.event_tx {
         let _ = tx
             .send(TurnEvent::Usage {
-                input_tokens: usage.input_tokens,
-                cached_input_tokens: usage.cached_input_tokens,
-                output_tokens: usage.output_tokens,
+                input_tokens,
+                cached_input_tokens,
+                output_tokens,
                 cost_usd: call_cost_usd,
+                provider_ref: effective_provider_name.to_string(),
+                model: effective_model.to_string(),
             })
             .await;
     }
@@ -476,6 +497,8 @@ mod cost_usd_regression_tests {
             channel: None,
             agent_alias: None,
             turn_id: "turn-cost-regression",
+            serving_provider_name: None,
+            serving_model: None,
         };
 
         let specs = IterationToolSpecs {

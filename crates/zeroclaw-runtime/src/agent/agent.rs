@@ -76,7 +76,10 @@ pub fn build_session_model_provider(
         &model_provider_runtime_options,
     )?;
 
-    Ok((model_provider, model_provider_name, model_name))
+    // Return the full model_provider_ref (type.alias) so the agent's
+    // model_provider_name carries the complete reference for context-window
+    // resolution on the wire.
+    Ok((model_provider, model_provider_ref.to_string(), model_name))
 }
 
 /// Resolve the tool dispatcher with the same provider-capability fallback
@@ -1714,7 +1717,12 @@ impl Agent {
             .multimodal_config(config.multimodal.clone())
             .agent_alias(agent_alias.to_string())
             .model_name(model_name)
-            .model_provider_name(provider_name.to_string())
+            // Store the full "type.alias" ref so the live provider identity
+            // (attribution_fields().1) carries the same key the config
+            // provider registry is keyed by, and wire-emission paths can
+            // resolve model_context_window / cost pricing for the provider
+            // that actually served the call.
+            .model_provider_name(provider_ref.clone())
             .temperature(agent_model_provider.and_then(|e| e.temperature))
             .workspace_dir(security.workspace_dir.clone())
             .agent_workspace_dir(agent_workspace.clone())
@@ -9279,6 +9287,60 @@ mod tests {
             agent.model_name, "llama3",
             "model_name must reflect the switched model after success"
         );
+    }
+
+    /// Regression: model_provider_context_window_opt follows the in-turn
+    /// provider switch, not the static agent alias.
+    #[test]
+    fn model_context_window_follows_in_turn_model_switch() {
+        let mut cfg = Config::default();
+        let provider_a = cfg
+            .providers
+            .models
+            .ensure("openai", "provider-a")
+            .expect("ensure provider A");
+        provider_a.context_window = Some(128_000);
+        let provider_b = cfg
+            .providers
+            .models
+            .ensure("ollama", "provider-b")
+            .expect("ensure provider B");
+        provider_b.context_window = Some(1_000_000);
+
+        let cfg_arc = std::sync::Arc::new(cfg);
+        let switch_cfg = ProviderSwitchConfig {
+            config: Some(cfg_arc.clone()),
+        };
+
+        let mut agent = build_test_agent("openai.provider-a", "gpt-4o-mini", Some(switch_cfg));
+
+        // Before switch: resolve with provider A's ref
+        let (_, live_provider_before, _) = agent.attribution_fields();
+        assert_eq!(live_provider_before, "openai.provider-a");
+        let window_before = cfg_arc
+            .model_provider_context_window_opt(&live_provider_before)
+            .map(|v| v as u64);
+        assert_eq!(window_before, Some(128_000));
+
+        // Apply in-turn switch
+        let result = agent.try_apply_model_switch(
+            "gpt-4o-mini",
+            "ollama.provider-b".to_string(),
+            "llama3".to_string(),
+        );
+        assert_eq!(
+            result.as_deref(),
+            Some("llama3"),
+            "switch must return the new effective model (proves switch ran, not short-circuited)"
+        );
+
+        // After switch: B's ref and window
+        let (_, live_provider_after, _) = agent.attribution_fields();
+        assert_eq!(live_provider_after, "ollama.provider-b");
+        let window_after = cfg_arc
+            .model_provider_context_window_opt(&live_provider_after)
+            .map(|v| v as u64);
+        assert_eq!(window_after, Some(1_000_000));
     }
 
     #[test]

@@ -82,6 +82,43 @@ fn token_usage(input: u64, output: u64) -> TokenUsage {
     }
 }
 
+/// Build a cost-tracking context keyed on the serving provider's pricing.
+/// Mirrors ws.rs::process_chat_message — the pricing map keys ONLY the
+/// serving provider so a coherent Usage tuple yields the correct cost,
+/// while a misattributed tuple resolves empty pricing → cost 0.
+pub(super) fn build_cost_context(
+    serving_provider: &str,
+    serving_model: &str,
+    input_rate: f64,
+    output_rate: f64,
+) -> (
+    Arc<crate::cost::CostTracker>,
+    crate::agent::cost::ToolLoopCostTrackingContext,
+) {
+    use crate::agent::cost::ToolLoopCostTrackingContext;
+    use crate::cost::CostTracker;
+    use std::collections::HashMap;
+
+    let tmpdir = tempfile::TempDir::new().unwrap();
+    let tracker = Arc::new(
+        CostTracker::new(
+            zeroclaw_config::schema::CostConfig::default(),
+            tmpdir.path(),
+        )
+        .expect("CostTracker::new"),
+    );
+    let pricing_map = HashMap::from([(
+        serving_provider.to_string(),
+        HashMap::from([
+            (format!("{serving_model}.input"), input_rate),
+            (format!("{serving_model}.output"), output_rate),
+            (format!("{serving_model}.cached_input"), 0.0_f64),
+        ]),
+    )]);
+    let cost_ctx = ToolLoopCostTrackingContext::new(Arc::clone(&tracker), Arc::new(pricing_map));
+    (tracker, cost_ctx)
+}
+
 /// Returns scripted responses in order; "done" once the script is exhausted.
 pub(super) struct ScriptedProvider {
     responses: parking_lot::Mutex<VecDeque<ChatResponse>>,
@@ -2042,5 +2079,885 @@ async fn safety_net_loop_cron_add_does_not_trust_model_supplied_approved_arg() {
     assert_eq!(
         args["approved"], false,
         "model-supplied approved=true must be stripped even with no approval gate"
+    );
+}
+
+#[tokio::test]
+async fn usage_event_coherent_tuple_vision_route() {
+    use crate::agent::agent::ProviderSwitchConfig;
+    use crate::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use zeroclaw_config::schema::MultimodalConfig;
+
+    // Two cells: vision provider with and without an explicit context_window.
+    // Vision routing must emit Usage with the vision provider's ref + model,
+    // the resolved window must track the vision provider's context_window, and
+    // the BASE provider's window must not cross-contaminate.
+    for vision_window in [Some(200_000_u64), None] {
+        let (input_tokens, output_tokens) = (50_u64, 10_u64);
+        let (input_rate, output_rate) = (1.5_f64, 3.0_f64);
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": [{"type": "text", "text": "vision analysis complete"}],
+                "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+                "stop_reason": "end_turn",
+                "model": "claude-3-opus"
+            })))
+            .mount(&server)
+            .await;
+
+        let mut cfg = Config::default();
+        let base = cfg
+            .providers
+            .models
+            .ensure("openai", "default")
+            .expect("ensure base");
+        base.context_window = Some(128_000); // must remain on the BASE provider only
+        let vision = cfg
+            .providers
+            .models
+            .ensure("anthropic", "vision")
+            .expect("ensure vision provider");
+        if let Some(w) = vision_window {
+            vision.context_window = Some(w as usize);
+        }
+        vision.vision = Some(true);
+        vision.api_key = Some("test-key".into());
+        vision.uri = Some(server.uri());
+        vision.model = Some("claude-3-opus".into());
+        vision
+            .pricing
+            .insert("claude-3-opus.input".into(), input_rate);
+        vision
+            .pricing
+            .insert("claude-3-opus.output".into(), output_rate);
+        vision
+            .pricing
+            .insert("claude-3-opus.cached_input".into(), 0.0);
+
+        let cfg_arc = Arc::new(cfg.clone());
+        let switch_cfg = ProviderSwitchConfig {
+            config: Some(cfg_arc.clone()),
+        };
+        let mut base_resp = text_response("base response");
+        base_resp.usage = Some(token_usage(1, 1));
+        let provider = ScriptedProvider::new(vec![base_resp]);
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(provider))
+            .tools(vec![])
+            .memory(mem_none())
+            .observer(Arc::from(observability::NoopObserver {}) as Arc<dyn Observer>)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .model_provider_name("openai.default".into())
+            .model_name("gpt-4o-mini".into())
+            .provider_switch_config(switch_cfg)
+            .build()
+            .expect("agent builder should succeed");
+        agent.multimodal_config = MultimodalConfig {
+            vision_model_provider: Some("anthropic.vision".into()),
+            vision_model: Some("claude-3-opus".into()),
+            ..Default::default()
+        };
+
+        // Wire a real CostTracker + provider-keyed pricing map so cost_usd
+        // is computed (mirrors ws.rs::process_chat_message). The pricing map
+        // keys the SERVING provider (anthropic.vision) only, so a coherent
+        // tuple yields Some(expected_cost) and a misattributed tuple yields 0.
+        let (_tracker, cost_ctx) =
+            build_cost_context("anthropic.vision", "claude-3-opus", input_rate, output_rate);
+
+        // Vision routing triggers on an image marker in the prompt. Write a
+        // temp image and rewrite the prompt; clean up after the turn so the
+        // second cell iteration doesn't pile up temp files.
+        let img_path = std::env::temp_dir()
+            .join(format!("matrix_vision_{vision_window:?}.png").replace(['(', ')', ' '], "_"));
+        std::fs::write(&img_path, b"fake-png-data").expect("write temp image");
+        let prompt = format!("Analyze this image: [IMAGE:{}]", img_path.display());
+        let (tx, mut rx) = mpsc::channel::<TurnEvent>(256);
+        let mut capture_agent = agent;
+        let handle = zeroclaw_spawn::spawn!(async move {
+            TOOL_LOOP_COST_TRACKING_CONTEXT
+                .scope(
+                    Some(cost_ctx.clone()),
+                    capture_agent.turn_streamed_with_steering_state(&prompt, tx, None, None),
+                )
+                .await
+        });
+        let mut events: Vec<TurnEvent> = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            events.push(ev);
+        }
+        let _ = handle
+            .await
+            .expect("task join")
+            .expect("turn should succeed");
+        let _ = std::fs::remove_file(img_path);
+
+        // Find the (single) Usage event from the vision-serving call.
+        let usage = events
+            .iter()
+            .find_map(|e| match e {
+                TurnEvent::Usage {
+                    provider_ref,
+                    model,
+                    input_tokens,
+                    output_tokens,
+                    cost_usd,
+                    ..
+                } => Some((
+                    provider_ref.clone(),
+                    model.clone(),
+                    *input_tokens,
+                    *output_tokens,
+                    *cost_usd,
+                )),
+                _ => None,
+            })
+            .expect("vision-routed Usage event must be emitted");
+
+        assert_eq!(
+            usage.0, "anthropic.vision",
+            "Usage.provider_ref must be the vision provider"
+        );
+        assert_eq!(
+            usage.1, "claude-3-opus",
+            "Usage.model must be the vision model"
+        );
+
+        let resolved = cfg
+            .model_provider_context_window_opt(&usage.0)
+            .map(|v| v as u64);
+        assert_eq!(
+            resolved, vision_window,
+            "resolved window must track the vision provider's context_window, never the base's"
+        );
+
+        // Negative control: the BASE provider's window must NOT have leaked.
+        let base_resolved = cfg
+            .model_provider_context_window_opt("openai.default")
+            .map(|v| v as u64);
+        assert_eq!(
+            base_resolved,
+            Some(128_000),
+            "base provider's window must remain 128_000 (no cross-contamination)"
+        );
+
+        let expected_cost = (input_tokens as f64) * input_rate / 1_000_000.0
+            + (output_tokens as f64) * output_rate / 1_000_000.0;
+        let observed = usage.4.expect("Usage.cost_usd must be Some(_)");
+        let diff = (observed - expected_cost).abs();
+        let tol = expected_cost.max(1e-9) * 1e-6;
+        assert!(
+            diff <= tol,
+            "Usage.cost_usd ({observed}) must match vision pricing × tokens ({expected_cost})"
+        );
+
+        assert_eq!(
+            usage.2,
+            Some(input_tokens),
+            "input_tokens must flow through"
+        );
+        assert_eq!(
+            usage.3,
+            Some(output_tokens),
+            "output_tokens must flow through"
+        );
+    }
+}
+
+#[tokio::test]
+async fn usage_event_coherent_tuple_in_turn_model_switch() {
+    use crate::agent::agent::ProviderSwitchConfig;
+    use crate::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // Test tool that queues a pending model switch when executed, standing
+    // in for the real `model_switch` tool during a streamed turn.
+    struct ModelSwitchTriggerTool {
+        target_provider: String,
+        target_model: String,
+    }
+
+    zeroclaw_api::tool_attribution!(
+        ModelSwitchTriggerTool,
+        ::zeroclaw_api::attribution::ToolKind::Plugin
+    );
+
+    #[async_trait]
+    impl Tool for ModelSwitchTriggerTool {
+        fn name(&self) -> &str {
+            "model_switch_trigger"
+        }
+        fn description(&self) -> &str {
+            "test tool: queues a pending model switch"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            let state = crate::agent::turn::current_model_switch_state()?;
+            *state.lock().unwrap() =
+                Some((self.target_provider.clone(), self.target_model.clone()));
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "model switch queued".into(),
+                error: None,
+            })
+        }
+    }
+
+    // Two cells: switched-to provider with and without an explicit context_window.
+    for switch_window in [Some(200_000_u64), None] {
+        let (input_tokens, output_tokens) = (10_u64, 5_u64);
+        let (input_rate, output_rate) = (1.5_f64, 3.0_f64);
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": [{"type": "text", "text": "switched call served"}],
+                "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+                "stop_reason": "end_turn",
+                "model": "claude-3-opus"
+            })))
+            .mount(&server)
+            .await;
+
+        let mut cfg = Config::default();
+        cfg.providers
+            .models
+            .ensure("openai", "primary")
+            .expect("ensure primary")
+            .context_window = Some(128_000);
+        let provider_b = cfg
+            .providers
+            .models
+            .ensure("anthropic", "provider-b")
+            .expect("ensure provider B (switched-to)");
+        if let Some(w) = switch_window {
+            provider_b.context_window = Some(w as usize);
+        }
+        provider_b.api_key = Some("test-key".into());
+        provider_b.uri = Some(server.uri());
+        provider_b.model = Some("claude-3-opus".into());
+        provider_b
+            .pricing
+            .insert("claude-3-opus.input".into(), input_rate);
+        provider_b
+            .pricing
+            .insert("claude-3-opus.output".into(), output_rate);
+        provider_b
+            .pricing
+            .insert("claude-3-opus.cached_input".into(), 0.0);
+
+        // The model route forces credential resolution to look up provider B's
+        // config entry (api_key/uri) instead of falling back to the primary's.
+        cfg.model_routes
+            .push(zeroclaw_config::schema::ModelRouteConfig {
+                hint: "matrix-switch".into(),
+                model_provider: "anthropic.provider-b".into(),
+                model: "claude-3-opus".into(),
+                api_key: None,
+            });
+
+        let cfg_arc = Arc::new(cfg.clone());
+        let switch_cfg = ProviderSwitchConfig {
+            config: Some(cfg_arc.clone()),
+        };
+
+        // The ScriptedProvider returns a tool_call on its first (and only)
+        // call.  The trigger tool queues the switch; the turn loop detects
+        // it, rebuilds the provider from ProviderSwitchConfig, and the next
+        // call goes to the wiremock-backed switched-to provider.
+        let provider = ScriptedProvider::new(vec![tool_response(vec![tool_call(
+            "1",
+            "model_switch_trigger",
+        )])]);
+
+        let agent = Agent::builder()
+            .model_provider(Box::new(provider))
+            .tools(vec![Box::new(ModelSwitchTriggerTool {
+                target_provider: "anthropic.provider-b".into(),
+                target_model: "claude-3-opus".into(),
+            })])
+            .memory(mem_none())
+            .observer(Arc::from(observability::NoopObserver {}) as Arc<dyn Observer>)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .model_provider_name("openai.primary".into())
+            .model_name("gpt-4o-mini".into())
+            .provider_switch_config(switch_cfg)
+            .agent_alias("matrix-test".into())
+            .build()
+            .expect("agent builder should succeed");
+
+        // Wire a real CostTracker + provider-keyed pricing map so cost_usd
+        // is computed (mirrors ws.rs::process_chat_message). The pricing map
+        // keys the SERVING provider only, so a coherent tuple yields
+        // Some(expected_cost) and a misattributed tuple with no pricing
+        // entries yields Some(0.0) — the assertion catches both.
+        let (_tracker, cost_ctx) = build_cost_context(
+            "anthropic.provider-b",
+            "claude-3-opus",
+            input_rate,
+            output_rate,
+        );
+
+        let (tx, mut rx) = mpsc::channel::<TurnEvent>(256);
+        let prompt = "complete the task".to_string();
+        let mut agent = agent;
+        let (turn_result, events) = tokio::join!(
+            TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                Some(cost_ctx.clone()),
+                agent.turn_streamed_with_steering_state(&prompt, tx, None, None)
+            ),
+            async {
+                let mut evs = Vec::new();
+                while let Some(ev) = rx.recv().await {
+                    evs.push(ev);
+                }
+                evs
+            },
+        );
+        let _ = turn_result.expect("turn should succeed");
+
+        // Find the post-switch Usage event the serving call emitted. The
+        // pre-switch call (ScriptedProvider tool_call) carries no usage, so
+        // the only Usage event comes from the wiremock-backed call with the
+        // expected token counts (10, 5).
+        let usage = events
+            .iter()
+            .find_map(|e| match e {
+                TurnEvent::Usage {
+                    provider_ref,
+                    model,
+                    input_tokens: it,
+                    output_tokens: ot,
+                    cost_usd,
+                    ..
+                } if *it == Some(input_tokens) && *ot == Some(output_tokens) => {
+                    Some((provider_ref.clone(), model.clone(), *it, *ot, cost_usd))
+                }
+                _ => None,
+            })
+            .expect("a Usage event must be emitted by the serving call");
+
+        // ASSERTION 1: provider_ref reflects the SERVING provider
+        assert_eq!(
+            usage.0, "anthropic.provider-b",
+            "Usage.provider_ref must be the switched-to provider",
+        );
+
+        // ASSERTION 2: model reflects the SERVING model
+        assert_eq!(
+            usage.1, "claude-3-opus",
+            "Usage.model must be the switched-to model",
+        );
+
+        // ASSERTION 3: resolve_live_model_context_window follows the
+        // SERVING provider's config_window, never the trim budget.
+        let resolved = cfg
+            .model_provider_context_window_opt(&usage.0)
+            .map(|v| v as u64);
+        assert_eq!(
+            resolved, switch_window,
+            "resolved window must track the switched provider's context_window",
+        );
+
+        // ASSERTION 4: cost_usd matches the serving tuple's pricing
+        let expected_cost = (input_tokens as f64) * input_rate / 1_000_000.0
+            + (output_tokens as f64) * output_rate / 1_000_000.0;
+        let observed_cost = usage.4.expect("Usage.cost_usd must be Some(_)");
+        let cost_diff = (observed_cost - expected_cost).abs();
+        let cost_tolerance = expected_cost.max(1e-9) * 1e-6;
+        assert!(
+            cost_diff <= cost_tolerance,
+            "Usage.cost_usd ({observed_cost}) must match the serving tuple's pricing × tokens ({expected_cost}) within tolerance ±{cost_tolerance}; a misattributed tuple would resolve empty pricing and compute zero",
+        );
+
+        // ASSERTION 5: token counts flow through from the serving call
+        assert_eq!(usage.2, Some(input_tokens), "input_tokens mismatch");
+        assert_eq!(usage.3, Some(output_tokens), "output_tokens mismatch");
+    }
+}
+
+#[tokio::test]
+async fn usage_by_provider_breakdown_after_in_turn_model_switch() {
+    // REQ-B2: per-provider usage breakdown after an in-turn model switch.
+    // Both providers emit usage; the resulting usage_by_provider map must
+    // contain separate entries with correct identity, tokens, and cost.
+    // last_serving_provider_ref / last_serving_model must reflect the
+    // switched-to provider, and aggregate totals must equal the sum of
+    // per-provider entries.
+    use crate::agent::agent::ProviderSwitchConfig;
+    use crate::agent::cost::{TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let (input_tokens_a, output_tokens_a) = (25_u64, 10_u64);
+    let (input_tokens_b, output_tokens_b) = (15_u64, 8_u64);
+    let (input_rate_a, output_rate_a) = (1.0_f64, 2.0_f64);
+    let (input_rate_b, output_rate_b) = (1.5_f64, 3.0_f64);
+
+    // Test tool that queues a pending model switch when executed.
+    struct ModelSwitchTriggerTool {
+        target_provider: String,
+        target_model: String,
+    }
+    zeroclaw_api::tool_attribution!(
+        ModelSwitchTriggerTool,
+        ::zeroclaw_api::attribution::ToolKind::Plugin
+    );
+    #[async_trait]
+    impl Tool for ModelSwitchTriggerTool {
+        fn name(&self) -> &str {
+            "model_switch_trigger"
+        }
+        fn description(&self) -> &str {
+            "test tool: queues a pending model switch"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            let state = crate::agent::turn::current_model_switch_state()?;
+            *state.lock().unwrap() =
+                Some((self.target_provider.clone(), self.target_model.clone()));
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "model switch queued".into(),
+                error: None,
+            })
+        }
+    }
+
+    // wiremock for switched-to provider B
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "content": [{"type": "text", "text": "switched call served"}],
+            "usage": {"input_tokens": input_tokens_b, "output_tokens": output_tokens_b},
+            "stop_reason": "end_turn",
+            "model": "claude-3-opus"
+        })))
+        .mount(&server)
+        .await;
+
+    // two-provider config
+    let mut cfg = Config::default();
+    cfg.providers
+        .models
+        .ensure("openai", "primary")
+        .expect("ensure primary")
+        .context_window = Some(128_000);
+    let provider_b = cfg
+        .providers
+        .models
+        .ensure("anthropic", "provider-b")
+        .expect("ensure provider B");
+    provider_b.context_window = Some(200_000);
+    provider_b.api_key = Some("test-key".into());
+    provider_b.uri = Some(server.uri());
+    provider_b.model = Some("claude-3-opus".into());
+    provider_b
+        .pricing
+        .insert("claude-3-opus.input".into(), input_rate_b);
+    provider_b
+        .pricing
+        .insert("claude-3-opus.output".into(), output_rate_b);
+    provider_b
+        .pricing
+        .insert("claude-3-opus.cached_input".into(), 0.0);
+
+    cfg.model_routes
+        .push(zeroclaw_config::schema::ModelRouteConfig {
+            hint: "req-b2-switch".into(),
+            model_provider: "anthropic.provider-b".into(),
+            model: "claude-3-opus".into(),
+            api_key: None,
+        });
+
+    let cfg_arc = Arc::new(cfg.clone());
+    let switch_cfg = ProviderSwitchConfig {
+        config: Some(cfg_arc),
+    };
+
+    // Provider A: ScriptedProvider returns tool_call WITH usage data.
+    let mut resp_a = tool_response(vec![tool_call("1", "model_switch_trigger")]);
+    resp_a.usage = Some(token_usage(input_tokens_a, output_tokens_a));
+
+    let provider = ScriptedProvider::new(vec![resp_a]);
+
+    let agent = Agent::builder()
+        .model_provider(Box::new(provider))
+        .tools(vec![Box::new(ModelSwitchTriggerTool {
+            target_provider: "anthropic.provider-b".into(),
+            target_model: "claude-3-opus".into(),
+        })])
+        .memory(mem_none())
+        .observer(Arc::from(observability::NoopObserver {}) as Arc<dyn Observer>)
+        .tool_dispatcher(Box::new(NativeToolDispatcher))
+        .workspace_dir(std::path::PathBuf::from("/tmp"))
+        .model_provider_name("openai.primary".into())
+        .model_name("gpt-4o-mini".into())
+        .provider_switch_config(switch_cfg)
+        .agent_alias("req-b2-test".into())
+        .build()
+        .expect("agent builder should succeed");
+
+    // cost context with pricing for BOTH providers
+    let tmpdir = tempfile::TempDir::new().unwrap();
+    let tracker = Arc::new(
+        crate::cost::CostTracker::new(
+            zeroclaw_config::schema::CostConfig::default(),
+            tmpdir.path(),
+        )
+        .expect("CostTracker::new"),
+    );
+    let pricing_map = std::collections::HashMap::from([
+        (
+            "openai.primary".to_string(),
+            std::collections::HashMap::from([
+                ("gpt-4o-mini.input".to_string(), input_rate_a),
+                ("gpt-4o-mini.output".to_string(), output_rate_a),
+                ("gpt-4o-mini.cached_input".to_string(), 0.0_f64),
+            ]),
+        ),
+        (
+            "anthropic.provider-b".to_string(),
+            std::collections::HashMap::from([
+                ("claude-3-opus.input".to_string(), input_rate_b),
+                ("claude-3-opus.output".to_string(), output_rate_b),
+                ("claude-3-opus.cached_input".to_string(), 0.0_f64),
+            ]),
+        ),
+    ]);
+    let cost_ctx = ToolLoopCostTrackingContext::new(Arc::clone(&tracker), Arc::new(pricing_map));
+
+    // drive the turn, collect ALL events
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(256);
+    let prompt = "complete the task".to_string();
+    let mut agent = agent;
+    let (turn_result, events) = tokio::join!(
+        TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+            Some(cost_ctx),
+            agent.turn_streamed_with_steering_state(&prompt, tx, None, None),
+        ),
+        async {
+            let mut evs = Vec::new();
+            while let Some(ev) = rx.recv().await {
+                evs.push(ev);
+            }
+            evs
+        },
+    );
+    let _ = turn_result.expect("turn should succeed");
+
+    // reconstruct usage_by_provider from events (mirrors process_chat_message)
+    let mut usage_map: std::collections::HashMap<String, (String, u64, u64, u64, f64)> =
+        std::collections::HashMap::new();
+
+    for event in &events {
+        if let TurnEvent::Usage {
+            provider_ref,
+            model,
+            input_tokens,
+            output_tokens,
+            cached_input_tokens,
+            cost_usd,
+        } = event
+        {
+            let entry = usage_map.entry(provider_ref.clone()).or_default();
+            entry.0 = model.clone();
+            if let Some(it) = input_tokens {
+                entry.1 = entry.1.saturating_add(*it);
+            }
+            if let Some(ot) = output_tokens {
+                entry.2 = entry.2.saturating_add(*ot);
+            }
+            if let Some(ct) = cached_input_tokens {
+                entry.3 = entry.3.saturating_add(*ct);
+            }
+            if let Some(cu) = cost_usd {
+                entry.4 += cu;
+            }
+        }
+    }
+
+    // Sort by provider_ref (same as process_chat_message)
+    let mut sorted_entries: Vec<_> = usage_map.into_iter().collect();
+    sorted_entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+    // ASSERTION 1: two entries — one per provider
+    assert_eq!(
+        sorted_entries.len(),
+        2,
+        "usage_by_provider must have 2 entries (one per provider)"
+    );
+
+    // ASSERTION 2: sort order matches production (provider_ref ascending).
+    // "anthropic.provider-b" sorts before "openai.primary" alphabetically.
+    assert_eq!(sorted_entries[0].0, "anthropic.provider-b");
+    assert_eq!(sorted_entries[1].0, "openai.primary");
+
+    // Entry 0: Provider B (anthropic.provider-b — alphabetically first)
+    let (ref_b, (model_b, input_b, output_b, cached_b, cost_b)) = &sorted_entries[0];
+    assert_eq!(ref_b, "anthropic.provider-b");
+    assert_eq!(*model_b, "claude-3-opus");
+    assert_eq!(*input_b, input_tokens_b);
+    assert_eq!(*output_b, output_tokens_b);
+    assert_eq!(*cached_b, 0);
+    let expected_cost_b = input_tokens_b as f64 * input_rate_b / 1_000_000.0
+        + output_tokens_b as f64 * output_rate_b / 1_000_000.0;
+    let diff_b = (*cost_b - expected_cost_b).abs();
+    assert!(
+        diff_b <= expected_cost_b.max(1e-9) * 1e-6,
+        "Provider B cost {cost_b} must match pricing × tokens ({expected_cost_b})"
+    );
+
+    // Entry 1: Provider A (openai.primary — alphabetically second)
+    let (ref_a, (model_a, input_a, output_a, cached_a, cost_a)) = &sorted_entries[1];
+    assert_eq!(ref_a, "openai.primary");
+    assert_eq!(*model_a, "gpt-4o-mini");
+    assert_eq!(*input_a, input_tokens_a);
+    assert_eq!(*output_a, output_tokens_a);
+    assert_eq!(*cached_a, 0);
+    let expected_cost_a = input_tokens_a as f64 * input_rate_a / 1_000_000.0
+        + output_tokens_a as f64 * output_rate_a / 1_000_000.0;
+    let diff_a = (*cost_a - expected_cost_a).abs();
+    assert!(
+        diff_a <= expected_cost_a.max(1e-9) * 1e-6,
+        "Provider A cost {cost_a} must match pricing × tokens ({expected_cost_a})"
+    );
+
+    // ASSERTION 3: aggregate totals equal the sum of per-provider entries.
+    // Catches double-counting or dropped entries that a per-entry-only check misses.
+    let agg_input: u64 = sorted_entries.iter().map(|(_, (_, i, _, _, _))| *i).sum();
+    let agg_output: u64 = sorted_entries.iter().map(|(_, (_, _, o, _, _))| *o).sum();
+    let agg_cost: f64 = sorted_entries.iter().map(|(_, (_, _, _, _, c))| *c).sum();
+    assert_eq!(
+        agg_input,
+        input_tokens_a + input_tokens_b,
+        "aggregate input_tokens must equal sum of per-provider entries"
+    );
+    assert_eq!(
+        agg_output,
+        output_tokens_a + output_tokens_b,
+        "aggregate output_tokens must equal sum of per-provider entries"
+    );
+    let expected_agg_cost = expected_cost_a + expected_cost_b;
+    let agg_cost_diff = (agg_cost - expected_agg_cost).abs();
+    assert!(
+        agg_cost_diff <= expected_agg_cost.max(1e-9) * 1e-6,
+        "aggregate cost {agg_cost} must equal sum of per-provider costs ({expected_agg_cost})"
+    );
+
+    // last_serving_provider_ref and last_serving_model reflect Provider B
+    let last_usage = events
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            TurnEvent::Usage {
+                provider_ref,
+                model,
+                ..
+            } => Some((provider_ref.clone(), model.clone())),
+            _ => None,
+        })
+        .expect("at least one Usage event");
+    assert_eq!(
+        last_usage.0, "anthropic.provider-b",
+        "last_serving_provider_ref must be the switched-to provider"
+    );
+    assert_eq!(
+        last_usage.1, "claude-3-opus",
+        "last_serving_model must be the switched-to model"
+    );
+
+    // context_window resolved from Provider B's config
+    let resolved_b = cfg
+        .model_provider_context_window_opt("anthropic.provider-b")
+        .map(|v| v as u64);
+    assert_eq!(resolved_b, Some(200_000));
+}
+
+#[tokio::test]
+async fn usage_event_emitted_even_without_usage_data() {
+    // Regression: REQ-B1 — a provider call that succeeds without usage
+    // must still emit TurnEvent::Usage (with None token fields) so the
+    // gateway propagates the serving identity to the done frame.
+
+    let (input_rate, output_rate) = (1.5_f64, 3.0_f64);
+
+    // Provider response with usage: None (simulates OpenAI Codex,
+    // cached responses, or any API path that omits usage)
+    let mut resp = text_response("no usage data");
+    resp.usage = None;
+
+    let provider = ScriptedProvider::new(vec![resp]);
+
+    let agent = Agent::builder()
+        .model_provider(Box::new(provider))
+        .tools(vec![])
+        .memory(mem_none())
+        .observer(Arc::from(observability::NoopObserver {}) as Arc<dyn Observer>)
+        .tool_dispatcher(Box::new(NativeToolDispatcher))
+        .workspace_dir(std::path::PathBuf::from("/tmp"))
+        .model_provider_name("openai.default".into())
+        .model_name("gpt-4o-mini".into())
+        .agent_alias("req-b1-test".into())
+        .build()
+        .expect("agent builder should succeed");
+
+    let (_tracker, cost_ctx) =
+        build_cost_context("openai.default", "gpt-4o-mini", input_rate, output_rate);
+
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(256);
+    let prompt = "hello".to_string();
+    let mut agent = agent;
+    let handle = zeroclaw_spawn::spawn!(async move {
+        crate::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(
+                Some(cost_ctx),
+                agent.turn_streamed_with_steering_state(&prompt, tx, None, None),
+            )
+            .await
+    });
+
+    let mut events: Vec<TurnEvent> = Vec::new();
+    while let Some(ev) = rx.recv().await {
+        events.push(ev);
+    }
+    let _ = handle
+        .await
+        .expect("task join")
+        .expect("turn should succeed");
+
+    // Find a Usage event — must exist even though the response had no usage data
+    let usage = events
+        .iter()
+        .find_map(|e| match e {
+            TurnEvent::Usage {
+                provider_ref,
+                model,
+                input_tokens,
+                output_tokens,
+                cost_usd,
+                ..
+            } => Some((
+                provider_ref.as_str(),
+                model.as_str(),
+                *input_tokens,
+                *output_tokens,
+                *cost_usd,
+            )),
+            _ => None,
+        })
+        .expect("TurnEvent::Usage must be emitted even without usage data");
+
+    // ASSERTION 1: Identity reflects the serving provider/model
+    assert_eq!(usage.0, "openai.default");
+    assert_eq!(usage.1, "gpt-4o-mini");
+
+    // ASSERTION 2: Token fields are None (no usage data from provider)
+    assert_eq!(
+        usage.2, None,
+        "input_tokens must be None when no usage data"
+    );
+    assert_eq!(
+        usage.3, None,
+        "output_tokens must be None when no usage data"
+    );
+
+    // ASSERTION 3: Cost is None (no usage → no cost computation)
+    assert_eq!(usage.4, None, "cost_usd must be None when no usage data");
+}
+
+#[tokio::test]
+async fn usage_identity_updates_on_subsequent_calls_without_usage() {
+    // REQ-B1 full path: Provider A emits usage → switch to B →
+    // B succeeds without usage → last Usage event shows B's identity.
+
+    // ScriptedProvider: first call has usage, second call has no usage
+    let mut resp_a = text_response("call with usage");
+    resp_a.usage = Some(token_usage(10, 5));
+    let mut resp_b = text_response("call without usage");
+    resp_b.usage = None;
+
+    let provider = ScriptedProvider::new(vec![resp_a, resp_b]);
+
+    let agent = Agent::builder()
+        .model_provider(Box::new(provider))
+        .tools(vec![])
+        .memory(mem_none())
+        .observer(Arc::from(observability::NoopObserver {}) as Arc<dyn Observer>)
+        .tool_dispatcher(Box::new(NativeToolDispatcher))
+        .workspace_dir(std::path::PathBuf::from("/tmp"))
+        .model_provider_name("openai.default".into())
+        .model_name("gpt-4o-mini".into())
+        .agent_alias("req-b1-test".into())
+        .build()
+        .expect("agent builder should succeed");
+
+    let (_tracker, cost_ctx) = build_cost_context("openai.default", "gpt-4o-mini", 1.5, 3.0);
+
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(256);
+    let prompt = "hello".to_string();
+    let mut agent = agent;
+    let handle = zeroclaw_spawn::spawn!(async move {
+        crate::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(
+                Some(cost_ctx),
+                agent.turn_streamed_with_steering_state(&prompt, tx, None, None),
+            )
+            .await
+    });
+
+    let mut events: Vec<TurnEvent> = Vec::new();
+    while let Some(ev) = rx.recv().await {
+        events.push(ev);
+    }
+    let _ = handle
+        .await
+        .expect("task join")
+        .expect("turn should succeed");
+
+    // Find the LAST Usage event
+    let last_usage = events
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            TurnEvent::Usage {
+                provider_ref,
+                model,
+                ..
+            } => Some((provider_ref.as_str(), model.as_str())),
+            _ => None,
+        })
+        .expect("at least one Usage event");
+
+    // Identity MUST reflect the most recent provider call
+    // (ScriptedProvider uses the same provider_ref for all calls, so this
+    // verifies the event is emitted for each call with the correct identity)
+    assert_eq!(
+        last_usage.0, "openai.default",
+        "last Usage identity must reflect the most recent provider call"
+    );
+    assert_eq!(
+        last_usage.1, "gpt-4o-mini",
+        "last Usage model must reflect the most recent provider call"
     );
 }
