@@ -4634,6 +4634,40 @@ fn record_passive_context(ctx: &ChannelRuntimeContext, msg: &ChannelMessage, his
     );
 }
 
+/// Decide whether the channel media pipeline may preserve image bytes as an
+/// `IMAGE:data:...` marker. Model-aware: the agent's configured model decides,
+/// not the family-level flag — a cataloged image-input model (e.g. Pixtral
+/// under a pure-compatible Mistral family whose provider default has no
+/// vision) must keep the marker even when the family says no vision. A
+/// configured vision provider also enables image preservation regardless of
+/// the primary model.
+fn media_pipeline_vision_available(
+    provider: &dyn ModelProvider,
+    model: &str,
+    has_vision_provider: bool,
+) -> bool {
+    provider.capabilities_for_model(model).vision || has_vision_provider
+}
+
+/// Build the transcription manager for the media pipeline, or `None` when no
+/// transcription provider is available. Shared by the route-independent
+/// preprocessing phase (runs before route selection) and the image phase
+/// (runs after) so both use the same configured providers.
+fn media_pipeline_transcription_manager(
+    ctx: &ChannelRuntimeContext,
+) -> Option<crate::transcription::TranscriptionManager> {
+    let base = crate::transcription::TranscriptionManager::new(&ctx.transcription_config)
+        .unwrap_or_else(|_| crate::transcription::TranscriptionManager::empty());
+    let m = base
+        .with_typed_providers(&ctx.prompt_config.providers.transcription)
+        .with_agent_transcription_provider(ctx.agent_transcription_provider.clone());
+    if m.available_providers().is_empty() {
+        None
+    } else {
+        Some(m)
+    }
+}
+
 async fn process_channel_message_body(
     ctx: Arc<ChannelRuntimeContext>,
     msg: zeroclaw_api::channel::ChannelMessage,
@@ -4790,31 +4824,23 @@ async fn process_channel_message_body(
         msg.content = thinking.effective_content.clone();
     }
 
-    // ── Media pipeline: enrich inbound message with media annotations ──
+    // ── Media pipeline phase 1 (route-independent): transcribe audio and
+    // summarize video BEFORE link enrichment and route classification. A
+    // routing keyword or URL that appears only in an audio transcript must
+    // participate in route selection and link enrichment — moving the whole
+    // pipeline after the route resolved would drop that participation. Image
+    // markers are deferred to phase 2 (below), after the effective route and
+    // provider are known, because the `IMAGE:data:...` preservation decision
+    // is model-aware.
     if ctx.media_pipeline.enabled && !msg.attachments.is_empty() {
-        let vision =
-            ctx.model_provider.supports_vision() || ctx.multimodal.vision_model_provider.is_some();
-        // Build from legacy config; if that fails (e.g. no legacy api_key
-        // but typed providers are configured), fall back to an empty shell
-        // so with_typed_providers() can still populate the registry.
-        let transcription_manager = {
-            let base = crate::transcription::TranscriptionManager::new(&ctx.transcription_config)
-                .unwrap_or_else(|_| crate::transcription::TranscriptionManager::empty());
-            let m = base
-                .with_typed_providers(&ctx.prompt_config.providers.transcription)
-                .with_agent_transcription_provider(ctx.agent_transcription_provider.clone());
-            if m.available_providers().is_empty() {
-                None
-            } else {
-                Some(m)
-            }
-        };
+        let transcription_manager = media_pipeline_transcription_manager(ctx.as_ref());
         let pipeline = media_pipeline::MediaPipeline::new(
             &ctx.media_pipeline,
             transcription_manager.as_ref(),
-            vision,
+            false, // vision unused in the route-independent phase
         );
-        msg.content = Box::pin(pipeline.process(&msg.content, &msg.attachments)).await;
+        msg.content =
+            Box::pin(pipeline.process_route_independent(&msg.content, &msg.attachments)).await;
     }
 
     // ── Link enricher: prepend URL summaries before agent sees the message ──
@@ -4908,6 +4934,41 @@ async fn process_channel_message_body(
             return;
         }
     };
+
+    // ── Media pipeline phase 2 (model-aware): image attachments ──
+    // Runs after the effective route and provider are resolved so the
+    // image-marker decision uses the selected provider/model, not the startup
+    // default. The catalog is warmed first so a credentialed compatible
+    // provider resolves per-model vision instead of the family default.
+    // Audio transcription already ran in phase 1 (before route selection);
+    // an audio-only message never reaches the image warm (fnd-001
+    // zero-overhead constraint — a transcript-only turn does not wait on a
+    // catalog-backed request).
+    if ctx.media_pipeline.enabled
+        && msg
+            .attachments
+            .iter()
+            .any(|a| a.kind() == media_pipeline::MediaKind::Image)
+    {
+        // Warm the effective provider's capability metadata (e.g. the models.dev
+        // catalog) so the image-preservation decision below resolves per-model
+        // vision instead of silently falling back to the family default. The
+        // leaf provider records its own warning on failure; this call never
+        // propagates an error.
+        active_model_provider.warm_capabilities_metadata().await;
+        let vision = media_pipeline_vision_available(
+            active_model_provider.as_ref(),
+            route.model.as_str(),
+            ctx.multimodal.vision_model_provider.is_some(),
+        );
+        let pipeline = media_pipeline::MediaPipeline::new(
+            &ctx.media_pipeline,
+            None, // transcription already ran in phase 1
+            vision,
+        );
+        msg.content = Box::pin(pipeline.process_images(&msg.content, &msg.attachments)).await;
+    }
+
     let history_user_content = msg.content.clone();
     // Autosave must not persist heavy/private inline `data:` image bytes into
     // durable memory. Strip them here (path/markers are preserved) before the
@@ -14046,6 +14107,73 @@ api_key = "anthropic-key"
         fn alias(&self) -> &str {
             "DummyModelProvider"
         }
+    }
+
+    /// Provider whose family default has no vision but whose catalog-backed
+    /// per-model capability marks one model as image-input — the exact
+    /// pure-compatible-Mistral/Pixtral shape the media pipeline gate exists for.
+    struct CatalogVisionModelProvider;
+
+    #[async_trait::async_trait]
+    impl ModelProvider for CatalogVisionModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        fn capabilities_for_model(
+            &self,
+            model: &str,
+        ) -> zeroclaw_api::model_provider::ProviderCapabilities {
+            zeroclaw_api::model_provider::ProviderCapabilities {
+                vision: model == "pixtral-x",
+                ..Default::default()
+            }
+        }
+
+        fn supports_vision(&self) -> bool {
+            false
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for CatalogVisionModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "CatalogVisionModelProvider"
+        }
+    }
+
+    #[test]
+    fn media_pipeline_vision_uses_model_aware_capability() {
+        // Regression for the channel media boundary: the family-level
+        // `supports_vision()` flag is false for this provider, yet the
+        // configured model is cataloged as image-input — the pipeline must
+        // keep the `IMAGE:data:...` marker for that model, and only for it.
+        let provider = CatalogVisionModelProvider;
+        assert!(
+            media_pipeline_vision_available(&provider, "pixtral-x", false),
+            "cataloged image-input model must preserve the image marker"
+        );
+        assert!(
+            !media_pipeline_vision_available(&provider, "mistral-text-model", false),
+            "text-only model must not preserve the image marker"
+        );
+        // A configured vision provider enables image preservation regardless
+        // of the primary model's per-model capability.
+        assert!(
+            media_pipeline_vision_available(&provider, "mistral-text-model", true),
+            "a configured vision provider keeps attachments"
+        );
     }
 
     struct FormatErrorModelProvider;
@@ -26547,6 +26675,453 @@ This is an example JSON object for profile settings."#;
                 .to_string()
                 .contains("data:image/png;base64,AQIDBA=="),
             "vision provider request must contain the preserved attachment bytes: {vision_body}"
+        );
+    }
+
+    /// Provider whose family-level capability has NO vision, but whose
+    /// `capabilities_for_model` marks the configured model as image-capable
+    /// once the capability catalog is warmed — the "catalog-only image model"
+    /// shape (e.g. Pixtral under a pure compatible family where the models.dev
+    /// catalog carries the per-model modality). Before the warm call the
+    /// catalog is empty and per-model vision falls back to the family default,
+    /// exactly like a credentialed compatible provider in a fresh process.
+    /// Records messages and warm invocations.
+    struct CatalogOnlyVisionModelProvider {
+        calls: std::sync::Mutex<Vec<Vec<(String, String)>>>,
+        warm_calls: std::sync::Arc<AtomicUsize>,
+        catalog_loaded: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for CatalogOnlyVisionModelProvider {
+        fn capabilities(&self) -> zeroclaw_providers::traits::ProviderCapabilities {
+            zeroclaw_providers::traits::ProviderCapabilities {
+                vision: false,
+                ..Default::default()
+            }
+        }
+
+        fn capabilities_for_model(
+            &self,
+            model: &str,
+        ) -> zeroclaw_providers::traits::ProviderCapabilities {
+            zeroclaw_providers::traits::ProviderCapabilities {
+                vision: self.catalog_loaded.load(Ordering::SeqCst)
+                    && model == "catalog-image-model",
+                ..Default::default()
+            }
+        }
+
+        async fn warm_capabilities_metadata(&self) {
+            self.catalog_loaded.store(true, Ordering::SeqCst);
+            self.warm_calls.fetch_add(1, Ordering::SeqCst);
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("fallback".to_string())
+        }
+
+        async fn chat_with_history(
+            &self,
+            messages: &[ChatMessage],
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            let snapshot = messages
+                .iter()
+                .map(|m| (m.role.clone(), m.content.clone()))
+                .collect::<Vec<_>>();
+            let mut calls = self.calls.lock().unwrap_or_else(|e| e.into_inner());
+            calls.push(snapshot);
+            Ok(format!("response-{}", calls.len()))
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for CatalogOnlyVisionModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "CatalogOnlyVisionModelProvider"
+        }
+    }
+
+    #[tokio::test]
+    async fn media_pipeline_preserves_image_marker_for_catalog_only_vision_model() {
+        // Regression for the channel media boundary: the image-preservation
+        // decision must run AFTER the effective route/provider are resolved and
+        // the capability catalog is warmed, so a catalog-only image model keeps
+        // the `IMAGE:data:...` marker. Before the fix the decision ran against
+        // the startup provider with an empty catalog and fell back to the
+        // family default (no vision), dropping the marker before any turn could
+        // restore the bytes.
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let leaf = Arc::new(CatalogOnlyVisionModelProvider {
+            calls: Default::default(),
+            warm_calls: Arc::new(AtomicUsize::new(0)),
+            catalog_loaded: AtomicBool::new(false),
+        });
+        // Production shape: the effective provider is the resilient composite
+        // returned by the factory; it must delegate warm to the cataloged leaf.
+        let wrapper: Arc<dyn ModelProvider> =
+            Arc::new(zeroclaw_providers::reliable::ReliableModelProvider::new(
+                "test",
+                vec![(
+                    "primary".into(),
+                    Box::new(Arc::clone(&leaf)) as Box<dyn ModelProvider>,
+                )],
+                0,
+                0,
+            ));
+
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            wrapper,
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            model: Arc::new("catalog-image-model".to_string()),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig {
+                enabled: true,
+                describe_images: true,
+                ..Default::default()
+            },
+            ..(*runtime_ctx).clone()
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-catalog-vision".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-catalog-vision".to_string(),
+                content: "please inspect this".to_string(),
+                channel: "test-channel".into(),
+                channel_alias: None,
+                timestamp: 1,
+                passive_context: false,
+                explicitly_addressed: false,
+                conversation_scope: zeroclaw_api::channel::ChannelConversationScope::Sender,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![zeroclaw_api::media::MediaAttachment {
+                    file_name: "catalog.png".to_string(),
+                    data: vec![1, 2, 3, 4],
+                    mime_type: Some("image/png".to_string()),
+                }],
+                subject: None,
+                internal_sop_event: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert!(
+            leaf.warm_calls.load(Ordering::SeqCst) >= 1,
+            "the resilient wrapper must delegate the warm call to the cataloged leaf"
+        );
+
+        {
+            let calls = leaf.calls.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(
+                calls.len(),
+                1,
+                "the cataloged provider should receive one turn"
+            );
+            let current_user = calls[0]
+                .iter()
+                .rev()
+                .find(|(role, _)| role == "user")
+                .expect("provider call should include the current user message");
+            assert!(
+                current_user.1.contains("[IMAGE:data:image/png;base64,"),
+                "catalog-only image model must preserve the IMAGE:data marker; got: {:?}",
+                current_user.1
+            );
+            assert!(current_user.1.contains("please inspect this"));
+        }
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert!(
+            !sent_messages.is_empty(),
+            "the cataloged provider should produce an assistant reply"
+        );
+    }
+
+    #[tokio::test]
+    async fn media_pipeline_does_not_warm_capabilities_for_audio_only_message() {
+        // Regression for the 2026-08-08 review (fnd-001 zero-overhead): an
+        // audio-only channel message must never invoke the catalog-backed
+        // capability warm. Before the fix, phase 2 warmed the effective
+        // provider whenever ANY attachment existed; it now fires only when an
+        // IMAGE attachment is present. The cataloged leaf records warm calls,
+        // so an unexpected warm is directly observable.
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let leaf = Arc::new(CatalogOnlyVisionModelProvider {
+            calls: Default::default(),
+            warm_calls: Arc::new(AtomicUsize::new(0)),
+            catalog_loaded: AtomicBool::new(false),
+        });
+        // Production shape: the effective provider is the resilient composite
+        // returned by the factory; it must delegate warm to the cataloged leaf.
+        let wrapper: Arc<dyn ModelProvider> =
+            Arc::new(zeroclaw_providers::reliable::ReliableModelProvider::new(
+                "test",
+                vec![(
+                    "primary".into(),
+                    Box::new(Arc::clone(&leaf)) as Box<dyn ModelProvider>,
+                )],
+                0,
+                0,
+            ));
+
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            wrapper,
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            model: Arc::new("catalog-image-model".to_string()),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig {
+                enabled: true,
+                transcribe_audio: false, // focus the test on the image warm
+                describe_images: true,
+                ..Default::default()
+            },
+            ..(*runtime_ctx).clone()
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-audio-only".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-audio-only".to_string(),
+                content: "please handle this".to_string(),
+                channel: "test-channel".into(),
+                channel_alias: None,
+                timestamp: 1,
+                passive_context: false,
+                explicitly_addressed: false,
+                conversation_scope: zeroclaw_api::channel::ChannelConversationScope::Sender,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![zeroclaw_api::media::MediaAttachment {
+                    file_name: "voice.ogg".to_string(),
+                    data: vec![0u8; 16],
+                    mime_type: Some("audio/ogg".to_string()),
+                }],
+                subject: None,
+                internal_sop_event: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(
+            leaf.warm_calls.load(Ordering::SeqCst),
+            0,
+            "an audio-only message must not invoke the catalog-backed capability warm"
+        );
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert!(
+            !sent_messages.is_empty(),
+            "the audio-only turn should still complete and produce an assistant reply"
+        );
+    }
+
+    #[tokio::test]
+    async fn media_transcription_feeds_route_classification_before_route_selection() {
+        // Regression for the 2026-08-05 review, production-shaped per the
+        // 2026-08-08 follow-up: the media pipeline's transcription phase is
+        // route-independent and must run BEFORE route classification. A routing
+        // keyword that appears only in an audio transcript must drive route
+        // selection through the REAL `process_channel_message` path — not by
+        // manually calling `process_route_independent` and the classifier. The
+        // transcript is produced by a wiremock-backed local_whisper provider
+        // (the production typed-provider registration path), and the matched
+        // route's provider is what receives the turn.
+
+        // 1. Mock transcription endpoint (local_whisper wire format).
+        let transcribe_server = wiremock::MockServer::start().await;
+        let _transcribe_mock = wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/transcribe"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "text": "use-fast-model from transcript" })),
+            )
+            .expect(1)
+            .mount(&transcribe_server)
+            .await;
+
+        // 2. Typed local_whisper provider pointing at the mock.
+        let mut prompt_config = zeroclaw_config::schema::Config::default();
+        prompt_config.providers.transcription.local_whisper.insert(
+            "mock".to_string(),
+            zeroclaw_config::schema::LocalWhisperTranscriptionProviderConfig {
+                uri: format!("{}/v1/transcribe", transcribe_server.uri()),
+                // `LocalWhisperProvider::from_config` requires a non-empty
+                // bearer token even for local endpoints; the mock never
+                // verifies it.
+                bearer_token: Some("test-token".to_string()),
+                language: None,
+                max_audio_bytes: 25 * 1024 * 1024,
+                timeout_secs: 5,
+            },
+        );
+
+        // 3. The matched route must be distinguishable from the default:
+        //    hint -> fast-provider / fast-model.
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        // Provider injected into the cache under the route's provider ref, so
+        // `get_or_create_provider` returns IT (not the default) and we can
+        // observe the routed provider receiving the turn.
+        let routed_provider = Arc::new(HistoryCaptureModelProvider {
+            calls: Default::default(),
+            vision: false,
+        });
+        let routed: Arc<dyn ModelProvider> = routed_provider.clone();
+        let provider_cache: Arc<Mutex<HashMap<String, Arc<dyn ModelProvider>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        // The cache key is generation-0 provider name (see
+        // `provider_cache_key(_, None, 0)`), so the route's provider ref is
+        // the exact lookup key.
+        provider_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert("fast-provider".to_string(), routed);
+
+        let query_classification = zeroclaw_config::schema::QueryClassificationConfig {
+            enabled: true,
+            rules: vec![zeroclaw_config::schema::ClassificationRule {
+                hint: "use-fast-model".to_string(),
+                keywords: vec!["use-fast-model".to_string()],
+                priority: 10,
+                ..Default::default()
+            }],
+        };
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(DummyModelProvider),
+            prompt_config,
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            model_routes: Arc::new(vec![zeroclaw_config::schema::ModelRouteConfig {
+                hint: "use-fast-model".to_string(),
+                model_provider: "fast-provider".to_string(),
+                model: "fast-model".to_string(),
+                ..Default::default()
+            }]),
+            provider_cache,
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig {
+                enabled: true,
+                transcribe_audio: true,
+                ..Default::default()
+            },
+            query_classification,
+            agent_transcription_provider: "local_whisper.mock".to_string(),
+            ..(*runtime_ctx).clone()
+        });
+
+        // Sanity: the production transcription-manager builder must register
+        // the typed local_whisper provider under the dotted alias. (The actual
+        // transcribe round-trip is exercised by the orchestrator path below —
+        // the wiremock `.expect(1)` proves it.)
+        let mgr =
+            crate::transcription::TranscriptionManager::new(&runtime_ctx.transcription_config)
+                .unwrap_or_else(|_| crate::transcription::TranscriptionManager::empty())
+                .with_typed_providers(&runtime_ctx.prompt_config.providers.transcription)
+                .with_agent_transcription_provider("local_whisper.mock");
+        let available = mgr.available_providers();
+        assert!(
+            available.contains(&"local_whisper.mock"),
+            "typed local_whisper.mock must register; got {available:?}"
+        );
+
+        // 4. Drive the real orchestrator path with an audio-only attachment.
+        //    The transcript keyword is present ONLY in the audio bytes — the
+        //    textual content carries nothing the classifier would match.
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-transcript-route".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-transcript-route".to_string(),
+                content: "please handle this".to_string(),
+                channel: "test-channel".into(),
+                channel_alias: None,
+                timestamp: 1,
+                passive_context: false,
+                explicitly_addressed: false,
+                conversation_scope: zeroclaw_api::channel::ChannelConversationScope::Sender,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![zeroclaw_api::media::MediaAttachment {
+                    file_name: "voice.ogg".to_string(),
+                    data: vec![0u8; 16],
+                    mime_type: Some("audio/ogg".to_string()),
+                }],
+                subject: None,
+                internal_sop_event: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        // 5. The matched route's provider received the turn — proving the
+        //    transcript (not the visible text) drove route selection.
+        let joined = {
+            let routed_calls = routed_provider
+                .calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            assert!(
+                !routed_calls.is_empty(),
+                "the route matched via the transcript keyword must dispatch to the routed provider"
+            );
+            let turn_messages = routed_calls
+                .last()
+                .expect("a turn reached the routed provider");
+            turn_messages
+                .iter()
+                .map(|(role, content)| format!("{role}:{content}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(
+            joined.contains("use-fast-model"),
+            "the transcribed routing keyword must reach the routed provider's turn: {joined}"
+        );
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert!(
+            !sent_messages.is_empty(),
+            "the routed turn should complete and produce an assistant reply"
         );
     }
 

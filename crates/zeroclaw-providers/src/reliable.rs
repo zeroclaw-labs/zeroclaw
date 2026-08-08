@@ -1469,6 +1469,16 @@ impl ModelProvider for ReliableModelProvider {
         capabilities
     }
 
+    async fn warm_capabilities_metadata(&self) {
+        // Delegate to every child: the synchronous `capabilities_for_model`
+        // gate aggregates per-model vision across all entries, so each child
+        // (e.g. a credentialed compatible provider) must preload its catalog
+        // before that gate runs.
+        for entry in &self.model_providers {
+            entry.provider().warm_capabilities_metadata().await;
+        }
+    }
+
     fn supports_native_tools(&self) -> bool {
         self.model_providers
             .first()
@@ -5520,5 +5530,137 @@ mod tests {
             "ReliableModelProvider must not surface as model_provider_type=reliable",
         );
         zeroclaw_log::clear_broadcast_hook();
+    }
+
+    /// Child that records `warm_capabilities_metadata` invocations.
+    struct WarmRecordingMock {
+        warm_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for WarmRecordingMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
+        async fn warm_capabilities_metadata(&self) {
+            self.warm_calls.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for WarmRecordingMock {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "WarmRecordingMock"
+        }
+    }
+
+    #[tokio::test]
+    async fn warm_capabilities_metadata_delegates_to_all_children() {
+        let warm_calls = Arc::new(AtomicUsize::new(0));
+        let reliable = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(WarmRecordingMock {
+                        warm_calls: Arc::clone(&warm_calls),
+                    }),
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(WarmRecordingMock {
+                        warm_calls: Arc::clone(&warm_calls),
+                    }),
+                ),
+            ],
+            0,
+            1,
+        );
+
+        reliable.warm_capabilities_metadata().await;
+
+        assert_eq!(
+            warm_calls.load(Ordering::SeqCst),
+            2,
+            "warm_capabilities_metadata must delegate to every child provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_delegates_through_to_compatible_catalog_resolution() {
+        // Production shape: a credentialed compatible provider (which lists
+        // models through its native /models endpoint and never triggers a
+        // models.dev listing) wrapped in the resilient composite that the
+        // production factory returns. The wrapper must delegate warm to the
+        // child so `capabilities_for_model` resolves per-model vision from the
+        // catalog; without delegation this returns the family default.
+        use crate::compatible::{AuthStyle, OpenAiCompatibleModelProvider};
+        use crate::models_dev::{__private_test_catalog_lock, CACHED_CATALOG, parse_catalog};
+
+        // Same provider key as the compatible.rs catalog-injection test so the
+        // process-wide OnceCell resolves identically regardless of which test
+        // runs first (only the first set() wins). Serialize with the models_dev
+        // lifecycle tests, which seed the same global with TINY_CATALOG; a
+        // racing seed would make this set() fail silently and the lookup below
+        // return None.
+        let _catalog_guard = __private_test_catalog_lock().await;
+        let catalog_json = br#"{
+            "mock-compatible": {
+                "models": {
+                    "vision-model": {
+                        "id": "vision-model",
+                        "modalities": {"input": ["image", "text"]}
+                    },
+                    "text-model": {
+                        "id": "text-model",
+                        "modalities": {"input": ["text"]}
+                    }
+                }
+            }
+        }"#;
+        let catalog = parse_catalog(catalog_json).unwrap();
+        let _ = CACHED_CATALOG.set(Arc::new(catalog));
+
+        let inner = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("mock-compatible")
+            .base_url("https://example.com/v1")
+            .credential(Some("fake-key"))
+            .auth_style(AuthStyle::Bearer)
+            .models_dev_key("mock-compatible")
+            .build();
+        assert!(
+            !<OpenAiCompatibleModelProvider as ModelProvider>::capabilities(&inner).vision,
+            "family default must have no vision so per-model resolution is exercised"
+        );
+
+        let wrapper = ReliableModelProvider::new(
+            "test",
+            vec![("primary".into(), Box::new(inner) as Box<dyn ModelProvider>)],
+            0,
+            0,
+        );
+
+        wrapper.warm_capabilities_metadata().await;
+
+        assert!(
+            wrapper.capabilities_for_model("vision-model").vision,
+            "production-shaped wrapper must resolve cataloged image-input model vision"
+        );
+        assert!(
+            !wrapper.capabilities_for_model("text-model").vision,
+            "cataloged text-only model must not resolve vision through the wrapper"
+        );
     }
 }
