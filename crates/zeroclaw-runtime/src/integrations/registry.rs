@@ -297,11 +297,23 @@ mod tests {
         entry.status
     }
 
+    /// Build a config with an explicit `[browser]` flag pair so the four
+    /// combinations below never depend on which flag happens to default
+    /// to `true`.
+    fn browser_config(enabled: bool, automation_enabled: bool) -> Config {
+        let mut config = Config::default();
+        config.browser.enabled = enabled;
+        config.browser.automation_enabled = automation_enabled;
+        config
+    }
+
     #[test]
     fn browser_active_in_default_config() {
-        // BrowserConfig::default() has enabled=true, so the toggle
-        // should be Active in the unconfigured registry.
+        // BrowserConfig::default() has enabled=true, so `browser_open` is
+        // registered and the toggle is Active in the unconfigured registry
+        // even though full automation is off.
         let config = Config::default();
+        assert!(config.browser.enabled && !config.browser.automation_enabled);
         assert!(matches!(
             toggle_status(&config, |n| n == "Browser"),
             IntegrationStatus::Active
@@ -310,12 +322,58 @@ mod tests {
 
     #[test]
     fn browser_available_when_disabled() {
-        let mut config = Config::default();
-        config.browser.enabled = false;
+        // Both flags off: the runtime registers neither `browser_open` nor
+        // `browser`, so nothing about this section is live.
+        let config = browser_config(false, false);
         assert!(matches!(
             toggle_status(&config, |n| n == "Browser"),
             IntegrationStatus::Available
         ));
+    }
+
+    #[test]
+    fn browser_active_when_only_automation_enabled() {
+        // `browser_open` is off but the full automation tool is registered.
+        // Reporting Available here would hide a live Chrome/Chromium
+        // surface from the operator.
+        let config = browser_config(false, true);
+        assert!(matches!(
+            toggle_status(&config, |n| n == "Browser"),
+            IntegrationStatus::Active
+        ));
+    }
+
+    #[test]
+    fn browser_active_when_both_flags_enabled() {
+        let config = browser_config(true, true);
+        assert!(matches!(
+            toggle_status(&config, |n| n == "Browser"),
+            IntegrationStatus::Active
+        ));
+    }
+
+    /// The descriptor's status must track the same predicate the schema
+    /// exposes, across every flag combination — the registry reads
+    /// `integration_descriptor()`, so a drift between the two would show
+    /// operators a status the runtime does not honour.
+    #[test]
+    fn browser_status_matches_schema_predicate_for_all_flag_combinations() {
+        for (enabled, automation_enabled) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let config = browser_config(enabled, automation_enabled);
+            let expected = if config.browser.integration_active() {
+                IntegrationStatus::Active
+            } else {
+                IntegrationStatus::Available
+            };
+            let actual = toggle_status(&config, |n| n == "Browser");
+            assert_eq!(
+                actual, expected,
+                "browser status mismatch for enabled={enabled}, \
+                 automation_enabled={automation_enabled}"
+            );
+        }
     }
 
     #[test]
