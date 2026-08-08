@@ -434,6 +434,18 @@ pub fn runtime_trace_path() -> Option<PathBuf> {
     current_state().map(|s| s.policy.path.clone())
 }
 
+/// The canonical *active* log file path: the path the currently installed
+/// writer actually persists to, or `None` when persistence is disabled at the
+/// writer layer. Unlike [`runtime_trace_path`], this is `None` when
+/// `storage` is disabled, so consumers that gate the path on "is persistence
+/// active?" read one source of truth (the writer state) instead of mixing a
+/// runtime config snapshot with the writer state.
+pub fn active_log_path() -> Option<PathBuf> {
+    current_state()
+        .filter(|s| s.policy.storage.is_enabled())
+        .map(|s| s.policy.path.clone())
+}
+
 pub fn flush_for_test() -> Result<()> {
     let Some(state) = current_state() else {
         return Ok(());
