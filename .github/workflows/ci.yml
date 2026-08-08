@@ -262,9 +262,48 @@ jobs:
 
   # ── Post-format build + check fan-out ─────────────────────────────────────
 
+  interactive-ctrlc-changes:
+    name: Detect interactive Ctrl+C changes
+    needs: [fmt]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.changed.outputs.run }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - name: Detect interactive Ctrl+C lifecycle changes
+        id: changed
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          changed_files="$(mktemp)"
+
+          case "${{ github.event_name }}" in
+            pull_request)
+              git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD > "$changed_files"
+              ;;
+            push|merge_group)
+              echo "run=true" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+            *)
+              echo "run=true" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+
+          if grep -Eq '^(crates/zeroclaw-runtime/|\.github/workflows/ci\.yml$)' "$changed_files"; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
     name: ${{ matrix.label }} ${{ matrix.target }}
-    needs: [fmt]
+    needs: [fmt, interactive-ctrlc-changes]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     strategy:
@@ -337,6 +376,13 @@ jobs:
           RUST_CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+      - name: Test interactive Ctrl+C lifecycle
+        if: runner.os == 'Windows' && needs.interactive-ctrlc-changes.outputs.run == 'true'
+        shell: bash
+        run: >-
+          cargo test --profile ci --locked -p zeroclaw-runtime --lib
+          interactive_signal_lifecycle
+          --target x86_64-pc-windows-msvc
 
   check:
     name: Check (${{ matrix.name }})
@@ -884,7 +930,7 @@ jobs:
   gate:
     name: CI Required Gate
     if: always()
-    needs: [fmt, repo-structure, lint, windows-clippy-tools-changes, windows-clippy-tools, build, check, check-plugin-backends, msrv, check-32bit, bench, test, parallel-runtime-test-changes, parallel-runtime-test, test-landlock, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary, web-permission-tests]
+    needs: [fmt, repo-structure, lint, windows-clippy-tools-changes, windows-clippy-tools, interactive-ctrlc-changes, build, check, check-plugin-backends, msrv, check-32bit, bench, test, parallel-runtime-test-changes, parallel-runtime-test, test-landlock, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary, web-permission-tests]
     runs-on: ubuntu-latest
     steps:
       - name: Check results
