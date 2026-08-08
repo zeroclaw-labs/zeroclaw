@@ -1,5 +1,21 @@
 use std::path::{Path, PathBuf};
 
+/// Shell language understood by a runtime's command builder.
+///
+/// This is part of the execution boundary: security policy must validate the
+/// same language that [`RuntimeAdapter::build_shell_command`] will interpret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellDialect {
+    /// A POSIX-style shell such as `sh`, `bash`, or `zsh`.
+    Posix,
+    /// The Windows command processor (`cmd.exe`).
+    WindowsCmd,
+    /// Windows PowerShell or PowerShell 7+.
+    PowerShell,
+    /// The runtime does not expose shell execution.
+    None,
+}
+
 /// Runtime adapter that abstracts platform differences for the agent.
 ///
 /// Implement this trait to port the agent to a new execution environment.
@@ -20,9 +36,12 @@ pub trait RuntimeAdapter: Send + Sync {
 
     /// Report whether this runtime supports shell command execution.
     ///
-    /// When `false`, the agent disables shell-based tools. Serverless and
-    /// edge runtimes typically return `false`.
-    fn has_shell_access(&self) -> bool;
+    /// Shell capability is derived from [`Self::shell_dialect`] so adapters
+    /// cannot report a shell while omitting the language that policy must
+    /// validate (or report a language while disabling shell tools).
+    fn has_shell_access(&self) -> bool {
+        self.shell_dialect() != ShellDialect::None
+    }
 
     /// Report whether this runtime supports filesystem read/write.
     ///
@@ -51,6 +70,12 @@ pub trait RuntimeAdapter: Send + Sync {
     fn memory_budget(&self) -> u64 {
         0
     }
+
+    /// Return the shell language accepted by [`Self::build_shell_command`].
+    ///
+    /// This is the source of truth for both shell capability and command
+    /// policy. Adapters without shell access must return [`ShellDialect::None`].
+    fn shell_dialect(&self) -> ShellDialect;
 
     /// Build a shell command process configured for this runtime.
     ///
@@ -81,10 +106,6 @@ mod tests {
             "dummy-runtime"
         }
 
-        fn has_shell_access(&self) -> bool {
-            true
-        }
-
         fn has_filesystem_access(&self) -> bool {
             true
         }
@@ -95,6 +116,17 @@ mod tests {
 
         fn supports_long_running(&self) -> bool {
             true
+        }
+
+        fn shell_dialect(&self) -> ShellDialect {
+            #[cfg(windows)]
+            {
+                ShellDialect::WindowsCmd
+            }
+            #[cfg(not(windows))]
+            {
+                ShellDialect::Posix
+            }
         }
 
         fn build_shell_command(
@@ -133,6 +165,10 @@ mod tests {
         assert!(runtime.has_shell_access());
         assert!(runtime.has_filesystem_access());
         assert!(runtime.supports_long_running());
+        #[cfg(windows)]
+        assert_eq!(runtime.shell_dialect(), ShellDialect::WindowsCmd);
+        #[cfg(not(windows))]
+        assert_eq!(runtime.shell_dialect(), ShellDialect::Posix);
         assert_eq!(runtime.storage_path(), PathBuf::from("/tmp/dummy-runtime"));
     }
 
