@@ -13,6 +13,10 @@ ZeroClaw v0.8.4 is a maintenance and hardening release spanning **262 commits** 
 
 ## What's New
 
+### Web and Search
+
+- **Large web fetches spill to a workspace file** (#9824): `web_fetch` responses whose converted text exceeds 50 KB are written under `tmp/web_fetch/` in the agent workspace and the tool returns the path plus guidance to read or search it with the file tools, instead of hard-truncating and discarding the tail. Spilling only happens when the security policy permits the `file_write` tool, and otherwise falls back to the previous inline truncation. Writes are containment-checked to the workspace root; the existing size cap remains the absolute guard.
+
 ### Memory and Retrieval
 
 - Add opt-in retrieval caching, a gated rerank stage, typed memory classification and fact extraction, configuration validation, migration reindex hooks, and content scanning at write and recall boundaries (#8897, #8895, #8900, #8899, #8984).
