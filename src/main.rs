@@ -430,7 +430,8 @@ use config::Config;
 pub use zeroclaw::{
     AgentsCommands, ChannelCommands, ChannelsCommands, CronCommands, GatewayCommands,
     HardwareCommands, IntegrationCommands, MigrateCommands, PeripheralCommands, ProvidersCommands,
-    ServiceCommands, SkillBundleCommands, SkillCommands, SopCommands, SopGraphFormat,
+    ServiceCommands, ServiceLogStream, SkillBundleCommands, SkillCommands, SopCommands,
+    SopGraphFormat,
 };
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -3543,6 +3544,29 @@ async fn async_main(command: clap::Command) -> Result<()> {
             )
         );
         return Ok(());
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    if let Commands::Service {
+        service_command: ServiceCommands::RunLaunchdDaemon,
+        ..
+    } = &cli.command
+    {
+        let config_dir = cli
+            .config_dir
+            .as_deref()
+            .map(std::path::Path::new)
+            .context("launchd runner requires --config-dir")?;
+        return service::run_launchd_daemon(config_dir).await;
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    if let Commands::Service {
+        service_command: ServiceCommands::RunOpenrcLogWriter { stream },
+        ..
+    } = &cli.command
+    {
+        return service::run_openrc_log_writer(matches!(stream, ServiceLogStream::Stderr));
     }
 
     // All other commands need config loaded first
@@ -8244,6 +8268,34 @@ mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
     use std::net::TcpListener;
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn openrc_log_writer_cli_maps_only_known_streams() {
+        for (value, expected) in [
+            ("stdout", ServiceLogStream::Stdout),
+            ("stderr", ServiceLogStream::Stderr),
+        ] {
+            let cli = Cli::try_parse_from(["zeroclaw", "service", "run-openrc-log-writer", value])
+                .expect("internal OpenRC logger should parse");
+            assert!(matches!(
+                cli.command,
+                Commands::Service {
+                    service_command: ServiceCommands::RunOpenrcLogWriter { stream },
+                    ..
+                } if stream == expected
+            ));
+        }
+        assert!(
+            Cli::try_parse_from([
+                "zeroclaw",
+                "service",
+                "run-openrc-log-writer",
+                "/tmp/arbitrary.log"
+            ])
+            .is_err()
+        );
+    }
 
     #[test]
     fn probe_config_dir_extracts_global_flag_in_all_forms() {
