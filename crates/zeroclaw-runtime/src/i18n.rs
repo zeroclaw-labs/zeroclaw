@@ -468,6 +468,46 @@ mod tests {
     }
 
     #[test]
+    fn quickstart_terminal_size_errors_format_from_english_fluent() {
+        let width_message = get_english_cli_string_with_args(
+            "cli-quickstart-terminal-too-narrow",
+            &[("min_width", "3"), ("width", "2")],
+        );
+        assert_eq!(
+            width_message,
+            "Quickstart needs a terminal at least 3 columns wide; the current terminal is 2 columns. Widen the terminal and try again."
+        );
+
+        let height_message = get_english_cli_string_with_args(
+            "cli-quickstart-terminal-too-short",
+            &[("height", "8"), ("min_height", "9")],
+        );
+        assert_eq!(
+            height_message,
+            "Quickstart needs a terminal at least 9 rows tall; the current terminal is 8 rows. Make the terminal taller and try again."
+        );
+
+        let resized_message = get_english_cli_string_with_args(
+            "cli-quickstart-terminal-resized",
+            &[
+                ("initial_width", "40"),
+                ("initial_height", "9"),
+                ("current_width", "4"),
+                ("current_height", "9"),
+            ],
+        );
+        assert_eq!(
+            resized_message,
+            "The terminal changed from 40x9 to 4x9 while the Quickstart checklist was open. Reopen the checklist to continue."
+        );
+
+        assert_eq!(
+            get_english_cli_string_with_args("cli-quickstart-empty-checklist", &[]),
+            "Quickstart cannot open an empty checklist."
+        );
+    }
+
+    #[test]
     fn disk_approval_override_cannot_rewrite_parser_commands() {
         let sources = CliFtlSources {
             locale: "es".to_string(),
