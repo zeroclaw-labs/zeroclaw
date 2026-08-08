@@ -68,20 +68,25 @@ pub fn host_matches_allowlist(host: &str, allowed: &[String]) -> bool {
     }
 
     let host_is_ip = host.parse::<std::net::IpAddr>().is_ok();
+    // Canonicalize host by stripping trailing dot for comparison.
+    // DNS treats "files.corp.lan." and "files.corp.lan" as equivalent.
+    let host_normalized = host.trim_end_matches('.');
 
     allowed.iter().any(|pattern| {
         if pattern.starts_with("*.") {
             let suffix = &pattern[1..]; // ".example.com"
-            return host.ends_with(suffix) || host == &pattern[2..];
+            return host_normalized.ends_with(suffix) || host_normalized == &pattern[2..];
         }
 
         if host_is_ip || pattern.parse::<std::net::IpAddr>().is_ok() {
             return host == pattern;
         }
 
-        host == pattern
-            || host
-                .strip_suffix(pattern)
+        // Canonicalize pattern by stripping trailing dot for comparison
+        let pattern_normalized = pattern.trim_end_matches('.');
+        host_normalized == pattern_normalized
+            || host_normalized
+                .strip_suffix(pattern_normalized)
                 .is_some_and(|prefix| prefix.ends_with('.'))
     })
 }
@@ -100,10 +105,43 @@ pub(crate) fn is_cloud_metadata_ip(ip: std::net::IpAddr) -> bool {
     const EC2_IMDS_V4: std::net::Ipv4Addr = std::net::Ipv4Addr::new(169, 254, 169, 254);
     const EC2_IMDS_V6: std::net::Ipv6Addr =
         std::net::Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254);
+    // Alibaba Cloud ECS metadata service — documented, and distinct from the
+    // AWS-style 169.254.169.254 range shared by most other providers:
+    // https://www.alibabacloud.com/help/en/ecs/user-guide/use-instance-identities
+    const ALIBABA_IMDS_V4: std::net::Ipv4Addr = std::net::Ipv4Addr::new(100, 100, 100, 200);
+    // AWS ECS task credentials endpoint (169.254.170.2). Like EC2 IMDS this is a
+    // credential-delivery address, not an ordinary private service, so it must
+    // stay outside the `allowed_private_hosts` carve-out:
+    // https://docs.aws.amazon.com/AmazonECS/latest/developerguide/security-iam-roles.html
+    const ECS_TASK_CREDENTIALS_V4: std::net::Ipv4Addr = std::net::Ipv4Addr::new(169, 254, 170, 2);
+    // AWS EKS Pod Identity credentials endpoint (169.254.170.23 / fd00:ec2::23).
+    // Same non-overridable classification as the ECS task credentials address:
+    // https://docs.aws.amazon.com/eks/latest/userguide/pod-id-how-it-works.html
+    const EKS_POD_ID_V4: std::net::Ipv4Addr = std::net::Ipv4Addr::new(169, 254, 170, 23);
+    const EKS_POD_ID_V6: std::net::Ipv6Addr =
+        std::net::Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0023);
+
+    fn is_v4_metadata(v4: std::net::Ipv4Addr) -> bool {
+        v4 == EC2_IMDS_V4
+            || v4 == ALIBABA_IMDS_V4
+            || v4 == ECS_TASK_CREDENTIALS_V4
+            || v4 == EKS_POD_ID_V4
+    }
 
     match ip {
-        std::net::IpAddr::V4(v4) => v4 == EC2_IMDS_V4,
-        std::net::IpAddr::V6(v6) => v6 == EC2_IMDS_V6,
+        std::net::IpAddr::V4(v4) => is_v4_metadata(v4),
+        std::net::IpAddr::V6(v6) => {
+            v6 == EC2_IMDS_V6
+                || v6 == EKS_POD_ID_V6
+                // IPv4-mapped IPv6 (::ffff:a.b.c.d) must be canonicalized to
+                // its IPv4 form before classification, otherwise the allowlist
+                // carve-out path could reach the metadata service through a
+                // dual-stack socket (e.g. ::ffff:169.254.169.254).
+                || match v6.to_ipv4_mapped() {
+                    Some(v4) => is_v4_metadata(v4),
+                    None => false,
+                }
+        }
     }
 }
 
@@ -394,6 +432,34 @@ mod tests {
     }
 
     #[test]
+    fn validate_resolved_ips_blocks_alibaba_metadata_even_for_private_opt_in() {
+        let ips = [std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+            100, 100, 100, 200,
+        ))];
+        let err = validate_resolved_ips_exclude_metadata("metadata.test", &ips)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cloud metadata address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_resolved_ips_blocks_alibaba_metadata_on_public_path() {
+        let ips = [std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+            100, 100, 100, 200,
+        ))];
+        let err = validate_resolved_ips_are_public("metadata.test", &ips)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cloud metadata address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn validate_resolved_ips_metadata_is_not_reported_as_generic_private() {
         let ips = [std::net::IpAddr::V4(std::net::Ipv4Addr::new(
             169, 254, 169, 254,
@@ -405,5 +471,156 @@ mod tests {
             err.contains("cloud metadata address"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn validate_resolved_ips_blocks_mapped_ec2_metadata_even_for_private_opt_in() {
+        // ::ffff:169.254.169.254 — the IPv4-mapped form of the EC2 metadata
+        // address. It must be rejected under the private-host carve-out.
+        let ips = ["::ffff:169.254.169.254".parse().unwrap()];
+        let err = validate_resolved_ips_exclude_metadata("metadata.test", &ips)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cloud metadata address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_resolved_ips_blocks_mapped_alibaba_metadata_even_for_private_opt_in() {
+        // ::ffff:100.100.100.200 — the IPv4-mapped form of the Alibaba ECS
+        // metadata address. Same carve-out bypass as the AWS-mapped case.
+        let ips = ["::ffff:100.100.100.200".parse().unwrap()];
+        let err = validate_resolved_ips_exclude_metadata("metadata.test", &ips)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cloud metadata address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_resolved_ips_blocks_ecs_task_credentials_even_for_private_opt_in() {
+        // AWS ECS task credentials (169.254.170.2) deliver instance role
+        // credentials, so the private-host carve-out must not lift their
+        // rejection.
+        let ips = [std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+            169, 254, 170, 2,
+        ))];
+        let err = validate_resolved_ips_exclude_metadata("credentials.test", &ips)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cloud metadata address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_resolved_ips_blocks_eks_pod_id_credentials_even_for_private_opt_in() {
+        // AWS EKS Pod Identity credentials (169.254.170.23) — same
+        // non-overridable credential-delivery classification.
+        let ips = [std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+            169, 254, 170, 23,
+        ))];
+        let err = validate_resolved_ips_exclude_metadata("credentials.test", &ips)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cloud metadata address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_resolved_ips_blocks_eks_pod_id_ipv6_credentials_even_for_private_opt_in() {
+        // AWS EKS Pod Identity IPv6 form (fd00:ec2::23).
+        let ips = ["fd00:ec2::23".parse().unwrap()];
+        let err = validate_resolved_ips_exclude_metadata("credentials.test", &ips)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cloud metadata address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_resolved_ips_blocks_mapped_ecs_credentials_even_for_private_opt_in() {
+        // ::ffff:169.254.170.2 — the IPv4-mapped form of the ECS task
+        // credentials address.
+        let ips = ["::ffff:169.254.170.2".parse().unwrap()];
+        let err = validate_resolved_ips_exclude_metadata("credentials.test", &ips)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cloud metadata address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_resolved_ips_blocks_mapped_eks_credentials_even_for_private_opt_in() {
+        // ::ffff:169.254.170.23 — the IPv4-mapped form of the EKS Pod
+        // Identity credentials address.
+        let ips = ["::ffff:169.254.170.23".parse().unwrap()];
+        let err = validate_resolved_ips_exclude_metadata("credentials.test", &ips)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cloud metadata address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_resolved_ips_blocks_ecs_credentials_on_public_path() {
+        // The normal public-path validator must also reject the credential
+        // endpoint — a non-allowlisted hostname resolving there must fail.
+        let ips = [std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+            169, 254, 170, 2,
+        ))];
+        let err = validate_resolved_ips_are_public("credentials.test", &ips)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cloud metadata address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_resolved_ips_blocks_eks_credentials_on_public_path() {
+        let ips = [std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+            169, 254, 170, 23,
+        ))];
+        let err = validate_resolved_ips_are_public("credentials.test", &ips)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cloud metadata address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_resolved_ips_blocks_mapped_metadata_on_public_path() {
+        let ips = ["::ffff:169.254.169.254".parse().unwrap()];
+        let err = validate_resolved_ips_are_public("metadata.test", &ips)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cloud metadata address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn is_cloud_metadata_ip_rejects_non_metadata_mapped_addresses() {
+        // A mapped loopback is not a metadata address and must stay allowed by
+        // the predicate (the caller's loopback policy decides it separately).
+        assert!(!is_cloud_metadata_ip("::ffff:127.0.0.1".parse().unwrap()));
     }
 }
