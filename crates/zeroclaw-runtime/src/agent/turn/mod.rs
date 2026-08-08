@@ -2074,17 +2074,19 @@ async fn drive_live_sop_actions(
                     );
                     break;
                 }
-                crate::sop::SopRunAction::DeterministicStep { run_id, step, .. } => {
-                    ::zeroclaw_log::record!(
-                        INFO,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_attrs(::serde_json::json!({
-                                "run_id": run_id,
-                                "step": step.number,
-                            })),
-                        "SOP live executor yielded deterministic step"
-                    );
-                    break;
+                crate::sop::SopRunAction::DeterministicStep { ref run_id, .. } => {
+                    let run_id = run_id.clone();
+                    let next = {
+                        let mut engine = match queued.engine.lock() {
+                            Ok(engine) => engine,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        engine.advance_headless_deterministic_step(&run_id, action)?
+                    };
+                    action = next;
+                    // Let an operator request acquire the engine before the next
+                    // deterministic capability is dispatched.
+                    tokio::task::yield_now().await;
                 }
                 crate::sop::SopRunAction::CheckpointWait { run_id, step, .. } => {
                     ::zeroclaw_log::record!(
@@ -2125,6 +2127,18 @@ async fn drive_live_sop_actions(
                                 "sop_name": sop_name,
                             })),
                         "SOP live executor completed run"
+                    );
+                    break;
+                }
+                crate::sop::SopRunAction::Cancelled { run_id, sop_name } => {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Cancel)
+                            .with_attrs(::serde_json::json!({
+                                "run_id": run_id,
+                                "sop_name": sop_name,
+                            })),
+                        "SOP live executor observed cancelled run"
                     );
                     break;
                 }

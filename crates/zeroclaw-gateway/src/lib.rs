@@ -1747,6 +1747,10 @@ pub async fn run_gateway(
             "/api/sops/{name}/runs/{run_id}/decide",
             post(api_sop_author::handle_sop_decide),
         )
+        .route(
+            "/api/sops/{name}/runs/{run_id}/cancel",
+            post(api_sop_author::handle_sop_cancel),
+        )
         .route("/api/config/drift", get(api_config::handle_drift))
         .route(
             "/api/config/reload-status",
