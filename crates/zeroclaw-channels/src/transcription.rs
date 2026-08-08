@@ -1078,17 +1078,6 @@ impl TranscriptionManager {
         self
     }
 
-    /// Test-only constructor: install a single mock transcription provider so
-    /// channel/orchestrator tests can exercise the media pipeline's
-    /// transcription phase without network access. Never used in production.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn with_mock_provider(mut self, provider: Box<dyn TranscriptionProvider>) -> Self {
-        self.transcription_providers
-            .insert(provider.name().to_string(), provider);
-        self
-    }
-
     /// Transcribe audio using the runtime-active agent's resolved
     /// `transcription_provider`. Fails loud when the agent has no
     /// transcription_provider configured — there is no global default.
