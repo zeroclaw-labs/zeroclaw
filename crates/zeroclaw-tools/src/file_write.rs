@@ -161,11 +161,58 @@ impl Tool for FileWriteTool {
                 error: Some("Invalid path: missing parent directory".into()),
             });
         };
+        let Some(file_name) = full_path.file_name() else {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some("Invalid path: missing file name".into()),
+            });
+        };
 
-        // Ensure parent directory exists before canonicalising.
+        // Admission check BEFORE any filesystem mutation. `create_dir_all`
+        // ahead of the policy check would let a denied nested target create
+        // directories inside a denied tree even though the final write is
+        // then rejected — `canonicalize_best_effort` walks up to the nearest
+        // EXISTING ancestor so this works even when `parent` doesn't exist yet.
+        let prospective_parent = zeroclaw_config::policy::canonicalize_best_effort(parent);
+        let prospective_target = prospective_parent.join(file_name);
+
+        if !self.security.is_resolved_path_allowed(&prospective_parent) {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(
+                    self.security
+                        .resolved_path_violation_message(&prospective_parent),
+                ),
+            });
+        }
+        if !self.security.is_resolved_path_allowed(&prospective_target) {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(
+                    self.security
+                        .resolved_path_violation_message(&prospective_target),
+                ),
+            });
+        }
+        if self.security.is_runtime_config_path(&prospective_target) {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(
+                    self.security
+                        .runtime_config_violation_message(&prospective_target),
+                ),
+            });
+        }
+
+        // Only after admission: create the parent directory, then re-check
+        // against the REAL resolved paths (cheap, guards a symlink swap
+        // happening between the check above and the directory creation here).
         tokio::fs::create_dir_all(parent).await?;
 
-        // Canonicalise parent AFTER creation to detect symlink escapes.
         let resolved_parent = match tokio::fs::canonicalize(parent).await {
             Ok(p) => p,
             Err(e) => {
@@ -188,15 +235,18 @@ impl Tool for FileWriteTool {
             });
         }
 
-        let Some(file_name) = full_path.file_name() else {
+        let resolved_target = resolved_parent.join(file_name);
+
+        if !self.security.is_resolved_path_allowed(&resolved_target) {
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
-                error: Some("Invalid path: missing file name".into()),
+                error: Some(
+                    self.security
+                        .resolved_path_violation_message(&resolved_target),
+                ),
             });
-        };
-
-        let resolved_target = resolved_parent.join(file_name);
+        }
 
         if self.security.is_runtime_config_path(&resolved_target) {
             return Ok(ToolResult {
@@ -833,5 +883,101 @@ mod tests {
         assert!(!outside_file.exists());
 
         let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    fn deny_write_guardrail_tool(workspace: std::path::PathBuf) -> FileWriteTool {
+        let profile = zeroclaw_config::schema::RiskProfileConfig::default();
+        let security = Arc::new(SecurityPolicy::from_risk_profile(&profile, &workspace));
+        FileWriteTool::new(security)
+    }
+
+    #[tokio::test]
+    async fn file_write_blocks_mandatory_deny_write_target() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_write_deny_write_env");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let tool = deny_write_guardrail_tool(dir.clone());
+        let result = tool
+            .execute(json!({"path": ".env", "content": "SECRET=1"}))
+            .await
+            .unwrap();
+
+        assert!(!result.success, "write to .env must be denied");
+        assert!(!dir.join(".env").exists());
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_write_allows_sibling_of_deny_write_target() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_write_deny_write_sibling");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let tool = deny_write_guardrail_tool(dir.clone());
+        let result = tool
+            .execute(json!({"path": "notes.txt", "content": "fine"}))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "sibling file must remain writable: {:?}",
+            result.error
+        );
+        assert!(dir.join("notes.txt").exists());
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_write_blocks_nested_git_config_deny_write_target() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_write_deny_write_git_config");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir.join(".git")).await.unwrap();
+
+        let tool = deny_write_guardrail_tool(dir.clone());
+        let result = tool
+            .execute(json!({"path": ".git/config", "content": "[core]"}))
+            .await
+            .unwrap();
+
+        assert!(!result.success, "write to .git/config must be denied");
+        assert!(!dir.join(".git/config").exists());
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// A denied nested target with a missing parent chain must be rejected
+    /// WITHOUT creating any part of that missing chain. Regression for the
+    /// bug where `file_write` ran `create_dir_all(parent)` before any policy
+    /// check, so a denied nested write still mutated the filesystem by
+    /// creating directories inside a denied tree ahead of the rejection.
+    #[tokio::test]
+    async fn denied_nested_write_with_missing_parent_creates_nothing() {
+        let dir =
+            std::env::temp_dir().join("zeroclaw_test_file_write_denied_nested_missing_parent");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir.join(".git/hooks"))
+            .await
+            .unwrap();
+
+        let tool = deny_write_guardrail_tool(dir.clone());
+        let result = tool
+            .execute(json!({"path": ".git/hooks/new/deep/x", "content": "bad"}))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "write under the deny_write-guarded .git/hooks/ tree must be denied"
+        );
+        assert!(
+            !dir.join(".git/hooks/new").exists(),
+            "rejected write must not create any part of the missing parent chain"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

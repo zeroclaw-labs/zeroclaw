@@ -221,6 +221,41 @@ impl GitOperationsTool {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
+    /// Enumerate the files a `git checkout <branch_name>` would change
+    /// relative to `HEAD` and reject the checkout before it runs if any of
+    /// them resolve to a `deny_write`-guarded path (e.g. the mandatory
+    /// `.env`/`.git/config` guardrails). `file_write`/`file_edit` check a
+    /// single write target before mutating; `checkout` has no single
+    /// target, so this enumerates the actual mutation set instead of
+    /// leaving it unchecked. Fails closed: if the diff enumeration itself
+    /// fails (unknown ref, detached HEAD edge cases), the checkout is
+    /// rejected rather than allowed to proceed unchecked.
+    async fn ensure_checkout_does_not_overwrite_denied_paths(
+        &self,
+        branch_name: &str,
+        working_dir: &std::path::Path,
+    ) -> anyhow::Result<()> {
+        let diff_output = self
+            .run_git_command(
+                &["diff", "--name-only", "HEAD", branch_name, "--"],
+                working_dir,
+            )
+            .await?;
+
+        for relative in diff_output.lines().filter(|line| !line.is_empty()) {
+            let candidate = working_dir.join(relative);
+            let resolved = zeroclaw_config::policy::canonicalize_best_effort(&candidate);
+            if !self.security.is_resolved_path_allowed(&resolved) {
+                anyhow::bail!(
+                    "Checkout blocked: switching to '{branch_name}' would overwrite '{relative}', \
+                     which is denied by the current write policy"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     async fn git_status(
         &self,
         _args: serde_json::Value,
@@ -598,6 +633,17 @@ impl GitOperationsTool {
         // Block dangerous branch names
         if branch_name.contains('@') || branch_name.contains('^') || branch_name.contains('~') {
             anyhow::bail!("Branch name contains invalid characters");
+        }
+
+        if let Err(e) = self
+            .ensure_checkout_does_not_overwrite_denied_paths(branch_name, working_dir)
+            .await
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!("{e}")),
+            });
         }
 
         let output = self
@@ -1770,5 +1816,113 @@ mod tests {
             error.contains("initialize") || error.contains("init"),
             "error should mention initializing a repository, got: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn checkout_rejects_branch_that_would_overwrite_mandatory_deny_write_target() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &[".env"]).await;
+
+        // Branch that changes the tracked .env content relative to master.
+        std::process::Command::new("git")
+            .args(["checkout", "-b", "feature"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        std::fs::write(tmp.path().join(".env"), "MALICIOUS=1").unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-am", "change env"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+
+        // Back on master so the tool's checkout actually switches branches.
+        std::process::Command::new("git")
+            .args(["checkout", "master"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: tmp.path().to_path_buf(),
+            deny_write: vec![tmp.path().join(".env")],
+            ..SecurityPolicy::default()
+        });
+        let tool = GitOperationsTool::new(security, tmp.path().to_path_buf());
+
+        let result = tool
+            .execute(json!({"operation": "checkout", "branch": "feature"}))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "checkout must be blocked when the target branch would overwrite a deny_write path"
+        );
+        assert!(
+            result.error.as_deref().unwrap_or("").contains(".env"),
+            "error should name the denied path, got: {:?}",
+            result.error
+        );
+
+        // Must not have partially executed: still on master with the
+        // original .env content untouched.
+        let content = std::fs::read_to_string(tmp.path().join(".env")).unwrap();
+        assert_eq!(
+            content, "initial",
+            ".env must be unchanged after a blocked checkout"
+        );
+        let branch = std::process::Command::new("git")
+            .args(["branch", "--show-current"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&branch.stdout).trim(), "master");
+    }
+
+    #[tokio::test]
+    async fn checkout_succeeds_when_target_branch_touches_no_denied_paths() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &[".env", "docs.txt"]).await;
+
+        std::process::Command::new("git")
+            .args(["checkout", "-b", "docs"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        std::fs::write(tmp.path().join("docs.txt"), "updated docs").unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-am", "update docs"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+
+        std::process::Command::new("git")
+            .args(["checkout", "master"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: tmp.path().to_path_buf(),
+            deny_write: vec![tmp.path().join(".env")],
+            ..SecurityPolicy::default()
+        });
+        let tool = GitOperationsTool::new(security, tmp.path().to_path_buf());
+
+        let result = tool
+            .execute(json!({"operation": "checkout", "branch": "docs"}))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "checkout touching only non-denied paths should succeed: {:?}",
+            result.error
+        );
+        let content = std::fs::read_to_string(tmp.path().join("docs.txt")).unwrap();
+        assert_eq!(content, "updated docs");
     }
 }
