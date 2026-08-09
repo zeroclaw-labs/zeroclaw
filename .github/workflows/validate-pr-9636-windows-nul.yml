@@ -1,0 +1,36 @@
+name: Validate PR 9636 Windows NUL
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/validate-pr-9636-windows-nul.yml
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  windows-nul:
+    name: Native Windows cmd.exe NUL redirect
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: a9a97261ddf965784cb4b9e021f826dcd39f6d16
+          fetch-depth: 1
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.96.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          save-if: false
+      - name: Ensure web/dist placeholder exists
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force web/dist | Out-Null
+          New-Item -ItemType File -Force web/dist/.gitkeep | Out-Null
+      - name: Run native-Windows NUL redirect regression
+        run: cargo test --locked -p zeroclaw-runtime --lib shell_executes_windows_nul_redirect_through_cmd_exe -- --nocapture
