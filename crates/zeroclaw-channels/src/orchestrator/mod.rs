@@ -521,19 +521,299 @@ fn acquire_persist_lock(ctx: &ChannelRuntimeContext, key: &str) -> Arc<std::sync
         .clone()
 }
 
-/// Per-conversation-history-key locks that serialize the complete processing
-/// cycle of turns sharing one conversation history: history snapshot, model
-/// execution, and assistant append happen as one atomic turn. Sender-scoped
-/// debounce dispatches each member of a shared (`ReplyTarget`) session
-/// through an independent worker, so without this lock two members' turns
-/// could read different history snapshots and persist replies in an order
-/// the conversation never had. Sender-scoped sessions embed the sender in
-/// the history key, so distinct senders never contend there.
-type TurnLockMap = Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>;
+/// A turn waiting for its conversation lane.
+///
+/// `hook_applied` records that the modifying `on_message_received` hook has
+/// already run for this message. The hook may rewrite routing, so the lane is
+/// chosen from the *post-hook* history key; a turn whose key changed under the
+/// hook is handed to the correct lane, and must not run the hook a second time.
+struct PendingTurn {
+    ctx: Arc<ChannelRuntimeContext>,
+    msg: zeroclaw_api::channel::ChannelMessage,
+    hook_applied: bool,
+    /// The sender's interruption slot, claimed when the message was received
+    /// so a queued turn stays reachable by `/stop`.
+    registration: Option<TurnRegistration>,
+}
 
-fn acquire_turn_lock(turn_locks: &TurnLockMap, key: &str) -> Arc<tokio::sync::Mutex<()>> {
-    let mut map = turn_locks.lock().unwrap_or_else(|e| e.into_inner());
-    map.entry(key.to_string()).or_default().clone()
+/// A position reserved in a conversation lane at receive time.
+///
+/// Reserving the position before the content is known is what keeps
+/// per-sender debounce from reordering a shared history: the first message of
+/// a debounce bucket takes the slot, and the combined content of the whole
+/// bucket is delivered into that same slot. Without the reservation an
+/// Alice → Bob → Alice sequence would run Bob first, because Alice's bucket
+/// only resolves after her window closes.
+enum LaneSlot {
+    Ready(Box<PendingTurn>),
+    Debounced {
+        turn: Box<PendingTurn>,
+        content: tokio::sync::oneshot::Receiver<String>,
+    },
+}
+
+/// Serial lanes keyed by conversation history key.
+///
+/// Turns that share one conversation history run one at a time, in the order
+/// the transport delivered them, so history snapshot, model execution, and
+/// assistant append form one atomic turn. Sender-scoped debounce dispatches
+/// each member of a shared (`ReplyTarget`) session independently, so without
+/// this two members' turns could read different history snapshots and persist
+/// replies in an order the conversation never had. Sender-scoped sessions
+/// embed the sender in the history key, so distinct senders never contend.
+///
+/// A lane is a queue, not a mutex, and that distinction is the point: a queued
+/// turn holds no global execution permit, so a busy shared topic can never
+/// occupy the in-flight budget while merely waiting, unrelated conversations
+/// keep dispatching, and the dispatch loop stays free to read `/stop` and
+/// interruptions. A lane retires as soon as its queue drains, so the registry
+/// only ever holds conversations with work in flight.
+struct ConversationLaneRegistry {
+    lanes: std::sync::Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<LaneSlot>>>,
+    drained: tokio::sync::Notify,
+    semaphore: Arc<tokio::sync::Semaphore>,
+    in_flight: Arc<tokio::sync::Mutex<HashMap<String, InFlightSenderTaskState>>>,
+}
+
+impl ConversationLaneRegistry {
+    fn new(
+        semaphore: Arc<tokio::sync::Semaphore>,
+        in_flight: Arc<tokio::sync::Mutex<HashMap<String, InFlightSenderTaskState>>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            lanes: std::sync::Mutex::new(HashMap::new()),
+            drained: tokio::sync::Notify::new(),
+            semaphore,
+            in_flight,
+        })
+    }
+
+    /// Append a turn to its conversation lane, starting the lane if idle.
+    ///
+    /// The send happens while the registry lock is held so it cannot race a
+    /// lane that is retiring: the retiring lane re-checks its queue under the
+    /// same lock, so the slot is either picked up or lands in a fresh lane.
+    fn enqueue(self: &Arc<Self>, key: &str, slot: LaneSlot) {
+        let mut lanes = self.lanes.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = match lanes.get(key) {
+            Some(tx) => match tx.send(slot) {
+                Ok(()) => return,
+                Err(returned) => returned.0,
+            },
+            None => slot,
+        };
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        // A closed lane can only appear here if its runner retired between the
+        // lookup and now, which the registry lock prevents; re-inserting keeps
+        // the invariant that a registered lane always has a live runner.
+        lanes.insert(key.to_string(), tx.clone());
+        let registry = Arc::clone(self);
+        let lane_key = key.to_string();
+        zeroclaw_spawn::spawn!(registry.run_lane(lane_key, rx));
+
+        // Re-send after the lane exists. The only way this fails is a runner
+        // that already retired, which cannot happen while this lock is held.
+        if tx.send(slot).is_err() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"conversation": key})),
+                "conversation lane closed before its first turn was queued"
+            );
+        }
+    }
+
+    async fn run_lane(
+        self: Arc<Self>,
+        key: String,
+        mut rx: tokio::sync::mpsc::UnboundedReceiver<LaneSlot>,
+    ) {
+        loop {
+            let Some(slot) = self.next_slot(&key, &mut rx) else {
+                break;
+            };
+
+            // Resolve a reserved debounce slot to its combined content. A
+            // dropped sender means the bucket was abandoned, so the reserved
+            // position is simply skipped.
+            let mut turn = match slot {
+                LaneSlot::Ready(turn) => turn,
+                LaneSlot::Debounced { mut turn, content } => match content.await {
+                    Ok(combined) => {
+                        turn.msg.content = combined;
+                        turn
+                    }
+                    Err(_) => {
+                        self.release(turn.registration.as_ref()).await;
+                        continue;
+                    }
+                },
+            };
+
+            if !turn.hook_applied {
+                let ctx = Arc::clone(&turn.ctx);
+                let Some(hooked) = run_inbound_message_hook(&ctx, turn.msg).await else {
+                    self.release(turn.registration.as_ref()).await;
+                    continue;
+                };
+                turn.msg = hooked;
+                turn.hook_applied = true;
+
+                // The hook may rewrite routing. Exclusion has to hold on the
+                // key the processing path actually reads and writes, so a turn
+                // whose identity moved is re-queued onto the lane that owns it.
+                let routed_key = conversation_history_key(&turn.msg);
+                if routed_key != key {
+                    self.enqueue(&routed_key, LaneSlot::Ready(turn));
+                    continue;
+                }
+            }
+
+            // An interrupted predecessor is awaited before the permit is taken,
+            // so a turn never occupies the in-flight budget while waiting for
+            // one that is still winding down.
+            if let Some(superseded) = turn
+                .registration
+                .as_mut()
+                .and_then(|registration| registration.superseded.take())
+            {
+                superseded.completion.wait().await;
+            }
+
+            // The execution permit is taken here and nowhere earlier: waiting
+            // in a conversation-local queue must never consume the global
+            // in-flight budget.
+            let permit = match Arc::clone(&self.semaphore).acquire_owned().await {
+                Ok(permit) => permit,
+                // The runtime is shutting down and no further turn can start.
+                // The lane is deregistered anyway so a waiter in
+                // `wait_drained` is never left watching a lane that is gone.
+                Err(_) => {
+                    self.deregister(&key);
+                    break;
+                }
+            };
+
+            run_conversation_turn(
+                turn.ctx,
+                turn.msg,
+                Arc::clone(&self.in_flight),
+                turn.registration,
+                permit,
+            )
+            .await;
+        }
+    }
+
+    async fn release(&self, registration: Option<&TurnRegistration>) {
+        if let Some(registration) = registration {
+            registration.release(&self.in_flight).await;
+        }
+    }
+
+    /// Take the next queued slot, retiring the lane when the queue is empty.
+    ///
+    /// Retirement happens under the registry lock and re-checks the queue, so
+    /// an enqueue that is holding the lock either lands before the re-check or
+    /// creates a fresh lane — a message can never be stranded in a dead queue.
+    fn next_slot(
+        &self,
+        key: &str,
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<LaneSlot>,
+    ) -> Option<LaneSlot> {
+        use tokio::sync::mpsc::error::TryRecvError;
+        match rx.try_recv() {
+            Ok(slot) => Some(slot),
+            Err(TryRecvError::Empty) => {
+                let mut lanes = self.lanes.lock().unwrap_or_else(|e| e.into_inner());
+                match rx.try_recv() {
+                    Ok(slot) => Some(slot),
+                    Err(_) => {
+                        lanes.remove(key);
+                        let empty = lanes.is_empty();
+                        drop(lanes);
+                        if empty {
+                            self.drained.notify_waiters();
+                        }
+                        None
+                    }
+                }
+            }
+            Err(TryRecvError::Disconnected) => None,
+        }
+    }
+
+    /// Drop a lane's registration without draining its queue, for the shutdown
+    /// path where no further turn can start.
+    fn deregister(&self, key: &str) {
+        let mut lanes = self.lanes.lock().unwrap_or_else(|e| e.into_inner());
+        lanes.remove(key);
+        let empty = lanes.is_empty();
+        drop(lanes);
+        if empty {
+            self.drained.notify_waiters();
+        }
+    }
+
+    /// Wait until every lane has retired, so shutdown lets queued turns finish.
+    async fn wait_drained(&self) {
+        loop {
+            // Register before re-reading the map: a lane retiring between the
+            // check and the registration would otherwise never wake this up.
+            let notified = self.drained.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            if self
+                .lanes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+            {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// Drive one debounce bucket into the lane slot reserved for it.
+///
+/// The debouncer replaces its result sender on every re-arm, so the receiver
+/// handed out with the first message of a bucket resolves to `Err` as soon as
+/// a follow-up extends the window. The forwarder waits for the replacement the
+/// dispatch loop hands over and keeps the reserved position, which is what
+/// makes bucket order equal receive order.
+fn spawn_debounce_forwarder(
+    first: tokio::sync::oneshot::Receiver<String>,
+) -> (
+    tokio::sync::oneshot::Receiver<String>,
+    tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Receiver<String>>,
+) {
+    let (slot_tx, slot_rx) = tokio::sync::oneshot::channel();
+    let (updates_tx, mut updates_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    zeroclaw_spawn::spawn!(async move {
+        let mut pending = first;
+        loop {
+            match pending.await {
+                Ok(combined) => {
+                    let _ = slot_tx.send(combined);
+                    return;
+                }
+                Err(_) => match updates_rx.recv().await {
+                    Some(next) => pending = next,
+                    // No replacement is coming: the dispatch loop dropped the
+                    // bucket, so the reserved slot resolves to "skip".
+                    None => return,
+                },
+            }
+        }
+    });
+
+    (slot_rx, updates_tx)
 }
 
 #[derive(Clone)]
@@ -562,10 +842,18 @@ impl InFlightTaskCompletion {
     }
 
     async fn wait(&self) {
+        // Register with the waiter list *before* re-reading the flag.
+        // `notify_waiters()` retains no permit, so a completion landing between
+        // a plain flag check and the registration would be lost and leave the
+        // replacement worker parked forever.
+        let notified = self.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
         if self.done.load(Ordering::Acquire) {
             return;
         }
-        self.notify.notified().await;
+        notified.await;
     }
 }
 
@@ -4984,6 +5272,34 @@ impl Channel for ApprovalTypingChannel {
     }
 }
 
+/// Run the modifying `on_message_received` hook and return the message the
+/// rest of the pipeline must use, or `None` when a hook cancelled it.
+///
+/// This runs in the dispatch path, before the conversation lane is chosen: the
+/// hook may rewrite routing, and turn exclusion is only meaningful when the
+/// lane key and the persisted history key are the same immutable value.
+async fn run_inbound_message_hook(
+    ctx: &Arc<ChannelRuntimeContext>,
+    msg: zeroclaw_api::channel::ChannelMessage,
+) -> Option<zeroclaw_api::channel::ChannelMessage> {
+    let Some(hooks) = &ctx.hooks else {
+        return Some(msg);
+    };
+
+    match hooks.run_on_message_received(msg).await {
+        zeroclaw_runtime::hooks::HookResult::Cancel(reason) => {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"reason": reason.to_string()})),
+                "incoming message dropped by hook"
+            );
+            None
+        }
+        zeroclaw_runtime::hooks::HookResult::Continue(modified) => Some(modified),
+    }
+}
+
 async fn process_channel_message(
     ctx: Arc<ChannelRuntimeContext>,
     msg: zeroclaw_api::channel::ChannelMessage,
@@ -5154,23 +5470,11 @@ async fn process_channel_message_body(
         "channel inbound message"
     );
 
-    // ── Hook: on_message_received (modifying) ────────────
-    let mut msg = if let Some(hooks) = &ctx.hooks {
-        match hooks.run_on_message_received(msg).await {
-            zeroclaw_runtime::hooks::HookResult::Cancel(reason) => {
-                ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"reason": reason.to_string()})),
-                    "incoming message dropped by hook"
-                );
-                return;
-            }
-            zeroclaw_runtime::hooks::HookResult::Continue(modified) => modified,
-        }
-    } else {
-        msg
-    };
+    // The modifying `on_message_received` hook already ran in the dispatch
+    // path (see `run_inbound_message_hook`): it can rewrite routing, and the
+    // conversation lane that serializes this turn has to be selected from the
+    // same final identity this path reads and writes.
+    let mut msg = msg;
 
     let target_channel = find_channel_for_message(&ctx.channels_by_name, &msg).cloned();
 
@@ -6931,41 +7235,45 @@ async fn process_channel_message_body(
     }
 }
 
-/// Shared worker body extracted so both the normal path and the debounce path
-/// can reuse the same in-flight tracking / cancellation / process logic.
-async fn dispatch_worker(
-    ctx: Arc<ChannelRuntimeContext>,
-    msg: zeroclaw_api::channel::ChannelMessage,
-    in_flight: Arc<tokio::sync::Mutex<HashMap<String, InFlightSenderTaskState>>>,
-    turn_locks: TurnLockMap,
-    task_sequence: Arc<AtomicU64>,
-    permit: tokio::sync::OwnedSemaphorePermit,
-) {
-    let _permit = permit;
+/// Claim the sender's interruption slot for a message that is about to be
+/// queued.
+///
+/// Registration happens at receive time, not at execution time: a turn waiting
+/// in its conversation lane must still be reachable by `/stop` and by the
+/// sender's own follow-up, otherwise a backlog would be uninterruptible until
+/// it started running.
+async fn register_inbound_turn(
+    ctx: &Arc<ChannelRuntimeContext>,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    in_flight: &Arc<tokio::sync::Mutex<HashMap<String, InFlightSenderTaskState>>>,
+    task_sequence: &Arc<AtomicU64>,
+) -> Option<TurnRegistration> {
+    if msg.channel == "cli" || msg.passive_context {
+        return None;
+    }
+
     let interrupt_enabled = ctx
         .interrupt_on_new_message
         .enabled_for_channel(msg.channel.as_str());
-    let sender_scope_key = interruption_scope_key(&msg);
-    let cancellation_token = CancellationToken::new();
+    let scope_key = interruption_scope_key(msg);
+    let cancellation = CancellationToken::new();
     let completion = Arc::new(InFlightTaskCompletion::new());
     let task_id = task_sequence.fetch_add(1, Ordering::Relaxed);
 
-    let register_in_flight = msg.channel != "cli" && !msg.passive_context;
+    let previous = {
+        let mut active = in_flight.lock().await;
+        active.insert(
+            scope_key.clone(),
+            InFlightSenderTaskState {
+                task_id,
+                cancellation: cancellation.clone(),
+                completion: Arc::clone(&completion),
+            },
+        )
+    };
 
-    if register_in_flight {
-        let previous = {
-            let mut active = in_flight.lock().await;
-            active.insert(
-                sender_scope_key.clone(),
-                InFlightSenderTaskState {
-                    task_id,
-                    cancellation: cancellation_token.clone(),
-                    completion: Arc::clone(&completion),
-                },
-            )
-        };
-
-        if interrupt_enabled && let Some(previous) = previous {
+    let previous = match (interrupt_enabled, previous) {
+        (true, Some(previous)) => {
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -6973,31 +7281,75 @@ async fn dispatch_worker(
                 "interrupting previous in-flight request for sender"
             );
             previous.cancellation.cancel();
-            previous.completion.wait().await;
+            Some(previous)
         }
-    }
+        _ => None,
+    };
 
-    // The interruption handshake above must stay outside the turn lock: a
-    // newer message from the same sender cancels the previous in-flight turn
-    // and waits for its completion first, which lets the canceled worker
-    // release the lock before this one queues on it.
-    let turn_lock = acquire_turn_lock(&turn_locks, &conversation_history_key(&msg));
-    {
-        let _turn_guard = turn_lock.lock().await;
-        process_channel_message(ctx, msg, cancellation_token).await;
-    }
+    Some(TurnRegistration {
+        scope_key,
+        task_id,
+        cancellation,
+        completion,
+        superseded: previous,
+    })
+}
 
-    if register_in_flight {
-        let mut active = in_flight.lock().await;
-        if active
-            .get(&sender_scope_key)
-            .is_some_and(|state| state.task_id == task_id)
+/// The sender's interruption slot, claimed at receive time and released when
+/// the turn finishes or is skipped.
+struct TurnRegistration {
+    scope_key: String,
+    task_id: u64,
+    cancellation: CancellationToken,
+    completion: Arc<InFlightTaskCompletion>,
+    /// The in-flight turn this one interrupted, if `interrupt_on_new_message`
+    /// is enabled for the channel. Awaited before this turn starts.
+    superseded: Option<InFlightSenderTaskState>,
+}
+
+impl TurnRegistration {
+    async fn release(
+        &self,
+        in_flight: &Arc<tokio::sync::Mutex<HashMap<String, InFlightSenderTaskState>>>,
+    ) {
         {
-            active.remove(&sender_scope_key);
+            let mut active = in_flight.lock().await;
+            if active
+                .get(&self.scope_key)
+                .is_some_and(|state| state.task_id == self.task_id)
+            {
+                active.remove(&self.scope_key);
+            }
         }
+        self.completion.mark_done();
+    }
+}
+
+/// Run one turn to completion. The caller owns the execution permit and the
+/// conversation lane, so everything here is already exclusive for this history.
+async fn run_conversation_turn(
+    ctx: Arc<ChannelRuntimeContext>,
+    msg: zeroclaw_api::channel::ChannelMessage,
+    in_flight: Arc<tokio::sync::Mutex<HashMap<String, InFlightSenderTaskState>>>,
+    registration: Option<TurnRegistration>,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) {
+    let _permit = permit;
+
+    let Some(registration) = registration else {
+        process_channel_message(ctx, msg, CancellationToken::new()).await;
+        return;
+    };
+
+    // `/stop` or a newer message may have cancelled this turn while it was
+    // still queued; the slot is released without running it.
+    if registration.cancellation.is_cancelled() {
+        registration.release(&in_flight).await;
+        return;
     }
 
-    completion.mark_done();
+    process_channel_message(ctx, msg, registration.cancellation.clone()).await;
+    registration.release(&in_flight).await;
 }
 
 #[derive(Clone)]
@@ -7518,13 +7870,19 @@ async fn run_message_dispatch_loop(
     max_in_flight_messages: usize,
 ) {
     let semaphore = Arc::new(tokio::sync::Semaphore::new(max_in_flight_messages));
-    let mut workers = tokio::task::JoinSet::new();
     let in_flight_by_sender = Arc::new(tokio::sync::Mutex::new(HashMap::<
         String,
         InFlightSenderTaskState,
     >::new()));
     let task_sequence = Arc::new(AtomicU64::new(1));
-    let turn_locks: TurnLockMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let lanes =
+        ConversationLaneRegistry::new(Arc::clone(&semaphore), Arc::clone(&in_flight_by_sender));
+    // Open debounce buckets, keyed by debounce key: the channel that feeds the
+    // lane position reserved by the bucket's first message.
+    let mut debounce_buckets: HashMap<
+        String,
+        tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Receiver<String>>,
+    > = HashMap::new();
 
     while let Some(msg) = rx.recv().await {
         // Gate answers (button-click markers / `approve <ref>` text replies)
@@ -7636,41 +7994,41 @@ async fn run_message_dispatch_loop(
                 .await
             {
                 zeroclaw_infra::debounce::DebounceResult::Pending(rx) => {
-                    // Spawn a lightweight task that waits for the debounce window
-                    // to expire, then feeds the combined message through the normal
-                    // worker path below.
-                    let debounce_ctx = Arc::clone(&ctx);
-                    let debounce_in_flight = Arc::clone(&in_flight_by_sender);
-                    let debounce_turn_locks = Arc::clone(&turn_locks);
-                    let debounce_semaphore = Arc::clone(&semaphore);
-                    let debounce_task_seq = Arc::clone(&task_sequence);
-                    let mut debounce_msg = msg;
-                    workers.spawn(async move {
-                        let combined = match rx.await {
-                            Ok(combined) => combined,
-                            Err(_) => {
-                                // Receiver dropped — a newer message superseded this one.
-                                return;
+                    // A follow-up message extends a bucket that already owns a
+                    // lane position: hand the debouncer's replacement receiver
+                    // to that position instead of reserving a later one, so the
+                    // combined turn keeps the place of the sender's first
+                    // message. `send` only fails once the bucket has been
+                    // delivered, which means the next message starts a new one.
+                    let rx = match debounce_buckets.get(&debounce_key) {
+                        Some(bucket) => match bucket.send(rx) {
+                            Ok(()) => continue,
+                            Err(returned) => {
+                                debounce_buckets.remove(&debounce_key);
+                                returned.0
                             }
-                        };
-                        debounce_msg.content = combined;
-                        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"channel": debounce_msg.channel, "sender": debounce_msg.sender})), "Debounced message ready — dispatching combined message");
+                        },
+                        None => rx,
+                    };
 
-                        let permit = match debounce_semaphore.acquire_owned().await {
-                            Ok(permit) => permit,
-                            Err(_) => return,
-                        };
-
-                        dispatch_worker(
-                            debounce_ctx,
-                            debounce_msg,
-                            debounce_in_flight,
-                            debounce_turn_locks,
-                            debounce_task_seq,
-                            permit,
-                        )
-                        .await;
-                    });
+                    let (content, bucket) = spawn_debounce_forwarder(rx);
+                    debounce_buckets.retain(|_, open| !open.is_closed());
+                    debounce_buckets.insert(debounce_key, bucket);
+                    let registration =
+                        register_inbound_turn(&ctx, &msg, &in_flight_by_sender, &task_sequence)
+                            .await;
+                    lanes.enqueue(
+                        &conversation_history_key(&msg),
+                        LaneSlot::Debounced {
+                            turn: Box::new(PendingTurn {
+                                ctx: Arc::clone(&ctx),
+                                msg,
+                                hook_applied: false,
+                                registration,
+                            }),
+                            content,
+                        },
+                    );
                     continue;
                 }
                 zeroclaw_infra::debounce::DebounceResult::Passthrough(content) => {
@@ -7683,35 +8041,23 @@ async fn run_message_dispatch_loop(
             msg
         };
 
-        let permit = match Arc::clone(&semaphore).acquire_owned().await {
-            Ok(permit) => permit,
-            Err(_) => break,
-        };
-
-        let worker_ctx = Arc::clone(&ctx);
-        let in_flight = Arc::clone(&in_flight_by_sender);
-        let worker_turn_locks = Arc::clone(&turn_locks);
-        let task_sequence = Arc::clone(&task_sequence);
-        workers.spawn(async move {
-            dispatch_worker(
-                worker_ctx,
+        // Queueing is non-blocking on purpose: the loop must stay free to read
+        // the next message — a `/stop`, or the follow-up that interrupts an
+        // active turn — while this conversation works through its backlog.
+        let registration =
+            register_inbound_turn(&ctx, &msg, &in_flight_by_sender, &task_sequence).await;
+        lanes.enqueue(
+            &conversation_history_key(&msg),
+            LaneSlot::Ready(Box::new(PendingTurn {
+                ctx: Arc::clone(&ctx),
                 msg,
-                in_flight,
-                worker_turn_locks,
-                task_sequence,
-                permit,
-            )
-            .await;
-        });
-
-        while let Some(result) = workers.try_join_next() {
-            log_worker_join_result(result);
-        }
+                hook_applied: false,
+                registration,
+            })),
+        );
     }
 
-    while let Some(result) = workers.join_next().await {
-        log_worker_join_result(result);
-    }
+    lanes.wait_drained().await;
 }
 
 fn normalize_telegram_identity(value: &str) -> String {
@@ -23372,6 +23718,319 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             sent.iter().any(|m| m.ends_with(&stop_sent)),
             "Alice's /stop must report the cancellation: {sent:?}"
+        );
+    }
+
+    /// A conversation with a backlog must not hold the global in-flight budget
+    /// while it merely waits. A queued turn owns no execution permit, so an
+    /// unrelated conversation keeps dispatching alongside the busy topic's
+    /// current turn instead of queueing behind its whole backlog.
+    #[tokio::test]
+    async fn shared_session_queued_turn_holds_no_execution_permit() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(SlowModelProvider {
+                delay: Duration::from_millis(150),
+            }),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        let alice = shared_topic_message("alice", "m1", "busy topic first");
+        let bob = shared_topic_message("bob", "m2", "busy topic second");
+        // Another room: its own conversation lane and its own history.
+        let mut carol = shared_topic_message("carol", "m3", "unrelated room");
+        carol.reply_target = "-1009999:12".into();
+        carol.thread_ts = Some("12".into());
+        assert_eq!(
+            conversation_history_key(&alice),
+            conversation_history_key(&bob)
+        );
+        assert_ne!(
+            conversation_history_key(&alice),
+            conversation_history_key(&carol)
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
+        let send_task = zeroclaw_spawn::spawn!(async move {
+            tx.send(alice).await.unwrap();
+            tx.send(bob).await.unwrap();
+            // By now both budget slots would be spoken for if a queued turn
+            // took its permit before entering the lane.
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            tx.send(carol).await.unwrap();
+        });
+
+        // Budget of two: one for the busy topic's running turn, one that must
+        // stay available to everybody else.
+        run_message_dispatch_loop(rx, AgentRouter::single(ctx), 2).await;
+        send_task.await.unwrap();
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 3, "every turn must complete: {sent:?}");
+        let position = |marker: &str| {
+            sent.iter()
+                .position(|m| m.contains(marker))
+                .unwrap_or_else(|| panic!("no reply for {marker}: {sent:?}"))
+        };
+        assert!(
+            position("message_id=m3") < position("message_id=m2"),
+            "an unrelated conversation must not wait behind a queued shared-topic turn: {sent:?}"
+        );
+    }
+
+    /// A turn still waiting in its conversation lane must stay reachable by
+    /// its sender's `/stop`. The interruption slot is claimed at receive time,
+    /// so cancelling a not-yet-started turn drops it instead of running it
+    /// once the lane reaches it.
+    #[tokio::test]
+    async fn shared_session_stop_cancels_a_queued_turn_before_it_starts() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(SlowModelProvider {
+                delay: Duration::from_millis(150),
+            }),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
+        let send_task = zeroclaw_spawn::spawn!(async move {
+            tx.send(shared_topic_message("alice", "m1", "slow one"))
+                .await
+                .unwrap();
+            // Bob's turn queues behind Alice's on the shared lane.
+            tx.send(shared_topic_message("bob", "m2", "bob queued"))
+                .await
+                .unwrap();
+            // …and his `/stop` lands while it is still queued.
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            tx.send(shared_topic_message("bob", "s1", "/stop"))
+                .await
+                .unwrap();
+        });
+
+        run_message_dispatch_loop(rx, AgentRouter::single(ctx), 4).await;
+        send_task.await.unwrap();
+
+        let stop_sent =
+            zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-stop-sent");
+        let stop_no_task =
+            zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-stop-no-task");
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert!(
+            sent.iter().any(|m| m.ends_with(&stop_sent)),
+            "a queued turn must be found by its sender's /stop: {sent:?}"
+        );
+        assert!(
+            !sent.iter().any(|m| m.ends_with(&stop_no_task)),
+            "the queued turn must not be invisible to /stop: {sent:?}"
+        );
+        assert!(
+            !sent.iter().any(|m| m.contains("message_id=m2")),
+            "a cancelled queued turn must never run: {sent:?}"
+        );
+        assert!(
+            sent.iter().any(|m| m.contains("message_id=m1")),
+            "Alice's turn must be unaffected by Bob's /stop: {sent:?}"
+        );
+    }
+
+    /// Debounce must not reorder a shared conversation. A sender's follow-up
+    /// extends the bucket that already owns a lane position, so the combined
+    /// turn keeps the place its first message had — even though another
+    /// member's bucket, opened later, fires earlier.
+    #[tokio::test]
+    async fn shared_session_debounce_extension_keeps_receive_order() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let prompt_config = zeroclaw_config::schema::Config {
+            channels: zeroclaw_config::schema::ChannelsConfig {
+                debounce_ms: 60,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(SlowModelProvider {
+                delay: Duration::from_millis(20),
+            }),
+            prompt_config,
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        let alice_first = shared_topic_message("alice", "m1", "first part");
+        let history_key = conversation_history_key(&alice_first);
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
+        let send_task = zeroclaw_spawn::spawn!(async move {
+            tx.send(alice_first).await.unwrap();
+            // Bob opens a later bucket…
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            tx.send(shared_topic_message("bob", "m2", "bob asks"))
+                .await
+                .unwrap();
+            // …and Alice's follow-up re-arms hers, so hers now fires last.
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            tx.send(shared_topic_message("alice", "m3", "second part"))
+                .await
+                .unwrap();
+        });
+
+        run_message_dispatch_loop(rx, AgentRouter::single(Arc::clone(&ctx)), 4).await;
+        send_task.await.unwrap();
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 2, "one turn per bucket must complete: {sent:?}");
+        drop(sent);
+
+        let mut histories = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let turns = histories
+            .get(&history_key)
+            .expect("shared history must exist")
+            .clone();
+        drop(histories);
+
+        let roles: Vec<&str> = turns.iter().map(|t| t.role.as_str()).collect();
+        assert_eq!(
+            roles,
+            vec!["user", "assistant", "user", "assistant"],
+            "debounced turns must persist as complete pairs, got: {turns:?}"
+        );
+        assert!(
+            turns[0].content.starts_with("[Message from alice]"),
+            "the bucket opened first must keep the first lane position: {}",
+            turns[0].content
+        );
+        assert!(
+            turns[0].content.contains("first part") && turns[0].content.contains("second part"),
+            "a re-armed bucket must dispatch as one combined turn: {}",
+            turns[0].content
+        );
+        assert!(
+            turns[2].content.starts_with("[Message from bob]"),
+            "the later bucket must stay behind, even though it fired first: {}",
+            turns[2].content
+        );
+    }
+
+    /// Rewrites every inbound message into one room, the way a routing hook
+    /// that folds satellite chats into a main topic would.
+    struct RoomMergeHook;
+
+    #[async_trait::async_trait]
+    impl zeroclaw_runtime::hooks::HookHandler for RoomMergeHook {
+        fn name(&self) -> &str {
+            "room-merge"
+        }
+
+        async fn on_message_received(
+            &self,
+            mut message: ChannelMessage,
+        ) -> zeroclaw_runtime::hooks::HookResult<ChannelMessage> {
+            message.reply_target = "-1001234:77".into();
+            message.thread_ts = Some("77".into());
+            zeroclaw_runtime::hooks::HookResult::Continue(message)
+        }
+    }
+
+    /// `on_message_received` may rewrite routing, so the lane has to be chosen
+    /// from the post-hook message. Two messages the hook merges into one room
+    /// must serialize on a single lane instead of racing into one history from
+    /// two lanes picked by their pre-hook keys.
+    #[tokio::test]
+    async fn shared_session_hook_rerouted_turns_share_one_lane() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut hooks = zeroclaw_runtime::hooks::HookRunner::new();
+        hooks.register(Box::new(RoomMergeHook));
+        let ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(SlowModelProvider {
+                delay: Duration::from_millis(120),
+            }),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            Some(Arc::new(hooks)),
+        );
+
+        let alice = shared_topic_message("alice", "m1", "from the main topic");
+        // Bob writes in a different room, which the hook folds into Alice's.
+        let mut bob = shared_topic_message("bob", "m2", "from the satellite chat");
+        bob.reply_target = "-1005555:88".into();
+        bob.thread_ts = Some("88".into());
+        let merged_key = conversation_history_key(&alice);
+        let pre_hook_bob_key = conversation_history_key(&bob);
+        assert_ne!(
+            merged_key, pre_hook_bob_key,
+            "the pre-hook keys must differ, otherwise the test proves nothing"
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
+        let send_task = zeroclaw_spawn::spawn!(async move {
+            tx.send(alice).await.unwrap();
+            // Bob's message arrives while Alice's model call is in flight.
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            tx.send(bob).await.unwrap();
+        });
+
+        run_message_dispatch_loop(rx, AgentRouter::single(Arc::clone(&ctx)), 4).await;
+        send_task.await.unwrap();
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 2, "both turns must complete: {sent:?}");
+        assert!(
+            sent.iter().all(|m| m.starts_with("-1001234:77:")),
+            "both replies must follow the rewritten route: {sent:?}"
+        );
+        drop(sent);
+
+        let mut histories = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let turns = histories
+            .get(&merged_key)
+            .expect("the merged history must exist")
+            .clone();
+        let stray = histories.get(&pre_hook_bob_key).cloned();
+        drop(histories);
+
+        assert!(
+            stray.is_none(),
+            "no turn may be written under a pre-hook key: {stray:?}"
+        );
+        let roles: Vec<&str> = turns.iter().map(|t| t.role.as_str()).collect();
+        assert_eq!(
+            roles,
+            vec!["user", "assistant", "user", "assistant"],
+            "turns the hook merged into one history must serialize, got: {turns:?}"
+        );
+        assert!(
+            turns[0].content.contains("from the main topic"),
+            "receive order must survive the reroute: {}",
+            turns[0].content
+        );
+        assert!(
+            turns[2].content.contains("from the satellite chat"),
+            "the rerouted turn must land after the first one's reply: {}",
+            turns[2].content
         );
     }
 
