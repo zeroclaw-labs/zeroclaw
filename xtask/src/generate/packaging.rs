@@ -198,8 +198,11 @@ mod tests {
         let f = spec::resolve_feature_list(&root(), &Selection::Dist)
             .unwrap()
             .join(",");
-        assert!(f.contains("channel-matrix"));
-        assert!(f.contains("whatsapp-web"));
-        assert!(!f.contains("channel-slack"));
+        for feature in spec::resolve_feature_list(&root(), &Selection::Dist).unwrap() {
+            assert!(f.contains(&feature), "dist feature {feature} not rendered");
+        }
+        for feature in spec::features_outside_dist(&root()).unwrap() {
+            assert!(!f.contains(&feature), "{feature} leaked into lean dist");
+        }
     }
 }

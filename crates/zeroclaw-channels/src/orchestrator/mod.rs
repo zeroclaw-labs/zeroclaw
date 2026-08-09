@@ -6343,9 +6343,10 @@ async fn process_channel_message_body(
                         .await;
                 }
             } else {
+                let safe_error = zeroclaw_providers::sanitize_api_error(&e.to_string());
                 eprintln!(
-                    "  ❌ LLM error after {}ms: {e}",
-                    started_at.elapsed().as_millis()
+                    "  ❌ LLM error after {}ms: {safe_error}",
+                    started_at.elapsed().as_millis(),
                 );
 
                 // Evict cached model_provider on auth errors so the next request
@@ -6371,7 +6372,6 @@ async fn process_channel_message_body(
                         );
                     }
                 }
-                let safe_error = zeroclaw_providers::sanitize_api_error(&e.to_string());
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -14093,6 +14093,50 @@ api_key = "anthropic-key"
         }
     }
 
+    const TEST_PROVIDER_QUERY_SECRET: &str = "abc,def'ghi(jkl)";
+
+    struct QuerySecretErrorModelProvider;
+
+    #[async_trait::async_trait]
+    impl ModelProvider for QuerySecretErrorModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        async fn chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!(
+                "Custom API error (400 Bad Request): error sending request for url \
+                 (https://generativelanguage.googleapis.com/v1beta/models/test:generateContent\
+                 ?access_token={TEST_PROVIDER_QUERY_SECRET})"
+            )
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for QuerySecretErrorModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "QuerySecretErrorModelProvider"
+        }
+    }
+
     #[derive(Default)]
     struct RecordingChannel {
         sent_messages: tokio::sync::Mutex<Vec<String>>,
@@ -14944,6 +14988,81 @@ api_key = "anthropic-key"
             "brackets must share a turn_id even on error"
         );
         assert!(starts[0].2.is_some(), "brackets must carry a turn_id");
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn provider_query_secret_is_absent_from_channel_error_log_and_reply() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(QuerySecretErrorModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        let mut msg = message_sent_hook_test_message();
+        msg.id = "msg-query-secret-error".to_string();
+        msg.sender = "query-secret-sender".to_string();
+
+        process_channel_message(runtime_ctx, msg, CancellationToken::new()).await;
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        let reply = sent_messages
+            .last()
+            .expect("provider failure must send an error reply");
+        assert!(
+            !reply.contains(TEST_PROVIDER_QUERY_SECRET),
+            "channel reply leaked provider query secret: {reply}"
+        );
+        assert!(
+            reply.contains("generativelanguage.googleapis.com/v1beta/models/test:generateContent"),
+            "sanitized reply should preserve the useful endpoint: {reply}"
+        );
+        drop(sent_messages);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut error_event = None;
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await {
+                Ok(Ok(value))
+                    if value.get("message").and_then(|v| v.as_str())
+                        == Some("channel_message_error")
+                        && value.pointer("/attributes/sender").and_then(|v| v.as_str())
+                            == Some("query-secret-sender") =>
+                {
+                    error_event = Some(value);
+                    break;
+                }
+                Ok(Ok(_))
+                | Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_)))
+                | Err(_) => {}
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+            }
+        }
+
+        let event = error_event.expect("channel_message_error log must be emitted");
+        let logged_error = event
+            .pointer("/attributes/error")
+            .and_then(|value| value.as_str())
+            .expect("channel_message_error must carry the sanitized error attribute");
+        assert!(
+            !logged_error.contains(TEST_PROVIDER_QUERY_SECRET),
+            "structured log leaked provider query secret: {event}"
+        );
+        assert!(
+            logged_error
+                .contains("generativelanguage.googleapis.com/v1beta/models/test:generateContent"),
+            "structured log should preserve the useful endpoint: {event}"
+        );
     }
 
     /// A turn cancelled mid-flight (interrupt-on-new-message) must still

@@ -331,7 +331,34 @@ fn classify_model_probe_error(err_message: &str) -> ModelProbeOutcome {
 
 fn doctor_model_targets(config: &Config, provider_override: Option<&str>) -> Vec<String> {
     if let Some(model_provider) = provider_override.map(str::trim).filter(|p| !p.is_empty()) {
-        return vec![model_provider.to_string()];
+        if model_provider.contains('.') {
+            return vec![model_provider.to_string()];
+        }
+
+        // A bare family name expands to every alias configured under it.
+        // Passing it through undotted reaches `create_model_provider_with_options`,
+        // which nulls `provider_api_url` and never looks the alias up — so the
+        // probe silently used the family's compiled-in default endpoint and
+        // reported a self-hosted gateway as unreachable at an address the
+        // operator never configured. Expanding here keeps the same invariant
+        // the orchestrator states for `/models`: a bare family must never
+        // construct a provider that ignores `[providers.models.<f>.<alias>]`.
+        let mut aliases: Vec<String> = config
+            .providers
+            .models
+            .aliases_of(model_provider)
+            .map(ToString::to_string)
+            .collect();
+        aliases.sort();
+        if aliases.is_empty() {
+            // Unknown or unconfigured family: hand the raw name downstream so
+            // the existing "no such provider" diagnostics still fire.
+            return vec![model_provider.to_string()];
+        }
+        return aliases
+            .into_iter()
+            .map(|alias| format!("{model_provider}.{alias}"))
+            .collect();
     }
 
     config
@@ -2296,6 +2323,94 @@ mod tests {
             result.is_err(),
             "a targeted refresh must fail the command when the fetched catalog cannot be persisted, \
              even though the network fetch itself succeeded"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bare_family_probes_the_configured_endpoint_not_the_compiled_default() {
+        // The regression: `--model-provider ollama` (bare) used to reach
+        // `create_model_provider_with_options`, which nulls the resolved API
+        // URL, so the probe hit the family's compiled-in default instead of
+        // the operator's `uri`. Self-hosted gateways were reported unreachable
+        // at an address nobody configured. The mock asserts on drop that the
+        // request actually arrived here.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v1/models"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "data": [{"id": "llama3", "object": "model"}]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = config_with_install_root(&tmp);
+        config
+            .providers
+            .models
+            .ensure("ollama", "homelab")
+            .expect("known model_provider type")
+            .uri = Some(format!("{}/v1", server.uri()));
+
+        run_models(&config, Some("ollama"), false, false)
+            .await
+            .expect("a bare family with one configured alias must probe that alias");
+    }
+
+    #[test]
+    fn a_bare_family_expands_to_every_configured_alias() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = config_with_install_root(&tmp);
+        for alias in ["homelab", "workstation"] {
+            config
+                .providers
+                .models
+                .ensure("ollama", alias)
+                .expect("known model_provider type")
+                .uri = Some("http://example.invalid".to_owned());
+        }
+
+        assert_eq!(
+            doctor_model_targets(&config, Some("ollama")),
+            vec!["ollama.homelab".to_owned(), "ollama.workstation".to_owned()],
+            "a bare family must fan out to its aliases rather than collapse to a config-less default"
+        );
+    }
+
+    #[test]
+    fn an_unconfigured_family_still_reaches_the_downstream_diagnostics() {
+        // Nothing configured under the family: keep handing the raw name down
+        // so the existing "no such provider" error text is what the user sees,
+        // rather than an empty target list that silently probes nothing.
+        let tmp = TempDir::new().unwrap();
+        let config = config_with_install_root(&tmp);
+        assert_eq!(
+            doctor_model_targets(&config, Some("ollama")),
+            vec!["ollama".to_owned()]
+        );
+        assert_eq!(
+            doctor_model_targets(&config, Some("nonsense")),
+            vec!["nonsense".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_dotted_ref_is_passed_through_untouched() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = config_with_install_root(&tmp);
+        config
+            .providers
+            .models
+            .ensure("ollama", "homelab")
+            .expect("known model_provider type")
+            .uri = Some("http://example.invalid".to_owned());
+
+        assert_eq!(
+            doctor_model_targets(&config, Some("ollama.homelab")),
+            vec!["ollama.homelab".to_owned()]
         );
     }
 
