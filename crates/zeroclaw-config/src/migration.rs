@@ -1281,6 +1281,81 @@ vision_model_provider = "grok"
     }
 
     #[test]
+    fn v2_explicit_default_provider_variant_overlay_stays_fail_closed() {
+        // `default_provider = "qwen-intl"` selects the international variant,
+        // but the raw `qwen` entry already materialized `qwen.default` with the
+        // cn endpoint. The fold is fill-only, so `endpoint = intl` cannot
+        // replace the existing cn endpoint. The selector is therefore a
+        // DIFFERENT source than the slot's recorded producer: it must register
+        // as a distinct producer and leave the bare `qwen` reference fail-closed
+        // rather than rewrite it to `qwen.default` and consume the global
+        // credential against the cn endpoint.
+        let raw = r#"
+schema_version = 2
+
+[providers]
+default_provider = "qwen-intl"
+api_key = "global-test-key"
+default_model = "vision-model"
+
+[providers.models.qwen]
+model = "canonical-model"
+
+[multimodal]
+vision_model_provider = "qwen"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("qwen"),
+            "a default_provider naming a different variant than the slot's \
+             producer must leave the bare reference fail-closed"
+        );
+    }
+
+    #[test]
+    fn v2_explicit_default_provider_distinct_colon_url_stays_fail_closed() {
+        // Two distinct colon-URL sources: the raw entry materializes
+        // `custom.default` with uri A, while `default_provider =
+        // "custom:https://B"` selects a different URL. The URL is part of the
+        // source identity, so the selector is NOT an equivalent overlay of the
+        // existing slot: it must stay a distinct producer and leave the bare
+        // `custom` reference fail-closed rather than consume the credential
+        // against URL A.
+        let raw = r#"
+schema_version = 2
+
+[providers]
+default_provider = "custom:https://b.example.invalid/v1"
+api_key = "global-test-key"
+default_model = "vision-model"
+
+[providers.models."custom:https://a.example.invalid/v1"]
+model = "vision-model"
+
+[multimodal]
+vision_model_provider = "custom"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("custom"),
+            "a default_provider naming a different colon-URL source than the \
+             slot's producer must leave the bare reference fail-closed"
+        );
+        let alias = cfg
+            .providers
+            .models
+            .find("custom", "default")
+            .expect("the migrated custom.default alias must exist");
+        assert_eq!(
+            alias.uri.as_deref(),
+            Some("https://a.example.invalid/v1"),
+            "the slot's existing uri must survive the non-equivalent overlay"
+        );
+    }
+
+    #[test]
     fn v2_globals_create_missing_default_alias_beside_non_default_alias() {
         // No `default_provider`, only a non-default alias (`openai.codex` from
         // `openai-codex`), and global `[providers]` values. The globals fold

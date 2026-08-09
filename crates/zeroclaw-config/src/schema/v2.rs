@@ -246,7 +246,11 @@ impl V2Config {
 
         // V3 ModelProviderConfig absorbed the V2 [providers] globals
         // (api_key, default_model, etc.) inline; fold them down.
-        let folded = fold_providers_globals_into_models(&mut new_providers, &mut aliased_models);
+        let folded = fold_providers_globals_into_models(
+            &mut new_providers,
+            &mut aliased_models,
+            &provenance,
+        );
         // Reflect the fold in alias provenance so the later bare-vision rewrite
         // never reads authority the fold did not earn. An explicit
         // `default_provider` or the synthesized OpenRouter fallback registers as
@@ -900,6 +904,7 @@ enum GlobalFold {
 fn fold_providers_globals_into_models(
     new_providers: &mut toml::Table,
     aliased_models: &mut toml::Table,
+    provenance: &std::collections::HashMap<(String, String), std::collections::BTreeSet<String>>,
 ) -> GlobalFold {
     let g_api_key = new_providers.remove("api_key");
     let g_api_url = new_providers.remove("api_url");
@@ -944,11 +949,33 @@ fn fold_providers_globals_into_models(
             Some(s) => {
                 let (raw_type, url) = split_colon_url_provider(s);
                 let (canonical, alias, extras) = normalize_provider_type(&raw_type, "default");
-                let existed = aliased_models
-                    .get(&canonical)
-                    .and_then(toml::Value::as_table)
-                    .is_some_and(|t| t.contains_key(&alias));
-                let source_key = (!existed).then(|| raw_type.clone());
+                // The explicit selector is an equivalent overlay of an existing
+                // slot only when the slot's recorded producer has the SAME
+                // source identity: canonical family, alias, variant extras
+                // (endpoint/auth_mode/uri), and — for colon-URL forms — the
+                // same URL. Checking only that the slot exists is not enough: a
+                // `qwen-intl` default_provider over a `qwen`-materialized
+                // `qwen.default` differs by endpoint, and two distinct
+                // `custom:https://...` selectors differ by URL. In those cases
+                // the selector names a different source, so it must register as
+                // a distinct producer (making the slot ambiguous and leaving the
+                // bare vision reference fail-closed) rather than be suppressed
+                // and let the rewrite consume a credential against the wrong
+                // endpoint.
+                let equivalent_existing = provenance
+                    .get(&(canonical.clone(), alias.clone()))
+                    .is_some_and(|producers| {
+                        producers.iter().any(|key| {
+                            let (existing_type, existing_url) = split_colon_url_provider(key);
+                            let (family, fam_alias, fam_extras) =
+                                normalize_provider_type(&existing_type, "default");
+                            family == canonical
+                                && fam_alias == alias
+                                && fam_extras == extras
+                                && existing_url == url
+                        })
+                    });
+                let source_key = (!equivalent_existing).then(|| raw_type.clone());
                 (canonical, alias, url, extras, source_key, false)
             }
             None => match aliased_models.keys().len() {
