@@ -38,9 +38,13 @@ impl SessionStore {
     }
 
     /// Load all messages for a session from its JSONL file.
-    /// Returns an empty vec if the file does not exist or is unreadable.
+    /// Returns an empty vec if the path is not a regular JSONL session file or
+    /// the file is unreadable.
     pub fn load(&self, session_key: &str) -> Vec<ChatMessage> {
         let path = self.session_path(session_key);
+        if !is_regular_jsonl_session_file(&path) {
+            return Vec::new();
+        }
         let file = match std::fs::File::open(&path) {
             Ok(f) => f,
             Err(_) => return Vec::new(),
@@ -161,6 +165,9 @@ impl SessionStore {
     /// The file is preserved (empty) so the session key remains in `list_sessions`.
     pub fn clear_messages(&self, session_key: &str) -> std::io::Result<usize> {
         let _guard = self.mutation_lock.lock();
+        if !is_regular_jsonl_session_file(&self.session_path(session_key)) {
+            return Ok(0);
+        }
         let count = self.load(session_key).len();
         if count > 0 {
             self.rewrite(session_key, &[])?;
@@ -168,25 +175,29 @@ impl SessionStore {
         Ok(count)
     }
 
-    /// Delete a session's JSONL file. Returns `true` if the file existed.
+    /// Delete a regular session JSONL file. Returns `true` if the file existed.
     pub fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
         let _guard = self.mutation_lock.lock();
         let path = self.session_path(session_key);
-        if !path.exists() {
+        if !is_regular_jsonl_session_file(&path) {
             return Ok(false);
         }
         std::fs::remove_file(&path)?;
         Ok(true)
     }
 
-    /// Return the modification time of a session's JSONL file.
+    /// Return the modification time of a regular session JSONL file.
     pub fn session_mtime(&self, session_key: &str) -> Option<std::time::SystemTime> {
-        std::fs::metadata(self.session_path(session_key))
+        let path = self.session_path(session_key);
+        if !is_regular_jsonl_session_file(&path) {
+            return None;
+        }
+        std::fs::symlink_metadata(path)
             .and_then(|m| m.modified())
             .ok()
     }
 
-    /// List all session keys that have files on disk.
+    /// List all session keys that have regular JSONL files on disk.
     pub fn list_sessions(&self) -> Vec<String> {
         let entries = match std::fs::read_dir(&self.sessions_dir) {
             Ok(e) => e,
@@ -196,11 +207,20 @@ impl SessionStore {
         entries
             .filter_map(|entry| {
                 let entry = entry.ok()?;
+                if !is_regular_jsonl_session_file(&entry.path()) {
+                    return None;
+                }
                 let name = entry.file_name().into_string().ok()?;
                 name.strip_suffix(".jsonl").map(String::from)
             })
             .collect()
     }
+}
+
+fn is_regular_jsonl_session_file(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension == "jsonl")
+        && std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
 }
 
 fn mutation_lock_for(sessions_dir: &Path) -> std::io::Result<Arc<MutationLock>> {
@@ -275,20 +295,30 @@ impl SessionBackend for SessionStore {
         self.delete_session(session_key)
     }
 
-    /// Quick existence probe mirroring how `delete_session` decides whether
-    /// the session is on disk Checking file presence is the same
-    /// O(1) `stat` that `delete_session` itself performs.
+    /// Quick existence probe using the same regular-file policy as the other
+    /// JSONL session operations.
     fn session_exists(&self, session_key: &str) -> bool {
-        self.session_path(session_key).exists()
+        is_regular_jsonl_session_file(&self.session_path(session_key))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    fn symlink_file(original: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(original, link)
+    }
+
+    #[cfg(windows)]
+    fn symlink_file(original: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_file(original, link)
+    }
 
     #[test]
     fn round_trip_append_and_load() {
@@ -383,6 +413,73 @@ mod tests {
         assert_eq!(sessions.len(), 2);
         assert!(sessions.contains(&"discord_bob".to_string()));
         assert!(sessions.contains(&"telegram_alice".to_string()));
+    }
+
+    #[test]
+    fn session_operations_accept_only_regular_jsonl_files() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let backend: &dyn SessionBackend = &store;
+        let sessions_dir = tmp.path().join("sessions");
+
+        backend
+            .append("valid", &ChatMessage::user("persisted message"))
+            .unwrap();
+        std::fs::create_dir(sessions_dir.join("directory.jsonl")).unwrap();
+        std::fs::write(sessions_dir.join("notes.txt"), "not a session").unwrap();
+
+        let mut invalid_keys = vec!["directory"];
+
+        #[cfg(any(unix, windows))]
+        {
+            let linked = sessions_dir.join("linked.jsonl");
+            match symlink_file(&store.session_path("valid"), &linked) {
+                Ok(()) => {
+                    symlink_file(
+                        &sessions_dir.join("missing.jsonl"),
+                        &sessions_dir.join("dangling.jsonl"),
+                    )
+                    .unwrap();
+                    invalid_keys.extend(["linked", "dangling"]);
+                }
+                #[cfg(windows)]
+                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+                Err(error) => panic!("failed to create session symlink fixture: {error}"),
+            }
+        }
+
+        assert_eq!(store.list_sessions(), vec!["valid".to_string()]);
+        assert!(backend.session_exists("valid"));
+        assert_eq!(backend.load("valid").len(), 1);
+        assert!(store.session_mtime("valid").is_some());
+
+        for key in invalid_keys {
+            assert!(!backend.session_exists(key), "{key} must not exist");
+            assert!(backend.load(key).is_empty(), "{key} must not load");
+            assert!(
+                store.session_mtime(key).is_none(),
+                "{key} must not expose an mtime"
+            );
+            assert_eq!(
+                backend.clear_messages(key).unwrap(),
+                0,
+                "{key} must not be cleared"
+            );
+            assert!(
+                !backend.delete_session(key).unwrap(),
+                "{key} must not be deleted"
+            );
+            assert!(
+                std::fs::symlink_metadata(store.session_path(key)).is_ok(),
+                "{key} filesystem entry must remain untouched"
+            );
+        }
+
+        assert_eq!(backend.clear_messages("valid").unwrap(), 1);
+        assert!(backend.session_exists("valid"));
+        assert!(backend.delete_session("valid").unwrap());
+        assert!(!backend.session_exists("valid"));
+        assert!(sessions_dir.join("notes.txt").is_file());
     }
 
     #[test]
