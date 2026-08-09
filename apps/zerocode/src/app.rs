@@ -3,7 +3,9 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyEventKind, MouseEventKind};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -19,7 +21,7 @@ use crate::config;
 use crate::config_manager;
 use crate::dashboard;
 use crate::doctor;
-use crate::keymap::{GlobalAction, ModalAction};
+use crate::keymap::{GlobalAction, ModalAction, SearchBoxAction};
 use crate::logs;
 use crate::mouse;
 use crate::quickstart_pane;
@@ -56,6 +58,82 @@ enum QuickstartChatDrain {
 /// How often the UI redraws when no input arrives (for live panes).
 const TICK: Duration = Duration::from_millis(200);
 const CHROME_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const MAX_COALESCED_MOUSE_DRAGS: usize = 64;
+
+fn mouse_drag_button(event: &Event) -> Option<crossterm::event::MouseButton> {
+    match event {
+        Event::Mouse(mouse) => match mouse.kind {
+            MouseEventKind::Drag(button) => Some(button),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn coalesce_mouse_drag<F>(mut current: Event, mut read_queued: F) -> Result<(Event, Option<Event>)>
+where
+    F: FnMut() -> Result<Option<Event>>,
+{
+    let Some(button) = mouse_drag_button(&current) else {
+        return Ok((current, None));
+    };
+
+    let mut coalesced = 1;
+    while coalesced < MAX_COALESCED_MOUSE_DRAGS {
+        let Some(next) = read_queued()? else {
+            return Ok((current, None));
+        };
+        if mouse_drag_button(&next) == Some(button) {
+            current = next;
+            coalesced += 1;
+        } else {
+            return Ok((current, Some(next)));
+        }
+    }
+    Ok((current, None))
+}
+
+/// Ephemeral interaction state for the keybinding overlay. Keybinding
+/// metadata itself stays in the action/help registry and is resolved on draw.
+#[derive(Debug, Default)]
+struct HelpOverlayState {
+    query: String,
+    scroll: usize,
+}
+
+impl HelpOverlayState {
+    /// Handle a key while the overlay has focus. Returns `true` when it
+    /// should close.
+    fn handle_key(&mut self, key: &KeyEvent) -> bool {
+        match SearchBoxAction::from_chord(key) {
+            Some(SearchBoxAction::Cancel) if self.query.is_empty() => return true,
+            Some(SearchBoxAction::Cancel) => {
+                self.query.clear();
+                self.scroll = 0;
+            }
+            Some(SearchBoxAction::Backspace) => {
+                self.query.pop();
+                self.scroll = 0;
+            }
+            Some(SearchBoxAction::Up) => {
+                self.scroll = self.scroll.saturating_sub(1);
+            }
+            Some(SearchBoxAction::Down) => {
+                self.scroll = self.scroll.saturating_add(1);
+            }
+            Some(SearchBoxAction::Accept) => {}
+            None => {
+                if let KeyCode::Char(c) = key.code
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                {
+                    self.query.push(c);
+                    self.scroll = 0;
+                }
+            }
+        }
+        false
+    }
+}
 
 /// Mode bar entries. Shared between drawing and click detection.
 /// SOP authoring is not exposed from any build: the web dashboard ships as the
@@ -280,7 +358,7 @@ pub async fn run(
 ) -> Result<()> {
     let mut mode = Mode::Dashboard;
     theme::set_agent_overrides(resolve_agent_overrides(config_dir));
-    let mut show_help = false;
+    let mut help_overlay: Option<HelpOverlayState> = None;
     let mut reload_confirm = false;
     let mut quit_confirm = false;
     let mut reload_status: Option<String> = None;
@@ -358,6 +436,7 @@ pub async fn run(
     )?;
     let mut chrome_status = ChromeStatus::default();
     chrome_status.tick(&rpc);
+    let mut pending_event = None;
 
     loop {
         // Draw
@@ -474,7 +553,7 @@ pub async fn run(
             );
 
             // Help modal overlay (drawn last so it sits on top).
-            if show_help {
+            if let Some(state) = help_overlay.as_mut() {
                 let mut node = HelpNode::entries(global_help_entries());
                 let pane_node = match mode {
                     Mode::Dashboard => dashboard_pane.help_context(),
@@ -487,7 +566,7 @@ pub async fn run(
                     Mode::Sop => sop_pane.help_context(),
                 };
                 node.children.push(pane_node);
-                draw_help_modal(frame, frame.area(), &node);
+                draw_help_modal(frame, frame.area(), &node, state);
             }
 
             if reload_confirm {
@@ -576,31 +655,44 @@ pub async fn run(
             }
         }
 
-        // Poll for input with a timeout so live panes refresh periodically.
-        if !event::poll(TICK)? {
-            if matches!(conn_state, ConnectionState::Disconnected { .. }) {
+        let input_event = if let Some(pending) = pending_event.take() {
+            pending
+        } else {
+            // Poll for input with a timeout so live panes refresh periodically.
+            if !event::poll(TICK)? {
+                if matches!(conn_state, ConnectionState::Disconnected { .. }) {
+                    continue;
+                }
+                if mode == Mode::Dashboard {
+                    dashboard_pane.tick().await;
+                }
+                if mode == Mode::Logs {
+                    logs_pane.tick().await;
+                }
+                if mode == Mode::Quickstart {
+                    quickstart.tick().await;
+                }
+                consume_pending_quickstart_chat(
+                    &conn_state,
+                    &reconnect_state,
+                    &mut mode,
+                    &mut chat_pane,
+                )
+                .await;
                 continue;
             }
-            if mode == Mode::Dashboard {
-                dashboard_pane.tick().await;
+            event::read()?
+        };
+        let (input_event, next_pending) = coalesce_mouse_drag(input_event, || {
+            if event::poll(Duration::ZERO)? {
+                Ok(Some(event::read()?))
+            } else {
+                Ok(None)
             }
-            if mode == Mode::Logs {
-                logs_pane.tick().await;
-            }
-            if mode == Mode::Quickstart {
-                quickstart.tick().await;
-            }
-            consume_pending_quickstart_chat(
-                &conn_state,
-                &reconnect_state,
-                &mut mode,
-                &mut chat_pane,
-            )
-            .await;
-            continue;
-        }
+        })?;
+        pending_event = next_pending;
 
-        match event::read()? {
+        match input_event {
             Event::Key(key) => {
                 if key.kind == KeyEventKind::Release {
                     continue;
@@ -655,7 +747,7 @@ pub async fn run(
                         }
                         _ => {}
                     }
-                    show_help = false;
+                    help_overlay = None;
                     reload_confirm = false;
                     reload_status = None;
                     quit_confirm = true;
@@ -692,17 +784,34 @@ pub async fn run(
                     continue;
                 }
 
-                // Help modal: any key dismisses it.
-                if show_help {
-                    show_help = false;
+                // The help overlay owns keyboard focus while open. Its opening
+                // chord toggles it closed; Esc clears a filter before closing.
+                if let Some(state) = help_overlay.as_mut() {
+                    if global == Some(GlobalAction::Help) || state.handle_key(&key) {
+                        help_overlay = None;
+                    }
                     continue;
                 }
 
-                let switch_to: Option<Mode> = match global {
-                    Some(GlobalAction::PaneNavLeft) => Some(mode.cycle(-1)),
-                    Some(GlobalAction::PaneNavRight) => Some(mode.cycle(1)),
-                    _ => None,
+                let editor_claims_pane_navigation = matches!(
+                    global,
+                    Some(GlobalAction::PaneNavLeft | GlobalAction::PaneNavRight)
+                ) && match mode {
+                    Mode::Config => config_app.claims_pane_navigation(&key),
+                    Mode::Acp => acp_pane.claims_pane_navigation(&key),
+                    Mode::Chat => chat_pane.claims_pane_navigation(&key),
+                    _ => false,
                 };
+                // Disconnected panes are skipped below to avoid dead-socket RPCs,
+                // so a retained editor cannot consume its local cursor chord.
+                let pane_can_receive_editor_chord =
+                    !matches!(conn_state, ConnectionState::Disconnected { .. });
+                let switch_to = pane_switch_delta(
+                    global,
+                    editor_claims_pane_navigation,
+                    pane_can_receive_editor_chord,
+                )
+                .map(|delta| mode.cycle(delta));
                 if let Some(next) = switch_to {
                     switch_mode(
                         &mut mode,
@@ -721,7 +830,7 @@ pub async fn run(
                 if global == Some(GlobalAction::Help)
                     && (!in_text_input || crate::keymap::help_bypasses_text_input(&key))
                 {
-                    show_help = true;
+                    help_overlay = Some(HelpOverlayState::default());
                     continue;
                 }
 
@@ -746,10 +855,10 @@ pub async fn run(
                 }
                 match mode {
                     Mode::Acp if acp_pane.take_help_request() => {
-                        show_help = true;
+                        help_overlay = Some(HelpOverlayState::default());
                     }
                     Mode::Chat if chat_pane.take_help_request() => {
-                        show_help = true;
+                        help_overlay = Some(HelpOverlayState::default());
                     }
                     _ => {}
                 }
@@ -775,10 +884,18 @@ pub async fn run(
                 .await;
             }
             Event::Mouse(mouse) => {
-                // Dismiss help on any click
-                if show_help {
-                    if matches!(mouse.kind, MouseEventKind::Down(_)) {
-                        show_help = false;
+                if let Some(state) = help_overlay.as_mut() {
+                    match mouse.kind {
+                        MouseEventKind::ScrollUp => {
+                            state.scroll = state.scroll.saturating_sub(3);
+                        }
+                        MouseEventKind::ScrollDown => {
+                            state.scroll = state.scroll.saturating_add(3);
+                        }
+                        MouseEventKind::Down(_) => {
+                            help_overlay = None;
+                        }
+                        _ => {}
                     }
                     continue;
                 }
@@ -814,7 +931,7 @@ pub async fn run(
                 if matches!(mouse.kind, MouseEventKind::Down(_))
                     && mouse::help_hint_click(mouse.column, mouse.row, content_area)
                 {
-                    show_help = true;
+                    help_overlay = Some(HelpOverlayState::default());
                     continue;
                 }
                 // Forward to active pane (skip when disconnected).
@@ -852,6 +969,14 @@ pub async fn run(
                         &mut chat_pane,
                     )
                     .await;
+                }
+            }
+            Event::Paste(text) if help_overlay.is_some() => {
+                if let Some(state) = help_overlay.as_mut() {
+                    state
+                        .query
+                        .extend(text.chars().filter(|character| !character.is_control()));
+                    state.scroll = 0;
                 }
             }
             Event::Paste(text) if !matches!(conn_state, ConnectionState::Disconnected { .. }) => {
@@ -902,6 +1027,21 @@ fn global_help_entries() -> Vec<HelpEntry> {
         ),
         HelpEntry::spacer(),
     ]
+}
+
+fn pane_switch_delta(
+    global: Option<GlobalAction>,
+    editor_claims_chord: bool,
+    pane_can_receive_editor_chord: bool,
+) -> Option<isize> {
+    if editor_claims_chord && pane_can_receive_editor_chord {
+        return None;
+    }
+    match global {
+        Some(GlobalAction::PaneNavLeft) => Some(-1),
+        Some(GlobalAction::PaneNavRight) => Some(1),
+        _ => None,
+    }
 }
 
 fn resolve_agent_overrides(
@@ -1158,32 +1298,117 @@ fn soft_wrap(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-fn draw_help_modal(frame: &mut ratatui::Frame, area: Rect, node: &HelpNode) {
+fn filter_help_node(node: &HelpNode, query: &str) -> Option<HelpNode> {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return Some(node.clone());
+    }
+
+    let node_matches = node
+        .title
+        .as_deref()
+        .is_some_and(|title| title.to_lowercase().contains(&needle))
+        || node
+            .description
+            .as_deref()
+            .is_some_and(|description| description.to_lowercase().contains(&needle));
+    if node_matches {
+        return Some(node.clone());
+    }
+
+    let entries: Vec<HelpEntry> = node
+        .entries
+        .iter()
+        .filter(|entry| {
+            entry.key_str().to_lowercase().contains(&needle)
+                || entry.action.to_lowercase().contains(&needle)
+        })
+        .cloned()
+        .collect();
+    let children: Vec<HelpNode> = node
+        .children
+        .iter()
+        .filter_map(|child| filter_help_node(child, &needle))
+        .collect();
+
+    if entries.is_empty() && children.is_empty() {
+        return None;
+    }
+
+    Some(HelpNode {
+        title: node.title.clone(),
+        description: None,
+        entries,
+        children,
+    })
+}
+
+fn help_control_hint() -> String {
+    use crate::keymap::action_key_labels;
+
+    let up = action_key_labels(SearchBoxAction::Up).join("/");
+    let down = action_key_labels(SearchBoxAction::Down).join("/");
+    let cancel = action_key_labels(SearchBoxAction::Cancel).join("/");
+    crate::i18n::t_args(
+        "zc-app-help-controls",
+        &[("up", &up), ("down", &down), ("cancel", &cancel)],
+    )
+}
+
+fn draw_help_modal(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    node: &HelpNode,
+    state: &mut HelpOverlayState,
+) {
     // We need inner_width to soft-wrap descriptions. Use a generous default
     // first pass, then clamp to terminal width.
     let max_inner_w = (area.width as usize).saturating_sub(6).max(30);
 
+    let mut all_flat: Vec<(String, String)> = Vec::new();
+    flatten_help_node(node, &mut all_flat, max_inner_w);
     let mut flat: Vec<(String, String)> = Vec::new();
-    flatten_help_node(node, &mut flat, max_inner_w);
+    if let Some(filtered) = filter_help_node(node, &state.query) {
+        flatten_help_node(&filtered, &mut flat, max_inner_w);
+    }
 
     // Compute key column width (skip sentinels and prose-only lines).
-    let key_width = flat
+    let key_width = all_flat
         .iter()
         .filter(|(k, _)| k != "\x01")
-        .map(|(k, _)| k.len())
+        .map(|(k, _)| crate::display_width::display_width(k))
         .max()
         .unwrap_or(0);
-    let val_width = flat
+    let val_width = all_flat
         .iter()
         .filter(|(k, _)| k != "\x01")
-        .map(|(_, v)| v.len())
+        .map(|(_, v)| crate::display_width::display_width(v))
         .max()
         .unwrap_or(0);
 
-    let inner_w = key_width + 2 + val_width;
+    let title = format!(" {} ", crate::i18n::t("zc-app-keybindings-title"));
+    let filter_label = crate::i18n::t("zc-app-help-filter-label");
+    let filter_placeholder = crate::i18n::t("zc-app-help-filter-placeholder");
+    let filter_display = if state.query.is_empty() {
+        filter_placeholder.as_str()
+    } else {
+        &state.query
+    };
+    let control_hint = help_control_hint();
+    let chrome_width = [
+        crate::display_width::display_width(&title),
+        crate::display_width::display_width(&filter_label)
+            + 2
+            + crate::display_width::display_width(filter_display),
+        crate::display_width::display_width(&control_hint),
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or(0);
+    let inner_w = (key_width + 2 + val_width).max(chrome_width);
     let box_w = (inner_w + 4).min(area.width as usize) as u16;
-    // +4: 2 border + 1 title + 1 footer + 1 blank
-    let box_h = (flat.len() + 5).min(area.height as usize) as u16;
+    // +4: 2 border + 1 filter row + 1 footer row.
+    let box_h = (all_flat.len() + 4).min(area.height as usize) as u16;
 
     let x = area.x + area.width.saturating_sub(box_w) / 2;
     let y = area.y + area.height.saturating_sub(box_h) / 2;
@@ -1195,14 +1420,43 @@ fn draw_help_modal(frame: &mut ratatui::Frame, area: Rect, node: &HelpNode) {
         .borders(Borders::ALL)
         .border_style(theme::dim_style())
         .style(theme::fill_style())
-        .title(Span::styled(" Keybindings ", theme::heading_style()));
+        .title(Span::styled(title, theme::heading_style()));
 
     let inner = block.inner(modal_rect);
     frame.render_widget(block, modal_rect);
 
-    let rule_width = inner.width as usize;
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    let filter_value = if state.query.is_empty() {
+        Span::styled(filter_placeholder, theme::dim_style())
+    } else {
+        Span::styled(state.query.clone(), theme::accent_style())
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(format!("{filter_label}: "), theme::body_style()),
+            filter_value,
+        ]))
+        .style(theme::fill_style()),
+        chunks[0],
+    );
+
+    let rule_width = chunks[1].width as usize;
     let mut text_lines: Vec<Line> = Vec::new();
 
+    if flat.is_empty() {
+        text_lines.push(Line::from(Span::styled(
+            crate::i18n::t("zc-app-help-no-matches"),
+            theme::dim_style(),
+        )));
+    }
     for (key, val) in &flat {
         if key == "\x01" {
             // Dim horizontal rule, optionally with a label.
@@ -1212,7 +1466,7 @@ fn draw_help_modal(frame: &mut ratatui::Frame, area: Rect, node: &HelpNode) {
             } else {
                 // "── Label ──"
                 let label = format!(" {} ", val);
-                let sides = rule_width.saturating_sub(label.len());
+                let sides = rule_width.saturating_sub(crate::display_width::display_width(&label));
                 let left = "─".repeat(sides / 2);
                 let right = "─".repeat(sides - sides / 2);
                 text_lines.push(Line::from(vec![
@@ -1227,24 +1481,29 @@ fn draw_help_modal(frame: &mut ratatui::Frame, area: Rect, node: &HelpNode) {
             // Prose line — no key column, full width.
             text_lines.push(Line::from(Span::styled(val.clone(), theme::body_style())));
         } else {
+            let padding =
+                " ".repeat(key_width.saturating_sub(crate::display_width::display_width(key)));
             text_lines.push(Line::from(vec![
-                Span::styled(
-                    format!("{:>width$}", key, width = key_width),
-                    theme::accent_style(),
-                ),
+                Span::styled(format!("{padding}{key}"), theme::accent_style()),
                 Span::styled("  ", theme::dim_style()),
                 Span::styled(val.clone(), theme::body_style()),
             ]));
         }
     }
 
-    text_lines.push(Line::from(""));
-    text_lines.push(Line::from(Span::styled(
-        crate::i18n::t("zc-app-press-any-key-to-close"),
-        theme::dim_style(),
-    )));
-
-    frame.render_widget(Paragraph::new(text_lines).style(theme::fill_style()), inner);
+    let max_scroll = text_lines.len().saturating_sub(chunks[1].height as usize);
+    state.scroll = state.scroll.min(max_scroll);
+    let scroll = state.scroll.min(u16::MAX as usize) as u16;
+    frame.render_widget(
+        Paragraph::new(text_lines)
+            .style(theme::fill_style())
+            .scroll((scroll, 0)),
+        chunks[1],
+    );
+    frame.render_widget(
+        Paragraph::new(Span::styled(control_hint, theme::dim_style())).style(theme::fill_style()),
+        chunks[2],
+    );
 }
 
 fn draw_reload_confirm_modal(frame: &mut ratatui::Frame, area: Rect) {
@@ -1434,6 +1693,154 @@ fn draw_reload_status_toast(frame: &mut ratatui::Frame, area: Rect, msg: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+
+    fn mouse_event(kind: MouseEventKind, column: u16, row: u16) -> Event {
+        Event::Mouse(crossterm::event::MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
+
+    #[test]
+    fn coalesces_contiguous_mouse_drags_to_latest_position() {
+        let first = mouse_event(
+            MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            1,
+            2,
+        );
+        let mut queued = VecDeque::from([
+            mouse_event(
+                MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                4,
+                5,
+            ),
+            mouse_event(
+                MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                8,
+                9,
+            ),
+        ]);
+
+        let (current, pending) =
+            coalesce_mouse_drag(first, || Ok(queued.pop_front())).expect("coalesce drag events");
+
+        assert_eq!(
+            current,
+            mouse_event(
+                MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                8,
+                9
+            )
+        );
+        assert_eq!(pending, None);
+    }
+
+    #[test]
+    fn coalescing_preserves_first_non_drag_event() {
+        let first = mouse_event(
+            MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            1,
+            2,
+        );
+        let mouse_up = mouse_event(
+            MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            8,
+            9,
+        );
+        let mut queued = VecDeque::from([
+            mouse_event(
+                MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                8,
+                9,
+            ),
+            mouse_up.clone(),
+        ]);
+
+        let (current, pending) =
+            coalesce_mouse_drag(first, || Ok(queued.pop_front())).expect("coalesce drag events");
+
+        assert_eq!(
+            current,
+            mouse_event(
+                MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                8,
+                9
+            )
+        );
+        assert_eq!(pending, Some(mouse_up));
+    }
+
+    #[test]
+    fn coalescing_bounds_each_drag_batch_and_preserves_following_input() {
+        let first = mouse_event(
+            MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            0,
+            0,
+        );
+        let mouse_up = mouse_event(
+            MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            MAX_COALESCED_MOUSE_DRAGS as u16,
+            0,
+        );
+        let key = Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        let mut queued: VecDeque<Event> = (1..=MAX_COALESCED_MOUSE_DRAGS)
+            .map(|column| {
+                mouse_event(
+                    MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                    column as u16,
+                    0,
+                )
+            })
+            .chain([mouse_up.clone(), key.clone()])
+            .collect();
+
+        let (current, pending) =
+            coalesce_mouse_drag(first, || Ok(queued.pop_front())).expect("coalesce first batch");
+
+        assert_eq!(
+            current,
+            mouse_event(
+                MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                MAX_COALESCED_MOUSE_DRAGS.saturating_sub(1) as u16,
+                0,
+            )
+        );
+        assert_eq!(pending, None);
+
+        let next = queued.pop_front().expect("next drag remains queued");
+        let (current, pending) =
+            coalesce_mouse_drag(next, || Ok(queued.pop_front())).expect("coalesce next batch");
+
+        assert_eq!(
+            current,
+            mouse_event(
+                MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                MAX_COALESCED_MOUSE_DRAGS as u16,
+                0,
+            )
+        );
+        assert_eq!(pending, Some(mouse_up));
+        assert_eq!(queued.pop_front(), Some(key));
+    }
+
+    #[test]
+    fn non_drag_event_passes_through_without_reading_ahead() {
+        let first = Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        let mut read_ahead = false;
+
+        let (current, pending) = coalesce_mouse_drag(first.clone(), || {
+            read_ahead = true;
+            Ok(None)
+        })
+        .expect("leave non-drag event unchanged");
+
+        assert_eq!(current, first);
+        assert_eq!(pending, None);
+        assert!(!read_ahead);
+    }
 
     #[test]
     fn chrome_process_summary_shows_cpu_loading_without_health() {
@@ -1519,6 +1926,184 @@ mod tests {
         let expected = action_key_labels(GlobalAction::Help);
 
         assert_eq!(help.keys, expected);
+    }
+
+    #[test]
+    fn active_text_editor_can_claim_global_pane_navigation() {
+        assert_eq!(
+            pane_switch_delta(Some(GlobalAction::PaneNavLeft), false, true),
+            Some(-1)
+        );
+        assert_eq!(
+            pane_switch_delta(Some(GlobalAction::PaneNavRight), true, true),
+            None
+        );
+    }
+
+    #[test]
+    fn disconnected_editor_claim_keeps_global_pane_navigation() {
+        assert_eq!(
+            pane_switch_delta(Some(GlobalAction::PaneNavRight), true, false),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn help_filter_matches_actions_case_insensitively() {
+        let node = HelpNode::titled(
+            "Chat",
+            vec![
+                HelpEntry::key("Ctrl+N", "New session"),
+                HelpEntry::key("Ctrl+D", "Cancel turn"),
+            ],
+        );
+
+        let filtered = filter_help_node(&node, "NEW SESSION").expect("action should match");
+
+        assert_eq!(filtered.title.as_deref(), Some("Chat"));
+        assert_eq!(filtered.entries.len(), 1);
+        assert_eq!(filtered.entries[0].action, "New session");
+    }
+
+    #[test]
+    fn help_filter_matches_live_registry_key_labels() {
+        use crate::keymap::{GlobalAction, action_key_labels};
+
+        let live_key = action_key_labels(GlobalAction::ReloadDaemon)
+            .into_iter()
+            .next()
+            .expect("reload action should have a binding");
+        let node = HelpNode::entries(global_help_entries());
+
+        let filtered =
+            filter_help_node(&node, &live_key).expect("rendered registry key should match");
+
+        assert_eq!(filtered.entries.len(), 1);
+        assert_eq!(
+            filtered.entries[0].action,
+            crate::i18n::t("zc-app-help-reload")
+        );
+    }
+
+    #[test]
+    fn help_filter_keeps_every_entry_when_section_title_matches() {
+        let child = HelpNode::titled(
+            "Sessions",
+            vec![
+                HelpEntry::key("n", "New session"),
+                HelpEntry::key("d", "Delete session"),
+            ],
+        );
+        let root = HelpNode::default().with_child(child);
+
+        let filtered = filter_help_node(&root, "sessions").expect("section should match");
+
+        assert_eq!(filtered.children.len(), 1);
+        assert_eq!(filtered.children[0].entries.len(), 2);
+    }
+
+    #[test]
+    fn help_overlay_typing_scroll_and_escape_are_stateful() {
+        let mut state = HelpOverlayState::default();
+
+        assert!(!state.handle_key(&KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)));
+        assert_eq!(state.query, "r");
+
+        assert!(!state.handle_key(&KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+        assert_eq!(state.scroll, 1);
+
+        assert!(!state.handle_key(&KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(state.query.is_empty());
+        assert_eq!(state.scroll, 0);
+
+        assert!(state.handle_key(&KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn help_control_hint_uses_live_search_box_bindings() {
+        use crate::keymap::action_key_labels;
+
+        let hint = help_control_hint();
+        for label in action_key_labels(SearchBoxAction::Up)
+            .into_iter()
+            .chain(action_key_labels(SearchBoxAction::Down))
+            .chain(action_key_labels(SearchBoxAction::Cancel))
+        {
+            assert!(
+                hint.contains(&label),
+                "control hint should contain live binding {label:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn help_modal_renders_filtered_results_and_keeps_controls_visible() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let node = HelpNode::entries(vec![
+            HelpEntry::key("r", "Reload daemon"),
+            HelpEntry::key("q", "Quit"),
+        ]);
+        let mut state = HelpOverlayState {
+            query: "reload".into(),
+            scroll: 0,
+        };
+        let backend = TestBackend::new(60, 10);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+
+        terminal
+            .draw(|frame| draw_help_modal(frame, frame.area(), &node, &mut state))
+            .expect("draw help modal");
+
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("reload"));
+        assert!(rendered.contains("Reload daemon"));
+        assert!(!rendered.contains("Quit"));
+        assert!(rendered.contains(&help_control_hint()));
+    }
+
+    #[test]
+    fn help_modal_scrolls_results_without_scrolling_filter_row() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let node = HelpNode::entries(
+            (0..10)
+                .map(|index| HelpEntry::key(index.to_string(), format!("Action {index}")))
+                .collect(),
+        );
+        let mut state = HelpOverlayState {
+            query: String::new(),
+            scroll: usize::MAX,
+        };
+        let backend = TestBackend::new(40, 8);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+
+        terminal
+            .draw(|frame| draw_help_modal(frame, frame.area(), &node, &mut state))
+            .expect("draw help modal");
+
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        let cancel = crate::keymap::action_key_labels(SearchBoxAction::Cancel)
+            .into_iter()
+            .next()
+            .expect("cancel action should have a binding");
+        assert_eq!(state.scroll, 6);
+        assert!(rendered.contains(&crate::i18n::t("zc-app-help-filter-label")));
+        assert!(rendered.contains(&cancel));
+        assert!(!rendered.contains("Action 0"));
+        assert!(rendered.contains("Action 9"));
     }
 
     #[test]

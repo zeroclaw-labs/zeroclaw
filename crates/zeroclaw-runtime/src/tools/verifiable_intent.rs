@@ -1,5 +1,10 @@
-//! Verifiable Intent tool — exposes VI verification and constraint evaluation
-//! to the agent orchestration loop.
+//! Verifiable Intent primitives exposed as a tool.
+//!
+//! These operations check individual values the caller supplies. They do not
+//! authenticate a credential chain: nothing here establishes that a constraint
+//! or a fulfillment came from a signed credential. This type is currently not
+//! registered for the model for that reason, and an embedder constructing it
+//! directly gets the same limitation.
 
 use async_trait::async_trait;
 use serde_json::json;
@@ -15,8 +20,11 @@ use crate::verifiable_intent::verification::{
 };
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 
-/// Tool for verifying Verifiable Intent credential chains and evaluating
-/// constraints against fulfillment data.
+/// Evaluates Verifiable Intent constraints and checks binding and timestamp
+/// primitives against values the caller provides.
+///
+/// It does not verify a credential chain, so a satisfied result is not evidence
+/// that the inputs were signed or authorized.
 pub struct VerifiableIntentTool {
     security: Arc<SecurityPolicy>,
     strictness: StrictnessMode,
@@ -38,9 +46,12 @@ impl Tool for VerifiableIntentTool {
     }
 
     fn description(&self) -> &str {
-        "Verify a Verifiable Intent credential chain. Supports two operations: \
-         'verify_binding' checks sd_hash binding between credential layers; \
-         'evaluate_constraints' validates constraints against fulfillment data."
+        "Check Verifiable Intent primitives against values you supply. This does \
+         NOT verify a credential chain, so a passing result does not show the \
+         inputs were signed or authorized. Operations: 'verify_binding' checks an \
+         sd_hash against a serialized parent; 'evaluate_constraints' evaluates \
+         constraints against fulfillment data; 'verify_timestamps' checks an \
+         iat/exp pair."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -293,6 +304,123 @@ mod tests {
         });
         let result = tool.execute(args).await.unwrap();
         assert!(result.success);
+    }
+
+    /// The reachable surface for a constraint check is this tool call: caller
+    /// JSON is deserialized into `Fulfillment`, dispatched through
+    /// `check_constraints`, and returned as a `ToolResult`. Every `Fulfillment`
+    /// field is `Option` with `Default` derived, so `"fulfillment": {}`
+    /// deserializes to all-`None`; this asserts the whole path fails closed
+    /// rather than only the constraint helper.
+    #[tokio::test]
+    async fn empty_fulfillment_does_not_satisfy_allowed_merchant() {
+        let tool = test_tool();
+        let args = json!({
+            "operation": "evaluate_constraints",
+            "constraints": [{
+                "type": "mandate.checkout.allowed_merchant",
+                "allowed_merchants": [
+                    { "name": "Store A", "website": "https://store-a.example.com" }
+                ]
+            }],
+            "fulfillment": {},
+        });
+
+        let result = tool.execute(args).await.unwrap();
+
+        assert!(
+            !result.success,
+            "an empty fulfillment must not satisfy an allowed-merchant constraint"
+        );
+        assert_eq!(
+            result.error.as_deref(),
+            Some("one or more constraints violated")
+        );
+
+        let output: serde_json::Value =
+            serde_json::from_str(result.output.as_str()).expect("tool output is JSON");
+        assert_eq!(output["all_satisfied"], false);
+        let entry = &output["results"][0];
+        assert_eq!(
+            entry["constraint_type"],
+            "mandate.checkout.allowed_merchant"
+        );
+        assert_eq!(entry["satisfied"], false);
+        let violation = entry["violations"][0]
+            .as_str()
+            .expect("violation is a string");
+        assert!(
+            violation.starts_with("VI/MerchantNotAllowed:"),
+            "unexpected violation: {violation}"
+        );
+    }
+
+    /// The same for the payee allowlist.
+    #[tokio::test]
+    async fn empty_fulfillment_does_not_satisfy_allowed_payee() {
+        let tool = test_tool();
+        let args = json!({
+            "operation": "evaluate_constraints",
+            "constraints": [{
+                "type": "payment.allowed_payee",
+                "allowed_payees": [
+                    { "name": "Payee A", "website": "https://payee-a.example.com" }
+                ]
+            }],
+            "fulfillment": {},
+        });
+
+        let result = tool.execute(args).await.unwrap();
+
+        assert!(
+            !result.success,
+            "an empty fulfillment must not satisfy an allowed-payee constraint"
+        );
+        assert_eq!(
+            result.error.as_deref(),
+            Some("one or more constraints violated")
+        );
+
+        let output: serde_json::Value =
+            serde_json::from_str(result.output.as_str()).expect("tool output is JSON");
+        assert_eq!(output["all_satisfied"], false);
+        let entry = &output["results"][0];
+        assert_eq!(entry["constraint_type"], "payment.allowed_payee");
+        assert_eq!(entry["satisfied"], false);
+        let violation = entry["violations"][0]
+            .as_str()
+            .expect("violation is a string");
+        assert!(
+            violation.starts_with("VI/PayeeNotAllowed:"),
+            "unexpected violation: {violation}"
+        );
+    }
+
+    /// Positive control for the two above: a disclosed merchant that is on the
+    /// allowlist still satisfies the constraint through the same tool path, so
+    /// the fail-closed arms cannot be satisfied by over-blocking.
+    #[tokio::test]
+    async fn disclosed_merchant_on_allowlist_still_satisfies_constraint() {
+        let tool = test_tool();
+        let args = json!({
+            "operation": "evaluate_constraints",
+            "constraints": [{
+                "type": "mandate.checkout.allowed_merchant",
+                "allowed_merchants": [
+                    { "name": "Store A", "website": "https://store-a.example.com" }
+                ]
+            }],
+            "fulfillment": {
+                "merchant": { "name": "Store A", "website": "https://store-a.example.com" }
+            },
+        });
+
+        let result = tool.execute(args).await.unwrap();
+
+        assert!(result.success, "error: {:?}", result.error);
+        let output: serde_json::Value =
+            serde_json::from_str(result.output.as_str()).expect("tool output is JSON");
+        assert_eq!(output["all_satisfied"], true);
     }
 
     #[tokio::test]

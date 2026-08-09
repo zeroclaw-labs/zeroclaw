@@ -291,6 +291,25 @@ pub fn wt<T>(r: wasmtime::Result<T>, ctx: &'static str) -> Result<T> {
     r.map_err(|e| anyhow::Error::msg(format!("{ctx}: {e}")))
 }
 
+/// Hint appended to instantiation failures, pointing plugin authors at the
+/// most common cause: a vendored `wit/v0` copy that has drifted from the
+/// host's current WIT. Phrased conditionally ("if this is a WIT ... mismatch")
+/// because it is appended to *every* instantiation failure, including non-WIT
+/// causes such as a too-small memory limit — so it must read as a lead to
+/// check, not an assertion of the cause. Kept as a `const` so it has one
+/// source of truth and tests can assert against it instead of a literal.
+const WIT_DRIFT_HINT: &str = "if this is a WIT interface/type mismatch, your plugin's vendored wit/v0 may have drifted — rebuild it against the WIT shipped with this host version";
+
+/// Like [`wt`], but for component instantiation specifically. Instantiation
+/// failures are where a stale vendored `wit/v0` copy surfaces, and wasmtime's
+/// error there is a chain (e.g. "while linking ... caused by: type mismatch
+/// for ..."). Unlike `wt`, this preserves the full chain via the alternate
+/// `{:#}` Display instead of flattening it to the top-level message, and
+/// appends [`WIT_DRIFT_HINT`] so the failure is actionable.
+pub fn wt_instantiate<T>(r: wasmtime::Result<T>, ctx: &'static str) -> Result<T> {
+    r.map_err(|e| anyhow::Error::msg(format!("{ctx}: {e:#} (hint: {WIT_DRIFT_HINT})")))
+}
+
 /// Compile a component from a WASM file. With a JIT backend present a `.wasm`
 /// component is compiled on load; in runtime-only builds the file is a
 /// precompiled `.cwasm` deserialized directly.
@@ -310,7 +329,7 @@ fn load_inner(wasm_path: &Path) -> wasmtime::Result<Component> {
     unsafe { Component::deserialize_file(engine(), wasm_path) }
 }
 
-/// Run an async call against a warm `Arc<Mutex<(Store, bindings)>>` plugin,
+/// Run an async call against a warm mutex-protected `(Store, bindings)` pair,
 /// holding the store lock for the duration of the single component call.
 macro_rules! call_plugin {
     ($self:expr, $body:expr) => {{
@@ -562,6 +581,48 @@ mod tests {
             primary_store.data().scope().id(),
             backup_store.data().scope().id(),
             "separate bindings must not share a host-service namespace"
+        );
+    }
+
+    #[test]
+    fn wt_instantiate_passes_through_on_success() {
+        let value = wt_instantiate(Ok(42), "failed to instantiate tool plugin")
+            .expect("Ok is passed through unchanged");
+        assert_eq!(value, 42);
+    }
+
+    #[test]
+    fn wt_instantiate_preserves_the_chain_and_appends_the_drift_hint() {
+        // Shaped like a real wasmtime component-model mismatch: a root cause
+        // (the WIT type mismatch) wrapped with an intermediate linking
+        // context, the way `instantiate_async` failures actually chain. This
+        // is `wasmtime::Error` (what `instantiate_async` actually returns),
+        // not `anyhow::Error` — the two are distinct types in this wasmtime
+        // version, though `Error::context` chains the same way.
+        let err =
+            wasmtime::Error::msg("type mismatch for `plugin-action`: expected 5 cases, found 4")
+                .context("while linking zeroclaw:plugin/logging");
+
+        let decorated = wt_instantiate::<()>(Err(err), "failed to instantiate tool plugin")
+            .expect_err("Err must stay an error");
+        let rendered = format!("{decorated}");
+
+        assert!(
+            rendered.contains("failed to instantiate tool plugin"),
+            "must keep the caller-supplied context: {rendered}"
+        );
+        assert!(
+            rendered.contains("type mismatch for"),
+            "must preserve the root cause via the alternate {{:#}} Display, \
+             not just the top-level message: {rendered}"
+        );
+        assert!(
+            rendered.contains("while linking zeroclaw:plugin/logging"),
+            "must preserve the intermediate chain link too: {rendered}"
+        );
+        assert!(
+            rendered.contains(WIT_DRIFT_HINT),
+            "must append the wit/v0 drift hint: {rendered}"
         );
     }
 }

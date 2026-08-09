@@ -52,15 +52,34 @@ When both the provider and the channel support streaming, the flow is: provider 
 
 ## Tool calls mid-stream
 
-When a model decides to call a tool, the provider emits `ToolCall`. The runtime:
+When a streaming provider decides to call a tool, it emits a structured
+`ToolCall` stream event. The runtime:
 
-1. Pauses reading from the provider's stream
-2. Flushes any buffered text to the channel
-3. Runs the tool (subject to security validation, see [Security → Overview](../security/overview.md))
-4. Resumes the conversation with the tool result appended
-5. Opens a new streaming call to the provider for the next assistant turn
+1. Reads the stream to completion, collecting structured `ToolCall` events and
+   forwarding visible text until `Final`
+2. Recovers the tool calls after the stream ends
+3. Runs the tools (subject to security validation, see [Security → Overview](../security/overview.md))
+4. Opens a new streaming call to the provider for the next assistant turn, with
+   the tool results appended to the conversation
+
+The current provider stream is never paused and resumed mid-read; tool
+execution happens after that stream reaches `Final`, and the next turn is a
+fresh streaming call.
 
 From the user's perspective: text, then a visible indicator that the agent ran a tool (via channel-specific hints), then more text. For channels without typing indicators, the gap between the tool call and the next text chunk is the only signal.
+
+## Transport completion and timeouts
+
+Streaming transports do not rely on connection close as the success signal.
+OpenAI-compatible streams finish on `[DONE]`, OpenAI Responses streams finish
+on their terminal response event, and Anthropic streams finish on
+`message_stop`. Servers may keep the HTTP connection open after those events.
+
+Streaming clients use byte-idle timeouts: 300 seconds for OpenAI Responses and
+OpenAI-compatible providers, and 90 seconds for Anthropic. Each received body
+read resets the relevant timeout, so active generations are not constrained by
+the whole-request timeout used for non-streaming calls. Connection setup,
+response headers, and buffered error bodies remain bounded.
 
 ## Non-streaming providers
 

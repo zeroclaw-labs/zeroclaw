@@ -156,7 +156,7 @@ impl<T: Tool> Tool for PathGuardedTool<T> {
             let blocked = if self.extractor.is_none()
                 && args.get("command").and_then(|v| v.as_str()).is_some()
             {
-                self.security.forbidden_path_argument(&arg)
+                self.security.forbidden_workspace_path_argument(&arg)
             } else if !self.security.is_path_allowed(&arg) {
                 Some(arg.clone())
             } else {

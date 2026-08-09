@@ -94,12 +94,20 @@ pub fn tool_dispatcher_for_provider(
     }
 }
 
+// Debug so a failing routing assertion can print which variant and which
+// source it actually got; without it the test just says "assertion failed".
+#[derive(Debug)]
 pub(crate) enum RoutedApproval {
     /// Use this response. `decider` names the channel that answered, for audit
     /// attribution; `None` for a bridge-synthesized fail-closed deny.
+    ///
+    /// `source` says whether a human actually decided. `decider` cannot answer
+    /// that on its own: it is also `None` when a single non-fan-out channel
+    /// relays a real operator answer.
     Decided {
         response: zeroclaw_api::channel::ChannelApprovalResponse,
         decider: Option<String>,
+        source: zeroclaw_api::channel::ApprovalSource,
     },
     /// Explicit `InheritOriginator` — defer to the originating-channel fan-out.
     Fallthrough,
@@ -117,22 +125,45 @@ pub(crate) async fn resolve_routed_approval(
         .find(|(name, _)| name.as_str() == route.approver_channel)
         .map(|(name, channel)| (name.clone(), Arc::clone(channel)));
 
-    let reason: &str = if let Some((channel_name, channel)) = approver {
-        let dur = std::time::Duration::from_secs(route.timeout_secs.max(1));
-        match tokio::time::timeout(dur, channel.request_approval(recipient, request)).await {
-            Ok(Ok(Some(response))) => {
-                return RoutedApproval::Decided {
-                    response,
-                    decider: Some(channel_name),
-                };
+    // `source` is tracked alongside `reason` so the fail-closed deny below can
+    // say WHY no operator decided, rather than leaving the caller to guess from
+    // a missing decider.
+    let (reason, source): (&str, zeroclaw_api::channel::ApprovalSource) =
+        if let Some((channel_name, channel)) = approver {
+            let dur = std::time::Duration::from_secs(route.timeout_secs.max(1));
+            // Attributed, not legacy: if the approver channel synthesizes its own
+            // `Some(Deny)` (its inner timeout firing before this outer one), that
+            // is a runtime denial and must not be relabelled as the approver's
+            // decision just because a response came back.
+            match tokio::time::timeout(dur, channel.request_approval_attributed(recipient, request))
+                .await
+            {
+                Ok(Ok(Some(attributed))) => {
+                    return RoutedApproval::Decided {
+                        response: attributed.response,
+                        decider: Some(channel_name),
+                        source: attributed.source,
+                    };
+                }
+                Ok(Ok(None)) => (
+                    "approver returned no decision",
+                    zeroclaw_api::channel::ApprovalSource::Unreachable,
+                ),
+                Ok(Err(_)) => (
+                    "approver channel unreachable",
+                    zeroclaw_api::channel::ApprovalSource::Unreachable,
+                ),
+                Err(_) => (
+                    "approver timed out",
+                    zeroclaw_api::channel::ApprovalSource::TimedOut,
+                ),
             }
-            Ok(Ok(None)) => "approver returned no decision",
-            Ok(Err(_)) => "approver channel unreachable",
-            Err(_) => "approver timed out",
-        }
-    } else {
-        "approver channel not registered"
-    };
+        } else {
+            (
+                "approver channel not registered",
+                zeroclaw_api::channel::ApprovalSource::Unavailable,
+            )
+        };
 
     match route.on_no_approver {
         zeroclaw_config::autonomy::OnNoApprover::Deny => {
@@ -151,6 +182,10 @@ pub(crate) async fn resolve_routed_approval(
             RoutedApproval::Decided {
                 response: zeroclaw_api::channel::ChannelApprovalResponse::Deny,
                 decider: None,
+                // The runtime denied this, not a person. Carrying the specific
+                // reason lets the tool result say so instead of reporting a
+                // user denial that never happened.
+                source,
             }
         }
         zeroclaw_config::autonomy::OnNoApprover::InheritOriginator => {
@@ -233,12 +268,18 @@ impl zeroclaw_api::channel::Channel for RoutedApprovalChannel {
         match resolve_routed_approval(&self.handles, &self.route, recipient, request).await {
             // The deciding approver's name travels on the response itself;
             // `None` for a bridge-synthesized fail-closed deny.
-            RoutedApproval::Decided { response, decider } => {
-                Ok(Some(zeroclaw_api::channel::AttributedApprovalResponse {
-                    response,
-                    decided_by: decider,
-                }))
-            }
+            //
+            // Cross-crate construction: `AttributedApprovalResponse` is
+            // `#[non_exhaustive]`, so struct-literal syntax is forbidden from
+            // here. Build via the dedicated constructors.
+            RoutedApproval::Decided {
+                response,
+                decider,
+                source,
+            } => Ok(Some(
+                zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(response, source)
+                    .with_decider_opt(decider),
+            )),
             // No originating channel to inherit on this path; let the gate apply
             // the non-interactive default (auto-deny).
             RoutedApproval::Fallthrough => Ok(None),
@@ -1246,6 +1287,8 @@ impl Agent {
             initialize_mcp,
             false,
             false,
+            // Non-ACP construction path: `deliver_file` has no transport here.
+            false,
             None,
             None,
             None,
@@ -1261,6 +1304,7 @@ impl Agent {
         session_cwd: Option<&Path>,
         initialize_mcp: bool,
         exclude_memory: bool,
+        acp_delivery: bool,
         sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
         sop_audit: Option<Arc<SopAuditLogger>>,
         canvas_store: Option<tools::CanvasStore>,
@@ -1272,6 +1316,7 @@ impl Agent {
             initialize_mcp,
             true,
             exclude_memory,
+            acp_delivery,
             None,
             sop_engine,
             sop_audit,
@@ -1289,6 +1334,7 @@ impl Agent {
         session_cwd: Option<&Path>,
         initialize_mcp: bool,
         exclude_memory: bool,
+        acp_delivery: bool,
         sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
         sop_audit: Option<Arc<SopAuditLogger>>,
         canvas_store: Option<tools::CanvasStore>,
@@ -1301,6 +1347,7 @@ impl Agent {
             initialize_mcp,
             true,
             exclude_memory,
+            acp_delivery,
             None,
             sop_engine,
             sop_audit,
@@ -1331,6 +1378,8 @@ impl Agent {
             initialize_mcp,
             true,
             exclude_memory,
+            // TUI turns never transport an ACP file attachment.
+            false,
             tui_env,
             sop_engine,
             sop_audit,
@@ -1360,6 +1409,8 @@ impl Agent {
             initialize_mcp,
             true,
             exclude_memory,
+            // TUI turns never transport an ACP file attachment.
+            false,
             tui_env,
             sop_engine,
             sop_audit,
@@ -1377,6 +1428,7 @@ impl Agent {
         initialize_mcp: bool,
         approval_backchannel: bool,
         exclude_memory: bool,
+        acp_delivery: bool,
         tui_env: Option<std::collections::HashMap<String, String>>,
         sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
         sop_audit: Option<Arc<SopAuditLogger>>,
@@ -1532,6 +1584,7 @@ impl Agent {
                 connect_mcp: initialize_mcp,
                 connect_peripherals: false,
                 exclude_memory,
+                acp_delivery,
                 list_deferred_mcp_specs: false,
                 emit_assembly_logs: true,
                 // `from_config` is the Agent (gateway / library) construction
@@ -1916,17 +1969,35 @@ impl Agent {
         Ok(())
     }
 
-    fn try_apply_pending_model_switch(&mut self, current_effective_model: &str) -> Option<String> {
-        let pending = crate::agent::loop_::get_model_switch_state()
-            .lock()
-            .ok()
-            .and_then(|guard| guard.clone())?;
-        let (new_model_provider, new_model) = pending;
+    fn rebuild_streamed_system_prompt_for_active_provider(
+        &mut self,
+        loop_history: &mut [ChatMessage],
+    ) -> Result<()> {
+        let dispatcher = tool_dispatcher_for_provider(&self.config, self.model_provider.as_ref());
+        self.rebuild_system_prompt_for_dispatcher(dispatcher.as_ref())?;
 
-        // Same-provider, same-model: nothing to do. Still clear the
-        // request so a stale equal-value entry does not linger.
+        let Some(ConversationMessage::Chat(persisted)) = self.history.first() else {
+            return Ok(());
+        };
+        let Some(active) = loop_history
+            .first_mut()
+            .filter(|message| message.role == "system")
+        else {
+            return Ok(());
+        };
+        active.content.clone_from(&persisted.content);
+        Ok(())
+    }
+
+    fn try_apply_model_switch(
+        &mut self,
+        current_effective_model: &str,
+        new_model_provider: String,
+        new_model: String,
+    ) -> Option<String> {
+        // Same-provider, same-model: nothing to do. The request is owned by
+        // the completed tool-loop scope, so there is no persistent slot to clear.
         if new_model_provider == self.model_provider_name && new_model == current_effective_model {
-            crate::agent::loop_::clear_model_switch_request();
             return None;
         }
 
@@ -1992,7 +2063,7 @@ impl Agent {
             )),
         };
 
-        let result = match switch_outcome {
+        match switch_outcome {
             Ok(new_prov) => {
                 // Commit state only after the provider was built
                 // successfully.
@@ -2014,9 +2085,7 @@ impl Agent {
                 );
                 None
             }
-        };
-        crate::agent::loop_::clear_model_switch_request();
-        result
+        }
     }
 
     fn classify_model(&self, user_message: &str) -> String {
@@ -2277,8 +2346,16 @@ impl Agent {
             });
         }
 
-        let mut loop_history = provider_messages;
-        let mut loop_new_messages: Vec<ChatMessage> = Vec::new();
+        // Split provider_messages: loop_history gets past turns only,
+        // loop_new_messages gets this turn's user message so the hook
+        // can observe/modify it. Seed loop_history with the user message so
+        // the provider sees it without clone-and-append.
+        let split_idx = provider_messages
+            .iter()
+            .rposition(|m| m.role == "user")
+            .unwrap_or(provider_messages.len());
+        let mut loop_history = provider_messages[..split_idx].to_vec();
+        let mut loop_new_messages: Vec<ChatMessage> = provider_messages[split_idx..].to_vec();
 
         let knobs = crate::agent::loop_::LoopKnobs {
             dedup_enabled: false,
@@ -2403,6 +2480,10 @@ impl Agent {
                 None,
             );
         }
+        // Pop the original user message (pushed before the loop) so the
+        // replayed version — which includes the user message, possibly
+        // modified by the hook.
+        self.history.pop();
         for replayed in Self::replay_loop_messages(&loop_new_messages) {
             self.history.push(replayed);
         }
@@ -2420,8 +2501,10 @@ impl Agent {
         // tool-free exchange (exactly one assistant message), mirroring the
         // old "no tool calls" put condition.
         if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key)
-            && loop_new_messages.len() == 1
-            && loop_new_messages[0].role == "assistant"
+            && loop_new_messages.len() == 2
+            && loop_new_messages
+                .last()
+                .is_some_and(|m| m.role == "assistant")
         {
             #[allow(clippy::cast_possible_truncation)]
             let _ = cache.put(key, &effective_model, &response, usage.output_tokens as u32);
@@ -2513,7 +2596,7 @@ impl Agent {
         let mut new_msgs: Vec<ConversationMessage> = Vec::new();
         // `effective_model` is `mut` so a `model_switch` requested mid-turn
         // (handled in the round loop's `ModelSwitchRequested` arm via
-        // `try_apply_pending_model_switch`) can rebind it for later rounds
+        // `try_apply_model_switch`) can rebind it for later rounds
         let mut effective_model = self.classify_model(user_message);
         let turn_id = Self::new_turn_id();
         let mut committed_response = String::new();
@@ -2600,7 +2683,14 @@ impl Agent {
             });
         }
 
-        let mut loop_history = provider_messages;
+        // Split provider_messages: loop_history gets past turns, user_msg_for_loop
+        // seeds round 0's round_added so the hook can observe/modify the user message.
+        let split_idx = provider_messages
+            .iter()
+            .rposition(|m| m.role == "user")
+            .unwrap_or(provider_messages.len());
+        let mut loop_history = provider_messages[..split_idx].to_vec();
+        let user_msg_for_loop: Vec<ChatMessage> = provider_messages[split_idx..].to_vec();
 
         let approval_bridge: Option<Box<dyn zeroclaw_api::channel::Channel>> =
             self.channel_handles.ask_user.as_ref().map(|handles| {
@@ -2655,25 +2745,42 @@ impl Agent {
                 });
             }
 
+            let mut round_added: Vec<ChatMessage> = if round == 0 {
+                user_msg_for_loop.clone()
+            } else {
+                Vec::new()
+            };
+
             // Steering drain: each accepted mid-turn message becomes its own
             // enriched user turn in both transcripts before the next round.
             for steering_message in crate::agent::loop_::drain_steering_messages(&mut steering_rx) {
-                self.append_streamed_user_message_to_history(
-                    &steering_message,
-                    &mut new_msgs,
-                    &turn_id,
-                )
-                .await;
-                if let Some(ConversationMessage::Chat(user_msg)) = new_msgs.last() {
-                    loop_history.push(user_msg.clone());
+                // Mirror the enrichment logic from append_streamed_user_message_to_history
+                // but route through round_added instead of self.history/new_msgs.
+                if self.auto_save {
+                    let store_start = std::time::Instant::now();
+                    let store_result = self
+                        .memory
+                        .store(
+                            "user_msg",
+                            &steering_message,
+                            MemoryCategory::Conversation,
+                            self.memory_session_id.as_deref(),
+                        )
+                        .await;
+                    self.observer.record_event(&ObserverEvent::MemoryStore {
+                        category: MemoryCategory::Conversation.to_string(),
+                        backend: self.memory.name().to_string(),
+                        duration: store_start.elapsed(),
+                        success: store_result.is_ok(),
+                        channel: Some(self.channel_name.clone()),
+                        agent_alias: self.observer_agent_alias(),
+                        turn_id: Some(turn_id.clone()),
+                    });
                 }
+                let now = self.current_turn_datetime().format("%Y-%m-%d %H:%M:%S %Z");
+                let enriched = format!("[{now}] {steering_message}");
+                round_added.push(ChatMessage::user(enriched));
             }
-
-            // Per-round append-log: the loop mirrors every message it adds to
-            // `loop_history` into this capture at push time, on success AND
-            // error exits — never derived from history indices, which the
-            // loop's own preflight pruning can invalidate.
-            let mut round_added: Vec<ChatMessage> = Vec::new();
             let round_loop = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                 Some(cost_context.clone()),
                 crate::agent::tool_receipts::scope_receipts(
@@ -2700,9 +2807,13 @@ impl Agent {
                                     .and_then(|c| c.config.as_deref()),
                                 hooks: self.hook_runner.as_deref(),
                                 activated_tools: self.activated_tools.as_ref(),
-                                model_switch_callback: Some(
-                                    crate::agent::loop_::get_model_switch_state(),
-                                ),
+                                // `None` here (rather than a shared global) is
+                                // deliberate: `run_tool_call_loop` mints a fresh,
+                                // task-local switch state for this round when it
+                                // sees `None`, so a `model_switch` requested this
+                                // round can never leak into a sibling round or a
+                                // concurrently running turn/agent.
+                                model_switch_callback: None,
                                 receipt_generator: receipt_scope
                                     .as_ref()
                                     .map(crate::agent::tool_receipts::ReceiptScope::generator),
@@ -2797,10 +2908,17 @@ impl Agent {
                 );
             }
 
-            // Replay everything the loop appended this round into the
-            // conversation history and the persistence capture.
-            let single_text_exchange =
-                round == 0 && round_added.len() == 1 && round_added[0].role == "assistant";
+            // round_added now contains the user message for round 0;
+            // a single tool-free exchange is [user, assistant].
+            let single_text_exchange = round == 0
+                && round_added.len() == 2
+                && round_added.first().is_some_and(|m| m.role == "user")
+                && round_added.last().is_some_and(|m| m.role == "assistant");
+
+            if round == 0 {
+                self.history.pop();
+                new_msgs.pop();
+            }
             for replayed in Self::replay_loop_messages(&round_added) {
                 new_msgs.push(replayed.clone());
                 self.history.push(replayed);
@@ -2848,17 +2966,32 @@ impl Agent {
                 Err(error) => {
                     // Model switch requested mid-turn: the unified loop
                     // signals a pending `model_switch` by returning
-                    // `ModelSwitchRequested` without clearing the request. The
+                    // `ModelSwitchRequested`. The
                     // round's tool call + result are already replayed into
                     // history/new_msgs above; rebuild the provider from the
                     // captured `ProviderSwitchConfig` and continue the round
                     // loop so the next provider call uses the switched
                     // provider/model. A failed rebuild (no switch config / build
                     // error) falls through to the normal error handling below.
-                    if crate::agent::loop_::is_model_switch_requested(&error).is_some()
-                        && let Some(new_effective_model) =
-                            self.try_apply_pending_model_switch(&effective_model)
+                    if let Some((new_model_provider, new_model)) =
+                        crate::agent::loop_::is_model_switch_requested(&error)
+                        && let Some(new_effective_model) = self.try_apply_model_switch(
+                            &effective_model,
+                            new_model_provider,
+                            new_model,
+                        )
                     {
+                        if let Err(error) = self
+                            .rebuild_streamed_system_prompt_for_active_provider(&mut loop_history)
+                        {
+                            let notice = self.trim_history(Some(&turn_id));
+                            forward_history_trim_notice(&event_tx, notice).await;
+                            return Err(StreamedTurnError {
+                                error,
+                                committed_response,
+                                new_messages: new_msgs,
+                            });
+                        }
                         let notice = self.trim_history(Some(&turn_id));
                         forward_history_trim_notice(&event_tx, notice).await;
                         effective_model = new_effective_model;
@@ -4473,6 +4606,69 @@ mod tests {
                 !prompt.contains(XML_TOOLS_MARKER),
                 "prompt must be rebuilt without XML tool listing"
             );
+        }
+
+        #[test]
+        fn streamed_provider_switch_refreshes_active_loop_skills_prompt() {
+            let workspace = tempfile::TempDir::new().expect("temp dir");
+            let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+                backend: "none".into(),
+                ..zeroclaw_config::schema::MemoryConfig::default()
+            };
+            let mem: Arc<dyn Memory> = Arc::from(
+                zeroclaw_memory::create_memory(&memory_cfg, workspace.path(), None)
+                    .expect("memory creation should succeed"),
+            );
+            let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+            let (provider, _) = capturing_provider(false);
+            let config = zeroclaw_config::schema::AliasedAgentConfig {
+                resolved: zeroclaw_config::schema::ResolvedRuntime {
+                    strict_tool_parsing: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let skills = vec![crate::skills::Skill {
+                name: "deploy".into(),
+                description: "Release safely".into(),
+                description_localizations: Default::default(),
+                version: "1.0.0".into(),
+                author: None,
+                tags: vec![],
+                tools: vec![],
+                prompts: vec!["Run smoke tests before deploy.".into()],
+                slash_options: Vec::new(),
+                always: false,
+                location: None,
+            }];
+            let mut agent = Agent::builder()
+                .model_provider(provider)
+                .tools(vec![Box::new(MockTool)])
+                .memory(mem)
+                .observer(observer)
+                .tool_dispatcher(Box::new(NativeToolDispatcher))
+                .config(config)
+                .skills(skills)
+                .skills_prompt_mode(zeroclaw_config::schema::SkillsPromptInjectionMode::Compact)
+                .workspace_dir(workspace.path().to_path_buf())
+                .build()
+                .expect("agent builder should succeed");
+            agent.history = vec![ConversationMessage::Chat(ChatMessage::system(
+                "stale compact prompt",
+            ))];
+            let mut loop_history = vec![ChatMessage::system("stale compact prompt")];
+
+            agent
+                .rebuild_streamed_system_prompt_for_active_provider(&mut loop_history)
+                .expect("streamed prompt rebuild should succeed");
+
+            assert!(
+                loop_history[0]
+                    .content
+                    .contains("Run smoke tests before deploy."),
+                "active loop history must receive the loader-safe inlined instructions"
+            );
+            assert!(!loop_history[0].content.contains("read_skill(name)"));
         }
 
         #[tokio::test]
@@ -8013,6 +8209,7 @@ mod tests {
                 .collect(),
             prompts: vec![],
             slash_options: Vec::new(),
+            always: false,
             location: None,
         }
     }
@@ -8141,6 +8338,7 @@ mod tests {
             }],
             prompts: vec![],
             slash_options: Vec::new(),
+            always: false,
             location: None,
         };
         tools::register_skill_tools_with_context(
@@ -8991,8 +9189,6 @@ mod tests {
         assert_all_events_share_turn_id(&events, Some("test-agent"), Some("agent"));
     }
 
-    use crate::agent::loop_::MODEL_SWITCH_TEST_LOCK as MODEL_SWITCH_TEST_GUARD;
-
     fn build_test_agent(
         initial_provider_name: &str,
         initial_model_name: &str,
@@ -9026,61 +9222,27 @@ mod tests {
     }
 
     #[test]
-    fn try_apply_pending_model_switch_noop_when_no_pending_request() {
-        let _guard = MODEL_SWITCH_TEST_GUARD.lock().unwrap();
-        crate::agent::loop_::clear_model_switch_request();
-
+    fn try_apply_model_switch_noop_when_identical_to_current() {
         let mut agent = build_test_agent("openai", "gpt-4o-mini", None);
-        let result = agent.try_apply_pending_model_switch("gpt-4o-mini");
-        assert_eq!(result, None);
-        assert_eq!(agent.model_provider_name, "openai");
-        assert_eq!(agent.model_name, "gpt-4o-mini");
-    }
-
-    #[test]
-    fn try_apply_pending_model_switch_noop_when_identical_to_current() {
-        let _guard = MODEL_SWITCH_TEST_GUARD.lock().unwrap();
-        crate::agent::loop_::clear_model_switch_request();
-
-        // Pre-set an "equal" switch request.
-        {
-            let state = crate::agent::loop_::get_model_switch_state();
-            let mut guard = state.lock().unwrap();
-            *guard = Some(("openai".to_string(), "gpt-4o-mini".to_string()));
-        }
-
-        let mut agent = build_test_agent("openai", "gpt-4o-mini", None);
-        let result = agent.try_apply_pending_model_switch("gpt-4o-mini");
-        assert_eq!(result, None, "same-provider/same-model is a no-op");
-        // State must be cleared so a stale equal entry does not linger.
-        let still_pending = crate::agent::loop_::get_model_switch_state()
-            .lock()
-            .unwrap()
-            .clone();
-        assert_eq!(
-            still_pending, None,
-            "equal switch request must be cleared after observation"
+        let result = agent.try_apply_model_switch(
+            "gpt-4o-mini",
+            "openai".to_string(),
+            "gpt-4o-mini".to_string(),
         );
+        assert_eq!(result, None, "same-provider/same-model is a no-op");
     }
 
     #[test]
-    fn try_apply_pending_model_switch_preserves_state_without_switch_config() {
-        let _guard = MODEL_SWITCH_TEST_GUARD.lock().unwrap();
-        crate::agent::loop_::clear_model_switch_request();
-
-        // Pre-set a real switch request.
-        {
-            let state = crate::agent::loop_::get_model_switch_state();
-            let mut guard = state.lock().unwrap();
-            *guard = Some(("anthropic".to_string(), "claude-haiku".to_string()));
-        }
-
+    fn try_apply_model_switch_preserves_agent_without_switch_config() {
         // Agent has NO provider_switch_config — cannot rebuild provider.
         let mut agent = build_test_agent("openai", "gpt-4o-mini", None);
-        let result = agent.try_apply_pending_model_switch("gpt-4o-mini");
+        let result = agent.try_apply_model_switch(
+            "gpt-4o-mini",
+            "anthropic".to_string(),
+            "claude-haiku".to_string(),
+        );
 
-        // Returns None (failed switch), state unchanged on the agent,
-        // pending request cleared so we don't retry forever.
+        // Returns None (failed switch) and leaves the agent unchanged.
         assert_eq!(result, None);
         assert_eq!(
             agent.model_provider_name, "openai",
@@ -9090,29 +9252,10 @@ mod tests {
             agent.model_name, "gpt-4o-mini",
             "model_name must NOT change when provider rebuild is not possible"
         );
-        let still_pending = crate::agent::loop_::get_model_switch_state()
-            .lock()
-            .unwrap()
-            .clone();
-        assert_eq!(
-            still_pending, None,
-            "pending switch must be cleared even when rebuild fails, \
-             so it does not retrigger on the next iteration"
-        );
     }
 
     #[test]
-    fn try_apply_pending_model_switch_succeeds_with_switch_config() {
-        let _guard = MODEL_SWITCH_TEST_GUARD.lock().unwrap();
-        crate::agent::loop_::clear_model_switch_request();
-
-        // Pre-set a real switch request to a different provider AND model.
-        {
-            let state = crate::agent::loop_::get_model_switch_state();
-            let mut guard = state.lock().unwrap();
-            *guard = Some(("ollama".to_string(), "llama3".to_string()));
-        }
-
+    fn try_apply_model_switch_succeeds_with_switch_config() {
         let switch_cfg = ProviderSwitchConfig {
             config: Some(std::sync::Arc::new(
                 zeroclaw_config::schema::Config::default(),
@@ -9120,7 +9263,8 @@ mod tests {
         };
 
         let mut agent = build_test_agent("openai", "gpt-4o-mini", Some(switch_cfg));
-        let result = agent.try_apply_pending_model_switch("gpt-4o-mini");
+        let result =
+            agent.try_apply_model_switch("gpt-4o-mini", "ollama".to_string(), "llama3".to_string());
 
         assert_eq!(
             result.as_deref(),
@@ -9135,28 +9279,10 @@ mod tests {
             agent.model_name, "llama3",
             "model_name must reflect the switched model after success"
         );
-        let still_pending = crate::agent::loop_::get_model_switch_state()
-            .lock()
-            .unwrap()
-            .clone();
-        assert_eq!(
-            still_pending, None,
-            "pending switch must be cleared after a successful switch"
-        );
     }
 
     #[test]
-    fn try_apply_pending_model_switch_succeeds_on_provider_only_change() {
-        let _guard = MODEL_SWITCH_TEST_GUARD.lock().unwrap();
-        crate::agent::loop_::clear_model_switch_request();
-
-        // Same model id, different provider.
-        {
-            let state = crate::agent::loop_::get_model_switch_state();
-            let mut guard = state.lock().unwrap();
-            *guard = Some(("ollama".to_string(), "shared-name".to_string()));
-        }
-
+    fn try_apply_model_switch_succeeds_on_provider_only_change() {
         let switch_cfg = ProviderSwitchConfig {
             config: Some(std::sync::Arc::new(
                 zeroclaw_config::schema::Config::default(),
@@ -9164,7 +9290,11 @@ mod tests {
         };
 
         let mut agent = build_test_agent("openai", "shared-name", Some(switch_cfg));
-        let result = agent.try_apply_pending_model_switch("shared-name");
+        let result = agent.try_apply_model_switch(
+            "shared-name",
+            "ollama".to_string(),
+            "shared-name".to_string(),
+        );
 
         assert_eq!(
             result.as_deref(),
@@ -9179,16 +9309,7 @@ mod tests {
     }
 
     #[test]
-    fn try_apply_pending_model_switch_prefers_route_api_key() {
-        let _guard = MODEL_SWITCH_TEST_GUARD.lock().unwrap();
-        crate::agent::loop_::clear_model_switch_request();
-
-        {
-            let state = crate::agent::loop_::get_model_switch_state();
-            let mut guard = state.lock().unwrap();
-            *guard = Some(("ollama".to_string(), "tinyllama".to_string()));
-        }
-
+    fn try_apply_model_switch_prefers_route_api_key() {
         let route = zeroclaw_config::schema::ModelRouteConfig {
             model_provider: "ollama".to_string(),
             model: "tinyllama".to_string(),
@@ -9205,7 +9326,11 @@ mod tests {
         };
 
         let mut agent = build_test_agent("openai", "gpt-4o-mini", Some(switch_cfg));
-        let result = agent.try_apply_pending_model_switch("gpt-4o-mini");
+        let result = agent.try_apply_model_switch(
+            "gpt-4o-mini",
+            "ollama".to_string(),
+            "tinyllama".to_string(),
+        );
 
         assert_eq!(
             result.as_deref(),
@@ -9354,7 +9479,7 @@ mod tests {
             serde_json::json!({"type": "object"})
         }
         async fn execute(&self, _args: serde_json::Value) -> Result<crate::tools::ToolResult> {
-            let state = crate::agent::loop_::get_model_switch_state();
+            let state = crate::agent::turn::current_model_switch_state()?;
             *state.lock().unwrap() =
                 Some((self.target_provider.clone(), self.target_model.clone()));
             Ok(crate::tools::ToolResult {
@@ -9367,13 +9492,6 @@ mod tests {
 
     #[test]
     fn turn_streamed_applies_pending_model_switch_for_next_call() {
-        // Serialize with the other tests that touch the process-wide
-        // `MODEL_SWITCH_REQUEST`. The async work runs inside a manually built
-        // current-thread runtime so the `std::sync` guard is never held across
-        // an `.await` in this (synchronous) test body.
-        let _guard = MODEL_SWITCH_TEST_GUARD.lock().unwrap();
-        crate::agent::loop_::clear_model_switch_request();
-
         let initial_calls = Arc::new(Mutex::new(0usize));
         let provider = Box::new(StreamSwitchTriggerProvider {
             call_count: Arc::clone(&initial_calls),
@@ -9400,6 +9518,26 @@ mod tests {
                 ..zeroclaw_config::schema::Config::default()
             })),
         };
+        let agent_config = zeroclaw_config::schema::AliasedAgentConfig {
+            resolved: zeroclaw_config::schema::ResolvedRuntime {
+                strict_tool_parsing: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let skills = vec![crate::skills::Skill {
+            name: "deploy".into(),
+            description: "Release safely".into(),
+            description_localizations: Default::default(),
+            version: "1.0.0".into(),
+            author: None,
+            tags: vec![],
+            tools: vec![],
+            prompts: vec!["Run smoke tests before deploy.".into()],
+            slash_options: Vec::new(),
+            always: false,
+            location: None,
+        }];
 
         let mut agent = Agent::builder()
             .model_provider(provider)
@@ -9410,6 +9548,9 @@ mod tests {
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .config(agent_config)
+            .skills(skills)
+            .skills_prompt_mode(zeroclaw_config::schema::SkillsPromptInjectionMode::Compact)
             .workspace_dir(std::path::PathBuf::from("/tmp"))
             .model_provider_name("openai".to_string())
             .model_name("gpt-4o-mini".to_string())
@@ -9442,6 +9583,16 @@ mod tests {
             agent.model_name, "llama3",
             "turn_streamed must commit the switched model after the tool result"
         );
+        let prompt = match agent.history.first() {
+            Some(ConversationMessage::Chat(message)) if message.role == "system" => {
+                &message.content
+            }
+            _ => panic!("history must retain the rebuilt system prompt"),
+        };
+        assert!(
+            prompt.contains("Model: llama3"),
+            "turn_streamed must rebuild the system prompt against the switched model"
+        );
 
         // The original provider is used for exactly the first call; the next
         // call in the same turn goes to the switched provider instead.
@@ -9469,19 +9620,6 @@ mod tests {
              provider/model (ollama/llama3); captured events: {events:?}"
         );
         drop(events);
-
-        // The pending switch must be cleared after consumption so it does not
-        // retrigger on a later iteration or turn.
-        let still_pending = crate::agent::loop_::get_model_switch_state()
-            .lock()
-            .unwrap()
-            .clone();
-        assert_eq!(
-            still_pending, None,
-            "pending switch must be cleared after turn_streamed consumes it"
-        );
-
-        crate::agent::loop_::clear_model_switch_request();
     }
 }
 
@@ -9576,12 +9714,21 @@ mod approval_route_tests {
             behavior: StubBehavior::Answer(ChannelApprovalResponse::Approve),
         }]);
         match resolve_routed_approval(&h, &route("ops", OnNoApprover::Deny), "r", &req()).await {
-            RoutedApproval::Decided { response, decider } => {
+            RoutedApproval::Decided {
+                response,
+                decider,
+                source,
+            } => {
                 assert_eq!(response, ChannelApprovalResponse::Approve);
                 assert_eq!(
                     decider.as_deref(),
                     Some("ops"),
                     "decider names the approver"
+                );
+                assert_eq!(
+                    source,
+                    zeroclaw_api::channel::ApprovalSource::Operator,
+                    "an approver's answer is an operator decision"
                 );
             }
             RoutedApproval::Fallthrough => panic!("expected a routed decision"),
@@ -9592,9 +9739,22 @@ mod approval_route_tests {
     async fn unregistered_approver_fails_closed_by_default() {
         let h = registry(vec![]);
         match resolve_routed_approval(&h, &route("ops", OnNoApprover::Deny), "r", &req()).await {
-            RoutedApproval::Decided { response, decider } => {
+            RoutedApproval::Decided {
+                response,
+                decider,
+                source,
+            } => {
                 assert_eq!(response, ChannelApprovalResponse::Deny, "fail-closed deny");
                 assert!(decider.is_none(), "synthetic deny has no decider");
+                // The regression this guards: a fail-closed deny is Some(Deny)
+                // with no decider, so anything inferring "a user decided" from
+                // the presence of a response reports a denial nobody made.
+                assert_eq!(
+                    source,
+                    zeroclaw_api::channel::ApprovalSource::Unavailable,
+                    "an unregistered approver is a runtime denial, not a user's"
+                );
+                assert!(source.is_runtime_fail_closed());
             }
             RoutedApproval::Fallthrough => panic!("default policy must NOT fall through"),
         }
@@ -9623,13 +9783,17 @@ mod approval_route_tests {
             behavior: StubBehavior::NoDecision,
         }]);
         let out = resolve_routed_approval(&h, &route("ops", OnNoApprover::Deny), "r", &req()).await;
-        assert!(matches!(
-            out,
-            RoutedApproval::Decided {
-                response: ChannelApprovalResponse::Deny,
-                ..
-            }
-        ));
+        assert!(
+            matches!(
+                out,
+                RoutedApproval::Decided {
+                    response: ChannelApprovalResponse::Deny,
+                    source: zeroclaw_api::channel::ApprovalSource::Unreachable,
+                    ..
+                }
+            ),
+            "an approver that returns no decision is a runtime denial: {out:?}"
+        );
     }
 
     // The route timeout (1s) fires and cancels the stub's long sleep, so this
@@ -9641,13 +9805,19 @@ mod approval_route_tests {
             behavior: StubBehavior::Slow,
         }]);
         let out = resolve_routed_approval(&h, &route("ops", OnNoApprover::Deny), "r", &req()).await;
-        assert!(matches!(
-            out,
-            RoutedApproval::Decided {
-                response: ChannelApprovalResponse::Deny,
-                ..
-            }
-        ));
+        // A timeout is the case most easily mistaken for a user's "no": the
+        // route returns Some(Deny) exactly as an operator denial would.
+        assert!(
+            matches!(
+                out,
+                RoutedApproval::Decided {
+                    response: ChannelApprovalResponse::Deny,
+                    source: zeroclaw_api::channel::ApprovalSource::TimedOut,
+                    ..
+                }
+            ),
+            "a timed-out approver is a runtime denial, not a user's: {out:?}"
+        );
     }
 
     use zeroclaw_api::channel::Channel as _;
