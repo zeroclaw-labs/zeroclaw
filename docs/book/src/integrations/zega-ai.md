@@ -74,6 +74,15 @@ Upstream handler: `handle_pair` (`crates/zeroclaw-gateway/src/lib.rs`).
 | `ZeroClawAuthManager` | Coordinates pairing credentials (enhanced → legacy fallback) and generates `Authorization: Bearer <token>` headers for all authenticated daemon interactions. |
 | Version Matrix | Client-side version compatibility checker targeting numeric bounds `>=0.8.0 <0.9.0-alpha` (pinned target `v0.8.3`). Strips pre-release suffixes prior to numeric component comparison (`major.minor.patch`). |
 
+## Native ZeroClaw Configuration & Runtime
+
+ZEGA configures the official ZeroClaw Rust binary (`v0.8.3`) using native `config.toml` declarations:
+
+- **Multi-LLM Failover Engine**: Primary `groq/llama-3.3-70b-versatile` with automatic failover to `google/gemini-1.5-flash` and `deepseek-v3`.
+- **Supervised Risk Profile**: Auto-approves read queries (`http_request`, `web_fetch`) while explicitly excluding `transfer` and `sign_transaction`.
+- **MCP Client Support**: Connects to Helius DAS MCP via SSE for read-only RPC queries and SendAI MCP via stdio for Solana Actions.
+- **Multi-Channel Adapters**: Integrates HMAC-SHA256 webhooks (`x-zeroclaw-signature`), Telegram Bot API for POS cashier commands, and WhatsApp.
+
 ## Native ZeroClaw Composition in ZEGA AI
 
 ZEGA composes ZeroClaw's stock agent primitives to deliver an autonomous merchant terminal:
@@ -82,8 +91,8 @@ ZEGA composes ZeroClaw's stock agent primitives to deliver an autonomous merchan
 
 - **`payment-reconciliation` (Cron Trigger `*/30s`)**: Periodically queries pending invoice reference keys on Solana Devnet via `getSignaturesForAddress` and `getTransaction`, verifying recipient pubkeys and posting confirmed settlements to ZEGA terminal views.
 - **`refund-approval` (Channel Trigger)**: Handles customer refund requests. Automatically screens inputs for prompt injection; if safe, halts at an approval checkpoint (`kind: checkpoint`, `policy: merchant-refund`, `quorum: 1`) requiring human merchant confirmation before proceeding.
-- **`defi-guardian` (Cron Trigger)**: Monitors price feed volatility and liquidity alerts via Jupiter & Switchboard.
-- **`balance-alert` (Cron Trigger)**: Monitors merchant wallet SOL balances for operational threshold alerts.
+- **`defi-guardian` (Cron Trigger `*/5m`)**: Monitors price feed volatility and liquidity alerts via Jupiter & Switchboard.
+- **`balance-alert` (Cron Trigger `*/15m`)**: Monitors merchant wallet SOL balances for operational threshold alerts.
 
 ### 2. Skills & Response Shaping
 
