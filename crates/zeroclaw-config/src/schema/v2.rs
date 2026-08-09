@@ -981,12 +981,10 @@ fn fold_providers_globals_into_models(
                 // Multiple distinct canonical families and no `default_provider`
                 // to say which one owns the global credentials. Nothing ties the
                 // unowned value(s) to whichever family iteration selects, so the
-                // fold must not claim a producer and must mark the target
-                // ambiguous. Already-family-owned slots stay single (explicit
-                // per-provider entries were registered by alias_provider_models);
-                // only globals-created/augmented slots lose their assumed owner
-                // so a bare vision reference is never redirected to credentials
-                // that have no stated owner.
+                // fold must not claim a producer. Whether the target is marked
+                // ambiguous is decided below once the fold has run, so a no-op
+                // overlay that changes nothing keeps its existing single-owner
+                // provenance (see the `ambiguous` return).
                 _ => {
                     let k = aliased_models.keys().next().expect("len > 1").clone();
                     (
@@ -1033,6 +1031,10 @@ fn fold_providers_globals_into_models(
     };
 
     // Per-provider entries take precedence: only fill missing slots.
+    // `folded_some` records whether the globals actually landed on this alias
+    // at all, so a no-op overlay across multiple families (every value shadowed
+    // by an existing per-provider field) keeps its single-owner provenance.
+    let mut folded_some = false;
     for (target_key, source) in [
         ("api_key", g_api_key),
         ("uri", uri_source),
@@ -1046,6 +1048,7 @@ fn fold_providers_globals_into_models(
             && !alias_table.contains_key(target_key)
         {
             alias_table.insert(target_key.to_string(), value);
+            folded_some = true;
         }
     }
 
@@ -1055,6 +1058,7 @@ fn fold_providers_globals_into_models(
     for (field, value) in normalized_extras {
         if !alias_table.contains_key(field) {
             alias_table.insert(field.to_string(), value);
+            folded_some = true;
         }
     }
 
@@ -1068,9 +1072,19 @@ fn fold_providers_globals_into_models(
         );
     }
     if ambiguous {
-        GlobalFold::Ambiguous {
-            family: target_type,
-            alias: target_alias,
+        // A no-op overlay across multiple families — the globals were fully
+        // shadowed by existing per-provider fields (`folded_some` is false) —
+        // changed nothing on the target, so the slot keeps its single-owner
+        // provenance and the bare vision rewrite may still fire. Only a fold
+        // that actually created or augmented the target makes its ownership
+        // unestablished and marks it ambiguous.
+        if folded_some {
+            GlobalFold::Ambiguous {
+                family: target_type,
+                alias: target_alias,
+            }
+        } else {
+            GlobalFold::None
         }
     } else if let Some(source) = source_key {
         GlobalFold::Producer(source)
