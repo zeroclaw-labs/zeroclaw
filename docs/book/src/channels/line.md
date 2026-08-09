@@ -149,7 +149,7 @@ The maximum accepted audio size is 25 MB. Larger files are silently skipped with
 
 ### Log keywords
 
-| Signal | Log message |
+| Condition | Log message |
 |---|---|
 | Startup healthy | `LINE: webhook server listening on http://0.0.0.0:<port>/line/webhook` |
 | Signature rejected | `LINE: invalid X-Line-Signature` |

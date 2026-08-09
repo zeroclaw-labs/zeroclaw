@@ -1,5 +1,4 @@
 //! Listen Tool - Speech-to-text via Whisper.cpp
-//!
 //! Records audio from microphone and transcribes using local Whisper model.
 //! Designed for offline operation on Raspberry Pi.
 

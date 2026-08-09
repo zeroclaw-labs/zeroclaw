@@ -1,10 +1,4 @@
 //! Local IPC transport for the RPC layer.
-//!
-//! On Unix this binds a `SOCK_STREAM` AF_UNIX socket at
-//! `<config.data_dir>/daemon.sock`; on Windows it creates a per-user named
-//! pipe whose name is derived from the data_dir so each `--data-dir` gets
-//! its own endpoint. `$ZEROCLAW_SOCKET` overrides the endpoint path on
-//! both platforms.
 
 use super::context::RpcContext;
 use super::dispatch::RpcDispatcher;
@@ -16,12 +10,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_config::schema::Config;
 
 use platform::LocalStream;
+
+const MAX_FRAME_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Backoff after a transient `accept()` error so the serve loop does not
 /// hot-spin while the condition (e.g. fd exhaustion) clears.
@@ -34,11 +30,6 @@ const EMFILE: i32 = 24; // too many open files (this process)
 #[cfg(unix)]
 const ENFILE: i32 = 23; // too many open files (system-wide)
 
-/// Returns `true` when an error from a stream listener's `accept()` is
-/// transient and the listener itself remains usable, so the serve loop
-/// should log and keep running rather than terminating the daemon. Covers
-/// file-descriptor exhaustion (`EMFILE`/`ENFILE`, see #7042) and the usual
-/// per-connection hiccups.
 fn is_recoverable_accept_error(e: &std::io::Error) -> bool {
     if matches!(
         e.kind(),
@@ -53,13 +44,6 @@ fn is_recoverable_accept_error(e: &std::io::Error) -> bool {
     false
 }
 
-/// Resolve the local-IPC endpoint path.
-///
-/// Returns `$ZEROCLAW_SOCKET` when set, otherwise a per-`data_dir`
-/// platform-native endpoint:
-/// - Unix: `<data_dir>/daemon.sock` (filesystem path)
-/// - Windows: `\\.\pipe\zeroclaw-<hash>` where `<hash>` is derived from
-///   `data_dir` so each data directory gets its own pipe
 pub fn socket_path(config: &Config) -> PathBuf {
     if let Ok(p) = std::env::var("ZEROCLAW_SOCKET") {
         return PathBuf::from(p);
@@ -113,10 +97,16 @@ impl RpcTransport for LocalTransport {
     }
 
     async fn next_frame(&mut self) -> Option<String> {
-        let mut line = String::new();
-        match self.reader.read_line(&mut line).await {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut limited = (&mut self.reader).take(MAX_FRAME_BYTES + 1);
+        match limited.read_until(b'\n', &mut buf).await {
             Ok(0) => None,
-            Ok(_) => Some(line),
+            Ok(_) => {
+                if buf.len() as u64 > MAX_FRAME_BYTES {
+                    return None;
+                }
+                Some(String::from_utf8_lossy(&buf).into_owned())
+            }
             Err(_) => None,
         }
     }
@@ -129,13 +119,13 @@ impl RpcTransport for LocalTransport {
 // ── Listener ─────────────────────────────────────────────────────
 
 /// Run the local IPC RPC listener as a daemon subsystem.
-///
 /// `client_count` is incremented on connect, decremented on disconnect.
 /// The daemon uses it for `--ephemeral` shutdown logic.
 pub async fn run_local_listener(
     ctx: Arc<RpcContext>,
     cancel: CancellationToken,
     client_count: Arc<AtomicUsize>,
+    readiness: Option<crate::daemon::SocketReadinessReporter>,
 ) -> Result<()> {
     let path = {
         let config = ctx.config.read();
@@ -148,6 +138,10 @@ pub async fn run_local_listener(
     let mut listener = platform::bind(&path).context("binding local IPC endpoint")?;
 
     platform::secure_endpoint(&path).await;
+
+    if let Some(readiness) = readiness {
+        readiness.report_ready();
+    }
 
     ::zeroclaw_log::record!(
         INFO,
@@ -174,7 +168,7 @@ pub async fn run_local_listener(
                             // Transient (e.g. EMFILE under fd pressure):
                             // the listener is still valid. Back off briefly
                             // to avoid hot-spinning, then keep serving
-                            // rather than killing the daemon (#7042).
+                            // rather than killing the daemon
                             ::zeroclaw_log::record!(
                                 WARN,
                                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -462,19 +456,57 @@ mod tests {
         panic!("socket never appeared at {}", path.display());
     }
 
+    /// Wait for the server-side client count to reach `expected`, or fail with
+    /// the value actually observed.
+    ///
+    /// `run_local_listener` increments the count in its accept loop but
+    /// decrements it at the end of the per-connection task, so a disconnect
+    /// becomes visible only once the dispatcher has seen EOF and that task has
+    /// finished. Waiting a fixed interval assumes that completes within it;
+    /// under a loaded test harness it may not.
+    #[cfg(unix)]
+    async fn wait_for_client_count(count: &Arc<AtomicUsize>, expected: usize) {
+        for _ in 0..250 {
+            if count.load(Ordering::Relaxed) == expected {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!(
+            "client count never reached {expected}; last observed {}",
+            count.load(Ordering::Relaxed)
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
-    async fn socket_initialize_handshake() {
+    async fn daemon_startup_socket_initialize_handshake_reports_readiness() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = test_ctx(tmp.path());
         let sock_path = ctx.config.read().data_dir.join("daemon.sock");
         let cancel = CancellationToken::new();
+        let (ready_tx, mut ready_rx) = tokio::sync::watch::channel(false);
+        let readiness = crate::daemon::SocketReadinessReporter::new(move || {
+            let _ = ready_tx.send(true);
+        });
 
         let server_cancel = cancel.clone();
         let server_ctx = ctx.clone();
         let handle = zeroclaw_spawn::spawn!(async move {
-            run_local_listener(server_ctx, server_cancel, test_client_count()).await
+            run_local_listener(
+                server_ctx,
+                server_cancel,
+                test_client_count(),
+                Some(readiness),
+            )
+            .await
         });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            ready_rx.wait_for(|ready| *ready).await.unwrap();
+        })
+        .await
+        .expect("local IPC should report its secured bind");
 
         wait_for_socket(&sock_path).await;
 
@@ -526,7 +558,7 @@ mod tests {
         let server_cancel = cancel.clone();
         let server_ctx = ctx.clone();
         zeroclaw_spawn::spawn!(async move {
-            let _ = run_local_listener(server_ctx, server_cancel, test_client_count()).await;
+            let _ = run_local_listener(server_ctx, server_cancel, test_client_count(), None).await;
         });
 
         wait_for_socket(&sock_path).await;
@@ -564,7 +596,7 @@ mod tests {
         let server_cancel = cancel.clone();
         let server_ctx = ctx.clone();
         zeroclaw_spawn::spawn!(async move {
-            let _ = run_local_listener(server_ctx, server_cancel, test_client_count()).await;
+            let _ = run_local_listener(server_ctx, server_cancel, test_client_count(), None).await;
         });
 
         wait_for_socket(&sock_path).await;
@@ -595,7 +627,7 @@ mod tests {
         let server_cancel = cancel.clone();
         let server_ctx = ctx.clone();
         zeroclaw_spawn::spawn!(async move {
-            let _ = run_local_listener(server_ctx, server_cancel, test_client_count()).await;
+            let _ = run_local_listener(server_ctx, server_cancel, test_client_count(), None).await;
         });
 
         for _ in 0..50 {
@@ -625,7 +657,7 @@ mod tests {
         let server_cancel = cancel.clone();
         let server_ctx = ctx.clone();
         zeroclaw_spawn::spawn!(async move {
-            let _ = run_local_listener(server_ctx, server_cancel, test_client_count()).await;
+            let _ = run_local_listener(server_ctx, server_cancel, test_client_count(), None).await;
         });
         wait_for_socket(&sock_path).await;
 
@@ -671,7 +703,7 @@ mod tests {
         let server_ctx = ctx.clone();
         let server_count = count.clone();
         zeroclaw_spawn::spawn!(async move {
-            let _ = run_local_listener(server_ctx, server_cancel, server_count).await;
+            let _ = run_local_listener(server_ctx, server_cancel, server_count, None).await;
         });
 
         wait_for_socket(&sock_path).await;
@@ -680,16 +712,13 @@ mod tests {
 
         let s1 = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
         let s2 = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert_eq!(count.load(Ordering::Relaxed), 2);
+        wait_for_client_count(&count, 2).await;
 
         drop(s1);
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert_eq!(count.load(Ordering::Relaxed), 1);
+        wait_for_client_count(&count, 1).await;
 
         drop(s2);
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert_eq!(count.load(Ordering::Relaxed), 0);
+        wait_for_client_count(&count, 0).await;
 
         cancel.cancel();
     }
@@ -708,7 +737,7 @@ mod tests {
         let server_cancel = cancel.clone();
         let server_ctx = ctx.clone();
         let handle = zeroclaw_spawn::spawn!(async move {
-            run_local_listener(server_ctx, server_cancel, test_client_count()).await
+            run_local_listener(server_ctx, server_cancel, test_client_count(), None).await
         });
 
         // Poll-connect until the server creates its pending instance.
@@ -762,7 +791,7 @@ mod accept_error_tests {
     #[cfg(unix)]
     #[test]
     fn fd_exhaustion_accept_errors_are_recoverable() {
-        // #7042: EMFILE/ENFILE must not terminate the daemon.
+        // EMFILE/ENFILE must not terminate the daemon.
         assert!(is_recoverable_accept_error(&Error::from_raw_os_error(24))); // EMFILE
         assert!(is_recoverable_accept_error(&Error::from_raw_os_error(23))); // ENFILE
     }

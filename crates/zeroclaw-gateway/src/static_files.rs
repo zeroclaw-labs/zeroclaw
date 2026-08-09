@@ -1,5 +1,4 @@
 //! Static file serving for the web dashboard.
-//!
 //! Serves the compiled `web/dist/` directory from the filesystem at runtime.
 //! The directory path is configured via `gateway.web_dist_dir`.
 

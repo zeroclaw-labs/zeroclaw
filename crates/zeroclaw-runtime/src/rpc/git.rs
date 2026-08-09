@@ -49,11 +49,6 @@ pub fn head_info(start: &Path) -> Option<HeadInfo> {
     }
 }
 
-/// Resolve a full refname (e.g. `refs/heads/main`) to its short commit hash,
-/// checking the loose ref file first, then `packed-refs`. Worktrees keep their
-/// own `HEAD` but share refs through the common git dir (`commondir`), so loose
-/// and packed lookups resolve against that shared dir. Returns `None` when the
-/// ref has no commit yet (unborn branch) or cannot be read.
 fn resolve_ref(git_dir: &Path, refname: &str) -> Option<String> {
     let common = common_dir(git_dir);
     let loose = common.join(refname);

@@ -19,14 +19,12 @@ the plugin host compiled in to run it.
 > **The release binary is not that binary.** The prebuilt binaries the
 > installer ships do not include the plugin host (`zeroclaw plugin …` is an
 > unrecognized subcommand), and `plugins-wasm` is not in the crate's default
-> feature set. Build the host side from source, and note the backend
-> features do **not** imply the umbrella: `--features plugins-wasm-cranelift`
-> alone builds cleanly and still produces a plugin-less binary, because the
-> runtime integration is gated on `plugins-wasm` itself. The working
-> invocation is:
+> feature set. Build the host side from source with an execution backend;
+> every backend feature carries the `plugins-wasm` umbrella itself, so one
+> flag is enough:
 >
 > ```bash
-> cargo build --release --features plugins-wasm,plugins-wasm-cranelift
+> cargo build --release --features plugins-wasm-cranelift
 > ```
 >
 > The [protocol page](../developing/plugin-protocol.md#build-features)
@@ -313,9 +311,9 @@ true), `patterns` (comma-separated literals, default empty).
 For this plugin: `name` and `version` matching what `plugin-info` reports,
 `wasm_path` naming the component file you will ship next to it,
 `capabilities` containing exactly `tool`, and `permissions` containing exactly
-`config_read`. Add `http_client` only if your tool makes outbound HTTP calls;
-that permission is what attaches the `wasi:http` context to your store, and
-without it there is no network surface at all.
+`config_read`. Add `http_client` only if your tool makes outbound HTTP calls.
+The tool adapter implements `wasi:http`, but links it only after that grant is
+validated; without both adapter support and the grant there is no HTTP surface.
 
 ### Tools that call the network
 

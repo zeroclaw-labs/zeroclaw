@@ -1,6 +1,7 @@
 //! LLM-failure recording and in-loop context-overflow recovery.
 
 use super::context::TurnCtx;
+use super::events::{ProgressEvent, send_progress};
 use super::outcome::is_tool_loop_cancelled;
 use crate::agent::history::estimate_history_tokens;
 use crate::agent::history_trim::trim_to_recent_turns;
@@ -33,6 +34,7 @@ pub(crate) fn record_llm_failure(
         output_tokens: None,
         channel: Some(ctx.channel_name.to_string()),
         agent_alias: ctx.agent_alias.map(|s| s.to_string()),
+        parent_agent_alias: ctx.parent_agent_alias.map(|s| s.to_string()),
         turn_id: Some(ctx.turn_id.to_string()),
         // Error path: no prompt/completion content captured.
         messages: None,
@@ -53,20 +55,12 @@ pub(crate) fn record_llm_failure(
     );
 }
 
-/// Context overflow recovery: trim history and retry.
-///
-/// Returns `true` when the history was trimmed and the caller should
-/// `continue` the loop; the orchestrator keeps
-/// `if recovered { continue; } return Err(e);` inline.
-///
-/// Emits `TurnEvent::HistoryTrimmed` and `ObserverEvent::HistoryTrimmed` on the
-/// trimmed branch so the 400-recovery cut is never silent to ACP / WS / SSE
-/// subscribers, matching the preemptive turn-boundary path.
 pub(crate) async fn try_recover_context_overflow(
     history: &mut Vec<ChatMessage>,
     e: &anyhow::Error,
     iteration: usize,
     event_tx: Option<&tokio::sync::mpsc::Sender<zeroclaw_api::agent::TurnEvent>>,
+    on_delta: Option<&tokio::sync::mpsc::Sender<super::events::DraftEvent>>,
     observer: &dyn Observer,
     context_token_budget: usize,
 ) -> bool {
@@ -93,6 +87,11 @@ pub(crate) async fn try_recover_context_overflow(
         let tokens_after = result.tokens_after;
         let mut recovered_history = result.history;
         if trimmed {
+            // Announce compaction only once the trim has actually succeeded.
+            // Recognizing the overflow is not enough: a single oversized turn
+            // cannot be trimmed, and announcing on recognition would claim
+            // work that never happens.
+            send_progress(on_delta, ProgressEvent::CompactingContext).await;
             // Insert the same model-visible breadcrumb the turn-boundary path
             // uses, after the leading system messages, so the retried provider
             // call tells the model earlier turns were dropped (never silent to
@@ -138,17 +137,6 @@ pub(crate) async fn try_recover_context_overflow(
             return true;
         }
 
-        // Nothing left to trim — truly unrecoverable. When the system prompt +
-        // inlined tool definitions alone dominate the budget, the single
-        // remaining turn can never fit no matter how much history is dropped;
-        // surface the actionable root cause and remedy instead of a generic
-        // unrecoverable error (#5808).
-        // Gate on the resolved effective budget (the same `N` the message
-        // displays), not the local 2/3-of-current recovery budget — otherwise a
-        // provider whose real window is below the configured budget could fire a
-        // message stating floor >= N while numerically floor < N. The recovery
-        // trim above still uses the local `budget`; only the remediation
-        // predicate and the displayed value key on the resolved budget (#5808).
         let system_floor = crate::agent::history::estimate_system_floor_tokens(history);
         if system_floor >= context_token_budget {
             ::zeroclaw_log::record!(
@@ -195,6 +183,110 @@ mod tests {
         h
     }
 
+    /// The `CompactingContext` lifecycle state is only reachable through this
+    /// recovery path, so it must be exercised with a live draft channel rather
+    /// than the `None` sender the other cases use — otherwise the state is
+    /// never emitted by any test and only appears in the enumeration tables.
+    #[tokio::test]
+    async fn recovery_emits_compacting_context_lifecycle_to_the_draft_channel() {
+        let mut history = overflowing_history();
+        let err = anyhow::Error::msg("maximum context length exceeded");
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel(8);
+        let observer = NoopObserver;
+
+        let recovered = try_recover_context_overflow(
+            &mut history,
+            &err,
+            1,
+            None,
+            Some(&delta_tx),
+            &observer,
+            32_000,
+        )
+        .await;
+
+        assert!(recovered, "an overflowing history must trim and recover");
+        let delta = delta_rx
+            .try_recv()
+            .expect("context recovery must emit a lifecycle delta");
+        assert!(
+            matches!(
+                delta,
+                super::super::events::StreamDelta::Lifecycle(ProgressEvent::CompactingContext)
+            ),
+            "context recovery must emit the typed CompactingContext state, got {delta:?}"
+        );
+    }
+
+    /// An unrelated provider error is not a compaction trigger at all.
+    #[tokio::test]
+    async fn unrecoverable_error_emits_no_compacting_context_lifecycle() {
+        let mut history = vec![ChatMessage::system("system")];
+        let err = anyhow::Error::msg("some unrelated provider failure");
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel(8);
+        let observer = NoopObserver;
+
+        let recovered = try_recover_context_overflow(
+            &mut history,
+            &err,
+            1,
+            None,
+            Some(&delta_tx),
+            &observer,
+            32_000,
+        )
+        .await;
+
+        assert!(!recovered, "a non-overflow error must not report recovery");
+        assert!(
+            delta_rx.try_recv().is_err(),
+            "no lifecycle state may be emitted when compaction never ran"
+        );
+    }
+
+    /// The case that matters for state accuracy: a genuine context overflow
+    /// that cannot be trimmed, because a single oversized turn leaves nothing
+    /// to drop. Recognizing the overflow must not announce compaction, or the
+    /// user is told the agent is compacting when it provably cannot.
+    #[tokio::test]
+    async fn overflow_that_cannot_trim_emits_no_compacting_context_lifecycle() {
+        // One system message plus a single user turn: `trim_to_recent_turns`
+        // always keeps the current turn, so there is no whole turn to drop.
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user(format!("only turn {}", "x".repeat(40_000)).as_str()),
+        ];
+        let before = history.clone();
+        let err = anyhow::Error::msg("maximum context length exceeded");
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel(8);
+        let observer = NoopObserver;
+
+        let recovered = try_recover_context_overflow(
+            &mut history,
+            &err,
+            1,
+            None,
+            Some(&delta_tx),
+            &observer,
+            32_000,
+        )
+        .await;
+
+        assert!(
+            !recovered,
+            "an overflow with a single turn cannot be recovered"
+        );
+        assert_eq!(
+            history.len(),
+            before.len(),
+            "nothing was trimmable, so history must be unchanged"
+        );
+        assert!(
+            delta_rx.try_recv().is_err(),
+            "recognizing an overflow must not announce compaction that cannot happen"
+        );
+    }
+
     #[tokio::test]
     async fn recovery_emits_history_trimmed_event_on_trim() {
         let mut history = overflowing_history();
@@ -203,7 +295,8 @@ mod tests {
         let observer = NoopObserver;
 
         let recovered =
-            try_recover_context_overflow(&mut history, &err, 1, Some(&tx), &observer, 32_000).await;
+            try_recover_context_overflow(&mut history, &err, 1, Some(&tx), None, &observer, 32_000)
+                .await;
 
         assert!(recovered, "an overflowing history must trim and recover");
         // The retried history must carry the model-visible breadcrumb after the
@@ -233,7 +326,7 @@ mod tests {
 
     #[tokio::test]
     async fn floor_exceeds_budget_single_turn_does_not_recover() {
-        // #5808 regression: the system prompt + tool definitions alone dominate
+        // the system prompt + tool definitions alone dominate
         // the budget and only one turn exists. Recovery must NOT loop — it
         // returns false (nothing left to drop) so the caller breaks instead of
         // re-running the same turn forever.
@@ -248,7 +341,8 @@ mod tests {
         let observer = NoopObserver;
 
         let recovered =
-            try_recover_context_overflow(&mut history, &err, 1, Some(&tx), &observer, 100).await;
+            try_recover_context_overflow(&mut history, &err, 1, Some(&tx), None, &observer, 100)
+                .await;
 
         assert!(
             !recovered,
@@ -275,7 +369,8 @@ mod tests {
         let observer = NoopObserver;
 
         let recovered =
-            try_recover_context_overflow(&mut history, &err, 1, Some(&tx), &observer, 32_000).await;
+            try_recover_context_overflow(&mut history, &err, 1, Some(&tx), None, &observer, 32_000)
+                .await;
 
         assert!(!recovered, "a non-overflow error must not trigger recovery");
         assert!(rx.try_recv().is_err(), "no event on the non-overflow path");
@@ -307,7 +402,8 @@ mod tests {
         while rx.try_recv().is_ok() {}
 
         let recovered =
-            try_recover_context_overflow(&mut history, &err, 1, None, &observer, budget).await;
+            try_recover_context_overflow(&mut history, &err, 1, None, None, &observer, budget)
+                .await;
         assert!(!recovered, "floor-dominates overflow must not recover");
 
         // Read the emitted `context_floor_exceeds_budget` record within a 2s

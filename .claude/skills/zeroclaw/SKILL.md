@@ -160,8 +160,9 @@ To see what's available: `GET /api/tools` (REST) lists all registered tools with
 Edit `~/.zeroclaw/config.toml` directly, use `zeroclaw config set <key>=<value>` for one field at a time, or delete `~/.zeroclaw/` and re-run `zeroclaw quickstart` for a fresh setup.
 
 **REST:**
-- `GET /api/config` — get current config (secrets masked as `***MASKED***`)
-- `PUT /api/config` — update config (send raw TOML as body, 1MB limit)
+- `GET /api/config`: compatibility whole-config read (secrets masked as `***MASKED***`)
+- `PATCH /api/config`: atomically update config with an RFC 6902 JSON Patch document
+- `OPTIONS /api/config`: get the whole-config JSON Schema; its current `Allow` header still lists legacy `PUT`, which the router does not register
 
 ### Providers & Models
 
@@ -203,20 +204,7 @@ Confirm with the user before running any estop command — these are disruptive.
 
 ### Channels
 
-ZeroClaw supports 21 messaging channels. To add one, you need to edit `~/.zeroclaw/config.toml`. For example, to set up Telegram:
-
-```toml
-[channels]
-telegram = true
-
-[channels_config.telegram]
-bot_token = "your-bot-token-from-botfather"
-allowed_users = [123456789]
-```
-
-Then restart the daemon. Check channel health with `zeroclaw channels doctor`.
-
-For the full list of channels and their config fields, read `references/cli-reference.md` (Channels section).
+Channel availability depends on the installed build's feature set. Use `zeroclaw channels list` to inspect configured channels and `zeroclaw channels doctor` to check their health. Consult the current channel guide and generated config reference before editing `~/.zeroclaw/config.toml`; do not infer config keys from a fixed channel inventory.
 
 ### Pairing (Authentication Setup)
 
@@ -253,16 +241,16 @@ Here are multi-step sequences you're likely to need:
 - **Host:** 127.0.0.1
 - **Auth:** Pairing required (bearer token)
 - **Rate limits:** 60 webhook requests/min, 10 pairing attempts/min
-- **Body limit:** 64KB (1MB for config updates)
+- **Body limit:** 64KB
 - **Timeout:** 30 seconds
 - **Idempotency:** Optional `X-Idempotency-Key` header on `/webhook` (300s TTL)
 - **Config location:** `~/.zeroclaw/config.toml`
 
 ## Reference Files
 
-For the complete API specification with every endpoint, field, and edge case, read `references/rest-api.md`.
+For a curated operational API reference, read `references/rest-api.md`. For precision-sensitive route work, verify the current gateway router and the documented subset exposed at `/api/openapi.json`.
 
-For the full CLI command tree with all flags and options, read `references/cli-reference.md`.
+For common CLI commands and options, read `references/cli-reference.md`. Use `zeroclaw --help` and `zeroclaw <command> --help` as the current command-tree authority.
 
 Only load these when you need precise details beyond what's in this file — for most operations, the quick references above are sufficient.
 

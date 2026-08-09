@@ -1,18 +1,5 @@
 use serde_json::Value;
 
-/// Evaluate a trigger condition against an event payload.
-///
-/// Condition syntax:
-///   - JSON path comparison: `$.key.subkey > 85`
-///   - Direct numeric comparison: `> 0` (used by peripheral triggers)
-///
-/// Supported operators: `>=`, `<=`, `!=`, `>`, `<`, `==`
-///
-/// Returns `false` (fail-closed) when:
-///   - payload is missing or empty
-///   - condition cannot be parsed
-///   - JSON path does not resolve to a value
-///   - extracted value and comparand are not comparable
 pub fn evaluate_condition(condition: &str, payload: Option<&str>) -> bool {
     let condition = condition.trim();
     if condition.is_empty() {
@@ -78,23 +65,32 @@ fn evaluate_direct_condition(condition: &str, payload: &str) -> bool {
 
 // ── Parsing helpers ─────────────────────────────────────────────
 
-/// Operators in order of longest-first to avoid prefix ambiguity.
-const OPERATORS: &[&str] = &[">=", "<=", "!=", "==", ">", "<"];
+/// Comparison operators, longest-token-first so parsing never mistakes a
+/// two-char token (`>=`) for its one-char prefix (`>`). This order is the
+/// single scan order every parser and every authoring surface reads.
+fn parse_order() -> [ConditionOp; 6] {
+    [
+        ConditionOp::Gte,
+        ConditionOp::Lte,
+        ConditionOp::Neq,
+        ConditionOp::Eq,
+        ConditionOp::Gt,
+        ConditionOp::Lt,
+    ]
+}
 
-/// Parse `".path.to.field op value"` → `(["path","to","field"], Op, "value")`.
-fn parse_path_op_value(input: &str) -> Option<(Vec<&str>, Op, String)> {
+/// Parse `".path.to.field op value"` → `(["path","to","field"], op, "value")`.
+fn parse_path_op_value(input: &str) -> Option<(Vec<&str>, ConditionOp, String)> {
     // Input starts after `$`, e.g. `.value > 85` or `.data.temp >= 100`
-    // Find operator position
-    for &op_str in OPERATORS {
-        if let Some(pos) = input.find(op_str) {
+    for op in parse_order() {
+        if let Some(pos) = input.find(op.token()) {
             let path_part = input[..pos].trim();
-            let value_part = input[pos + op_str.len()..].trim();
+            let value_part = input[pos + op.token().len()..].trim();
 
             if value_part.is_empty() {
                 return None;
             }
 
-            let op = Op::from_str(op_str)?;
             let segments: Vec<&str> = path_part.split('.').filter(|s| !s.is_empty()).collect();
 
             if segments.is_empty() {
@@ -107,16 +103,15 @@ fn parse_path_op_value(input: &str) -> Option<(Vec<&str>, Op, String)> {
     None
 }
 
-/// Parse `"op value"` → `(Op, "value")`.
-fn parse_op_value(input: &str) -> Option<(Op, String)> {
+/// Parse `"op value"` → `(op, "value")`.
+fn parse_op_value(input: &str) -> Option<(ConditionOp, String)> {
     let input = input.trim();
-    for &op_str in OPERATORS {
-        if let Some(rest) = input.strip_prefix(op_str) {
+    for op in parse_order() {
+        if let Some(rest) = input.strip_prefix(op.token()) {
             let value = rest.trim();
             if value.is_empty() {
                 return None;
             }
-            let op = Op::from_str(op_str)?;
             return Some((op, value.to_string()));
         }
     }
@@ -146,8 +141,13 @@ fn resolve_json_path<'a>(value: &'a Value, segments: &[&str]) -> Option<&'a Valu
 
 // ── Comparison ──────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Op {
+/// A condition comparison operator. This enum is the single source of truth for
+/// the operator set: the parser scans its tokens, the evaluator matches on its
+/// variants, and every authoring surface renders the list this enum yields (via
+/// [`ConditionOp::catalog`]). Adding an operator here is the only edit needed;
+/// no surface hand-lists operators.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::EnumIter)]
+pub enum ConditionOp {
     Gt,
     Lt,
     Gte,
@@ -156,22 +156,141 @@ enum Op {
     Neq,
 }
 
-impl Op {
-    fn from_str(s: &str) -> Option<Self> {
-        match s {
-            ">" => Some(Self::Gt),
-            "<" => Some(Self::Lt),
-            ">=" => Some(Self::Gte),
-            "<=" => Some(Self::Lte),
-            "==" => Some(Self::Eq),
-            "!=" => Some(Self::Neq),
-            _ => None,
+impl ConditionOp {
+    /// The literal token as it appears in a condition string.
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Gt => ">",
+            Self::Lt => "<",
+            Self::Gte => ">=",
+            Self::Lte => "<=",
+            Self::Eq => "==",
+            Self::Neq => "!=",
+        }
+    }
+
+    /// A short human label for pickers ("is", "is greater than", ...).
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Eq => "is",
+            Self::Neq => "is not",
+            Self::Gt => "is greater than",
+            Self::Lt => "is less than",
+            Self::Gte => "is at least",
+            Self::Lte => "is at most",
+        }
+    }
+
+    /// The full operator catalog in canonical display order (equality first,
+    /// then ordering), for authoring surfaces to render verbatim.
+    pub fn catalog() -> Vec<ConditionOpSpec> {
+        use strum::IntoEnumIterator;
+        [
+            Self::Eq,
+            Self::Neq,
+            Self::Gt,
+            Self::Gte,
+            Self::Lt,
+            Self::Lte,
+        ]
+        .into_iter()
+        .map(|op| {
+            debug_assert!(Self::iter().any(|variant| variant == op));
+            ConditionOpSpec {
+                token: op.token().to_string(),
+                label: op.label().to_string(),
+            }
+        })
+        .collect()
+    }
+
+    /// Every operator token, for the parser's longest-first scan. Walks the
+    /// same enum the catalog does, so no token literal is hand-listed twice.
+    pub fn catalog_tokens() -> Vec<&'static str> {
+        use strum::IntoEnumIterator;
+        Self::iter().map(Self::token).collect()
+    }
+}
+
+/// Wire shape of one operator for authoring surfaces: the literal `token` to
+/// splice into a condition string, and a human `label` to show in a picker.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct ConditionOpSpec {
+    pub token: String,
+    pub label: String,
+}
+
+/// A condition string decomposed into the three parts an authoring surface
+/// edits: an optional JSON path (absent for `direct` scalar payloads), the
+/// operator token, and the raw comparand. This is the single authority both
+/// the web and zerocode builders round-trip through, so the two surfaces
+/// assemble identical strings from identical parts.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConditionParts {
+    pub path: Option<String>,
+    pub op: String,
+    pub value: String,
+}
+
+impl ConditionParts {
+    /// Split a stored condition into parts against the operator catalog.
+    /// Tokens are matched longest first so `>=` wins over `>`. A `$`-prefixed
+    /// input is JSON-path form; anything else is a direct scalar comparison
+    /// with no path. Unmatched input yields an empty `op` so the caller can
+    /// fall back to raw editing without losing the text.
+    #[must_use]
+    pub fn parse(condition: &str) -> Self {
+        let trimmed = condition.trim();
+        let has_path = trimmed.starts_with('$');
+        let scan_from = if has_path {
+            trimmed
+                .trim_start_matches('$')
+                .trim_start_matches('.')
+                .trim()
+        } else {
+            trimmed
+        };
+        let mut tokens: Vec<&'static str> = ConditionOp::catalog_tokens();
+        tokens.sort_by_key(|b| std::cmp::Reverse(b.len()));
+        for token in tokens {
+            if let Some(at) = scan_from.find(token) {
+                let left = scan_from[..at].trim().to_string();
+                let right = scan_from[at + token.len()..].trim().to_string();
+                return Self {
+                    path: has_path.then_some(left),
+                    op: token.to_string(),
+                    value: right,
+                };
+            }
+        }
+        Self {
+            path: has_path.then(|| scan_from.trim().to_string()),
+            op: String::new(),
+            value: String::new(),
+        }
+    }
+
+    /// Reassemble a condition string. JSON-path form emits `$.<path> <op>
+    /// <value>`; direct scalar form emits `<op> <value>`. An empty operator
+    /// yields `None` (fire on every event).
+    #[must_use]
+    pub fn build(&self) -> Option<String> {
+        if self.op.is_empty() {
+            return None;
+        }
+        let rhs = format!("{} {}", self.op, self.value);
+        let rhs = rhs.trim();
+        match &self.path {
+            None => Some(rhs.to_string()),
+            Some(p) if p.trim().is_empty() => Some(rhs.to_string()),
+            Some(p) => Some(format!("$.{} {}", p.trim(), rhs)),
         }
     }
 }
 
 /// Compare a JSON value against a string comparand using the given operator.
-fn compare_values(extracted: &Value, op: Op, comparand: &str) -> bool {
+fn compare_values(extracted: &Value, op: ConditionOp, comparand: &str) -> bool {
     // Try numeric comparison first
     if let Some(lhs) = value_as_f64(extracted)
         && let Ok(rhs) = comparand.parse::<f64>()
@@ -188,12 +307,12 @@ fn compare_values(extracted: &Value, op: Op, comparand: &str) -> bool {
         .unwrap_or(comparand);
 
     match op {
-        Op::Eq => lhs == rhs,
-        Op::Neq => lhs != rhs,
-        Op::Gt => lhs.as_str() > rhs,
-        Op::Lt => lhs.as_str() < rhs,
-        Op::Gte => lhs.as_str() >= rhs,
-        Op::Lte => lhs.as_str() <= rhs,
+        ConditionOp::Eq => lhs == rhs,
+        ConditionOp::Neq => lhs != rhs,
+        ConditionOp::Gt => lhs.as_str() > rhs,
+        ConditionOp::Lt => lhs.as_str() < rhs,
+        ConditionOp::Gte => lhs.as_str() >= rhs,
+        ConditionOp::Lte => lhs.as_str() <= rhs,
     }
 }
 
@@ -214,20 +333,95 @@ fn value_as_string(v: &Value) -> String {
     }
 }
 
-fn apply_op_f64(lhs: f64, op: Op, rhs: f64) -> bool {
+fn apply_op_f64(lhs: f64, op: ConditionOp, rhs: f64) -> bool {
     match op {
-        Op::Gt => lhs > rhs,
-        Op::Lt => lhs < rhs,
-        Op::Gte => lhs >= rhs,
-        Op::Lte => lhs <= rhs,
-        Op::Eq => (lhs - rhs).abs() < f64::EPSILON,
-        Op::Neq => (lhs - rhs).abs() >= f64::EPSILON,
+        ConditionOp::Gt => lhs > rhs,
+        ConditionOp::Lt => lhs < rhs,
+        ConditionOp::Gte => lhs >= rhs,
+        ConditionOp::Lte => lhs <= rhs,
+        ConditionOp::Eq => (lhs - rhs).abs() < f64::EPSILON,
+        ConditionOp::Neq => (lhs - rhs).abs() >= f64::EPSILON,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── ConditionParts round-trip (cross-surface fixture) ───────────────
+    // These fixtures are mirrored verbatim in the web builder test
+    // (web/src/lib/sops.condition.test.ts). The two surfaces must parse and
+    // build identically or a condition authored in one drifts in the other.
+
+    #[test]
+    fn condition_parts_parse_json_path() {
+        let p = ConditionParts::parse("$.value >= 85");
+        assert_eq!(p.path.as_deref(), Some("value"));
+        assert_eq!(p.op, ">=");
+        assert_eq!(p.value, "85");
+    }
+
+    #[test]
+    fn condition_parts_parse_prefers_longest_operator() {
+        let p = ConditionParts::parse("$.temp >= 100");
+        assert_eq!(p.op, ">=", "must not match bare > before >=");
+    }
+
+    #[test]
+    fn condition_parts_parse_direct_scalar_has_no_path() {
+        let p = ConditionParts::parse("> 0");
+        assert_eq!(p.path, None);
+        assert_eq!(p.op, ">");
+        assert_eq!(p.value, "0");
+    }
+
+    #[test]
+    fn condition_parts_parse_nested_path() {
+        let p = ConditionParts::parse("$.data.temp == critical");
+        assert_eq!(p.path.as_deref(), Some("data.temp"));
+        assert_eq!(p.op, "==");
+        assert_eq!(p.value, "critical");
+    }
+
+    #[test]
+    fn condition_parts_build_json_path() {
+        let p = ConditionParts {
+            path: Some("value".into()),
+            op: ">=".into(),
+            value: "85".into(),
+        };
+        assert_eq!(p.build().as_deref(), Some("$.value >= 85"));
+    }
+
+    #[test]
+    fn condition_parts_build_direct_scalar() {
+        let p = ConditionParts {
+            path: None,
+            op: ">".into(),
+            value: "0".into(),
+        };
+        assert_eq!(p.build().as_deref(), Some("> 0"));
+    }
+
+    #[test]
+    fn condition_parts_empty_op_builds_none() {
+        let p = ConditionParts {
+            path: Some("value".into()),
+            op: String::new(),
+            value: "85".into(),
+        };
+        assert_eq!(p.build(), None);
+    }
+
+    #[test]
+    fn condition_parts_round_trip_every_operator() {
+        for spec in ConditionOp::catalog() {
+            let src = format!("$.field {} 5", spec.token);
+            let parsed = ConditionParts::parse(&src);
+            assert_eq!(parsed.op, spec.token);
+            assert_eq!(parsed.build().as_deref(), Some(src.as_str()));
+        }
+    }
 
     // ── evaluate_condition (public API) ─────────────────
 
@@ -386,14 +580,14 @@ mod tests {
     #[test]
     fn parse_op_value_basic() {
         let (op, val) = parse_op_value("> 42").unwrap();
-        assert_eq!(op, Op::Gt);
+        assert_eq!(op, ConditionOp::Gt);
         assert_eq!(val, "42");
     }
 
     #[test]
     fn parse_op_value_gte_not_gt() {
         let (op, val) = parse_op_value(">= 10").unwrap();
-        assert_eq!(op, Op::Gte);
+        assert_eq!(op, ConditionOp::Gte);
         assert_eq!(val, "10");
     }
 
@@ -407,7 +601,7 @@ mod tests {
     fn parse_path_op_value_basic() {
         let (segments, op, val) = parse_path_op_value(".value > 85").unwrap();
         assert_eq!(segments, vec!["value"]);
-        assert_eq!(op, Op::Gt);
+        assert_eq!(op, ConditionOp::Gt);
         assert_eq!(val, "85");
     }
 
@@ -415,7 +609,7 @@ mod tests {
     fn parse_path_op_value_nested() {
         let (segments, op, val) = parse_path_op_value(".data.temp >= 100").unwrap();
         assert_eq!(segments, vec!["data", "temp"]);
-        assert_eq!(op, Op::Gte);
+        assert_eq!(op, ConditionOp::Gte);
         assert_eq!(val, "100");
     }
 
@@ -423,7 +617,7 @@ mod tests {
     fn parse_path_op_value_string_comparand() {
         let (segments, op, val) = parse_path_op_value(r#".status == "critical""#).unwrap();
         assert_eq!(segments, vec!["status"]);
-        assert_eq!(op, Op::Eq);
+        assert_eq!(op, ConditionOp::Eq);
         assert_eq!(val, r#""critical""#);
     }
 
@@ -447,5 +641,41 @@ mod tests {
     fn resolve_path_missing() {
         let json: Value = serde_json::from_str(r#"{"a": 1}"#).unwrap();
         assert!(resolve_json_path(&json, &["b"]).is_none());
+    }
+
+    // ── Operator catalog ────────────────────────────────
+
+    #[test]
+    fn op_catalog_covers_every_variant_once() {
+        use strum::IntoEnumIterator;
+        let catalog = ConditionOp::catalog();
+        assert_eq!(
+            catalog.len(),
+            ConditionOp::iter().count(),
+            "catalog must render every operator variant exactly once"
+        );
+        for op in ConditionOp::iter() {
+            assert!(
+                catalog.iter().any(|spec| spec.token == op.token()),
+                "operator {} missing from catalog",
+                op.token()
+            );
+        }
+    }
+
+    #[test]
+    fn op_tokens_are_parseable_back() {
+        use strum::IntoEnumIterator;
+        for op in ConditionOp::iter() {
+            let condition = format!("$.value {} 1", op.token());
+            // Every catalog token must round-trip through the path parser.
+            let parsed = parse_path_op_value(condition.trim_start_matches('$'));
+            assert!(
+                parsed.is_some(),
+                "token {} did not parse back through the grammar",
+                op.token()
+            );
+            assert_eq!(parsed.unwrap().1, op);
+        }
     }
 }

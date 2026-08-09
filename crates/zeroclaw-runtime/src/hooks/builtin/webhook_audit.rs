@@ -9,13 +9,6 @@ use crate::hooks::traits::{HookHandler, HookResult};
 use zeroclaw_api::tool::ToolResult;
 use zeroclaw_config::schema::WebhookAuditConfig;
 
-/// Validate a webhook URL against SSRF attacks.
-///
-/// Rejects URLs with:
-/// - Non-HTTPS schemes (HTTP is allowed for localhost in debug builds only)
-/// - Loopback addresses (127.0.0.0/8, ::1)
-/// - Link-local addresses (169.254.0.0/16, fe80::/10)
-/// - RFC1918 private addresses (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
 fn validate_webhook_url(url: &str) -> Result<(), String> {
     let parsed = reqwest::Url::parse(url).map_err(|e| format!("invalid webhook URL: {e}"))?;
 
@@ -224,7 +217,6 @@ fn matches_any_pattern(patterns: &[String], tool: &str) -> bool {
 }
 
 /// Truncate serialised args to `max_bytes`. If 0, no truncation.
-///
 /// Uses byte-oriented slicing with char-boundary alignment to avoid
 /// mixing byte length comparisons with char-count truncation.
 #[allow(clippy::cast_possible_truncation)]

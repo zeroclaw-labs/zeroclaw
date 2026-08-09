@@ -1,13 +1,24 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use std::io::Write;
 use std::path::Path;
-use zeroclaw_config::schema::Config;
+use zeroclaw_config::schema::{Config, UNCONFIGURED_CONTEXT_WINDOW_FALLBACK};
 
 const DAEMON_STALE_SECONDS: i64 = 30;
 const SCHEDULER_STALE_SECONDS: i64 = 120;
 const CHANNEL_STALE_SECONDS: i64 = 300;
 const COMMAND_VERSION_PREVIEW_CHARS: usize = 60;
+const MODEL_CACHE_FILE: &str = "models_cache.json";
+
+/// Canonicalize a provider reference: undotted names like `openrouter` become
+/// `openrouter.default` so the cache key matches the channel reader's lookup.
+fn canonicalize_provider_ref(provider_name: &str) -> String {
+    if provider_name.contains('.') {
+        provider_name.to_string()
+    } else {
+        format!("{provider_name}.default")
+    }
+}
 
 // ── Diagnostic item ──────────────────────────────────────────────
 
@@ -80,6 +91,7 @@ impl DiagItem {
 pub fn diagnose(config: &Config) -> Vec<DiagResult> {
     let mut items: Vec<DiagItem> = Vec::new();
 
+    check_degraded_sections(config, &mut items);
     check_config_semantics(config, &mut items);
     check_workspace(config, &mut items);
     check_daemon_state(config, &mut items);
@@ -111,11 +123,6 @@ fn model_probe_row(label: &str, probe: &ModelProbe) -> DiagResult {
     }
 }
 
-/// Collapse per-type model probes: when ≥2 aliases of a provider type return
-/// the same result, emit a single `type: …` row; otherwise emit each alias as
-/// `type.alias: …` so divergence (or a single configured alias) stays visible.
-/// Input is in iteration order, where aliases of a type are contiguous (that's
-/// how `iter_entries` yields them). Pure — separated for unit testing.
 fn collapse_model_probes(probes: Vec<(String, ModelProbe)>) -> Vec<DiagResult> {
     let mut groups: Vec<(String, Vec<(String, ModelProbe)>)> = Vec::new();
     for (name, probe) in probes {
@@ -165,12 +172,6 @@ async fn probe_models(config: &Config) -> Vec<DiagResult> {
     collapse_model_probes(probes)
 }
 
-/// Cross-check OpenAI Codex (OAuth/subscription) credentials against the
-/// OpenAI provider slots that opt into them via `requires_openai_auth`.
-///
-/// Pure — separated for unit testing. Takes the already-resolved fact "is a
-/// Codex credential present?" plus the live `Config`, reads slot state on
-/// demand, and stores nothing (single-source-of-truth rule).
 fn codex_auth_wiring_items(codex_profile_present: bool, config: &Config) -> Vec<DiagItem> {
     const CAT: &str = "providers.auth";
 
@@ -330,7 +331,34 @@ fn classify_model_probe_error(err_message: &str) -> ModelProbeOutcome {
 
 fn doctor_model_targets(config: &Config, provider_override: Option<&str>) -> Vec<String> {
     if let Some(model_provider) = provider_override.map(str::trim).filter(|p| !p.is_empty()) {
-        return vec![model_provider.to_string()];
+        if model_provider.contains('.') {
+            return vec![model_provider.to_string()];
+        }
+
+        // A bare family name expands to every alias configured under it.
+        // Passing it through undotted reaches `create_model_provider_with_options`,
+        // which nulls `provider_api_url` and never looks the alias up — so the
+        // probe silently used the family's compiled-in default endpoint and
+        // reported a self-hosted gateway as unreachable at an address the
+        // operator never configured. Expanding here keeps the same invariant
+        // the orchestrator states for `/models`: a bare family must never
+        // construct a provider that ignores `[providers.models.<f>.<alias>]`.
+        let mut aliases: Vec<String> = config
+            .providers
+            .models
+            .aliases_of(model_provider)
+            .map(ToString::to_string)
+            .collect();
+        aliases.sort();
+        if aliases.is_empty() {
+            // Unknown or unconfigured family: hand the raw name downstream so
+            // the existing "no such provider" diagnostics still fire.
+            return vec![model_provider.to_string()];
+        }
+        return aliases
+            .into_iter()
+            .map(|alias| format!("{model_provider}.{alias}"))
+            .collect();
     }
 
     config
@@ -377,6 +405,79 @@ fn create_doctor_model_provider(
     }
 }
 
+/// Persist the fetched model catalog to the shared cache location so that
+/// `/model` can display available models without a live probe.
+///
+/// The cache is written to `<data_dir>/state/models_cache.json` — the
+/// canonical instance-wide runtime-state directory (databases, daemon
+/// state), honoring `ZEROCLAW_DATA_DIR` overrides. Both the CLI writer and
+/// the channel reader resolve this same path via [`Config::data_dir`].
+pub fn persist_model_cache(
+    config: &Config,
+    provider_name: &str,
+    models: &[String],
+) -> anyhow::Result<()> {
+    let cache_dir = config.data_dir.join("state");
+    std::fs::create_dir_all(&cache_dir).context("Failed to create state dir for model cache")?;
+
+    let cache_path = cache_dir.join(MODEL_CACHE_FILE);
+
+    // Load existing cache, starting fresh only when the file is genuinely
+    // absent. A malformed or unreadable existing file is left untouched and
+    // reported rather than silently replaced with a single-provider cache.
+    let mut cache: zeroclaw_config::schema::ModelCacheState =
+        match std::fs::read_to_string(&cache_path) {
+            Ok(raw) => serde_json::from_str(&raw).with_context(|| {
+                format!(
+                    "Existing model cache at {} is malformed; refusing to overwrite",
+                    cache_path.display()
+                )
+            })?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                zeroclaw_config::schema::ModelCacheState::default()
+            }
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "Failed to read existing model cache at {}",
+                        cache_path.display()
+                    )
+                });
+            }
+        };
+
+    // Replace or insert the entry for this provider.
+    let canonical = canonicalize_provider_ref(provider_name);
+    cache.entries.retain(|e| e.model_provider != canonical);
+    cache
+        .entries
+        .push(zeroclaw_config::schema::ModelCacheEntry {
+            model_provider: canonical,
+            models: models.to_vec(),
+        });
+
+    let json = serde_json::to_string_pretty(&cache).context("Failed to serialize model cache")?;
+
+    // Atomic write: publish through a unique, exclusively-created temp file in
+    // the same directory, then rename into place. A fixed temp-file name would
+    // let two concurrent refreshes collide on the same inode, or let a
+    // pre-existing symlink at that predictable path get followed and
+    // truncated; `tempfile` picks a fresh random name each call and removes
+    // the file automatically if we return before `persist`.
+    let mut tmp = tempfile::Builder::new()
+        .prefix(MODEL_CACHE_FILE)
+        .suffix(".tmp")
+        .tempfile_in(&cache_dir)
+        .context("Failed to create model cache temp file")?;
+    tmp.write_all(json.as_bytes())
+        .context("Failed to write model cache temp file")?;
+    tmp.persist(&cache_path)
+        .map_err(|e| e.error)
+        .context("Failed to rename model cache temp file")?;
+
+    Ok(())
+}
+
 pub async fn run_models(
     config: &Config,
     provider_override: Option<&str>,
@@ -408,19 +509,43 @@ pub async fn run_models(
 
         match outcome {
             Ok(models) => {
-                ok_count += 1;
-                println!("    ✅ {} models", models.len());
-                if show_model_names && !models.is_empty() {
-                    for m in &models {
-                        println!("      • {}", m);
+                // Persist the catalog so `/model` can display it without a live probe.
+                // Count and report the provider as successful only after the cache
+                // update actually succeeds — a fetched-but-uncached catalog is a
+                // failed refresh, not a partial success.
+                match persist_model_cache(config, provider_name, &models) {
+                    Ok(()) => {
+                        ok_count += 1;
+                        println!("    ✅ {} models", models.len());
+                        if show_model_names && !models.is_empty() {
+                            for m in &models {
+                                println!("      • {}", m);
+                            }
+                        }
+                        matrix_rows.push((
+                            provider_name.clone(),
+                            ModelProbeOutcome::Ok,
+                            Some(models.len()),
+                            "catalog fetched".to_string(),
+                        ));
+                    }
+                    Err(e) => {
+                        error_count += 1;
+                        println!(
+                            "    ⚠️  {}",
+                            crate::i18n::get_required_cli_string_with_args(
+                                "cli-doctor-cache-write-failed",
+                                &[("error", &e.to_string())],
+                            )
+                        );
+                        matrix_rows.push((
+                            provider_name.clone(),
+                            ModelProbeOutcome::Error,
+                            None,
+                            truncate_for_display(&e.to_string(), 120),
+                        ));
                     }
                 }
-                matrix_rows.push((
-                    provider_name.clone(),
-                    ModelProbeOutcome::Ok,
-                    Some(models.len()),
-                    "catalog fetched".to_string(),
-                ));
             }
             Err(error) => {
                 let error_text = format_error_chain(&error);
@@ -742,11 +867,6 @@ fn model_in_catalog(model: &str, catalog: &[String]) -> bool {
     catalog.iter().any(|id| id == model)
 }
 
-/// List the models configured in `config.toml` (one per `[providers.models.*]`
-/// entry). Default is an offline readout; `verify = true` (`models list
-/// --check`, and the `doctor models` health path) additionally probes each
-/// provider's live catalog and flags whether the configured model is actually
-/// available.
 pub async fn run_configured_models(
     config: &Config,
     provider_override: Option<&str>,
@@ -919,6 +1039,33 @@ pub fn run_traces(
 
 // ── Config semantic validation ───────────────────────────────────
 
+/// Surface config sections the resilient loader dropped at load time
+/// (`Config::degraded_sections` / `Config::degraded_security`, populated by
+/// `migrate_to_current_salvaged` in `zeroclaw-config`) so `doctor` names the
+/// actual malformed section instead of downstream checks reporting confusing
+/// secondary symptoms (e.g. "no channels configured").
+fn check_degraded_sections(config: &Config, items: &mut Vec<DiagItem>) {
+    let cat = "config";
+    for path in &config.degraded_security {
+        items.push(DiagItem::error(
+            cat,
+            crate::i18n::get_required_cli_string_with_args(
+                "cli-doctor-degraded-security",
+                &[("path", path.as_str())],
+            ),
+        ));
+    }
+    for path in &config.degraded_sections {
+        items.push(DiagItem::warn(
+            cat,
+            crate::i18n::get_required_cli_string_with_args(
+                "cli-doctor-degraded-section",
+                &[("path", path.as_str())],
+            ),
+        ));
+    }
+}
+
 fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     let cat = "config";
 
@@ -973,6 +1120,42 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
                 items.push(DiagItem::ok(cat, format!("{label}: model: {model}")));
             } else {
                 items.push(DiagItem::warn(cat, format!("{label}: no model configured")));
+            }
+
+            // A missing value remains unknown until this profile is selected;
+            // zero is explicitly invalid because it leaves recovery with no
+            // usable model-context budget.
+            match entry.context_window {
+                Some(0) => items.push(DiagItem::error(
+                    cat,
+                    crate::i18n::get_required_cli_string_with_args(
+                        "cli-doctor-context-window-zero",
+                        &[("provider_ref", &label)],
+                    ),
+                )),
+                Some(context_window) => items.push(DiagItem::ok(
+                    cat,
+                    crate::i18n::get_required_cli_string_with_args(
+                        "cli-doctor-context-window-ok",
+                        &[
+                            ("provider_ref", &label),
+                            ("context_window", &context_window.to_string()),
+                        ],
+                    ),
+                )),
+                None => items.push(DiagItem::warn(
+                    cat,
+                    crate::i18n::get_required_cli_string_with_args(
+                        "cli-doctor-context-window-unset",
+                        &[
+                            ("provider_ref", &label),
+                            (
+                                "fallback",
+                                &UNCONFIGURED_CONTEXT_WINDOW_FALLBACK.to_string(),
+                            ),
+                        ],
+                    ),
+                )),
             }
 
             // Temperature range
@@ -1105,6 +1288,31 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         ));
     }
 
+    // Enabled bot channels with no token: a partial alias survives the
+    // resilient load (`bot_token` has a serde default), so it never
+    // reaches `degraded_sections` — doctor must name the unset field here
+    // or the operator only finds out when the channel fails to start.
+    for (alias, tg) in &cc.telegram {
+        if tg.enabled && zeroclaw_config::traits::is_unset_display_value(&tg.bot_token) {
+            items.push(DiagItem::warn(
+                cat,
+                format!(
+                    "channels.telegram.{alias}.bot_token is unset but the channel is enabled — the channel cannot connect until a bot token is set"
+                ),
+            ));
+        }
+    }
+    for (alias, dc) in &cc.discord {
+        if dc.enabled && zeroclaw_config::traits::is_unset_display_value(&dc.bot_token) {
+            items.push(DiagItem::warn(
+                cat,
+                format!(
+                    "channels.discord.{alias}.bot_token is unset but the channel is enabled — the channel cannot connect until a bot token is set"
+                ),
+            ));
+        }
+    }
+
     // Delegate agents: model_provider validity (resolved from model_provider alias)
     let mut agent_names: Vec<_> = config.agents.keys().collect();
     agent_names.sort();
@@ -1130,23 +1338,26 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     for warning in config.collect_warnings() {
         items.push(DiagItem::warn(
             cat,
-            format!("{} (at {})", warning.message, warning.path),
+            format!(
+                "{} (at {})",
+                localized_validation_warning_message(&warning),
+                warning.path
+            ),
         ));
     }
 }
 
-/// Flag `gateway.web_dist_dir` values that rely on shell-style expansion
-/// (a leading `~` or any `$VAR` / `${VAR}`). The gateway reads this field
-/// verbatim and never invokes a shell, so values like `~/web-dist` or
-/// `$HOME/web-dist` resolve to literal on-disk paths and silently fail to
-/// find the bundled assets — surface that here at `zeroclaw doctor` time
-/// instead of at runtime. Parallel check lives in
-/// `src/commands/self_test.rs::check_web_dist_dir`.
-///
-/// User-facing message goes through Fluent
-/// (`cli-doctor-web-dist-dir-expansion-warning`) per AGENTS.md §
-/// Localization — no bare Rust literals for CLI output. Reason phrases
-/// are Fluent keys too (`cli-web-dist-dir-reason-{tilde,dollar}`).
+fn localized_validation_warning_message(
+    warning: &zeroclaw_config::validation_warnings::ValidationWarning,
+) -> String {
+    match warning.code.as_str() {
+        "skills_prompt_injection_mode_full_deprecated" => crate::i18n::get_required_cli_string(
+            "cli-doctor-skills-prompt-injection-mode-full-deprecated",
+        ),
+        _ => warning.message.clone(),
+    }
+}
+
 fn check_web_dist_dir(config: &Config, items: &mut Vec<DiagItem>) {
     let cat = "config";
     match config.gateway.web_dist_dir.as_deref() {
@@ -1277,12 +1488,6 @@ fn check_workspace(config: &Config, items: &mut Vec<DiagItem>) {
         }
     }
 
-    // Per-agent personality files. These are resolved per agent from
-    // `<install>/agents/<alias>/workspace/` (or an explicit
-    // `[agents.<alias>.workspace.path]` override) — never from `data_dir`.
-    // Iterate every enabled agent so multi-agent installs each get checked,
-    // and name the alias in the result so the report is unambiguous. Sorted
-    // for deterministic output (HashMap iteration order is unspecified).
     let mut agent_aliases: Vec<&String> = config.agents.keys().collect();
     agent_aliases.sort();
     for alias in agent_aliases {
@@ -1767,6 +1972,89 @@ mod tests {
     }
 
     #[test]
+    fn context_window_diagnostics_distinguish_unset_explicit_and_zero_profiles() {
+        let mut unset = Config::default();
+        let profile = unset
+            .providers
+            .models
+            .ensure("ollama", "local")
+            .expect("known model provider type");
+        profile.model = Some("qwen3".to_string());
+
+        let mut unset_items = Vec::new();
+        check_config_semantics(&unset, &mut unset_items);
+        let unset_message = crate::i18n::get_required_cli_string_with_args(
+            "cli-doctor-context-window-unset",
+            &[
+                ("provider_ref", "ollama.local"),
+                (
+                    "fallback",
+                    &UNCONFIGURED_CONTEXT_WINDOW_FALLBACK.to_string(),
+                ),
+            ],
+        );
+        let unset_item = unset_items
+            .iter()
+            .find(|item| item.message == unset_message)
+            .expect("unset profile must produce the localized warning");
+        assert_eq!(unset_item.severity, Severity::Warn);
+
+        let mut explicit = unset.clone();
+        explicit
+            .providers
+            .models
+            .ensure("ollama", "local")
+            .expect("known model provider type")
+            .context_window = Some(32_000);
+        let mut explicit_items = Vec::new();
+        check_config_semantics(&explicit, &mut explicit_items);
+        let explicit_message = crate::i18n::get_required_cli_string_with_args(
+            "cli-doctor-context-window-ok",
+            &[
+                ("provider_ref", "ollama.local"),
+                ("context_window", "32000"),
+            ],
+        );
+        let explicit_item = explicit_items
+            .iter()
+            .find(|item| item.message == explicit_message)
+            .expect("explicit profile must produce the localized OK result");
+        assert_eq!(explicit_item.severity, Severity::Ok);
+
+        let unset_warnings = unset_items
+            .iter()
+            .filter(|item| item.severity == Severity::Warn)
+            .count();
+        let explicit_warnings = explicit_items
+            .iter()
+            .filter(|item| item.severity == Severity::Warn)
+            .count();
+        assert_eq!(
+            unset_warnings,
+            explicit_warnings + 1,
+            "an unset context window must add exactly one doctor warning"
+        );
+
+        let mut zero = explicit;
+        zero.providers
+            .models
+            .ensure("ollama", "local")
+            .expect("known model provider type")
+            .context_window = Some(0);
+        let mut zero_items = Vec::new();
+        check_config_semantics(&zero, &mut zero_items);
+        let zero_message = crate::i18n::get_required_cli_string_with_args(
+            "cli-doctor-context-window-zero",
+            &[("provider_ref", "ollama.local")],
+        );
+        let zero_item = zero_items
+            .iter()
+            .find(|item| item.message == zero_message)
+            .expect("zero context window must produce the localized error");
+        assert_eq!(zero_item.severity, Severity::Error);
+    }
+
+    #[test]
     fn config_validation_warns_no_channels() {
         let config = Config::default();
         let mut items = Vec::new();
@@ -1774,6 +2062,57 @@ mod tests {
         let ch_item = items.iter().find(|i| i.message.contains("channel"));
         assert!(ch_item.is_some());
         assert_eq!(ch_item.unwrap().severity, Severity::Warn);
+    }
+
+    #[test]
+    fn degraded_sections_reported_as_warning() {
+        let config = Config {
+            degraded_sections: vec!["channels.telegram.default".to_string()],
+            ..Default::default()
+        };
+        let mut items = Vec::new();
+        check_degraded_sections(&config, &mut items);
+        let item = items
+            .iter()
+            .find(|i| i.message.contains("channels.telegram.default"));
+        assert!(
+            item.is_some(),
+            "expected a diagnostic naming the degraded section, got messages: {:?}",
+            items.iter().map(|i| &i.message).collect::<Vec<_>>()
+        );
+        assert_eq!(item.unwrap().severity, Severity::Warn);
+    }
+
+    #[test]
+    fn degraded_security_reported_as_error() {
+        let config = Config {
+            degraded_security: vec!["security".to_string()],
+            ..Default::default()
+        };
+        let mut items = Vec::new();
+        check_degraded_sections(&config, &mut items);
+        let item = items.iter().find(|i| {
+            i.category == "config"
+                && i.severity == Severity::Error
+                && i.message.contains("security")
+        });
+        assert!(
+            item.is_some(),
+            "expected an error diagnostic naming the degraded security section, got messages: {:?}",
+            items.iter().map(|i| &i.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn clean_config_reports_no_degraded_sections() {
+        let config = Config::default();
+        let mut items = Vec::new();
+        check_degraded_sections(&config, &mut items);
+        assert!(
+            items.is_empty(),
+            "a config with no degraded sections must not produce degraded-section diagnostics, got messages: {:?}",
+            items.iter().map(|i| &i.message).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -1834,6 +2173,247 @@ mod tests {
         );
     }
 
+    fn config_with_install_root(tmp: &TempDir) -> Config {
+        Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().to_path_buf(),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn canonicalize_provider_ref_defaults_undotted_names() {
+        assert_eq!(
+            canonicalize_provider_ref("openrouter"),
+            "openrouter.default"
+        );
+        assert_eq!(
+            canonicalize_provider_ref("openrouter.work"),
+            "openrouter.work"
+        );
+    }
+
+    #[test]
+    fn persist_model_cache_merges_multiple_providers_and_replaces_on_refresh() {
+        let tmp = TempDir::new().unwrap();
+        let config = config_with_install_root(&tmp);
+
+        persist_model_cache(&config, "openrouter", &["a".to_string(), "b".to_string()]).unwrap();
+        persist_model_cache(&config, "ollama", &["c".to_string()]).unwrap();
+        // Refreshing openrouter replaces its entry rather than duplicating it.
+        persist_model_cache(&config, "openrouter", &["a2".to_string()]).unwrap();
+
+        let raw = std::fs::read_to_string(tmp.path().join("state/models_cache.json")).unwrap();
+        let cache: zeroclaw_config::schema::ModelCacheState = serde_json::from_str(&raw).unwrap();
+        assert_eq!(cache.entries.len(), 2);
+        let openrouter = cache
+            .entries
+            .iter()
+            .find(|e| e.model_provider == "openrouter.default")
+            .unwrap();
+        assert_eq!(openrouter.models, vec!["a2".to_string()]);
+        let ollama = cache
+            .entries
+            .iter()
+            .find(|e| e.model_provider == "ollama.default")
+            .unwrap();
+        assert_eq!(ollama.models, vec!["c".to_string()]);
+    }
+
+    #[test]
+    fn persist_model_cache_preserves_malformed_existing_file() {
+        let tmp = TempDir::new().unwrap();
+        let config = config_with_install_root(&tmp);
+        let state_dir = tmp.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let cache_path = state_dir.join(MODEL_CACHE_FILE);
+        std::fs::write(&cache_path, "not valid json").unwrap();
+
+        let result = persist_model_cache(&config, "openrouter", &["a".to_string()]);
+
+        assert!(
+            result.is_err(),
+            "malformed existing cache must fail the write, not silently replace it"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&cache_path).unwrap(),
+            "not valid json",
+            "existing malformed cache must be left untouched"
+        );
+    }
+
+    #[test]
+    fn persist_model_cache_preserves_unreadable_existing_file() {
+        let tmp = TempDir::new().unwrap();
+        let config = config_with_install_root(&tmp);
+        let state_dir = tmp.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        // A directory where the cache file is expected produces a read
+        // error that is not `NotFound` — distinct from the missing-file case.
+        let cache_path = state_dir.join(MODEL_CACHE_FILE);
+        std::fs::create_dir_all(&cache_path).unwrap();
+
+        let result = persist_model_cache(&config, "openrouter", &["a".to_string()]);
+
+        assert!(result.is_err());
+        assert!(
+            cache_path.is_dir(),
+            "unreadable existing cache path must be left untouched, not replaced"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn persist_model_cache_does_not_follow_a_preexisting_tmp_symlink() {
+        let tmp = TempDir::new().unwrap();
+        let config = config_with_install_root(&tmp);
+        let state_dir = tmp.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        // Plant a symlink at the *old* fixed temp-file name, pointing outside
+        // the cache directory. The old `cache_path.with_extension("json.tmp")`
+        // scheme would write through this predictable path and truncate the
+        // decoy; the new unique/exclusive tempfile-based path must never pick
+        // this name at all.
+        let decoy = tmp.path().join("decoy.json");
+        std::fs::write(&decoy, "untouched").unwrap();
+        std::os::unix::fs::symlink(&decoy, state_dir.join("models_cache.json.tmp")).unwrap();
+
+        persist_model_cache(&config, "openrouter", &["a".to_string()]).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&decoy).unwrap(),
+            "untouched",
+            "persistence must not write through a pre-existing symlink at a predictable temp path"
+        );
+        let raw = std::fs::read_to_string(state_dir.join(MODEL_CACHE_FILE)).unwrap();
+        assert!(raw.contains("openrouter"));
+    }
+
+    #[tokio::test]
+    async fn run_models_targeted_refresh_fails_when_cache_write_fails() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/tags"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "models": [{"name": "llama3"}]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = config_with_install_root(&tmp);
+        config
+            .providers
+            .models
+            .ensure("ollama", "default")
+            .expect("known model_provider type")
+            .uri = Some(server.uri());
+
+        // Make the cache destination unwritable: `state` exists as a plain
+        // file, so `create_dir_all` inside `persist_model_cache` fails even
+        // though the provider fetch itself succeeds.
+        std::fs::write(tmp.path().join("state"), "not a directory").unwrap();
+
+        let result = run_models(&config, Some("ollama.default"), false, false).await;
+
+        assert!(
+            result.is_err(),
+            "a targeted refresh must fail the command when the fetched catalog cannot be persisted, \
+             even though the network fetch itself succeeded"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bare_family_probes_the_configured_endpoint_not_the_compiled_default() {
+        // The regression: `--model-provider ollama` (bare) used to reach
+        // `create_model_provider_with_options`, which nulls the resolved API
+        // URL, so the probe hit the family's compiled-in default instead of
+        // the operator's `uri`. Self-hosted gateways were reported unreachable
+        // at an address nobody configured. The mock asserts on drop that the
+        // request actually arrived here.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v1/models"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "data": [{"id": "llama3", "object": "model"}]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = config_with_install_root(&tmp);
+        config
+            .providers
+            .models
+            .ensure("ollama", "homelab")
+            .expect("known model_provider type")
+            .uri = Some(format!("{}/v1", server.uri()));
+
+        run_models(&config, Some("ollama"), false, false)
+            .await
+            .expect("a bare family with one configured alias must probe that alias");
+    }
+
+    #[test]
+    fn a_bare_family_expands_to_every_configured_alias() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = config_with_install_root(&tmp);
+        for alias in ["homelab", "workstation"] {
+            config
+                .providers
+                .models
+                .ensure("ollama", alias)
+                .expect("known model_provider type")
+                .uri = Some("http://example.invalid".to_owned());
+        }
+
+        assert_eq!(
+            doctor_model_targets(&config, Some("ollama")),
+            vec!["ollama.homelab".to_owned(), "ollama.workstation".to_owned()],
+            "a bare family must fan out to its aliases rather than collapse to a config-less default"
+        );
+    }
+
+    #[test]
+    fn an_unconfigured_family_still_reaches_the_downstream_diagnostics() {
+        // Nothing configured under the family: keep handing the raw name down
+        // so the existing "no such provider" error text is what the user sees,
+        // rather than an empty target list that silently probes nothing.
+        let tmp = TempDir::new().unwrap();
+        let config = config_with_install_root(&tmp);
+        assert_eq!(
+            doctor_model_targets(&config, Some("ollama")),
+            vec!["ollama".to_owned()]
+        );
+        assert_eq!(
+            doctor_model_targets(&config, Some("nonsense")),
+            vec!["nonsense".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_dotted_ref_is_passed_through_untouched() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = config_with_install_root(&tmp);
+        config
+            .providers
+            .models
+            .ensure("ollama", "homelab")
+            .expect("known model_provider type")
+            .uri = Some("http://example.invalid".to_owned());
+
+        assert_eq!(
+            doctor_model_targets(&config, Some("ollama.homelab")),
+            vec!["ollama.homelab".to_owned()]
+        );
+    }
+
     #[test]
     fn config_validation_catches_unknown_provider() {
         // Typed slots can only hold canonical family names, so an unknown
@@ -1861,13 +2441,6 @@ mod tests {
         );
         assert_eq!(prov_item.unwrap().severity, Severity::Warn);
     }
-
-    // The pre-Phase-6 tests `config_validation_catches_malformed_custom_provider`
-    // and `config_validation_accepts_custom_provider` are obsolete: the typed
-    // ModelProviders container can't represent malformed `custom:` outer keys at
-    // all. Custom-URL model_providers now live under the `custom` typed slot with the
-    // operator-supplied URL in `base.uri`. The malformed-custom-key validator
-    // path is unreachable.
 
     #[test]
     fn config_validation_warns_empty_model_route() {
@@ -1965,6 +2538,67 @@ mod tests {
             "doctor should surface dangling fallback refs"
         );
         assert_eq!(fallback_item.unwrap().severity, Severity::Warn);
+    }
+
+    #[test]
+    fn config_validation_warns_enabled_tokenless_bot_channels() {
+        // A partial (tokenless) alias survives the resilient load and
+        // never reaches degraded_sections, so doctor must flag the unset
+        // bot_token itself when the alias is enabled.
+        let mut config = Config::default();
+        config.channels.telegram.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::TelegramConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        config.channels.discord.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::DiscordConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+        for path in [
+            "channels.telegram.default.bot_token",
+            "channels.discord.default.bot_token",
+        ] {
+            let item = items.iter().find(|i| i.message.contains(path));
+            assert!(
+                item.is_some(),
+                "doctor should flag enabled tokenless alias at {path}, got {:?}",
+                items.iter().map(|i| &i.message).collect::<Vec<_>>()
+            );
+            assert_eq!(item.unwrap().severity, Severity::Warn);
+        }
+    }
+
+    #[test]
+    fn config_validation_ignores_disabled_tokenless_bot_channels() {
+        // A staged (disabled) tokenless alias is a normal intermediate state
+        // — quickstart and `config set` create exactly this — so doctor must
+        // not warn about it.
+        let mut config = Config::default();
+        config.channels.telegram.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::TelegramConfig::default(),
+        );
+        config.channels.discord.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::DiscordConfig::default(),
+        );
+
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+        assert!(
+            !items.iter().any(|i| i.message.contains(".bot_token")),
+            "doctor must not flag disabled tokenless aliases, got {:?}",
+            items.iter().map(|i| &i.message).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -2162,10 +2796,29 @@ mod tests {
     }
 
     #[test]
+    fn skills_prompt_deprecation_warning_uses_fluent() {
+        let warning = zeroclaw_config::validation_warnings::ValidationWarning::new(
+            "skills_prompt_injection_mode_full_deprecated",
+            "unlocalized fallback",
+            "skills.prompt_injection_mode",
+        );
+
+        let expected = crate::i18n::get_required_cli_string(
+            "cli-doctor-skills-prompt-injection-mode-full-deprecated",
+        );
+        assert_eq!(localized_validation_warning_message(&warning), expected);
+        assert_ne!(expected, "unlocalized fallback");
+        assert_ne!(
+            expected,
+            "{cli-doctor-skills-prompt-injection-mode-full-deprecated}"
+        );
+    }
+
+    #[test]
     fn diagnose_flags_web_dist_dir_with_tilde() {
         // Asserts the localized Fluent message resolves and inlines the path +
         // the tilde reason — the diagnostic now goes through Fluent per
-        // AGENTS.md (#6961 Round 3).
+        // AGENTS.mdRound 3).
         let mut config = Config::default();
         config.gateway.web_dist_dir = Some("~/web-dist".to_string());
 

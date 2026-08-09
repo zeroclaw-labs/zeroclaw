@@ -7,6 +7,7 @@ use zeroclaw_config::policy::SecurityPolicy;
 
 /// Per-step allow/deny tool scope. Enforcement is opt-in through SOP config.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct StepToolScope {
     /// Only these names or groups are allowed when present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -17,7 +18,6 @@ pub struct StepToolScope {
 }
 
 /// Resolve the additional excluded tools for an active SOP step.
-///
 /// This resolver is narrow-only: step scope can remove tools from the registry,
 /// never restore a tool already denied by the configured security policy.
 pub fn resolve_excluded(

@@ -1,20 +1,6 @@
 //! Read/write endpoints for per-agent personality markdown files
 //! (`SOUL.md`, `IDENTITY.md`, `USER.md`, `AGENTS.md`, `TOOLS.md`,
 //! `HEARTBEAT.md`, `BOOTSTRAP.md`, `MEMORY.md`).
-//!
-//! The runtime injects these into the system prompt at request time
-//! (see `zeroclaw_runtime::agent::personality::load_personality`). This
-//! module is the dashboard's authoring surface for them.
-//!
-//! Sandbox: filenames are matched against the static `EDITABLE_PERSONALITY_FILES`
-//! allowlist re-exported from the runtime crate. The on-disk path is
-//! built from a `&'static str` taken from that allowlist plus the
-//! agent's workspace dir resolved via `Config::agent_workspace_dir`,
-//! so user-supplied path components cannot escape the workspace.
-//!
-//! The `agent` query parameter is required and selects which agent's
-//! workspace the endpoint operates against. Each agent has its own
-//! `<install>/agents/<alias>/workspace/` per the multi-agent layout.
 
 use axum::{
     Json,
@@ -339,13 +325,6 @@ pub async fn handle_put(
     .into_response()
 }
 
-/// GET /api/personality/templates — render the default starter set.
-///
-/// Reuses `TemplateContext::default()` for any field the caller didn't
-/// override. The `memory.backend` config is consulted as a sensible
-/// default for `include_memory` when the query parameter is absent, so
-/// onboarding picks the right MEMORY.md behaviour without the user
-/// having to repeat themselves.
 pub async fn handle_templates(
     State(state): State<AppState>,
     headers: HeaderMap,

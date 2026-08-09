@@ -8,11 +8,7 @@
 // passed through to the API client and ignored by the gateway.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { markdown } from '@codemirror/lang-markdown';
-import { oneDark } from '@codemirror/theme-one-dark';
-import { githubLight } from '@uiw/codemirror-theme-github';
-import CodeMirror from '@uiw/react-codemirror';
-import { useTheme } from '@/hooks/useTheme';
+import MarkdownEditor from '@/components/MarkdownEditor';
 import ReactMarkdown from 'react-markdown';
 import rehypeHighlight from 'rehype-highlight';
 import remarkGfm from 'remark-gfm';
@@ -41,11 +37,6 @@ interface Props {
 }
 
 export default function PersonalityEditor({ agent }: Props) {
-  // Drive the CodeMirror theme from the active console theme's scheme so the
-  // editor isn't a dark slab inside a light (operator-light etc.) palette.
-  // `resolvedTheme` is 'dark' | 'light' | 'oled'; only 'light' is a light scheme.
-  const { resolvedTheme } = useTheme();
-  const cmTheme = resolvedTheme === 'light' ? githubLight : oneDark;
 
   const [index, setIndex] = useState<PersonalityIndex | null>(null);
   const [active, setActive] = useState<string | null>(null);
@@ -424,36 +415,23 @@ export default function PersonalityEditor({ agent }: Props) {
               )}
             </div>
           ) : (
-            <div
-              className="rounded-md border overflow-hidden"
-              style={{ borderColor: 'var(--pc-border)' }}
-            >
-              <CodeMirror
-                value={activeBuf?.draft ?? ''}
-                onChange={(value) =>
-                  setBuffers((prev) => ({
-                    ...prev,
-                    [active]: {
-                      loaded: prev[active]?.loaded ?? '',
-                      draft: value,
-                      loadedMtimeMs: prev[active]?.loadedMtimeMs ?? null,
-                      exists: prev[active]?.exists ?? false,
-                      truncated: prev[active]?.truncated ?? false,
-                    },
-                  }))
-                }
-                extensions={[markdown()]}
-                theme={cmTheme}
-                height="32rem"
-                basicSetup={{
-                  lineNumbers: true,
-                  highlightActiveLine: true,
-                  foldGutter: true,
-                  bracketMatching: true,
-                }}
-                placeholder={`# ${active}\n\n…`}
-              />
-            </div>
+            <MarkdownEditor
+              value={activeBuf?.draft ?? ''}
+              onChange={(value) =>
+                setBuffers((prev) => ({
+                  ...prev,
+                  [active]: {
+                    loaded: prev[active]?.loaded ?? '',
+                    draft: value,
+                    loadedMtimeMs: prev[active]?.loadedMtimeMs ?? null,
+                    exists: prev[active]?.exists ?? false,
+                    truncated: prev[active]?.truncated ?? false,
+                  },
+                }))
+              }
+              height="32rem"
+              placeholder={`# ${active}\n\n…`}
+            />
           )}
           <div
             className="flex items-center justify-between text-xs"
