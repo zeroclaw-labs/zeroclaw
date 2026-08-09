@@ -825,11 +825,10 @@ impl BrowserTool {
             return Ok(());
         };
 
-        // One canonical target validator shared by every backend.
-        let resolved_target = self.validate_screenshot_target(path_str).await?;
-
-        // Replace the raw user path with the canonical target.
-        *path = Some(resolved_target.to_string_lossy().to_string());
+        // One canonical target validator shared by every backend. It returns
+        // the checked target as a lossless UTF-8 string — never a lossy
+        // conversion — so the backends write exactly the path that was allowed.
+        *path = Some(self.validate_screenshot_target(path_str).await?);
         Ok(())
     }
 
@@ -844,14 +843,18 @@ impl BrowserTool {
     /// 4. `is_runtime_config_path` — rejects `config.toml`, `config.toml.bak`,
     ///    `.config.toml.tmp-*`.
     /// 5. `symlink_metadata` — rejects existing symlink targets.
+    /// 6. Rejects canonical destinations that are not valid UTF-8.
     ///
     /// Shared by the local backends (`validate_screenshot_path`) and the
     /// ComputerUse flow (`validate_screenshot_path_for_computer_use`) so one
     /// policy cannot drift between them.
-    async fn validate_screenshot_target(
-        &self,
-        raw_path: &str,
-    ) -> anyhow::Result<std::path::PathBuf> {
+    ///
+    /// Returns the validated target as a lossless UTF-8 string. Every backend
+    /// consumes the destination as a string (command argument, JSON value, or
+    /// `tokio::fs::write(&str)`), so a canonical destination that is not valid
+    /// UTF-8 is rejected here: a lossy conversion could change the pathname and
+    /// name a location that never passed the allowlist.
+    async fn validate_screenshot_target(&self, raw_path: &str) -> anyhow::Result<String> {
         // String-level reject (null bytes, .. traversal, URL-encoded traversal)
         if !self.security.is_path_allowed(raw_path) {
             let msg = crate::i18n::get_required_tool_string_with_args(
@@ -921,7 +924,22 @@ impl BrowserTool {
             anyhow::bail!("{msg}");
         }
 
-        Ok(resolved_target)
+        // The allowlist above validated the byte-preserving PathBuf. Every
+        // backend receives the destination as a UTF-8 string, and a lossy
+        // conversion (`to_string_lossy`) would silently replace non-UTF-8
+        // bytes with U+FFFD — naming a pathname that never passed the policy.
+        // Fail closed here, while we still hold the checked target: on Unix a
+        // valid UTF-8 input can canonicalize (through a symlink) to a parent
+        // containing non-UTF-8 bytes.
+        let Some(resolved_str) = resolved_target.to_str() else {
+            let msg = crate::i18n::get_required_tool_string_with_args(
+                "tool-browser-screenshot-error-path-not-utf8",
+                &[("path", raw_path)],
+            );
+            anyhow::bail!("{msg}");
+        };
+
+        Ok(resolved_str.to_string())
     }
 
     fn validate_computer_use_action(
@@ -999,10 +1017,7 @@ impl BrowserTool {
                 // Store the validated path for local write after sidecar returns PNG.
                 // Do NOT forward the path to the sidecar - it returns PNG bytes.
                 if let Some(obj) = args.as_object_mut() {
-                    obj.insert(
-                        "path".to_string(),
-                        Value::String(resolved_target.to_string_lossy().to_string()),
-                    );
+                    obj.insert("path".to_string(), Value::String(resolved_target));
                 }
                 Ok(args)
             }
@@ -3465,6 +3480,129 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("symlink"));
+    }
+
+    /// Path-identity regression: a valid UTF-8 alias can resolve (through a
+    /// symlink) to a canonical parent whose name contains non-UTF-8 bytes. The
+    /// allowlist validates the byte-preserving `PathBuf`, but the backends
+    /// consume the destination as a UTF-8 string — a lossy conversion would
+    /// silently rewrite the pathname and name a location that never passed the
+    /// policy. `execute_action` must reject such a target before either local
+    /// backend receives the action. If the validator call is removed, this
+    /// fails (the backends would otherwise succeed or error without the
+    /// specific allowlist rejection).
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn execute_action_rejects_non_utf8_canonical_target_before_backend_dispatch() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+
+        // A real directory (inside the workspace allowlist) whose name carries a
+        // raw non-UTF-8 byte, so the outside-workspace gate does not fire first.
+        let mut raw_name = b"nonutf8-".to_vec();
+        raw_name.push(0xFF);
+        let non_utf8_dir = ws.join(std::path::PathBuf::from(OsString::from_vec(raw_name)));
+        tokio::fs::create_dir_all(non_utf8_dir.join("shots"))
+            .await
+            .unwrap();
+
+        // UTF-8 symlink alias inside the workspace -> the non-UTF-8 directory.
+        symlink(&non_utf8_dir, ws.join("alias")).unwrap();
+
+        let tool = screenshot_tool_with_workspace(&ws);
+
+        // AgentBrowser: the rejection must come from the validator, before
+        // dispatch (the backend would otherwise never see this exact error).
+        let action = BrowserAction::Screenshot {
+            path: Some("alias/shots/page.png".into()),
+            full_page: false,
+        };
+        let err = tool
+            .execute_action(action, ResolvedBackend::AgentBrowser)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("non-UTF-8"),
+            "a non-UTF-8 canonical target must be rejected by the validator before backend \
+             dispatch, got: {err}"
+        );
+
+        // RustNative: same gate, same rejection, before the local write.
+        let action2 = BrowserAction::Screenshot {
+            path: Some("alias/shots/page.png".into()),
+            full_page: false,
+        };
+        let err = tool
+            .execute_action(action2, ResolvedBackend::RustNative)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("non-UTF-8"),
+            "a non-UTF-8 canonical target must be rejected for rust_native too, got: {err}"
+        );
+    }
+
+    /// ComputerUse shares the same canonical target validator, so a non-UTF-8
+    /// canonical destination is rejected locally — before the sidecar round
+    /// trip — and is never forwarded.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn computer_use_rejects_non_utf8_canonical_target_before_sidecar() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+
+        let mut raw_name = b"nonutf8-".to_vec();
+        raw_name.push(0xFF);
+        let non_utf8_dir = ws.join(std::path::PathBuf::from(OsString::from_vec(raw_name)));
+        tokio::fs::create_dir_all(non_utf8_dir.join("shots"))
+            .await
+            .unwrap();
+        symlink(&non_utf8_dir, ws.join("alias")).unwrap();
+
+        // ComputerUse tool whose workspace is the temp `ws` (the shared helper
+        // pins `current_dir`).
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: ws.clone(),
+            allowed_roots: vec![ws.clone()],
+            ..SecurityPolicy::default()
+        });
+        let tool = BrowserTool::new_with_backend(
+            security,
+            vec!["*".into()],
+            None,
+            "computer_use".into(),
+            None,
+            true,
+            "http://127.0.0.1:9515".into(),
+            None,
+            test_computer_use_config(),
+            Vec::new(),
+        )
+        .unwrap();
+
+        let err = tool
+            .validate_screenshot_path_for_computer_use(
+                "screenshot",
+                json!({"path": "alias/shots/page.png"}),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("non-UTF-8"),
+            "computer_use must reject a non-UTF-8 canonical target before the sidecar call, got: {err}"
+        );
     }
 
     #[tokio::test]

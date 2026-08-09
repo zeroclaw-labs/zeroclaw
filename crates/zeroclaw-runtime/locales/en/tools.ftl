@@ -155,6 +155,7 @@ tool-browser-screenshot-error-path-outside-workspace = Screenshot path '{ $path 
 tool-browser-screenshot-error-missing-filename = Screenshot path '{ $path }' is missing a filename component
 tool-browser-screenshot-error-runtime-config-target = Cannot write screenshot to runtime config path '{ $target }'
 tool-browser-screenshot-error-symlink-target = Cannot write screenshot to symlink target '{ $target }'
+tool-browser-screenshot-error-path-not-utf8 = Screenshot path '{ $path }' resolves to a non-UTF-8 pathname; refusing to write through a lossy conversion
 tool-browser-screenshot-error-computeruse-non-string-path = Screenshot 'path' parameter must be a string, got { $path }
 tool-browser-screenshot-error-non-string-path = Screenshot 'path' must be a string or absent
 tool-browser-screenshot-error-args-not-object = Screenshot arguments must be a JSON object
