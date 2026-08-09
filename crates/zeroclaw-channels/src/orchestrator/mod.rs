@@ -612,8 +612,10 @@ impl ConversationLaneRegistry {
         let lane_key = key.to_string();
         zeroclaw_spawn::spawn!(registry.run_lane(lane_key, rx));
 
-        // Re-send after the lane exists. The only way this fails is a runner
-        // that already retired, which cannot happen while this lock is held.
+        // Re-send after the lane exists. A runner cannot retire while this
+        // lock is held, so the only way this fails is a runtime already
+        // shutting down that dropped the freshly spawned runner before its
+        // first poll; the turn is abandoned with a warning.
         if tx.send(slot).is_err() {
             ::zeroclaw_log::record!(
                 WARN,
@@ -635,76 +637,106 @@ impl ConversationLaneRegistry {
                 break;
             };
 
-            // Resolve a reserved debounce slot to its combined content. A
-            // dropped sender means the bucket was abandoned, so the reserved
-            // position is simply skipped.
-            let mut turn = match slot {
-                LaneSlot::Ready(turn) => turn,
-                LaneSlot::Debounced { mut turn, content } => match content.await {
-                    Ok(combined) => {
-                        turn.msg.content = combined;
-                        turn
-                    }
-                    Err(_) => {
-                        self.release(turn.registration.as_ref()).await;
-                        continue;
-                    }
-                },
-            };
-
-            if !turn.hook_applied {
-                let ctx = Arc::clone(&turn.ctx);
-                let Some(hooked) = run_inbound_message_hook(&ctx, turn.msg).await else {
-                    self.release(turn.registration.as_ref()).await;
-                    continue;
-                };
-                turn.msg = hooked;
-                turn.hook_applied = true;
-
-                // The hook may rewrite routing. Exclusion has to hold on the
-                // key the processing path actually reads and writes, so a turn
-                // whose identity moved is re-queued onto the lane that owns it.
-                let routed_key = conversation_history_key(&turn.msg);
-                if routed_key != key {
-                    self.enqueue(&routed_key, LaneSlot::Ready(turn));
-                    continue;
-                }
-            }
-
-            // An interrupted predecessor is awaited before the permit is taken,
-            // so a turn never occupies the in-flight budget while waiting for
-            // one that is still winding down.
-            if let Some(superseded) = turn
-                .registration
-                .as_mut()
-                .and_then(|registration| registration.superseded.take())
-            {
-                superseded.completion.wait().await;
-            }
-
-            // The execution permit is taken here and nowhere earlier: waiting
-            // in a conversation-local queue must never consume the global
-            // in-flight budget.
-            let permit = match Arc::clone(&self.semaphore).acquire_owned().await {
-                Ok(permit) => permit,
-                // The runtime is shutting down and no further turn can start.
-                // The lane is deregistered anyway so a waiter in
-                // `wait_drained` is never left watching a lane that is gone.
-                Err(_) => {
-                    self.deregister(&key);
-                    break;
-                }
-            };
-
-            run_conversation_turn(
-                turn.ctx,
-                turn.msg,
-                Arc::clone(&self.in_flight),
-                turn.registration,
-                permit,
-            )
-            .await;
+            // Each slot is processed in its own task so a panic — in a hook,
+            // or anywhere down the processing path — is contained and logged:
+            // the lane keeps serving its queue and still retires through
+            // `next_slot`, instead of dying with its registration stuck in the
+            // registry and `wait_drained` hanging on shutdown.
+            let registry = Arc::clone(&self);
+            let lane_key = key.clone();
+            let worker = zeroclaw_spawn::spawn!(registry.process_slot(lane_key, slot));
+            log_worker_join_result(worker.await);
         }
+    }
+
+    /// Process one queued slot to completion: resolve debounced content, run
+    /// the inbound hook (re-queueing the turn when the hook rewrote its
+    /// routing), await an interrupted predecessor, take an execution permit,
+    /// and run the turn. The caller awaits this task, so slots of one lane
+    /// still run strictly one at a time.
+    async fn process_slot(self: Arc<Self>, key: String, slot: LaneSlot) {
+        // Resolve a reserved debounce slot to its combined content. A
+        // dropped sender means the bucket was abandoned, so the reserved
+        // position is simply skipped.
+        let mut turn = match slot {
+            LaneSlot::Ready(turn) => turn,
+            LaneSlot::Debounced { mut turn, content } => match content.await {
+                Ok(combined) => {
+                    turn.msg.content = combined;
+                    turn
+                }
+                Err(_) => {
+                    self.release(turn.registration.as_ref()).await;
+                    return;
+                }
+            },
+        };
+
+        // `/stop` or a superseding message may have cancelled this turn
+        // while it waited in the queue; drop it before it runs the hook,
+        // waits for a predecessor, or takes an execution permit.
+        if turn
+            .registration
+            .as_ref()
+            .is_some_and(|registration| registration.cancellation.is_cancelled())
+        {
+            self.release(turn.registration.as_ref()).await;
+            return;
+        }
+
+        if !turn.hook_applied {
+            let ctx = Arc::clone(&turn.ctx);
+            let Some(hooked) = run_inbound_message_hook(&ctx, turn.msg).await else {
+                self.release(turn.registration.as_ref()).await;
+                return;
+            };
+            turn.msg = hooked;
+            turn.hook_applied = true;
+
+            // The hook may rewrite routing. Exclusion has to hold on the
+            // key the processing path actually reads and writes, so a turn
+            // whose identity moved is re-queued onto the lane that owns it.
+            let routed_key = conversation_history_key(&turn.msg);
+            if routed_key != key {
+                self.enqueue(&routed_key, LaneSlot::Ready(turn));
+                return;
+            }
+        }
+
+        // An interrupted predecessor is awaited before the permit is taken,
+        // so a turn never occupies the in-flight budget while waiting for
+        // one that is still winding down.
+        if let Some(superseded) = turn
+            .registration
+            .as_mut()
+            .and_then(|registration| registration.superseded.take())
+        {
+            superseded.completion.wait().await;
+        }
+
+        // The execution permit is taken here and nowhere earlier: waiting
+        // in a conversation-local queue must never consume the global
+        // in-flight budget.
+        let permit = match Arc::clone(&self.semaphore).acquire_owned().await {
+            Ok(permit) => permit,
+            // The runtime is shutting down and no further turn can start.
+            // The registration is released so nothing ever waits on a
+            // completion that will never be marked; the lane itself keeps
+            // draining and retires through `next_slot`.
+            Err(_) => {
+                self.release(turn.registration.as_ref()).await;
+                return;
+            }
+        };
+
+        run_conversation_turn(
+            turn.ctx,
+            turn.msg,
+            Arc::clone(&self.in_flight),
+            turn.registration,
+            permit,
+        )
+        .await;
     }
 
     async fn release(&self, registration: Option<&TurnRegistration>) {
@@ -742,18 +774,6 @@ impl ConversationLaneRegistry {
                 }
             }
             Err(TryRecvError::Disconnected) => None,
-        }
-    }
-
-    /// Drop a lane's registration without draining its queue, for the shutdown
-    /// path where no further turn can start.
-    fn deregister(&self, key: &str) {
-        let mut lanes = self.lanes.lock().unwrap_or_else(|e| e.into_inner());
-        lanes.remove(key);
-        let empty = lanes.is_empty();
-        drop(lanes);
-        if empty {
-            self.drained.notify_waiters();
         }
     }
 
@@ -7993,22 +8013,40 @@ async fn run_message_dispatch_loop(
                 .debounce_with_window(&debounce_key, &msg.content, debounce_window)
                 .await
             {
-                zeroclaw_infra::debounce::DebounceResult::Pending(rx) => {
-                    // A follow-up message extends a bucket that already owns a
-                    // lane position: hand the debouncer's replacement receiver
-                    // to that position instead of reserving a later one, so the
-                    // combined turn keeps the place of the sender's first
-                    // message. `send` only fails once the bucket has been
-                    // delivered, which means the next message starts a new one.
+                zeroclaw_infra::debounce::DebounceResult::Pending { rx, extended } => {
+                    // A follow-up that extended an open bucket hands the
+                    // debouncer's replacement receiver to the lane position
+                    // that bucket already owns, so the combined turn keeps the
+                    // place of the sender's first message. Whether the bucket
+                    // was extended or opened comes from the debouncer itself,
+                    // decided under its lock: inferring it here from forwarder
+                    // liveness would race the window expiry, and a receiver
+                    // sent to a forwarder whose bucket just fired would be
+                    // dropped unread — silently losing the new message.
                     let rx = match debounce_buckets.get(&debounce_key) {
-                        Some(bucket) => match bucket.send(rx) {
+                        Some(bucket) if extended => match bucket.send(rx) {
                             Ok(()) => continue,
+                            // An extended bucket always has a live forwarder
+                            // (it can only retire after consuming the bucket's
+                            // final receiver). If the invariant ever breaks,
+                            // reserving a fresh slot loses ordering but never
+                            // the message.
                             Err(returned) => {
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                    .with_attrs(::serde_json::json!({"debounce": debounce_key})),
+                                    "debounce forwarder retired before its bucket was delivered"
+                                );
                                 debounce_buckets.remove(&debounce_key);
                                 returned.0
                             }
                         },
-                        None => rx,
+                        _ => rx,
                     };
 
                     let (content, bucket) = spawn_debounce_forwarder(rx);
@@ -23350,7 +23388,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .debounce_with_window(&message_debounce_key(&alice), &alice.content, window)
             .await
         {
-            zeroclaw_infra::debounce::DebounceResult::Pending(rx) => rx,
+            zeroclaw_infra::debounce::DebounceResult::Pending { rx, .. } => rx,
             zeroclaw_infra::debounce::DebounceResult::Passthrough(_) => {
                 panic!("nonzero window must debounce")
             }
@@ -23359,7 +23397,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .debounce_with_window(&message_debounce_key(&bob), &bob.content, window)
             .await
         {
-            zeroclaw_infra::debounce::DebounceResult::Pending(rx) => rx,
+            zeroclaw_infra::debounce::DebounceResult::Pending { rx, .. } => rx,
             zeroclaw_infra::debounce::DebounceResult::Passthrough(_) => {
                 panic!("nonzero window must debounce")
             }
@@ -23925,6 +23963,86 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             turns[2].content.starts_with("[Message from bob]"),
             "the later bucket must stay behind, even though it fired first: {}",
+            turns[2].content
+        );
+    }
+
+    /// A message that opens a new debounce bucket right after the sender's
+    /// previous bucket fired must reserve its own lane slot. Handing its
+    /// receiver to the delivered bucket's forwarder — which may still be
+    /// retiring — would drop it unread and lose the message; the debouncer's
+    /// `extended` flag is what makes the distinction deterministic.
+    #[tokio::test]
+    async fn shared_session_sequential_debounce_buckets_both_run() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let prompt_config = zeroclaw_config::schema::Config {
+            channels: zeroclaw_config::schema::ChannelsConfig {
+                debounce_ms: 40,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(SlowModelProvider {
+                delay: Duration::from_millis(120),
+            }),
+            prompt_config,
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        let first = shared_topic_message("alice", "m1", "first bucket");
+        let history_key = conversation_history_key(&first);
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
+        let send_task = zeroclaw_spawn::spawn!(async move {
+            tx.send(first).await.unwrap();
+            // Well past the debounce window: the first bucket has fired and
+            // its turn is running when the second message arrives.
+            tokio::time::sleep(Duration::from_millis(90)).await;
+            tx.send(shared_topic_message("alice", "m2", "second bucket"))
+                .await
+                .unwrap();
+        });
+
+        run_message_dispatch_loop(rx, AgentRouter::single(Arc::clone(&ctx)), 4).await;
+        send_task.await.unwrap();
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(
+            sent.len(),
+            2,
+            "a bucket opened after the previous one fired must still run: {sent:?}"
+        );
+        drop(sent);
+
+        let mut histories = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let turns = histories
+            .get(&history_key)
+            .expect("shared history must exist")
+            .clone();
+        drop(histories);
+
+        let roles: Vec<&str> = turns.iter().map(|t| t.role.as_str()).collect();
+        assert_eq!(
+            roles,
+            vec!["user", "assistant", "user", "assistant"],
+            "both buckets must persist as complete pairs, got: {turns:?}"
+        );
+        assert!(
+            turns[0].content.contains("first bucket"),
+            "first bucket's turn must persist first: {}",
+            turns[0].content
+        );
+        assert!(
+            turns[2].content.contains("second bucket"),
+            "second bucket's turn must persist second: {}",
             turns[2].content
         );
     }
