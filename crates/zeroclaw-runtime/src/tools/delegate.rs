@@ -142,6 +142,13 @@ pub struct DelegateTool {
     /// time. When unset (legacy unit-test constructors), DelegateTool falls
     /// back to using `self.security` for the spawned inner DelegateTool.
     root_config: Option<Arc<Config>>,
+    /// Live config handle threaded into independent agentic target registries
+    /// so tools that resolve policy at use time (e.g. `image_gen`'s
+    /// `allowed_private_hosts`) observe a canonical `config/set` revocation
+    /// instead of the construction-time snapshot. Mirrors the parent
+    /// `all_tools_with_runtime` `live_config` argument. `None` for one-shot /
+    /// non-channel callers, which fall back to the snapshot.
+    live_config: Option<Arc<RwLock<Config>>>,
     /// Alias of the agent that owns this DelegateTool. Excluded from the
     /// advertised roster so an agent is never offered itself as a
     /// delegation target. Empty when unset (legacy unit-test constructors).
@@ -257,6 +264,7 @@ impl DelegateTool {
             runtime_profiles: Arc::new(HashMap::new()),
             skill_bundles: Arc::new(HashMap::new()),
             root_config: None,
+            live_config: None,
             caller_alias: String::new(),
         }
     }
@@ -304,6 +312,7 @@ impl DelegateTool {
             runtime_profiles: Arc::new(HashMap::new()),
             skill_bundles: Arc::new(HashMap::new()),
             root_config: None,
+            live_config: None,
             caller_alias: String::new(),
         }
     }
@@ -404,6 +413,19 @@ impl DelegateTool {
     /// canonical agent config at delegate time.
     pub fn with_root_config(mut self, config: Arc<Config>) -> Self {
         self.root_config = Some(config);
+        self
+    }
+
+    /// Attach the live config handle so independent agentic target registries
+    /// observe canonical `config/set` mutations (e.g. `image_gen`'s
+    /// `allowed_private_hosts` revocation) instead of the snapshot. `None`
+    /// keeps the snapshot fallback, matching the parent
+    /// `all_tools_with_runtime` `live_config` semantics.
+    pub fn with_live_config(
+        mut self,
+        live_config: Option<Arc<parking_lot::RwLock<Config>>>,
+    ) -> Self {
+        self.live_config = live_config;
         self
     }
 
@@ -749,7 +771,10 @@ impl DelegateTool {
             None,
             None,
             None,
-            None,
+            // Thread the parent's live config handle so the independent target
+            // registry's tools (e.g. `image_gen`'s allowlist resolver) observe
+            // canonical `config/set` mutations instead of the snapshot.
+            self.live_config.clone(),
         );
 
         let target_workspace = config.agent_workspace_dir(agent_name);
@@ -1562,6 +1587,7 @@ impl DelegateTool {
                     risk_profiles,
                     runtime_profiles,
                     skill_bundles,
+                    live_config: None,
                     root_config,
                     caller_alias,
                 };
@@ -1811,6 +1837,7 @@ impl DelegateTool {
                         runtime_profiles,
                         skill_bundles,
                         root_config,
+                        live_config: None,
                         caller_alias,
                     };
                     let agent_name_for_return = agent_name.clone();
@@ -7510,6 +7537,129 @@ mod tests {
         assert!(
             !tool_names.contains(&"echo_tool"),
             "independent target must not inherit parent-only tools"
+        );
+    }
+
+    #[tokio::test]
+    async fn independent_delegate_image_gen_allowlist_follows_live_config_handle() {
+        // Regression for the reviewer finding that independent agentic target
+        // registries were rebuilt with `live_config=None`, so `image_gen`'s
+        // `allowed_private_hosts` resolver fell back to the snapshot. The
+        // parent registry observes a canonical `config/set` revocation, but an
+        // independent delegate retained the old carve-out.
+        //
+        // Observable: `ImageGenTool::new_with_config_resolver` validates the
+        // allowlist at construction, so whether `image_gen` registers in the
+        // independent target's registry reveals which allowlist source it read.
+        // Legal live allowlist → registered; a mutated (malformed) live entry →
+        // construction fails and the tool is dropped, even though the snapshot
+        // `root_config` still carries the legal entry.
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, ImageGenConfig, RiskProfileConfig, RuntimeProfileConfig,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        // Snapshot carries a LEGAL allowlist, so a reverted wiring (snapshot
+        // fallback) would always register image_gen and this test would fail on
+        // the malformed-live case below.
+        config.image_gen = ImageGenConfig {
+            enabled: true,
+            default_model: "fal-ai/flux/schnell".into(),
+            api_key_env: "FAL_API_KEY".into(),
+            allowed_private_hosts: vec!["127.0.0.1".into()],
+        };
+        config.risk_profiles.insert(
+            "caller".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                allowed_tools: vec!["echo_tool".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "target".to_string(),
+            RiskProfileConfig {
+                allowed_tools: vec!["image_gen".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.runtime_profiles.insert(
+            "agentic".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "caller".into(),
+                model_provider: "ollama.caller".into(),
+                delegates: vec![DelegateTargetConfig {
+                    agent: "target".to_string(),
+                    mode: DelegateExecutionMode::Independent,
+                }],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "target".into(),
+                runtime_profile: "agentic".into(),
+                model_provider: "ollama.target".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let config = Arc::new(config);
+        // The live handle starts as a clone of the (legal) snapshot config.
+        let live = Arc::new(RwLock::new((*config).clone()));
+
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let tool = DelegateTool::new(config.agents.clone(), None, Arc::clone(&caller_policy))
+            .with_root_config(Arc::clone(&config))
+            .with_live_config(Some(Arc::clone(&live)))
+            .with_caller_alias("caller")
+            .with_runtime(Arc::new(DelegateTestRuntime))
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+
+        async fn build_target(tool: &DelegateTool) -> Vec<Box<dyn Tool>> {
+            let target_policy = tool
+                .policy_for_target("target")
+                .expect("independent target policy resolves");
+            tool.independent_agentic_tools_for_target("target", target_policy)
+                .await
+                .expect("target-owned registry builds")
+                .tools
+        }
+
+        // Legal live allowlist → image_gen registers in the independent target.
+        let first = build_target(&tool).await;
+        assert!(
+            first.iter().any(|t| t.name() == "image_gen"),
+            "independent target must register image_gen with a legal live allowlist"
+        );
+
+        // Mutate the shared live config to a MALFORMED allowlist. The snapshot
+        // `root_config` still carries the legal entry, so a reverted wiring that
+        // rebuilds the registry from the snapshot would still register image_gen
+        // and this assertion would fail.
+        live.write().image_gen.allowed_private_hosts = vec!["bad entry with space".into()];
+        let second = build_target(&tool).await;
+        assert!(
+            !second.iter().any(|t| t.name() == "image_gen"),
+            "independent delegate must observe the live config revocation: image_gen \
+             must be dropped when the live allowlist is malformed (snapshot fallback \
+             would keep it registered)"
         );
     }
 
