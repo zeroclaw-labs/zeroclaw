@@ -2,13 +2,31 @@ use crate::helpers::domain_guard;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use serde_json::json;
+use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, with_ephemeral_workspace_warning};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::FileDownloadConfig;
+
+/// Result type produced by the DNS resolver seam.
+type ResolveResult = Result<Vec<std::net::SocketAddr>, String>;
+/// Async DNS resolver seam, injectable so tests can count or forbid resolver
+/// calls. Defaults to [`resolve_endpoint_ips`]. Takes an owned host so the
+/// returned future can outlive the call (no borrowed-lifetime coupling).
+type EndpointResolver =
+    Arc<dyn Fn(String, u16) -> Pin<Box<dyn Future<Output = ResolveResult> + Send>> + Send + Sync>;
+
+fn default_endpoint_resolver() -> EndpointResolver {
+    Arc::new(
+        |host: String, port: u16| -> Pin<Box<dyn Future<Output = ResolveResult> + Send>> {
+            Box::pin(async move { resolve_endpoint_ips(&host, port).await })
+        },
+    )
+}
 
 const RESPONSE_BODY_LIMIT_BYTES: usize = 4 * 1024;
 const TOOL_DESCRIPTION_KEY: &str = "tool-file-download";
@@ -25,6 +43,9 @@ pub struct FileDownloadTool {
     /// never retains a stale policy copy per the single-source-of-truth rule
     /// (AGENTS.md).
     allowed_private_hosts_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    /// DNS resolver seam, injectable so tests can observe that a rejected
+    /// dispatch performs zero resolver I/O. Defaults to [`resolve_endpoint_ips`].
+    endpoint_resolver: EndpointResolver,
     /// Whether the downloaded file persists on the host filesystem. `false` on
     /// an ephemeral runtime (Docker tmpfs / no volume mount), where the file is
     /// written inside the container but invisible on the host and discarded at
@@ -57,6 +78,7 @@ impl FileDownloadTool {
             security,
             config,
             allowed_private_hosts_resolver: Arc::new(move || snapshot.clone()),
+            endpoint_resolver: default_endpoint_resolver(),
             persistent_writes,
         }
     }
@@ -82,6 +104,31 @@ impl FileDownloadTool {
             security,
             config,
             allowed_private_hosts_resolver: Arc::new(allowed_private_hosts_resolver),
+            endpoint_resolver: default_endpoint_resolver(),
+            persistent_writes,
+        }
+    }
+
+    /// Construct with an explicit DNS resolver seam, mirroring
+    /// [`Self::new_with_persistence_and_resolver`]. Tests inject a counting or
+    /// forbidding resolver to prove a rejected dispatch performs zero resolver
+    /// I/O; production callers use the default [`resolve_endpoint_ips`].
+    #[cfg(test)]
+    fn new_with_endpoint_resolver<F>(
+        security: Arc<SecurityPolicy>,
+        config: FileDownloadConfig,
+        persistent_writes: bool,
+        allowed_private_hosts_resolver: F,
+        endpoint_resolver: EndpointResolver,
+    ) -> Self
+    where
+        F: Fn() -> Vec<String> + Send + Sync + 'static,
+    {
+        Self {
+            security,
+            config,
+            allowed_private_hosts_resolver: Arc::new(allowed_private_hosts_resolver),
+            endpoint_resolver,
             persistent_writes,
         }
     }
@@ -109,7 +156,7 @@ impl FileDownloadTool {
         raw_url: &str,
     ) -> Result<(String, Vec<std::net::SocketAddr>), String> {
         let (transport_host, policy_host, port) = parse_endpoint_url(raw_url)?;
-        let resolved_addrs = resolve_endpoint_ips(&policy_host, port).await?;
+        let resolved_addrs = (self.endpoint_resolver)(policy_host.to_string(), port).await?;
         let allowed = normalize_allowed_private_hosts(&(self.allowed_private_hosts_resolver)());
         ssrf_check_endpoint(&policy_host, &resolved_addrs, &allowed)?;
         // Return transport_host for resolve_to_addrs binding — this preserves
@@ -323,6 +370,33 @@ fn ssrf_check_endpoint(
 ) -> Result<(), String> {
     let ips: Vec<std::net::IpAddr> = resolved_addrs.iter().map(|sa| sa.ip()).collect();
     let private_allowed = domain_guard::host_matches_allowlist(policy_host, allowed_hosts);
+
+    // Cloud metadata / credential-delivery addresses are rejected regardless
+    // of `allowed_private_hosts` (the schema contract at
+    // `file_download.allowed_private_hosts` documents that the carve-out never
+    // lifts the metadata exclusion). Surface a DISTINCT error with no allowlist
+    // suggestion — the generic private-host message would tell the operator to
+    // add a host that cannot be enabled.
+    if let Some(metadata_ip) = ips
+        .iter()
+        .find(|ip| domain_guard::is_cloud_metadata_ip(**ip))
+    {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "tool": "file_download",
+                    "host": policy_host,
+                    "ip": metadata_ip.to_string(),
+                })),
+            "file_download: rejected cloud metadata/credential endpoint host"
+        );
+        return Err(tool_msg_with_args(
+            "tool-file-download-error-metadata-endpoint",
+            &[("host", policy_host), ("ip", &metadata_ip.to_string())],
+        ));
+    }
 
     // Every blocked endpoint must emit a WARN rejection event — not just
     // literal private hosts. The resolved-IP validator below already covers
@@ -802,6 +876,7 @@ mod tests {
     use std::collections::HashMap;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
     use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -853,6 +928,38 @@ mod tests {
             url,
             ..FileDownloadConfig::default()
         }
+    }
+
+    /// Build a tool whose DNS resolver counts every invocation and returns a
+    /// resolvable loopback answer, so a rejected dispatch can assert zero
+    /// resolver I/O deterministically (no reliance on IP-literal short-circuit).
+    fn tool_with_counting_resolver(
+        security: Arc<SecurityPolicy>,
+        config: FileDownloadConfig,
+        resolver_calls: Arc<AtomicUsize>,
+    ) -> FileDownloadTool {
+        let counter = Arc::clone(&resolver_calls);
+        let endpoint_resolver: EndpointResolver = Arc::new(
+            move |_host: String,
+                  port: u16|
+                  -> Pin<Box<dyn Future<Output = ResolveResult> + Send>> {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    Ok(vec![std::net::SocketAddr::new(
+                        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                        port,
+                    )])
+                })
+            },
+        );
+        let snapshot = config.allowed_private_hosts.clone();
+        FileDownloadTool::new_with_endpoint_resolver(
+            security,
+            config,
+            true,
+            move || snapshot.clone(),
+            endpoint_resolver,
+        )
     }
 
     /// Count files in `dir` whose name marks an in-progress download temp file.
@@ -1933,6 +2040,54 @@ mod tests {
         .expect("public-IP hostname must pass without opt-in");
     }
 
+    /// Operator-visibility contract for metadata rejections: the error must
+    /// NOT suggest adding the host to `allowed_private_hosts`, because the
+    /// metadata/credential exclusion is non-overridable (schema contract). A
+    /// future wording change that implies the allowlist can lift it would be
+    /// false remediation.
+    #[test]
+    fn ssrf_check_endpoint_metadata_rejection_has_no_allowlist_suggestion() {
+        // EC2 IMDS — rejected even with a wildcard allowlist.
+        let err = ssrf_check_endpoint(
+            "metadata.example.com",
+            &[std::net::SocketAddr::from(([169, 254, 169, 254], 80))],
+            &["*".into()],
+        )
+        .expect_err("metadata address must be rejected even under a wildcard allowlist");
+        assert!(
+            err.contains("cloud metadata") || err.contains("credential"),
+            "metadata rejection must be operator-visible as such; got: {err}"
+        );
+        assert!(
+            !err.contains("To allow this host")
+                && !err.contains("add it")
+                && !err.contains("To allow this"),
+            "metadata rejection must NOT instruct the operator to add the host to \
+             the allowlist (it cannot lift the exclusion); got: {err}"
+        );
+        // It MAY name the config key to say the allowlist does NOT apply.
+        assert!(
+            err.contains("cannot be enabled"),
+            "metadata rejection should state the allowlist cannot lift it; got: {err}"
+        );
+
+        // EKS Pod Identity credentials — same contract through the non-opt-in path.
+        let err2 = ssrf_check_endpoint(
+            "eks-credentials.example.com",
+            &[std::net::SocketAddr::from(([169, 254, 170, 23], 80))],
+            &[],
+        )
+        .expect_err("EKS credential address must be rejected");
+        assert!(
+            err2.contains("cloud metadata") || err2.contains("credential"),
+            "EKS credential rejection must be operator-visible as such; got: {err2}"
+        );
+        assert!(
+            !err2.contains("To allow this host") && !err2.contains("add it"),
+            "EKS credential rejection must NOT instruct adding to the allowlist; got: {err2}"
+        );
+    }
+
     /// Operator-visibility contract for the SSRF audit events: every blocked
     /// endpoint emits a WARN rejection, an allowlisted host whose resolved
     /// addresses actually use the private carve-out emits an INFO admission,
@@ -2182,9 +2337,14 @@ mod tests {
     #[tokio::test]
     async fn execute_defers_dns_until_after_readonly_check() {
         let tmp = TempDir::new().unwrap();
-        let tool = FileDownloadTool::new(
+        let resolver_calls = Arc::new(AtomicUsize::new(0));
+        // A hostname URL (not an IP literal) so the resolver would genuinely
+        // run if the ordering regressed — the counting seam below then proves
+        // it did not.
+        let tool = tool_with_counting_resolver(
             test_security(tmp.path().to_path_buf(), AutonomyLevel::ReadOnly),
-            cfg(Some("http://127.0.0.1:1/x".into())),
+            cfg(Some("http://files.corp.test:1/x".into())),
+            Arc::clone(&resolver_calls),
         );
 
         let result = tool
@@ -2203,6 +2363,11 @@ mod tests {
             !err.contains("private") && !err.contains("loopback"),
             "DNS check must come AFTER the read-only check; got: {err}"
         );
+        assert_eq!(
+            resolver_calls.load(Ordering::SeqCst),
+            0,
+            "a read-only rejection must perform zero resolver I/O"
+        );
         assert!(!tmp.path().join("out.bin").exists());
     }
 
@@ -2212,9 +2377,11 @@ mod tests {
     #[tokio::test]
     async fn execute_defers_dns_until_after_missing_arg_check() {
         let tmp = TempDir::new().unwrap();
-        let tool = FileDownloadTool::new(
+        let resolver_calls = Arc::new(AtomicUsize::new(0));
+        let tool = tool_with_counting_resolver(
             test_security(tmp.path().to_path_buf(), AutonomyLevel::Full),
-            cfg(Some("http://127.0.0.1:1/x".into())),
+            cfg(Some("http://files.corp.test:1/x".into())),
+            Arc::clone(&resolver_calls),
         );
 
         // The missing-arg path bubbles up as `anyhow::Err` with a
@@ -2236,6 +2403,11 @@ mod tests {
             !msg.contains("private") && !msg.contains("loopback"),
             "DNS check must come AFTER arg validation; got: {msg}"
         );
+        assert_eq!(
+            resolver_calls.load(Ordering::SeqCst),
+            0,
+            "a missing-arg rejection must perform zero resolver I/O"
+        );
     }
 
     /// DNS resolution must defer until after destination validation. A
@@ -2244,9 +2416,11 @@ mod tests {
     #[tokio::test]
     async fn execute_defers_dns_until_after_destination_check() {
         let tmp = TempDir::new().unwrap();
-        let tool = FileDownloadTool::new(
+        let resolver_calls = Arc::new(AtomicUsize::new(0));
+        let tool = tool_with_counting_resolver(
             test_security(tmp.path().to_path_buf(), AutonomyLevel::Full),
-            cfg(Some("http://127.0.0.1:1/x".into())),
+            cfg(Some("http://files.corp.test:1/x".into())),
+            Arc::clone(&resolver_calls),
         );
 
         // `nested/..` terminates in `..` → "no concrete file name"
@@ -2268,6 +2442,11 @@ mod tests {
         assert!(
             !err.contains("private") && !err.contains("loopback"),
             "DNS check must come AFTER destination validation; got: {err}"
+        );
+        assert_eq!(
+            resolver_calls.load(Ordering::SeqCst),
+            0,
+            "a destination rejection must perform zero resolver I/O"
         );
     }
 

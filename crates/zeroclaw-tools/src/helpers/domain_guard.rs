@@ -141,7 +141,34 @@ pub(crate) fn is_cloud_metadata_ip(ip: std::net::IpAddr) -> bool {
                     Some(v4) => is_v4_metadata(v4),
                     None => false,
                 }
+                // RFC 6052 NAT64/DNS64 (64:ff9b::/96) embeds the IPv4 address
+                // in the low 32 bits — canonicalize it before classification.
+                || match nat64_embedded_ipv4(v6) {
+                    Some(v4) => is_v4_metadata(v4),
+                    None => false,
+                }
         }
+    }
+}
+
+/// RFC 6052 well-known NAT64/DNS64 prefix `64:ff9b::/96`. DNS64 embeds the
+/// IPv4 answer in the low 32 bits of the synthesized address, so e.g.
+/// `64:ff9b::a9fe:a9fe` embeds `169.254.169.254`. A hostname whose DNS64
+/// answer is one of these forms would otherwise pass the `is_non_global_v6`
+/// gate (the prefix is not classified as non-global) and reach a
+/// credential/metadata endpoint through the `allowed_private_hosts`
+/// carve-out.
+pub(crate) fn nat64_embedded_ipv4(v6: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    let octets = v6.octets();
+    let well_known_prefix = [
+        0x00, 0x64, 0xff, 0x9b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+    if octets[..12] == well_known_prefix {
+        Some(std::net::Ipv4Addr::new(
+            octets[12], octets[13], octets[14], octets[15],
+        ))
+    } else {
+        None
     }
 }
 
@@ -498,6 +525,87 @@ mod tests {
         assert!(
             err.contains("cloud metadata address"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_resolved_ips_blocks_nat64_ec2_metadata_even_for_private_opt_in() {
+        // RFC 6052 DNS64/NAT64 (64:ff9b::/96) embedding 169.254.169.254. The
+        // allowlist carve-out path skips the generic non-global IPv6 check and
+        // relies entirely on the metadata predicate, so this form must be
+        // canonicalized and rejected there.
+        let ips = ["64:ff9b::a9fe:a9fe".parse().unwrap()];
+        let err = validate_resolved_ips_exclude_metadata("metadata.test", &ips)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cloud metadata address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_resolved_ips_blocks_nat64_ecs_credentials_even_for_private_opt_in() {
+        // 64:ff9b::a9fe:aa02 embeds the ECS task credentials address
+        // 169.254.170.2.
+        let ips = ["64:ff9b::a9fe:aa02".parse().unwrap()];
+        let err = validate_resolved_ips_exclude_metadata("credentials.test", &ips)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cloud metadata address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_resolved_ips_blocks_nat64_eks_credentials_even_for_private_opt_in() {
+        // 64:ff9b::a9fe:aa17 embeds the EKS Pod Identity credentials address
+        // 169.254.170.23.
+        let ips = ["64:ff9b::a9fe:aa17".parse().unwrap()];
+        let err = validate_resolved_ips_exclude_metadata("credentials.test", &ips)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cloud metadata address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_resolved_ips_blocks_nat64_ec2_metadata_on_public_path() {
+        // The same NAT64 form must also be rejected on the non-allowlisted
+        // public validator, not misreported as a generic non-global address.
+        let ips = ["64:ff9b::a9fe:a9fe".parse().unwrap()];
+        let err = validate_resolved_ips_are_public("metadata.test", &ips)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cloud metadata address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn nat64_embedded_ipv4_extracts_well_known_prefix() {
+        assert_eq!(
+            nat64_embedded_ipv4("64:ff9b::a9fe:a9fe".parse().unwrap()),
+            Some(std::net::Ipv4Addr::new(169, 254, 169, 254)),
+        );
+        assert_eq!(
+            nat64_embedded_ipv4("64:ff9b::a9fe:aa02".parse().unwrap()),
+            Some(std::net::Ipv4Addr::new(169, 254, 170, 2)),
+        );
+        assert_eq!(
+            nat64_embedded_ipv4("64:ff9b::6464:64c8".parse().unwrap()),
+            Some(std::net::Ipv4Addr::new(100, 100, 100, 200)),
+        );
+        // A non-64:ff9b prefix must not be extracted.
+        assert_eq!(nat64_embedded_ipv4("2001:db8::1".parse().unwrap()), None);
+        assert_eq!(
+            nat64_embedded_ipv4("64:ff9b::1:2:3:4".parse().unwrap()),
+            None,
+            "bits above the embedded IPv4 must not be accepted"
         );
     }
 
