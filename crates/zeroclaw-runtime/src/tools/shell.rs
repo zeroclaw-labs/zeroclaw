@@ -929,6 +929,61 @@ mod tests {
         );
     }
 
+    /// End-to-end regression for the shell workspace-boundary bypass: driving
+    /// the REAL wrapped shell tool, a write through an in-workspace symlink
+    /// pointing outside must be refused before the command runs, and nothing may
+    /// be created at the target. This covers only the direct path-shaped
+    /// redirect form the static scan can see; dynamic forms (scripts,
+    /// expansion, races) are outside this layer.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_blocks_symlink_escape_end_to_end() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "zeroclaw_shell_e2e_symlink_escape_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let workspace = root.join("workspace");
+        let outside = root.join("outside");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        // `link` inside the workspace points at the outside directory.
+        symlink(&outside, workspace.join("link")).unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: workspace.clone(),
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        });
+        let tool = wrapped_shell(security);
+
+        let result = tool
+            .execute(json!({"command": "echo pwned > link/escape.txt", "approved": true}))
+            .await
+            .expect("shell tool must return a result");
+
+        assert!(!result.success, "the escaping write must be refused");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Path blocked"),
+            "expected a path-block error, got: {:?}",
+            result.error
+        );
+        assert!(
+            !outside.join("escape.txt").exists(),
+            "no file may be written outside the workspace through the symlink"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[tokio::test]
     async fn shell_blocks_option_assignment_path_argument() {
         let tool = wrapped_shell(test_security(AutonomyLevel::Supervised));
