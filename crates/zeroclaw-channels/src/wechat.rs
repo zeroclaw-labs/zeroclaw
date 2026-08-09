@@ -447,7 +447,7 @@ fn https_base_url(
 /// `ret`/`errcode` in the JSON body — the same envelope the getUpdates
 /// sync loop parses. Checking only the HTTP status treats those failures
 /// (e.g. an expired or missing `context_token`) as success, so the message
-/// is silently dropped (zeroclaw-labs/zeroclaw#8967).
+/// is silently dropped.
 ///
 /// An empty or non-JSON 2xx body carries no envelope to inspect and is
 /// treated as success, preserving the pre-check behavior for those shapes.
@@ -1957,7 +1957,10 @@ impl WeChatChannel {
 
         // The API reports failures as HTTP 200 with a non-zero ret/errcode
         // in the body; a status check alone silently drops the message.
-        let body = resp.text().await.unwrap_or_default();
+        let body = resp
+            .text()
+            .await
+            .context("failed to read sendMessage response body")?;
         if let Some(err) = sendmessage_body_error(&body) {
             anyhow::bail!("sendMessage failed ({err})");
         }
@@ -2591,6 +2594,86 @@ impl Channel for WeChatChannel {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    fn test_wechat_channel_for_api(api_base_url: String, state_dir: &Path) -> WeChatChannel {
+        let mut channel = WeChatChannel::new(
+            "wechat_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            None,
+            None,
+            Some(state_dir.to_path_buf()),
+        )
+        .unwrap();
+        channel.api_base_url = api_base_url;
+        *channel.bot_token.write().unwrap() = Some("test-token".into());
+        channel
+    }
+
+    #[tokio::test]
+    async fn send_text_reports_2xx_error_envelope() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/sendmessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ret": -1,
+                "errcode": 301,
+                "errmsg": "context token expired"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let state = tempdir().unwrap();
+        let channel = test_wechat_channel_for_api(server.uri(), state.path());
+        let err = channel
+            .send_text("recipient", "hello", None)
+            .await
+            .expect_err("a 2xx iLink error envelope must fail the send");
+
+        let message = err.to_string();
+        assert!(message.contains("sendMessage failed"), "{message}");
+        assert!(message.contains("errcode=301"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn send_text_propagates_2xx_body_read_failure() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 64\r\nConnection: close\r\n\r\n{}")
+                .await
+                .unwrap();
+        });
+
+        let state = tempdir().unwrap();
+        let channel = test_wechat_channel_for_api(format!("http://{address}"), state.path());
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            channel.send_text("recipient", "hello", None),
+        )
+        .await
+        .expect("the local truncated-body request must complete")
+        .expect_err("a truncated 2xx response body must fail the send");
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("the local truncated-body server must complete")
+            .unwrap();
+
+        assert!(
+            err.to_string()
+                .contains("failed to read sendMessage response body"),
+            "{err:#}"
+        );
+    }
 
     #[test]
     fn sendmessage_body_error_flags_nonzero_ret() {
