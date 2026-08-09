@@ -25,6 +25,7 @@ use zeroclaw_api::jsonrpc::{
 };
 use zeroclaw_api::model_provider::ChatMessage;
 use zeroclaw_api::runtime_status::RuntimeConfigKind;
+use zeroclaw_commands::{CommandSurface, commands_for_surface};
 
 /// Wire protocol version. Bump on breaking changes.
 pub const RPC_PROTOCOL_VERSION: u64 = 1;
@@ -910,13 +911,26 @@ impl RpcDispatcher {
             .iter()
             .map(|(_, name)| (*name).to_string())
             .collect();
+        let commands = commands_for_surface(CommandSurface::Tui)
+            .map(|spec| CommandDescriptor {
+                id: spec.id.as_str().to_string(),
+                name: spec.name.to_string(),
+                aliases: spec
+                    .aliases
+                    .iter()
+                    .map(|alias| (*alias).to_string())
+                    .collect(),
+            })
+            .collect();
 
         to_result(InitializeResult {
             protocol_version: RPC_PROTOCOL_VERSION,
             server_version: env!("CARGO_PKG_VERSION").to_string(),
+            server_pid: std::process::id(),
             tui_id: Some(tui_id),
             tui_sig,
             capabilities,
+            commands,
         })
     }
 
@@ -1125,7 +1139,9 @@ impl RpcDispatcher {
             .await
             .map_err(|_| rpc_err(SESSION_LIMIT_REACHED, "Session limit reached"))?;
 
-        if let Some(ref tui_id) = self.tui_id {
+        if let Some(ref tui_id) = self.tui_id
+            && req.keep_siblings != Some(true)
+        {
             let evicted = self
                 .ctx
                 .sessions
@@ -2024,6 +2040,12 @@ impl RpcDispatcher {
     async fn handle_session_configure(&self, params: &Value) -> RpcResult {
         let req: SessionConfigureParams = parse_params(params)?;
         validate_session_configure_overrides(&req.overrides)?;
+        let _model_provider_update = self
+            .ctx
+            .sessions
+            .lock_model_provider_update(&req.session_id)
+            .await
+            .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
 
         let merged = self
             .ctx
@@ -2825,20 +2847,20 @@ impl RpcDispatcher {
     fn schedule_live_sessions_refresh_for_agent(&self, agent_alias: String) {
         let ctx = Arc::clone(&self.ctx);
         zeroclaw_spawn::spawn!(async move {
-            let provider_ref = {
-                let config = ctx.config.read();
-                config
-                    .agent(&agent_alias)
-                    .map(|agent| agent.model_provider.to_string())
-            };
-            let Some(provider_ref) = provider_ref else {
-                return;
-            };
-            Self::refresh_live_sessions_matching(ctx, &provider_ref, |session_agent, overrides| {
-                agent_scoped_refresh_selects(&agent_alias, session_agent, overrides)
-            })
-            .await;
+            Self::refresh_live_sessions_for_agent(ctx, &agent_alias).await;
         });
+    }
+
+    async fn refresh_live_sessions_for_agent(ctx: Arc<RpcContext>, agent_alias: &str) {
+        Self::refresh_live_sessions_matching(ctx, |config, session_agent, overrides| {
+            if !agent_scoped_refresh_selects(agent_alias, session_agent, overrides) {
+                return None;
+            }
+            config
+                .agent(agent_alias)
+                .map(|agent| agent.model_provider.to_string())
+        })
+        .await;
     }
 
     async fn refresh_live_sessions_for_model_provider(
@@ -2846,45 +2868,44 @@ impl RpcDispatcher {
         model_provider_ref: &str,
     ) {
         let target_ref = model_provider_ref.to_string();
-        Self::refresh_live_sessions_matching(ctx, model_provider_ref, move |_agent, overrides| {
-            provider_scoped_refresh_selects(&target_ref, overrides)
+        Self::refresh_live_sessions_matching(ctx, move |config, session_agent, overrides| {
+            if !provider_scoped_refresh_selects(&target_ref, overrides) {
+                return None;
+            }
+            let effective_ref = overrides.model_provider.as_deref().or_else(|| {
+                config
+                    .agent(session_agent)
+                    .map(|agent| agent.model_provider.as_str())
+            });
+            (effective_ref == Some(target_ref.as_str())).then(|| target_ref.clone())
         })
         .await;
     }
 
-    async fn refresh_live_sessions_matching<F>(
-        ctx: Arc<RpcContext>,
-        model_provider_ref: &str,
-        select: F,
-    ) where
-        F: Fn(&str, &SessionOverrides) -> bool,
+    async fn refresh_live_sessions_matching<F>(ctx: Arc<RpcContext>, resolve_provider_ref: F)
+    where
+        F: Fn(&Config, &str, &SessionOverrides) -> Option<String>,
     {
         let session_ids = ctx.sessions.list_ids().await;
         for session_id in session_ids {
+            let Some(_model_provider_update) =
+                ctx.sessions.lock_model_provider_update(&session_id).await
+            else {
+                continue;
+            };
             let Some(agent_alias) = ctx.sessions.get_agent_alias(&session_id).await else {
                 continue;
             };
             let Some(overrides) = ctx.sessions.get_overrides(&session_id).await else {
                 continue;
             };
-            if !select(&agent_alias, &overrides) {
-                continue;
-            }
-            let resolves_provider = {
-                let config = ctx.config.read();
-                let effective_ref = overrides.model_provider.as_deref().or_else(|| {
-                    config
-                        .agent(&agent_alias)
-                        .map(|agent| agent.model_provider.as_str())
-                });
-                effective_ref == Some(model_provider_ref)
-            };
-            if !resolves_provider {
-                continue;
-            }
-
             let (model_provider, model_provider_name, model_name, tool_dispatcher, temperature) = {
                 let config = ctx.config.read();
+                let Some(model_provider_ref) =
+                    resolve_provider_ref(&config, &agent_alias, &overrides)
+                else {
+                    continue;
+                };
                 let provider_temperature = model_provider_ref.split_once('.').and_then(
                     |(provider_type, provider_alias)| {
                         config
@@ -2913,7 +2934,7 @@ impl RpcDispatcher {
                 };
                 match crate::agent::agent::build_session_model_provider(
                     &config,
-                    model_provider_ref,
+                    &model_provider_ref,
                     overrides.model.as_deref(),
                 ) {
                     Ok((model_provider, model_provider_name, model_name)) => {
@@ -6786,13 +6807,21 @@ mod tests {
         let r = InitializeResult {
             protocol_version: 1,
             server_version: "0.1.0".into(),
+            server_pid: 42,
             tui_id: None,
             tui_sig: None,
             capabilities: vec![],
+            commands: vec![],
         };
         let val = to_result(r).unwrap();
         assert_eq!(val["protocol_version"], 1);
         assert_eq!(val["server_version"], "0.1.0");
+        assert_eq!(val["server_pid"], 42);
+        assert_eq!(
+            val["commands"],
+            json!([]),
+            "new daemons must serialize an authoritative empty catalogue"
+        );
     }
 
     #[test]
@@ -6872,6 +6901,27 @@ mod tests {
         assert!(result.is_ok(), "initialize should succeed; got {result:?}");
         assert!(dispatcher.client_elicitation_caps.form);
         assert!(!dispatcher.client_elicitation_caps.url);
+    }
+
+    #[tokio::test]
+    async fn initialize_advertises_canonical_tui_command_descriptors() {
+        let (mut dispatcher, _sessions) =
+            make_acp_test_dispatcher(zeroclaw_config::schema::Config::default());
+        let result = dispatcher
+            .handle_initialize(&serde_json::json!({
+                "protocol_version": RPC_PROTOCOL_VERSION
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result["commands"],
+            serde_json::json!([
+                {"id": "help", "name": "help"},
+                {"id": "new", "name": "new", "aliases": ["new-session"]},
+                {"id": "model", "name": "model"}
+            ])
+        );
     }
 
     #[tokio::test]
@@ -6965,6 +7015,104 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let dispatcher = RpcDispatcher::new(Arc::new(ctx), tx, "test-peer".into());
         (dispatcher, sessions)
+    }
+
+    /// Create a Chat-mode session through the real `session/new` handler,
+    /// optionally sending the `keep_siblings` opt-out.
+    async fn new_chat_session_for_eviction_test(
+        dispatcher: &RpcDispatcher,
+        session_id: &str,
+        keep_siblings: Option<bool>,
+    ) {
+        let mut params = json!({
+            "agent_alias": "test-agent",
+            "chat_mode": "chat",
+            "session_id": session_id,
+        });
+        if let Some(keep) = keep_siblings {
+            params["keep_siblings"] = json!(keep);
+        }
+        let result = dispatcher.handle_session_new_for_test(&params).await;
+        assert!(
+            result.is_ok(),
+            "session/new for {session_id} should succeed; got: {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn session_new_default_evicts_idle_same_mode_sibling() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (mut dispatcher, sessions) = make_acp_test_dispatcher(config);
+        dispatcher.set_tui_id_for_test(Some("tui-evict-default".into()));
+
+        new_chat_session_for_eviction_test(&dispatcher, "sibling-old", None).await;
+        new_chat_session_for_eviction_test(&dispatcher, "sibling-new", None).await;
+
+        assert!(
+            sessions.get_agent("sibling-old").await.is_none(),
+            "an unflagged session/new must evict the idle same-mode sibling"
+        );
+        assert!(
+            sessions.get_agent("sibling-new").await.is_some(),
+            "the new session must survive the sweep"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_new_keep_siblings_spares_idle_same_mode_sibling() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (mut dispatcher, sessions) = make_acp_test_dispatcher(config);
+        dispatcher.set_tui_id_for_test(Some("tui-keep".into()));
+
+        new_chat_session_for_eviction_test(&dispatcher, "kept-old", None).await;
+        new_chat_session_for_eviction_test(&dispatcher, "kept-new", Some(true)).await;
+
+        assert!(
+            sessions.get_agent("kept-old").await.is_some(),
+            "keep_siblings: true must skip the idle-sibling sweep"
+        );
+        assert!(sessions.get_agent("kept-new").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn session_new_keep_siblings_false_matches_default_eviction() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (mut dispatcher, sessions) = make_acp_test_dispatcher(config);
+        dispatcher.set_tui_id_for_test(Some("tui-keep-false".into()));
+
+        new_chat_session_for_eviction_test(&dispatcher, "false-old", None).await;
+        new_chat_session_for_eviction_test(&dispatcher, "false-new", Some(false)).await;
+
+        assert!(
+            sessions.get_agent("false-old").await.is_none(),
+            "an explicit keep_siblings: false must behave like an absent flag"
+        );
+        assert!(sessions.get_agent("false-new").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn keep_siblings_shields_only_the_flagged_call() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (mut dispatcher, sessions) = make_acp_test_dispatcher(config);
+        dispatcher.set_tui_id_for_test(Some("tui-keep-scope".into()));
+
+        new_chat_session_for_eviction_test(&dispatcher, "scoped-a", Some(true)).await;
+        new_chat_session_for_eviction_test(&dispatcher, "scoped-b", Some(true)).await;
+        assert!(sessions.get_agent("scoped-a").await.is_some());
+        assert!(sessions.get_agent("scoped-b").await.is_some());
+
+        // A later unflagged session/new under the same TUI still garbage
+        // collects previously kept idle siblings: the flag protects a single
+        // call's sweep, not the sessions it leaves behind.
+        new_chat_session_for_eviction_test(&dispatcher, "scoped-c", None).await;
+        assert!(sessions.get_agent("scoped-a").await.is_none());
+        assert!(sessions.get_agent("scoped-b").await.is_none());
+        assert!(sessions.get_agent("scoped-c").await.is_some());
     }
 
     #[tokio::test]
@@ -8678,6 +8826,241 @@ mod tests {
         );
 
         wait_for_model_name(&dispatcher, &session_id, "other-model").await;
+    }
+
+    #[tokio::test]
+    async fn model_provider_update_blocks_session_configure() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = Arc::new(make_config_set_test_dispatcher(
+            make_model_refresh_test_config(&tmp),
+        ));
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        let update_guard = dispatcher
+            .ctx
+            .sessions
+            .lock_model_provider_update(&session_id)
+            .await
+            .expect("session update lock exists");
+
+        let configure_dispatcher = Arc::clone(&dispatcher);
+        let configure_waiting = dispatcher.ctx.sessions.model_provider_update_waiting();
+        let configure_wait = configure_waiting.notified();
+        let configure = zeroclaw_spawn::spawn!(async move {
+            configure_dispatcher
+                .handle_session_configure(&json!({
+                    "session_id": session_id,
+                    "overrides": { "temperature": 0.6 }
+                }))
+                .await
+        });
+        let mut configure = Box::pin(configure);
+        tokio::time::timeout(std::time::Duration::from_secs(1), configure_wait)
+            .await
+            .expect("session/configure must reach the provider update boundary");
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), &mut configure)
+                .await
+                .is_err(),
+            "session/configure must wait while a provider update owns the ordering boundary"
+        );
+
+        drop(update_guard);
+        configure
+            .await
+            .expect("session/configure task must complete")
+            .expect("session/configure must succeed after the update boundary is released");
+    }
+
+    #[tokio::test]
+    async fn model_provider_update_does_not_block_unrelated_session_configure() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_model_refresh_test_config(&tmp));
+        let blocked_session = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        let other_session = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        let blocked_guard = dispatcher
+            .ctx
+            .sessions
+            .lock_model_provider_update(&blocked_session)
+            .await
+            .expect("session update lock exists");
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            dispatcher.handle_session_configure(&json!({
+                "session_id": other_session,
+                "overrides": { "temperature": 0.6 }
+            })),
+        )
+        .await
+        .expect("an unrelated session must not wait for this session's provider update")
+        .expect("session/configure must succeed for the unrelated session");
+
+        drop(blocked_guard);
+    }
+
+    #[tokio::test]
+    async fn model_provider_update_preserves_newer_session_override() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut cfg = make_model_refresh_test_config(&tmp);
+        let other = cfg
+            .providers
+            .models
+            .ensure("openai", "other-provider")
+            .expect("openai provider slot exists");
+        other.api_key = Some("test-key".into());
+        other.uri = Some("http://127.0.0.1:1".into());
+        other.model = Some("other-model".into());
+
+        let dispatcher = make_config_set_test_dispatcher(cfg);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        let update_guard = dispatcher
+            .ctx
+            .sessions
+            .lock_model_provider_update(&session_id)
+            .await
+            .expect("session update lock exists");
+
+        dispatcher
+            .ctx
+            .config
+            .write()
+            .agents
+            .get_mut("test-agent")
+            .expect("test agent exists")
+            .model_provider = "openai.other-provider".into();
+        let refresh_ctx = Arc::clone(&dispatcher.ctx);
+        let refresh_waiting = dispatcher.ctx.sessions.model_provider_update_waiting();
+        let refresh_wait = refresh_waiting.notified();
+        let refresh = zeroclaw_spawn::spawn!(async move {
+            RpcDispatcher::refresh_live_sessions_for_agent(refresh_ctx, "test-agent").await;
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), refresh_wait)
+            .await
+            .expect("agent refresh must reach the provider update boundary");
+
+        let configure_dispatcher = Arc::new(dispatcher);
+        let configure_task_dispatcher = Arc::clone(&configure_dispatcher);
+        let configure_session_id = session_id.clone();
+        let configure_waiting = configure_dispatcher
+            .ctx
+            .sessions
+            .model_provider_update_waiting();
+        let configure_wait = configure_waiting.notified();
+        let configure = zeroclaw_spawn::spawn!(async move {
+            configure_task_dispatcher
+                .handle_session_configure(&json!({
+                    "session_id": configure_session_id,
+                    "overrides": { "model_provider": "openai.test-provider" }
+                }))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), configure_wait)
+            .await
+            .expect("session/configure must queue behind the agent refresh");
+        drop(update_guard);
+
+        refresh.await.expect("agent refresh task must complete");
+        configure
+            .await
+            .expect("session/configure task must complete")
+            .expect("session/configure must apply the newer override");
+        assert_eq!(
+            model_name_for_session(&configure_dispatcher, &session_id).await,
+            "old-model",
+            "a queued agent refresh must not overwrite a newer session provider override"
+        );
+        assert_eq!(
+            configure_dispatcher
+                .ctx
+                .sessions
+                .get_overrides(&session_id)
+                .await
+                .and_then(|overrides| overrides.model_provider),
+            Some("openai.test-provider".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn model_provider_update_converges_on_latest_agent_config() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut cfg = make_model_refresh_test_config(&tmp);
+        for (alias, model) in [
+            ("other-provider", "other-model"),
+            ("latest-provider", "latest-model"),
+        ] {
+            let provider = cfg
+                .providers
+                .models
+                .ensure("openai", alias)
+                .expect("openai provider slot exists");
+            provider.api_key = Some("test-key".into());
+            provider.uri = Some("http://127.0.0.1:1".into());
+            provider.model = Some(model.into());
+        }
+
+        let dispatcher = make_config_set_test_dispatcher(cfg);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        let update_guard = dispatcher
+            .ctx
+            .sessions
+            .lock_model_provider_update(&session_id)
+            .await
+            .expect("session update lock exists");
+
+        dispatcher
+            .ctx
+            .config
+            .write()
+            .agents
+            .get_mut("test-agent")
+            .expect("test agent exists")
+            .model_provider = "openai.other-provider".into();
+        let release_older_refresh = Arc::new(tokio::sync::Notify::new());
+        let older_release = Arc::clone(&release_older_refresh);
+        let older_ctx = Arc::clone(&dispatcher.ctx);
+        let older_refresh = zeroclaw_spawn::spawn!(async move {
+            older_release.notified().await;
+            RpcDispatcher::refresh_live_sessions_for_agent(older_ctx, "test-agent").await;
+        });
+
+        dispatcher
+            .ctx
+            .config
+            .write()
+            .agents
+            .get_mut("test-agent")
+            .expect("test agent exists")
+            .model_provider = "openai.latest-provider".into();
+        let latest_ctx = Arc::clone(&dispatcher.ctx);
+        let latest_waiting = dispatcher.ctx.sessions.model_provider_update_waiting();
+        let latest_wait = latest_waiting.notified();
+        let latest_refresh = zeroclaw_spawn::spawn!(async move {
+            RpcDispatcher::refresh_live_sessions_for_agent(latest_ctx, "test-agent").await;
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), latest_wait)
+            .await
+            .expect("latest agent refresh must reach the provider update boundary");
+
+        let older_waiting = dispatcher.ctx.sessions.model_provider_update_waiting();
+        let older_wait = older_waiting.notified();
+        release_older_refresh.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(1), older_wait)
+            .await
+            .expect("older agent refresh must queue after the latest refresh");
+        drop(update_guard);
+
+        latest_refresh
+            .await
+            .expect("latest agent refresh task must complete");
+        older_refresh
+            .await
+            .expect("older agent refresh task must complete");
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "latest-model",
+            "queued refreshes must resolve the latest persisted agent provider"
+        );
     }
 
     #[tokio::test]

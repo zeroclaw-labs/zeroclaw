@@ -602,7 +602,10 @@ pub struct Config {
     #[serde(default)]
     pub locale: Option<String>,
 
-    /// Verifiable Intent (VI) credential verification and issuance (`[verifiable_intent]`).
+    /// Verifiable Intent (VI) credential issuance and constraint checking
+    /// (`[verifiable_intent]`). No credential chain verifier exists yet, so the
+    /// `vi_verify` tool is not registered for the model and this section does not
+    /// currently enable verification of anything.
     #[serde(default)]
     #[nested]
     #[group = "Agent"]
@@ -912,9 +915,12 @@ pub struct ModelProviderConfig {
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vision: Option<bool>,
-    /// Arbitrary key/value pairs forwarded verbatim as `chat_template_kwargs`
-    /// in the request body (llama.cpp-specific). Use this to pass model-family
-    /// template variables that control behaviour not exposed by other fields.
+    /// Arbitrary key/value pairs forwarded verbatim as a top-level
+    /// `chat_template_kwargs` object in the request body of OpenAI-compatible
+    /// providers. Consumed by chat-template-aware backends such as vLLM,
+    /// SGLang, and llama.cpp to pass model-family template variables that
+    /// control behaviour not exposed by other fields. Must be a JSON object
+    /// (TOML inline table); non-object values are ignored with a warning.
     /// Example (Qwen3 thinking suppression):
     ///   `chat_template_kwargs = { enable_thinking = false }`
     #[tab(Advanced)]
@@ -2268,6 +2274,33 @@ pub struct CloudflareModelProviderConfig {
     pub base: ModelProviderConfig,
 }
 
+// ── Atlas Cloud ──
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AtlasCloudEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for AtlasCloudEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.atlascloud.ai/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.atlascloud"]
+pub struct AtlasCloudModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
 // ── OVH ──
 
 #[derive(
@@ -3282,6 +3315,7 @@ impl_default_family_endpoint! {
     TelnyxModelProviderConfig,
     VercelModelProviderConfig,
     CloudflareModelProviderConfig,
+    AtlasCloudModelProviderConfig,
     OvhModelProviderConfig,
     CopilotModelProviderConfig,
     DoubaoModelProviderConfig,
@@ -4036,19 +4070,29 @@ impl Config {
             .unwrap_or(32_000)
     }
 
+    /// The model's context window exactly as configured, or `None` when no
+    /// provider profile declares one.
+    ///
+    /// `None` means *unknown*, not "small". Report it to an operator as unset
+    /// rather than resolving it to [`UNCONFIGURED_CONTEXT_WINDOW_FALLBACK`],
+    /// which would present a stub as though it were the model's real capacity.
+    /// Use [`Config::effective_model_context_window`] when a number is required
+    /// for budget arithmetic.
+    #[must_use]
+    pub fn configured_model_context_window(&self, agent_alias: &str) -> Option<usize> {
+        // Provider config (config.toml) is the source of truth for this value.
+        self.resolved_model_provider_for_agent(agent_alias)
+            .and_then(|(_, _, provider_config)| provider_config.context_window)
+    }
+
     /// Returns the model's context window size (max input tokens).
-    /// Source: provider config `context_window` → fallback 32,000.
+    /// Source: provider config `context_window` →
+    /// [`UNCONFIGURED_CONTEXT_WINDOW_FALLBACK`].
     /// Does NOT check runtime profile (that's for output budget).
     #[must_use]
     pub fn effective_model_context_window(&self, agent_alias: &str) -> usize {
-        // 1. Provider config (config.toml) — PRIMARY SOT for model's context window
-        if let Some((_, _, provider_config)) = self.resolved_model_provider_for_agent(agent_alias)
-            && let Some(ctx) = provider_config.context_window
-        {
-            return ctx;
-        }
-        // 2. Hard fallback 32,000 (stub)
-        32_000
+        self.configured_model_context_window(agent_alias)
+            .unwrap_or(UNCONFIGURED_CONTEXT_WINDOW_FALLBACK)
     }
 
     #[must_use]
@@ -4157,10 +4201,9 @@ impl Config {
         Some(out)
     }
 
-    /// Resolve the effective skills prompt-injection mode for an agent: the
-    /// agent's resolved runtime profile's `prompt_injection_mode` override when
-    /// set, otherwise the global `[skills] prompt_injection_mode`. Agents with
-    /// no runtime profile (or an unknown alias) fall back to the global value.
+    /// Resolve the effective skills prompt-injection mode for an agent: use an
+    /// explicit runtime-profile override when set, otherwise inherit the global
+    /// `[skills] prompt_injection_mode` value.
     ///
     /// Keyed on the resolved runtime profile — the sanctioned surface for
     /// per-agent runtime tunables — so agent-inline knobs stay inert.
@@ -4530,6 +4573,18 @@ fn default_delegate_agentic_timeout_secs() -> u64 {
 
 /// Valid temperature range for all paths (config, CLI, env override).
 pub const TEMPERATURE_RANGE: std::ops::RangeInclusive<f64> = 0.0..=2.0;
+
+/// Context window assumed when no provider profile declares one.
+///
+/// Deliberately conservative: it has to be safe for any model, which means it
+/// is almost always *wrong* for the model actually in use — a 1M-context model
+/// on a profile that omits `context_window` runs against this number. It exists
+/// so budget arithmetic has an operand, not because it describes any model.
+///
+/// Anything reporting to an operator must call
+/// [`Config::configured_model_context_window`] and say "not configured" when it
+/// returns `None`, rather than echoing this value as the model's real capacity.
+pub const UNCONFIGURED_CONTEXT_WINDOW_FALLBACK: usize = 32_000;
 
 /// Defaults to 0 so configs without an explicit `schema_version` are recognized
 /// as pre-versioning and get migrated.
@@ -5038,18 +5093,30 @@ impl Default for McpConfig {
     }
 }
 
-/// Verifiable Intent (VI) credential verification and issuance (`[verifiable_intent]` section).
+/// Verifiable Intent (VI) credential issuance and constraint checking
+/// (`[verifiable_intent]` section).
+///
+/// ZeroClaw implements issuance, crypto, types and constraint checking, but not
+/// a credential chain verifier. Until one exists the `vi_verify` tool is
+/// withheld from the model-visible registry, so neither key below enables
+/// verification of a credential. The library paths are unaffected.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "verifiable_intent"]
 pub struct VerifiableIntentConfig {
-    /// Enable VI credential verification on commerce tool calls (default: false).
+    /// Opt in to the VI section (default: false).
+    ///
+    /// While the tool is withheld this does not enable credential verification
+    /// on commerce tool calls. It currently causes a warning naming that gap,
+    /// emitted once per config application: at process startup, and again when
+    /// a daemon reload re-reads config from disk.
     #[serde(default)]
     pub enabled: bool,
 
-    /// Strictness mode for constraint evaluation: "strict" (fail-closed on unknown
-    /// constraint types) or "permissive" (skip unknown types with a warning).
-    /// Default: "strict".
+    /// Intended strictness mode for constraint evaluation.
+    ///
+    /// Accepts `"strict"` or `"permissive"`, and defaults to `"strict"`. No
+    /// production code reads it while the tool is withheld.
     #[serde(default = "default_vi_strictness")]
     pub strictness: String,
 }
@@ -5960,10 +6027,13 @@ impl Default for PacingConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum SkillsPromptInjectionMode {
-    /// Inline full skill instructions and tool metadata into the system prompt.
-    #[default]
+    /// Inline full skill instructions. This legacy behavior remains supported
+    /// when explicitly configured during the deprecation window.
     Full,
-    /// Inline only compact skill metadata (name/description/location) and load details on demand.
+    /// Default behavior: inline compact skill metadata
+    /// (name/description/location + callable tool specs) and load instructions
+    /// on demand via `read_skill`.
+    #[default]
     Compact,
 }
 
@@ -6084,8 +6154,9 @@ pub struct SkillsConfig {
     /// is cloned to its own `extra-registry-<name>/` workspace directory.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_registries: Vec<ExternalRegistry>,
-    /// Controls how skills are injected into the system prompt.
-    /// `full` preserves legacy behavior. `compact` keeps context small and loads skills on demand.
+    /// Controls how skills are injected into the system prompt. Omission now
+    /// defaults to `compact`; explicit `full` remains supported during the
+    /// deprecation window and emits a validation warning before Schema V4.
     #[serde(default)]
     pub prompt_injection_mode: SkillsPromptInjectionMode,
     /// Autonomous skill creation from successful multi-step task executions.
@@ -11943,7 +12014,7 @@ pub struct RuntimeProfileConfig {
     /// How skills are injected into the system prompt for agents on this
     /// profile. `None` inherits the global `[skills] prompt_injection_mode`;
     /// `compact` inlines only compact skill metadata and registers the
-    /// `read_skill` tool, `full` inlines full skill instructions. Resolved
+    /// `read_skill` tool, while `full` inlines full skill instructions. Resolved
     /// through [`Config::effective_skills_prompt_mode`], the single point both
     /// the system-prompt builder and the `read_skill` tool-registration gate
     /// consult so they always agree on the effective mode.
@@ -12169,10 +12240,13 @@ pub struct DockerRuntimeConfig {
     pub read_only_rootfs: bool,
 
     /// Mount configured workspace into `/workspace`.
+    ///
+    /// When enabled, the workspace must exist and canonicalize before Docker
+    /// command construction.
     #[serde(default = "default_true")]
     pub mount_workspace: bool,
 
-    /// Optional workspace root allowlist for Docker mount validation.
+    /// Optional workspace root allowlist for fail-closed Docker mount validation: when `mount_workspace` is enabled, the workspace must exist and canonicalize even when this list is empty; every configured root must also exist and canonicalize; one invalid entry rejects the command before Docker starts; an empty list permits any canonical workspace.
     #[serde(default)]
     pub allowed_workspace_roots: Vec<String>,
 }
@@ -14049,6 +14123,11 @@ impl ChannelConfig for DiscordConfig {
     }
 }
 
+/// Default number of prior Slack thread messages included on first encounter.
+pub const DEFAULT_SLACK_THREAD_CONTEXT_MAX_MESSAGES: usize = 0;
+/// Slack's `conversations.replies` request limit used by thread hydration.
+pub const MAX_SLACK_THREAD_CONTEXT_MAX_MESSAGES: usize = 50;
+
 /// Slack bot channel configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -14113,6 +14192,13 @@ pub struct SlackConfig {
     #[tab(Advanced)]
     #[serde(default)]
     pub strict_mention_in_thread: bool,
+    /// Maximum number of prior messages prepended when ZeroClaw first
+    /// encounters a Slack thread. `0` disables automatic thread-context
+    /// hydration. When omitted, defaults to 0, so hydration is opt-in.
+    /// Maximum: 50.
+    #[tab(Advanced)]
+    #[serde(default)]
+    pub thread_context_max_messages: Option<usize>,
     /// Use the newer Slack `markdown` block type (12 000 char limit, richer formatting).
     /// Defaults to false (uses universally supported `section` blocks with `mrkdwn`).
     /// Enable this only if your Slack workspace supports the `markdown` block type.
@@ -14175,6 +14261,13 @@ impl ChannelConfig for SlackConfig {
 }
 
 impl SlackConfig {
+    /// Resolve the configured thread-context depth without copying config
+    /// state into the channel runtime.
+    pub fn effective_thread_context_max_messages(&self) -> usize {
+        self.thread_context_max_messages
+            .unwrap_or(DEFAULT_SLACK_THREAD_CONTEXT_MAX_MESSAGES)
+    }
+
     /// Resolve the effective Slack bot token: the configured `bot_token` when
     /// set and non-empty, else the `ZEROCLAW_SLACK_BOT_TOKEN` env var, else
     /// `SLACK_BOT_TOKEN`. Returns `None` when none is available. Resolving here
@@ -14425,8 +14518,10 @@ pub struct WebhookConfig {
     pub retry_max_delay_ms: Option<u64>,
 }
 
+pub const DEFAULT_WEBHOOK_CHANNEL_PORT: u16 = 8090;
+
 fn default_webhook_channel_port() -> u16 {
-    8090
+    DEFAULT_WEBHOOK_CHANNEL_PORT
 }
 
 impl ChannelConfig for WebhookConfig {
@@ -14771,8 +14866,13 @@ pub struct WhatsAppConfig {
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub verify_token: Option<String>,
     /// App secret from Meta Business Suite (for webhook signature verification)
-    /// Can also be set via `ZEROCLAW_WHATSAPP_APP_SECRET` environment variable
-    /// Only used in Cloud API mode
+    /// Can also be set with the alias-qualified generic environment override:
+    /// `ZEROCLAW_channels__whatsapp__<alias>__app_secret`.
+    /// Only used in Cloud API mode.
+    ///
+    /// Required to receive webhooks. Inbound requests are signature-verified,
+    /// and with no secret configured the gateway cannot verify them, so it
+    /// refuses them with `401` rather than accepting them unverified.
     #[serde(default)]
     #[secret]
     #[tab(Connection)]
@@ -14931,7 +15031,11 @@ pub struct LinqConfig {
     /// Phone number to send from (E.164 format)
     #[tab(Advanced)]
     pub from_phone: String,
-    /// Webhook signing secret for signature verification
+    /// Webhook signing secret for signature verification.
+    ///
+    /// Required to receive webhooks. Inbound requests are signature-verified,
+    /// and with no secret configured the gateway cannot verify them, so it
+    /// refuses them with `401` rather than accepting them unverified.
     #[serde(default)]
     #[secret]
     #[tab(Connection)]
@@ -18379,6 +18483,40 @@ struct ExtraNestedModelProviderTable {
     nested: String,
 }
 
+/// Classification of a `peer_groups.<name>.channel` reference against the
+/// configured `[channels.*]` blocks. This is the single source of truth for
+/// resolving a raw `channel` string — `Config::validate()` consumes it for
+/// its hard-error checks, and `Config::collect_peer_groups_warnings`
+/// consumes it for the non-fatal dangling-alias warning. Do not duplicate
+/// this resolution logic elsewhere; classify the ref once and match on the
+/// result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PeerGroupChannelRef {
+    /// Empty or whitespace-only `channel` value.
+    Empty,
+    /// A bare channel type with no dotted alias (e.g. `"discord"`), which
+    /// authorizes every alias of that type.
+    BareType {
+        channel_type: String,
+        /// Whether `[channels.<channel_type>.*]` has at least one entry.
+        configured: bool,
+    },
+    /// A dotted `type.alias` reference (e.g. `"discord.work"`).
+    Dotted {
+        channel_type: String,
+        alias: String,
+        /// Whether `[channels.<channel_type>.*]` is configured at all.
+        type_configured: bool,
+        /// Whether `alias` is among the configured aliases for
+        /// `channel_type`. Always `false` when `type_configured` is `false`.
+        exists: bool,
+        /// The configured aliases for `channel_type` (empty when the type
+        /// itself is unconfigured), sorted lexicographically so consumers
+        /// that pick between candidates are deterministic.
+        known_aliases: Vec<String>,
+    },
+}
+
 impl Config {
     /// External-peer usernames authorized on `<channel_type>.<alias>`.
     ///
@@ -19055,10 +19193,36 @@ impl Config {
     /// and document the code in `validation_warnings.rs`.
     pub fn collect_warnings(&self) -> Vec<crate::validation_warnings::ValidationWarning> {
         let mut warnings = Vec::new();
+        if matches!(
+            self.skills.prompt_injection_mode,
+            SkillsPromptInjectionMode::Full
+        ) {
+            warnings.push(crate::validation_warnings::ValidationWarning::new(
+                "skills_prompt_injection_mode_full_deprecated",
+                "skills.prompt_injection_mode = \"full\" is deprecated. Explicit full mode remains supported during the deprecation window, but compact is now the default; migrate before Schema V4 removes full mode.",
+                "skills.prompt_injection_mode",
+            ));
+        }
+        for (profile_alias, profile) in &self.runtime_profiles {
+            if matches!(
+                profile.prompt_injection_mode,
+                Some(SkillsPromptInjectionMode::Full)
+            ) {
+                let path = format!("runtime_profiles.{profile_alias}.prompt_injection_mode");
+                warnings.push(crate::validation_warnings::ValidationWarning::new(
+                    "skills_prompt_injection_mode_full_deprecated",
+                    format!(
+                        "{path} = \"full\" is deprecated. Explicit full mode remains supported during the deprecation window, but compact is now the default; migrate before Schema V4 removes full mode."
+                    ),
+                    path,
+                ));
+            }
+        }
         self.collect_fallback_warnings(&mut warnings);
         self.collect_cross_provider_summary_model_warnings(&mut warnings);
         self.collect_a2a_exposed_skills_warnings(&mut warnings);
         self.collect_memory_semantic_search_warnings(&mut warnings);
+        self.collect_peer_groups_warnings(&mut warnings);
         // Must run after `collect_cross_provider_summary_model_warnings`: it
         // scans `warnings` to suppress its generic inert `summary_model`
         // warning when the more specific cross-provider diagnostic already
@@ -19582,6 +19746,112 @@ impl Config {
             .collect()
     }
 
+    /// Classify a raw `peer_groups.<name>.channel` value against the
+    /// configured `[channels.*]` blocks. See [`PeerGroupChannelRef`] for the
+    /// meaning of each variant; this is the only place that resolves the
+    /// channel-type/alias lookup for peer groups, via the same canonical
+    /// `get_map_keys` enumeration every other typed-ref check uses (`None` =
+    /// the channel type has no configured block at all; `Some(keys)` = the
+    /// list of configured aliases for that type).
+    fn classify_peer_group_channel_ref(&self, raw: &str) -> PeerGroupChannelRef {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return PeerGroupChannelRef::Empty;
+        }
+        // `get_map_keys` stores section names using the raw field ident
+        // (snake); look up the channel type verbatim.
+        let (channel_type, alias) = match trimmed.split_once('.') {
+            Some((ty, al)) => (ty, Some(al)),
+            None => (trimmed, None),
+        };
+        let channel_aliases = self.get_map_keys(&format!("channels.{channel_type}"));
+        match alias {
+            None => PeerGroupChannelRef::BareType {
+                channel_type: channel_type.to_string(),
+                configured: channel_aliases.is_some(),
+            },
+            Some(alias) => {
+                let type_configured = channel_aliases.is_some();
+                let exists = channel_aliases
+                    .as_ref()
+                    .is_some_and(|keys| keys.iter().any(|k| k == alias));
+                // `get_map_keys` iterates a HashMap-backed section, so its
+                // order is randomized per process; sort here (the canonical
+                // resolution point) so downstream consumers — notably the
+                // did-you-mean tie-break in `collect_peer_groups_warnings`
+                // — are deterministic across runs.
+                let mut known_aliases = channel_aliases.unwrap_or_default();
+                known_aliases.sort();
+                PeerGroupChannelRef::Dotted {
+                    channel_type: channel_type.to_string(),
+                    alias: alias.to_string(),
+                    type_configured,
+                    exists,
+                    known_aliases,
+                }
+            }
+        }
+    }
+
+    /// Surface a `peer_groups.<name>.channel` dotted reference that does not
+    /// resolve to any configured `[channels.<type>.<alias>]` block —
+    /// typically a typo (`telegram.alert` vs. configured `telegram.alerts`)
+    /// that silently authorizes nobody instead of failing loudly. This is a
+    /// non-fatal companion to the `DanglingReference` hard error
+    /// `Config::validate()` already raises for the exact same condition (see
+    /// `classify_peer_group_channel_ref`): it exists so config-load tracing,
+    /// `channel doctor`, and the gateway config surface can flag the
+    /// misconfiguration even when a caller chooses to log-and-continue past
+    /// a failed `validate()` instead of refusing to boot.
+    ///
+    /// Bare type-wide refs (`channel = "discord"`) are an explicit non-goal:
+    /// they intentionally authorize every alias of that type, so there is no
+    /// "did you mean" ambiguity, and an unconfigured bare type is already a
+    /// hard error at `validate()`.
+    fn collect_peer_groups_warnings(
+        &self,
+        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
+    ) {
+        let mut group_names: Vec<&String> = self.peer_groups.keys().collect();
+        group_names.sort();
+        for group_name in group_names {
+            let group_channel = self.peer_groups[group_name].channel.trim();
+            let PeerGroupChannelRef::Dotted {
+                channel_type,
+                alias,
+                type_configured,
+                exists,
+                known_aliases,
+            } = self.classify_peer_group_channel_ref(group_channel)
+            else {
+                continue;
+            };
+            if type_configured && exists {
+                continue;
+            }
+
+            let suggestion = if type_configured {
+                crate::validation_warnings::closest_match(&alias, &known_aliases)
+                    .map(|closest| format!("; did you mean \"{channel_type}.{closest}\"?"))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            let reason = if type_configured {
+                format!("[channels.{channel_type}.{alias}] is not configured")
+            } else {
+                format!("no [channels.{channel_type}.*] block is configured")
+            };
+            warnings.push(crate::validation_warnings::ValidationWarning::new(
+                "peer_group_channel_dangling",
+                format!(
+                    "peer_groups.{group_name}.channel = {group_channel:?} but {reason}{suggestion}"
+                ),
+                format!("peer_groups.{group_name}.channel"),
+            ));
+        }
+    }
+
     /// Validate configuration values that would cause runtime failures.
     ///
     /// Called after TOML deserialization and env-override application to catch
@@ -19678,6 +19948,18 @@ impl Config {
                 &format!("channels.telegram.{alias}.api_base_url"),
                 &tg.api_base_url,
             )?;
+        }
+
+        for (alias, slack) in &self.channels.slack {
+            let max_messages = slack.effective_thread_context_max_messages();
+            if max_messages > MAX_SLACK_THREAD_CONTEXT_MAX_MESSAGES {
+                let path = format!("channels.slack.{alias}.thread_context_max_messages");
+                validation_bail!(
+                    InvalidNumericRange,
+                    path,
+                    "{path} = {max_messages} is out of range; must be 0..={MAX_SLACK_THREAD_CONTEXT_MAX_MESSAGES}"
+                );
+            }
         }
 
         for (alias, dc) in &self.channels.discord {
@@ -21113,37 +21395,55 @@ impl Config {
         for group_name in peer_group_names {
             let group = &self.peer_groups[group_name];
             let group_channel = group.channel.trim();
-            if group_channel.is_empty() {
-                validation_bail!(
-                    RequiredFieldEmpty,
-                    format!("peer_groups.{group_name}.channel"),
-                    "peer_groups.{group_name}.channel must name a channel type (e.g. \"discord\") or dotted alias (e.g. \"discord.work\")",
-                );
-            }
-            // `get_map_keys` stores section names using the raw field ident
-            // (snake); look up the channel type verbatim.
+            // The channel ref is resolved once by the shared classifier; its
+            // bound fields feed the error messages below. The split_once
+            // locals exist only for the member-ref loop further down, which
+            // is out of scope for the classifier.
             let (group_channel_type, group_channel_alias) = match group_channel.split_once('.') {
                 Some((ty, al)) => (ty, Some(al)),
                 None => (group_channel, None),
             };
-            let channel_aliases = self.get_map_keys(&format!("channels.{group_channel_type}"));
-            if channel_aliases.is_none() {
-                validation_bail!(
-                    DanglingReference,
-                    format!("peer_groups.{group_name}.channel"),
-                    "peer_groups.{group_name}.channel = {group_channel:?} but no [channels.{group_channel_type}.*] block is configured",
-                );
-            }
-            if let Some(alias) = group_channel_alias {
-                let exists = channel_aliases
-                    .as_ref()
-                    .is_some_and(|keys| keys.iter().any(|k| k == alias));
-                if !exists {
+            match self.classify_peer_group_channel_ref(group_channel) {
+                PeerGroupChannelRef::Empty => {
                     validation_bail!(
-                        DanglingReference,
+                        RequiredFieldEmpty,
                         format!("peer_groups.{group_name}.channel"),
-                        "peer_groups.{group_name}.channel = {group_channel:?} but [channels.{group_channel_type}.{alias}] is not configured",
+                        "peer_groups.{group_name}.channel must name a channel type (e.g. \"discord\") or dotted alias (e.g. \"discord.work\")",
                     );
+                }
+                PeerGroupChannelRef::BareType {
+                    channel_type,
+                    configured,
+                } => {
+                    if !configured {
+                        validation_bail!(
+                            DanglingReference,
+                            format!("peer_groups.{group_name}.channel"),
+                            "peer_groups.{group_name}.channel = {group_channel:?} but no [channels.{channel_type}.*] block is configured",
+                        );
+                    }
+                }
+                PeerGroupChannelRef::Dotted {
+                    channel_type,
+                    alias,
+                    type_configured,
+                    exists,
+                    ..
+                } => {
+                    if !type_configured {
+                        validation_bail!(
+                            DanglingReference,
+                            format!("peer_groups.{group_name}.channel"),
+                            "peer_groups.{group_name}.channel = {group_channel:?} but no [channels.{channel_type}.*] block is configured",
+                        );
+                    }
+                    if !exists {
+                        validation_bail!(
+                            DanglingReference,
+                            format!("peer_groups.{group_name}.channel"),
+                            "peer_groups.{group_name}.channel = {group_channel:?} but [channels.{channel_type}.{alias}] is not configured",
+                        );
+                    }
                 }
             }
             for (i, member) in group.agents.iter().enumerate() {
@@ -23038,6 +23338,54 @@ max_height = 8
         assert_eq!(cfg.max_height, 8);
     }
 
+    /// The whole point of splitting the accessor: an operator-facing caller
+    /// must be able to tell "unconfigured" from a real 32,000, which a bare
+    /// `usize` cannot express.
+    #[::core::prelude::v1::test]
+    fn configured_context_window_reports_unset_distinctly_from_the_fallback() {
+        let mut cfg = super::Config::default();
+        cfg.providers
+            .models
+            .ensure("ollama", "local")
+            .expect("known model provider type")
+            .model = Some("qwen3".to_string());
+        cfg.agents.insert(
+            "coder".to_string(),
+            super::AliasedAgentConfig {
+                model_provider: "ollama.local".into(),
+                ..Default::default()
+            },
+        );
+
+        // A real referenced profile without a declaration is honestly
+        // unknown, while budget arithmetic retains its historical operand.
+        assert_eq!(cfg.configured_model_context_window("coder"), None);
+        // Budget arithmetic still gets an operand, unchanged from before.
+        assert_eq!(
+            cfg.effective_model_context_window("coder"),
+            super::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK
+        );
+
+        // Explicitly configuring the same numeric value remains distinguishable
+        // from the fallback.
+        cfg.providers
+            .models
+            .ensure("ollama", "local")
+            .expect("known model provider type")
+            .context_window = Some(super::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK);
+        assert_eq!(
+            cfg.configured_model_context_window("coder"),
+            Some(super::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK)
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn unconfigured_context_window_fallback_is_documented_stub_value() {
+        // Pinned so a change to the stub is a deliberate, reviewed edit — the
+        // value is load-bearing for trim budgets on unconfigured profiles.
+        assert_eq!(super::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK, 32_000);
+    }
+
     #[::core::prelude::v1::test]
     fn mcp_server_config_pinned_resources_defaults_empty_and_round_trips() {
         // Absent field defaults to empty.
@@ -23951,7 +24299,7 @@ api_token = "Bearer test-token"
         assert!(!c.skills.install_suggestions.enabled);
         assert_eq!(
             c.skills.prompt_injection_mode,
-            SkillsPromptInjectionMode::Full
+            SkillsPromptInjectionMode::Compact
         );
         assert!(c.data_dir.to_string_lossy().contains("data"));
         assert!(c.config_path.to_string_lossy().contains("config.toml"));
@@ -23992,29 +24340,48 @@ api_token = "Bearer test-token"
             .agents
             .insert("inherit".to_string(), AliasedAgentConfig::default());
 
-        // Profile override beats the global value.
+        // Profile override to Compact beats the (deprecated) global value.
         assert_eq!(
             config.effective_skills_prompt_mode("override"),
             SkillsPromptInjectionMode::Compact
         );
-        // Profile present but mode unset → inherit the global value.
+        // An unset profile, an agent with no profile, and an unknown alias all
+        // inherit the explicit global Full value during the deprecation window.
         assert_eq!(
             config.effective_skills_prompt_mode("unset"),
             SkillsPromptInjectionMode::Full
         );
-        // No runtime profile → inherit the global value.
         assert_eq!(
             config.effective_skills_prompt_mode("inherit"),
             SkillsPromptInjectionMode::Full
         );
-        // Unknown alias also falls back to the global value.
         assert_eq!(
             config.effective_skills_prompt_mode("missing"),
             SkillsPromptInjectionMode::Full
         );
 
-        // Flipping the global moves only the inheriting/unset/unknown agents;
-        // the profile override is unaffected.
+        // A runtime profile that explicitly pins Full is also honored.
+        config.runtime_profiles.insert(
+            "full_profile".to_string(),
+            RuntimeProfileConfig {
+                prompt_injection_mode: Some(SkillsPromptInjectionMode::Full),
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "pinned_full".to_string(),
+            AliasedAgentConfig {
+                runtime_profile: "full_profile".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        assert_eq!(
+            config.effective_skills_prompt_mode("pinned_full"),
+            SkillsPromptInjectionMode::Full
+        );
+
+        // Flipping the global to Compact updates inheriting agents while both
+        // explicit profile overrides remain authoritative.
         config.skills.prompt_injection_mode = SkillsPromptInjectionMode::Compact;
         assert_eq!(
             config.effective_skills_prompt_mode("unset"),
@@ -24031,6 +24398,10 @@ api_token = "Bearer test-token"
         assert_eq!(
             config.effective_skills_prompt_mode("override"),
             SkillsPromptInjectionMode::Compact
+        );
+        assert_eq!(
+            config.effective_skills_prompt_mode("pinned_full"),
+            SkillsPromptInjectionMode::Full
         );
     }
 
@@ -24088,7 +24459,8 @@ runtime_profile = "fast"
             SkillsPromptInjectionMode::Compact
         );
 
-        // Profile-less agent: resolved value falls back to the global default.
+        // Profile-less agent: explicit global `full` remains effective during
+        // the deprecation window.
         let plain = parsed
             .resolved_agent_config("plain")
             .expect("agent plain resolves");
@@ -24096,6 +24468,50 @@ runtime_profile = "fast"
             plain.resolved.prompt_injection_mode,
             SkillsPromptInjectionMode::Full
         );
+        assert_eq!(
+            parsed.effective_skills_prompt_mode("plain"),
+            SkillsPromptInjectionMode::Full
+        );
+    }
+
+    #[test]
+    async fn explicit_global_full_emits_structured_deprecation_warning() {
+        let mut config = Config::default();
+        config.skills.prompt_injection_mode = SkillsPromptInjectionMode::Full;
+
+        let warning = config
+            .collect_warnings()
+            .into_iter()
+            .find(|warning| warning.code == "skills_prompt_injection_mode_full_deprecated")
+            .expect("explicit global full should emit a deprecation warning");
+
+        assert_eq!(warning.path, "skills.prompt_injection_mode");
+        assert!(warning.message.contains("remains supported"));
+        assert!(!warning.message.contains("ignored"));
+    }
+
+    #[test]
+    async fn runtime_profile_full_emits_structured_deprecation_warning() {
+        let mut config = Config::default();
+        config.runtime_profiles.insert(
+            "legacy".to_string(),
+            RuntimeProfileConfig {
+                prompt_injection_mode: Some(SkillsPromptInjectionMode::Full),
+                ..RuntimeProfileConfig::default()
+            },
+        );
+
+        let warning = config
+            .collect_warnings()
+            .into_iter()
+            .find(|warning| {
+                warning.code == "skills_prompt_injection_mode_full_deprecated"
+                    && warning.path == "runtime_profiles.legacy.prompt_injection_mode"
+            })
+            .expect("runtime-profile full should emit a deprecation warning");
+
+        assert!(warning.message.contains("remains supported"));
+        assert!(!warning.message.contains("ignored"));
     }
 
     #[test]
@@ -27432,6 +27848,50 @@ allowed_users = ["U111"]
         assert_eq!(parsed.thread_replies, Some(false));
         assert!(!parsed.interrupt_on_new_message);
         assert!(!parsed.mention_only);
+    }
+
+    #[test]
+    async fn slack_thread_context_max_messages_defaults_to_zero() {
+        let parsed: SlackConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed.thread_context_max_messages, None);
+        assert_eq!(parsed.effective_thread_context_max_messages(), 0);
+    }
+
+    #[test]
+    async fn slack_thread_context_max_messages_deserializes_explicit_value() {
+        let parsed: SlackConfig =
+            serde_json::from_str(r#"{"thread_context_max_messages":7}"#).unwrap();
+        assert_eq!(parsed.thread_context_max_messages, Some(7));
+        assert_eq!(parsed.effective_thread_context_max_messages(), 7);
+    }
+
+    #[test]
+    async fn slack_thread_context_max_messages_allows_zero_to_disable_backfill() {
+        let parsed: SlackConfig =
+            serde_json::from_str(r#"{"thread_context_max_messages":0}"#).unwrap();
+        assert_eq!(parsed.thread_context_max_messages, Some(0));
+        assert_eq!(parsed.effective_thread_context_max_messages(), 0);
+    }
+
+    #[test]
+    async fn slack_thread_context_max_messages_rejects_values_above_slack_fetch_limit() {
+        let mut config = Config::default();
+        config.channels.slack.insert(
+            "default".to_string(),
+            SlackConfig {
+                thread_context_max_messages: Some(51),
+                ..Default::default()
+            },
+        );
+
+        let err = config
+            .validate()
+            .expect_err("values above the Slack fetch limit must be rejected")
+            .to_string();
+        assert!(
+            err.contains("channels.slack.default.thread_context_max_messages"),
+            "unexpected validation error: {err}",
+        );
     }
 
     #[test]
@@ -33125,6 +33585,34 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         assert_description(&email, ".observer_mode", "never modifies any IMAP flag");
     }
 
+    #[test]
+    async fn agent_workspace_path_is_a_settable_property() {
+        let mut workspace = crate::multi_agent::AgentWorkspaceConfig::default();
+
+        let path = workspace
+            .prop_fields()
+            .into_iter()
+            .find(|field| field.name == "agent_workspace.path")
+            .expect("workspace path property");
+        assert_eq!(path.kind, crate::config::PropKind::String);
+        assert_eq!(path.display_value, crate::config::UNSET_DISPLAY);
+
+        workspace
+            .set_prop("agent_workspace.path", "/srv/zeroclaw/assistant")
+            .unwrap();
+        assert_eq!(
+            workspace.path,
+            Some(std::path::PathBuf::from("/srv/zeroclaw/assistant"))
+        );
+        assert_eq!(
+            workspace.get_prop("agent_workspace.path").unwrap(),
+            "/srv/zeroclaw/assistant"
+        );
+
+        workspace.set_prop("agent_workspace.path", "").unwrap();
+        assert_eq!(workspace.path, None);
+    }
+
     #[cfg(feature = "schema-export")]
     #[test]
     async fn generated_config_types_keep_schema_descriptions() {
@@ -33667,7 +34155,7 @@ api_key = "op://zeroclaw/provider/openai-api-key"
             &bin_dir,
             r#"#!/bin/sh
 if [ "$1" = "read" ] && [ "$2" = "op://zeroclaw/provider/openai-api-key" ]; then
-  sleep 1
+  sleep 3
   printf '%s\n' 'sk-proj-from-onepassword'
   exit 0
 fi
@@ -33701,8 +34189,11 @@ api_key = "op://zeroclaw/provider/openai-api-key"
         let load_task = tokio::spawn(Config::load_or_init());
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
+        // Threshold sized against the 3s fake-op sleep: a blocked worker pins
+        // elapsed at >=3s, while scheduler latency under full-suite CI load
+        // stays well under 1.5s.
         assert!(
-            started.elapsed() < std::time::Duration::from_millis(500),
+            started.elapsed() < std::time::Duration::from_millis(1500),
             "op:// config load should not block the async runtime worker"
         );
 
@@ -36037,6 +36528,247 @@ allowed_users = []
         config
             .validate()
             .expect("two-member same-channel peer group must validate cleanly");
+    }
+
+    const PEER_GROUP_CHANNEL_DANGLING_WARNING: &str = "peer_group_channel_dangling";
+
+    #[test]
+    async fn collect_warnings_flags_peer_group_dangling_alias_with_suggestion() {
+        let mut config = multi_agent_test_config();
+        // A second configured telegram alias close enough to the typo below
+        // to be a plausible "did you mean" suggestion.
+        config
+            .channels
+            .telegram
+            .insert("alerts".to_string(), TelegramConfig::default());
+        let group = crate::multi_agent::PeerGroupConfig {
+            channel: "telegram.alert".into(),
+            agents: vec![crate::multi_agent::AgentAlias::new("alpha")],
+            ..crate::multi_agent::PeerGroupConfig::default()
+        };
+        config.peer_groups.insert("team_chat".to_string(), group);
+
+        let warnings = warnings_with_code(&config, PEER_GROUP_CHANNEL_DANGLING_WARNING);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "expected exactly one warning: {warnings:?}"
+        );
+        let warning = &warnings[0];
+        assert_eq!(warning.path, "peer_groups.team_chat.channel");
+        assert!(
+            warning.message.contains("team_chat"),
+            "message should name the offending group: {}",
+            warning.message
+        );
+        assert!(
+            warning.message.contains("telegram.alert"),
+            "message should name the bad ref: {}",
+            warning.message
+        );
+        assert!(
+            warning
+                .message
+                .contains("did you mean \"telegram.alerts\"?"),
+            "message should suggest the near-match configured alias: {}",
+            warning.message
+        );
+    }
+
+    #[test]
+    async fn collect_warnings_flags_peer_group_dangling_alias_without_suggestion() {
+        let mut config = multi_agent_test_config();
+        // Only "draft" is configured; "zz" is not a plausible typo of it.
+        let group = crate::multi_agent::PeerGroupConfig {
+            channel: "telegram.zz".into(),
+            agents: vec![crate::multi_agent::AgentAlias::new("alpha")],
+            ..crate::multi_agent::PeerGroupConfig::default()
+        };
+        config.peer_groups.insert("team_chat".to_string(), group);
+
+        let warnings = warnings_with_code(&config, PEER_GROUP_CHANNEL_DANGLING_WARNING);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "expected exactly one warning: {warnings:?}"
+        );
+        assert!(
+            !warnings[0].message.contains("did you mean"),
+            "no near-match should mean no suggestion: {}",
+            warnings[0].message
+        );
+    }
+
+    #[test]
+    async fn collect_warnings_peer_group_suggestion_is_deterministic_on_ties() {
+        let mut config = multi_agent_test_config();
+        // "alerta" and "alerts" are both distance 1 from the typo "alert";
+        // the classifier sorts known_aliases, so the lexicographically first
+        // candidate must win regardless of HashMap iteration order.
+        config
+            .channels
+            .telegram
+            .insert("alerts".to_string(), TelegramConfig::default());
+        config
+            .channels
+            .telegram
+            .insert("alerta".to_string(), TelegramConfig::default());
+        let group = crate::multi_agent::PeerGroupConfig {
+            channel: "telegram.alert".into(),
+            agents: vec![crate::multi_agent::AgentAlias::new("alpha")],
+            ..crate::multi_agent::PeerGroupConfig::default()
+        };
+        config.peer_groups.insert("team_chat".to_string(), group);
+
+        let warnings = warnings_with_code(&config, PEER_GROUP_CHANNEL_DANGLING_WARNING);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "expected exactly one warning: {warnings:?}"
+        );
+        assert!(
+            warnings[0]
+                .message
+                .contains("did you mean \"telegram.alerta\"?"),
+            "equidistant candidates must resolve to the lexicographically first alias: {}",
+            warnings[0].message
+        );
+    }
+
+    #[test]
+    async fn collect_warnings_peer_group_trailing_dot_ref_warns_without_suggestion() {
+        let mut config = multi_agent_test_config();
+        // A trailing dot leaves an empty alias; that is dangling (warn) but
+        // is not a typo of anything, so no "did you mean" — the distance
+        // floor would otherwise propose an unrelated short alias.
+        config
+            .channels
+            .telegram
+            .insert("ab".to_string(), TelegramConfig::default());
+        let group = crate::multi_agent::PeerGroupConfig {
+            channel: "telegram.".into(),
+            agents: vec![crate::multi_agent::AgentAlias::new("alpha")],
+            ..crate::multi_agent::PeerGroupConfig::default()
+        };
+        config.peer_groups.insert("team_chat".to_string(), group);
+
+        let warnings = warnings_with_code(&config, PEER_GROUP_CHANNEL_DANGLING_WARNING);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "expected exactly one warning: {warnings:?}"
+        );
+        assert!(
+            !warnings[0].message.contains("did you mean"),
+            "an empty alias must never produce a suggestion: {}",
+            warnings[0].message
+        );
+    }
+
+    #[test]
+    async fn collect_warnings_flags_peer_group_channel_type_unconfigured() {
+        let mut config = multi_agent_test_config();
+        // "foobar" is not a channel type the schema knows at all, so
+        // `get_map_keys("channels.foobar")` is `None` and the classifier
+        // reports the type itself as unconfigured. (A recognized type with
+        // zero aliases — e.g. bare `discord` here — returns `Some(vec![])`
+        // and takes the alias-not-found branch instead; see the next test.)
+        let group = crate::multi_agent::PeerGroupConfig {
+            channel: "foobar.ops".into(),
+            agents: vec![crate::multi_agent::AgentAlias::new("alpha")],
+            ..crate::multi_agent::PeerGroupConfig::default()
+        };
+        config.peer_groups.insert("team_chat".to_string(), group);
+
+        let warnings = warnings_with_code(&config, PEER_GROUP_CHANNEL_DANGLING_WARNING);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "expected exactly one warning: {warnings:?}"
+        );
+        assert!(
+            warnings[0].message.contains("foobar.ops"),
+            "message should name the bad ref: {}",
+            warnings[0].message
+        );
+        assert!(
+            warnings[0]
+                .message
+                .contains("no [channels.foobar.*] block is configured"),
+            "message should use the type-unconfigured reason: {}",
+            warnings[0].message
+        );
+        assert!(
+            !warnings[0].message.contains("did you mean"),
+            "an unconfigured type has no aliases to suggest: {}",
+            warnings[0].message
+        );
+    }
+
+    #[test]
+    async fn collect_warnings_flags_peer_group_known_type_with_no_aliases() {
+        let mut config = multi_agent_test_config();
+        // "discord" IS a recognized schema channel type, so even with zero
+        // configured aliases `get_map_keys("channels.discord")` returns
+        // `Some(vec![])` — the classifier reports the type as configured
+        // and the warning takes the alias-not-found reason.
+        let group = crate::multi_agent::PeerGroupConfig {
+            channel: "discord.ops".into(),
+            agents: vec![crate::multi_agent::AgentAlias::new("alpha")],
+            ..crate::multi_agent::PeerGroupConfig::default()
+        };
+        config.peer_groups.insert("team_chat".to_string(), group);
+
+        let warnings = warnings_with_code(&config, PEER_GROUP_CHANNEL_DANGLING_WARNING);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "expected exactly one warning: {warnings:?}"
+        );
+        assert!(
+            warnings[0]
+                .message
+                .contains("[channels.discord.ops] is not configured"),
+            "message should use the alias-not-found reason: {}",
+            warnings[0].message
+        );
+        assert!(
+            !warnings[0].message.contains("did you mean"),
+            "zero configured aliases means nothing to suggest: {}",
+            warnings[0].message
+        );
+    }
+
+    #[test]
+    async fn collect_warnings_silent_for_valid_peer_group_dotted_channel() {
+        let mut config = multi_agent_test_config();
+        let group = crate::multi_agent::PeerGroupConfig {
+            channel: "telegram.draft".into(),
+            agents: vec![crate::multi_agent::AgentAlias::new("alpha")],
+            ..crate::multi_agent::PeerGroupConfig::default()
+        };
+        config.peer_groups.insert("team_chat".to_string(), group);
+
+        assert!(
+            warnings_with_code(&config, PEER_GROUP_CHANNEL_DANGLING_WARNING).is_empty(),
+            "a valid dotted alias must not warn"
+        );
+    }
+
+    #[test]
+    async fn collect_warnings_silent_for_bare_type_peer_group_channel() {
+        let mut config = multi_agent_test_config();
+        let group = crate::multi_agent::PeerGroupConfig {
+            channel: "telegram".into(),
+            agents: vec![crate::multi_agent::AgentAlias::new("alpha")],
+            ..crate::multi_agent::PeerGroupConfig::default()
+        };
+        config.peer_groups.insert("team_chat".to_string(), group);
+
+        assert!(
+            warnings_with_code(&config, PEER_GROUP_CHANNEL_DANGLING_WARNING).is_empty(),
+            "a bare type-wide ref must never warn, even though it authorizes every alias"
+        );
     }
 
     #[test]

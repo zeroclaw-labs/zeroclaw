@@ -22,12 +22,7 @@ pub(crate) const BASE_URL: &str = "https://api.openai.com/v1";
 /// Default endpoint for the OpenAI Responses API.
 const RESPONSES_URL: &str = "https://api.openai.com/v1/responses";
 
-/// Max wait for the next streaming body read before the connection is treated
-/// as stalled. Streaming clients omit reqwest's overall `.timeout()` (it kills
-/// long-running responses mid-stream), so without a per-read bound a connection
-/// that goes silent after the headers park `bytes_stream().next().await` forever
-/// and the turn hangs on "working". `read_timeout` caps the gap between reads and
-/// converts a silent stall into a retryable stream error.
+/// Maximum silence between body reads for OpenAI Responses SSE streams.
 const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 pub struct OpenAiModelProvider {
@@ -112,23 +107,37 @@ struct NativeMessage {
     reasoning_content: Option<String>,
 }
 
+/// OpenAI chat-completions native tool entry. Shared with the
+/// OpenAI-compatible provider (`compatible.rs`), which emits the same wire
+/// shape.
 #[derive(Debug, Serialize, Deserialize)]
-struct NativeToolSpec {
+pub(crate) struct NativeToolSpec {
     #[serde(rename = "type")]
-    kind: String,
-    function: NativeToolFunctionSpec,
+    pub(crate) kind: String,
+    pub(crate) function: NativeToolFunctionSpec,
+    /// Unknown sibling fields from parsed caller-supplied specs, preserved
+    /// verbatim so the `chat_with_tools` round-trip validates without
+    /// silently altering the payload. Empty (serializes nothing) for
+    /// internally built specs.
+    #[serde(flatten)]
+    pub(crate) extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct NativeToolFunctionSpec {
-    name: String,
-    description: String,
+pub(crate) struct NativeToolFunctionSpec {
+    pub(crate) name: String,
+    pub(crate) description: String,
     /// `Arc`-shared with the tool registry's stored schema — serialized
     /// transparently, never deep-cloned per request
-    parameters: std::sync::Arc<serde_json::Value>,
+    pub(crate) parameters: std::sync::Arc<serde_json::Value>,
+    /// Unknown sibling fields (e.g. OpenAI `strict`) from parsed
+    /// caller-supplied specs, preserved verbatim. Empty for internally
+    /// built specs.
+    #[serde(flatten)]
+    pub(crate) extra: serde_json::Map<String, serde_json::Value>,
 }
 
-fn parse_native_tool_spec(value: serde_json::Value) -> anyhow::Result<NativeToolSpec> {
+pub(crate) fn parse_native_tool_spec(value: serde_json::Value) -> anyhow::Result<NativeToolSpec> {
     let spec: NativeToolSpec = serde_json::from_value(value).map_err(|e| {
         ::zeroclaw_log::record!(
             WARN,
@@ -324,7 +333,9 @@ impl OpenAiModelProvider {
                 .iter()
                 .map(|tool| NativeToolSpec {
                     kind: "function".to_string(),
+                    extra: serde_json::Map::new(),
                     function: NativeToolFunctionSpec {
+                        extra: serde_json::Map::new(),
                         name: tool.name.clone(),
                         description: tool.description.clone(),
                         parameters: std::sync::Arc::clone(&tool.parameters),
@@ -852,7 +863,7 @@ pub(crate) async fn run_responses_sse(
     let mut pending_utf8: Vec<u8> = Vec::new();
     let mut chunk_buf = String::new();
 
-    loop {
+    'stream: loop {
         match byte_stream.next().await {
             Some(Ok(bytes)) => {
                 if let Err(err) =
@@ -895,6 +906,9 @@ pub(crate) async fn run_responses_sse(
                             return;
                         }
                     }
+                    if state.saw_completion {
+                        break 'stream;
+                    }
                 }
                 Err(err) => {
                     if err.downcast_ref::<ResponsesStreamApiError>().is_some() {
@@ -908,7 +922,8 @@ pub(crate) async fn run_responses_sse(
         }
     }
 
-    if !chunk_buf.trim().is_empty()
+    if !state.saw_completion
+        && !chunk_buf.trim().is_empty()
         && let Ok(events) = process_sse_chunk(&chunk_buf, &mut state)
     {
         for event in events {
@@ -1381,6 +1396,58 @@ impl ::zeroclaw_api::attribution::Attributable for OpenAiResponsesModelProvider 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn responses_completed_ignores_trailing_events_without_eof() {
+        use axum::{Router, response::IntoResponse, routing::post};
+
+        let app = Router::new().route(
+            "/responses",
+            post(|| async {
+                let first = futures_util::stream::once(async {
+                    Ok::<_, std::convert::Infallible>(axum::body::Bytes::from_static(
+                        b"data: {\"type\":\"response.completed\",\"response\":{\"output\":[],\"output_text\":\"fallback\"}}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"after-terminal\"}\n\n",
+                    ))
+                });
+                let open = futures_util::stream::pending::<
+                    Result<axum::body::Bytes, std::convert::Infallible>,
+                >();
+                axum::body::Body::from_stream(first.chain(open)).into_response()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind Responses SSE test server");
+        let addr = listener.local_addr().expect("Responses SSE test address");
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve Responses SSE test");
+        });
+        let request = reqwest::Client::new().post(format!("http://{addr}/responses"));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(16);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            run_responses_sse(request, &tx, false),
+        )
+        .await
+        .expect("response.completed must finish without waiting for EOF");
+        drop(tx);
+        server.abort();
+
+        let mut text = None;
+        let mut saw_final = false;
+        while let Some(event) = rx.recv().await {
+            match event {
+                Ok(StreamEvent::TextDelta(chunk)) => text = Some(chunk.delta),
+                Ok(StreamEvent::Final) => saw_final = true,
+                _ => {}
+            }
+        }
+        assert_eq!(text.as_deref(), Some("fallback"));
+        assert!(saw_final, "response.completed must emit Final");
+    }
 
     #[tokio::test]
     async fn responses_chat_propagates_usage() {

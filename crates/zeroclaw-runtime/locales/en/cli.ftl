@@ -233,9 +233,9 @@ cli-cron-long-about =
 
     Examples:
       zeroclaw cron list
-      zeroclaw cron add '0 9 * * 1-5' 'Good morning' --tz America/New_York --agent
-      zeroclaw cron add '*/30 * * * *' 'Check system health' --agent
-      zeroclaw cron add '*/5 * * * *' 'echo ok'
+      zeroclaw cron add '0 9 * * 1-5' 'Good morning' --agent sentinel --prompt --tz America/New_York
+      zeroclaw cron add '*/30 * * * *' 'Check system health' --agent sentinel --prompt
+      zeroclaw cron add '*/5 * * * *' 'echo ok' --agent sentinel
       zeroclaw cron add-at 2025-01-15T14:00:00Z 'Send reminder' --agent
       zeroclaw cron add-every 60000 'Ping heartbeat'
       zeroclaw cron once 30m 'Run backup in 30 minutes' --agent
@@ -678,6 +678,7 @@ cli-quickstart-error-channel-bound = channel `{$reference}` is already bound to 
 cli-quickstart-error-channel-required = channel type and alias are required
 cli-quickstart-error-channel-field-not-advertised = channel field `{$field}` is not available in Quickstart
 cli-quickstart-error-channel-token-required = Telegram bot token is required
+cli-quickstart-error-webhook-secret-required = Webhook shared secret is required
 cli-quickstart-error-peer-group-name-required = peer-group name is required
 cli-quickstart-error-peer-group-channel-required = peer-group channel ref is required
 cli-quickstart-error-peer-group-unknown-channel = peer-group `{$name}` references unknown channel `{$channel}`
@@ -934,6 +935,12 @@ turn-tool-interrupted-before-result = [interrupted by user before this tool prod
 # Safe reply delivered when the model repeatedly emits malformed internal
 # tool-call protocol and the turn gives up retrying.
 channel-runtime-malformed-tool-output = I generated an internal tool-call format error and could not complete this request. Please try again.
+channel-runtime-progress-received = Received
+channel-runtime-progress-planning = Planning
+channel-runtime-progress-waiting-on-model = Waiting on model
+channel-runtime-progress-running-tool = Running tool
+channel-runtime-progress-compacting-context = Compacting context
+channel-runtime-progress-finalizing-response = Finalizing response
 channel-runtime-new-session = Conversation history cleared. Starting fresh.
 channel-runtime-stop-sent = Stop signal sent.
 channel-runtime-stop-no-task = No in-flight task for this sender scope.
@@ -941,6 +948,8 @@ channel-runtime-model-empty = Model ID cannot be empty. Use `/model <model-id>`.
 channel-runtime-model-switched = Model switched to `{ $model }` (model_provider: `{ $provider }`). Context preserved.
 channel-runtime-agent-scope-rejected = Sender `{ $sender }` is not authorized for `/model --agent` on agent `{ $agent }`. Use `/model --user { $model }` for a session-only override, or ask an admin to mark a peer group `admin_for_agent_scope = true` with you as a member.
 channel-runtime-request-timeout = ⚠️ Request timed out while waiting for the model. Please try again.
+channel-runtime-no-reply-refused = 🚫 I can't help with that request.
+channel-runtime-no-reply-failed = ⚠️ I couldn't complete that request.
 channel-runtime-current-model-status =
     Current model_provider: `{ $provider }`
     Current model: `{ $model }`
@@ -1056,8 +1065,18 @@ cli-gateway-restart-hint-process = restart the `zeroclaw daemon` process
 # a supervisor retry loop. The two variants differ only by who holds the port.
 cli-daemon-gateway-already-running = A ZeroClaw gateway is already running on {$host}:{$port}. The daemon supervises its own gateway and will not start a second one on the same address. Stop that gateway (or point the daemon at a free port with `zeroclaw config set gateway.port <port>`), then run the daemon again.
 cli-daemon-gateway-port-occupied = Gateway address {$host}:{$port} is already in use by another process. Free the port or point the daemon at a free port (`zeroclaw config set gateway.port <port>`), then run the daemon again.
+cli-daemon-starting-title = 🧠 ZeroClaw daemon starting…
+cli-daemon-starting-detail = Preparing configured daemon endpoints
+cli-daemon-started-title = 🧠 ZeroClaw daemon ready
+cli-daemon-started-gateway = Gateway:  {$url}
+cli-daemon-started-socket = Socket:   {$path}
+cli-daemon-started-pairing = Pairing:    enabled (see gateway output above for current status)
+cli-daemon-started-stop = Ctrl+C or SIGTERM to stop
 
 # ── Context window (doctor update-context-windows, agent interactive) ──
+cli-doctor-context-window-ok = {$provider_ref}: context window: {$context_window} tokens
+cli-doctor-context-window-zero = {$provider_ref}: context_window is 0 (invalid; set it to the model's real context limit)
+cli-doctor-context-window-unset = {$provider_ref}: no context_window set — will use {$fallback} token fallback when selected; likely far below this model's real limit; set context_window on this profile
 cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%
 cli-agent-context-bar-unknown = ctx: unknown / {$max}
 cli-doctor-ctxwin-already-set = {$provider_ref}: already has context_window = {$ctx}
@@ -1075,9 +1094,46 @@ cli-doctor-cache-write-failed = Failed to persist model cache: {$error}
 # ── Degraded config sections (doctor diagnose, #8835) ──
 cli-doctor-degraded-security = SECURITY-CRITICAL config section `{$path}` is invalid and was reset to its default so the daemon can boot; the running posture may be WEAKER than intended. Run `zeroclaw config migrate` to see the parse error, then repair the file.
 cli-doctor-degraded-section = config section `{$path}` is malformed and was reset to defaults; values in that section are NOT in effect. Run `zeroclaw config migrate` to see the parse error, then repair the file.
+cli-doctor-skills-prompt-injection-mode-full-deprecated = Skill prompt injection mode "full" is deprecated. Explicit full mode remains supported during the deprecation window, but compact is now the default; migrate before Schema V4 removes full mode.
 sop-approval-deferred-at-capacity = Approval could not resume run {$run_id}: execution slots are full. The gate remains waiting; retry after a slot frees.
 sop-approval-policy-unavailable = Approval failed because the parked SOP step is unavailable: {$reason}. The run remains waiting.
 sop-rpc-decision-invalid-state = Run {$run_id} cannot be resolved in its current state.
 sop-rpc-decision-unauthorized = The RPC principal is not authorized to resolve this SOP step.
 sop-rpc-policy-missing = SOP approval policy '{$name}' is not configured.
 sop-rpc-policy-unavailable = The parked SOP policy is unavailable: {$reason}.
+
+# ── Runtime command construction — shell and skill shell tools ──
+tool-runtime-command-build-failed = Failed to build runtime command: {$error}
+tool-runtime-command-docker-workspace-path = Failed to build runtime command: Failed to canonicalize Docker workspace path {$path}: {$cause}
+tool-runtime-command-docker-allowed-root = Failed to build runtime command: Failed to canonicalize Docker workspace root {$path}: {$cause}
+
+# ── Tool approval (channels, #9409) ──
+# Human-visible copy for the operator-facing tool-approval prompt, shared
+# across the button adapters (Telegram, Discord, Slack) and the text-reply
+# adapters (Matrix, Signal, WhatsApp, Slack polling fallback). Approval
+# TOKENS, `callback_data`/`custom_id`/`action_id` values, and the reply
+# KEYWORDS parsed by `util::parse_approval_reply` (yes/y/approve, no/n/deny,
+# always) stay hardcoded ASCII in Rust — only the surrounding prose is
+# localized here.
+channel-approval-heading = Tool approval required
+channel-approval-heading-shout = APPROVAL REQUIRED
+channel-approval-tool-label = Tool
+channel-approval-args-label = Args
+channel-approval-btn-approve = Approve
+channel-approval-btn-deny = Deny
+channel-approval-btn-always = Always
+channel-approval-tap-instruction = Tap a button below:
+channel-approval-reply-instruction-yesno = Reply: "{ $yes_command }", "{ $no_command }", or "{ $always_command }"
+channel-approval-reply-instruction-approve-deny = Reply `{ $approve_command }` / `{ $deny_command }` / `{ $always_command }`.
+channel-telegram-approval-ack-approved = Approved
+channel-telegram-approval-ack-always-approved = Always approved
+channel-telegram-approval-ack-denied = Denied
+channel-telegram-approval-ack-unknown = Unknown action
+channel-discord-approval-btn-allow-once = Allow once
+channel-discord-approval-btn-allow-session = Allow this session
+channel-discord-approval-btn-allow-always = Always allow
+channel-approval-title = Approve { $tool }?
+channel-approval-opt-allow-once = Allow once
+channel-approval-opt-allow-always = Always allow
+channel-approval-opt-reject = Reject
+channel-approval-opt-reject-with-edit = Reject with edit

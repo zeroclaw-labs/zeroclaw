@@ -49,8 +49,11 @@ impl Tool for McpToolWrapper {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        // Deep copy for legacy callers that need an owned tree; the agent
-        // loop goes through `spec()` below, which shares instead of cloning.
+        // Deep copy for callers that need an owned tree. The agent loop
+        // must never take this path: it goes through `spec()` below, and
+        // every delegating wrapper in the registry forwards `spec()` so the
+        // shared `Arc` survives the trip (see the invariant on
+        // `Tool::spec`).
         (*self.input_schema).clone()
     }
 

@@ -614,7 +614,10 @@ pub struct ModelProviderRuntimeOptions {
     /// model served by a vision-capable family as non-vision. Mapped from
     /// `ModelProviderConfig::vision`.
     pub vision: Option<bool>,
-    /// Passed verbatim as `chat_template_kwargs` to the llamacpp provider.
+    /// Forwarded verbatim as a top-level `chat_template_kwargs` object in the
+    /// request body for OpenAI-compatible providers (folded into `extra_body`
+    /// by `apply_compat_options`). Consumed by chat-template-aware backends
+    /// such as vLLM, SGLang, and llama.cpp.
     pub chat_template_kwargs: Option<serde_json::Value>,
     /// Path to a custom CA certificate file for TLS connections.
     pub tls_ca_cert_path: Option<String>,
@@ -790,11 +793,55 @@ fn token_end(input: &str, from: usize) -> usize {
     end
 }
 
+/// Remove complete query strings from HTTP(S) URLs embedded in error text.
+///
+/// Query-value punctuation cannot safely identify where a credential ends:
+/// commas, apostrophes, and parentheses are all legal query data. Treat the
+/// URL's entire non-whitespace query tail as sensitive instead. This also
+/// covers credential parameter names that the sanitizer does not know about.
+fn scrub_url_queries(input: &str) -> String {
+    let lowercase = input.to_ascii_lowercase();
+    let mut scrubbed = String::with_capacity(input.len());
+    let mut cursor = 0;
+
+    while cursor < input.len() {
+        let remaining = &input[cursor..];
+        let remaining_lowercase = &lowercase[cursor..];
+        let next_http = remaining_lowercase.find("http://");
+        let next_https = remaining_lowercase.find("https://");
+        let Some(relative_url_start) = (match (next_http, next_https) {
+            (Some(http), Some(https)) => Some(http.min(https)),
+            (Some(http), None) => Some(http),
+            (None, Some(https)) => Some(https),
+            (None, None) => None,
+        }) else {
+            scrubbed.push_str(remaining);
+            break;
+        };
+        let url_start = cursor + relative_url_start;
+        scrubbed.push_str(&input[cursor..url_start]);
+
+        let url_tail = &input[url_start..];
+        let url_end = url_start + url_tail.find(char::is_whitespace).unwrap_or(url_tail.len());
+        let url_token = &input[url_start..url_end];
+        if let Some(query_start) = url_token.find('?') {
+            scrubbed.push_str(&url_token[..query_start]);
+        } else {
+            scrubbed.push_str(url_token);
+        }
+        cursor = url_end;
+    }
+
+    scrubbed
+}
+
 /// Scrub known secret-like token prefixes from model_provider error strings.
 /// Redacts tokens with prefixes like `sk-`, `xoxb-`, `xoxp-`, `ghp_`, `gho_`,
-/// `ghu_`, and `github_pat_`.
+/// `ghu_`, `github_pat_`, and Google/Gemini `AIza` keys. Complete query strings
+/// are removed from embedded HTTP(S) URLs because query parameters may carry
+/// credentials under provider-specific names.
 pub fn scrub_secret_patterns(input: &str) -> String {
-    const PREFIXES: [&str; 7] = [
+    const PREFIXES: [&str; 8] = [
         "sk-",
         "xoxb-",
         "xoxp-",
@@ -802,9 +849,10 @@ pub fn scrub_secret_patterns(input: &str) -> String {
         "gho_",
         "ghu_",
         "github_pat_",
+        "AIza",
     ];
 
-    let mut scrubbed = input.to_string();
+    let mut scrubbed = scrub_url_queries(input);
 
     for prefix in PREFIXES {
         let mut search_from = 0;
@@ -879,9 +927,10 @@ pub async fn api_error(model_provider: &str, response: reqwest::Response) -> any
     ))
 }
 
-/// Resolve API key for a model_provider from config and environment variables.
-/// Return the typed-alias `api_key` field, trimmed. Env-var overrides land on
-/// the field at config-load via the `ZEROCLAW_*` schema-mirror grammar.
+/// Resolve API key for a model_provider from the typed alias config/override.
+/// Env-var bridges land on the alias field at config-load via the
+/// `ZEROCLAW_*` schema-mirror grammar; this constructor boundary deliberately
+/// does not read provider-specific global variables.
 fn resolve_model_provider_credential(
     _name: &str,
     credential_override: Option<&str>,
@@ -1886,6 +1935,7 @@ pub fn list_model_providers() -> Vec<ModelProviderInfo> {
             ("nearai", "NEAR AI Cloud", false),
             ("vercel", "Vercel AI Gateway", false),
             ("cloudflare", "Cloudflare AI", false),
+            ("atlascloud", "Atlas Cloud", false),
             ("moonshot", "Moonshot", false),
             ("synthetic", "Synthetic", false),
             ("opencode", "OpenCode", false),
@@ -2115,6 +2165,43 @@ mod tests {
     fn resolve_provider_credential_filters_empty_override() {
         assert!(resolve_model_provider_credential("openrouter", Some("   ")).is_none());
         assert!(resolve_model_provider_credential("openrouter", None).is_none());
+    }
+
+    #[test]
+    fn resolve_atlascloud_credential_stays_on_typed_alias_boundary() {
+        let _env_lock = env_lock();
+        let _guard = EnvGuard::set("ATLASCLOUD_API_KEY", Some("  atlas-env-key  "));
+        assert!(resolve_model_provider_credential("atlascloud", None).is_none());
+        assert_eq!(
+            resolve_model_provider_credential("atlascloud", Some("  explicit-key  ")).as_deref(),
+            Some("explicit-key")
+        );
+        assert!(resolve_model_provider_credential("openrouter", None).is_none());
+    }
+
+    #[test]
+    fn atlascloud_uses_canonical_provider_id_only() {
+        assert_eq!(
+            canonicalize_v2_model_provider_name("atlascloud"),
+            "atlascloud"
+        );
+        for alias in ["atlas", "atlas-cloud", "atlas_cloud"] {
+            assert_eq!(canonicalize_v2_model_provider_name(alias), alias);
+        }
+    }
+
+    #[test]
+    fn atlascloud_provider_is_listed_and_constructible() {
+        let providers = list_model_providers();
+        let atlascloud = providers
+            .iter()
+            .find(|provider| provider.name == "atlascloud")
+            .expect("Atlas Cloud provider should be listed");
+        assert_eq!(atlascloud.display_name, "Atlas Cloud");
+        assert!(
+            create_model_provider("atlascloud", Some("provider-test-credential")).is_ok(),
+            "Atlas Cloud should construct through the OpenAI-compatible family factory"
+        );
     }
 
     #[test]
@@ -3543,6 +3630,56 @@ mod tests {
         let result = sanitize_api_error(&input);
         assert!(std::str::from_utf8(result.as_bytes()).is_ok());
         assert!(!result.contains("sk-abcdef123"));
+    }
+
+    #[test]
+    fn sanitize_scrubs_gemini_key_in_reqwest_url() {
+        let key = "AIzaSyDUMMYKEYFORTESTINGONLY1234567890";
+        let input = format!(
+            "error sending request for url (https://127.0.0.1:1/v1beta/models/x:generateContent?key={key})"
+        );
+        let result = sanitize_api_error(&input);
+        assert!(!result.contains(key), "key leaked: {result}");
+        assert!(result.contains("generateContent"));
+        assert!(!result.contains("?key="));
+    }
+
+    #[test]
+    fn sanitize_scrubs_bare_gemini_key_prefix() {
+        // An `AIza` key that appears outside a query string (e.g. a JSON body)
+        // is still redacted by the prefix rule.
+        let input = r#"{"error":"invalid api key AIzaSyABCDEF0123456789abcdefGHIJKLmnopqrs"}"#;
+        let result = sanitize_api_error(input);
+        assert!(!result.contains("AIzaSyABCDEF0123456789abcdefGHIJKLmnopqrs"));
+        assert!(result.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn sanitize_removes_complete_url_query_regardless_of_parameter_name() {
+        let input =
+            "GET HTTPS://api.example.com/v1/thing?region=us&access_token=hunter2secret failed";
+        let result = sanitize_api_error(input);
+        assert!(!result.contains("hunter2secret"), "{result}");
+        assert!(!result.contains("region=us"), "{result}");
+        assert!(result.contains("HTTPS://api.example.com/v1/thing"));
+    }
+
+    #[test]
+    fn sanitize_removes_query_values_containing_url_punctuation() {
+        let secret = "abc,def'ghi(jkl)";
+        let input = format!("GET https://api.example.com/v1/thing?api_key={secret} failed");
+        let result = sanitize_api_error(&input);
+
+        assert!(!result.contains(secret), "{result}");
+        assert!(!result.contains("def'ghi(jkl)"), "{result}");
+        assert!(result.contains("https://api.example.com/v1/thing"));
+    }
+
+    #[test]
+    fn sanitize_leaves_non_url_key_value_text_unchanged() {
+        let input = "playing monkey=banana in the query";
+        let result = sanitize_api_error(input);
+        assert_eq!(result, input);
     }
 
     #[test]
