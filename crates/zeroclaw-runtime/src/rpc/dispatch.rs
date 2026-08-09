@@ -9931,6 +9931,8 @@ mod tests {
         assert_process_line_error("{", PARSE_ERROR, Value::Null).await;
 
         let invalid = [
+            (r#"{"jsonrpc":"2.0"}"#, Value::Null),
+            (r#"{"jsonrpc":"2.0","result":true}"#, Value::Null),
             (r#"{"jsonrpc":"1.0","method":"status","id":1}"#, json!(1)),
             (
                 r#"{"jsonrpc":"2.0","id":2,"result":true,"error":{"code":-1,"message":"bad"}}"#,

@@ -332,15 +332,14 @@ impl RpcOutbound {
     }
 
     /// Route a response assembled by an internal caller.
-    /// Returns whether a matching pending request existed.
     pub fn dispatch_response(
         &self,
         id_str: &str,
         result: Option<Value>,
         error: Option<JsonRpcError>,
-    ) -> bool {
+    ) {
         let result = error.map_or_else(|| Ok(result.unwrap_or(Value::Null)), Err);
-        self.dispatch_validated_response(id_str, result)
+        let _ = self.dispatch_validated_response(id_str, result);
     }
 
     /// Number of in-flight outbound requests awaiting responses.
