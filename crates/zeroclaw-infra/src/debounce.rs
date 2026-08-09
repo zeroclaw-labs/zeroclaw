@@ -10,9 +10,22 @@ use tokio::task::JoinHandle;
 /// Result of submitting a message to the debouncer.
 pub enum DebounceResult {
     /// The message was accumulated and a timer is running. The caller should
-    /// skip processing — the debounced message will arrive via the returned
-    /// [`tokio::sync::oneshot::Receiver`] when the window expires.
-    Pending(tokio::sync::oneshot::Receiver<String>),
+    /// skip processing — the debounced message will arrive via `rx` when the
+    /// window expires.
+    Pending {
+        rx: tokio::sync::oneshot::Receiver<String>,
+        /// `false` when this message opened a new accumulation bucket, `true`
+        /// when it extended one that was already open — the receiver handed
+        /// out for the bucket's previous message resolves to `Err`, and this
+        /// receiver replaces it.
+        ///
+        /// The distinction is decided under the debouncer's own lock. A caller
+        /// that keeps per-bucket state cannot reconstruct it afterwards:
+        /// checking any mirror of "is the bucket still open" races the window
+        /// expiry, and a bucket that fired in between would swallow a receiver
+        /// belonging to the next one.
+        extended: bool,
+    },
     /// Debouncing is disabled (window = 0); pass the message through immediately.
     Passthrough(String),
 }
@@ -99,7 +112,7 @@ impl MessageDebouncer {
                 fire_debounced(&entries_ref, &key).await;
             });
 
-            DebounceResult::Pending(rx)
+            DebounceResult::Pending { rx, extended: true }
         } else {
             let (tx, rx) = tokio::sync::oneshot::channel();
 
@@ -119,7 +132,10 @@ impl MessageDebouncer {
                 },
             );
 
-            DebounceResult::Pending(rx)
+            DebounceResult::Pending {
+                rx,
+                extended: false,
+            }
         }
     }
 }
@@ -146,7 +162,7 @@ mod tests {
         assert!(!debouncer.enabled());
         match debouncer.debounce("user1", "hello").await {
             DebounceResult::Passthrough(msg) => assert_eq!(msg, "hello"),
-            DebounceResult::Pending(_) => panic!("expected Passthrough"),
+            DebounceResult::Pending { .. } => panic!("expected Passthrough"),
         }
     }
 
@@ -154,7 +170,7 @@ mod tests {
     async fn single_message_fires_after_window() {
         let debouncer = MessageDebouncer::new(Duration::from_millis(50));
         let rx = match debouncer.debounce("user1", "hello").await {
-            DebounceResult::Pending(rx) => rx,
+            DebounceResult::Pending { rx, .. } => rx,
             DebounceResult::Passthrough(_) => panic!("expected Pending"),
         };
         let combined = rx.await.unwrap();
@@ -166,13 +182,13 @@ mod tests {
         let debouncer = MessageDebouncer::new(Duration::from_millis(100));
 
         let _rx1 = match debouncer.debounce("user1", "hello").await {
-            DebounceResult::Pending(rx) => rx,
+            DebounceResult::Pending { rx, .. } => rx,
             DebounceResult::Passthrough(_) => panic!("expected Pending"),
         };
 
         tokio::time::sleep(Duration::from_millis(30)).await;
         let rx2 = match debouncer.debounce("user1", "world").await {
-            DebounceResult::Pending(rx) => rx,
+            DebounceResult::Pending { rx, .. } => rx,
             DebounceResult::Passthrough(_) => panic!("expected Pending"),
         };
 
@@ -181,15 +197,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn extended_flag_tracks_bucket_boundaries() {
+        let debouncer = MessageDebouncer::new(Duration::from_millis(50));
+
+        // First message opens a bucket…
+        let rx1 = match debouncer.debounce("user1", "one").await {
+            DebounceResult::Pending { rx, extended } => {
+                assert!(!extended, "first message must open a bucket");
+                rx
+            }
+            DebounceResult::Passthrough(_) => panic!("expected Pending"),
+        };
+
+        // …a rapid follow-up extends it and supersedes the first receiver…
+        let rx2 = match debouncer.debounce("user1", "two").await {
+            DebounceResult::Pending { rx, extended } => {
+                assert!(extended, "rapid follow-up must extend the open bucket");
+                rx
+            }
+            DebounceResult::Passthrough(_) => panic!("expected Pending"),
+        };
+        assert!(rx1.await.is_err(), "superseded receiver must resolve Err");
+        assert_eq!(rx2.await.unwrap(), "one\ntwo");
+
+        // …and once the bucket fired, the next message opens a new one.
+        match debouncer.debounce("user1", "three").await {
+            DebounceResult::Pending { extended, .. } => {
+                assert!(!extended, "a delivered bucket must not be extendable");
+            }
+            DebounceResult::Passthrough(_) => panic!("expected Pending"),
+        }
+    }
+
+    #[tokio::test]
     async fn different_senders_independent() {
         let debouncer = MessageDebouncer::new(Duration::from_millis(50));
 
         let rx_a = match debouncer.debounce("alice", "hi alice").await {
-            DebounceResult::Pending(rx) => rx,
+            DebounceResult::Pending { rx, .. } => rx,
             DebounceResult::Passthrough(_) => panic!("expected Pending"),
         };
         let rx_b = match debouncer.debounce("bob", "hi bob").await {
-            DebounceResult::Pending(rx) => rx,
+            DebounceResult::Pending { rx, .. } => rx,
             DebounceResult::Passthrough(_) => panic!("expected Pending"),
         };
 
@@ -206,7 +255,7 @@ mod tests {
             .await
         {
             DebounceResult::Passthrough(msg) => assert_eq!(msg, "hello"),
-            DebounceResult::Pending(_) => panic!("expected Passthrough"),
+            DebounceResult::Pending { .. } => panic!("expected Passthrough"),
         }
     }
 
@@ -217,7 +266,7 @@ mod tests {
             .debounce_with_window("user1", "fast", Duration::from_millis(50))
             .await
         {
-            DebounceResult::Pending(rx) => rx,
+            DebounceResult::Pending { rx, .. } => rx,
             DebounceResult::Passthrough(_) => panic!("expected Pending"),
         };
         let combined = rx.await.unwrap();
