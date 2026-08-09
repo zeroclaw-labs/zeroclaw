@@ -1457,6 +1457,51 @@ vision_model_provider = "openai"
     }
 
     #[test]
+    fn v2_no_op_globals_overlay_with_second_family_keeps_single_owner() {
+        // The maintainer's exact finding: two canonical families with no
+        // `default_provider`, and `openai.default` already complete (its own
+        // api_key and model) so every global value loses to the per-provider
+        // field. The fold is a no-op overlay — nothing lands on the target —
+        // so it must not mark the slot ambiguous: the bare `openai` reference
+        // has a stated owner (the raw `openai` entry) and must rewrite to
+        // `openai.default`, preserving the per-provider credential.
+        let raw = r#"
+schema_version = 2
+
+[providers]
+api_key = "global-key"
+default_model = "vision-model"
+
+[providers.models.openai]
+api_key = "openai-key"
+model = "vision-model"
+
+[providers.models.opencode-go]
+api_key = "opencode-key"
+
+[multimodal]
+vision_model_provider = "openai"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("openai.default"),
+            "a no-op globals overlay must allow the bare reference to rewrite"
+        );
+        let alias = cfg
+            .providers
+            .models
+            .find("openai", "default")
+            .expect("openai.default must exist");
+        assert_eq!(
+            alias.api_key.as_deref(),
+            Some("openai-key"),
+            "the per-provider credential must win over the shadowed global"
+        );
+        assert_eq!(alias.model.as_deref(), Some("vision-model"));
+    }
+
+    #[test]
     fn v2_dot_bearing_legacy_vision_reference_migrates() {
         // `llama.cpp` carries a dot but is a legacy synonym for the llamacpp
         // family; the rewrite must not early-return on the dot.
