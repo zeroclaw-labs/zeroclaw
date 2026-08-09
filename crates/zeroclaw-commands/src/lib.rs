@@ -1,10 +1,4 @@
 //! Shared built-in channel slash command catalogue.
-//!
-//! This crate is the source of truth for built-in command metadata that is
-//! accepted or advertised by channel runtimes. Web and TUI command discovery are
-//! intentionally not represented here until those clients consume a generated or
-//! RPC-backed catalogue; keeping local client command lists out of this crate
-//! avoids pretending duplicated metadata is shared state.
 
 use serde::Serialize;
 
@@ -46,6 +40,22 @@ pub enum BuiltinCommandId {
     Goal,
 }
 
+impl BuiltinCommandId {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Help => "help",
+            Self::Clear => "clear",
+            Self::New => "new",
+            Self::Stop => "stop",
+            Self::Model => "model",
+            Self::Models => "models",
+            Self::Config => "config",
+            Self::Thinking => "thinking",
+            Self::Goal => "goal",
+        }
+    }
+}
+
 /// Where command execution is owned today.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -58,11 +68,6 @@ pub enum CommandExecution {
     GoalAdmission,
 }
 
-/// Built-in command metadata.
-///
-/// This is descriptive catalogue state, not an execution dispatcher. Command
-/// handlers still parse their own arguments so the catalogue does not become a
-/// second copy of runtime policy or command semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct CommandSpec {
     /// Stable id for code that should not branch on display text.
@@ -110,6 +115,7 @@ pub struct ParsedCommandToken {
 }
 
 const CHANNEL_ONLY: &[CommandSurface] = &[CommandSurface::Channel];
+const CHANNEL_AND_TUI: &[CommandSurface] = &[CommandSurface::Channel, CommandSurface::Tui];
 
 static BUILTIN_COMMANDS: &[CommandSpec] = &[
     CommandSpec {
@@ -118,7 +124,7 @@ static BUILTIN_COMMANDS: &[CommandSpec] = &[
         aliases: &[],
         usage: "/help",
         description_key: "command-help-description",
-        surfaces: CHANNEL_ONLY,
+        surfaces: CHANNEL_AND_TUI,
         execution: CommandExecution::ClientLocal,
     },
     CommandSpec {
@@ -136,7 +142,7 @@ static BUILTIN_COMMANDS: &[CommandSpec] = &[
         aliases: &["new-session"],
         usage: "/new",
         description_key: "command-new-description",
-        surfaces: CHANNEL_ONLY,
+        surfaces: CHANNEL_AND_TUI,
         execution: CommandExecution::RuntimeCommand,
     },
     CommandSpec {
@@ -154,7 +160,7 @@ static BUILTIN_COMMANDS: &[CommandSpec] = &[
         aliases: &[],
         usage: "/model [--user|--agent] [model]",
         description_key: "command-model-description",
-        surfaces: CHANNEL_ONLY,
+        surfaces: CHANNEL_AND_TUI,
         execution: CommandExecution::RuntimeCommand,
     },
     CommandSpec {
@@ -261,11 +267,69 @@ mod tests {
     }
 
     #[test]
+    fn command_lookup_normalizes_case_whitespace_and_bot_suffix() {
+        assert_eq!(
+            normalize_command_name("  /MODEL@ZeroClaw_Bot  "),
+            Some("model".to_string())
+        );
+        assert_eq!(
+            command_by_name("  /THINK@ZeroClaw_Bot  ").map(|spec| spec.id),
+            Some(BuiltinCommandId::Thinking)
+        );
+        assert_eq!(
+            parse_command_token("  /NEW-SESSION@ZeroClaw_Bot  ", CommandSurface::Channel)
+                .map(|parsed| parsed.command.id),
+            Some(BuiltinCommandId::New)
+        );
+    }
+
+    #[test]
     fn surface_filter_rejects_unavailable_commands() {
         assert!(parse_command_token("/config", CommandSurface::Channel).is_some());
         assert!(parse_command_token("/config", CommandSurface::Web).is_none());
         assert!(parse_command_token("/attach", CommandSurface::Tui).is_none());
         assert!(parse_command_token("/attach", CommandSurface::Channel).is_none());
+    }
+
+    #[test]
+    fn normalize_command_name_empty_and_whitespace_returns_none() {
+        assert_eq!(normalize_command_name(""), None);
+        assert_eq!(normalize_command_name("   "), None);
+        assert_eq!(normalize_command_name("\t\n"), None);
+    }
+
+    #[test]
+    fn normalize_command_name_pure_slash_or_at_suffix_returns_none() {
+        assert_eq!(normalize_command_name("/"), None);
+        assert_eq!(normalize_command_name("@bot"), None);
+        assert_eq!(normalize_command_name("/@bot"), None);
+        assert_eq!(normalize_command_name("  /  @bot  "), None);
+    }
+
+    #[test]
+    fn normalize_command_name_unicode_preserved() {
+        assert_eq!(normalize_command_name("/新"), Some("新".to_string()));
+        assert_eq!(normalize_command_name("/新@my_bot"), Some("新".to_string()));
+    }
+
+    #[test]
+    fn tui_surface_advertises_help_model_and_new_only() {
+        let tui_ids: Vec<BuiltinCommandId> = commands_for_surface(CommandSurface::Tui)
+            .map(|spec| spec.id)
+            .collect();
+        assert_eq!(
+            tui_ids,
+            vec![
+                BuiltinCommandId::Help,
+                BuiltinCommandId::New,
+                BuiltinCommandId::Model,
+            ]
+        );
+        assert!(parse_command_token("/help", CommandSurface::Tui).is_some());
+        assert!(parse_command_token("/model", CommandSurface::Tui).is_some());
+        assert!(parse_command_token("/new", CommandSurface::Tui).is_some());
+        assert!(parse_command_token("/new-session", CommandSurface::Tui).is_some());
+        assert!(parse_command_token("/clear", CommandSurface::Tui).is_none());
     }
 
     #[test]

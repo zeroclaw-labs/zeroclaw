@@ -15,15 +15,10 @@ use zeroclaw_api::tool::ToolSpec;
 const TEMPERATURE_DEFAULT: f64 = 1.0;
 /// Anthropic's public API endpoint. Overrideable via `model_providers.<name>.base_url`.
 pub(crate) const BASE_URL: &str = "https://api.anthropic.com";
-/// Max wait for the next SSE line before the stream is treated as stalled.
-/// reqwest's overall `.timeout()` does not reliably fire once a streaming body
-/// is being drained chunk-by-chunk, so a connection that goes silent after
-/// `message_start` (proxy/load-balancer hiccup) parks `next_line().await`
-/// forever — the detached parser task leaks and the turn hangs on "working".
-/// A per-line idle bound converts that into a retryable `StreamError`.
-const SSE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
-
 use crate::stream_guard::AbortOnDrop;
+
+/// Maximum silence between body reads for Anthropic SSE streams.
+const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
 pub struct AnthropicModelProvider {
     /// `[providers.models.anthropic.<alias>]` config-key alias.
@@ -31,6 +26,14 @@ pub struct AnthropicModelProvider {
     credential: Option<String>,
     base_url: String,
     max_tokens: u32,
+    timeout_secs: u64,
+    /// Memoized cleaned tool schemas: each registered schema is cleaned once
+    /// per provider instance (not once per request) and the byte-stable
+    /// result keeps the `cache_control` tools block identical across
+    /// requests. Note the memo only pays off while the instance lives —
+    /// paths that rebuild the provider per call (e.g. the per-iteration
+    /// vision route) start it empty each time.
+    schema_cache: zeroclaw_api::schema::SchemaCleanCache,
 }
 
 #[cfg(test)]
@@ -93,12 +96,6 @@ struct NativeThinkingConfig {
     budget_tokens: u32,
 }
 
-/// Whether a model accepts the fixed-budget native-thinking request shape
-/// (`{"thinking": {"type": "enabled", "budget_tokens": N}}`). Opus 4.7 supports
-/// only adaptive thinking and rejects fixed budgets with a 400; until adaptive
-/// thinking is implemented, those models stay on prompt-based reasoning.
-/// Anthropic's extended-thinking docs:
-/// <https://platform.claude.com/docs/en/build-with-claude/extended-thinking>
 fn anthropic_model_supports_native_thinking(model: &str) -> bool {
     !model.contains("claude-opus-4-7")
 }
@@ -160,7 +157,7 @@ struct NativeToolSpec {
     description: String,
     /// `Arc`-shared with the tool registry's stored schema when no cleaning
     /// is required — serialized transparently, deep-cloned only for schemas
-    /// the Anthropic cleaner actually rewrites (#8642).
+    /// the Anthropic cleaner actually rewrites
     input_schema: std::sync::Arc<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_control: Option<CacheControl>,
@@ -241,31 +238,81 @@ struct NativeContentIn {
     input: Option<serde_json::Value>,
 }
 
-impl AnthropicModelProvider {
-    pub fn new(alias: &str, credential: Option<&str>) -> Self {
-        Self::with_base_url(alias, credential, None)
+/// Typed builder for [`AnthropicModelProvider`].
+///
+/// `alias` is the only positional argument. Everything else has a
+/// sensible default: the base URL falls back to Anthropic's published
+/// endpoint, no credential leaves the provider unauthenticated (fine
+/// for local mocks), and token/timeout limits use the workspace baselines.
+#[must_use]
+pub struct AnthropicBuilder {
+    alias: String,
+    credential: Option<String>,
+    base_url: Option<String>,
+    max_tokens: Option<u32>,
+    timeout_secs: Option<u64>,
+}
+
+impl AnthropicBuilder {
+    /// Explicit API credential. Whitespace-only inputs are normalized
+    /// to `None` so a stray `Some("   ")` from config cannot produce a
+    /// bogus `Bearer    ` header.
+    pub fn credential(mut self, credential: Option<&str>) -> Self {
+        self.credential = credential
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+            .map(ToString::to_string);
+        self
     }
 
-    pub fn with_base_url(alias: &str, credential: Option<&str>, base_url: Option<&str>) -> Self {
-        let base_url = base_url
-            .map(|u| u.trim_end_matches('/'))
-            .unwrap_or(BASE_URL)
-            .to_string();
-        Self {
-            alias: alias.to_string(),
-            credential: credential
-                .map(str::trim)
-                .filter(|k| !k.is_empty())
-                .map(ToString::to_string),
-            base_url,
-            max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
+    /// Override the API endpoint. Trailing slashes are stripped so
+    /// callers need not care whether config supplied them.
+    pub fn base_url(mut self, base_url: &str) -> Self {
+        self.base_url = Some(base_url.trim_end_matches('/').to_string());
+        self
+    }
+
+    /// Override the maximum output tokens for API requests. Defaults to
+    /// [`zeroclaw_api::model_provider::BASELINE_MAX_TOKENS`] when unset.
+    pub fn max_tokens(mut self, max_tokens: u32) -> Self {
+        self.max_tokens = Some(max_tokens);
+        self
+    }
+
+    /// Override the HTTP request timeout for LLM API calls. Defaults to
+    /// [`zeroclaw_api::model_provider::BASELINE_TIMEOUT_SECS`] when unset.
+    pub fn timeout_secs(mut self, timeout_secs: u64) -> Self {
+        self.timeout_secs = Some(timeout_secs);
+        self
+    }
+
+    pub fn build(self) -> AnthropicModelProvider {
+        AnthropicModelProvider {
+            alias: self.alias,
+            credential: self.credential,
+            base_url: self.base_url.unwrap_or_else(|| BASE_URL.to_string()),
+            max_tokens: self
+                .max_tokens
+                .unwrap_or(zeroclaw_api::model_provider::BASELINE_MAX_TOKENS),
+            timeout_secs: self
+                .timeout_secs
+                .unwrap_or(zeroclaw_api::model_provider::BASELINE_TIMEOUT_SECS),
+            schema_cache: zeroclaw_api::schema::SchemaCleanCache::new(),
         }
     }
+}
 
-    /// Override the maximum output tokens for API requests.
-    pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
-        self.max_tokens = max_tokens;
-        self
+impl AnthropicModelProvider {
+    /// Entry point. Only `alias` is required; every other field is set
+    /// via a labelled chain method on the returned [`AnthropicBuilder`].
+    pub fn builder(alias: &str) -> AnthropicBuilder {
+        AnthropicBuilder {
+            alias: alias.to_string(),
+            credential: None,
+            base_url: None,
+            max_tokens: None,
+            timeout_secs: None,
+        }
     }
 
     fn is_setup_token(token: &str) -> bool {
@@ -278,12 +325,6 @@ impl AnthropicModelProvider {
         credential: &str,
     ) -> reqwest::RequestBuilder {
         let is_setup = Self::is_setup_token(credential);
-        // Diagnostic for "401 invalid x-api-key" mysteries: when a provider
-        // is sending a credential the upstream rejects, this is the only
-        // line that nails what bytes actually went out. Logs header kind,
-        // length, first 8 chars (enough to identify api03 vs oat01 vs an
-        // accidental enc2: blob) and last 4 (smudge for tail integrity).
-        // No full credential — that stays out of logs.
         let len = credential.len();
         let head: String = credential.chars().take(8).collect();
         let tail: String = credential
@@ -355,7 +396,7 @@ impl AnthropicModelProvider {
         }
     }
 
-    fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
+    fn convert_tools(&self, tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
         let items = tools?;
         if items.is_empty() {
             return None;
@@ -365,7 +406,9 @@ impl AnthropicModelProvider {
             .map(|tool| NativeToolSpec {
                 name: tool.name.clone(),
                 description: tool.description.clone(),
-                input_schema: zeroclaw_api::schema::SchemaCleanr::clean_shared(
+                // Cleaned at most once per registered schema per provider
+                // instance (memoized), then `Arc`-shared into every request body.
+                input_schema: self.schema_cache.clean_shared(
                     &tool.parameters,
                     zeroclaw_api::schema::CleaningStrategy::Anthropic,
                 ),
@@ -698,22 +741,6 @@ impl AnthropicModelProvider {
         let mut tool_calls = Vec::new();
 
         let usage = response.usage.map(|u| {
-            // Anthropic's three input buckets are DISJOINT per
-            // https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching
-            //
-            //   total_input_tokens = cache_read_input_tokens
-            //                      + cache_creation_input_tokens
-            //                      + input_tokens
-            //
-            // Anthropic's `input_tokens` is the tokens AFTER the last cache
-            // breakpoint, not the total prompt. The other two are tokens
-            // before the breakpoint (read from cache vs. being written now).
-            //
-            // Our internal TokenUsage contract is that `input_tokens` is the
-            // *total* prompt sent to the model. Sum all three to normalize.
-            // `cached_input_tokens` is reported as the cache-read portion
-            // (the discounted-billing subset of the total) — this matches
-            // what billable_uncached_input = input - cached expects.
             let uncached = u.input_tokens.unwrap_or(0);
             let cache_read = u.cache_read_input_tokens.unwrap_or(0);
             let cache_create = u.cache_creation_input_tokens.unwrap_or(0);
@@ -740,11 +767,6 @@ impl AnthropicModelProvider {
                     }
                 }
                 "thinking" => {
-                    // Store thinking text byte-for-byte: the signature is
-                    // computed over the exact bytes the model returned, so
-                    // any mutation (including trim()) invalidates it on
-                    // replay. Only skip when the provider returns genuinely
-                    // empty content.
                     if let Some(thinking) = block.thinking.as_deref().or(block.text.as_deref())
                         && !thinking.is_empty()
                     {
@@ -842,9 +864,23 @@ impl AnthropicModelProvider {
     fn http_client(&self) -> Client {
         zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
             "model_provider.anthropic",
-            120,
+            self.timeout_secs,
             10,
         )
+    }
+
+    /// Streaming requests have no whole-request deadline. Header acquisition
+    /// and buffered error bodies are bounded separately, while successful SSE
+    /// bodies use the shared byte-idle timeout.
+    fn streaming_http_client(&self) -> Result<Client, reqwest::Error> {
+        let builder = Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .read_timeout(STREAM_IDLE_TIMEOUT);
+        let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
+            builder,
+            "model_provider.anthropic",
+        );
+        builder.build()
     }
 
     /// Build a streaming request body from a `NativeChatRequest`.
@@ -885,25 +921,16 @@ impl AnthropicModelProvider {
         let mut tool_name: Option<String> = None;
         let mut tool_input_json = String::new();
 
-        // Anthropic emits usage in two places: `message_start` carries the
-        // input-token count + prompt-cache reads; `message_delta` carries
-        // running output-token totals (each delta supersedes the prior). We
-        // capture both, then emit one `StreamEvent::Usage` at `message_stop`
-        // so the gateway accumulator and `record_turn_cost()` see the same
-        // signal Anthropic sends — closes the original #6001 live repro,
-        // which was Anthropic-shaped streaming.
         let mut input_tokens: Option<u64> = None;
         let mut output_tokens: Option<u64> = None;
         let mut cached_input_tokens: Option<u64> = None;
         let mut cache_creation_input_tokens: Option<u64> = None;
 
-        let mut saw_stop_reason = false;
-
         loop {
-            let line = match tokio::time::timeout(SSE_IDLE_TIMEOUT, lines.next_line()).await {
-                Ok(Ok(Some(line))) => line,
-                Ok(Ok(None)) => break,
-                Ok(Err(err)) => {
+            let line = match lines.next_line().await {
+                Ok(Some(line)) => line,
+                Ok(None) => break,
+                Err(err) => {
                     ::zeroclaw_log::record!(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -916,24 +943,6 @@ impl AnthropicModelProvider {
                     );
                     let _ = tx
                         .send(Err(StreamError::Http(format!("SSE read error: {err}"))))
-                        .await;
-                    return;
-                }
-                Err(_) => {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "idle_secs": SSE_IDLE_TIMEOUT.as_secs(),
-                            })),
-                        "stream: SSE idle timeout — connection stalled, aborting stream"
-                    );
-                    let _ = tx
-                        .send(Err(StreamError::Http(format!(
-                            "SSE stream stalled: no data for {}s",
-                            SSE_IDLE_TIMEOUT.as_secs()
-                        ))))
                         .await;
                     return;
                 }
@@ -1067,9 +1076,6 @@ impl AnthropicModelProvider {
                         .and_then(|d| d.get("stop_reason"))
                         .and_then(|s| s.as_str())
                         .unwrap_or("none");
-                    if stop_reason != "none" {
-                        saw_stop_reason = true;
-                    }
                     // Anthropic's running-total: each `message_delta`
                     // supersedes the previous one, so we always overwrite.
                     let observed_output = event
@@ -1105,13 +1111,6 @@ impl AnthropicModelProvider {
                         || cached_input_tokens.is_some()
                         || cache_creation_input_tokens.is_some()
                     {
-                        // Normalize to TokenUsage contract: `input_tokens` is
-                        // the *total* prompt size. Anthropic reports three
-                        // DISJOINT buckets per
-                        // https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching:
-                        //   total = cache_read + cache_creation + input_tokens
-                        // where `input_tokens` from the API is "tokens after
-                        // the last cache breakpoint", not the total.
                         let uncached = input_tokens.unwrap_or(0);
                         let cache_read = cached_input_tokens.unwrap_or(0);
                         let cache_create = cache_creation_input_tokens.unwrap_or(0);
@@ -1146,7 +1145,7 @@ impl AnthropicModelProvider {
             }
         }
 
-        crate::stream_guard::finish_sse_stream(tx, saw_stop_reason, "message_stop").await;
+        crate::stream_guard::finish_sse_stream(tx, false, "message_stop").await;
     }
 }
 
@@ -1271,7 +1270,7 @@ impl ModelProvider for AnthropicModelProvider {
             .try_with(Clone::clone)
             .ok()
             .flatten();
-        let native_tools = Self::convert_tools(request.tools);
+        let native_tools = self.convert_tools(request.tools);
         let tools_count = native_tools.as_ref().map_or(0, Vec::len);
         let tool_choice = if native_tools.is_some() {
             tool_choice_override.map(|tc| serde_json::json!({ "type": tc }))
@@ -1464,7 +1463,7 @@ impl ModelProvider for AnthropicModelProvider {
             .try_with(Clone::clone)
             .ok()
             .flatten();
-        let native_tools = Self::convert_tools(request.tools);
+        let native_tools = self.convert_tools(request.tools);
         let tools_count = native_tools.as_ref().map_or(0, Vec::len);
         let tool_choice = if native_tools.is_some() {
             tool_choice_override.map(|tc| serde_json::json!({ "type": tc }))
@@ -1481,15 +1480,6 @@ impl ModelProvider for AnthropicModelProvider {
         let (effective_temperature, thinking_config, effective_max_tokens) =
             self.resolve_thinking(request.thinking, temperature, model);
 
-        // When native thinking is enabled, streamed `thinking_delta` /
-        // `signature_delta` SSE events are not yet parsed into
-        // `reasoning_content`, which means a tool-use turn could emit a
-        // tool call without preserving the signed thinking block that
-        // justified it — breaking Anthropic's signature round-trip. Fall
-        // back to a non-streaming request so `parse_native_response` can
-        // preserve the signed blocks, and synthesize a short stream from
-        // the completed response. Full streaming thinking_delta
-        // preservation is tracked as a follow-up.
         if thinking_config.is_some() {
             ::zeroclaw_log::record!(
                 INFO,
@@ -1562,11 +1552,6 @@ impl ModelProvider for AnthropicModelProvider {
             .flat_map(|result| match result {
                 Ok(resp) => {
                     let mut events: Vec<StreamResult<StreamEvent>> = Vec::new();
-                    // Emit signed thinking blocks first via `StreamChunk.reasoning`
-                    // so the agent loop can accumulate them into
-                    // `ChatResponse.reasoning_content` for multi-turn replay.
-                    // Anthropic requires signed thinking blocks to precede
-                    // tool-use blocks in conversation history.
                     if let Some(rc) = resp.reasoning_content {
                         events.push(Ok(StreamEvent::TextDelta(StreamChunk {
                             delta: String::new(),
@@ -1629,9 +1614,19 @@ impl ModelProvider for AnthropicModelProvider {
                     .boxed();
             }
         };
-        let client = self.http_client();
+        let client = match self.streaming_http_client() {
+            Ok(client) => client,
+            Err(error) => {
+                let message = format!(
+                    "Failed to build Anthropic streaming client: {}",
+                    super::format_error_chain(&error)
+                );
+                return stream::once(async move { Err(StreamError::Http(message)) }).boxed();
+            }
+        };
         let url = format!("{}/v1/messages", self.base_url);
         let is_oauth = Self::is_setup_token(&credential);
+        let phase_timeout = std::time::Duration::from_secs(self.timeout_secs);
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
 
@@ -1640,7 +1635,7 @@ impl ModelProvider for AnthropicModelProvider {
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Spawn)
                 .with_category(::zeroclaw_log::EventCategory::Provider)
                 .with_attrs(::serde_json::json!({
-                    "idle_timeout_secs": SSE_IDLE_TIMEOUT.as_secs(),
+                    "idle_timeout_secs": STREAM_IDLE_TIMEOUT.as_secs(),
                     "channel_capacity": 64,
                 })),
             "stream: spawning detached Anthropic SSE parser task"
@@ -1665,11 +1660,20 @@ impl ModelProvider for AnthropicModelProvider {
                 req = req.header("x-api-key", &credential);
             }
 
-            let response = match req.send().await {
-                Ok(r) => r,
-                Err(e) => {
+            let response = match tokio::time::timeout(phase_timeout, req.send()).await {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
                     let _ = tx
                         .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                        .await;
+                    return;
+                }
+                Err(_) => {
+                    let _ = tx
+                        .send(Err(StreamError::Http(format!(
+                            "streaming response headers not received within {}s",
+                            phase_timeout.as_secs()
+                        ))))
                         .await;
                     return;
                 }
@@ -1677,10 +1681,14 @@ impl ModelProvider for AnthropicModelProvider {
 
             if !response.status().is_success() {
                 let status = response.status();
-                let error = response
-                    .text()
-                    .await
-                    .unwrap_or_else(|_| format!("HTTP error: {status}"));
+                let error = match tokio::time::timeout(phase_timeout, response.text()).await {
+                    Ok(Ok(body)) => body,
+                    Ok(Err(error)) => format!("error response body read failed: {error}"),
+                    Err(_) => format!(
+                        "error response body not received within {}s",
+                        phase_timeout.as_secs()
+                    ),
+                };
                 let _ = tx
                     .send(Err(StreamError::ModelProvider(format!(
                         "{status}: {error}"
@@ -1695,7 +1703,7 @@ impl ModelProvider for AnthropicModelProvider {
         // The guard travels inside the unfold state so it is dropped at the
         // exact moment the consumer drops the stream — turning a turn cancel
         // (or normal completion) into an immediate parser-task abort instead
-        // of a leaked socket that lingers until SSE_IDLE_TIMEOUT.
+        // of a leaked socket that lingers until STREAM_IDLE_TIMEOUT.
         let guard = AbortOnDrop::new(parser_handle.abort_handle());
         stream::unfold((rx, guard), |(mut rx, guard)| async move {
             rx.recv().await.map(|event| (event, (rx, guard)))
@@ -1722,14 +1730,6 @@ mod tests {
     use super::*;
     use crate::auth::anthropic_token::{AnthropicAuthKind, detect_auth_kind};
 
-    /// Fake Anthropic SSE stream covering the message_start → content → delta
-    /// → stop sequence with usage in both the start frame and the stop delta.
-    /// Each `data:` line is one Anthropic event per the streaming spec.
-    ///
-    /// The usage frame includes all three disjoint input buckets
-    /// (input_tokens=314 after-breakpoint, cache_read=42, cache_creation=100)
-    /// so the test exercises the documented Anthropic formula:
-    ///   total = cache_read + cache_creation + input_tokens
     fn fake_anthropic_sse() -> &'static [u8] {
         b"event: message_start\n\
 data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-5\",\"usage\":{\"input_tokens\":314,\"cache_read_input_tokens\":42,\"cache_creation_input_tokens\":100}}}\n\n\
@@ -1747,7 +1747,7 @@ data: {\"type\":\"message_stop\"}\n\n"
 
     #[tokio::test]
     async fn streaming_usage_emitted_before_final() {
-        // The original #6001 live repro was Anthropic streaming; before this
+        // The originallive repro was Anthropic streaming; before this
         // PR the message_start / message_delta usage frames were only logged
         // at DEBUG and never surfaced as `StreamEvent::Usage`. Now they are.
         use std::io::Cursor;
@@ -1856,50 +1856,10 @@ data: {\"type\":\"message_stop\"}\n\n"
     }
 
     #[tokio::test(start_paused = true)]
-    async fn stalled_stream_times_out_instead_of_hanging() {
-        // Repro: connection delivers message_start then goes silent. The
-        // parser must surface a retryable StreamError rather than parking on
-        // next_line() forever (the "stuck on working" hang).
-        let start = b"event: message_start\n\
-data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude\",\"usage\":{\"input_tokens\":1}}}\n\n"
-            .to_vec();
-        let reader = tokio::io::BufReader::new(StallAfterReader {
-            data: std::io::Cursor::new(start),
-            drained: false,
-        });
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
-
-        let parser = ::zeroclaw_spawn::spawn!(async move {
-            AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx).await;
-        });
-
-        // Let the parser run until it parks on the stalled read before we
-        // jump virtual time forward.
-        tokio::task::yield_now().await;
-        // Advance virtual time past the idle bound; the parser should wake,
-        // emit an error, and return — closing the channel.
-        tokio::time::advance(SSE_IDLE_TIMEOUT + std::time::Duration::from_secs(1)).await;
-
-        let mut last_err = None;
-        while let Some(ev) = rx.recv().await {
-            if let Err(e) = ev {
-                last_err = Some(e);
-            }
-        }
-        parser.await.expect("parser task must finish, not hang");
-
-        let err = last_err.expect("a StreamError must be emitted on stall");
-        assert!(
-            matches!(err, StreamError::Http(ref m) if m.contains("stalled")),
-            "expected stalled-stream Http error, got: {err:?}"
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
     async fn dropping_guard_aborts_parser_without_idle_wait() {
         // The full-measure fix: dropping the consumer stream must abort the
         // detached parser immediately (turn cancel), not leak the socket until
-        // SSE_IDLE_TIMEOUT. We model the stream's lifetime with AbortOnDrop and
+        // STREAM_IDLE_TIMEOUT. We model the stream's lifetime with AbortOnDrop and
         // assert the task is aborted the instant the guard drops.
         let start = b"event: message_start\n\
 data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude\",\"usage\":{\"input_tokens\":1}}}\n\n"
@@ -1923,7 +1883,7 @@ data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\"
             "parser must still be running (parked on the stalled read) before drop"
         );
 
-        // Dropping the guard must abort the parser — no SSE_IDLE_TIMEOUT wait.
+        // Dropping the guard must abort the parser — no STREAM_IDLE_TIMEOUT wait.
         drop(guard);
         tokio::task::yield_now().await;
         assert!(
@@ -1933,12 +1893,80 @@ data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\"
     }
 
     #[tokio::test]
+    async fn successful_stream_can_outlive_configured_request_timeout() {
+        use axum::{Router, response::IntoResponse, routing::post};
+        use futures_util::StreamExt as _;
+
+        let app = Router::new().route(
+            "/v1/messages",
+            post(|| async {
+                let first = futures_util::stream::once(async {
+                    Ok::<_, std::convert::Infallible>(axum::body::Bytes::from_static(
+                        b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+                    ))
+                });
+                let terminal = futures_util::stream::once(async {
+                    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+                    Ok::<_, std::convert::Infallible>(axum::body::Bytes::from_static(
+                        b"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\ndata: {\"type\":\"message_stop\"}\n\n",
+                    ))
+                });
+                axum::body::Body::from_stream(first.chain(terminal)).into_response()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind Anthropic SSE test server");
+        let addr = listener.local_addr().expect("Anthropic SSE test address");
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve Anthropic SSE test");
+        });
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .base_url(&format!("http://{addr}"))
+            .timeout_secs(1)
+            .build();
+        let messages = vec![ChatMessage::user("hi")];
+        let mut stream = provider.stream_chat(
+            ProviderChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: None,
+            },
+            "claude-haiku-4-5",
+            None,
+            StreamOptions {
+                enabled: true,
+                count_tokens: false,
+            },
+        );
+        let mut text = String::new();
+        let mut saw_final = false;
+
+        tokio::time::timeout(std::time::Duration::from_secs(4), async {
+            while let Some(event) = stream.next().await {
+                match event.expect("successful SSE stream must not fail") {
+                    StreamEvent::TextDelta(chunk) => text.push_str(&chunk.delta),
+                    StreamEvent::Final => {
+                        saw_final = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("successful stream must finish after exceeding the request timeout");
+
+        server.abort();
+        assert_eq!(text, "hi");
+        assert!(saw_final, "message_stop must emit Final");
+    }
+
+    #[tokio::test]
     async fn eof_before_message_stop_surfaces_error_not_final() {
-        // Live repro (trace aaf558a6): the SSE socket closed mid-response
-        // after tool-result submission; the parser fell through to Final and
-        // the turn ended as an empty "final response" with no explanation.
-        // EOF without message_stop (or a stop_reason) is a truncated
-        // response and must surface a retryable error.
         use std::io::Cursor;
 
         let bytes = b"event: message_start\n\
@@ -1946,7 +1974,9 @@ data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"clau
 event: content_block_start\n\
 data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
 event: content_block_delta\n\
-data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n";
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n";
         let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
         let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
         AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx).await;
@@ -2005,7 +2035,9 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[test]
     fn creates_with_key() {
-        let p = AnthropicModelProvider::new("test", Some("anthropic-test-credential"));
+        let p = AnthropicModelProvider::builder("test")
+            .credential(Some("anthropic-test-credential"))
+            .build();
         assert!(p.credential.is_some());
         assert_eq!(p.credential.as_deref(), Some("anthropic-test-credential"));
         assert_eq!(p.base_url, "https://api.anthropic.com");
@@ -2013,51 +2045,55 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[test]
     fn creates_without_key() {
-        let p = AnthropicModelProvider::new("test", None);
+        let p = AnthropicModelProvider::builder("test").build();
         assert!(p.credential.is_none());
         assert_eq!(p.base_url, "https://api.anthropic.com");
     }
 
     #[test]
     fn creates_with_empty_key() {
-        let p = AnthropicModelProvider::new("test", Some(""));
+        let p = AnthropicModelProvider::builder("test")
+            .credential(Some(""))
+            .build();
         assert!(p.credential.is_none());
     }
 
     #[test]
     fn creates_with_whitespace_key() {
-        let p = AnthropicModelProvider::new("test", Some("  anthropic-test-credential  "));
+        let p = AnthropicModelProvider::builder("test")
+            .credential(Some("  anthropic-test-credential  "))
+            .build();
         assert!(p.credential.is_some());
         assert_eq!(p.credential.as_deref(), Some("anthropic-test-credential"));
     }
 
     #[test]
     fn creates_with_custom_base_url() {
-        let p = AnthropicModelProvider::with_base_url(
-            "test",
-            Some("anthropic-credential"),
-            Some("https://api.example.com"),
-        );
+        let p = AnthropicModelProvider::builder("test")
+            .credential(Some("anthropic-credential"))
+            .base_url("https://api.example.com")
+            .build();
         assert_eq!(p.base_url, "https://api.example.com");
         assert_eq!(p.credential.as_deref(), Some("anthropic-credential"));
     }
 
     #[test]
     fn custom_base_url_trims_trailing_slash() {
-        let p =
-            AnthropicModelProvider::with_base_url("test", None, Some("https://api.example.com/"));
+        let p = AnthropicModelProvider::builder("test")
+            .base_url("https://api.example.com/")
+            .build();
         assert_eq!(p.base_url, "https://api.example.com");
     }
 
     #[test]
     fn no_base_url_uses_published_endpoint() {
-        let p = AnthropicModelProvider::with_base_url("test", None, None);
+        let p = AnthropicModelProvider::builder("test").build();
         assert_eq!(p.base_url, "https://api.anthropic.com");
     }
 
     #[tokio::test]
     async fn chat_fails_without_key() {
-        let p = AnthropicModelProvider::new("test", None);
+        let p = AnthropicModelProvider::builder("test").build();
         let result = p
             .chat_with_system(None, "hello", "claude-3-opus", Some(0.7))
             .await;
@@ -2079,7 +2115,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[test]
     fn apply_auth_uses_bearer_and_beta_for_setup_tokens() {
-        let model_provider = AnthropicModelProvider::new("test", None);
+        let model_provider = AnthropicModelProvider::builder("test").build();
         let request = model_provider
             .apply_auth(
                 model_provider
@@ -2116,7 +2152,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[test]
     fn apply_auth_uses_x_api_key_for_regular_tokens() {
-        let model_provider = AnthropicModelProvider::new("test", None);
+        let model_provider = AnthropicModelProvider::builder("test").build();
         let request = model_provider
             .apply_auth(
                 model_provider
@@ -2140,7 +2176,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[tokio::test]
     async fn chat_with_system_fails_without_key() {
-        let p = AnthropicModelProvider::new("test", None);
+        let p = AnthropicModelProvider::builder("test").build();
         let result = p
             .chat_with_system(
                 Some("You are ZeroClaw"),
@@ -2250,7 +2286,9 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[test]
     fn resolve_thinking_drops_native_for_opus_4_7() {
-        let provider = AnthropicModelProvider::new("test", Some("test-key"));
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .build();
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
             budget_tokens: 10_000,
         };
@@ -2268,7 +2306,9 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[test]
     fn resolve_thinking_keeps_native_for_supported_models() {
-        let provider = AnthropicModelProvider::new("test", Some("test-key"));
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .build();
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
             budget_tokens: 10_000,
         };
@@ -2580,6 +2620,41 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert!(messages.is_empty());
     }
 
+    /// Provider instance for `convert_tools` tests — conversion is a `&self`
+    /// method so each schema is cleaned once through the provider's memo.
+    fn make_convert_provider() -> AnthropicModelProvider {
+        AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .build()
+    }
+
+    #[test]
+    fn convert_tools_memoizes_cleaned_schema_across_requests() {
+        let provider = make_convert_provider();
+        let tools = vec![ToolSpec::new(
+            "lookup",
+            "Look something up",
+            serde_json::json!({
+                "type": "object",
+                "properties": { "id": { "$ref": "#/$defs/Id" } },
+                "$defs": { "Id": { "type": "string" } }
+            }),
+        )];
+
+        let first = provider.convert_tools(Some(&tools)).unwrap();
+        let second = provider.convert_tools(Some(&tools)).unwrap();
+
+        assert!(
+            first[0].input_schema.get("$defs").is_none(),
+            "Anthropic strategy must resolve and strip $defs"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&first[0].input_schema, &second[0].input_schema),
+            "dirty schemas must be cleaned once and memoized — a fresh tree per \
+             request would also break tools-block prompt-cache stability"
+        );
+    }
+
     #[test]
     fn convert_tools_adds_cache_to_last_tool() {
         let tools = vec![
@@ -2591,7 +2666,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             ),
         ];
 
-        let native_tools = AnthropicModelProvider::convert_tools(Some(&tools)).unwrap();
+        let native_tools = make_convert_provider().convert_tools(Some(&tools)).unwrap();
 
         assert_eq!(native_tools.len(), 2);
         assert!(native_tools[0].cache_control.is_none());
@@ -2606,7 +2681,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             serde_json::json!({"type": "object"}),
         )];
 
-        let native_tools = AnthropicModelProvider::convert_tools(Some(&tools)).unwrap();
+        let native_tools = make_convert_provider().convert_tools(Some(&tools)).unwrap();
 
         assert_eq!(native_tools.len(), 1);
         assert!(native_tools[0].cache_control.is_some());
@@ -2635,7 +2710,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             }),
         )];
 
-        let native_tools = AnthropicModelProvider::convert_tools(Some(&tools)).unwrap();
+        let native_tools = make_convert_provider().convert_tools(Some(&tools)).unwrap();
         let schema = &native_tools[0].input_schema;
 
         let filter = &schema["properties"]["filter"];
@@ -2668,7 +2743,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             }),
         )];
 
-        let native_tools = AnthropicModelProvider::convert_tools(Some(&tools)).unwrap();
+        let native_tools = make_convert_provider().convert_tools(Some(&tools)).unwrap();
         let schema = &native_tools[0].input_schema;
 
         let filter = &schema["properties"]["filter"];
@@ -2683,13 +2758,13 @@ data: {\"type\":\"message_stop\"}\n\n";
     #[test]
     fn convert_tools_empty_tools_returns_none() {
         let tools: Vec<ToolSpec> = vec![];
-        let result = AnthropicModelProvider::convert_tools(Some(&tools));
+        let result = make_convert_provider().convert_tools(Some(&tools));
         assert!(result.is_none());
     }
 
     #[test]
     fn convert_tools_none_returns_none() {
-        let result: Option<Vec<NativeToolSpec>> = AnthropicModelProvider::convert_tools(None);
+        let result: Option<Vec<NativeToolSpec>> = make_convert_provider().convert_tools(None);
         assert!(result.is_none());
     }
 
@@ -2799,7 +2874,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[tokio::test]
     async fn warmup_without_key_is_noop() {
-        let model_provider = AnthropicModelProvider::new("test", None);
+        let model_provider = AnthropicModelProvider::builder("test").build();
         let result = model_provider.warmup().await;
         assert!(result.is_ok());
     }
@@ -2836,9 +2911,6 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(native_msgs[2].role, "user");
     }
 
-    /// Integration test: spin up a mock Anthropic API server, call chat_with_tools
-    /// with a multi-turn conversation + tools, and verify the request body contains
-    /// ALL conversation turns and native tool definitions.
     #[tokio::test]
     async fn chat_with_tools_sends_full_history_and_native_tools() {
         use axum::{Json, Router, routing::post};
@@ -2881,6 +2953,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             credential: Some("test-key".to_string()),
             base_url: format!("http://{addr}"),
             max_tokens: 4096,
+            timeout_secs: 120,
+            schema_cache: zeroclaw_api::schema::SchemaCleanCache::new(),
         };
 
         // Multi-turn conversation: system → user (Go code) → assistant (code response) → user (follow-up)
@@ -2986,14 +3060,6 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[test]
     fn native_response_sums_all_three_anthropic_input_buckets() {
-        // Per https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching:
-        //   total_input = cache_read + cache_creation + input_tokens
-        // where Anthropic's `input_tokens` is *only* the tokens after the
-        // last cache breakpoint. The three buckets are disjoint.
-        //
-        // This is the most common live shape on a long Anthropic session:
-        // huge cache_read, tiny input_tokens, occasional cache_creation as
-        // the conversation grows past the previous breakpoint.
         let json = r#"{
             "content": [{"type": "text", "text": "ok"}],
             "usage": {
@@ -3072,7 +3138,9 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[test]
     fn capabilities_returns_vision_and_native_tools() {
-        let model_provider = AnthropicModelProvider::new("test", Some("test-key"));
+        let model_provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .build();
         let caps = model_provider.capabilities();
         assert!(
             caps.native_tool_calling,
@@ -3303,7 +3371,6 @@ data: {\"type\":\"message_stop\"}\n\n";
             "orphaned tool_use should be answered by a synthesized tool_result"
         );
 
-        // The tool_result must lead its message (before sibling text).
         assert!(
             matches!(
                 next.content.first(),
@@ -3389,5 +3456,67 @@ data: {\"type\":\"message_stop\"}\n\n";
                 window[0].role
             );
         }
+    }
+
+    #[tokio::test]
+    async fn anthropic_factory_forwards_timeout_to_native_provider() {
+        use crate::ModelProviderRuntimeOptions;
+        use crate::factory::FamilyProviderFactory;
+        use axum::{Json, Router, routing::post};
+        use serde_json::json;
+        use tokio::time::{Duration, Instant};
+        use zeroclaw_config::schema::AnthropicModelProviderConfig;
+
+        async fn slow_messages() -> Json<serde_json::Value> {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            Json(json!({
+                "id": "msg_late",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "too late"}],
+                "model": "claude-sonnet-4-5",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            }))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("test server addr");
+        let app = Router::new().route("/v1/messages", post(slow_messages));
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.expect("serve test server");
+        });
+
+        let opts = ModelProviderRuntimeOptions {
+            provider_timeout_secs: Some(1),
+            ..Default::default()
+        };
+        let provider = AnthropicModelProviderConfig::default()
+            .create_provider(
+                "native",
+                Some("test-key"),
+                Some(&format!("http://{addr}")),
+                &opts,
+            )
+            .expect("anthropic provider should build");
+
+        let started = Instant::now();
+        let result = provider
+            .chat_with_system(None, "hello", "claude-sonnet-4-5", Some(0.7))
+            .await;
+        let elapsed = started.elapsed();
+
+        server.abort();
+
+        assert!(
+            result.is_err(),
+            "slow response should time out when factory forwards provider_timeout_secs"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "request waited for the server response instead of using configured timeout: {elapsed:?}"
+        );
     }
 }

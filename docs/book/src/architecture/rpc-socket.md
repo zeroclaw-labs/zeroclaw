@@ -45,7 +45,7 @@ named pipes carry the same byte stream as Unix sockets.
 
 ```
 {"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":1},"id":1}\n
-{"jsonrpc":"2.0","result":{"protocolVersion":1,"serverVersion":"0.8.2"},"id":1}\n
+{"jsonrpc":"2.0","result":{"protocolVersion":1,"serverVersion":"0.8.4"},"id":1}\n
 ```
 
 ## Handshake
@@ -76,12 +76,38 @@ the operating system:
 | Method | Direction | Description |
 |---|---|---|
 | `initialize` | client -> daemon | Authenticate and negotiate protocol version |
-| `session/new` | client -> daemon | Create an agent session (requires `agentAlias`, optional `cwd`, `sessionId`) |
+| `session/new` | client -> daemon | Create an agent session (requires `agentAlias`, optional `cwd`, `sessionId`; optional `keep_siblings` suppresses the idle same-mode sibling eviction for multi-session clients that manage sibling lifecycle themselves) |
 | `session/close` | client -> daemon | Close and clean up a session |
 | `session/prompt` | client -> daemon | Run a turn (streamed via `session/update` notifications) |
 | `session/cancel` | client -> daemon | Cancel an in-flight turn |
 | `status` | client -> daemon | Server version, protocol version, active session list |
 | `session/update` | daemon -> client | Streaming notification during a turn (text chunks, tool calls, approvals) |
+| `elicitation/create` | daemon -> client | Request interactive input for ask-user and poll flows |
+
+### Bidirectional requests
+
+Either side may send a request on the established socket. The receiver must
+answer with the same `id` and exactly one of `result` or `error`. Outbound
+requests use `zc-out-<number>` IDs. Correlation remains directional: each peer
+matches responses only against its own pending-request map, so the same textual
+ID can be in flight independently in opposite directions.
+
+```json
+{"jsonrpc":"2.0","method":"elicitation/create","params":{"message":"Continue?"},"id":"zc-out-0"}
+{"jsonrpc":"2.0","result":{"action":"accept","content":{"answer":"yes"}},"id":"zc-out-0"}
+```
+
+An explicit `"result": null` is a successful response and still resolves the
+pending caller. An `error` object resolves it as a failure. If the peer does not
+answer, the initiating ask-user or poll operation retains its existing timeout
+behavior.
+
+Every frame must be a JSON object with `"jsonrpc": "2.0"`. Requests require a
+string `method`; when present, `params` must be an object or array. Responses
+require a string, numeric, or null `id` and exactly one response member. Invalid
+JSON produces `-32700` (parse error). Valid JSON with an invalid JSON-RPC shape
+produces `-32600` (invalid request). Unknown response IDs are logged without
+frame contents and ignored rather than answered, preventing response loops.
 
 ### Turn streaming
 

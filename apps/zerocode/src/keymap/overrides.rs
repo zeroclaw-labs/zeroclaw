@@ -1,10 +1,4 @@
 //! Runtime keybinding overrides.
-//!
-//! A single process-global table, keyed by each action enum's `TAG`,
-//! mapping a variant's snake_case name to its overridden chords. Read
-//! only inside the generated `resolved_bindings()`, so every consumer's
-//! `from_chord` call site stays unchanged. Populated at startup from the
-//! local config and re-populated on preset pick / capture-modal save.
 
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -47,7 +41,6 @@ pub fn set_row(tag: &str, variant: &str, chords: Vec<Chord>) {
     }
 }
 
-/// Reset to no overrides — test isolation only.
 #[cfg(test)]
 fn reset() {
     if let Ok(mut guard) = ACTIVE.write() {

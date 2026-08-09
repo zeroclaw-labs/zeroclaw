@@ -1,8 +1,4 @@
 //! Shared JSON-RPC 2.0 types for the ACP server and runtime RPC layer.
-//!
-//! Extracted from `zeroclaw-channels::orchestrator::acp_server` so both the
-//! ACP stdio channel and the Unix socket RPC transport can share the same
-//! wire types without cross-crate dependency.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -33,20 +29,14 @@ pub mod field {
 
 // ── Wire types ───────────────────────────────────────────────────
 
-/// A JSON-RPC 2.0 frame that can represent either a request or response.
-/// Used for deserializing bidirectional RPC traffic where incoming frames
-/// may be responses to our outbound requests.
-///
-/// The custom Deserialize impl preserves explicit `result: null` as `Some(Value::Null)`
-/// so valid JSON-RPC 2.0 success responses are not silently dropped.
+/// A validated inbound JSON-RPC 2.0 frame.
 #[derive(Debug)]
-pub struct JsonRpcFrame {
-    pub jsonrpc: String,
-    pub method: Option<String>,
-    pub params: Option<Value>,
-    pub id: Option<Value>,
-    pub result: Option<Value>,
-    pub error: Option<JsonRpcError>,
+pub enum JsonRpcFrame {
+    Request(JsonRpcRequest),
+    Response {
+        id: Value,
+        result: Result<Value, JsonRpcError>,
+    },
 }
 
 impl<'de> Deserialize<'de> for JsonRpcFrame {
@@ -60,70 +50,83 @@ impl<'de> Deserialize<'de> for JsonRpcFrame {
             .as_object_mut()
             .ok_or_else(|| D::Error::custom("JsonRpcFrame must be a JSON object"))?;
 
-        let jsonrpc = match obj.remove(field::JSONRPC) {
-            Some(Value::String(s)) => s,
+        match obj.remove(field::JSONRPC) {
+            Some(Value::String(version)) if version == JSONRPC_VERSION => {}
+            Some(Value::String(_)) => {
+                return Err(D::Error::custom("jsonrpc field must equal 2.0"));
+            }
             Some(_) => return Err(D::Error::custom("jsonrpc field must be a string")),
             None => return Err(D::Error::missing_field(field::JSONRPC)),
-        };
+        }
 
-        let method = match obj.remove(field::METHOD) {
-            Some(Value::String(s)) => Some(s),
-            Some(Value::Null) | None => None,
-            Some(_) => return Err(D::Error::custom("method field must be a string")),
-        };
-
+        let method = obj.remove(field::METHOD);
         let params = obj.remove(field::PARAMS);
         let id = obj.remove(field::ID);
-
-        // Result: remove field; explicit null is preserved as Some(Value::Null).
         let result = obj.remove(field::RESULT);
+        let error = obj.remove(field::ERROR);
 
-        // Error: remove field, attempt deserialization, transpose Option<Result> to Result<Option>.
-        let error = obj
-            .remove(field::ERROR)
-            .map(serde_json::from_value::<JsonRpcError>)
-            .transpose()
-            .map_err(D::Error::custom)?;
+        if let Some(method) = method {
+            let Value::String(method) = method else {
+                return Err(D::Error::custom("method field must be a string"));
+            };
+            if result.is_some() || error.is_some() {
+                return Err(D::Error::custom(
+                    "request frames cannot contain result or error",
+                ));
+            }
+            if id.as_ref().is_some_and(|id| !is_valid_jsonrpc_id(id)) {
+                return Err(D::Error::custom("id must be a string, number, or null"));
+            }
+            if params
+                .as_ref()
+                .is_some_and(|params| !params.is_object() && !params.is_array())
+            {
+                return Err(D::Error::custom(
+                    "params must be an object or array when present",
+                ));
+            }
+            return Ok(Self::Request(JsonRpcRequest {
+                jsonrpc: JSONRPC_VERSION.to_string(),
+                method,
+                params: params.unwrap_or_default(),
+                id,
+            }));
+        }
 
-        Ok(JsonRpcFrame {
-            jsonrpc,
-            method,
-            params,
-            id,
-            result,
-            error,
-        })
+        if params.is_some() {
+            return Err(D::Error::custom("response frames cannot contain params"));
+        }
+        let id = id.ok_or_else(|| D::Error::missing_field(field::ID))?;
+        if !is_valid_jsonrpc_id(&id) {
+            return Err(D::Error::custom("id must be a string, number, or null"));
+        }
+
+        match (result, error) {
+            (Some(result), None) => Ok(Self::Response {
+                id,
+                result: Ok(result),
+            }),
+            (None, Some(error)) => Ok(Self::Response {
+                id,
+                result: Err(serde_json::from_value(error).map_err(D::Error::custom)?),
+            }),
+            (Some(_), Some(_)) => Err(D::Error::custom(
+                "response frames must not contain both result and error",
+            )),
+            (None, None) => Err(D::Error::custom(
+                "frame must contain a method or exactly one response member",
+            )),
+        }
     }
 }
 
-impl JsonRpcFrame {
-    /// Whether this frame is a response to an outbound request: no method,
-    /// and a `result` or `error` field was present (including explicit null).
-    pub fn is_response(&self) -> bool {
-        self.method.is_none() && (self.result.is_some() || self.error.is_some())
-    }
-
-    /// The response result value when present (including explicit null),
-    /// otherwise None.
-    pub fn response_result(&self) -> Option<&Value> {
-        self.result.as_ref()
-    }
-
-    /// The request method (for incoming client requests).
-    pub fn request_method(&self) -> Option<&str> {
-        self.method.as_deref()
-    }
-
-    /// The request params (for incoming client requests).
-    pub fn request_params(&self) -> Option<&Value> {
-        self.params.as_ref()
-    }
+fn is_valid_jsonrpc_id(id: &Value) -> bool {
+    matches!(id, Value::String(_) | Value::Number(_) | Value::Null)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct JsonRpcRequest {
     pub jsonrpc: String,
-    #[serde(default)]
     pub method: String,
     #[serde(default)]
     pub params: Value,
@@ -215,12 +218,6 @@ pub const ACP_PROTOCOL_VERSION: u64 = 1;
 
 type PendingResponder = oneshot::Sender<std::result::Result<Value, JsonRpcError>>;
 
-/// Writer + outbound-call tracker shared between server loops and
-/// per-session bridges (e.g. AcpChannel, RpcDispatcher).
-///
-/// All writes go through `writer_tx` so concurrent notifications and
-/// outbound requests cannot interleave bytes. Outbound requests get string
-/// ids (`zc-out-<n>`) disjoint from any client-issued id space.
 #[derive(Debug)]
 pub struct RpcOutbound {
     writer_tx: mpsc::Sender<String>,
@@ -315,26 +312,35 @@ impl RpcOutbound {
         })
     }
 
-    /// Route an inbound JSON-RPC response to its pending caller.
-    pub fn dispatch_response(
+    /// Route an already validated JSON-RPC response to its pending caller.
+    /// Returns whether a matching pending request existed.
+    pub fn dispatch_validated_response(
         &self,
         id_str: &str,
-        result: Option<Value>,
-        error: Option<JsonRpcError>,
-    ) {
+        result: std::result::Result<Value, JsonRpcError>,
+    ) -> bool {
         let responder = self
             .pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(id_str);
-        if let Some(tx) = responder {
-            let payload = if let Some(err) = error {
-                Err(err)
-            } else {
-                Ok(result.unwrap_or(Value::Null))
-            };
-            let _ = tx.send(payload);
-        }
+        let Some(tx) = responder else {
+            return false;
+        };
+        let _ = tx.send(result);
+        true
+    }
+
+    /// Route a response assembled by an internal caller.
+    /// Returns whether a matching pending request existed.
+    pub fn dispatch_response(
+        &self,
+        id_str: &str,
+        result: Option<Value>,
+        error: Option<JsonRpcError>,
+    ) -> bool {
+        let result = error.map_or_else(|| Ok(result.unwrap_or(Value::Null)), Err);
+        self.dispatch_validated_response(id_str, result)
     }
 
     /// Number of in-flight outbound requests awaiting responses.
@@ -514,9 +520,11 @@ mod tests {
         let json = r#"{"jsonrpc":"2.0","id":"zc-out-5","result":{"answer":42}}"#;
         let frame: JsonRpcFrame = serde_json::from_str(json).unwrap();
 
-        assert!(frame.is_response());
-        assert_eq!(frame.response_result(), Some(&json!({"answer": 42})));
-        assert!(frame.request_method().is_none());
+        let JsonRpcFrame::Response { id, result } = frame else {
+            panic!("expected response");
+        };
+        assert_eq!(id, json!("zc-out-5"));
+        assert_eq!(result.unwrap(), json!({"answer": 42}));
     }
 
     #[test]
@@ -525,10 +533,11 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":"zc-out-3","error":{"code":-32601,"message":"not found"}}"#;
         let frame: JsonRpcFrame = serde_json::from_str(json).unwrap();
 
-        assert!(frame.is_response());
-        assert!(frame.response_result().is_none());
-        assert!(frame.error.is_some());
-        assert_eq!(frame.error.as_ref().unwrap().code, -32601);
+        let JsonRpcFrame::Response { id, result } = frame else {
+            panic!("expected response");
+        };
+        assert_eq!(id, json!("zc-out-3"));
+        assert_eq!(result.unwrap_err().code, -32601);
     }
 
     #[test]
@@ -536,10 +545,12 @@ mod tests {
         let json = r#"{"jsonrpc":"2.0","method":"ping","params":{"v":1},"id":"client-1"}"#;
         let frame: JsonRpcFrame = serde_json::from_str(json).unwrap();
 
-        assert!(!frame.is_response());
-        assert_eq!(frame.request_method(), Some("ping"));
-        assert_eq!(frame.request_params(), Some(&json!({"v": 1})));
-        assert_eq!(frame.id, Some(json!("client-1")));
+        let JsonRpcFrame::Request(req) = frame else {
+            panic!("expected request");
+        };
+        assert_eq!(req.method, "ping");
+        assert_eq!(req.params, json!({"v": 1}));
+        assert_eq!(req.id, Some(json!("client-1")));
     }
 
     #[test]
@@ -548,9 +559,11 @@ mod tests {
         let json = r#"{"jsonrpc":"2.0","method":"ping","id":42}"#;
         let frame: JsonRpcFrame = serde_json::from_str(json).unwrap();
 
-        assert!(!frame.is_response());
-        assert_eq!(frame.request_method(), Some("ping"));
-        assert_eq!(frame.id, Some(json!(42)));
+        let JsonRpcFrame::Request(req) = frame else {
+            panic!("expected request");
+        };
+        assert_eq!(req.method, "ping");
+        assert_eq!(req.id, Some(json!(42)));
     }
 
     #[test]
@@ -558,9 +571,12 @@ mod tests {
         let json = r#"{"jsonrpc":"2.0","method":"log","params":{"msg":"hello"}}"#;
         let frame: JsonRpcFrame = serde_json::from_str(json).unwrap();
 
-        assert!(!frame.is_response());
-        assert_eq!(frame.request_method(), Some("log"));
-        assert!(frame.id.is_none());
+        let JsonRpcFrame::Request(req) = frame else {
+            panic!("expected notification");
+        };
+        assert_eq!(req.method, "log");
+        assert_eq!(req.params, json!({"msg": "hello"}));
+        assert!(req.id.is_none());
     }
 
     #[test]
@@ -568,9 +584,11 @@ mod tests {
         let json = r#"{"jsonrpc":"2.0","method":"ping","id":1}"#;
         let frame: JsonRpcFrame = serde_json::from_str(json).unwrap();
 
-        assert!(!frame.is_response());
-        assert_eq!(frame.request_method(), Some("ping"));
-        assert!(frame.request_params().is_none());
+        let JsonRpcFrame::Request(req) = frame else {
+            panic!("expected request");
+        };
+        assert_eq!(req.method, "ping");
+        assert_eq!(req.params, Value::Null);
     }
 
     #[test]
@@ -578,53 +596,10 @@ mod tests {
         let json = r#"{"jsonrpc":"2.0","id":"x","result":null}"#;
         let frame: JsonRpcFrame = serde_json::from_str(json).unwrap();
 
-        assert!(frame.result.is_some());
-        assert_eq!(frame.result, Some(Value::Null));
-        assert!(frame.is_response());
-        assert_eq!(frame.response_result(), Some(&Value::Null));
-    }
-
-    #[test]
-    fn frame_empty_method_no_result_not_response() {
-        // No method, no result, no error => not a response.
-        let json = r#"{"jsonrpc":"2.0"}"#;
-        let frame: JsonRpcFrame = serde_json::from_str(json).unwrap();
-
-        assert!(!frame.is_response());
-    }
-
-    #[test]
-    fn frame_string_id_to_string_roundtrips() {
-        // Verify the dispatch path: string IDs survive to_string().
-        let json = r#"{"jsonrpc":"2.0","id":"zc-out-7","result":true}"#;
-        let frame: JsonRpcFrame = serde_json::from_str(json).unwrap();
-
-        let id_str = frame.id.as_ref().unwrap().as_str().unwrap().to_string();
-        assert_eq!(id_str, "zc-out-7");
-    }
-
-    #[test]
-    fn frame_numeric_id_to_string_for_dispatch() {
-        // Verify the dispatch path: numeric IDs convert via to_string().
-        let json = r#"{"jsonrpc":"2.0","id":99,"result":"done"}"#;
-        let frame: JsonRpcFrame = serde_json::from_str(json).unwrap();
-
-        // This is what dispatch.rs does for non-string IDs:
-        let id_str = match frame.id.as_ref().unwrap() {
-            Value::String(s) => s.clone(),
-            _ => frame.id.as_ref().unwrap().to_string(),
+        let JsonRpcFrame::Response { result, .. } = frame else {
+            panic!("expected response");
         };
-        assert_eq!(id_str, "99");
-    }
-
-    #[test]
-    fn frame_response_result_returns_none_for_error_responses() {
-        let json = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32700,"message":"parse error"}}"#;
-        let frame: JsonRpcFrame = serde_json::from_str(json).unwrap();
-
-        assert!(frame.is_response());
-        // response_result should be None even though is_response() is true
-        assert!(frame.response_result().is_none());
+        assert_eq!(result.unwrap(), Value::Null);
     }
 
     #[test]
@@ -636,14 +611,28 @@ mod tests {
     }
 
     #[test]
-    fn frame_result_null_is_detected_as_response() {
-        let json = r#"{"jsonrpc":"2.0","id":"k","result":null}"#;
-        let frame: JsonRpcFrame = serde_json::from_str(json).unwrap();
+    fn frame_rejects_invalid_envelopes() {
+        let invalid = [
+            r#"{"jsonrpc":"1.0","method":"ping","id":1}"#,
+            r#"{"jsonrpc":"2.0"}"#,
+            r#"{"jsonrpc":"2.0","method":null,"id":1}"#,
+            r#"{"jsonrpc":"2.0","method":"ping","id":1,"result":true}"#,
+            r#"{"jsonrpc":"2.0","method":"ping","params":true,"id":1}"#,
+            r#"{"jsonrpc":"2.0","method":"ping","params":null,"id":1}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":true,"error":{"code":-1,"message":"bad"}}"#,
+            r#"{"jsonrpc":"2.0","id":1}"#,
+            r#"{"jsonrpc":"2.0","result":true}"#,
+            r#"{"jsonrpc":"2.0","id":{"nested":1},"result":true}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":true,"params":{}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":"bad","message":"bad"}}"#,
+        ];
 
-        assert!(frame.is_response());
-        assert!(frame.result.is_some());
-        assert_eq!(frame.result, Some(Value::Null));
-        assert_eq!(frame.response_result(), Some(&Value::Null));
+        for json in invalid {
+            assert!(
+                serde_json::from_str::<JsonRpcFrame>(json).is_err(),
+                "invalid frame accepted: {json}"
+            );
+        }
     }
 
     #[test]
@@ -662,6 +651,11 @@ mod tests {
         assert_eq!(req.method, "m");
         assert_eq!(req.params, Value::Null);
         assert_eq!(req.id, Some(json!(1)));
+    }
+
+    #[test]
+    fn request_rejects_missing_method() {
+        assert!(serde_json::from_str::<JsonRpcRequest>(r#"{"jsonrpc":"2.0","id":1}"#).is_err());
     }
 
     #[test]

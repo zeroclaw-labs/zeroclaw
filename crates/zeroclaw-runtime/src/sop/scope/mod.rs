@@ -18,7 +18,6 @@ pub struct StepToolScope {
 }
 
 /// Resolve the additional excluded tools for an active SOP step.
-///
 /// This resolver is narrow-only: step scope can remove tools from the registry,
 /// never restore a tool already denied by the configured security policy.
 pub fn resolve_excluded(

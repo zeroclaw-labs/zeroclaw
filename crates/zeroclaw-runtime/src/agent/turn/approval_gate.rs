@@ -8,11 +8,6 @@ use crate::agent::tool_execution::ToolExecutionOutcome;
 use crate::approval::{ApprovalRequest, ApprovalRequirement, ApprovalResponse};
 use std::time::Duration;
 
-/// Outcome of [`gate_tool_approval`] for one tool call.
-///
-/// `Deny`/`Replace` carry the synthesized [`ToolExecutionOutcome`] the caller
-/// records into its `ordered_results` slot before skipping execution;
-/// `Proceed::approved` feeds `set_runtime_approved_arg`.
 pub(crate) enum ApprovalGateOutcome {
     Proceed { approved: bool },
     Deny(ToolExecutionOutcome),
@@ -45,7 +40,7 @@ pub(crate) async fn gate_tool_approval(
         // Non-interactive (channels): try the channel's inline
         // approval (e.g. Telegram inline keyboard) before falling
         // back to auto-deny.
-        let (decision, decided_by) = if mgr.is_non_interactive() {
+        let (decision, decided_by, unanswerable) = if mgr.is_non_interactive() {
             let attributed = if let Some(ch) = ctx.channel {
                 let ch_request = zeroclaw_api::channel::ChannelApprovalRequest {
                     tool_name: request.tool_name.clone(),
@@ -78,6 +73,19 @@ pub(crate) async fn gate_tool_approval(
             // back on the response itself, so attribution can't be cross-wired
             // by a concurrent approval on the same channel instance.
             let decided_by = attributed.as_ref().and_then(|a| a.decided_by.clone());
+            // Whether an operator actually decided, taken from the response's own
+            // provenance rather than inferred.
+            //
+            // `attributed.is_none()` is NOT sufficient: a fail-closed approval route
+            // returns `Some(Deny)` with no decider when the approver is missing,
+            // unreachable, silent, or timed out, and a direct channel timeout does the
+            // same. Those are runtime denials wearing an operator's clothes. Nor does
+            // `decided_by.is_none()` work, since a single non-fan-out channel leaves
+            // that `None` for a real human answer.
+            let unanswerable = attributed
+                .as_ref()
+                .map(|a| a.source.is_runtime_fail_closed())
+                .unwrap_or(true);
             let decision = match attributed.map(|a| a.response) {
                 Some(zeroclaw_api::channel::ChannelApprovalResponse::Approve) => {
                     ApprovalResponse::Yes
@@ -92,23 +100,33 @@ pub(crate) async fn gate_tool_approval(
                 // Channel doesn't support approval — auto-deny.
                 None => ApprovalResponse::No,
             };
-            (decision, decided_by)
+            (decision, decided_by, unanswerable)
         } else {
-            (mgr.prompt_cli(&request), None)
+            (mgr.prompt_cli(&request), None, false)
         };
 
-        // The approval audit records which surface decided. On the streaming
-        // path `ctx.channel` is the approval bridge fanning out to several
-        // registered back-channels, and `ctx.channel_name` is the loop's
-        // static "cli"; prefer the back-channel that actually answered (carried
-        // on the decision via `decided_by`) so a WS/ACP approval is attributed
-        // to WS/ACP, not "cli". Single channels and the CLI prompt path leave it
-        // `None` and keep `channel_name`.
         let decision_channel = decided_by.unwrap_or_else(|| ctx.channel_name.to_string());
         mgr.record_decision(tool_name, tool_args, &decision, &decision_channel);
 
         if decision == ApprovalResponse::No {
-            let denied = "Denied by user.".to_string();
+            // This string is fed back to the MODEL, so it states the outcome and
+            // stops there. It deliberately does not name the settings that would
+            // permit the call: `auto_approve` bypasses operator approval for that
+            // tool and `level = "full"` removes approval gates for every tool and
+            // drops workspace-only confinement. Putting that remedy in front of the
+            // model invites it to argue for expanding its own privileges, which is a
+            // disproportionate response to an approval channel being unavailable.
+            // Operators get the actionable advice through the WARN record below and
+            // the UI, where changing policy is actually their decision to make.
+            let denied = if unanswerable {
+                format!(
+                    "Tool call not executed: '{tool_name}' requires approval and no operator \
+                     decision was available, so the runtime denied it by policy. This was not \
+                     a user's decision."
+                )
+            } else {
+                "Denied by user.".to_string()
+            };
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
@@ -121,6 +139,20 @@ pub(crate) async fn gate_tool_approval(
                         "arguments": scrub_credentials(&tool_args.to_string()),
                         "result": denied,
                         "trace_id": ctx.turn_id,
+                        // Operator-facing only. The remedy lives here rather than
+                        // in `result`, which is shown to the model: deciding to
+                        // relax an approval policy is the operator's call, and
+                        // putting the option in front of the model would invite it
+                        // to lobby for its own privilege expansion.
+                        "denied_by_runtime": unanswerable,
+                        "operator_hint": if unanswerable {
+                            Some("No operator could be asked. Check that an approval-capable \
+                                  channel is connected and that the agent's approval route names \
+                                  a registered, reachable approver. If this tool should run \
+                                  unattended, review the agent's risk profile deliberately.")
+                        } else {
+                            None
+                        },
                     })),
                 "tool_call_result"
             );

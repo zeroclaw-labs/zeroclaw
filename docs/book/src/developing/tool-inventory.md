@@ -45,6 +45,7 @@ product integrations.
 | `ask_user`, `escalate_to_human`, `reaction`, `poll`, `channel_room` | These are channel-bridging operator interaction primitives with late-bound channel handles and receipts. |
 | `sessions_current`, `sessions_list`, `sessions_history`, `sessions_send` | Session visibility and message sending must share the daemon/gateway session backend and agent ownership boundaries. |
 | `model_routing_config`, `model_switch`, `proxy_config` | These expose the current model/proxy routing control plane and should not drift from config-source behavior. |
+| `TodoWrite` | Maintains the agent's structured task list inside the runtime tool surface; keep its stable tool name and lifecycle behavior in core. |
 | `read_skill` and skill-defined tools with `kind = "shell"`, `kind = "http"`, or `kind = "builtin"` | Skills are an intended extension surface, but the runtime bridge that turns installed skills into tools is core. |
 
 ## Feature-Gate Candidates
@@ -56,7 +57,7 @@ boundaries because they add platform, dependency, network, or UI surface area.
 |---|---|---|
 | `browser`, `browser_open`, `browser_delegate`, `text_browser` | Config-gated and runtime-dependent. | Keep first-party, but continue tightening feature/config gates because browser automation is a large trusted surface. |
 | `http_request`, `web_fetch`, `web_search_tool` | Config-gated network access. | Keep first-party while SSRF, allowlist, provider routing, and receipt behavior remain ZeroClaw-owned. Revisit only after MCP/plugin replacements can express the same network policy. |
-| SOP tools (`sop_list`, `sop_execute`, `sop_advance`, `sop_approve`, `sop_status`) | Runtime-handle gated. | Keep first-party; SOP lifecycle, approvals, and audit records are runtime state, not a generic external integration. |
+| SOP tools (`sop_list`, `sop_execute`, `sop_advance`, `sop_approve`, `sop_status`, and conditional `sop_workshop`) | Runtime-handle gated; `sop_workshop` also requires procedural memory. | Keep first-party; SOP lifecycle, approvals, procedural memory, and audit records are runtime state, not a generic external integration. |
 | WASM plugin tools | Compile-feature and config-gated host bridge. | Keep the host bridge first-party; individual plugin capabilities should live outside core. |
 | `execute_pipeline` | Config-gated tool chaining. | Keep gated until tool chaining policy, per-step receipts, and caller allowlists are stable enough to judge whether it is core. |
 | `knowledge` | Config-gated knowledge surface. | Keep gated while relationship memory and graph workflows are still being promoted into user-facing docs and skills. |
@@ -65,7 +66,7 @@ boundaries because they add platform, dependency, network, or UI surface area.
 | `screenshot`, `image_info`, `canvas` | Visual/UI tool surface. | Keep for now; classify with the visual/UI tool surface once plugin and dashboard boundaries settle. |
 | `llm_task` | Provider-dependent subtask execution. | Keep until provider-scoped subtask execution has a separate contract from delegation. |
 | `security_ops` | Config-gated security operations. | Keep gated; security operations need first-party policy visibility until a plugin can advertise equivalent permissions, receipts, and rollback. |
-| `verifiable_intent` | Config-gated trust policy. | Keep gated; intent issuance and verification affect trust policy and should stay first-party until the credential boundary is stable. |
+| `verifiable_intent` | Config-gated trust policy. **The `vi_verify` tool is temporarily withheld from the model-visible registry.** | Keep gated and first-party; intent issuance and verification affect trust policy and should stay first-party until the credential boundary is stable. No chain verifier exists yet, so `vi_verify` is not registered even when `verifiable_intent.enabled = true`; enabling the section now only emits a warning naming that gap, at process startup and again on each daemon reload. The issuance and verification library paths are unchanged. Restore registration only behind a verify-and-evaluate path that consumes a verified chain result. |
 | Hardware probes (`hardware_board_info`, `hardware_memory_map`, `hardware_memory_read`) | Peripheral-gated hardware access. | Keep first-party while hardware tools are added through the peripheral registry path and touch physical devices under ZeroClaw permission rules. |
 
 ## Externalize Later

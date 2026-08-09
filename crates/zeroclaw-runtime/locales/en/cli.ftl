@@ -76,6 +76,18 @@ cli-skills-review-summary = { "  " }💾 Skill review: {$summary}
 cli-skills-install-start = Installing skill from: {$source}
 cli-skills-install-resolving-registry = { "  " }Resolving '{$source}' from skills registry...
 cli-skills-install-resolving-extra-registry = { "  " }Resolving '{$source}' from registry '{$registry}'...
+cli-skills-install-skill-requires-git = --skill <name> requires a git repository URL as the source (got '{$source}')
+cli-skills-install-catalog-failed = failed to install skill '{$skill}' from catalog {$source}
+cli-skills-install-invalid-skill-name = invalid --skill name '{$skill}': use a bare skill name (letters, digits, '-', '_')
+cli-skills-install-catalog-clone-failed = failed to clone skill catalog {$url}
+cli-skills-install-skill-not-in-catalog-empty = skill '{$skill}' not found in {$url}: no skills/ directory, or it is empty
+cli-skills-install-skill-not-in-catalog =
+    skill '{$skill}' not found in {$url}.
+    Available skills: {$available}
+cli-skills-install-catalog-root-symlink = skill catalog {$url} has a symlinked skills/ directory; refusing to inspect it
+cli-skills-install-catalog-root-escapes = skill catalog {$url} has a skills/ directory that resolves outside the cloned catalog; refusing to inspect it
+cli-skills-install-catalog-skill-symlink = skill '{$skill}' in {$url} is a symlink; catalog skills must be real directories inside the repository
+cli-skills-install-catalog-skill-escapes = skill '{$skill}' in {$url} resolves outside the cloned catalog; refusing to install
 cli-skills-install-git-failed = failed to install git skill source: {$source}
 cli-skills-install-registry-failed = failed to install skill from registry: {$source}
 cli-skills-install-extra-registry-failed = failed to install skill from extra registry: {$source}
@@ -221,9 +233,9 @@ cli-cron-long-about =
 
     Examples:
       zeroclaw cron list
-      zeroclaw cron add '0 9 * * 1-5' 'Good morning' --tz America/New_York --agent
-      zeroclaw cron add '*/30 * * * *' 'Check system health' --agent
-      zeroclaw cron add '*/5 * * * *' 'echo ok'
+      zeroclaw cron add '0 9 * * 1-5' 'Good morning' --agent sentinel --prompt --tz America/New_York
+      zeroclaw cron add '*/30 * * * *' 'Check system health' --agent sentinel --prompt
+      zeroclaw cron add '*/5 * * * *' 'echo ok' --agent sentinel
       zeroclaw cron add-at 2025-01-15T14:00:00Z 'Send reminder' --agent
       zeroclaw cron add-every 60000 'Ping heartbeat'
       zeroclaw cron once 30m 'Run backup in 30 minutes' --agent
@@ -506,6 +518,8 @@ cli-sop-execution-mode = {"  "}Execution mode: {$value}
 cli-sop-deterministic = {"  "}Deterministic:  {$value}
 cli-sop-cooldown = {"  "}Cooldown:       {$value}s
 cli-sop-max-concurrent = {"  "}Max concurrent: {$value}
+cli-sop-admission-policy = {"  "}Admission:      {$value}
+cli-sop-max-pending-approvals = {"  "}Max pending:    {$value}
 cli-sop-location = {"  "}Location:       {$value}
 cli-sop-triggers = {"  "}Triggers:
 cli-sop-steps = {"  "}Steps:
@@ -662,6 +676,9 @@ cli-quickstart-error-unknown-risk-preset = unknown risk preset `{$preset}`
 cli-quickstart-error-unknown-runtime-preset = unknown runtime preset `{$preset}`
 cli-quickstart-error-channel-bound = channel `{$reference}` is already bound to agent `{$owner}`
 cli-quickstart-error-channel-required = channel type and alias are required
+cli-quickstart-error-channel-field-not-advertised = channel field `{$field}` is not available in Quickstart
+cli-quickstart-error-channel-token-required = Telegram bot token is required
+cli-quickstart-error-webhook-secret-required = Webhook shared secret is required
 cli-quickstart-error-peer-group-name-required = peer-group name is required
 cli-quickstart-error-peer-group-channel-required = peer-group channel ref is required
 cli-quickstart-error-peer-group-unknown-channel = peer-group `{$name}` references unknown channel `{$channel}`
@@ -684,6 +701,8 @@ cli-otp-enrollment-uri = Enrollment URI: {$uri}
 cli-otp-received = {"  "}✓ OTP received
 cli-secret-captured = {"  "}● Value captured — press Enter to save
 cli-secret-received = {"  "}✓ Secret received
+cli-secret-needs-tty = Secret input requires a terminal on stdin and stderr.
+cli-secret-empty = Value cannot be empty.
 cli-pairing-enabled = 🔐 Gateway pairing is enabled.
 cli-pairing-use-code = {"  "}Use this one-time code to pair a new device:
 cli-pairing-post = {"    "}POST /pair with header X-Pairing-Code: {$code}
@@ -856,7 +875,7 @@ cli-hardware-supported-platforms = Supported platforms: Linux, macOS, Windows.
 # ── update (zeroclaw update) ──
 cli-update-already-current = Already up to date (v{$version}).
 cli-update-success = Successfully updated to v{$version}!
-cli-update-prebuilt-channel-note = Pre-built updates use the lean default channel bundle. Build from source with `./install.sh --source --preset full`, `--features channels-full`, or a specific `channel-*` feature for Slack and other non-default channels.
+cli-update-prebuilt-channel-note = Pre-built updates use the lean standard distribution. Build from source with `./install.sh --source --preset full`, `--features channels-full`, or a specific `channel-*` feature for Slack and other channels outside that distribution.
 cli-update-available = Update available: v{$current} -> v{$latest}
 cli-update-forcing-reinstall = Forcing reinstall: v{$current} -> v{$latest}
 cli-update-not-writable = install directory {$dir} is not writable ({$error}); re-run `zeroclaw update` with elevated privileges (sudo on macOS/Linux, an Administrator console on Windows)
@@ -890,11 +909,20 @@ turn-interrupted-by-user = [interrupted by user]
 # on this path, so the wording names the channel, not a user.
 turn-cancelled-client-rpc = [turn cancelled via client]
 turn-stream-interrupted = [stream interrupted]
+# Trailing notice appended (and streamed as a final chunk) when the resilient
+# provider wrapper served the turn with a different model or provider than the
+# one requested, so silent model downgrades stay visible on direct-turn
+# surfaces (WS, RPC/ZeroCode, ACP).
+turn-model-fallback-notice = ⚡ { $requested_model } ({ $requested_provider }) was unavailable; this reply was served by { $actual_model } ({ $actual_provider }).
+# Shown at the end of agent output when the tool call loop exhausted its
+# iteration budget and the agent cannot continue without exceeding limits.
+turn-max-iterations-reached = *Turn stopped: reached maximum tool iterations ({ $max_iterations }).*
 # Breadcrumb injected into history where older turns were dropped to fit the
 # context budget; user-visible across channels, WS, RPC, ACP.
 history-trim-breadcrumb = [earlier turns omitted to fit the context window]
 # Reason carried on every history_trimmed event (WS, SSE, ACP).
 history-trim-reason-budget = context token budget exceeded
+history-trim-reason-message-cap = history message limit exceeded
 # Remediation surfaced when the system prompt + inlined tool definitions alone
 # meet or exceed the context budget, so no amount of conversation trimming can
 # fit the request (#5808).
@@ -907,6 +935,12 @@ turn-tool-interrupted-before-result = [interrupted by user before this tool prod
 # Safe reply delivered when the model repeatedly emits malformed internal
 # tool-call protocol and the turn gives up retrying.
 channel-runtime-malformed-tool-output = I generated an internal tool-call format error and could not complete this request. Please try again.
+channel-runtime-progress-received = Received
+channel-runtime-progress-planning = Planning
+channel-runtime-progress-waiting-on-model = Waiting on model
+channel-runtime-progress-running-tool = Running tool
+channel-runtime-progress-compacting-context = Compacting context
+channel-runtime-progress-finalizing-response = Finalizing response
 channel-runtime-new-session = Conversation history cleared. Starting fresh.
 channel-runtime-stop-sent = Stop signal sent.
 channel-runtime-stop-no-task = No in-flight task for this sender scope.
@@ -914,6 +948,8 @@ channel-runtime-model-empty = Model ID cannot be empty. Use `/model <model-id>`.
 channel-runtime-model-switched = Model switched to `{ $model }` (model_provider: `{ $provider }`). Context preserved.
 channel-runtime-agent-scope-rejected = Sender `{ $sender }` is not authorized for `/model --agent` on agent `{ $agent }`. Use `/model --user { $model }` for a session-only override, or ask an admin to mark a peer group `admin_for_agent_scope = true` with you as a member.
 channel-runtime-request-timeout = ⚠️ Request timed out while waiting for the model. Please try again.
+channel-runtime-no-reply-refused = 🚫 I can't help with that request.
+channel-runtime-no-reply-failed = ⚠️ I couldn't complete that request.
 channel-runtime-current-model-status =
     Current model_provider: `{ $provider }`
     Current model: `{ $model }`
@@ -1013,6 +1049,14 @@ cli-bundle-deleted = deleted skill_bundles.{$alias} (stripped from {$count} agen
 cli-bundle-warn-move = warning: bundle directory move failed: {$error}
 cli-bundle-renamed = renamed skill_bundles.{$from} → skill_bundles.{$to}
 
+# ── Web dashboard restart hints — RestartInfo.hint shown after an in-app upgrade (PR #8173) ──
+# The first four are shell command templates shown verbatim; they are not translated.
+cli-gateway-restart-hint-kubernetes = kubectl rollout restart deployment/zeroclaw
+cli-gateway-restart-hint-container = docker compose restart
+cli-gateway-restart-hint-systemd = systemctl restart zeroclaw
+cli-gateway-restart-hint-launchd = launchctl kickstart -k <your-zeroclaw-label>
+cli-gateway-restart-hint-process = restart the `zeroclaw daemon` process
+
 # ── daemon gateway bind pre-flight — zeroclaw daemon (#7895) ──
 # Emitted by the daemon startup guard in src/main.rs when the configured gateway
 # address is already bound. The daemon supervises its own in-process gateway
@@ -1021,8 +1065,18 @@ cli-bundle-renamed = renamed skill_bundles.{$from} → skill_bundles.{$to}
 # a supervisor retry loop. The two variants differ only by who holds the port.
 cli-daemon-gateway-already-running = A ZeroClaw gateway is already running on {$host}:{$port}. The daemon supervises its own gateway and will not start a second one on the same address. Stop that gateway (or point the daemon at a free port with `zeroclaw config set gateway.port <port>`), then run the daemon again.
 cli-daemon-gateway-port-occupied = Gateway address {$host}:{$port} is already in use by another process. Free the port or point the daemon at a free port (`zeroclaw config set gateway.port <port>`), then run the daemon again.
+cli-daemon-starting-title = 🧠 ZeroClaw daemon starting…
+cli-daemon-starting-detail = Preparing configured daemon endpoints
+cli-daemon-started-title = 🧠 ZeroClaw daemon ready
+cli-daemon-started-gateway = Gateway:  {$url}
+cli-daemon-started-socket = Socket:   {$path}
+cli-daemon-started-pairing = Pairing:    enabled (see gateway output above for current status)
+cli-daemon-started-stop = Ctrl+C or SIGTERM to stop
 
 # ── Context window (doctor update-context-windows, agent interactive) ──
+cli-doctor-context-window-ok = {$provider_ref}: context window: {$context_window} tokens
+cli-doctor-context-window-zero = {$provider_ref}: context_window is 0 (invalid; set it to the model's real context limit)
+cli-doctor-context-window-unset = {$provider_ref}: no context_window set — will use {$fallback} token fallback when selected; likely far below this model's real limit; set context_window on this profile
 cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%
 cli-agent-context-bar-unknown = ctx: unknown / {$max}
 cli-doctor-ctxwin-already-set = {$provider_ref}: already has context_window = {$ctx}
@@ -1035,4 +1089,51 @@ cli-doctor-ctxwin-saved = Saved {$updated} updates to config.toml
 cli-doctor-ctxwin-dry-run = Dry run complete — no changes written. Run without --dry-run to apply.
 cli-doctor-ctxwin-none = No updates needed.
 cli-doctor-ctxwin-write-failed = {$provider_ref}: failed to write context_window: {$error}
+cli-doctor-cache-write-failed = Failed to persist model cache: {$error}
 
+# ── Degraded config sections (doctor diagnose, #8835) ──
+cli-doctor-degraded-security = SECURITY-CRITICAL config section `{$path}` is invalid and was reset to its default so the daemon can boot; the running posture may be WEAKER than intended. Run `zeroclaw config migrate` to see the parse error, then repair the file.
+cli-doctor-degraded-section = config section `{$path}` is malformed and was reset to defaults; values in that section are NOT in effect. Run `zeroclaw config migrate` to see the parse error, then repair the file.
+cli-doctor-skills-prompt-injection-mode-full-deprecated = Skill prompt injection mode "full" is deprecated. Explicit full mode remains supported during the deprecation window, but compact is now the default; migrate before Schema V4 removes full mode.
+sop-approval-deferred-at-capacity = Approval could not resume run {$run_id}: execution slots are full. The gate remains waiting; retry after a slot frees.
+sop-approval-policy-unavailable = Approval failed because the parked SOP step is unavailable: {$reason}. The run remains waiting.
+sop-rpc-decision-invalid-state = Run {$run_id} cannot be resolved in its current state.
+sop-rpc-decision-unauthorized = The RPC principal is not authorized to resolve this SOP step.
+sop-rpc-policy-missing = SOP approval policy '{$name}' is not configured.
+sop-rpc-policy-unavailable = The parked SOP policy is unavailable: {$reason}.
+
+# ── Runtime command construction — shell and skill shell tools ──
+tool-runtime-command-build-failed = Failed to build runtime command: {$error}
+tool-runtime-command-docker-workspace-path = Failed to build runtime command: Failed to canonicalize Docker workspace path {$path}: {$cause}
+tool-runtime-command-docker-allowed-root = Failed to build runtime command: Failed to canonicalize Docker workspace root {$path}: {$cause}
+
+# ── Tool approval (channels, #9409) ──
+# Human-visible copy for the operator-facing tool-approval prompt, shared
+# across the button adapters (Telegram, Discord, Slack) and the text-reply
+# adapters (Matrix, Signal, WhatsApp, Slack polling fallback). Approval
+# TOKENS, `callback_data`/`custom_id`/`action_id` values, and the reply
+# KEYWORDS parsed by `util::parse_approval_reply` (yes/y/approve, no/n/deny,
+# always) stay hardcoded ASCII in Rust — only the surrounding prose is
+# localized here.
+channel-approval-heading = Tool approval required
+channel-approval-heading-shout = APPROVAL REQUIRED
+channel-approval-tool-label = Tool
+channel-approval-args-label = Args
+channel-approval-btn-approve = Approve
+channel-approval-btn-deny = Deny
+channel-approval-btn-always = Always
+channel-approval-tap-instruction = Tap a button below:
+channel-approval-reply-instruction-yesno = Reply: "{ $yes_command }", "{ $no_command }", or "{ $always_command }"
+channel-approval-reply-instruction-approve-deny = Reply `{ $approve_command }` / `{ $deny_command }` / `{ $always_command }`.
+channel-telegram-approval-ack-approved = Approved
+channel-telegram-approval-ack-always-approved = Always approved
+channel-telegram-approval-ack-denied = Denied
+channel-telegram-approval-ack-unknown = Unknown action
+channel-discord-approval-btn-allow-once = Allow once
+channel-discord-approval-btn-allow-session = Allow this session
+channel-discord-approval-btn-allow-always = Always allow
+channel-approval-title = Approve { $tool }?
+channel-approval-opt-allow-once = Allow once
+channel-approval-opt-allow-always = Always allow
+channel-approval-opt-reject = Reject
+channel-approval-opt-reject-with-edit = Reject with edit

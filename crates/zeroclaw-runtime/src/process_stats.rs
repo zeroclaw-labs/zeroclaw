@@ -1,17 +1,4 @@
 //! Self-process resource sampling — RSS (resident memory) and CPU%.
-//!
-//! Backed by the `sysinfo` crate so Linux, macOS, Windows, and FreeBSD are
-//! all supported uniformly. Unsupported hosts (whatever `sysinfo` doesn't
-//! recognise) fall back to `ProcessStats::unsupported()` (rss=0, cpu=None);
-//! the dashboard renders the tiles blank-with-note on those platforms.
-//!
-//! CPU% is computed across calls: we hold a process-global `System` inside
-//! a `OnceLock<Mutex<...>>` and refresh the same pid on each `sample()` so
-//! sysinfo can diff against the previous sample. The first call returns
-//! `cpu_percent = None` (no baseline yet); the first refresh after gateway
-//! boot fills it in. Value semantics match the historical Linux
-//! implementation: 0..100*ncpu (100% = one core saturated). The dashboard
-//! divides by `num_cpus` for its normalized display.
 
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -53,11 +40,6 @@ struct State {
     /// the first sample to preserve the pre-sysinfo contract (dashboard
     /// already handles this).
     have_baseline: bool,
-    /// Wall-clock of the last CPU refresh, used to rate-limit CPU refreshes
-    /// to at least `MINIMUM_CPU_UPDATE_INTERVAL` — refreshing sooner makes
-    /// sysinfo return `0` (most platforms) or `100 * ncpu` (Linux),
-    /// which shows up as a hard floor/ceiling artifact on high-frequency
-    /// callers like `/rpc/health`.
     last_cpu_refresh: Option<Instant>,
     /// Last CPU% we returned; served on rapid re-samples so callers still
     /// see a plausible value instead of a sysinfo-internal artifact.

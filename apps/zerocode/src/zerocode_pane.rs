@@ -2,7 +2,6 @@
 //! and preset picker, plus the chord-capture modal for per-action
 //! rebinding. All surfaces walk the canonical registries (`theme_names`,
 //! `KEY_PRESETS`, each action enum's `variants()`) — nothing is
-//! hardcoded here.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -570,11 +569,6 @@ impl ZerocodePane {
             })
             .collect();
 
-        // Free-entry fallback row.
-        // Status line for the registry load (loading / error). Only shown
-        // when there are no locales yet; it is informational, never a
-        // selectable row, so there is no "type a locale" affordance that
-        // implies users can invent locales the build does not ship.
         if self.locales.is_empty() {
             let (msg, style) = if let Some(err) = &self.list_error {
                 (
@@ -954,12 +948,6 @@ impl ZerocodePane {
         true
     }
 
-    /// Begin assigning a theme to the highlighted agent: point the reusable
-    /// theme list at that agent's override. Focus stays on Agent Themes — the
-    /// pending assignment (theme_target_agent) is what swaps the detail surface
-    /// to the theme list — so the left rail, Left/Back, and mouse all keep
-    /// treating Agent Themes as the active section. Preselect the list cursor on
-    /// the agent's current override if it has one.
     fn begin_agent_assign(&mut self) {
         let Some(alias) = self.agents.get(self.agent_cursor).cloned() else {
             self.status = Some(crate::i18n::t("zc-zerocode-agent-theme-no-agents"));
@@ -1527,11 +1515,6 @@ impl ZerocodePane {
 const SWATCH_ROLE_COUNT: usize = 6;
 const SWATCH_STRIP_WIDTH: usize = SWATCH_ROLE_COUNT + 1;
 
-/// Inline palette swatches for a theme row: one block per representative role,
-/// in the theme's own colours, followed by a trailing space before the name.
-/// The `terminal` (inherit) theme has every role as `Color::Reset`, so it gets
-/// blank swatches — there is no fixed palette to preview, but the width is kept
-/// so its name aligns with the others.
 fn theme_swatch_spans(name: &str) -> Vec<Span<'static>> {
     let Some(roles) = theme_swatch_roles(name) else {
         return vec![Span::raw(" ".repeat(SWATCH_STRIP_WIDTH))];

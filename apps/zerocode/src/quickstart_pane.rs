@@ -11,14 +11,6 @@ use ratatui::{
 };
 use std::sync::Arc;
 
-/// Display placeholder the daemon emits for an unset `Option` field,
-/// mirroring `zeroclaw_config::traits::UNSET_DISPLAY`. zerocode talks to
-/// the daemon over RPC and mirrors config types on the wire rather than
-/// depending on `zeroclaw-config`, so the sentinel is duplicated here.
-/// It is a *display* value, never a real default — seeding a field
-/// buffer with it or submitting it makes the daemon validate `<unset>`
-/// against the field's true type (e.g. a bool), which fails with
-/// "bool value with length 7".
 const UNSET_DISPLAY: &str = "<unset>";
 const MODEL_CATALOG_MAX_ATTEMPTS: u8 = 2;
 const MODEL_PROVIDER_EXISTING_COLLAPSED_LIMIT: usize = 5;
@@ -70,9 +62,10 @@ enum Selector {
 }
 
 impl Selector {
-    const ALL: [Selector; 7] = [
+    const ALL: [Selector; 8] = [
         Selector::ModelProvider,
         Selector::RiskProfile,
+        Selector::RuntimeProfile,
         Selector::Memory,
         Selector::Channels,
         Selector::PeerGroups,
@@ -139,18 +132,6 @@ impl Selector {
     }
 }
 
-/// Drop validation errors for selectors the user hasn't filled yet.
-///
-/// `revalidate` runs after every selector commit, and the runtime
-/// validates the *whole* submission, short-circuiting at the first
-/// failing step. Mid-build that first failure is almost always a
-/// selector the user simply hasn't reached — e.g. the empty risk
-/// profile, surfacing the instant the model provider is committed. Shown
-/// as a red "1 error(s) — fix selectors and resubmit", it reads as if the
-/// step they just finished broke. Keep only errors for selectors the user
-/// has actually filled; unfilled ones are already tracked as `[ ]` in the
-/// checklist, and submit re-validates the full set with nothing empty to
-/// short-circuit on.
 fn retain_filled_selector_errors(
     form: &FormState,
     errors: Vec<QuickstartError>,
@@ -326,13 +307,6 @@ fn queue_apply_handoff(
     }
 }
 
-/// The character a key press contributes to a free-text buffer (the
-/// agent-name field), or `None` for control chords and non-character
-/// keys. Letters that double as modal hotkeys on file rows — `e` (edit
-/// in $EDITOR), `t` (from template), `c` (clear), `d` (delete) — are
-/// still plain text on a text row, so this deliberately ignores the
-/// chord mapping: the hotkey arms are gated on `on_file` and never fire
-/// while the cursor is on the name field.
 fn typed_char(key: &KeyEvent) -> Option<char> {
     match key.code {
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => Some(c),
@@ -373,37 +347,44 @@ fn risk_options() -> [PickerOption; 3] {
     ]
 }
 
-fn runtime_options() -> [PickerOption; 3] {
-    [
-        opt(
-            "tight",
-            crate::i18n::t("zc-quickstart-runtime-tight"),
-            crate::i18n::t("zc-quickstart-runtime-tight-desc"),
-        ),
-        opt(
-            "balanced",
-            crate::i18n::t("zc-quickstart-runtime-balanced"),
-            crate::i18n::t("zc-quickstart-runtime-balanced-desc"),
-        ),
-        opt(
-            "unbounded",
-            crate::i18n::t("zc-quickstart-runtime-unbounded"),
-            crate::i18n::t("zc-quickstart-runtime-unbounded-desc"),
-        ),
-    ]
+fn runtime_picker_options(snapshot: Option<&QuickstartStateResult>) -> Vec<PickerOption> {
+    snapshot
+        .into_iter()
+        .flat_map(|snapshot| &snapshot.runtime_presets)
+        .map(|preset| {
+            let localized = match preset.preset_name.as_str() {
+                "tight" => Some((
+                    "zc-quickstart-runtime-tight",
+                    "zc-quickstart-runtime-tight-desc",
+                )),
+                "local_small" => Some((
+                    "zc-quickstart-runtime-local-small",
+                    "zc-quickstart-runtime-local-small-desc",
+                )),
+                "balanced" => Some((
+                    "zc-quickstart-runtime-balanced",
+                    "zc-quickstart-runtime-balanced-desc",
+                )),
+                "unbounded" => Some((
+                    "zc-quickstart-runtime-unbounded",
+                    "zc-quickstart-runtime-unbounded-desc",
+                )),
+                _ => None,
+            };
+            let (label, help) = localized
+                .map(|(label_key, help_key)| {
+                    (
+                        crate::i18n::try_t(label_key).unwrap_or_else(|| preset.label.clone()),
+                        crate::i18n::try_t(help_key).unwrap_or_else(|| preset.help.clone()),
+                    )
+                })
+                .unwrap_or_else(|| (preset.label.clone(), preset.help.clone()));
+            opt(&preset.preset_name, label, help)
+        })
+        .collect()
 }
 
 fn memory_options() -> Vec<PickerOption> {
-    // Walk every variant of the schema's canonical `MemoryBackendKind`.
-    // `serde_json::to_value` returns the `#[serde(rename_all =
-    // "snake_case")]` string for each variant — that string IS the
-    // wire key written into `memory.backend`, so the picker carries
-    // no parallel mapping. Variants come out in declaration order
-    // because `enum-iterator`-style iteration is unnecessary for a
-    // closed set: we list them once here against the schema and any
-    // schema additions are caught at compile time because
-    // `MemoryKind` is a public re-export and a `match` exhaustiveness
-    // check below would fail to compile if a variant were dropped.
     let variants: [MemoryKind; 6] = [
         MemoryKind::Sqlite,
         MemoryKind::Markdown,
@@ -437,12 +418,6 @@ fn memory_options() -> Vec<PickerOption> {
 }
 
 fn provider_type_options(snapshot: Option<&QuickstartStateResult>) -> Vec<PickerOption> {
-    // Source of truth is the daemon-side
-    // `zeroclaw_runtime::quickstart::snapshot_state`, which maps the
-    // canonical `zeroclaw_providers::list_model_providers()` registry
-    // into wire rows. Adding a model provider in
-    // `zeroclaw-providers` lights up here automatically — Quickstart
-    // never maintains its own list.
     let Some(snap) = snapshot else {
         return Vec::new();
     };
@@ -541,7 +516,7 @@ fn channel_type_options(snapshot: Option<&QuickstartStateResult>) -> Vec<PickerO
 struct ChannelDraft {
     channel_type: String,
     alias: String,
-    token: Option<String>,
+    fields: std::collections::HashMap<String, String>,
     mode: SelectorMode,
 }
 
@@ -570,6 +545,7 @@ struct FormState {
     risk_mode: SelectorMode,
     runtime: String,
     runtime_mode: SelectorMode,
+    runtime_auto_defaulted: bool,
     memory: MemoryKind,
     memory_mode: SelectorMode,
     /// `true` once the user has explicitly committed a Memory
@@ -599,6 +575,7 @@ impl FormState {
             risk_mode: SelectorMode::Fresh,
             runtime: String::new(),
             runtime_mode: SelectorMode::Fresh,
+            runtime_auto_defaulted: false,
             memory: MemoryKind::Sqlite,
             memory_mode: SelectorMode::Fresh,
             memory_chosen: false,
@@ -717,9 +694,7 @@ impl FormState {
             SelectorMode::Fresh => SelectorChoice::Fresh(self.risk.clone()),
             SelectorMode::Existing => SelectorChoice::Existing(self.risk.clone()),
         };
-        // Runtime profile picker removed from all surfaces; apply silently
-        // forces the `unbounded` preset. Submit it so the field is well-formed.
-        let runtime_profile = SelectorChoice::Fresh("unbounded".to_string());
+        let runtime_profile = self.runtime_profile_choice();
         let memory = match self.memory_mode {
             SelectorMode::Fresh => SelectorChoice::Fresh(self.memory),
             SelectorMode::Existing => SelectorChoice::Existing(self.memory_existing_alias.clone()),
@@ -736,7 +711,7 @@ impl FormState {
                     SelectorMode::Fresh => SelectorChoice::Fresh(ChannelQuickStart {
                         channel_type: c.channel_type.clone(),
                         alias: c.alias.clone(),
-                        token: c.token.clone(),
+                        fields: c.fields.clone(),
                     }),
                     SelectorMode::Existing => {
                         SelectorChoice::Existing(format!("{}.{}", c.channel_type, c.alias))
@@ -752,6 +727,51 @@ impl FormState {
             },
         }
     }
+
+    fn runtime_profile_choice(&self) -> SelectorChoice<String> {
+        match self.runtime_mode {
+            SelectorMode::Fresh => SelectorChoice::Fresh(self.runtime.clone()),
+            SelectorMode::Existing => SelectorChoice::Existing(self.runtime.clone()),
+        }
+    }
+
+    fn apply_provider_runtime_default(&mut self, default: Option<&str>) {
+        let Some(next) = default else { return };
+        if self.runtime.is_empty() || self.runtime_auto_defaulted {
+            self.runtime = next.to_string();
+            self.runtime_mode = SelectorMode::Fresh;
+            self.runtime_auto_defaulted = true;
+        }
+    }
+}
+
+fn provider_runtime_default<'a>(
+    snapshot: Option<&'a QuickstartStateResult>,
+    type_key: &str,
+) -> Option<&'a str> {
+    let snapshot = snapshot?;
+    snapshot
+        .model_provider_types
+        .iter()
+        .find(|provider| provider.kind == type_key)
+        .and_then(|provider| provider.default_runtime_profile.as_deref())
+        .or(snapshot.default_runtime_profile.as_deref())
+}
+
+fn apply_existing_provider_choice(
+    form: &mut FormState,
+    snapshot: Option<&QuickstartStateResult>,
+    dotted_ref: &str,
+) {
+    let Some((provider_type, alias)) = dotted_ref.split_once('.') else {
+        return;
+    };
+    form.provider_type = provider_type.to_string();
+    form.provider_alias = alias.to_string();
+    form.provider_mode = SelectorMode::Existing;
+    form.model.clear();
+    form.provider_fields.clear();
+    form.apply_provider_runtime_default(provider_runtime_default(snapshot, provider_type));
 }
 
 /// Modal kinds the pane can put up over the main checklist. Each
@@ -810,11 +830,6 @@ struct TextInputModal {
     peer_group_channel: Option<String>,
 }
 
-/// Lifecycle of the live model catalog for a ModelProvider FieldForm.
-/// The form opens immediately in `Pending` so the modal paints a
-/// loading row instead of the picker blocking on the catalog RPC; a
-/// later `tick` resolves it to `Loaded` (model row upgraded to an
-/// enum picker) or `Empty` (catalog unavailable → free-text fallback).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ModelCatalogState {
     /// Section has no model row (channels) — nothing to load.
@@ -850,6 +865,16 @@ struct FieldFormRow {
     descriptor: QuickstartFieldDescriptor,
     /// User-typed buffer. Pre-filled from `descriptor.default`.
     buf: String,
+}
+
+fn channel_fields_from_rows(rows: &[FieldFormRow]) -> std::collections::HashMap<String, String> {
+    rows.iter()
+        .filter_map(|row| {
+            let value = row.buf.trim();
+            (!value.is_empty() && value != UNSET_DISPLAY)
+                .then(|| (row.descriptor.key.clone(), value.to_string()))
+        })
+        .collect()
 }
 
 struct ChannelListModal {
@@ -1191,11 +1216,6 @@ impl QuickstartPane {
             self.handle_modal_key(key).await;
             return false;
         }
-        // After Apply, `applied_alias` is set and the daemon is in the
-        // middle of reloading. Suppress all main-list key handling
-        // until the connection drops and the next `app::run`
-        // iteration consumes the armed Stage-2 intent. Pressing Enter
-        // here does nothing — there's no reachable RPC to act on.
         if self.applied_alias.is_some() {
             return false;
         }
@@ -1242,14 +1262,6 @@ impl QuickstartPane {
         }
     }
 
-    /// Route a bracketed-paste payload into the active modal's text
-    /// field. Mirrors the per-modal char-insertion rules in
-    /// `handle_modal_key` so paste lands in exactly the same buffer a
-    /// keystroke would: the TextInput buffer, the focused non-enum
-    /// FieldForm row (e.g. an `api_key`), or the Agent name row. Panes
-    /// without an active text target ignore the paste. Without this,
-    /// `app`'s `Event::Paste` had no Quickstart arm, so paste was
-    /// silently dropped on every Quickstart widget.
     pub fn handle_paste(&mut self, text: &str) {
         let Some(modal) = self.active_modal.as_mut() else {
             return;
@@ -1285,14 +1297,6 @@ impl QuickstartPane {
             .await;
     }
 
-    /// Mouse handler. Recognises:
-    ///   - left-click on a modal row → moves modal cursor + synthesises
-    ///     Enter (committing that row);
-    ///   - left-click outside an active modal → closes the modal;
-    ///   - left-click on a selector row → moves the selector cursor +
-    ///     opens that selector's modal;
-    ///   - scroll up/down → moves the cursor on whichever surface is
-    ///     active (modal if open, otherwise selector list).
     pub async fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent, _content: Rect) {
         use crossterm::event::{MouseButton, MouseEventKind};
         let col = mouse.column;
@@ -1535,7 +1539,7 @@ impl QuickstartPane {
     fn open_picker_modal(&mut self, sel: Selector) {
         let mut options: Vec<PickerOption> = match sel {
             Selector::RiskProfile => risk_options().to_vec(),
-            Selector::RuntimeProfile => runtime_options().to_vec(),
+            Selector::RuntimeProfile => runtime_picker_options(self.state_snapshot.as_ref()),
             Selector::Memory => memory_options(),
             _ => return,
         };
@@ -1559,6 +1563,9 @@ impl QuickstartPane {
                 }
                 options.push(existing_opt(alias.clone()));
             }
+        }
+        if options.is_empty() {
+            return;
         }
         let cursor = match sel {
             Selector::RiskProfile => options
@@ -1611,8 +1618,10 @@ impl QuickstartPane {
                     }
                 }
                 Some(QuickstartModalAction::Confirm) => {
-                    if let Some(expanded) = p.options[p.cursor].existing_provider_toggle_expanded()
-                    {
+                    let Some(option) = p.options.get(p.cursor) else {
+                        return;
+                    };
+                    if let Some(expanded) = option.existing_provider_toggle_expanded() {
                         p.options =
                             model_provider_picker_options(self.state_snapshot.as_ref(), !expanded);
                         p.cursor = p
@@ -1626,11 +1635,14 @@ impl QuickstartPane {
                             });
                         return;
                     }
-                    if !p.options[p.cursor].is_selectable() {
+                    let Some(option) = p.options.get(p.cursor) else {
+                        return;
+                    };
+                    if !option.is_selectable() {
                         return;
                     }
-                    let chosen = p.options[p.cursor].value.clone();
-                    let use_existing = p.options[p.cursor].use_existing();
+                    let chosen = option.value.clone();
+                    let use_existing = option.use_existing();
                     let selector = p.selector;
                     let purpose = p.purpose;
                     match (purpose, use_existing) {
@@ -2079,17 +2091,7 @@ impl QuickstartPane {
     }
 
     fn adopt_existing_provider(&mut self, dotted_ref: String) {
-        if let Some((ty, alias)) = dotted_ref.split_once('.') {
-            self.form.provider_type = ty.to_string();
-            self.form.provider_alias = alias.to_string();
-            self.form.provider_mode = SelectorMode::Existing;
-            // Default model / field values aren't carried in the
-            // "existing" path — the runtime resolves the alias against
-            // the live config at apply time. Leave them empty so they
-            // don't overwrite the existing alias's values.
-            self.form.model.clear();
-            self.form.provider_fields.clear();
-        }
+        apply_existing_provider_choice(&mut self.form, self.state_snapshot.as_ref(), &dotted_ref);
     }
 
     fn adopt_existing_channel(&mut self, dotted_ref: String) {
@@ -2097,7 +2099,7 @@ impl QuickstartPane {
             self.form.channels.push(ChannelDraft {
                 channel_type: ty.to_string(),
                 alias: alias.to_string(),
-                token: None,
+                fields: std::collections::HashMap::new(),
                 mode: SelectorMode::Existing,
             });
         }
@@ -2137,11 +2139,6 @@ impl QuickstartPane {
             .collect()
     }
 
-    /// Debounced-ish validation: after a selector commit, ask the
-    /// runtime whether the assembled submission would pass. Errors
-    /// land in `last_errors` and surface in the status strip. The
-    /// `quickstart/validate` path is read-only and cheap; we run it
-    /// once per commit rather than per keystroke.
     async fn revalidate(&mut self) {
         let submission = self.form.to_submission();
         match self.rpc.quickstart_validate(&submission).await {
@@ -2177,12 +2174,6 @@ impl QuickstartPane {
             }
         };
         let is_model_provider = matches!(section, QuickstartFieldSection::ModelProvider);
-        // Open the form before loading the live model catalog. The next
-        // idle tick upgrades the model row to a picker or paints the
-        // free-text fallback, so users see progress instead of a
-        // frozen modal while the catalog RPC runs. The row builder also
-        // handles bool toggles, enum defaults, and the synthetic model
-        // provider alias row.
         let mut rows = build_field_form_rows(section, fields, None);
         restore_field_form_rows_from_form(section, &type_key, &mut rows, &self.form);
         let model_catalog_state = if is_model_provider {
@@ -2308,6 +2299,9 @@ impl QuickstartPane {
         }
         match f.selector {
             Selector::ModelProvider => {
+                let runtime_default =
+                    provider_runtime_default(self.state_snapshot.as_ref(), &f.type_key)
+                        .map(str::to_string);
                 let pick = |key: &str| {
                     f.fields
                         .iter()
@@ -2346,31 +2340,14 @@ impl QuickstartPane {
                 self.form.provider_mode = SelectorMode::Fresh;
                 self.form.model = pick("model");
                 self.form.provider_fields = provider_fields;
+                self.form
+                    .apply_provider_runtime_default(runtime_default.as_deref());
             }
             Selector::Channels => {
-                let pick = |key: &str| {
-                    f.fields
-                        .iter()
-                        .find(|r| r.descriptor.key == key)
-                        .map(|r| r.buf.trim().to_string())
-                        .unwrap_or_default()
-                };
-                // `bot-token` covers Telegram / Discord; `token` is the
-                // generic fallback for any channel kind that just needs
-                // one secret.
-                let token = {
-                    let v = pick("bot-token");
-                    if v.is_empty() {
-                        let alt = pick("token");
-                        if alt.is_empty() { None } else { Some(alt) }
-                    } else {
-                        Some(v)
-                    }
-                };
                 self.form.channels.push(ChannelDraft {
                     channel_type: f.type_key.clone(),
                     alias: f.alias.clone(),
-                    token,
+                    fields: channel_fields_from_rows(&f.fields),
                     mode: SelectorMode::Fresh,
                 });
             }
@@ -2393,6 +2370,7 @@ impl QuickstartPane {
             Selector::RuntimeProfile => {
                 self.form.runtime = value;
                 self.form.runtime_mode = mode;
+                self.form.runtime_auto_defaulted = false;
             }
             Selector::Memory => {
                 if use_existing {
@@ -2573,15 +2551,6 @@ fn generate_run_id() -> String {
     format!("{now:x}-{pid:x}")
 }
 
-/// Wrapped visual-row height of each logical line at `width`, using the
-/// same word-wrap (`Wrap { trim: false }`) the modal body renders with.
-/// Every line occupies at least one row — a blank line still takes a row.
-///
-/// Sizing the modal by logical line count alone left it too short
-/// whenever content soft-wrapped: long risk-profile blurbs pushed the
-/// `yolo` option off-screen, and a long pasted `api_key` pushed the
-/// `model` picker out of view. These heights drive both the box size and
-/// the cursor-tracking scroll so the geometry survives wrapping.
 fn wrapped_row_heights(lines: &[Line], width: u16) -> Vec<u16> {
     lines
         .iter()
@@ -2806,11 +2775,6 @@ fn build_field_form_rows(
             if matches!(d.kind, crate::client::QuickstartFieldKind::Bool) {
                 d.enum_variants = Some(vec!["false".to_string(), "true".to_string()]);
             }
-            // For enum fields, default the buffer to the first variant
-            // so the user lands on a valid value. ←/→ cycles through the
-            // list. The daemon's `<unset>` placeholder for optional
-            // fields is treated as no value — seeding or submitting it
-            // would fail validation against the field's real type.
             let default = d
                 .default
                 .clone()
@@ -2924,11 +2888,6 @@ fn missing_template_error(filename: &str) -> QuickstartError {
     }
 }
 
-/// Paint the modal and return `(inner_rect, row_to_cursor)` so the
-/// pane's mouse handler can resolve a click to a cursor index. The
-/// `row_to_cursor` vec maps each body row (top → bottom) to either
-/// `Some(cursor_index)` for clickable rows or `None` for help /
-/// blank lines.
 fn draw_modal(
     frame: &mut Frame,
     area: Rect,
@@ -3041,13 +3000,6 @@ fn draw_modal(
                     row.buf.clone()
                 };
                 let is_empty_buf = raw_display.is_empty();
-                // Ghost text (the field default) is a placeholder for an
-                // empty buffer, but only when the row is NOT focused.
-                // Showing it on the focused row makes the default look
-                // like real, editable text the user cannot Backspace
-                // away — the alias `default` ghost-state defect. The
-                // focused empty row renders empty so the cursor sits
-                // where typing lands.
                 let show_ghost = is_empty_buf && !is_cursor && !is_enum;
                 let (display, value_style) = if is_model_row
                     && matches!(
@@ -3155,10 +3107,10 @@ fn draw_modal(
                         Span::styled(glyph, theme::accent_style()),
                         Span::styled(format!("{}.{}", c.channel_type, c.alias), style),
                         Span::styled(
-                            if c.token.is_some() {
-                                "  (token set)"
-                            } else {
+                            if c.fields.is_empty() {
                                 ""
+                            } else {
+                                "  (configured)"
                             },
                             theme::dim_style(),
                         ),
@@ -3389,11 +3341,6 @@ fn draw_modal(
         .inner(Rect::new(area.x, area.y, box_w, area.height))
         .width;
 
-    // Size the box from the *wrapped* row counts, not the logical line
-    // counts. Long picker blurbs and long pasted field values (e.g. an
-    // `api_key`) soft-wrap across several rows; sizing by line count alone
-    // left the box too short, so later rows — the `yolo` risk option, the
-    // `model` picker — fell outside the viewport entirely.
     let body_heights = wrapped_row_heights(&body_lines, inner_width);
     let header_rows = wrapped_total(&header_lines, inner_width);
     // Prefix sums: where each logical body line begins in wrapped-row
@@ -3536,6 +3483,22 @@ fn draw_modal(
 mod tests {
     use super::*;
 
+    fn field_row(key: &str, value: &str) -> FieldFormRow {
+        FieldFormRow {
+            descriptor: QuickstartFieldDescriptor {
+                key: key.to_string(),
+                label: key.to_string(),
+                help: String::new(),
+                kind: crate::client::QuickstartFieldKind::String,
+                is_secret: key == "bot_token",
+                enum_variants: None,
+                required: true,
+                default: None,
+            },
+            buf: value.to_string(),
+        }
+    }
+
     /// A FormState with every real selector satisfied.
     fn complete_form() -> FormState {
         let mut f = FormState::default_form();
@@ -3555,6 +3518,7 @@ mod tests {
             agents: Vec::new(),
             risk_profiles: Vec::new(),
             runtime_profiles: Vec::new(),
+            default_runtime_profile: Some("unbounded".into()),
             model_providers: existing.into_iter().map(str::to_string).collect(),
             channels: Vec::new(),
             unassigned_channels: Vec::new(),
@@ -3564,16 +3528,19 @@ mod tests {
                     kind: "openrouter".into(),
                     display_name: "OpenRouter".into(),
                     local: false,
+                    default_runtime_profile: Some("unbounded".into()),
                 },
                 crate::client::QuickstartTypeOption {
                     kind: "anthropic".into(),
                     display_name: "Anthropic".into(),
                     local: false,
+                    default_runtime_profile: Some("unbounded".into()),
                 },
                 crate::client::QuickstartTypeOption {
-                    kind: "ollama".into(),
-                    display_name: "Ollama".into(),
+                    kind: "lmstudio".into(),
+                    display_name: "LM Studio".into(),
                     local: true,
+                    default_runtime_profile: Some("local_small".into()),
                 },
             ],
             channel_types: Vec::new(),
@@ -3632,6 +3599,84 @@ mod tests {
     }
 
     #[test]
+    fn existing_local_provider_adoption_uses_daemon_runtime_default() {
+        let snapshot = model_provider_snapshot(vec!["lmstudio.default"]);
+        let mut form = FormState::default_form();
+
+        apply_existing_provider_choice(&mut form, Some(&snapshot), "lmstudio.default");
+
+        assert_eq!(form.provider_type, "lmstudio");
+        assert_eq!(form.provider_alias, "default");
+        assert_eq!(form.provider_mode, SelectorMode::Existing);
+        assert_eq!(form.runtime, "local_small");
+        assert!(form.runtime_auto_defaulted);
+    }
+
+    #[test]
+    fn runtime_picker_includes_daemon_advertised_local_small_preset() {
+        let mut snapshot = model_provider_snapshot(Vec::new());
+        snapshot.runtime_presets = vec![crate::client::QuickstartPresetMirror {
+            preset_name: "local_small".into(),
+            label: "Local small".into(),
+            help: "Safe defaults for local models.".into(),
+        }];
+
+        let options = runtime_picker_options(Some(&snapshot));
+        let local_small = options
+            .iter()
+            .find(|option| option.value == "local_small")
+            .expect("daemon-advertised runtime preset should be selectable");
+
+        assert!(!local_small.use_existing());
+    }
+
+    #[test]
+    fn runtime_picker_localizes_known_presets_and_preserves_unknown_daemon_text() {
+        let mut snapshot = model_provider_snapshot(Vec::new());
+        snapshot.runtime_presets = vec![
+            crate::client::QuickstartPresetMirror {
+                preset_name: "tight".into(),
+                label: "Daemon Tight".into(),
+                help: "Daemon tight help.".into(),
+            },
+            crate::client::QuickstartPresetMirror {
+                preset_name: "future_runtime".into(),
+                label: "Future Runtime".into(),
+                help: "Future runtime help.".into(),
+            },
+        ];
+
+        let options = runtime_picker_options(Some(&snapshot));
+
+        assert_eq!(
+            options[0].label,
+            crate::i18n::t("zc-quickstart-runtime-tight")
+        );
+        assert_eq!(
+            options[0].help,
+            crate::i18n::t("zc-quickstart-runtime-tight-desc")
+        );
+        assert_eq!(options[1].label, "Future Runtime");
+        assert_eq!(options[1].help, "Future runtime help.");
+    }
+
+    #[tokio::test]
+    async fn runtime_picker_does_not_open_without_advertised_presets() {
+        let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel(1);
+        let rpc = std::sync::Arc::new(crate::client::RpcClient::with_rpc(std::sync::Arc::new(
+            crate::jsonrpc::RpcOutbound::new(writer_tx),
+        )));
+        let reconnect_state = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::app::CrossReconnectState::default(),
+        ));
+        let mut pane = QuickstartPane::new(rpc, reconnect_state);
+
+        pane.open_picker_modal(Selector::RuntimeProfile);
+
+        assert!(pane.active_modal.is_none());
+    }
+
+    #[test]
     fn model_provider_alias_duplicate_is_caught_from_snapshot() {
         let snap = model_provider_snapshot(vec!["openrouter.default"]);
         let mut form = FieldFormModal {
@@ -3667,6 +3712,21 @@ mod tests {
         form.fields[0].buf = "work".into();
 
         assert!(model_provider_alias_duplicate_error(Some(&snap), &form).is_none());
+    }
+
+    #[test]
+    fn channel_form_preserves_all_schema_field_keys() {
+        let rows = vec![
+            field_row("bot_token", " 123:ABC "),
+            field_row("allowed_users", "[\"42\"]"),
+            field_row("unused", UNSET_DISPLAY),
+        ];
+
+        let fields = channel_fields_from_rows(&rows);
+
+        assert_eq!(fields["bot_token"], "123:ABC");
+        assert_eq!(fields["allowed_users"], "[\"42\"]");
+        assert!(!fields.contains_key("unused"));
     }
 
     #[test]
@@ -3708,11 +3768,6 @@ mod tests {
 
     #[test]
     fn optional_channel_and_peer_group_rows_do_not_block_submit() {
-        // Regression: Channels and Peer groups are labelled optional,
-        // but the checklist stayed incomplete until the user opened
-        // each row and explicitly confirmed "none". They still render
-        // as incomplete when empty so optional "skipped" is not
-        // confused with "completed".
         let f = complete_form();
         assert!(f.channels.is_empty());
         assert!(f.peer_groups.is_empty());
@@ -3731,7 +3786,7 @@ mod tests {
         f.channels.push(ChannelDraft {
             channel_type: "telegram".into(),
             alias: "chat".into(),
-            token: None,
+            fields: std::collections::HashMap::new(),
             mode: SelectorMode::Fresh,
         });
         f.peer_groups.push(crate::wire::QuickstartPeerGroup {
@@ -3744,6 +3799,144 @@ mod tests {
         assert!(f.is_satisfied(Selector::Channels));
         assert!(f.is_satisfied(Selector::PeerGroups));
         assert!(f.all_selectors_satisfied());
+    }
+
+    #[test]
+    fn submission_preserves_selected_fresh_runtime_profile() {
+        let mut f = complete_form();
+        f.runtime = "local_small".into();
+        f.runtime_mode = SelectorMode::Fresh;
+
+        let submission = f.to_submission();
+
+        assert_eq!(
+            submission.runtime_profile,
+            SelectorChoice::Fresh("local_small".into())
+        );
+    }
+
+    #[test]
+    fn submission_preserves_selected_existing_runtime_profile() {
+        let mut f = complete_form();
+        f.runtime = "small-laptop".into();
+        f.runtime_mode = SelectorMode::Existing;
+
+        let submission = f.to_submission();
+
+        assert_eq!(
+            submission.runtime_profile,
+            SelectorChoice::Existing("small-laptop".into())
+        );
+    }
+
+    #[test]
+    fn local_provider_defaults_to_local_small_runtime_profile() {
+        let mut f = FormState::default_form();
+
+        f.apply_provider_runtime_default(Some("local_small"));
+
+        assert_eq!(f.runtime, "local_small");
+        assert_eq!(
+            f.to_submission().runtime_profile,
+            SelectorChoice::Fresh("local_small".into())
+        );
+    }
+
+    #[test]
+    fn cloud_provider_defaults_to_unbounded_runtime_profile() {
+        let mut f = FormState::default_form();
+
+        f.apply_provider_runtime_default(Some("unbounded"));
+
+        assert_eq!(f.runtime, "unbounded");
+        assert_eq!(
+            f.to_submission().runtime_profile,
+            SelectorChoice::Fresh("unbounded".into())
+        );
+    }
+
+    #[test]
+    fn missing_provider_override_uses_daemon_state_fallback() {
+        let mut snapshot = model_provider_snapshot(Vec::new());
+        snapshot.model_provider_types[0].default_runtime_profile = None;
+
+        assert_eq!(
+            provider_runtime_default(Some(&snapshot), "openrouter"),
+            Some("unbounded"),
+        );
+    }
+
+    #[test]
+    fn missing_provider_and_state_defaults_leave_runtime_incomplete() {
+        let mut f = FormState::default_form();
+
+        f.apply_provider_runtime_default(None);
+
+        assert!(f.runtime.is_empty());
+        assert!(!f.selector_is_complete(Selector::RuntimeProfile, &[]));
+    }
+
+    #[test]
+    fn provider_runtime_default_preserves_explicit_runtime_choice() {
+        let mut f = FormState::default_form();
+        f.runtime = "tight".into();
+        f.runtime_mode = SelectorMode::Fresh;
+
+        f.apply_provider_runtime_default(Some("local_small"));
+
+        assert_eq!(f.runtime, "tight");
+        assert_eq!(
+            f.to_submission().runtime_profile,
+            SelectorChoice::Fresh("tight".into())
+        );
+    }
+
+    #[test]
+    fn provider_runtime_default_preserves_explicit_unbounded_choice() {
+        let mut f = FormState::default_form();
+        f.runtime = "unbounded".into();
+        f.runtime_mode = SelectorMode::Fresh;
+
+        f.apply_provider_runtime_default(Some("local_small"));
+
+        assert_eq!(f.runtime, "unbounded");
+        assert_eq!(
+            f.to_submission().runtime_profile,
+            SelectorChoice::Fresh("unbounded".into())
+        );
+    }
+
+    #[test]
+    fn provider_runtime_default_preserves_explicit_local_small_choice() {
+        let mut f = FormState::default_form();
+        f.runtime = "local_small".into();
+        f.runtime_mode = SelectorMode::Fresh;
+
+        f.apply_provider_runtime_default(Some("unbounded"));
+
+        assert_eq!(f.runtime, "local_small");
+        assert_eq!(
+            f.to_submission().runtime_profile,
+            SelectorChoice::Fresh("local_small".into())
+        );
+    }
+
+    #[test]
+    fn explicit_runtime_choice_stops_provider_default_rewrites() {
+        let mut f = FormState::default_form();
+
+        f.apply_provider_runtime_default(Some("local_small"));
+        assert_eq!(f.runtime, "local_small");
+        f.runtime = "unbounded".into();
+        f.runtime_mode = SelectorMode::Fresh;
+        f.runtime_auto_defaulted = false;
+        f.apply_provider_runtime_default(Some("local_small"));
+
+        assert_eq!(f.runtime, "unbounded");
+        assert_eq!(
+            f.to_submission().runtime_profile,
+            SelectorChoice::Fresh("unbounded".into())
+        );
     }
 
     #[test]
@@ -4087,6 +4280,19 @@ mod tests {
     fn completed_selector_advances_to_next_row() {
         let form = FormState::default_form();
         assert_eq!(
+            Selector::ALL,
+            [
+                Selector::ModelProvider,
+                Selector::RiskProfile,
+                Selector::RuntimeProfile,
+                Selector::Memory,
+                Selector::Channels,
+                Selector::PeerGroups,
+                Selector::Agent,
+                Selector::Submit,
+            ],
+        );
+        assert_eq!(
             next_selector_index_after(Selector::ModelProvider, &form),
             Some(1)
         );
@@ -4235,11 +4441,6 @@ mod tests {
 
     #[test]
     fn revalidate_hides_errors_for_unfilled_selectors() {
-        // Regression: committing the model provider triggered a full
-        // re-validate. The runtime short-circuits at the first failing
-        // step, so the still-empty risk profile came back as a single
-        // error and the status strip flashed "1 error(s) — fix selectors
-        // and resubmit", as if the provider step had failed.
         let mut f = FormState::default_form();
         f.provider_type = "anthropic".into();
         f.provider_alias = "default".into();
@@ -4283,13 +4484,6 @@ mod tests {
 
     #[test]
     fn name_field_accepts_hotkey_letters() {
-        // Regression: e/t/c/d double as Agent-modal hotkeys (edit in
-        // $EDITOR, from template, clear, delete) on file rows. On the
-        // name row they are plain text, but the old handler routed every
-        // keypress through the chord mapping and dropped any char that
-        // resolved to an action — so agent names could not contain those
-        // letters. `typed_char` is the text-buffer path; assert it keeps
-        // them, and that they really are bound actions (bug was reachable).
         use crate::keymap::QuickstartModalAction;
         for ch in ['e', 'c', 't', 'd', 'E', 'C', 'T', 'D'] {
             let key = KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE);
@@ -4311,11 +4505,6 @@ mod tests {
 
     #[test]
     fn unset_placeholder_is_not_a_real_default() {
-        // The daemon emits `<unset>` as a display placeholder for
-        // optional fields. Seeding a buffer with it (or submitting it)
-        // made the daemon validate `<unset>` against the field's real
-        // type, failing e.g. a bool with "length 7". Confirm the
-        // sentinel matches the daemon's UNSET_DISPLAY wire value.
         assert_eq!(UNSET_DISPLAY, "<unset>");
         let seeded = Some(UNSET_DISPLAY.to_string())
             .filter(|v| v != UNSET_DISPLAY && !v.is_empty())
@@ -4401,11 +4590,6 @@ mod tests {
 
     #[test]
     fn wrapped_total_counts_soft_wrapped_rows() {
-        // Regression: the modal box was sized from logical line count, so
-        // a picker blurb (or pasted value) wider than the box still
-        // counted as one row — leaving later options like `yolo` outside
-        // the viewport. `wrapped_total` must report the real wrapped
-        // height the body Paragraph renders.
         let long = Line::from("a".repeat(40));
         assert_eq!(wrapped_total(std::slice::from_ref(&long), 10), 4);
         // A blank line still occupies one row.
@@ -4427,11 +4611,6 @@ mod tests {
         assert_eq!(wrapped_total(&lines, 10), 5);
     }
 
-    /// Render a modal through a headless `TestBackend` and return the
-    /// `(box_rect, per-cursor hit-rects)` `draw_modal` produced — the same
-    /// geometry the live render path uses, so a test can assert on the
-    /// post-scroll, wrapped-row layout instead of just the measurement
-    /// primitives.
     fn render_modal_rects(area: Rect, modal: &Modal) -> (Rect, Vec<Rect>) {
         use ratatui::{Terminal, backend::TestBackend};
         let backend = TestBackend::new(area.width, area.height);
@@ -4460,12 +4639,6 @@ mod tests {
 
     #[test]
     fn picker_keeps_every_option_visible_when_blurbs_wrap() {
-        // #7359 headline: each risk-profile option carries an inline help
-        // blurb that wraps to two rows. The old box was sized from the
-        // logical line count (3), so the last option (`yolo`) fell off the
-        // bottom. With wrapped sizing the box grows to fit all three, and
-        // the hit-rects are spaced by *wrapped* height (>=2 rows apart),
-        // not logical lines (which would be 1 apart — the pre-fix bug).
         let help = "Applies specific filesystem and approval defaults for day-to-day operation.";
         let modal = risk_picker(2, help);
         let area = Rect::new(0, 0, 60, 24);
@@ -4486,12 +4659,6 @@ mod tests {
 
     #[test]
     fn picker_scrolls_to_keep_selected_option_visible() {
-        // When even the grown box can't fit every wrapped row, the selected
-        // row must scroll into view: its hit-rect is non-zero while an
-        // earlier row that scrolled off the top collapses to a zero rect.
-        // This exercises the row_starts -> scroll_offset -> row_rects chain
-        // that the measurement-helper tests don't reach. On the pre-fix code
-        // (logical-line scroll) the first option's rect stayed non-zero.
         let help = "Applies specific filesystem and approval defaults, with extra \
                     explanation to force several wrapped rows inside a narrow modal box.";
         let modal = risk_picker(2, help);

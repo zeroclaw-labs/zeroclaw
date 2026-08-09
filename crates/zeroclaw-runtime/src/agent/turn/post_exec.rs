@@ -2,7 +2,7 @@
 //! completion Status, and filling the executed calls' `ordered_results` slots.
 
 use super::context::TurnCtx;
-use super::events::StreamDelta;
+use super::events::{ProgressEvent, StreamDelta, send_progress};
 use super::redact::scrub_credentials;
 use crate::agent::tool_execution::ToolExecutionOutcome;
 use crate::util::truncate_with_ellipsis;
@@ -64,6 +64,7 @@ pub(crate) async fn record_executed_outcomes(
         }
 
         // ── Progress: tool completion ───────────────────────
+        send_progress(ctx.on_delta, ProgressEvent::Planning).await;
         if let Some(tx) = ctx.on_delta {
             let secs = outcome.duration.as_secs();
             let progress_msg = render_completion_progress(
@@ -124,9 +125,6 @@ fn render_completion_progress(
 mod tests {
     use super::render_completion_progress;
 
-    /// The CLI progress line is a rendering surface, so credential-shaped
-    /// failure text must be scrubbed even though `error_reason` is raw on the
-    /// data path.
     #[test]
     fn completion_progress_scrubs_credential_error_reason() {
         let line = render_completion_progress(

@@ -17,9 +17,16 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Search, X, Wrench, Terminal } from 'lucide-react';
-import type { ToolSpec, CliTool, OptionDomain } from '@/types/api';
-import { getTools, getCliTools } from '@/lib/api';
+import {
+  loadToolCatalogResult,
+  peekToolCatalog,
+  type CatalogEntry as ToolCatalogEntry,
+  type CatalogLoadWarning,
+} from '@/lib/toolCatalog';
 import { t } from '@/lib/i18n';
+import { ToolCatalogWarningPanel } from './ToolCatalogWarningPanel';
+
+export { loadToolCatalog as loadCatalog, type CatalogEntry } from '@/lib/toolCatalog';
 
 export interface ToolPickerProps {
   /** Currently-selected tool names. Order is preserved on toggle. */
@@ -36,70 +43,6 @@ export interface ToolPickerProps {
   agent?: string;
 }
 
-/** A flattened, group-tagged catalog entry. */
-export interface CatalogEntry {
-  name: string;
-  description: string;
-  group: 'agent' | 'cli';
-  /** JSON Schema for the tool's args (agent tools only; CLI tools omit it). */
-  parameters?: unknown;
-  /** Declared structured-output schema, when the tool declares one. */
-  output?: unknown;
-  /** Parameter name → runtime option domain, for domain-typed params. */
-  param_domains?: Record<string, OptionDomain>;
-}
-
-// Process-wide cache so re-mounting the picker (e.g. reopening the Cron
-// modal, or switching config sections) doesn't re-hit the network. Keyed by
-// agent alias (`'' `= the gateway's default-agent listing): the agent-tools
-// half is `getTools(agent)`, so a picker bound to a specific agent (e.g. a
-// channel's owning agent) caches that agent's real scoped catalog separately
-// from the default. Each per-agent catalog is effectively static for the
-// daemon's lifetime.
-const catalogCache = new Map<string, CatalogEntry[]>();
-const catalogInflight = new Map<string, Promise<CatalogEntry[]>>();
-
-function cliDescription(tool: CliTool): string {
-  // CliTool has no `description`; synthesize a short one from category/path
-  // so the row still says something useful.
-  const parts = [tool.category, tool.version ? `v${tool.version}` : null, tool.path]
-    .filter(Boolean)
-    .join(' · ');
-  return parts || tool.path;
-}
-
-export function loadCatalog(agent?: string): Promise<CatalogEntry[]> {
-  const key = agent ?? '';
-  const cached = catalogCache.get(key);
-  if (cached) return Promise.resolve(cached);
-  const inflight = catalogInflight.get(key);
-  if (inflight) return inflight;
-  const promise = Promise.all([getTools(agent), getCliTools()])
-    .then(([tools, cliTools]) => {
-      const agentEntries: CatalogEntry[] = tools.map((tnt: ToolSpec) => ({
-        name: tnt.name,
-        description: tnt.description,
-        group: 'agent' as const,
-        parameters: tnt.parameters,
-        output: tnt.output,
-        param_domains: tnt.param_domains,
-      }));
-      const cli: CatalogEntry[] = cliTools.map((c: CliTool) => ({
-        name: c.name,
-        description: cliDescription(c),
-        group: 'cli' as const,
-      }));
-      const entries = [...agentEntries, ...cli];
-      catalogCache.set(key, entries);
-      return entries;
-    })
-    .finally(() => {
-      catalogInflight.delete(key);
-    });
-  catalogInflight.set(key, promise);
-  return promise;
-}
-
 function truncate(text: string, max = 110): string {
   if (text.length <= max) return text;
   return `${text.slice(0, max - 1)}…`;
@@ -113,48 +56,54 @@ export default function ToolPicker({
   agent,
 }: ToolPickerProps) {
   const cacheKey = agent ?? '';
-  const [catalog, setCatalog] = useState<CatalogEntry[] | null>(
-    () => catalogCache.get(cacheKey) ?? null,
+  const [catalog, setCatalog] = useState<ToolCatalogEntry[] | null>(
+    () => peekToolCatalog(cacheKey),
   );
-  const [loading, setLoading] = useState(() => !catalogCache.has(cacheKey));
+  const [loading, setLoading] = useState(() => peekToolCatalog(cacheKey) === null);
   const [error, setError] = useState<string | null>(null);
+  const [warnings, setWarnings] = useState<CatalogLoadWarning[]>([]);
+  const [reloadSeq, setReloadSeq] = useState(0);
   const [search, setSearch] = useState('');
 
   // Reload when the bound agent changes so the catalog reflects that agent's
   // scoped tools (cached per agent, so switching back is instant).
   useEffect(() => {
-    const cached = catalogCache.get(cacheKey);
+    const cached = reloadSeq === 0 ? peekToolCatalog(cacheKey) : null;
     if (cached) {
       setCatalog(cached);
       setLoading(false);
       setError(null);
+      setWarnings([]);
       return;
     }
     let cancelled = false;
     setLoading(true);
     setError(null);
+    setWarnings([]);
     setCatalog(null);
-    loadCatalog(agent)
-      .then((entries) => {
+    loadToolCatalogResult(agent)
+      .then((result) => {
         if (!cancelled) {
-          setCatalog(entries);
+          setCatalog(result.entries);
+          setWarnings(result.warnings);
           setLoading(false);
         }
       })
       .catch((err: unknown) => {
         if (!cancelled) {
           setError(err instanceof Error ? err.message : t('tool_picker.load_failed'));
+          setWarnings([]);
           setLoading(false);
         }
       });
     return () => {
       cancelled = true;
     };
-  }, [agent, cacheKey]);
+  }, [agent, cacheKey, reloadSeq]);
 
   // Fast membership lookups for the catalog and the current selection.
   const byName = useMemo(() => {
-    const map = new Map<string, CatalogEntry>();
+    const map = new Map<string, ToolCatalogEntry>();
     for (const e of catalog ?? []) map.set(e.name, e);
     return map;
   }, [catalog]);
@@ -178,11 +127,15 @@ export default function ToolPicker({
     onChange(value.filter((n) => n !== name));
   };
 
+  const retryCatalogLoad = () => {
+    setReloadSeq((seq) => seq + 1);
+  };
+
   // Bulk toggle for a group's currently-displayed entries. If every displayed
   // entry is already selected, deselect them all; otherwise add the missing
   // ones. Operates on the filtered list so it honors an active search, and
   // matches the count shown in the group header.
-  const toggleAll = (entries: CatalogEntry[]) => {
+  const toggleAll = (entries: ToolCatalogEntry[]) => {
     if (disabled || entries.length === 0) return;
     const names = entries.map((e) => e.name);
     const allSelected = names.every((n) => selectedSet.has(n));
@@ -387,6 +340,14 @@ export default function ToolPicker({
             )}
           </div>
         )}
+
+      {warnings.length > 0 && (
+        <ToolCatalogWarningPanel
+          warnings={warnings}
+          onRetry={retryCatalogLoad}
+          retryDisabled={loading}
+        />
+      )}
 
       {/* Catalog list */}
       {loading ? (

@@ -42,6 +42,10 @@ import {
 } from "lucide-react";
 import DirectoryPicker from "./DirectoryPicker";
 import ToolPicker from "@/components/ToolPicker";
+import ToolPermissionGrid, {
+  type ToolPermissionGridValue,
+} from "@/components/ToolPermissionGrid";
+import { profileLevelFromDraft } from "@/components/ToolPermissionGrid.logic";
 import { Badge, Button, ComboBox, Select } from "@/components/ui";
 import type { BadgeTone } from "@/components/ui";
 import { t } from "@/lib/i18n";
@@ -1182,6 +1186,94 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
       configDraft.stageTombstone(path);
     };
 
+    // Shared by every string-array-ish field's onChange, including the
+    // grouped ToolPermissionGrid below — same draft representation, so the
+    // save path (parseInput → parseStringArrayValue) never sees a difference
+    // between a field edited via its own row and one edited via the grid.
+    const applyFieldValue = (f: ListResponseEntry, v: string) => {
+      setDraft((d) => ({ ...d, [f.path]: v }));
+      const baseline = defaultInputValue(f);
+      if (v === baseline || (f.is_secret && v.length === 0)) {
+        configDraft.clearDraft(f.path);
+      } else {
+        let parsed: unknown;
+        try {
+          parsed = parseInput(f, v);
+        } catch {
+          parsed = v;
+        }
+        if (
+          f.kind === "string-array" &&
+          Array.isArray(parsed) &&
+          parsed.length === 0 &&
+          isOptionalArray(f.type_hint)
+        ) {
+          parsed = null;
+        }
+        configDraft.setDraft(f.path, v, parsed);
+      }
+    };
+
+    // Group sibling `*.allowed_tools` / `*.excluded_tools` / `*.auto_approve`
+    // / `*.always_ask` entries into one ToolPermissionGrid instead of four
+    // independent FieldRows. Matched by parent prefix + leaf name — today
+    // only `risk_profiles.<alias>` has all four as direct siblings, but
+    // nothing here hardcodes that section, same spirit as the single-leaf
+    // `isAllowedToolsField` hook below.
+    const permissionGroups = useMemo(() => {
+      const leaves = [
+        "allowed_tools",
+        "excluded_tools",
+        "auto_approve",
+        "always_ask",
+      ] as const;
+      type Leaf = (typeof leaves)[number];
+      const byParent = new Map<string, Partial<Record<Leaf, ListResponseEntry>>>();
+      for (const e of entries) {
+        if (e.kind !== "string-array") continue;
+        const idx = e.path.lastIndexOf(".");
+        if (idx === -1) continue;
+        const parent = e.path.slice(0, idx);
+        const leaf = e.path.slice(idx + 1) as Leaf;
+        if (!(leaves as readonly string[]).includes(leaf)) continue;
+        const bucket = byParent.get(parent) ?? {};
+        bucket[leaf] = e;
+        byParent.set(parent, bucket);
+      }
+      const groups: { parent: string; fields: Record<Leaf, ListResponseEntry> }[] = [];
+      for (const [parent, bucket] of byParent) {
+        if (bucket.allowed_tools && bucket.excluded_tools && bucket.auto_approve && bucket.always_ask) {
+          groups.push({
+            parent,
+            fields: {
+              allowed_tools: bucket.allowed_tools,
+              excluded_tools: bucket.excluded_tools,
+              auto_approve: bucket.auto_approve,
+              always_ask: bucket.always_ask,
+            },
+          });
+        }
+      }
+      return groups;
+    }, [entries]);
+
+    // Paths consumed by a permission group — excluded from the normal
+    // per-field row list (see `visibleEntries` below). Deliberately NOT
+    // filtered by the field-name search box: that box searches config field
+    // names, the grid has its own tool-name search over a different set of
+    // things (individual tool rows), and conflating the two would make the
+    // grid flicker in and out as the operator types.
+    const groupedPaths = useMemo(() => {
+      const s = new Set<string>();
+      for (const g of permissionGroups) {
+        s.add(g.fields.allowed_tools.path);
+        s.add(g.fields.excluded_tools.path);
+        s.add(g.fields.auto_approve.path);
+        s.add(g.fields.always_ask.path);
+      }
+      return s;
+    }, [permissionGroups]);
+
     const sortedEntries = useMemo(() => {
       // Stable order: `enabled` first (drives whether anything below it
       // matters), then first-run required fields, then secrets, then
@@ -1213,9 +1305,11 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
     );
 
     const visibleEntries = useMemo(() => {
-      const base = enabledEntry
-        ? sortedEntries.filter((e) => e.path !== enabledEntry.path)
-        : sortedEntries;
+      const base = (
+        enabledEntry
+          ? sortedEntries.filter((e) => e.path !== enabledEntry.path)
+          : sortedEntries
+      ).filter((e) => !groupedPaths.has(e.path));
       const filtered = includePath
         ? base.filter((e) => includePath(e.path))
         : base;
@@ -1225,7 +1319,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
         filter,
         (e) => `${fieldShortLabel(e)} ${e.path}`,
       );
-    }, [sortedEntries, filter, includePath, enabledEntry]);
+    }, [sortedEntries, filter, includePath, enabledEntry, groupedPaths]);
 
     // Count of fields whose draft value differs from the saved display value.
     // Drives the unsaved-changes counter in the sticky save bar. Must be
@@ -1387,29 +1481,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
                 mcpTransport={resolveMcpTransport(f.path, entries, draft)}
                 requiredByTransport={requiredByTransport}
                 value={draft[f.path] ?? ""}
-                onChange={(v) => {
-                  setDraft((d) => ({ ...d, [f.path]: v }));
-                  const baseline = defaultInputValue(f);
-                  if (v === baseline || (f.is_secret && v.length === 0)) {
-                    configDraft.clearDraft(f.path);
-                  } else {
-                    let parsed: unknown;
-                    try {
-                      parsed = parseInput(f, v);
-                    } catch {
-                      parsed = v;
-                    }
-                    if (
-                      f.kind === "string-array" &&
-                      Array.isArray(parsed) &&
-                      parsed.length === 0 &&
-                      isOptionalArray(f.type_hint)
-                    ) {
-                      parsed = null;
-                    }
-                    configDraft.setDraft(f.path, v, parsed);
-                  }
-                }}
+                onChange={(v) => applyFieldValue(f, v)}
                 comment={comments[f.path] ?? ""}
                 onCommentChange={(v) => {
                   setComments((c) => ({ ...c, [f.path]: v }));
@@ -1434,6 +1506,43 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
             ))}
           </form>
         )}
+
+        {/* One grid per detected `allowed_tools`/`excluded_tools`/
+          `auto_approve`/`always_ask` sibling group, rendered outside the
+          filterable field list (see `groupedPaths` / `visibleEntries`
+          above) so the tool-name search inside the grid never fights the
+          field-name search box above it. */}
+        {permissionGroups.map((g) => (
+          <div
+            key={g.parent}
+            className="surface-panel p-4"
+            style={{ borderColor: "var(--pc-border)" }}
+          >
+            <h3
+              className="text-sm font-semibold mb-3"
+              style={{ color: "var(--pc-text-primary)" }}
+            >
+              {t("fieldform.tool_permissions_title")}
+            </h3>
+            <ToolPermissionGrid
+              id={g.parent}
+              agent={toolAgent}
+              level={profileLevelFromDraft(draft, g.parent)}
+              value={{
+                allowedTools: parseArrayRows(draft[g.fields.allowed_tools.path] ?? ""),
+                excludedTools: parseArrayRows(draft[g.fields.excluded_tools.path] ?? ""),
+                autoApprove: parseArrayRows(draft[g.fields.auto_approve.path] ?? ""),
+                alwaysAsk: parseArrayRows(draft[g.fields.always_ask.path] ?? ""),
+              }}
+              onChange={(next: ToolPermissionGridValue) => {
+                applyFieldValue(g.fields.allowed_tools, JSON.stringify(next.allowedTools));
+                applyFieldValue(g.fields.excluded_tools, JSON.stringify(next.excludedTools));
+                applyFieldValue(g.fields.auto_approve, JSON.stringify(next.autoApprove));
+                applyFieldValue(g.fields.always_ask, JSON.stringify(next.alwaysAsk));
+              }}
+            />
+          </div>
+        ))}
 
         {/* Sticky footer bar — pinned to the bottom of the scrolling form
           area so Save is always visible without scrolling. Status (unsaved

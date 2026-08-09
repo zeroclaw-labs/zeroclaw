@@ -8,7 +8,7 @@
 > If anything in here feels heavyweight, that is intentional friction, we do
 > not yet have the automation discipline to remove it safely.
 
-Last verified against the `0.8.0-beta` cycle.
+Last verified against the `v0.8.2` release cycle.
 
 ---
 
@@ -23,8 +23,10 @@ Last verified against the `0.8.0-beta` cycle.
 7. [Versioned documentation deployment](#step-7-versioned-documentation-deployment)
 
 That is the entire process. Everything else (Docker, website redeploy, Scoop,
-AUR, Homebrew, Discord, tweet) runs automatically as downstream jobs. You do not
-need to do anything for those unless a job explicitly fails.
+AUR, Discord, tweet) runs automatically as downstream jobs. Homebrew Core
+detects the stable GitHub release through its own autobump service. You do not
+need to do anything for those unless a job explicitly fails or Homebrew's
+external bump remains stale.
 
 ---
 
@@ -59,22 +61,38 @@ Bump `workspace.package.version` in the workspace `Cargo.toml`, then run the two
 
 This updates README badges, the Tauri config, and workflow description
 examples, then regenerates every spec-driven install surface via
-`cargo generate installers`: setup.bat, `dist/aur/PKGBUILD`,
+`cargo generate installers`: install.sh, setup.bat, `dist/aur/PKGBUILD`,
 `dist/scoop/zeroclaw.json`, `flake.nix`, the Dockerfile/Containerfile feature
-sets, and `dev/ci/docker-tags.toml`. Those surfaces derive their version and
-feature lists from the canonical install spec (`Cargo.toml` plus
-`[package.metadata.zeroclaw]`), so the bump keeps them in step automatically;
-never hand-edit a generated region. This script also refreshes the Nix git
-dependency hashes (`nix/hashes.json`) via `scripts/dev/refresh-nix-hashes.sh`.
+sets, `dev/ci/docker-tags.toml`, `docs/book/src/_snippets/install.md`, the Unix
+fast-path blocks in README/platform docs, and the Windows prebuilt block in
+`docs/book/src/setup/windows.md`.
+Version, feature, and application-packaging values come from `Cargo.toml` and
+`[package.metadata.zeroclaw]`; the four stable installation routes come from
+typed contracts in `xtask/src/generate/spec.rs`. The bump keeps these surfaces
+in step automatically, so never hand-edit a generated region. Live release
+availability remains hand-authored and is not inferred by the generator. This
+script also refreshes the Nix git dependency hashes (`nix/hashes.json`) via
+`scripts/dev/refresh-nix-hashes.sh`.
 
-Then refresh the docs translation catalogues and pin them to the matching tag:
+### Refresh and pin translations
+
+After `bump-version.sh` sets the release version, refresh the docs translation
+catalogues and pin them to the matching tag. If the catalogues were prepared
+separately, inspect coverage and validate them before cutting the tag:
+
+```sh
+cargo mdbook stats
+cargo mdbook check
+```
+
+Then run the release wrapper:
 
 <div class="os-tabs-src">
 
 #### sh
 
 ```sh
-./scripts/release/refresh-translations.sh    # init submodule, refresh catalogues, tag, pin
+./scripts/release/refresh-translations.sh --model-provider anthropic.release
 ```
 
 </div>
@@ -85,8 +103,16 @@ hand), runs the translation pass, commits and pushes the catalogues to the
 submodule, cuts the `v{version}` tag there, and stages the main-repo gitlink
 pinned to that tag. It initialises the submodule if it is not already checked
 out. Run it after `bump-version.sh` so the `Cargo.toml` version it reads is the
-release version. Pass `--no-translate` to skip the sync pass when the catalogues
-are already current, or an explicit version to override the `Cargo.toml` default.
+release version. The configured provider alias is required explicitly so the
+release does not depend on a hardcoded backend; pass `--config-dir` when needed.
+The alias selected by `--model-provider` resolves from
+`providers.models.<kind>.<alias>`. Use `--no-translate` when the catalogues are
+already current, or pass an explicit version before `--model-provider` to
+override the `Cargo.toml` default, for example:
+
+```sh
+./scripts/release/refresh-translations.sh 0.8.2 --model-provider anthropic.release
+```
 
 Commit everything together:
 
@@ -103,8 +129,8 @@ gate in CI fails the PR if a generated surface is out of sync with the spec, so
 a missed regeneration cannot land. The
 **Validate Translations Pin** gate resolves the submodule at the pinned commit
 and validates catalogue format and msgid parity, so a bad pin cannot land
-either. See [Docs & Translations](../maintainers/docs-and-translations.md) for
-catalogue refresh details.
+either. See [Docs & Translations](../maintainers/docs-and-translations.md#filling-doc-translations-gettext)
+for translation pipeline details.
 
 **Confirm the merge landed correctly:**
 
@@ -165,6 +191,17 @@ real `GITHUB_TOKEN` to every workflow run:
    ```
 
    </div>
+
+   Artifact-producing jobs need an `act` artifact-service protocol that
+   `actions/upload-artifact` v7 and `actions/download-artifact` v8 require,
+   and **no currently released version of `act` implements it** (checked
+   through the latest release as of this writing). The helper preflights the
+   installed `act` version before starting a job that uses the pinned
+   artifact actions and fails closed: it will not attempt the job on an
+   unverified version. Until a compatible `act` release ships and is
+   verified against a real artifact round-trip, use the GitHub-hosted
+   fallback below for any artifact-producing or artifact-consuming job; that
+   is the recommended path today, not a rare exception.
 
 3. Install Docker Engine or Docker Desktop from
    <https://docs.docker.com/engine/install/>. On Linux, add yourself to
@@ -228,6 +265,40 @@ value never lands in argv), and sets `--artifact-server-path` so
 `actions/upload-artifact` and `actions/download-artifact` work between
 jobs. All of that is plain `act` underneath; the script just removes
 the flag soup.
+
+Before any artifact-producing or artifact-consuming job starts, the helper
+checks the resolved standalone `act` or `gh act` version against an internal
+compatibility threshold (`act` >= an unreachable sentinel, currently
+`999.0.0`). That threshold is **not** a version to go install; no released
+`act` version satisfies it, and it only moves to a real, specific version
+once a real artifact round-trip has been verified against that release. Every
+currently released `act` version fails the preflight before the build starts
+and points to GitHub-hosted Actions; do not downgrade the pinned artifact
+actions to make a local runner pass.
+
+For `--all`, compatibility is checked across the complete selected job set
+before the first job starts. If any selected job needs the artifact service,
+the sweep fails closed (no currently released `act` clears the threshold) and
+exits without running a partial subset. `--all --no-allowlist` follows the
+same compatibility policy.
+
+Local artifact preflight failures are expected on every currently released
+`act`, not an occasional hiccup. Push the exact commit to GitHub and use the
+hosted workflow as the validation fallback for artifact-bearing jobs. The
+read-only cross-platform build can be dispatched safely and watched from the
+CLI:
+
+```sh
+gh workflow run cross-platform-build-manual.yml --ref <validation-branch>
+gh run list --workflow cross-platform-build-manual.yml --branch <validation-branch> --limit 1
+gh run watch <run-id> --exit-status
+```
+
+Do not trigger `release-stable-manual.yml` early as a dry-run substitute: that
+workflow publishes after its environment approvals. Record the local artifact
+jobs as skipped because of the version policy, use the hosted cross-platform
+build for the artifact round trip, and leave the protected stable-release run
+for Step 4.
 
 ### `--all` only runs jobs on a dry-run-safe allowlist
 
@@ -337,31 +408,66 @@ Once `publish` completes, confirm:
 [ ] GitHub Release exists at /releases/tag/vX.Y.Z and is marked Latest
 [ ] Release notes are non-empty
 [ ] SHA256SUMS asset is present and non-empty
+[ ] Both SPDX and CycloneDX SBOM assets are present
+[ ] Exactly one zeroclaw-vX.Y.Z-verification.tar.gz asset is present
+[ ] No loose *.bundle, *.attestation.jsonl, or *.intoto.jsonl assets are present
 [ ] At least one binary archive is downloadable (spot-check linux x86_64)
+[ ] Prebuilt Docker and generated Docker matrix jobs are green
 ```
 
 `CHANGELOG-next.md` is intentionally left on `master` after the release: the
 publish job only reads it as the release body, it does not delete it. The next
 release cycle overwrites it, so no manual cleanup is required.
 
-You do not need to manually verify Docker or the distribution channels
-unless a job in the workflow run shows red. Check the workflow run summary; if
-all jobs are green, you are done.
+For the normal `workflow_dispatch` path, Docker Publish runs synchronously
+inside the stable release workflow. You do not need a separate Docker check if
+all release jobs are green. If a maintainer instead starts the release by
+pushing a `vX.Y.Z` tag, Docker Publish starts as a separate tag-triggered run;
+confirm that sibling run is green before treating container publication as
+complete. Scoop and AUR need separate attention only when their jobs show red.
+Homebrew Core is external to this workflow; its
+[autobump service](https://docs.brew.sh/Autobump) checks eligible formulae on
+its own schedule.
 
 Consumers who want to verify signatures, SBOMs, or SLSA provenance on the
 published artifacts can follow
 [Release artifact verification](./release-verification.md).
 
+After any release-attestation workflow change, a human maintainer must also run
+the online and disconnected verification rehearsal in
+`docs/maintainers/release-attestation-runbook.md` before closing the tracking
+issue. A local workflow lint or `act` run does not replace that release-level
+check because neither can mint GitHub's production OIDC attestation.
+
 ---
 
 ## Step 7: Versioned documentation deployment
 
-ZeroClaw docs use a versioned structure on the `gh-pages` branch. When a tag is pushed, the `Deploy mdBook docs to Pages` workflow automatically builds and deploys the documentation for that version. This runs automatically after the tag from step 4 lands; the bootstrap and version-floor details below are reference material for when you need to recreate `gh-pages` or change the supported-version window.
+ZeroClaw docs use a versioned structure on the `gh-pages` branch. The `Release
+Stable` workflow's `deploy-docs` job dispatches the `Deploy mdBook docs to
+Pages` workflow for the release tag once `publish` succeeds; that dispatched
+run builds and publishes the version's documentation into `/vX.Y.Z/`
+asynchronously (the dispatch job does not wait for it). The bootstrap and
+version-floor details below are reference material for when you need to
+recreate `gh-pages` or change the supported-version window.
+
+> **Why an explicit dispatch and not the tag-push trigger.** `docs-deploy.yml`
+> lists `tags: [v*]`, but the release tag is created by the `publish` job via
+> `gh release create` using `GITHUB_TOKEN`. GitHub does not start a new workflow
+> run from a tag push created with `GITHUB_TOKEN`
+> ([docs](https://docs.github.com/actions/security-for-github-actions/security-guides/automatic-token-authentication#using-the-github_token-in-a-workflow)),
+> so the `tags: [v*]` trigger never fires for a release cut this way. The
+> `deploy-docs` job therefore invokes `docs-deploy.yml` via `workflow_dispatch`
+> (the documented exception that runs even under `GITHUB_TOKEN`) with the tag as
+> input. If you ever cut a tag by hand with a personal token instead, the
+> `tags: [v*]` push trigger fires and the release-workflow dispatch is a no-op
+> re-run of the same deploy, and both paths converge on `/vX.Y.Z/`.
 
 ### What happens automatically
 
-- Pushing a tag (e.g., `v0.8.0`) triggers a build that lands in `/v0.8.0/`.
+- The `deploy-docs` job dispatches a build that lands in `/vX.Y.Z/`.
 - "Stable" is a pointer, not a copy. The release tag deploy (e.g., `v0.8.0`) is what builds and publishes that version's docs directory. `bump-version.sh` writes the released version to `docs/book/stable-version.txt`; landing that change on master refreshes the stable metadata only. The master deploy does not rebuild or republish the release tag's docs; it copies `stable-version.txt` to the `gh-pages` root and regenerates the root `/` redirect and the version-selector's "Stable (latest release)" entry so both resolve to that release's already-published version dir. The deploy fails loudly if the named version dir is not present on `gh-pages`. There is no duplicate `/stable/` tree.
+- **Ordering matters:** the tag deploy must land `/vX.Y.Z/` on `gh-pages` *before* a master deploy can flip the stable pointer to it. In the normal release sequence the version-bump PR merges first (Step 2), so its `master` docs deploy typically runs *before* `Release Stable` creates and deploys the tag. That earlier master deploy finds `/vX.Y.Z/` absent and deliberately retains the previous pointer; the flip is deferred (see the deferred-flip logic in `docs-deploy.yml`). The `deploy-docs` job then creates `/vX.Y.Z/`, and the flip publishes on the *next* master deploy after the dir is live. Note that `deploy-docs` only dispatches the tag build and does not wait for it: a green `deploy-docs` job means the dispatch was accepted, not that the docs run finished. After `/vX.Y.Z/` is live, dispatch `docs-deploy.yml` with `tag=master` to publish the stable-pointer flip (and confirm the dispatched runs actually succeeded in the Actions tab).
 - `gh-pages` is ephemeral: every deploy force-pushes a single orphan commit (no accumulating history) and enforces retention via `DOCS_KEEP_VERSIONS` (master plus the newest N final releases; pre-releases and older finals are pruned). This keeps clone size bounded.
 - The `_shared/` directory (containing UI CSS, JS, and favicons) is updated from the build so the theme cascades to all deployed versions.
 - Translated locales (`es`, `fr`, `ja`, `zh-CN`) render from the `docs/book/po` submodule, which the deploy resolves via `submodules: recursive` at whatever commit the deployed ref pins. That pin is set during the version bump; see [Step 2](#step-2-bump-and-merge-the-version-pr) for the refresh, tag, and pin procedure. English needs no submodule.
@@ -401,16 +507,30 @@ If you need to raise the floor to drop support for an older version:
 
 ## If something goes wrong
 
+**The run dies instantly with `startup_failure` (zero jobs created):** Treat
+this as a symptom, not an allowlist diagnosis. Check the run summary and
+repository Actions policy. If GitHub reports a selected-actions rejection and
+the release workflow recently added or changed `uses:` refs, compare those refs
+with [Allowed actions](./ci-and-actions.md#allowed-actions). Add only the
+rejected pattern in Settings → Actions → General, wait a few minutes for the
+setting to propagate, then dispatch a fresh run. If GitHub does not report a
+policy rejection, investigate the workflow definition or other repository
+policy instead.
+
 **validate failed: version mismatch:** The version bump PR was not merged, or
 you typed the wrong version. Fix the mismatch and re-trigger.
 
 **An environment gate timed out:** Re-run only the timed-out job. No need to
 restart the workflow.
 
-**A distribution channel job failed (Scoop, AUR, Homebrew):** Each has a
-corresponding manually-triggerable sub-workflow. Re-run the specific one with
-`dry_run: true` first to confirm the fix, then `dry_run: false`. These are
-nice-to-have: a failed Scoop job does not invalidate the release itself.
+**A Scoop or AUR distribution job failed:** Each has a corresponding
+manually-triggerable sub-workflow. Re-run the specific one with `dry_run: true`
+first to confirm the fix, then `dry_run: false`. These are nice-to-have: a
+failed distribution job does not invalidate the release itself.
+
+**Homebrew Core is stale:** Homebrew is not a release-workflow job. Check the
+[Homebrew autobump status and documented manual bump
+path](https://docs.brew.sh/Autobump) instead of adding a repository fork token.
 
 ---
 

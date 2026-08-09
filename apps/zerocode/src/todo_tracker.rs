@@ -1,9 +1,4 @@
 //! Read-only TodoWrite tracker widget for the Code pane.
-//!
-//! Holds the last authoritative plan (whole-list replace) and owns the
-//! show/hide state machine: auto-pop once on the first plan of a
-//! session, after which the user's toggle is authoritative; a master
-//! `enabled` flag hard-gates all rendering.
 
 use crate::wire::{ConfigFieldEntry, PlanEntry, PlanStatus};
 
@@ -54,12 +49,6 @@ impl Default for TodoTrackerSettings {
 }
 
 impl TodoTrackerSettings {
-    /// Build settings from `config/list` field entries (prefix
-    /// `todotracker`). Each field is keyed by its dotted `path`
-    /// (`todotracker.enabled`, …); absent or unparseable fields keep the
-    /// schema default. The daemon is the source of truth for defaults,
-    /// but we re-apply them here so a partial/failed fetch degrades
-    /// gracefully.
     #[allow(dead_code)]
     pub(crate) fn from_config_fields(fields: &[ConfigFieldEntry]) -> Self {
         let mut s = Self::default();
@@ -130,8 +119,6 @@ impl TodoTracker {
         }
     }
 
-    /// Test-only convenience constructor: builds settings from the three
-    /// behavioral flags with default width/max_height.
     #[cfg(test)]
     pub(crate) fn new(location: TodoLocation, enabled: bool, enabled_at_start: bool) -> Self {
         Self::from_settings(TodoTrackerSettings {
@@ -209,36 +196,47 @@ impl TodoTracker {
     pub(crate) fn render(&self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
         use ratatui::style::{Modifier, Style};
         use ratatui::text::{Line, Span};
-        use ratatui::widgets::{Block, Borders, Paragraph};
+        use ratatui::widgets::Paragraph;
+
+        use crate::theme;
 
         let title = format!(
-            "Plan ({}) — {}/{} done",
+            " Plan ({}) — {}/{} done ",
             self.total(),
             self.done(),
             self.total()
         );
-        let block = Block::default().borders(Borders::ALL).title(title);
+        // Themed pane chrome: dim border + bold themed title, matching
+        // every other split-pane in the Code/Chat view. `fill_style`
+        // paints the panel interior with the theme background so the
+        // tracker never shows the terminal default through.
+        let block = theme::panel_block(&title).style(theme::fill_style());
 
         if self.entries.is_empty() {
-            let placeholder = Paragraph::new("No active plan").block(block);
+            let placeholder = Paragraph::new(Span::styled("No active plan", theme::dim_style()))
+                .style(theme::fill_style())
+                .block(block);
             frame.render_widget(placeholder, area);
             return;
         }
 
         let mut lines: Vec<Line> = Vec::with_capacity(self.entries.len());
         for e in &self.entries {
+            // Map each plan status onto a theme role so the tracker
+            // tracks the active palette (and per-agent overrides) live:
+            // completed → dim, in-progress → bold accent, pending → body.
             let (glyph, style, label): (&str, Style, &str) = match e.status {
                 PlanStatus::Completed => (
                     "✔",
-                    Style::default().add_modifier(Modifier::DIM),
+                    theme::dim_style().add_modifier(Modifier::DIM),
                     e.content.as_str(),
                 ),
                 PlanStatus::InProgress => (
                     "▶",
-                    Style::default().add_modifier(Modifier::BOLD),
+                    theme::accent_style(),
                     e.active_form.as_deref().unwrap_or(&e.content),
                 ),
-                PlanStatus::Pending => ("○", Style::default(), e.content.as_str()),
+                PlanStatus::Pending => ("○", theme::body_style(), e.content.as_str()),
             };
             lines.push(Line::from(vec![
                 Span::styled(format!("{glyph} "), style),
@@ -246,7 +244,9 @@ impl TodoTracker {
             ]));
         }
 
-        let para = Paragraph::new(lines).block(block);
+        let para = Paragraph::new(lines)
+            .style(theme::fill_style())
+            .block(block);
         frame.render_widget(para, area);
     }
 }
@@ -439,6 +439,25 @@ mod tests {
         buf.content().iter().map(|c| c.symbol()).collect::<String>()
     }
 
+    /// Render into a `TestBackend` and return the whole buffer so tests
+    /// can inspect per-cell styling (foreground colours), not just text.
+    fn render_to_buffer(t: &TodoTracker, w: u16, h: u16) -> ratatui::buffer::Buffer {
+        let backend = TestBackend::new(w, h);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| t.render(f, Rect::new(0, 0, w, h))).unwrap();
+        term.backend().buffer().clone()
+    }
+
+    /// The foreground colour of the first cell whose symbol equals
+    /// `needle` (a single grapheme — `TestBackend` stores one grapheme per
+    /// cell). Used to prove entry spans carry themed colours.
+    fn fg_of_symbol(buf: &ratatui::buffer::Buffer, needle: &str) -> Option<ratatui::style::Color> {
+        buf.content()
+            .iter()
+            .find(|c| c.symbol() == needle)
+            .map(|c| c.fg)
+    }
+
     #[test]
     fn renders_entries_with_status_glyphs() {
         let mut t = TodoTracker::new(TodoLocation::Right, true, true);
@@ -451,6 +470,108 @@ mod tests {
         assert!(out.contains("Alpha"));
         assert!(out.contains("Beta"));
         assert!(out.contains("Gamma"));
+    }
+
+    #[test]
+    fn render_obeys_active_theme() {
+        // Regression guard: the tracker panel must paint from the active
+        // ZeroCode theme, not ratatui defaults. Pin a known palette and
+        // assert entry spans carry that theme's colours (routed through the
+        // same colour-depth downgrade the renderer uses, so the assertion
+        // is independent of the test terminal's detected depth).
+        use ratatui::style::Color;
+
+        let theme = crate::theme::theme_by_name("icy_blue").expect("icy_blue registered");
+        let _guard = crate::theme::set_active_for_test(theme);
+
+        let expect = |c: Color| crate::color_depth::downgrade(c);
+
+        let mut t = TodoTracker::new(TodoLocation::Right, true, true);
+        t.set_plan(vec![
+            entry("Alpha", PlanStatus::Completed),
+            entry("Beta", PlanStatus::InProgress),
+            entry("Gamma", PlanStatus::Pending),
+        ]);
+        let buf = render_to_buffer(&t, 30, 8);
+
+        // Pending entry uses the theme body colour ("Gamma" → 'G').
+        assert_eq!(
+            fg_of_symbol(&buf, "G"),
+            Some(expect(theme.body)),
+            "pending entry must use theme body colour"
+        );
+        // In-progress uses the accent colour ("Beta" → 'B').
+        assert_eq!(
+            fg_of_symbol(&buf, "B"),
+            Some(expect(theme.accent)),
+            "in-progress entry must use theme accent colour"
+        );
+        // Completed uses the dim colour (unique '✔' glyph).
+        assert_eq!(
+            fg_of_symbol(&buf, "✔"),
+            Some(expect(theme.dim)),
+            "completed entry must use theme dim colour"
+        );
+        // No rendered cell should fall back to the terminal default fg:
+        // every painted cell carries a themed colour.
+        assert!(
+            buf.content().iter().all(|c| c.fg != Color::Reset),
+            "no cell should use the terminal default foreground"
+        );
+    }
+
+    #[test]
+    fn placeholder_obeys_active_theme() {
+        // The empty-state placeholder must also honour the theme (dim
+        // foreground), not the ratatui default.
+        use ratatui::style::Color;
+
+        let theme = crate::theme::theme_by_name("icy_blue").expect("icy_blue registered");
+        let _guard = crate::theme::set_active_for_test(theme);
+
+        let t = TodoTracker::new(TodoLocation::Right, true, true);
+        let buf = render_to_buffer(&t, 24, 5);
+        // "No active plan" → unique 'N' cell carries the placeholder style.
+        assert_eq!(
+            fg_of_symbol(&buf, "N"),
+            Some(crate::color_depth::downgrade(theme.dim)),
+            "empty placeholder must use theme dim colour"
+        );
+        assert!(
+            buf.content().iter().all(|c| c.fg != Color::Reset),
+            "no cell should use the terminal default foreground"
+        );
+    }
+
+    #[test]
+    fn terminal_theme_distinguishes_completed_from_pending() {
+        use ratatui::style::{Color, Modifier};
+
+        let theme = crate::theme::theme_by_name("terminal").expect("terminal registered");
+        let _guard = crate::theme::set_active_for_test(theme);
+
+        let mut t = TodoTracker::new(TodoLocation::Right, true, true);
+        t.set_plan(vec![
+            entry("Completed", PlanStatus::Completed),
+            entry("Pending", PlanStatus::Pending),
+        ]);
+        let buf = render_to_buffer(&t, 30, 7);
+        let completed = buf
+            .content()
+            .iter()
+            .find(|cell| cell.symbol() == "✔")
+            .expect("completed row rendered");
+        let pending = buf
+            .content()
+            .iter()
+            .find(|cell| cell.symbol() == "○")
+            .expect("pending row rendered");
+
+        assert_eq!(completed.fg, Color::Reset);
+        assert_eq!(pending.fg, Color::Reset);
+        assert!(completed.modifier.contains(Modifier::DIM));
+        assert!(!pending.modifier.contains(Modifier::DIM));
+        assert_ne!(completed.modifier, pending.modifier);
     }
 
     #[test]

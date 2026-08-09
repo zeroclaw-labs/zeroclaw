@@ -1,10 +1,4 @@
 //! Interactive user prompting tool for cross-channel confirmations.
-//!
-//! Exposes `ask_user` as an agent-callable tool that sends a question to a
-//! messaging channel and waits for the user's response. The tool holds a
-//! late-binding channel map handle that is populated once channels are
-//! initialized (after tool construction). This mirrors the pattern used by
-//! [`ReactionTool`](super::reaction::ReactionTool).
 
 use async_trait::async_trait;
 use parking_lot::RwLock;
@@ -187,9 +181,16 @@ impl Tool for AskUserTool {
         let timeout = std::time::Duration::from_secs(timeout_secs);
 
         // Prefer the channel's native structured-choice flow when choices are
-        // present (e.g. ACP `session/request_permission`, Telegram inline
-        // keyboard). Channels that don't implement it return `Ok(None)` and
-        // we fall through to the generic send + listen path.
+        // present (e.g. ACP `session/request_permission` / `elicitation/create`,
+        // Telegram inline keyboard).
+        //
+        // `Ok(None)` is overloaded on the Channel trait:
+        //   - default impl / no native UI → "caller should fall back to send+listen"
+        //   - ACP/RPC after Decline|Cancel → also `Ok(None)`
+        // Only free-form-capable channels may take the send+listen fallback.
+        // Structured-only channels (ACP, RPC Code tab, WS approval) must fail
+        // fast: their `listen` never delivers a reply, so fallthrough either
+        // hangs until timeout or returns a misleading "channel closed" error.
         if let Some(ref choices_vec) = choices
             && !choices_vec.is_empty()
         {
@@ -204,7 +205,21 @@ impl Tool for AskUserTool {
                         error: None,
                     });
                 }
-                Ok(None) => { /* fall through to send+listen */ }
+                Ok(None) if channel.supports_free_form_ask() => {
+                    /* fall through to send+listen */
+                }
+                Ok(None) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(format!(
+                            "Channel '{channel_name}' did not complete the structured choice \
+                             (user cancelled/declined, or the channel has no free-form fallback). \
+                             Retry ask_user; free-form questions on this channel await ACP \
+                             elicitation Phase 2."
+                        )),
+                    });
+                }
                 Err(e) => {
                     return Ok(ToolResult {
                         success: false,
@@ -216,13 +231,6 @@ impl Tool for AskUserTool {
                 }
             }
         } else if !channel.supports_free_form_ask() {
-            // Free-form ask_user has no first-class ACP method yet. Phase 1
-            // of the elicitation rollout shipped multiple-choice; free-form
-            // text is Phase 2 of that spec. Until Phase 2 lands, agents
-            // talking to ACP clients must supply `choices` so we can route
-            // through `request_choice` → `elicitation/create` (or the
-            // legacy `session/request_permission` fallback for older clients).
-            // ACP elicitation RFD: https://agentclientprotocol.com/rfds/elicitation
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
@@ -595,5 +603,119 @@ mod tests {
             .unwrap();
         assert!(result.success);
         assert_eq!(result.output, "ok");
+    }
+
+    /// ACP/RPC-shaped channel: structured `request_choice` returns `Ok(None)`
+    /// (user cancelled/declined, or no form capability), free-form is unsupported,
+    /// and `listen` exits immediately without delivering a message. Falling
+    /// through to send+listen would hang until `timeout_secs`.
+    struct StructuredOnlyChannel {
+        channel_name: String,
+        choice_result: parking_lot::Mutex<Option<Result<Option<String>, String>>>,
+        listen_called: parking_lot::Mutex<bool>,
+    }
+
+    impl StructuredOnlyChannel {
+        fn new(name: &str, choice_result: Result<Option<String>, String>) -> Self {
+            Self {
+                channel_name: name.to_string(),
+                choice_result: parking_lot::Mutex::new(Some(choice_result)),
+                listen_called: parking_lot::Mutex::new(false),
+            }
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for StructuredOnlyChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::AcpChannel,
+            )
+        }
+        fn alias(&self) -> &str {
+            "test"
+        }
+    }
+
+    #[async_trait]
+    impl Channel for StructuredOnlyChannel {
+        fn name(&self) -> &str {
+            &self.channel_name
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            *self.listen_called.lock() = true;
+            // Mirrors RpcApprovalChannel / AcpChannel: listen ends without a
+            // message. If ask_user falls through here, rx.recv() hangs.
+            Ok(())
+        }
+
+        fn supports_free_form_ask(&self) -> bool {
+            false
+        }
+
+        async fn request_choice(
+            &self,
+            _question: &str,
+            _choices: &[String],
+            _timeout: std::time::Duration,
+        ) -> anyhow::Result<Option<String>> {
+            match self.choice_result.lock().take() {
+                Some(Ok(v)) => Ok(v),
+                Some(Err(e)) => Err(anyhow::Error::msg(e)),
+                None => Ok(None),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn request_choice_none_on_structured_only_channel_fails_fast() {
+        // Regression: Ok(None) from request_choice used to fall through to
+        // send+listen. On ACP/RPC channels listen never delivers a reply, so
+        // the tool hung until timeout (default 300s) and the session had to
+        // be cancelled manually.
+        let ch = Arc::new(StructuredOnlyChannel::new("rpc", Ok(None)));
+        let tool = make_tool_with_channels(vec![("rpc", Arc::clone(&ch) as Arc<dyn Channel>)]);
+
+        let started = std::time::Instant::now();
+        let result = tool
+            .execute(json!({
+                "question": "How should users set a name?",
+                "choices": ["Slash only", "Slash + picker", "Something else"],
+                "timeout_secs": 30
+            }))
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "must fail fast, not wait on listen; elapsed={elapsed:?}"
+        );
+        assert!(
+            !result.success,
+            "expected failure, got success: {:?}",
+            result.output
+        );
+        let err = result.error.as_deref().unwrap_or("");
+        assert!(
+            err.contains("rpc")
+                || err.contains("choices")
+                || err.contains("free-form")
+                || err.contains("declined")
+                || err.contains("cancelled")
+                || err.contains("cancel"),
+            "error should explain structured-only failure; got: {err}"
+        );
+        assert!(
+            !*ch.listen_called.lock(),
+            "must not fall through to listen on a structured-only channel"
+        );
     }
 }

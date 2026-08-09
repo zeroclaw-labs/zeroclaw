@@ -1,15 +1,4 @@
 //! WASM sandbox runtime — in-process tool isolation via `wasmi`.
-//!
-//! Provides capability-based sandboxing without Docker or external runtimes.
-//! Each WASM module runs with:
-//! - **Fuel limits**: prevents infinite loops (each instruction costs 1 fuel)
-//! - **Memory caps**: configurable per-module memory ceiling
-//! - **No filesystem access**: by default, tools are pure computation
-//! - **No network access**: unless explicitly allowlisted hosts are configured
-//!
-//! # Feature gate
-//! This module is only compiled when `--features runtime-wasm` is enabled.
-//! The default ZeroClaw binary excludes it to maintain the 4.6 MB size target.
 
 use super::traits::RuntimeAdapter;
 use zeroclaw_config::schema::WasmRuntimeConfig;
@@ -129,11 +118,6 @@ impl WasmRuntime {
         mb.saturating_mul(1024 * 1024)
     }
 
-    /// Execute a WASM module from the tools directory.
-    ///
-    /// This is the primary entry point for running sandboxed tool code.
-    /// The module must export a `_start` function (WASI convention) or
-    /// a custom `run` function that takes no arguments and returns i32.
     #[cfg(feature = "runtime-wasm")]
     pub fn execute_module(
         &self,

@@ -381,7 +381,7 @@ impl ScheduleTool {
         }
 
         // Enforce rate-limiting AFTER command/args validation so that invalid
-        // requests do not consume the action budget.  (Fixes #3699)
+        // requests do not consume the action budget.
         if let Some(blocked) = self.enforce_mutation_allowed(action) {
             return Ok(blocked);
         }

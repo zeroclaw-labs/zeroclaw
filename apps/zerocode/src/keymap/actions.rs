@@ -1,9 +1,4 @@
 //! Action enums for the keymap.
-//!
-//! Each enum is produced by the `keyactions!` macro. Every variant
-//! declares its default chords and label inline; the macro generates
-//! the enum, `Serialize`/`Deserialize` derives, `label()`,
-//! `bindings()`, and `from_chord()` from one source.
 
 use serde::{Deserialize, Serialize};
 
@@ -123,7 +118,10 @@ use crossterm::event::{KeyCode, KeyModifiers};
 keyactions! {
     pub enum GlobalAction ("global") {
         Quit         [Chord::ctrl('c')]                                 => "quit",
-        Help         [Chord::char('?'), Chord::key(KeyCode::F(1)), Chord::with(KeyCode::F(1), KeyModifiers::CONTROL)]      => "help",
+        Help         [
+            Chord::char('?'),
+            Chord::ctrl('g'),
+        ]                                                              => "help",
         PaneNavLeft  [Chord::with(KeyCode::Left, KeyModifiers::ALT), Chord::with(KeyCode::Char('b'), KeyModifiers::ALT)]  => "prev pane",
         PaneNavRight [Chord::with(KeyCode::Right, KeyModifiers::ALT), Chord::with(KeyCode::Char('f'), KeyModifiers::ALT)] => "next pane",
         ReloadDaemon [Chord::ctrl('r')]                                 => "reload daemon",
@@ -141,8 +139,11 @@ keyactions! {
         JumpStart               [Chord::char('g')] => "jump to start",
         JumpEnd                 [Chord::char('G')] => "jump to end",
         // Use alt+shift+up/down to avoid macOS Mission Control conflict (ctrl+up/down)
-        // and queue navigation conflict (alt+up/down). See issue #8075.
-        BrowseEnter             [Chord::with(KeyCode::Up, KeyModifiers::ALT.union(KeyModifiers::SHIFT)), Chord::ctrl('k')] => "enter browse mode",
+        // and queue navigation conflict (alt+up/down).
+        BrowseEnter             [
+            Chord::with(KeyCode::Up, KeyModifiers::ALT.union(KeyModifiers::SHIFT)),
+            Chord::ctrl('k'),
+        ] => "enter browse mode",
         BrowseExit              [Chord::with(KeyCode::Down, KeyModifiers::ALT.union(KeyModifiers::SHIFT))] => "exit browse mode",
         BrowseUp                [Chord::key(KeyCode::Up)] => "browse prev",
         BrowseDown              [Chord::key(KeyCode::Down)] => "browse next",
@@ -225,6 +226,7 @@ keyactions! {
         DetailWidenDown  [Chord::shift(KeyCode::Down)] => "widen detail down",
         BeginSearch      [Chord::char('/')] => "search",
         CopyDetail       [Chord::char('c')] => "copy detail",
+        RenameAgent      [Chord::char('e')] => "rename agent",
         KillSession      [Chord::char('X')] => "kill session",
         TriggerCron      [Chord::char('R')] => "run cron job now",
         Refresh          [Chord::char('r')] => "refresh",
@@ -318,6 +320,8 @@ keyactions! {
         NewLine            [Chord::shift(KeyCode::Enter)] => "new line",
         CursorLeft         [Chord::key(KeyCode::Left)] => "cursor left",
         CursorRight        [Chord::key(KeyCode::Right)] => "cursor right",
+        CursorWordLeft     [Chord::with(KeyCode::Left, KeyModifiers::ALT), Chord::with(KeyCode::Char('b'), KeyModifiers::ALT)] => "word left",
+        CursorWordRight    [Chord::with(KeyCode::Right, KeyModifiers::ALT), Chord::with(KeyCode::Char('f'), KeyModifiers::ALT)] => "word right",
         CursorStart        [Chord::key(KeyCode::Home)] => "line start",
         CursorEnd          [Chord::key(KeyCode::End), Chord::ctrl('e')] => "line end",
         OpenFileBrowser    [Chord::ctrl('a')] => "browse files",
@@ -387,6 +391,12 @@ keyactions! {
         Cancel    [Chord::key(KeyCode::Esc)] => "cancel",
         Save      [Chord::ctrl('s')] => "save",
         Backspace [Chord::key(KeyCode::Backspace)] => "backspace",
+        CursorLeft      [Chord::key(KeyCode::Left)] => "cursor left",
+        CursorRight     [Chord::key(KeyCode::Right)] => "cursor right",
+        CursorWordLeft  [Chord::with(KeyCode::Left, KeyModifiers::ALT), Chord::with(KeyCode::Char('b'), KeyModifiers::ALT)] => "word left",
+        CursorWordRight [Chord::with(KeyCode::Right, KeyModifiers::ALT), Chord::with(KeyCode::Char('f'), KeyModifiers::ALT)] => "word right",
+        CursorStart     [Chord::key(KeyCode::Home)] => "input start",
+        CursorEnd       [Chord::key(KeyCode::End)] => "input end",
         Up        [Chord::key(KeyCode::Up)] => "prev",
         Down      [Chord::key(KeyCode::Down)] => "next",
     }

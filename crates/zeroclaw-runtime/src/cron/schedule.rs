@@ -172,13 +172,6 @@ fn translated_weekday_list(mut standard_days: Vec<u8>) -> Result<String> {
         .join(","))
 }
 
-/// Expand a standard-crontab weekday range whose endpoints involve a Sunday
-/// alias (0 or 7) into an ascending, comma-separated list of cron-crate
-/// values. Translating each endpoint independently would produce a
-/// non-ascending range (e.g. `6-7` → `7-1`) that the cron crate rejects, or
-/// silently drop days (e.g. `0-7` → `1-1`). Enumerating each standard day in
-/// the range, translating it, then sorting and de-duplicating yields a valid
-/// fragment that fires on exactly the intended days.
 fn expand_weekday_range(start: u8, end: u8) -> Result<String> {
     translated_weekday_list(standard_weekday_range_values(start, end))
 }
@@ -238,13 +231,6 @@ fn normalize_weekday_field(field: &str) -> Result<String> {
                 if new_start < new_end || (new_start == new_end && start == end) {
                     (format!("{new_start}-{new_end}"), false)
                 } else {
-                    // The endpoints involve a Sunday alias (0 or 7), so translating
-                    // each endpoint independently either yields a non-ascending range
-                    // the cron crate rejects (e.g. `6-7` → `7-1`) or collapses a
-                    // multi-day range to a single day (e.g. `0-7` → `1-1`). Expand the
-                    // standard range into an explicit, ascending list of translated
-                    // single values instead. (A genuine single-day range such as
-                    // `3-3` keeps `new_start == new_end` because `start == end`.)
                     if let Some(s) = step {
                         let step: u8 = s
                             .parse()
@@ -323,12 +309,6 @@ mod tests {
 
     #[test]
     fn normalize_weekday_field_handles_sunday_alias_in_range() {
-        // Ranges whose endpoints hit a Sunday alias (0 or 7) cannot be
-        // expressed as a simple translated range: translating each endpoint
-        // independently yields a non-ascending range that cron 0.15 rejects
-        // (`6-7` → `7-1`) or one that silently drops days (`0-7` → `1-1`).
-        // These must expand into an ascending list of single values instead.
-
         // 0-7 (Sun..Sun = the full week) → every cron-crate weekday.
         assert_eq!(normalize_weekday_field("0-7").unwrap(), "1,2,3,4,5,6,7");
         // 6-7 (Sat,Sun) → cron-crate 7 (Sat) + 1 (Sun).

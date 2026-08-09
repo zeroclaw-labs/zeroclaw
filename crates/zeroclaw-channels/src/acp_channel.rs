@@ -1,46 +1,4 @@
 //! ACP (Agent Client Protocol) back-channel.
-//!
-//! Bridges ZeroClaw's [`Channel`] abstraction onto an active ACP session so
-//! tools like `ask_user`, `escalate_to_human`, and `reaction` can talk back
-//! to the IDE/CLI client (Toad, Zed, etc.) instead of returning
-//! "no channels available".
-//!
-//! ## What this channel does
-//!
-//! - `send` emits an `agent_message_chunk` `session/update` notification —
-//!   the ACP client renders it inline in the conversation.
-//! - `request_choice` issues an `elicitation/create` JSON-RPC request
-//!   (form mode, single-select enum) when the client advertises
-//!   `elicitation.form` in `initialize.clientCapabilities`. Otherwise
-//!   it falls back to the legacy `session/request_permission` overload
-//!   for backward compatibility with clients that haven't yet shipped
-//!   the [elicitation RFD][rfd]
-//!   (<https://agentclientprotocol.com/rfds/elicitation>).
-//! - `request_multi_choice` issues an `elicitation/create` request
-//!   with a `type: array` / `anyOf` schema. There is no legacy
-//!   fallback for multi-select — callers receive `Ok(None)` when the
-//!   client lacks the capability and should take their own non-ACP
-//!   path.
-//! - `listen` is **not implemented**. Free-form ACP "ask the user" has no
-//!   first-class method in Phase 1 of the elicitation rollout; until
-//!   Phase 2 lands, `ask_user` callers under ACP must supply structured
-//!   `choices`.
-//!
-//! ## Wire format
-//!
-//! Per the [ACP conventions][acp-conventions]: ACP-defined JSON object
-//! property keys use **camelCase** (`sessionId`, `toolCallId`, `rawInput`,
-//! `sessionUpdate`, `oldText`, `newText`, …), and string values carried by
-//! discriminator fields use **snake_case** (`agent_message_chunk`,
-//! `allow_once`, `reject_with_edit`, …). The JSON-RPC envelope follows the
-//! 2.0 spec and is constructed by [`zeroclaw_api::jsonrpc`] using the
-//! shared [`JSONRPC_VERSION`][zeroclaw_api::jsonrpc::JSONRPC_VERSION]
-//! constant. Do **not** snake_case-rewrite these property keys: the
-//! upstream ACP spec is the contract these IDE clients (Zed, Toad, …)
-//! parse against, and divergence breaks them.
-//!
-//! [rfd]: https://agentclientprotocol.com/rfds/elicitation
-//! [acp-conventions]: https://agentclientprotocol.com/protocol/v1/overview#conventions
 
 use async_trait::async_trait;
 use serde_json::json;
@@ -53,6 +11,7 @@ use zeroclaw_api::elicitation::{
     ElicitationCapabilities, ElicitationMode, ElicitationRequest, ElicitationResponse,
     multi_select_schema, single_select_schema,
 };
+use zeroclaw_runtime::i18n;
 
 use crate::orchestrator::acp_server::RpcOutbound;
 
@@ -67,21 +26,10 @@ pub struct AcpChannel {
     /// network drop, user closes IDE) would otherwise park `execute_tool_call`
     /// forever and hold the session slot against `max_sessions`.
     approval_timeout: Duration,
-    /// Parsed from the client's `initialize.clientCapabilities.elicitation`
-    /// block. Drives the capability gate in `request_choice`: if
-    /// `client_caps.form` is true we emit `elicitation/create`; otherwise
-    /// we fall back to the legacy `session/request_permission` path.
-    /// See the ACP elicitation RFD: <https://agentclientprotocol.com/rfds/elicitation>.
     client_caps: ElicitationCapabilities,
 }
 
 impl AcpChannel {
-    /// Build an ACP channel bound to a specific ACP session id and the
-    /// server's outbound JSON-RPC plumbing.
-    ///
-    /// `approval_timeout` caps how long `request_approval` and `request_choice`
-    /// will wait for a client response. Pass `session_timeout_secs` from
-    /// `AcpServerConfig` so the bound is consistent with the session lifetime.
     pub fn new(
         name: impl Into<String>,
         session_id: impl Into<String>,
@@ -238,11 +186,6 @@ fn map_approval_kind(tool_name: &str) -> &'static str {
     }
 }
 
-/// Build the `rawInput` object for a `session/request_permission` approval.
-///
-/// This carries the raw tool arguments so clients that inspect `rawInput`
-/// directly can read the original field names. Structured diff rendering is
-/// driven by the `content` array (see `build_approval_content`).
 fn build_approval_raw_input(
     tool_name: &str,
     raw_arguments: &Option<serde_json::Value>,
@@ -275,14 +218,6 @@ fn build_approval_raw_input(
     json!({ "tool": tool_name })
 }
 
-/// Build the `content` array for a `session/request_permission` approval.
-///
-/// Zed and Toad render tool call content items from the `content` array, not
-/// from `rawInput`. For file-editing tools, emit an ACP `Diff` content item
-/// (`{ "type": "diff", "path": ..., "oldText": ..., "newText": ... }`) so the
-/// client renders a side-by-side diff editor instead of raw JSON field names.
-/// Other tools fall back to a plain-text content block containing the
-/// pre-computed `arguments_summary`.
 fn build_approval_content(
     tool_name: &str,
     raw_arguments: &Option<serde_json::Value>,
@@ -331,16 +266,6 @@ fn build_approval_content(
     }])
 }
 
-/// Property names we refuse to put into a form-mode elicitation schema.
-///
-/// **Re-exported source of truth:** the canonical list lives at
-/// `zeroclaw_api::elicitation::SENSITIVE_PROPERTY_NAMES`; the schema
-/// helpers in this file (now imported from `zeroclaw_api`) consult it
-/// internally. This module no longer keeps its own copy — that would
-/// be duplicate state per `AGENTS.md`. The list is referenced here in
-/// doc form only so a future reader sees the rationale without
-/// chasing the import.
-
 #[async_trait]
 impl Channel for AcpChannel {
     async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
@@ -380,12 +305,6 @@ impl Channel for AcpChannel {
     }
 
     async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
-        // ACP has no first-class "next free-form user message in this session"
-        // method. Phase 1 of the elicitation rollout shipped multiple-choice
-        // via `request_choice` → `elicitation/create`; free-form text is
-        // Phase 2. Until Phase 2 lands, `ask_user` under ACP must supply
-        // structured `choices`, which routes through `request_choice`.
-        // ACP elicitation RFD: https://agentclientprotocol.com/rfds/elicitation
         anyhow::bail!(
             "AcpChannel.listen is not supported (free-form ask_user awaits ACP elicitation Phase 2)"
         )
@@ -488,39 +407,55 @@ impl Channel for AcpChannel {
         }
     }
 
+    /// Delegates to [`Self::request_approval_attributed`] and drops the
+    /// provenance, so the prompt logic lives in exactly one place.
     async fn request_approval(
+        &self,
+        recipient: &str,
+        request: &ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
+        Ok(self
+            .request_approval_attributed(recipient, request)
+            .await?
+            .map(|attributed| attributed.response))
+    }
+
+    async fn request_approval_attributed(
         &self,
         _recipient: &str,
         request: &ChannelApprovalRequest,
-    ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
+    ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
         let is_edit_tool = matches!(request.tool_name.as_str(), "file_edit" | "file_write");
         let mut options = vec![
             json!({
                 "optionId": "allow-once",
-                "name": "Allow once",
+                "name": i18n::get_required_cli_string("channel-approval-opt-allow-once"),
                 "kind": "allow_once",
             }),
             json!({
                 "optionId": "allow-always",
-                "name": "Always allow",
+                "name": i18n::get_required_cli_string("channel-approval-opt-allow-always"),
                 "kind": "allow_always",
             }),
         ];
         if is_edit_tool {
             options.push(json!({
                 "optionId": "reject-with-edit",
-                "name": "Reject with edit",
+                "name": i18n::get_required_cli_string("channel-approval-opt-reject-with-edit"),
                 "kind": "reject_with_edit",
             }));
         }
         options.push(json!({
             "optionId": "reject-once",
-            "name": "Reject",
+            "name": i18n::get_required_cli_string("channel-approval-opt-reject"),
             "kind": "reject_once",
         }));
 
         let tool_call_id = format!("approval-{}", uuid::Uuid::new_v4());
-        let title = format!("Approve {}?", request.tool_name);
+        let title = i18n::get_required_cli_string_with_args(
+            "channel-approval-title",
+            &[("tool", &request.tool_name)],
+        );
         let kind = map_approval_kind(&request.tool_name);
         let raw_input = build_approval_raw_input(&request.tool_name, &request.raw_arguments);
         let content = build_approval_content(
@@ -576,22 +511,34 @@ impl Channel for AcpChannel {
                     .and_then(|o| o.get("optionId"))
                     .and_then(|s| s.as_str())
                     .unwrap_or("");
-                match option_id {
-                    "allow-once" => Ok(Some(ChannelApprovalResponse::Approve)),
-                    "allow-always" => Ok(Some(ChannelApprovalResponse::AlwaysApprove)),
-                    "reject-once" | "reject-always" => Ok(Some(ChannelApprovalResponse::Deny)),
+                // "selected" means the operator picked one of the options we
+                // offered, so every arm here is a genuine operator decision.
+                let response = match option_id {
+                    "allow-once" => ChannelApprovalResponse::Approve,
+                    "allow-always" => ChannelApprovalResponse::AlwaysApprove,
+                    "reject-once" | "reject-always" => ChannelApprovalResponse::Deny,
                     "reject-with-edit" => {
                         let replacement = outcome
                             .and_then(|o| o.get("replacementContent"))
                             .and_then(|s| s.as_str())
                             .unwrap_or("")
                             .to_string();
-                        Ok(Some(ChannelApprovalResponse::DenyWithEdit { replacement }))
+                        ChannelApprovalResponse::DenyWithEdit { replacement }
                     }
                     other => anyhow::bail!("ACP returned unknown permission optionId: {other}"),
-                }
+                };
+                Ok(Some(
+                    zeroclaw_api::channel::AttributedApprovalResponse::operator(response),
+                ))
             }
-            "cancelled" => Ok(Some(ChannelApprovalResponse::Deny)),
+            // The client withdrew the prompt; nobody chose anything. Still a
+            // deny, but the runtime's, not the operator's.
+            "cancelled" => Ok(Some(
+                zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                    ChannelApprovalResponse::Deny,
+                    zeroclaw_api::channel::ApprovalSource::Unreachable,
+                ),
+            )),
             other => anyhow::bail!("ACP returned unexpected permission outcome: {other}"),
         }
     }
@@ -1063,7 +1010,14 @@ mod tests {
         assert_eq!(req["params"]["options"].as_array().unwrap().len(), 3);
         assert_eq!(req["params"]["options"][0]["optionId"], "allow-once");
         assert_eq!(req["params"]["options"][1]["kind"], "allow_always");
-        assert_eq!(req["params"]["toolCall"]["title"], "Approve git?");
+        // Locale-aware: resolve the expected title through the same Fluent
+        // key the implementation uses, rather than hardcoding the `en` text,
+        // so this test doesn't desync from a future wording change.
+        let expected_title = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+            "channel-approval-title",
+            &[("tool", "git")],
+        );
+        assert_eq!(req["params"]["toolCall"]["title"], expected_title);
         assert_eq!(req["params"]["toolCall"]["status"], "pending");
         assert_eq!(
             req["params"]["toolCall"]["content"][0]["content"]["text"],

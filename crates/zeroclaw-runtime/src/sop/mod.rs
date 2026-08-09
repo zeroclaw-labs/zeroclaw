@@ -31,8 +31,8 @@ pub use binding::{
 pub use capability::{
     CapabilityContext, CapabilityInfo, CapabilityResult, SopCapability, SopCapabilityRegistry,
 };
-pub use engine::{MaintenanceSummary, SopEngine};
-pub use executor::spawn_headless_run_driver;
+pub use engine::{MaintenanceSummary, SopEngine, err_is_resume_at_capacity};
+pub use executor::{drive_resumed_broker_action, spawn_headless_run_driver};
 pub use graph::{
     FlowRole, GraphDiagnostic, GraphLayout, GraphLegend, GraphNode, GraphPin, GraphSeverity,
     GraphWire, LayoutGeometry, LegendEntry, NodeKind, NodePosition, NodeRunOverlay, NodeRunState,
@@ -89,6 +89,21 @@ pub fn tool_specs_from_config(
         .collect()
 }
 
+/// Injected side-effect adapters for [`build_sop_engine`]. Each is optional and
+/// fail-closed when absent: the route falls back to the log-only no-op adapter,
+/// and the `forge.comment` / `llm.generate` capabilities report a clear failure
+/// instead of acting. The daemon injects real implementations; CLI / standalone
+/// callers pass `SopEngineAdapters::default()`.
+#[derive(Default)]
+pub struct SopEngineAdapters {
+    /// Delivers approval request / escalation notices to a channel.
+    pub route: Option<Arc<dyn approval::ApprovalRouteAdapter>>,
+    /// Posts a SOP step's comment to a git forge (`forge.comment`).
+    pub forge: Option<Arc<dyn capability::ForgeCommentAdapter>>,
+    /// Runs one bounded model call as a pipeline step (`llm.generate`).
+    pub llm: Option<Arc<dyn capability::LlmGenerateAdapter>>,
+}
+
 /// Build a single shared SopEngine + SopAuditLogger pair.
 /// This is the sole construction site for SOP state within a daemon.
 /// Callers receive `Arc<Mutex<SopEngine>>` and `Arc<SopAuditLogger>`
@@ -98,10 +113,16 @@ pub fn build_sop_engine(
     config: SopConfig,
     workspace_dir: &Path,
     audit_memory: Arc<dyn Memory>,
+    adapters: SopEngineAdapters,
 ) -> (Arc<Mutex<SopEngine>>, Arc<SopAuditLogger>) {
-    // Select the run-state backend from config (default: ephemeral in-memory,
-    // unchanged behavior). A backend-open failure must not crash daemon startup,
-    // so fall back to in-memory with a loud log. `workspace_dir` here is the
+    let SopEngineAdapters {
+        route: route_adapter,
+        forge: forge_adapter,
+        llm: llm_adapter,
+    } = adapters;
+    // Select the run-state backend from config (default: durable sqlite, so parked
+    // HITL runs survive a restart). A backend-open failure must not crash daemon
+    // startup, so fall back to in-memory with a loud log. `workspace_dir` here is the
     // daemon data dir (every caller passes `config.data_dir`), so a durable store
     // lands at `<data_dir>/sop/runs.db` unless `[sop] run_state_dir` overrides it.
     let store = store::build_run_store(&config, workspace_dir).unwrap_or_else(|e| {
@@ -115,10 +136,28 @@ pub fn build_sop_engine(
         Arc::new(store::InMemoryRunStore::new())
     });
     let (run_tx, _run_rx) = tokio::sync::broadcast::channel(256);
+    // EPIC G: the approval broker (membership + quorum) resolves policies/groups
+    // from the engine's live `[sop.approval]` at use-time. The route adapter
+    // delivers approval request/escalation notices to a channel; the daemon injects
+    // a real channel-delivering adapter, while CLI/standalone callers pass `None`
+    // and fall back to the no-op (log-only) adapter - unchanged behavior there.
+    let route: Arc<dyn approval::ApprovalRouteAdapter> =
+        route_adapter.unwrap_or_else(|| Arc::new(approval::NoopRouteAdapter));
+    let approval_broker = Arc::new(approval::ApprovalBroker::with_route(route));
+    // Deterministic capability registry: builtins + the injected-adapter
+    // capabilities (`forge.comment` write-back, `llm.generate` bounded model
+    // call). The daemon injects real adapters; CLI/standalone callers pass
+    // `SopEngineAdapters::default()`, leaving both fail-closed exactly like
+    // `shell.exec`/`notify.channel`.
+    let mut capabilities = capability::SopCapabilityRegistry::with_builtins();
+    capabilities.register(capability::ForgeCommentCapability::new(forge_adapter));
+    capabilities.register(capability::LlmGenerateCapability::new(llm_adapter));
     let mut engine = SopEngine::new(config)
         .with_store(store)
         .with_metrics(SopMetricsCollector::shared())
-        .with_run_notifier(run_tx);
+        .with_run_notifier(run_tx)
+        .with_approval_broker(approval_broker)
+        .with_capabilities(Arc::new(capabilities));
     engine.reload(workspace_dir);
     engine.restore_runs();
     let engine = Arc::new(Mutex::new(engine));
@@ -147,11 +186,16 @@ fn sops_dir(workspace_dir: &Path) -> PathBuf {
 }
 
 /// Resolve the SOPs directory from config, falling back to workspace default.
+///
+/// A relative `config_dir` (the common case in the documented
+/// `<workspace>/sops` layout) resolves against `workspace_dir`; an
+/// absolute or `~`-prefixed value is used as-is (`Path::join` replaces
+/// the base entirely when the joined path is itself absolute).
 pub fn resolve_sops_dir(workspace_dir: &Path, config_dir: Option<&str>) -> PathBuf {
     match config_dir {
         Some(dir) if !dir.is_empty() => {
             let expanded = shellexpand::tilde(dir);
-            PathBuf::from(expanded.as_ref())
+            workspace_dir.join(expanded.as_ref())
         }
         _ => sops_dir(workspace_dir),
     }
@@ -404,6 +448,8 @@ fn load_sop(sop_dir: &Path, default_execution_mode: SopExecutionMode) -> Result<
         cooldown_secs,
         max_concurrent,
         deterministic,
+        admission_policy,
+        max_pending_approvals,
         agent,
     } = manifest.sop;
 
@@ -426,6 +472,8 @@ fn load_sop(sop_dir: &Path, default_execution_mode: SopExecutionMode) -> Result<
         max_concurrent,
         location: Some(sop_dir.to_path_buf()),
         deterministic,
+        admission_policy,
+        max_pending_approvals,
         agent,
     };
     capability::SopCapabilityRegistry::with_builtins().validate_sop(&sop)?;
@@ -562,6 +610,27 @@ pub fn parse_steps(md: &str) -> Vec<SopStep> {
                 if let Ok(call) = serde_json::from_str::<PlannedToolCall>(val.trim()) {
                     current.calls.push(call);
                 }
+            } else if let Some(val) = bullet.strip_prefix("prompt:") {
+                let val = val.trim();
+                if !val.is_empty() {
+                    current.gate_prompt = Some(val.to_string());
+                }
+            } else if let Some(val) = bullet.strip_prefix("policy:") {
+                let val = val.trim();
+                current.policy = if val.is_empty() {
+                    None
+                } else {
+                    Some(val.to_string())
+                };
+            } else if let Some(val) = bullet.strip_prefix("edit:") {
+                // Editable-field opt-in for a checkpoint gate: the named field of
+                // the piped value an approver may amend before the run resumes.
+                let val = val.trim();
+                current.edit = if val.is_empty() {
+                    None
+                } else {
+                    Some(val.to_string())
+                };
             } else {
                 // Continuation body line
                 if !current.body.is_empty() {
@@ -604,6 +673,9 @@ struct StepParseState {
     mode: Option<SopExecutionMode>,
     calls: Vec<PlannedToolCall>,
     agent: Option<String>,
+    policy: Option<String>,
+    gate_prompt: Option<String>,
+    edit: Option<String>,
 }
 
 impl StepParseState {
@@ -635,6 +707,9 @@ impl StepParseState {
             calls: std::mem::take(&mut self.calls),
             pos: None,
             agent: self.agent.take(),
+            policy: self.policy.take(),
+            gate_prompt: self.gate_prompt.take(),
+            edit: self.edit.take(),
         });
         *self = Self::default();
     }
@@ -1053,6 +1128,30 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn resolve_sops_dir_joins_relative_config_value_to_workspace() {
+        let workspace = Path::new("/home/user/.zoder/data");
+        let resolved = resolve_sops_dir(workspace, Some("shared/sops"));
+        assert_eq!(resolved, workspace.join("shared/sops"));
+    }
+
+    #[test]
+    fn resolve_sops_dir_keeps_absolute_config_value_as_is() {
+        let workspace = Path::new("/home/user/.zoder/data");
+        let resolved = resolve_sops_dir(workspace, Some("/srv/shared/sops"));
+        assert_eq!(resolved, Path::new("/srv/shared/sops"));
+    }
+
+    #[test]
+    fn resolve_sops_dir_falls_back_to_workspace_sops_when_unset() {
+        let workspace = Path::new("/home/user/.zoder/data");
+        assert_eq!(resolve_sops_dir(workspace, None), workspace.join("sops"));
+        assert_eq!(
+            resolve_sops_dir(workspace, Some("")),
+            workspace.join("sops")
+        );
+    }
+
     fn authoring_sop(steps: Vec<SopStep>) -> Sop {
         Sop {
             name: "authoring".into(),
@@ -1066,6 +1165,8 @@ mod tests {
             max_concurrent: 1,
             location: None,
             deterministic: false,
+            admission_policy: Default::default(),
+            max_pending_approvals: 0,
             agent: None,
         }
     }
@@ -1517,6 +1618,23 @@ mod tests {
     }
 
     #[test]
+    fn parse_steps_reads_policy_bullet() {
+        let steps = parse_steps(
+            r#"
+## Steps
+1. **Gate** - Requires the release group.
+   - policy: prod
+2. **Go** - Unpoliced.
+"#,
+        );
+        assert_eq!(steps[0].policy.as_deref(), Some("prod"));
+        assert_eq!(
+            steps[1].policy, None,
+            "a step with no policy bullet stays None"
+        );
+    }
+
+    #[test]
     fn parse_steps_populates_capability_bullets() {
         let steps = parse_steps(
             r#"
@@ -1535,5 +1653,25 @@ mod tests {
             step.capability_input.clone(),
             Some(json!({"require_clean": true}))
         );
+    }
+
+    #[test]
+    fn load_sop_reads_admission_policy_and_pending_cap() {
+        // A2: admission_policy + max_pending_approvals are user-facing SOP.toml knobs;
+        // prove they survive the SOP.toml -> runtime Sop load path.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("s");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SOP.toml"),
+            "[sop]\nname = \"s\"\ndescription = \"d\"\nadmission_policy = \"drop\"\nmax_pending_approvals = 1\n",
+        )
+        .unwrap();
+        let sop = load_sop(&dir, SopExecutionMode::Supervised).expect("load ok");
+        assert_eq!(
+            sop.admission_policy,
+            crate::sop::types::SopAdmissionPolicy::Drop
+        );
+        assert_eq!(sop.max_pending_approvals, 1);
     }
 }

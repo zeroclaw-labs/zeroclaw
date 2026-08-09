@@ -1,6 +1,6 @@
 # Streaming
 
-Every provider in ZeroClaw that speaks a streaming API streams token-by-token. The runtime forwards those streams to channel adapters that support partial updates (Discord, Slack, Telegram, the gateway's WebSocket), so the user sees text appear as the model generates it.
+Streaming is capability-driven. Providers that implement the streaming methods and return `supports_streaming() == true` can emit token deltas; other providers use the non-streaming response path. The runtime forwards available streams to channel adapters that support partial updates.
 
 ## What gets streamed
 
@@ -11,18 +11,18 @@ authoritative, per-variant definitions live with the type in
 `crates/zeroclaw-api/src/model_provider.rs` (`enum StreamEvent`); reasoning
 tokens arrive as text deltas, not a separate variant.
 
-Channels consume these events via the `Channel` trait's outbound stream hook.
+The runtime consumes these events. The channel orchestrator uses the `Channel` trait's draft-delivery methods and capability flags to surface progressive output where supported.
 
 ## Capability flags
 
 A provider exposes two flags so the runtime knows what it can expect:
 
 ```rust
-fn supports_streaming(&self) -> bool { true }
-fn supports_streaming_tool_events(&self) -> bool { true }
+fn supports_streaming(&self) -> bool { false }
+fn supports_streaming_tool_events(&self) -> bool { false }
 ```
 
-- **`supports_streaming`**: true for every actively maintained provider
+- **`supports_streaming`**: true only when the concrete provider opts into streaming; the trait default is false
 - **`supports_streaming_tool_events`**: true when the provider emits `ToolCall` events during the stream rather than at the end
 
 OpenAI-compatible providers differ: some stream tool-call arg deltas chunk-by-chunk, others only emit the call once complete. The `compatible.rs` SSE parser handles both.
@@ -44,31 +44,46 @@ stays correct as channels gain or lose streaming support:
 
 {{#channel-streaming-matrix}}
 
-When both the provider and the channel support streaming, the flow is: provider emits `TextDelta` → runtime passes to channel → channel edits the sent message. The edit cadence is bounded by `draft_update_interval_ms` in the channel config (default: 500 ms) to avoid rate-limiting.
+When both the provider and the channel support streaming, the flow is: provider emits `TextDelta` → runtime passes to channel → channel edits the sent message. The edit cadence is bounded by that channel's `draft_update_interval_ms` setting to avoid rate-limiting; defaults vary by channel.
 
 ## Reasoning blocks
 
-Reasoning models (OpenAI o-series, DeepSeek-R1, Qwen-thinking variants) emit `ReasoningDelta` events separate from regular text. By default the runtime strips these from outbound streams, see `<think>…</think>` handling in `crates/zeroclaw-channels/src/orchestrator/mod.rs`. Users see the final answer, not the chain-of-thought.
-
-To surface reasoning to the user, enable it on the alias entry. This is off by default because reasoning content is (a) often verbose and (b) sometimes reveals internal deliberation that looks confusing to an end user.
-
-To disable reasoning entirely on a reasoning-capable model, set the relevant reasoning field to off. Both fields are top-level; the right name depends on the provider/endpoint. Setting both covers Ollama native, Ollama OpenAI-compat, and upstream APIs that honour `reasoning_effort`.
+`StreamEvent` has no separate `ReasoningDelta` variant. When a provider exposes reasoning during streaming, it uses the `reasoning` field on the `StreamChunk` carried by `TextDelta`; provider and runtime configuration determine whether that content is requested or surfaced. Consumers should follow the `StreamChunk` contract rather than matching a nonexistent event variant.
 
 ## Tool calls mid-stream
 
-When a model decides to call a tool, the provider emits `ToolCall`. The runtime:
+When a streaming provider decides to call a tool, it emits a structured
+`ToolCall` stream event. The runtime:
 
-1. Pauses reading from the provider's stream
-2. Flushes any buffered text to the channel
-3. Runs the tool (subject to security validation, see [Security → Overview](../security/overview.md))
-4. Resumes the conversation with the tool result appended
-5. Opens a new streaming call to the provider for the next assistant turn
+1. Reads the stream to completion, collecting structured `ToolCall` events and
+   forwarding visible text until `Final`
+2. Recovers the tool calls after the stream ends
+3. Runs the tools (subject to security validation, see [Security → Overview](../security/overview.md))
+4. Opens a new streaming call to the provider for the next assistant turn, with
+   the tool results appended to the conversation
+
+The current provider stream is never paused and resumed mid-read; tool
+execution happens after that stream reaches `Final`, and the next turn is a
+fresh streaming call.
 
 From the user's perspective: text, then a visible indicator that the agent ran a tool (via channel-specific hints), then more text. For channels without typing indicators, the gap between the tool call and the next text chunk is the only signal.
 
+## Transport completion and timeouts
+
+Streaming transports do not rely on connection close as the success signal.
+OpenAI-compatible streams finish on `[DONE]`, OpenAI Responses streams finish
+on their terminal response event, and Anthropic streams finish on
+`message_stop`. Servers may keep the HTTP connection open after those events.
+
+Streaming clients use byte-idle timeouts: 300 seconds for OpenAI Responses and
+OpenAI-compatible providers, and 90 seconds for Anthropic. Each received body
+read resets the relevant timeout, so active generations are not constrained by
+the whole-request timeout used for non-streaming calls. Connection setup,
+response headers, and buffered error bodies remain bounded.
+
 ## Non-streaming providers
 
-If a provider returns the entire response in one shot (older OpenAI-compat endpoints, legacy Gemini), the runtime synthesises a single `TextDelta` containing the full reply followed by `Final`. Channel adapters still work; they just don't see partials.
+When `supports_streaming()` is false, callers use the provider's non-streaming chat path. Channel adapters can still send the completed reply, but they do not receive incremental provider stream events.
 
 ## Code references
 

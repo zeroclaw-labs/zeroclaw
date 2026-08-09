@@ -63,6 +63,7 @@ cli-wechat-bound-success = ✅ WeChat 账号绑定成功。现在可以和 ZeroC
 cli-wechat-invalid-bind-code = ❌ 绑定码无效。请重试。
 cli-skills-list-about = 列出所有已安装的技能
 cli-skills-audit-about = 审计技能源目录或已安装的技能名称
+cli-skills-audit-failed = 技能审核失败。
 cli-skills-install-about = 从 URL 或本地路径安装新技能
 cli-skills-remove-about = 移除已安装的技能
 cli-skills-test-about = 为某个技能（或所有技能）运行 TEST.sh 验证
@@ -70,8 +71,16 @@ cli-skills-review-summary = { "  " }💾 技能审查：{$summary}
 cli-skills-install-start = 正在安装技能来源：{$source}
 cli-skills-install-resolving-registry = { "  " }正在从技能注册表解析 '{$source}'...
 cli-skills-install-resolving-extra-registry = { "  " }正在从注册表 '{$registry}' 解析 '{$source}'...
+cli-skills-install-git-failed = 安装 git 技能源失败：{$source}
+cli-skills-install-registry-failed = 从注册表安装技能失败：{$source}
+cli-skills-install-extra-registry-failed = 从额外注册表安装技能失败：{$source}
+cli-skills-install-local-failed = 安装本地技能源失败：{$source}
 cli-skills-install-installed-audited = { "  " }{$status} 技能已安装并审计：{$path}（已扫描 {$files} 个文件）
 cli-skills-install-security-audit-completed = { "  " }安全审计已成功完成。
+cli-skills-install-into-bundle = { "  " }已安装到技能包 '{$alias}'。在 skill_bundles 中列出此技能包的代理将会加载它。
+cli-skills-install-global-note = { "  " }注意：已安装到全局技能目录，没有代理会自动加载它。请使用 --bundle <alias> 重新运行，或将某个技能包分配给代理，以使其可加载。
+cli-skills-removed-archived = { "  " }{$status} 技能 '{$name}' 已从技能包 '{$bundle}' 中移除（归档于 shared/skills/_deleted/ 下）。
+cli-skills-removed-global = { "  " }{$status} 技能 '{$name}' 已从全局技能目录中移除。
 cli-skills-install-tier-official = 正在安装 {$name} v{$version} — 官方（zeroclaw-labs 维护）
 cli-skills-install-tier-community =
     正在安装 {$name} v{$version} — 社区提交
@@ -187,9 +196,9 @@ cli-cron-long-about =
 
     示例：
     zeroclaw cron list
-    zeroclaw cron add '0 9 * * 1-5' 'Good morning' --tz America/New_York --agent
-    zeroclaw cron add '*/30 * * * *' 'Check system health' --agent
-    zeroclaw cron add '*/5 * * * *' 'echo ok'
+    zeroclaw cron add '0 9 * * 1-5' 'Good morning' --agent sentinel --prompt --tz America/New_York
+    zeroclaw cron add '*/30 * * * *' 'Check system health' --agent sentinel --prompt
+    zeroclaw cron add '*/5 * * * *' 'echo ok' --agent sentinel
     zeroclaw cron add-at 2025-01-15T14:00:00Z 'Send reminder' --agent
     zeroclaw cron add-every 60000 'Ping heartbeat'
     zeroclaw cron once 30m 'Run backup in 30 minutes' --agent
@@ -287,13 +296,11 @@ cli-skills-install-suggestion =
 
     匹配的能力：{$matched}
     下一步：运行 `{$install_command}` 进行安装。
-
 cli-plugin-install-suggestion =
     看起来此请求需要 `{$name}` 插件，但它尚未安装。
 
     匹配的能力：{$matched}
     下一步：运行 `{$install_command}` 进行安装。
-
 cli-completions-long-about =
     为 `zeroclaw` 生成 shell 补全脚本。
 
@@ -402,6 +409,13 @@ cli-skills-none-installed = 未安装技能。
 cli-skills-create-hint = {"  "}创建一个: mkdir -p ~/.zeroclaw/workspace/skills/my-skill
 cli-skills-install-hint = {"  "}或安装: zeroclaw skills install <source>
 cli-skills-installed-header = 已安装的技能 ({$count}):
+cli-skills-list-group-bundle = 技能包：{$alias}
+cli-skills-list-group-agent = 由代理 '{$alias}' 加载
+cli-skills-list-group-global = 全局 / open-skills / 插件（非来自技能包）
+cli-skills-agent-not-configured = 代理 '{$alias}' 未配置
+cli-skills-agent-multiple-bundles = 代理 '{$alias}' 有多个技能包（{$bundles}）；请传入 --bundle 以选择其中一个
+cli-skills-multiple-locations-bundle = 技能 '{$name}' 存在于多个位置（{$locations}）；请传入 --bundle 以选择其中一个
+cli-skills-multiple-locations-path = 技能 '{$name}' 存在于多个位置（{$locations}）；请传入明确的路径以消除歧义
 cli-skills-tags = 标签:  {$tags}
 cli-skills-skipped-header = 已跳过 ({$count}):
 cli-skills-skipped-reason = {"    "}原因: {$reason}
@@ -427,6 +441,8 @@ cli-sop-execution-mode = {"  "}执行模式: {$value}
 cli-sop-deterministic = {"  "}确定性:  {$value}
 cli-sop-cooldown = {"  "}冷却时间:       {$value}s
 cli-sop-max-concurrent = {"  "}最大并发数: {$value}
+cli-sop-admission-policy = {"  "}准入策略:   {$value}
+cli-sop-max-pending-approvals = {"  "}最大待批数: {$value}
 cli-sop-location = {"  "}位置:       {$value}
 cli-sop-triggers = {"  "}触发器:
 cli-sop-steps = {"  "}步骤:
@@ -462,6 +478,7 @@ cli-cron-added-oneshot = ✅ 已添加一次性 cron 任务 {$id}
 cli-cron-added-interval-agent = ✅ 已添加间隔 agent cron 任务 {$id}
 cli-cron-added-interval = ✅ 已添加间隔 cron 任务 {$id}
 cli-cron-updated = ✅ 已更新 cron 任务 {$id}
+cli-cron-update-no-field = 必须至少提供 --expression、--tz、--command、--name、--allowed-tool 或 --uses-memory 中的一个
 cli-cron-removed = ✅ 已移除 cron 任务 {$id}
 cli-cron-paused = ⏸️  已暂停 cron 任务 {$id}
 cli-cron-resumed = ▶️  已恢复 cron 任务 {$id}
@@ -510,6 +527,19 @@ cli-quickstart-peer-group-row = {$channel} → {$name}（{$count} 个对等方�
 cli-quickstart-provider-local-label = {$name}（本地）
 cli-quickstart-provider-type-prompt = 提供方类型
 cli-quickstart-alias-for = {$name} 的别名
+cli-quickstart-openai-auth-mode-label = 身份验证
+cli-quickstart-openai-auth-mode-help = 选择 `codex` 以使用 ChatGPT/Codex 订阅身份验证配置文件。如果你已通过 Codex CLI 登录，请运行 `zeroclaw auth login --model-provider openai-codex --import ~/.codex/auth.json`；否则请运行 `zeroclaw auth login --model-provider openai-codex`。
+cli-quickstart-anthropic-auth-mode-label = 身份验证
+cli-quickstart-anthropic-auth-mode-help = 如需 Anthropic Console 密钥，请选择 `api_key`；如果你打算为 Claude Max 运行 `claude setup-token` 并粘贴生成的令牌，请选择 `setup_token`。
+cli-quickstart-anthropic-api-key-help = 粘贴 Anthropic Console API 密钥或由 `claude setup-token` 生成的令牌。
+cli-quickstart-auth-codex-prompt = 现在使用你的 ChatGPT 账户登录 OpenAI Codex 吗？
+cli-quickstart-auth-codex-import-prompt = 发现已有的 Codex 登录 (~/.codex/auth.json) — 现在导入吗？
+cli-quickstart-auth-codex-skip-hint = {"  "}稍后完成：zeroclaw auth login --model-provider openai-codex
+cli-quickstart-auth-anthropic-prompt = 现在为 Anthropic 提供方 `{$alias}` 运行 `claude setup-token` 吗？
+cli-quickstart-auth-anthropic-token-prompt = 粘贴 `claude setup-token` 生成的令牌
+cli-quickstart-auth-anthropic-saved = {"  "}已为 anthropic.{$alias} 保存 Claude setup token。
+cli-quickstart-auth-anthropic-skip-hint = {"  "}稍后完成：claude setup-token，然后 zeroclaw config set providers.models.anthropic.{$alias}.api_key <token>
+cli-quickstart-auth-failed = {"  "}身份验证设置未完成：{$error}
 cli-quickstart-model-field-missing-warning = 警告：架构没有为 `{$provider}` 生成 `model` 字段 — 将退回到手动输入。请报告此问题。
 cli-quickstart-model-id-for = {$name} 的模型 ID
 cli-quickstart-risk-profile-prompt = 风险配置文件
@@ -555,12 +585,17 @@ cli-quickstart-error-not-type-alias-ref = `{$reference}` 不是 `<type>.<alias>`
 cli-quickstart-error-no-configured-path = 未配置 `{$path}`
 cli-quickstart-error-provider-required = 必须填写提供方类型、别名和模型
 cli-quickstart-error-unknown-provider-type = 未知模型提供方类型 `{$provider}` — 请从提供方列表中选择
+cli-quickstart-error-unknown-openai-auth-mode = 未知的 OpenAI 身份验证模式 `{$mode}` — 请选择 `api_key` 或 `codex`
+cli-quickstart-error-unknown-anthropic-auth-mode = 未知的 Anthropic 身份验证模式 `{$mode}` — 请选择 `api_key` 或 `setup_token`
 cli-quickstart-error-alias-exists = 别名 `{$alias}` 已存在
 cli-quickstart-error-no-profile = 未配置 `{$alias}` 配置文件
 cli-quickstart-error-unknown-risk-preset = 未知风险预设 `{$preset}`
 cli-quickstart-error-unknown-runtime-preset = 未知运行时预设 `{$preset}`
 cli-quickstart-error-channel-bound = 通道 `{$reference}` 已绑定到 agent `{$owner}`
 cli-quickstart-error-channel-required = 必须填写通道类型和别名
+cli-quickstart-error-channel-field-not-advertised = Quickstart 中不支持通道字段 `{$field}`
+cli-quickstart-error-channel-token-required = 必须填写 Telegram Bot 令牌
+cli-quickstart-error-webhook-secret-required = 必须填写 Webhook 共享密钥
 cli-quickstart-error-peer-group-name-required = 必须填写对等组名称
 cli-quickstart-error-peer-group-channel-required = 必须填写对等组通道引用
 cli-quickstart-error-peer-group-unknown-channel = 对等组 `{$name}` 引用了未知通道 `{$channel}`
@@ -673,7 +708,7 @@ cli-plugins-none = 未安装任何插件。
 cli-plugins-installed = 已安装的插件：
 cli-plugin-search-none = 没有匹配 '{$query}' 的插件。
 cli-plugin-search-results = 匹配 '{$query}' 的插件（{$count}）：
-cli-plugin-search-result =   {$name} v{$version} — {$description}
+cli-plugin-search-result = {$name} v{$version} — {$description}
 cli-plugin-no-description = （无描述）
 cli-plugin-install-resolving = 正在从插件注册表解析 '{$source}'...
 cli-plugin-installed-from = 已从 {$source} 安装插件
@@ -741,7 +776,7 @@ cli-hardware-unsupported-platform = 此平台不支持硬件 USB 发现。
 cli-hardware-supported-platforms = 支持的平台：Linux、macOS、Windows。
 cli-update-already-current = 已是最新版本（v{$version}）。
 cli-update-success = 已成功更新至 v{$version}！
-cli-update-prebuilt-channel-note = 预构建更新使用精简默认通道包。如需 Slack 和其他非默认通道，请从源码构建：`./install.sh --source --preset full`、`--features channels-full`，或指定对应的 `channel-*` 功能。
+cli-update-prebuilt-channel-note = 预构建更新使用精简的标准发行集。如需 Slack 和其他未包含在该发行集中的通道，请从源码构建：`./install.sh --source --preset full`、`--features channels-full`，或指定对应的 `channel-*` 功能。
 cli-update-available = 有可用更新：v{$current} -> v{$latest}
 cli-update-forcing-reinstall = 强制重新安装：v{$current} -> v{$latest}
 cli-update-not-writable = 安装目录 {$dir} 不可写（{$error}）；请使用更高权限重新运行 `zeroclaw update`（在 macOS/Linux 上使用 sudo，在 Windows 上使用管理员控制台）
@@ -757,19 +792,26 @@ cli-channels-build-hint = {"  "}请从源码构建：`./install.sh --source --pr
 cli-channels-start-hint = 启动渠道：zeroclaw channel start
 cli-channels-doctor-hint = 检查健康状况：    zeroclaw channel doctor
 cli-channels-configure-hint = 配置方法：      zeroclaw config set channels.<name>.<field>=<value>
-
 cli-models-set-ok = 默认模型已设置为 "{ $model }" (provider: { $provider })。
 cli-models-status-current = 默认模型: { $model } (provider: { $provider })
 cli-models-status-none = 未配置默认模型。
 turn-interrupted-by-user = [被用户中断]
 turn-cancelled-client-rpc = [已通过客户端取消回合]
 turn-stream-interrupted = [流已中断]
+turn-model-fallback-notice = ⚡ { $requested_model }（{ $requested_provider }）不可用；此回复由 { $actual_model }（{ $actual_provider }）生成。
 history-trim-breadcrumb = [earlier turns omitted to fit the context window]
 history-trim-reason-budget = context token budget exceeded
+history-trim-reason-message-cap = 已超出历史消息数量限制
 history-trim-floor-exceeds-budget = system prompt and tool definitions ({$floor} tokens) alone meet or exceed the context budget ({$budget} tokens); raise [runtime_profiles.<name>] max_context_tokens or reduce the tool surface by disabling unused integrations
 turn-ingress-dropped = 此请求未被处理：{ $reason }
 turn-tool-interrupted-before-result = [在此工具产生结果前被用户中断]
 channel-runtime-malformed-tool-output = 我生成了内部工具调用格式错误，无法完成此请求。请重试。
+channel-runtime-progress-received = 已收到
+channel-runtime-progress-planning = 正在规划
+channel-runtime-progress-waiting-on-model = 正在等待模型
+channel-runtime-progress-running-tool = 正在运行工具
+channel-runtime-progress-compacting-context = 正在压缩上下文
+channel-runtime-progress-finalizing-response = 正在完成回复
 channel-runtime-new-session = 对话历史已清除。重新开始。
 channel-runtime-stop-sent = 已发送停止信号。
 channel-runtime-stop-no-task = 此发送者范围内没有正在执行的任务。
@@ -777,6 +819,8 @@ channel-runtime-model-empty = 模型 ID 不能为空。请使用 `/model <model-
 channel-runtime-model-switched = 已切换到模型 `{ $model }`（model_provider：`{ $provider }`）。上下文已保留。
 channel-runtime-agent-scope-rejected = 发送者 `{ $sender }` 无权在 agent `{ $agent }` 上执行 `/model --agent`。请改用 `/model --user { $model }`（仅本次会话生效），或请管理员将 peer group 的 `admin_for_agent_scope` 设为 `true` 并将你列为成员。
 channel-runtime-request-timeout = ⚠️ 等待模型响应超时，请重试。
+channel-runtime-no-reply-refused = 🚫 我无法处理该请求。
+channel-runtime-no-reply-failed = ⚠️ 我无法完成该请求。
 channel-runtime-current-model-status =
     当前 model_provider：`{ $provider }`
     当前模型：`{ $model }`
@@ -872,10 +916,23 @@ cli-bundle-deleted = 已删除 skill_bundles.{$alias}（已从 {$count} 个 agen
 cli-bundle-warn-move = 警告：bundle 目录移动失败：{$error}
 cli-bundle-renamed = 已重命名 skill_bundles.{$from} → skill_bundles.{$to}
 
+# ── Web 仪表盘重启提示 — 应用内升级后显示的 RestartInfo.hint（PR #8173）──
+# 前四个是按原样展示的 shell 命令模板，不作翻译。
+cli-gateway-restart-hint-kubernetes = kubectl rollout restart deployment/zeroclaw
+cli-gateway-restart-hint-container = docker compose restart
+cli-gateway-restart-hint-systemd = systemctl restart zeroclaw
+cli-gateway-restart-hint-launchd = launchctl kickstart -k <your-zeroclaw-label>
+cli-gateway-restart-hint-process = 重启 `zeroclaw daemon` 进程
+
 cli-daemon-gateway-already-running = ZeroClaw gateway 已在 {$host}:{$port} 运行。daemon 会管理自己的 gateway，不会在同一地址启动第二个 gateway。请停止该 gateway（或使用 `zeroclaw config set gateway.port <port>` 将 daemon 指向空闲端口），然后重新运行 daemon。
 cli-daemon-gateway-port-occupied = Gateway 地址 {$host}:{$port} 已被另一个进程占用。请释放该端口或将 daemon 指向空闲端口（`zeroclaw config set gateway.port <port>`），然后重新运行 daemon。
-
-# ── Context window (doctor update-context-windows, agent interactive) ──
+cli-daemon-starting-title = 🧠 ZeroClaw daemon 正在启动…
+cli-daemon-starting-detail = 正在准备已配置的 daemon endpoint
+cli-daemon-started-title = 🧠 ZeroClaw daemon 已就绪
+cli-daemon-started-gateway = Gateway:  {$url}
+cli-daemon-started-socket = Socket:   {$path}
+cli-daemon-started-pairing = 配对：已启用（当前状态请查看上方 gateway 输出）
+cli-daemon-started-stop = 按 Ctrl+C 或发送 SIGTERM 停止
 cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%
 cli-agent-context-bar-unknown = ctx: 未知 / {$max}
 cli-doctor-ctxwin-already-set = {$provider_ref}: 已有 context_window = {$ctx}
@@ -888,3 +945,48 @@ cli-doctor-ctxwin-saved = 已保存 {$updated} 项更新到 config.toml
 cli-doctor-ctxwin-dry-run = 试运行完成 — 未写入更改。去掉 --dry-run 以应用。
 cli-doctor-ctxwin-none = 无需更新。
 cli-doctor-ctxwin-write-failed = {$provider_ref}: 写入 context_window 失败: {$error}
+cli-doctor-context-window-ok = {$provider_ref}：上下文窗口：{$context_window} 个令牌
+cli-doctor-context-window-zero = {$provider_ref}：context_window 为 0（无效；请设置为模型的实际上下文上限）
+cli-doctor-context-window-unset = {$provider_ref}：未设置 context_window — 选择此配置时将使用 {$fallback} 个令牌的回退值；该值可能远低于模型的实际上限；请在此配置中设置 context_window
+
+# ── Degraded config sections (doctor diagnose, #8835) ──
+cli-doctor-degraded-security = 安全关键配置节 `{$path}` 无效，已重置为默认值以便守护进程启动；当前运行的安全态势可能弱于预期。运行 `zeroclaw config migrate` 查看解析错误，然后修复该文件。
+cli-doctor-degraded-section = 配置节 `{$path}` 格式错误，已重置为默认值；该节中的值当前不生效。运行 `zeroclaw config migrate` 查看解析错误，然后修复该文件。
+cli-doctor-skills-prompt-injection-mode-full-deprecated = 技能提示注入模式 "full" 已弃用。弃用过渡期内仍支持显式 full 模式，但 compact 现已成为默认值；请在 Schema V4 移除 full 模式前完成迁移。
+sop-approval-deferred-at-capacity = 执行槽位已满，无法恢复运行 {$run_id}。审批仍处于等待状态；请在槽位释放后重试。
+sop-approval-policy-unavailable = 无法使用暂停的 SOP 步骤，审批失败：{$reason}。运行仍处于等待状态。
+sop-rpc-decision-invalid-state = 运行 {$run_id} 无法在当前状态下完成决策。
+sop-rpc-decision-unauthorized = RPC 主体无权对该 SOP 步骤作出决策。
+sop-rpc-policy-missing = 未配置 SOP 审批策略“{$name}”。
+sop-rpc-policy-unavailable = 暂停的 SOP 策略不可用：{$reason}。
+
+# ── Tool approval (channels, #9409) ──
+# Human-visible copy for the operator-facing tool-approval prompt, shared
+# across the button adapters (Telegram, Discord, Slack) and the text-reply
+# adapters (Matrix, Signal, WhatsApp, Slack polling fallback). Approval
+# TOKENS, `callback_data`/`custom_id`/`action_id` values, and the reply
+# KEYWORDS parsed by `util::parse_approval_reply` (yes/y/approve, no/n/deny,
+# always) stay hardcoded ASCII in Rust — only the surrounding prose is
+# localized here.
+channel-approval-heading = 需要工具批准
+channel-approval-heading-shout = 需要批准
+channel-approval-tool-label = 工具
+channel-approval-args-label = 参数
+channel-approval-btn-approve = 批准
+channel-approval-btn-deny = 拒绝
+channel-approval-btn-always = 始终
+channel-approval-tap-instruction = 点击下方按钮：
+channel-approval-reply-instruction-yesno = 回复：“{ $yes_command }”、“{ $no_command }” 或 “{ $always_command }”
+channel-approval-reply-instruction-approve-deny = 回复 `{ $approve_command }` / `{ $deny_command }` / `{ $always_command }`。
+channel-telegram-approval-ack-approved = 已批准
+channel-telegram-approval-ack-always-approved = 已始终批准
+channel-telegram-approval-ack-denied = 已拒绝
+channel-telegram-approval-ack-unknown = 未知操作
+channel-discord-approval-btn-allow-once = 仅本次允许
+channel-discord-approval-btn-allow-session = 本会话允许
+channel-discord-approval-btn-allow-always = 始终允许
+channel-approval-title = 批准 { $tool }？
+channel-approval-opt-allow-once = 仅本次允许
+channel-approval-opt-allow-always = 始终允许
+channel-approval-opt-reject = 拒绝
+channel-approval-opt-reject-with-edit = 编辑后拒绝

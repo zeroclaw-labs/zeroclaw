@@ -1,7 +1,8 @@
-//! JSON-RPC 2.0 transport — copied from `zeroclaw-api::jsonrpc` so
-//! `apps/zerocode` does not depend on that crate. Wire shape is the
-//! contract; if the daemon evolves its envelope, this file evolves
-//! to match.
+//! JSON-RPC 2.0 transport.
+//!
+//! `apps/zerocode` keeps local ownership of its transport plumbing.
+//! Wire shape is the contract; if the daemon evolves its envelope, this file
+//! evolves to match.
 //!
 //! `RpcOutbound` carries the writer channel + a pending-request map
 //! so concurrent notifications and outbound calls cannot interleave
@@ -41,7 +42,6 @@ pub mod field {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct JsonRpcRequest {
     pub jsonrpc: String,
-    #[serde(default)]
     pub method: String,
     #[serde(default)]
     pub params: Value,

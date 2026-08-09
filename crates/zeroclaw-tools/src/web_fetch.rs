@@ -12,15 +12,6 @@ use zeroclaw_config::schema::FirecrawlConfig;
 /// Bodies shorter than this are treated as JS-only pages that need Firecrawl.
 const FIRECRAWL_MIN_BODY_LEN: usize = 100;
 
-/// Web fetch tool: fetches a web page and converts HTML to plain text for LLM consumption.
-///
-/// Unlike `http_request` (an API client returning raw responses), this tool:
-/// - Only supports GET
-/// - Follows redirects (up to 10)
-/// - Converts HTML to clean plain text via `nanohtml2text`
-/// - Passes through text/plain, text/markdown, and application/json as-is
-/// - Sets a descriptive User-Agent
-/// - Falls back to Firecrawl API when standard fetch fails (if enabled)
 pub struct WebFetchTool {
     security: Arc<SecurityPolicy>,
     allowed_domains: Vec<String>,
@@ -72,12 +63,6 @@ impl WebFetchTool {
     }
 
     fn truncate_response(&self, text: &str) -> String {
-        // max_response_size == 0 means "unlimited" (matches the
-        // http_request tool's documented semantics + tests at
-        // crates/zeroclaw-tools/src/http_request.rs:151). Without this
-        // branch, the unsigned-arithmetic path below would truncate
-        // every response to zero bytes, then append the truncation
-        // marker — useless content + spurious Firecrawl fallback.
         if self.max_response_size == 0 {
             return text.to_string();
         }
@@ -98,11 +83,6 @@ impl WebFetchTool {
         response: reqwest::Response,
     ) -> anyhow::Result<String> {
         let mut bytes_stream = response.bytes_stream();
-        // max_response_size == 0 → unlimited. Without this branch, the
-        // existing saturating_add(1) made hard_cap = 1 byte, so the
-        // entire stream was truncated after one byte. Use usize::MAX as
-        // the effective hard_cap when unlimited so append_chunk_with_cap
-        // never stops early on size grounds.
         let hard_cap = if self.max_response_size == 0 {
             usize::MAX
         } else {
@@ -559,11 +539,6 @@ fn validate_target_url_with_dns_check(
         );
     }
 
-    // Only WARN when a private-host bypass concretely fired here: an explicit
-    // carve-out, or "*" lifting the block for a literally private/local host.
-    // Gating on bare `private_tolerated` would log this SSRF-bypass on *every*
-    // fetch once "*" is set, burying the real signal. (The new "*"-tolerates-a-
-    // resolved-private-IP case is only knowable post-DNS, which this path skips.)
     if private_explicit || (private_tolerated && host_is_private_or_local) {
         ::zeroclaw_log::record!(
             WARN,
@@ -574,11 +549,6 @@ fn validate_target_url_with_dns_check(
         );
     }
 
-    // The allowed_domains check is skipped only for a host that is *literally*
-    // private/local and covered by the private allowlist (an explicit entry, or
-    // "*"). A non-private host — including an explicit internal DNS name or any
-    // host reached via "*" — still requires allowed_domains approval, so the
-    // private allowlist can never be used to reach an arbitrary public host.
     let skip_allowed_domains = host_is_private_or_local && private_tolerated;
 
     if !skip_allowed_domains && !domain_guard::host_matches_allowlist(&host, allowed_domains) {
@@ -663,13 +633,6 @@ fn extract_host(url: &str) -> anyhow::Result<String> {
     Ok(host)
 }
 
-/// How a host is covered by `allowed_private_hosts`.
-///
-/// The distinction only affects logging: an explicit entry is a deliberate
-/// per-host carve-out, whereas `*` blanket-tolerates a private/internal
-/// resolution. Both lift the literal private-host block and skip the
-/// resolved-IP public check; neither widens `allowed_domains` for a non-private
-/// host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PrivateAllow {
     /// Not covered by the private allowlist.
@@ -1066,13 +1029,6 @@ mod tests {
         );
     }
 
-    /// Drives the actual streamed-read path (standard_fetch +
-    /// read_response_text_limited) via wiremock to lock in the
-    /// max_response_size=0 behaviour. Audacity88 review (PR #6884)
-    /// flagged the direct-helper test as insufficient because it
-    /// did not exercise the saturating_add(1) cap that previously
-    /// stopped streaming after 1 byte and triggered spurious
-    /// Firecrawl fallback.
     #[tokio::test]
     async fn standard_fetch_with_zero_limit_returns_full_body_and_skips_firecrawl_fallback() {
         use wiremock::matchers::method;
@@ -1655,7 +1611,7 @@ mod tests {
 
     #[test]
     fn private_wildcard_allows_domain_resolving_to_private_ip() {
-        // Regression for #7412: allowed_private_hosts = ["*"] must permit a
+        // allowed_private_hosts = ["*"] must permit a
         // regular domain that resolves to a private/internal IP, as long as the
         // name itself passes allowed_domains. The DNS public check must be
         // skipped (closure panics if reached).

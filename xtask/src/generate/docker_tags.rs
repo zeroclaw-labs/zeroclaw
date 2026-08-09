@@ -146,7 +146,7 @@ mod tests {
     }
 
     #[test]
-    fn dist_tag_ships_channels_all_tag_ships_heavyweight() {
+    fn dist_tag_is_lean_while_all_tag_is_kitchen_sink() {
         let s = render(&root()).unwrap();
         let v: toml::Value = toml::from_str(&s).unwrap();
         let tags = v["tags"].as_array().unwrap();
@@ -158,13 +158,21 @@ mod tests {
             .iter()
             .find(|t| t["stem"].as_str() == Some("all-features"))
             .unwrap();
-        assert!(
-            dist["features"]
-                .as_str()
-                .unwrap()
-                .contains("channel-discord")
-        );
-        assert!(!dist["features"].as_str().unwrap().contains("hardware"));
+        let dist_features = dist["features"].as_str().unwrap();
+        for feature in
+            crate::generate::spec::resolve_feature_list(&root(), &Selection::Dist).unwrap()
+        {
+            assert!(
+                dist_features.contains(&feature),
+                "dist feature {feature} not rendered"
+            );
+        }
+        for feature in crate::generate::spec::features_outside_dist(&root()).unwrap() {
+            assert!(
+                !dist_features.contains(&feature),
+                "{feature} leaked into lean dist"
+            );
+        }
         assert!(all["features"].as_str().unwrap().contains("hardware"));
     }
 }

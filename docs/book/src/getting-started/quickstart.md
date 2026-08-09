@@ -10,14 +10,10 @@ where you are.
 
 {{#include ../_snippets/install.md}}
 
-This builds and installs both `zeroclaw` and the `zerocode` terminal interface.
-Run it with no flags for an interactive picker that lets you choose the build
-type, which apps to install, and which optional features to compile in.
-
 ## The steps
 
 > **Important:** if any of these terms are unfamiliar, read
-> [Getting Started → Concepts](./index.md#concepts) first. It defines model
+> [Getting Started → Concepts](./concepts.md) first. It defines model
 > provider, risk profile, alias, and the rest in one place.
 
 {{#include ../_snippets/quickstart-steps.md}}

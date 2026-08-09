@@ -12,18 +12,12 @@ pub enum VadEvent {
 }
 
 /// Pluggable Voice Activity Detector.
-///
 /// Implementations receive mono f32 samples and emit [`VadEvent`] transitions.
 pub trait Vad: Send + Sync {
     /// Process a buffer of mono f32 samples and return the detected event.
     fn process(&mut self, samples: &[f32]) -> VadEvent;
 }
 
-/// No-op VAD that always reports silence.
-///
-/// Used when `gateway-voice-duplex` is enabled but no real VAD implementation
-/// is configured. A real implementation (energy-based or webrtcvad) will
-/// follow in a separate PR.
 #[derive(Debug, Default)]
 pub struct NoopVad;
 
@@ -42,5 +36,11 @@ mod tests {
         let mut vad = NoopVad;
         assert_eq!(vad.process(&[0.0; 160]), VadEvent::Silence);
         assert_eq!(vad.process(&[0.5; 160]), VadEvent::Silence);
+    }
+
+    #[test]
+    fn default_noop_vad_treats_empty_input_as_silence() {
+        let mut vad = NoopVad;
+        assert_eq!(vad.process(&[]), VadEvent::Silence);
     }
 }

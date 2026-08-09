@@ -1,19 +1,22 @@
 //! JSONL-based session persistence for channel conversations.
-//!
-//! Each session (keyed by `channel_sender` or `channel_thread_sender`) is stored
-//! as an append-only JSONL file in `{workspace}/sessions/`. Messages are appended
-//! one-per-line as JSON, never modifying old lines. On daemon restart, sessions
-//! are loaded from disk to restore conversation context.
 
 use crate::session_backend::SessionBackend;
+use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock, Weak};
 use zeroclaw_api::model_provider::ChatMessage;
 pub use zeroclaw_api::session_keys::sanitize_session_key;
+
+type MutationLock = parking_lot::Mutex<()>;
+
+static MUTATION_LOCKS: OnceLock<parking_lot::Mutex<HashMap<PathBuf, Weak<MutationLock>>>> =
+    OnceLock::new();
 
 /// Append-only JSONL session store for channel conversations.
 pub struct SessionStore {
     sessions_dir: PathBuf,
+    mutation_lock: Arc<MutationLock>,
 }
 
 impl SessionStore {
@@ -21,7 +24,11 @@ impl SessionStore {
     pub fn new(workspace_dir: &Path) -> std::io::Result<Self> {
         let sessions_dir = workspace_dir.join("sessions");
         std::fs::create_dir_all(&sessions_dir)?;
-        Ok(Self { sessions_dir })
+        let mutation_lock = mutation_lock_for(&sessions_dir)?;
+        Ok(Self {
+            sessions_dir,
+            mutation_lock,
+        })
     }
 
     /// Compute the file path for a session key, sanitizing for filesystem safety.
@@ -58,6 +65,11 @@ impl SessionStore {
 
     /// Append a single message to the session JSONL file.
     pub fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {
+        let _guard = self.mutation_lock.lock();
+        self.append_unlocked(session_key, message)
+    }
+
+    fn append_unlocked(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {
         let path = self.session_path(session_key);
         let mut file = std::fs::OpenOptions::new()
             .create(true)
@@ -72,10 +84,10 @@ impl SessionStore {
     }
 
     /// Remove the last message from a session's JSONL file.
-    ///
     /// Rewrite approach: load all messages, drop the last, rewrite. This is
     /// O(n) but rollbacks are rare.
     pub fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
+        let _guard = self.mutation_lock.lock();
         let mut messages = self.load(session_key);
         if messages.is_empty() {
             return Ok(false);
@@ -85,26 +97,70 @@ impl SessionStore {
         Ok(true)
     }
 
+    /// Replace the last message without exposing an intermediate truncated session.
+    pub fn update_last(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<bool> {
+        self.update_last_with(session_key, message, |temp, path| {
+            temp.persist(path).map(|_| ()).map_err(|error| error.error)
+        })
+    }
+
+    fn update_last_with<F>(
+        &self,
+        session_key: &str,
+        message: &ChatMessage,
+        persist: F,
+    ) -> std::io::Result<bool>
+    where
+        F: FnOnce(tempfile::NamedTempFile, &Path) -> std::io::Result<()>,
+    {
+        let _guard = self.mutation_lock.lock();
+        let mut messages = self.load(session_key);
+        let Some(last) = messages.last_mut() else {
+            return Ok(false);
+        };
+        *last = message.clone();
+        self.rewrite_with(session_key, &messages, persist)?;
+        Ok(true)
+    }
+
     /// Compact a session file by rewriting only valid messages (removes corrupt lines).
     pub fn compact(&self, session_key: &str) -> std::io::Result<()> {
+        let _guard = self.mutation_lock.lock();
         let messages = self.load(session_key);
         self.rewrite(session_key, &messages)
     }
 
     fn rewrite(&self, session_key: &str, messages: &[ChatMessage]) -> std::io::Result<()> {
+        self.rewrite_with(session_key, messages, |temp, path| {
+            temp.persist(path).map(|_| ()).map_err(|error| error.error)
+        })
+    }
+
+    fn rewrite_with<F>(
+        &self,
+        session_key: &str,
+        messages: &[ChatMessage],
+        persist: F,
+    ) -> std::io::Result<()>
+    where
+        F: FnOnce(tempfile::NamedTempFile, &Path) -> std::io::Result<()>,
+    {
         let path = self.session_path(session_key);
-        let mut file = std::fs::File::create(&path)?;
+        let mut temp = tempfile::NamedTempFile::new_in(&self.sessions_dir)?;
         for msg in messages {
-            let json = serde_json::to_string(msg)
+            serde_json::to_writer(&mut temp, msg)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            writeln!(file, "{json}")?;
+            temp.write_all(b"\n")?;
         }
-        Ok(())
+
+        temp.as_file().sync_all()?;
+        persist(temp, &path)
     }
 
     /// Clear all messages from a session by truncating its JSONL file.
     /// The file is preserved (empty) so the session key remains in `list_sessions`.
     pub fn clear_messages(&self, session_key: &str) -> std::io::Result<usize> {
+        let _guard = self.mutation_lock.lock();
         let count = self.load(session_key).len();
         if count > 0 {
             self.rewrite(session_key, &[])?;
@@ -114,6 +170,7 @@ impl SessionStore {
 
     /// Delete a session's JSONL file. Returns `true` if the file existed.
     pub fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
+        let _guard = self.mutation_lock.lock();
         let path = self.session_path(session_key);
         if !path.exists() {
             return Ok(false);
@@ -146,6 +203,21 @@ impl SessionStore {
     }
 }
 
+fn mutation_lock_for(sessions_dir: &Path) -> std::io::Result<Arc<MutationLock>> {
+    let key = sessions_dir.canonicalize()?;
+    let registry = MUTATION_LOCKS.get_or_init(|| parking_lot::Mutex::new(HashMap::new()));
+    let mut locks = registry.lock();
+    locks.retain(|_, lock| lock.strong_count() > 0);
+
+    if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+        return Ok(lock);
+    }
+
+    let lock = Arc::new(MutationLock::new(()));
+    locks.insert(key, Arc::downgrade(&lock));
+    Ok(lock)
+}
+
 impl SessionBackend for SessionStore {
     fn load(&self, session_key: &str) -> Vec<ChatMessage> {
         self.load(session_key)
@@ -159,15 +231,14 @@ impl SessionBackend for SessionStore {
         self.remove_last(session_key)
     }
 
+    fn update_last(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<bool> {
+        self.update_last(session_key, message)
+    }
+
     fn list_sessions(&self) -> Vec<String> {
         self.list_sessions()
     }
 
-    /// Override the trait default so JSONL-backed channel hydration picks
-    /// the most-recent sessions when truncating to MAX_CONVERSATION_SENDERS.
-    /// The trait default stamps every key with `Utc::now()`, which makes
-    /// the orchestrator's `sort_by_key(|m| Reverse(m.last_activity))`
-    /// arbitrary once more than that many sessions are persisted.
     fn list_sessions_with_metadata(&self) -> Vec<crate::session_backend::SessionMetadata> {
         use chrono::{DateTime, Utc};
         self.list_sessions()
@@ -205,7 +276,7 @@ impl SessionBackend for SessionStore {
     }
 
     /// Quick existence probe mirroring how `delete_session` decides whether
-    /// the session is on disk (#7126). Checking file presence is the same
+    /// the session is on disk Checking file presence is the same
     /// O(1) `stat` that `delete_session` itself performs.
     fn session_exists(&self, session_key: &str) -> bool {
         self.session_path(session_key).exists()
@@ -215,6 +286,8 @@ impl SessionBackend for SessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, mpsc};
+    use std::time::Duration;
     use tempfile::TempDir;
 
     #[test]
@@ -351,6 +424,105 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = SessionStore::new(tmp.path()).unwrap();
         assert!(!store.remove_last("nonexistent").unwrap());
+    }
+
+    #[test]
+    fn update_last_via_trait_replaces_final_message() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let backend: &dyn SessionBackend = &store;
+        let key = "update_test";
+
+        backend.append(key, &ChatMessage::user("first")).unwrap();
+        backend.append(key, &ChatMessage::assistant("old")).unwrap();
+
+        assert!(
+            backend
+                .update_last(key, &ChatMessage::assistant("new"))
+                .unwrap()
+        );
+
+        let messages = backend.load(key);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].content, "first");
+        assert_eq!(messages[1].content, "new");
+    }
+
+    #[test]
+    fn failed_rewrite_preserves_original_file() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let key = "rewrite_failure";
+
+        store.append(key, &ChatMessage::user("first")).unwrap();
+        store
+            .append(key, &ChatMessage::assistant("second"))
+            .unwrap();
+        let path = store.session_path(key);
+        let original = std::fs::read(&path).unwrap();
+
+        let mut temp_path = None;
+        let result = store.rewrite_with(key, &[ChatMessage::user("replacement")], |temp, _path| {
+            temp_path = Some(temp.path().to_path_buf());
+            Err(std::io::Error::other("injected persist failure"))
+        });
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(!temp_path.unwrap().exists());
+    }
+
+    #[test]
+    fn concurrent_append_waits_for_update_last_commit() {
+        let tmp = TempDir::new().unwrap();
+        let update_store = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        let append_store = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        let key = "concurrent_update";
+        update_store
+            .append(key, &ChatMessage::user("first"))
+            .unwrap();
+        update_store
+            .append(key, &ChatMessage::assistant("old"))
+            .unwrap();
+
+        let (staged_tx, staged_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let update_worker = Arc::clone(&update_store);
+        let updater = std::thread::spawn(move || {
+            update_worker.update_last_with(key, &ChatMessage::assistant("new"), |temp, path| {
+                staged_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                temp.persist(path).map(|_| ()).map_err(|error| error.error)
+            })
+        });
+
+        staged_rx.recv().unwrap();
+        let (append_started_tx, append_started_rx) = mpsc::channel();
+        let (append_done_tx, append_done_rx) = mpsc::channel();
+        let append_store = Arc::clone(&append_store);
+        let appender = std::thread::spawn(move || {
+            append_started_tx.send(()).unwrap();
+            let result = append_store.append(key, &ChatMessage::user("concurrent"));
+            append_done_tx.send(()).unwrap();
+            result
+        });
+
+        append_started_rx.recv().unwrap();
+        assert!(
+            append_done_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err()
+        );
+
+        release_tx.send(()).unwrap();
+        assert!(updater.join().unwrap().unwrap());
+        appender.join().unwrap().unwrap();
+
+        let messages = update_store.load(key);
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].content, "first");
+        assert_eq!(messages[1].content, "new");
+        assert_eq!(messages[2].content, "concurrent");
     }
 
     #[test]
@@ -498,7 +670,7 @@ mod tests {
         assert!(backend.load("trait_delete").is_empty());
     }
 
-    // ── session_exists (#7126) ─────────────────────────────────────
+    // ── session_exists─────────────────────────────────────
     #[test]
     fn session_exists_tracks_lifecycle() {
         let tmp = TempDir::new().unwrap();

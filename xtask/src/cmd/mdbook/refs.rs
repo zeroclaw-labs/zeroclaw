@@ -49,7 +49,8 @@ pub fn build_refs(root: &Path) -> anyhow::Result<()> {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    std::fs::write(ref_dir.join("cli.md"), cli_content + "\n")?;
+    let cli_content = crate::cmd::mdbook::placeholders::normalize(&(cli_content + "\n"));
+    std::fs::write(ref_dir.join("cli.md"), cli_content)?;
 
     let schema = Command::new("cargo")
         .args([
@@ -65,13 +66,24 @@ pub fn build_refs(root: &Path) -> anyhow::Result<()> {
     if !schema.status.success() {
         anyhow::bail!("cargo run markdown-schema failed");
     }
-    std::fs::write(ref_dir.join("config.md"), &schema.stdout)?;
+    let config_content = String::from_utf8(schema.stdout)?;
+    let config_content = crate::cmd::mdbook::placeholders::normalize(&config_content);
+    std::fs::write(ref_dir.join("config.md"), config_content)?;
     Ok(())
 }
 
 pub fn build_api(root: &Path) -> anyhow::Result<()> {
     println!("==> Generating rustdoc API reference");
     let target = target_dir(root);
+    // The docs-site rustdoc theme is owned here, not by `[build] rustdocflags`
+    // in `.cargo/config.toml` — the repository-wide flag would also reach
+    // `cargo test --doc`, which under Rust 1.96's stricter parser rejects
+    // a duplicate `--default-theme` with `Option 'default-theme' given more
+    // than once`. `compose_rustdocflags` preserves any caller-supplied flags
+    // (e.g. `-D warnings`) and only appends the site default when the caller
+    // did not already pin a theme.
+    let inherited = std::env::var_os("RUSTDOCFLAGS").map(|s| s.to_string_lossy().into_owned());
+    let rustdocflags = compose_rustdocflags(inherited.as_deref());
     run_cmd(
         Command::new("cargo")
             .args([
@@ -83,6 +95,107 @@ pub fn build_api(root: &Path) -> anyhow::Result<()> {
                 "--target-dir",
             ])
             .arg(&target)
+            .env("RUSTDOCFLAGS", rustdocflags)
             .current_dir(root),
     )
+}
+
+/// Compose the `RUSTDOCFLAGS` value for the docs-site `cargo doc` invocation.
+///
+/// Behaviour:
+/// - When the caller did not supply `--default-theme`, append the site default
+///   (`--default-theme=ayu`) to the inherited flags verbatim. This keeps any
+///   caller-supplied options (`-D warnings`, `--cfg=...`, etc.) intact.
+/// - When the caller already pinned `--default-theme=<value>` (equals form) or
+///   `--default-theme <value>` (space-separated form), return the inherited
+///   flags unchanged. Rust 1.96+ rejects a duplicate `--default-theme` with
+///   `Option 'default-theme' given more than once`, so the caller wins.
+///
+/// Pure / sync; unit-tested in isolation from `Command` and `cargo doc`.
+pub(crate) fn compose_rustdocflags(inherited: Option<&str>) -> String {
+    const SITE_DEFAULT_THEME: &str = "--default-theme=ayu";
+    const THEME_PREFIX: &str = "--default-theme=";
+    match inherited {
+        None | Some("") => SITE_DEFAULT_THEME.to_string(),
+        Some(flags) => {
+            // Check for `--default-theme=<value>` form (equals sign)
+            if flags.contains(THEME_PREFIX) {
+                return flags.to_string();
+            }
+
+            // Check for `--default-theme <value>` form (space-separated)
+            let tokens: Vec<&str> = flags.split_whitespace().collect();
+            let caller_pinned_theme = tokens
+                .windows(2)
+                .any(|window| window[0] == "--default-theme" && !window[1].starts_with('-'));
+
+            if caller_pinned_theme {
+                flags.to_string()
+            } else {
+                format!("{flags} {SITE_DEFAULT_THEME}")
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compose_rustdocflags;
+
+    #[test]
+    fn compose_with_no_inherited_returns_site_default() {
+        // No caller flags → output is exactly the site default.
+        assert_eq!(compose_rustdocflags(None), "--default-theme=ayu");
+        // Empty string is the same case (caller had no real flags).
+        assert_eq!(compose_rustdocflags(Some("")), "--default-theme=ayu");
+    }
+
+    #[test]
+    fn compose_appends_site_default_to_unrelated_inherited_flags() {
+        // Unrelated inherited flags survive verbatim; site default is appended.
+        assert_eq!(
+            compose_rustdocflags(Some("-D warnings")),
+            "-D warnings --default-theme=ayu"
+        );
+        assert_eq!(
+            compose_rustdocflags(Some("-D warnings --cfg=docsrs")),
+            "-D warnings --cfg=docsrs --default-theme=ayu"
+        );
+    }
+
+    #[test]
+    fn compose_preserves_caller_pinned_theme_without_duplication() {
+        // Rust 1.96+ rejects a duplicate `--default-theme`, so when the caller
+        // has already pinned one we keep theirs verbatim — including a non-site
+        // value (e.g. `--default-theme=light`) that the site default would
+        // otherwise overwrite.
+        assert_eq!(
+            compose_rustdocflags(Some("--default-theme=light")),
+            "--default-theme=light"
+        );
+        assert_eq!(
+            compose_rustdocflags(Some("-D warnings --default-theme=light")),
+            "-D warnings --default-theme=light"
+        );
+        // Caller pinned the same site default; we still keep theirs rather
+        // than risk a duplicate if a future change re-emits the default.
+        assert_eq!(
+            compose_rustdocflags(Some("--default-theme=ayu")),
+            "--default-theme=ayu"
+        );
+    }
+
+    #[test]
+    fn compose_preserves_caller_pinned_theme_space_separated() {
+        // Rustdoc also accepts `--default-theme <value>` (space-separated form).
+        // The caller's theme must win to avoid rustdoc rejecting duplicate flags.
+        assert_eq!(
+            compose_rustdocflags(Some("--default-theme light")),
+            "--default-theme light"
+        );
+        assert_eq!(
+            compose_rustdocflags(Some("-D warnings --default-theme light")),
+            "-D warnings --default-theme light"
+        );
+    }
 }

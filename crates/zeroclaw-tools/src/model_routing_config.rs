@@ -620,11 +620,6 @@ impl ModelRoutingConfigTool {
                     .unwrap_or("(none)")
                     .to_string();
 
-                // Rollback: restore the previous entry's baseline fields for
-                // this type.alias slot. Family-specific extras on the typed
-                // family config are NOT touched — they survive the modify+
-                // restore cycle because we only ever mutated baseline fields
-                // (model, temperature, api_key) above.
                 if let Some(prev_entry) = previous_provider_entry
                     && let Some(slot) = cfg.providers.models.ensure(&type_k, &alias_k)
                 {

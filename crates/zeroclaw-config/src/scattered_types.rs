@@ -71,11 +71,7 @@ pub use zeroclaw_api::model_provider::{
 pub struct ThinkingConfig {
     #[serde(default)]
     pub default_level: ThinkingLevel,
-    /// Opt-in flag for provider-native extended thinking. When `true`, the
-    /// provider sends a dedicated `thinking` parameter with `budget_tokens`
-    /// instead of relying solely on prompt-based reasoning. Defaults to
-    /// `false` so existing High/Max users keep their prior prompt-based
-    /// behavior (cost, latency, transport path) until they explicitly migrate.
+    /// Enables provider-native thinking parameters when the selected level has a budget.
     #[serde(default)]
     pub native_thinking: bool,
     #[serde(default)]
@@ -93,11 +89,6 @@ impl Default for ThinkingConfig {
 }
 
 impl ThinkingConfig {
-    /// Resolve the effective `budget_tokens` for a given level.
-    ///
-    /// Only levels with a built-in default (`High`, `Max`) are eligible for
-    /// native thinking. Config overrides for levels Off–Medium are ignored
-    /// to prevent accidentally forcing `temperature = 1.0` on low levels.
     pub fn budget_tokens_for(&self, level: ThinkingLevel) -> Option<u32> {
         // Guard: only levels that have a built-in budget can use native thinking.
         let default = level.default_budget_tokens()?;
@@ -251,7 +242,7 @@ impl Default for EvalHarnessConfig {
 }
 
 fn default_cc_enabled() -> bool {
-    true
+    false
 }
 fn default_threshold_ratio() -> f64 {
     0.50
@@ -285,6 +276,11 @@ fn default_tool_result_retrim_chars() -> usize {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "agent.context_compression"]
 pub struct ContextCompressionConfig {
+    /// The runtime context compressor was removed; no runtime execution path
+    /// consumes this flag, so setting it to `true` currently has no effect.
+    /// Defaults to `false` to match actual runtime behavior;
+    /// `Config::collect_warnings` reads an explicit `true` only to report
+    /// `context_compression_unsupported`.
     #[serde(default = "default_cc_enabled")]
     pub enabled: bool,
     #[serde(default = "default_threshold_ratio")]
@@ -301,20 +297,10 @@ pub struct ContextCompressionConfig {
     pub source_max_chars: usize,
     #[serde(default = "default_cc_timeout_secs")]
     pub timeout_secs: u64,
-    /// Summarizer provider as a `providers.models.<type>.<alias>` reference.
-    /// Empty (Default) = inherit the agent's own resolved provider+model.
-    /// Self-contained (provider + model + auth), so a profile shared across
-    /// agents on different providers always summarizes on *this* provider —
-    /// fixes the cross-provider bug the deprecated `summary_model` had. An
-    /// agent-level `summary_provider` overrides this. Validated in
-    /// `Config::validate()`.
+    /// Summarizer provider as a `<type>.<alias>` reference into `providers.models`.
     #[serde(default)]
     pub summary_provider: crate::providers::ModelProviderRef,
-    /// DEPRECATED bare model id — historically swapped onto the AGENT's own
-    /// provider (the cross-provider footgun, #7964). Still honored as a fallback
-    /// when `summary_provider` is empty, so existing configs keep working
-    /// unchanged. Prefer `summary_provider`. **Slated for removal in schema v4**
-    /// (batched with the next schema bump — not bumped for a single field).
+    /// DEPRECATED bare model id retained as a compatibility fallback.
     #[serde(default)]
     pub summary_model: Option<String>,
     #[serde(default = "default_identifier_policy")]
@@ -352,18 +338,7 @@ fn default_precheck_timeout_secs() -> u64 {
     5
 }
 
-/// Channel reply-intent precheck configuration.
-///
-/// The precheck runs a lightweight `REPLY` / `NO_REPLY` classifier before the
-/// main agent loop so group-chat messages that are not addressed to the
-/// assistant do not trigger a full tool-using turn.
-///
-/// In V3 multi-agent configs this block is configured inside each agent as
-/// `[agents.<alias>.precheck]`. Defaults preserve the current behavior: the
-/// classifier is enabled, model/provider selection follows the agent's
-/// `classifier_provider` ref when configured and otherwise reuses the active
-/// route model, and provider errors or timeouts fail open to REPLY.
-/// `timeout_secs` must be greater than zero.
+/// Per-channel reply-intent precheck configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "agent.precheck"]
@@ -571,16 +546,7 @@ pub struct EmailConfig {
     /// Outlook/Hotmail that have deprecated password auth.
     #[serde(default)]
     pub oauth2: Option<EmailOAuth2Config>,
-    /// When `true`, the daemon never modifies any IMAP flag: not on startup,
-    /// not on message receipt, not ever. It only processes emails that arrive
-    /// after startup (UID >= uid_next at connect time). Existing unread mail
-    /// stays unread; no `\Seen` is set implicitly via RFC822 or explicitly via
-    /// STORE. Think of it as a PA who reads your messages aloud but never
-    /// touches the read/unread indicator.
-    ///
-    /// When `false` (default), the daemon behaves as an active mailbox owner:
-    /// it drains UNSEEN messages on startup (RFC822 fetch, which implicitly
-    /// sets `\Seen`) and processes all new mail as it arrives.
+    /// When true, the daemon observes new mail but never modifies any IMAP flag.
     #[serde(default)]
     pub observer_mode: bool,
 }
@@ -785,6 +751,20 @@ impl crate::traits::ChannelConfig for VoiceCallConfig {
     }
 }
 
+impl VoiceCallConfig {
+    /// Whether all required credentials (`account_id`, `auth_token`,
+    /// `from_number`) are present. Mirrors `WhatsAppConfig::is_cloud_config`'s
+    /// role: the channel orchestrator uses this bool to decide whether to
+    /// build the channel at all, skipping (with a warning) an
+    /// enabled-but-uncredentialed alias instead of building a listener that
+    /// can never connect and crashloops its per-channel supervisor.
+    pub fn has_required_credentials(&self) -> bool {
+        !crate::traits::is_unset_display_value(&self.account_id)
+            && !crate::traits::is_unset_display_value(&self.auth_token)
+            && !crate::traits::is_unset_display_value(&self.from_number)
+    }
+}
+
 impl Default for VoiceCallConfig {
     fn default() -> Self {
         Self {
@@ -807,6 +787,50 @@ impl Default for VoiceCallConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn voice_call_has_required_credentials_true_when_all_set() {
+        let vc = VoiceCallConfig {
+            account_id: "AC123".into(),
+            auth_token: "tok".into(),
+            from_number: "+15551234567".into(),
+            ..Default::default()
+        };
+        assert!(vc.has_required_credentials());
+    }
+
+    #[test]
+    fn voice_call_has_required_credentials_false_when_any_blank() {
+        let base = VoiceCallConfig {
+            account_id: "AC123".into(),
+            auth_token: "tok".into(),
+            from_number: "+15551234567".into(),
+            ..Default::default()
+        };
+
+        assert!(
+            !VoiceCallConfig {
+                account_id: "   ".into(),
+                ..base.clone()
+            }
+            .has_required_credentials()
+        );
+        assert!(
+            !VoiceCallConfig {
+                auth_token: "   ".into(),
+                ..base.clone()
+            }
+            .has_required_credentials()
+        );
+        assert!(
+            !VoiceCallConfig {
+                from_number: "   ".into(),
+                ..base
+            }
+            .has_required_credentials()
+        );
+        assert!(!VoiceCallConfig::default().has_required_credentials());
+    }
 
     #[test]
     fn thinking_level_from_str_canonical_aliases() {
@@ -887,6 +911,16 @@ mod tests {
         assert_eq!(ThinkingLevel::Medium.default_budget_tokens(), None);
         assert_eq!(ThinkingLevel::High.default_budget_tokens(), Some(10_000));
         assert_eq!(ThinkingLevel::Max.default_budget_tokens(), Some(50_000));
+    }
+
+    // The runtime context compressor was removed; nothing reads
+    // `context_compression` at runtime anymore, so the default must be
+    // `false` (a `true` default would mislead users into thinking the
+    // knob does something). See `context_compression_unsupported` in
+    // `schema.rs` for the companion validation warning.
+    #[test]
+    fn context_compression_config_defaults_to_disabled() {
+        assert!(!ContextCompressionConfig::default().enabled);
     }
 
     #[test]

@@ -11,6 +11,7 @@ zeroclaw-api.workspace = true
 zeroclaw-spawn.workspace = true
 zeroclaw-infra.workspace = true
 zeroclaw-config.workspace = true
+zeroclaw-commands.workspace = true
 zeroclaw-log.workspace = true
 zeroclaw-providers.workspace = true
 zeroclaw-memory.workspace = true
@@ -22,6 +23,7 @@ fluent = "0.16"
 anyhow = "1.0"
 async-trait = "0.1"
 base64 = "0.22"
+cap-std = "4"
 chacha20poly1305 = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 chrono-tz = "0.10"
@@ -29,7 +31,6 @@ console = "0.16"
 cron = "0.15"
 dialoguer = { version = "0.12", features = ["fuzzy-select"] }
 directories = "6.0"
-flate2 = "1"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 glob = "0.3"
 hex = "0.4"
@@ -78,7 +79,6 @@ urlencoding = "2.1"
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 webpki-roots = "1.0.6"
 which = "8.0"
-zip = { version = "8.1", default-features = false, features = ["deflate-flate2"] }
 zeroclaw-macros.workspace = true
 
 # Optional deps
@@ -120,6 +120,10 @@ tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
 scopeguard = "1.2"
 filetime = "0.2"
 wiremock = "0.6"
+# Test-only registry constructor used by the daemon heartbeat MCP
+# retry-regression tests. Not in default deps so
+# the helper is unreachable from production builds.
+zeroclaw-tools = { workspace = true, features = ["test-helpers"] }
 
 # Channel features (forwarded to zeroclaw-channels)
 

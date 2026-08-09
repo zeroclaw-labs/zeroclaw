@@ -1,11 +1,6 @@
 //! The agent's approval bridge: a synthetic [`Channel`] that fans a single
 //! tool-approval request out to every registered `ask_user` back-channel (ACP
 //! editor, WebSocket dashboard, …) and returns the first decisive answer.
-//!
-//! The deciding back-channel's name travels back with the decision via
-//! [`AttributedApprovalResponse`], so the approval audit can attribute the
-//! decision to the surface that actually answered — without a channel-global
-//! side channel that concurrent approvals could overwrite (issue #7737).
 
 use std::sync::Arc;
 
@@ -15,15 +10,6 @@ use zeroclaw_api::channel::{
     AttributedApprovalResponse, Channel, ChannelApprovalRequest, ChannelMessage, SendMessage,
 };
 
-/// Routes the loop's single-channel approval callback through every registered
-/// `ask_user` back-channel — the first decisive answer wins — preserving the
-/// multi-channel iteration of the old direct execution path (ACP and WS
-/// sessions register their approval back-channels at session start; hard-coding
-/// one name would break the other).
-///
-/// When the active risk profile names a DISTINCT approver channel via `route`,
-/// the gate consults that approver alone (bounded, fail-closed) instead of
-/// fanning out to the originating back-channels; `None` ⇒ today's fan-out.
 pub(crate) struct AskUserApprovalBridge {
     handles: PerToolChannelHandle,
     route: Option<zeroclaw_config::autonomy::ApprovalRoute>,
@@ -80,19 +66,20 @@ impl Channel for AskUserApprovalBridge {
         recipient: &str,
         request: &ChannelApprovalRequest,
     ) -> anyhow::Result<Option<AttributedApprovalResponse>> {
-        // ── Cross-channel HITL route ───────────────────────────────────────
-        // A configured `ApprovalRoute` redirects this gate to a DISTINCT
-        // approver channel rather than the originating fan-out. The approver is
-        // asked alone, bounded by `timeout_secs`; any non-decisive outcome is
-        // resolved by `on_no_approver` — fail-closed `Deny` by default, or fall
-        // through to the originating fan-out on explicit `InheritOriginator`.
         if let Some(route) = &self.route {
             match resolve_routed_approval(&self.handles, route, recipient, request).await {
-                RoutedApproval::Decided { response, decider } => {
-                    return Ok(Some(AttributedApprovalResponse {
-                        response,
-                        decided_by: decider,
-                    }));
+                // Cross-crate construction: `AttributedApprovalResponse` is
+                // `#[non_exhaustive]`, so struct-literal syntax is forbidden
+                // from here. Build via the dedicated constructors.
+                RoutedApproval::Decided {
+                    response,
+                    decider,
+                    source,
+                } => {
+                    return Ok(Some(
+                        AttributedApprovalResponse::from_runtime(response, source)
+                            .with_decider_opt(decider),
+                    ));
                 }
                 RoutedApproval::Fallthrough => {
                     // explicit InheritOriginator → originating fan-out below
@@ -107,15 +94,19 @@ impl Channel for AskUserApprovalBridge {
             .map(|(name, channel)| (name.clone(), Arc::clone(channel)))
             .collect();
         for (channel_name, channel) in &channels {
-            match channel.request_approval(recipient, request).await {
+            // Ask for the ATTRIBUTED response, not the legacy one: a back-channel
+            // that synthesizes `Some(Deny)` on timeout reports that provenance
+            // here, and calling `request_approval` would discard it and relabel
+            // the runtime's deny as the operator's.
+            match channel
+                .request_approval_attributed(recipient, request)
+                .await
+            {
                 // The deciding back-channel's name travels back on the response
                 // itself, so a concurrent fan-out on the same bridge instance
                 // cannot overwrite this call's attribution.
-                Ok(Some(response)) => {
-                    return Ok(Some(AttributedApprovalResponse {
-                        response,
-                        decided_by: Some(channel_name.clone()),
-                    }));
+                Ok(Some(attributed)) => {
+                    return Ok(Some(attributed.with_decider(channel_name.clone())));
                 }
                 Ok(None) => continue,
                 Err(e) => {
@@ -197,6 +188,110 @@ mod tests {
         })
     }
 
+    /// A back-channel whose prompt timed out, so it synthesizes `Some(Deny)`
+    /// the way Discord / Matrix / Telegram / Slack / the gateway WS all do.
+    struct TimedOutApprover {
+        name: String,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for TimedOutApprover {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Cli,
+            )
+        }
+        fn alias(&self) -> &str {
+            &self.name
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for TimedOutApprover {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        async fn send(&self, _m: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn request_approval_attributed(
+            &self,
+            _recipient: &str,
+            _r: &ChannelApprovalRequest,
+        ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
+            Ok(Some(
+                zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                    ChannelApprovalResponse::Deny,
+                    zeroclaw_api::channel::ApprovalSource::TimedOut,
+                ),
+            ))
+        }
+    }
+
+    /// The fan-out must not launder a back-channel's synthesized timeout into an
+    /// operator decision.
+    ///
+    /// This is the regression: the bridge used to call the legacy
+    /// `request_approval`, which returns a bare `Some(Deny)` that is
+    /// indistinguishable from a real "no", and then stamped `Operator` on it.
+    /// The gate then told the model "Denied by user." for a prompt no human
+    /// ever saw. The bridge now asks for the attributed response and forwards
+    /// the provenance untouched, adding only the deciding channel's name.
+    #[tokio::test]
+    async fn fanout_preserves_a_backchannel_synthesized_timeout() {
+        let bridge = AskUserApprovalBridge::new(
+            handles_with(vec![Arc::new(TimedOutApprover {
+                name: "discord".to_string(),
+            })]),
+            None,
+        );
+
+        let decided = bridge
+            .request_approval_attributed("user-A", &req())
+            .await
+            .unwrap()
+            .expect("a synthesized deny is still a response");
+
+        assert_eq!(decided.response, ChannelApprovalResponse::Deny);
+        assert_eq!(
+            decided.source,
+            zeroclaw_api::channel::ApprovalSource::TimedOut,
+            "the back-channel's runtime provenance must survive the fan-out"
+        );
+        assert!(decided.source.is_runtime_fail_closed());
+        assert_eq!(
+            decided.decided_by.as_deref(),
+            Some("discord"),
+            "the fan-out still names which surface produced the outcome"
+        );
+    }
+
+    /// The complement: a back-channel that a person actually answered still
+    /// reports `Operator`, so the fix does not simply blanket-neutralize every
+    /// denial.
+    #[tokio::test]
+    async fn fanout_keeps_operator_provenance_for_a_real_answer() {
+        let bridge =
+            AskUserApprovalBridge::new(handles_with(vec![approver("acp", "user-A")]), None);
+
+        let decided = bridge
+            .request_approval_attributed("user-A", &req())
+            .await
+            .unwrap()
+            .expect("a back-channel approved");
+
+        assert_eq!(
+            decided.source,
+            zeroclaw_api::channel::ApprovalSource::Operator
+        );
+        assert!(!decided.source.is_runtime_fail_closed());
+    }
+
     fn handles_with(channels: Vec<Arc<dyn Channel>>) -> PerToolChannelHandle {
         let map: HashMap<String, Arc<dyn Channel>> = channels
             .into_iter()
@@ -235,11 +330,6 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_fanouts_keep_their_own_attribution() {
-        // Two back-channels, each scoped to a different recipient. Two approvals
-        // run concurrently on the SAME bridge instance. Under the old design the
-        // bridge stashed the deciding channel in a shared `Mutex` that a second
-        // fan-out could overwrite before the first decision was attributed;
-        // carrying attribution on the response makes each call keep its own.
         let bridge = Arc::new(AskUserApprovalBridge::new(
             handles_with(vec![
                 approver("chan-A", "user-A"),

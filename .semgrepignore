@@ -1,0 +1,26 @@
+# Semgrep path ignores — suppress known false-positive / low-value scan surfaces.
+#
+# The Semgrep findings audit traced the bulk of its noise to illustrative tokens,
+# keys, and insecure-WebSocket examples in these locations. They are governed by
+# gitleaks + the no-real-secrets policy, and mirror CodeQL's existing
+# `paths-ignore: tests/**`.
+#
+# NOTE: inline `#[cfg(test)]` fixtures inside src/*.rs cannot be excluded by path
+# (they share a file with production code). Those surface once in the full-scan
+# baseline and are handled by dismissing them in the Security tab, not here.
+
+# Test trees carry deliberate example secrets/tokens/keys for detectors to match.
+tests/
+
+# Example / demo assets (e.g. hardware SIM HTML) — not shipped application code.
+examples/
+
+# mdBook theme + Handlebars templates (doc rendering, not app code).
+docs/book/theme/
+*.hbs
+
+# Selected skill docs contain illustrative protocol and token placeholders. Keep
+# executable tooling elsewhere under .claude/ in scan scope.
+.claude/skills/zeroclaw/SKILL.md
+.claude/skills/zeroclaw/references/cli-reference.md
+.claude/skills/zeroclaw/references/rest-api.md

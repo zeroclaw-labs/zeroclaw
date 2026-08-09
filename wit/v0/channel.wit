@@ -30,10 +30,11 @@ interface channel {
         sender: string,
         reply-target: string,
         content: string,
-        /// Platform type identifier (e.g. `"telegram"`, `"discord"`).
+        /// Legacy platform hint. The host ignores this for routing and stamps
+        /// the channel type from the admitted logical endpoint.
         channel: string,
-        /// ZeroClaw channel alias, when the platform supports multiple bot
-        /// instances. Used to compute distinct session IDs per bot.
+        /// Legacy alias hint. The host ignores this for routing and stamps the
+        /// alias from the admitted instance binding.
         channel-alias: option<string>,
         /// Unix timestamp in milliseconds.
         timestamp: u64,
