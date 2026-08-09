@@ -953,6 +953,10 @@ cli-doctor-context-window-ok = {$provider_ref} : fenêtre de contexte : {$contex
 cli-doctor-context-window-zero = {$provider_ref} : context_window vaut 0 (invalide ; définissez la limite de contexte réelle du modèle)
 cli-doctor-context-window-unset = {$provider_ref} : aucun context_window défini — utilisera la valeur de repli de {$fallback} jetons lorsqu'il sera sélectionné ; probablement bien inférieure à la limite réelle de ce modèle ; définissez context_window sur ce profil
 
+# Doctor probe timeout warning — shown when model probing times out but prior
+# diagnostics (config, workspace, daemon) are preserved and returned.
+cli-doctor-probe-timeout-message = La vérification des modèles a expiré. Certains catalogues de fournisseurs peuvent être inaccessibles. Vous pouvez réexécuter Doctor pour actualiser.
+
 # ── Degraded config sections (doctor diagnose, #8835) ──
 cli-doctor-degraded-security = La section de configuration CRITIQUE POUR LA SÉCURITÉ `{$path}` est invalide et a été réinitialisée à sa valeur par défaut pour permettre au daemon de démarrer ; la posture en cours d'exécution peut être PLUS FAIBLE que prévu. Exécutez `zeroclaw config migrate` pour voir l'erreur d'analyse, puis réparez le fichier.
 cli-doctor-degraded-section = La section de configuration `{$path}` est malformée et a été réinitialisée aux valeurs par défaut ; les valeurs de cette section ne sont PAS en vigueur. Exécutez `zeroclaw config migrate` pour voir l'erreur d'analyse, puis réparez le fichier.

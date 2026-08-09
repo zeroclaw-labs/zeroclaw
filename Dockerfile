@@ -140,9 +140,9 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
       export RUST_TARGET=x86_64-unknown-linux-gnu; \
     fi && \
     if [ -n "$ZEROCLAW_CARGO_FLAGS" ]; then \
-      cargo build --release --locked --target "$RUST_TARGET" -p zeroclawlabs -p zerocode $ZEROCLAW_CARGO_FLAGS; \
+      cargo build --release --locked --target "$RUST_TARGET" -p zeroclaw -p zerocode $ZEROCLAW_CARGO_FLAGS; \
     else \
-      cargo build --release --locked --target "$RUST_TARGET" -p zeroclawlabs -p zerocode; \
+      cargo build --release --locked --target "$RUST_TARGET" -p zeroclaw -p zerocode; \
     fi
 RUN rm -rf src benches crates xtask tools/fill-translations
 
@@ -179,10 +179,9 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
     else \
       export RUST_TARGET=x86_64-unknown-linux-gnu STRIP=strip; \
     fi && \
-    rm -rf target/"$RUST_TARGET"/release/.fingerprint/zeroclawlabs-* \
-           target/"$RUST_TARGET"/release/deps/zeroclawlabs-* \
-           target/"$RUST_TARGET"/release/incremental/zeroclawlabs-* \
-           target/"$RUST_TARGET"/release/.fingerprint/zeroclaw-* \
+    rm -rf target/"$RUST_TARGET"/release/.fingerprint/zeroclaw-* \
+           target/"$RUST_TARGET"/release/deps/zeroclaw-* \
+           target/"$RUST_TARGET"/release/incremental/zeroclaw-* \
            target/"$RUST_TARGET"/release/deps/zeroclaw_* \
            target/"$RUST_TARGET"/release/incremental/zeroclaw_* \
            target/"$RUST_TARGET"/release/.fingerprint/xtask-* \
@@ -196,9 +195,9 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
            target/release/.fingerprint/zerocode-* \
            target/release/build/zerocode-* && \
     if [ -n "$ZEROCLAW_CARGO_FLAGS" ]; then \
-      cargo build --release --locked --target "$RUST_TARGET" -p zeroclawlabs -p zerocode $ZEROCLAW_CARGO_FLAGS; \
+      cargo build --release --locked --target "$RUST_TARGET" -p zeroclaw -p zerocode $ZEROCLAW_CARGO_FLAGS; \
     else \
-      cargo build --release --locked --target "$RUST_TARGET" -p zeroclawlabs -p zerocode; \
+      cargo build --release --locked --target "$RUST_TARGET" -p zeroclaw -p zerocode; \
     fi && \
     cp target/"$RUST_TARGET"/release/zeroclaw /app/zeroclaw && \
     cp target/"$RUST_TARGET"/release/zerocode /app/zerocode && \

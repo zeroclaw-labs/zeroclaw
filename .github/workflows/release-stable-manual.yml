@@ -1201,7 +1201,8 @@ jobs:
     with:
       release_tag: ${{ needs.validate.outputs.tag }}
       dry_run: false
-    secrets: inherit
+    secrets:
+      SCOOP_BUCKET_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}
 
   aur:
     name: Update AUR Package

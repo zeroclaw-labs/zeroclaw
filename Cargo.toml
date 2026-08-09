@@ -34,7 +34,7 @@ directories = "6.0"
 sys-locale = "0.3"
 
 [package]
-name = "zeroclawlabs"
+name = "zeroclaw"
 # Workspace crates are publish = false during microkernel transition.
 publish = false
 default-run = "zeroclaw"
