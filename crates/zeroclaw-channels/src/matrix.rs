@@ -821,7 +821,7 @@ mod client {
             .with_context(|| format!("create matrix store dir {}", store.display()))?;
 
         let client = Client::builder()
-            .homeserver_url(&config.homeserver)
+            .server_name_or_homeserver_url(&config.homeserver)
             .sqlite_store(&store, None)
             // Widen the per-request timeout past the sync long-poll window so
             // an idle `/sync` never trips the SDK's default 30s request
