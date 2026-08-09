@@ -444,6 +444,9 @@ fn graceful_kill(child: &mut tokio::process::Child) {
 /// never masks the primary synthesis error. The already-exited and no-child
 /// branches delete the temp file with a single synchronous `remove_file` (fast
 /// local-unlink); the pending-reap branch removes it inside the reaper thread.
+/// If the OS refuses to create the reaper thread (resource pressure), `Drop`
+/// recovers the still-owned child and reaps inline so the artifact is still
+/// removed rather than leaked.
 struct EdgeTtsTempArtifact {
     path: PathBuf,
     child: Option<tokio::process::Child>,
@@ -485,10 +488,40 @@ impl Drop for EdgeTtsTempArtifact {
                 // thread owns the bounded wait, escalates to a hard kill if the
                 // grace window expires, and only then removes the temp file,
                 // preserving the reap-before-delete ordering.
+                //
+                // The child travels in a shared cell so the closure can be
+                // dropped without losing it: if the OS refuses the new thread
+                // under resource pressure, `spawn` returns `Err` and the
+                // closure (and its `Arc` clone) is dropped. The cell then still
+                // holds the child, so this `Drop` recovers it and reaps inline
+                // as a fallback, rather than leaving the temp file behind with
+                // only `kill_on_drop` to stop the process.
+                let child_cell = std::sync::Arc::new(std::sync::Mutex::new(Some(child)));
+                let reaper_cell = std::sync::Arc::clone(&child_cell);
                 let path = self.path.clone();
-                let _ = std::thread::Builder::new()
+                let spawned = std::thread::Builder::new()
                     .name("edge-tts-reaper".to_string())
-                    .spawn(move || reap_and_remove(child, path, EDGE_TTS_REAP_GRACE));
+                    .spawn(move || {
+                        if let Some(child) = reaper_cell
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .take()
+                        {
+                            reap_and_remove(child, path, EDGE_TTS_REAP_GRACE);
+                        }
+                    });
+                if spawned.is_err() {
+                    // Rare resource-exhaustion path: no thread was created. The
+                    // child is still in the cell; reap and remove on this thread
+                    // so the artifact is cleaned up despite the failed spawn.
+                    if let Some(child) = child_cell
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take()
+                    {
+                        reap_and_remove(child, self.path.clone(), EDGE_TTS_REAP_GRACE);
+                    }
+                }
             }
         }
     }
