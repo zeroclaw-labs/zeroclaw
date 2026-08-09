@@ -75,6 +75,7 @@ impl SessionStore {
 
     fn append_unlocked(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {
         let path = self.session_path(session_key);
+        validate_jsonl_session_file_path(&path)?;
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -130,6 +131,7 @@ impl SessionStore {
     /// Compact a session file by rewriting only valid messages (removes corrupt lines).
     pub fn compact(&self, session_key: &str) -> std::io::Result<()> {
         let _guard = self.mutation_lock.lock();
+        validate_jsonl_session_file_path(&self.session_path(session_key))?;
         let messages = self.load(session_key);
         self.rewrite(session_key, &messages)
     }
@@ -218,9 +220,31 @@ impl SessionStore {
 }
 
 fn is_regular_jsonl_session_file(path: &Path) -> bool {
-    path.extension()
-        .is_some_and(|extension| extension == "jsonl")
-        && std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
+    matches!(validate_jsonl_session_file_path(path), Ok(true))
+}
+
+/// Validate that a JSONL session path is absent or an existing regular file.
+/// Returns whether the regular file already exists.
+fn validate_jsonl_session_file_path(path: &Path) -> std::io::Result<bool> {
+    if path
+        .extension()
+        .is_none_or(|extension| extension != "jsonl")
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "session path must have a .jsonl extension",
+        ));
+    }
+
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(true),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "session path must be a regular file",
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 fn mutation_lock_for(sessions_dir: &Path) -> std::io::Result<Arc<MutationLock>> {
@@ -318,6 +342,35 @@ mod tests {
     #[cfg(windows)]
     fn symlink_file(original: &Path, link: &Path) -> std::io::Result<()> {
         std::os::windows::fs::symlink_file(original, link)
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct SessionEntrySnapshot {
+        entry_kind: &'static str,
+        link_target: Option<PathBuf>,
+        entry_contents: Option<Vec<u8>>,
+        tracked_target_contents: Option<Option<Vec<u8>>>,
+    }
+
+    fn snapshot_session_entry(path: &Path, tracked_target: Option<&Path>) -> SessionEntrySnapshot {
+        let metadata = std::fs::symlink_metadata(path).unwrap();
+        let file_type = metadata.file_type();
+        SessionEntrySnapshot {
+            entry_kind: if file_type.is_symlink() {
+                "symlink"
+            } else if file_type.is_dir() {
+                "directory"
+            } else if file_type.is_file() {
+                "file"
+            } else {
+                "other"
+            },
+            link_target: file_type
+                .is_symlink()
+                .then(|| std::fs::read_link(path).unwrap()),
+            entry_contents: file_type.is_file().then(|| std::fs::read(path).unwrap()),
+            tracked_target_contents: tracked_target.map(|target| std::fs::read(target).ok()),
+        }
     }
 
     #[test]
@@ -428,7 +481,7 @@ mod tests {
         std::fs::create_dir(sessions_dir.join("directory.jsonl")).unwrap();
         std::fs::write(sessions_dir.join("notes.txt"), "not a session").unwrap();
 
-        let mut invalid_keys = vec!["directory"];
+        let mut invalid_entries = vec![("directory", None)];
 
         #[cfg(any(unix, windows))]
         {
@@ -440,7 +493,10 @@ mod tests {
                         &sessions_dir.join("dangling.jsonl"),
                     )
                     .unwrap();
-                    invalid_keys.extend(["linked", "dangling"]);
+                    invalid_entries.extend([
+                        ("linked", Some(store.session_path("valid"))),
+                        ("dangling", Some(sessions_dir.join("missing.jsonl"))),
+                    ]);
                 }
                 #[cfg(windows)]
                 Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
@@ -453,7 +509,7 @@ mod tests {
         assert_eq!(backend.load("valid").len(), 1);
         assert!(store.session_mtime("valid").is_some());
 
-        for key in invalid_keys {
+        for (key, _) in &invalid_entries {
             assert!(!backend.session_exists(key), "{key} must not exist");
             assert!(backend.load(key).is_empty(), "{key} must not load");
             assert!(
@@ -474,6 +530,33 @@ mod tests {
                 "{key} filesystem entry must remain untouched"
             );
         }
+
+        let rejected_message = ChatMessage::user("must not be persisted");
+        let mut mutation_failures = Vec::new();
+        for (key, tracked_target) in &invalid_entries {
+            let path = store.session_path(key);
+            let before = snapshot_session_entry(&path, tracked_target.as_deref());
+            let append_result = backend.append(key, &rejected_message);
+            let compact_result = backend.compact(key);
+            let after = snapshot_session_entry(&path, tracked_target.as_deref());
+
+            if append_result.is_ok() || compact_result.is_ok() || after != before {
+                mutation_failures.push(format!(
+                    "{key}: append={append_result:?}, compact={compact_result:?}, before={before:?}, after={after:?}"
+                ));
+            }
+        }
+
+        backend
+            .append("new-session", &ChatMessage::user("new session works"))
+            .unwrap();
+        assert_eq!(backend.load("new-session").len(), 1);
+
+        assert!(
+            mutation_failures.is_empty(),
+            "append/compact must reject invalid entries without modifying entries or targets:\n{}",
+            mutation_failures.join("\n")
+        );
 
         assert_eq!(backend.clear_messages("valid").unwrap(), 1);
         assert!(backend.session_exists("valid"));
