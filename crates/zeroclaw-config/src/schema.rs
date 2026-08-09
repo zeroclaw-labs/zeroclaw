@@ -3762,6 +3762,17 @@ pub struct AliasedAgentConfig {
     #[serde(default)]
     #[nested]
     pub a2a: crate::multi_agent::AgentA2aConfig,
+
+    /// Per-agent environment injection and HOME confinement
+    /// (`[agents.<alias>.env]`). Explicit `KEY=VALUE` env vars and an
+    /// optional workspace-confined `HOME` override for subprocesses this
+    /// agent spawns (the `shell` tool today). Default is a no-op: no
+    /// extra vars, `HOME` inherited from the daemon. See
+    /// `crate::multi_agent::AgentEnvConfig`.
+    #[tab(Workspace)]
+    #[serde(default)]
+    #[nested]
+    pub env: crate::multi_agent::AgentEnvConfig,
 }
 
 impl Default for AliasedAgentConfig {
@@ -3789,6 +3800,7 @@ impl Default for AliasedAgentConfig {
             memory: crate::multi_agent::AgentMemoryConfig::default(),
             identity: IdentityConfig::default(),
             a2a: crate::multi_agent::AgentA2aConfig::default(),
+            env: crate::multi_agent::AgentEnvConfig::default(),
         }
     }
 }

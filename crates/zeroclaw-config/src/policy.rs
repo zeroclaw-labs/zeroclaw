@@ -1,6 +1,6 @@
 use anyhow::Context as _;
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -210,6 +210,21 @@ pub struct SecurityPolicy {
     /// Extra arguments forwarded to firejail when `sandbox_backend`
     /// resolves to `"firejail"`.
     pub firejail_args: Vec<String>,
+    /// Explicit `KEY=VALUE` env vars injected into subprocesses this
+    /// agent spawns, sourced from `agents.<alias>.env.vars`. Distinct
+    /// from `shell_env_passthrough` (a NAME allowlist of vars whose
+    /// VALUES are copied from the daemon's own ambient env) — these are
+    /// literal values from operator config, never model-controlled.
+    /// Empty (never populated) when constructed via `from_profiles`
+    /// alone; only `for_agent` has the agent context to fill this in.
+    pub env_vars: BTreeMap<String, String>,
+    /// Resolved, workspace-confined `HOME` override for this agent's
+    /// subprocesses. `None` means inherit the daemon's real `$HOME`
+    /// (today's default behavior). Populated by `SecurityPolicy::for_agent`
+    /// from `agents.<alias>.env.home_mode`/`home_path`; already validated
+    /// to sit inside `workspace_dir` unless
+    /// `workspace.unrestricted_filesystem` is set.
+    pub home_override: Option<PathBuf>,
     pub tracker: PerSenderTracker,
 }
 
@@ -397,6 +412,18 @@ pub enum EscalationViolation {
     /// Child raises `shell_env_passthrough` to leak env vars the
     /// parent declined to forward.
     ShellEnvPassthroughExpanded { variable: String },
+    /// Child `env_vars` sets a key not present (or present with a
+    /// different value) on the parent — either a new leak surface or a
+    /// tamper on a variable the parent already pinned.
+    EnvVarNotInParent { variable: String },
+    /// Child `home_override` resolves outside the parent's own HOME
+    /// (or workspace, if the parent has no HOME override) boundary.
+    HomeOverrideNotInParent { path: PathBuf },
+    /// Parent confined HOME but the child leaves `home_override` unset,
+    /// which falls back to the daemon's real `$HOME`. Runs the same
+    /// direction as `ForbiddenPathDroppedByChild`: dropping a parent's
+    /// restriction is an escalation, not a narrowing.
+    HomeOverrideDroppedByChild { parent_path: PathBuf },
     /// Child override raises `max_actions_per_hour` above the
     /// parent's ceiling.
     MaxActionsExceeded { child: u32, parent: u32 },
@@ -450,6 +477,18 @@ impl std::fmt::Display for EscalationViolation {
             Self::ShellEnvPassthroughExpanded { variable } => write!(
                 f,
                 "subagent shell_env_passthrough entry {variable:?} is not present on the parent's list"
+            ),
+            Self::EnvVarNotInParent { variable } => write!(
+                f,
+                "subagent env_vars entry {variable:?} is not present with the same value on the parent's env_vars"
+            ),
+            Self::HomeOverrideNotInParent { path } => write!(
+                f,
+                "subagent home_override {path:?} is not contained within the parent's HOME/workspace boundary"
+            ),
+            Self::HomeOverrideDroppedByChild { parent_path } => write!(
+                f,
+                "subagent leaves home_override unset (inheriting the daemon's real $HOME) while the parent confines HOME to {parent_path:?}"
             ),
             Self::MaxActionsExceeded { child, parent } => write!(
                 f,
@@ -505,6 +544,8 @@ impl Default for SecurityPolicy {
             sandbox_enabled: None,
             sandbox_backend: None,
             firejail_args: vec![],
+            env_vars: BTreeMap::new(),
+            home_override: None,
             tracker: PerSenderTracker::new(),
         }
     }
@@ -2323,6 +2364,53 @@ impl SecurityPolicy {
             }
         }
 
+        // env_vars is a leak/tamper surface like shell_env_passthrough, but
+        // keyed AND valued: a delegated child must not inject a var (by
+        // name) the parent didn't already grant, nor override the
+        // parent's value for a shared name.
+        for (key, value) in &self.env_vars {
+            match parent.env_vars.get(key) {
+                Some(parent_value) if parent_value == value => {}
+                _ => {
+                    return Err(EscalationViolation::EnvVarNotInParent {
+                        variable: key.clone(),
+                    });
+                }
+            }
+        }
+
+        // home_override is checked in BOTH directions, because `None` is
+        // not a neutral value here — it means "inherit the daemon's real
+        // $HOME", the least confined option, not "no opinion".
+        //
+        //   - Child sets a HOME: it must stay within whatever the parent
+        //     already permits (the parent's own resolved HOME, or its
+        //     workspace when the parent has no override). A child HOME
+        //     outside that boundary would let a delegate write config and
+        //     state files (.bashrc, .gitconfig, .npmrc) the parent never
+        //     sanctioned.
+        //   - Child leaves HOME unset while the parent confined it: that
+        //     escapes the confinement outright, landing back on the real
+        //     $HOME. Same shape as `ForbiddenPathDroppedByChild` and
+        //     `WorkspaceOnlyDisabledByChild` — a child may narrow the
+        //     parent's restrictions, never drop them.
+        match (&self.home_override, &parent.home_override) {
+            (Some(child_home), parent_home) => {
+                let parent_boundary = parent_home.as_ref().unwrap_or(&parent.workspace_dir);
+                if !path_contains(parent_boundary, child_home) {
+                    return Err(EscalationViolation::HomeOverrideNotInParent {
+                        path: child_home.clone(),
+                    });
+                }
+            }
+            (None, Some(parent_home)) => {
+                return Err(EscalationViolation::HomeOverrideDroppedByChild {
+                    parent_path: parent_home.clone(),
+                });
+            }
+            (None, None) => {}
+        }
+
         if self.max_actions_per_hour > parent.max_actions_per_hour {
             return Err(EscalationViolation::MaxActionsExceeded {
                 child: self.max_actions_per_hour,
@@ -2428,6 +2516,12 @@ impl SecurityPolicy {
             sandbox_enabled: risk_profile.sandbox_enabled,
             sandbox_backend: risk_profile.sandbox_backend.clone(),
             firejail_args: risk_profile.firejail_args.clone(),
+            // `agents.<alias>.env` has no risk/runtime-profile source —
+            // it's agent-private state. `from_profiles` has no agent
+            // context, so these stay at their no-op defaults; `for_agent`
+            // overwrites them once it has `agent_cfg` in hand.
+            env_vars: BTreeMap::new(),
+            home_override: None,
             tracker: PerSenderTracker::new(),
         }
     }
@@ -2497,9 +2591,95 @@ impl SecurityPolicy {
             if agent_cfg.workspace.unrestricted_filesystem {
                 policy.workspace_only = false;
             }
+
+            policy.env_vars = agent_cfg
+                .env
+                .vars
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+
+            policy.home_override = match agent_cfg.env.home_mode {
+                crate::multi_agent::HomeMode::Inherit => None,
+                crate::multi_agent::HomeMode::Workspace => {
+                    // Parity with the `memory/` subdirectory convention:
+                    // keep HOME's dotfiles/caches out of the workspace root.
+                    let home = agent_workspace.join("home");
+                    std::fs::create_dir_all(&home).with_context(|| {
+                        format!(
+                            "SecurityPolicy::for_agent: failed to create agent HOME dir {}",
+                            home.display()
+                        )
+                    })?;
+                    Some(home)
+                }
+                crate::multi_agent::HomeMode::Custom => {
+                    let Some(raw) = agent_cfg.env.home_path.as_ref() else {
+                        anyhow::bail!(
+                            "agents.{agent_alias}.env.home_mode = \"custom\" requires env.home_path"
+                        );
+                    };
+                    let expanded = expand_user_path(&raw.to_string_lossy());
+                    let candidate = if expanded.is_absolute() {
+                        expanded
+                    } else {
+                        agent_workspace.join(expanded)
+                    };
+                    if !agent_cfg.workspace.unrestricted_filesystem
+                        && workspace_prefixed_relative_suffix(&candidate, &agent_workspace)
+                            .is_none()
+                    {
+                        anyhow::bail!(
+                            "agents.{agent_alias}.env.home_path ({}) resolves outside the agent's \
+                             workspace ({}); set workspace.unrestricted_filesystem = true to allow \
+                             this, or use a path inside the workspace",
+                            candidate.display(),
+                            agent_workspace.display()
+                        );
+                    }
+                    std::fs::create_dir_all(&candidate).with_context(|| {
+                        format!(
+                            "SecurityPolicy::for_agent: failed to create agent HOME dir {}",
+                            candidate.display()
+                        )
+                    })?;
+                    Some(candidate)
+                }
+            };
         }
 
         Ok(policy)
+    }
+
+    /// Move this policy onto a new workspace root, carrying workspace-relative
+    /// derived paths with it.
+    ///
+    /// `workspace_dir` is not a plain field: other fields are resolved against
+    /// it at construction time, so assigning it directly leaves those derived
+    /// paths pointing at the old root. Bounded delegation
+    /// (`DelegateTool::policy_for_target`) retargets a delegate onto the
+    /// caller's workspace and must go through here.
+    ///
+    /// Today that means `home_override`. A HOME that resolved inside the old
+    /// workspace is re-rooted onto the new one, preserving its suffix, so the
+    /// confinement moves with the workspace instead of going stale. A HOME
+    /// that was never workspace-relative (only reachable via
+    /// `workspace.unrestricted_filesystem`) is left untouched — re-rooting an
+    /// absolute path the operator chose deliberately would be wrong.
+    ///
+    /// Note `allowed_roots` is derived the same way (`from_profiles` joins
+    /// relative profile entries onto `workspace_dir`) but is deliberately NOT
+    /// re-rooted here: that would widen what a bounded delegate may reach in
+    /// the caller's workspace, a trust-boundary change that needs its own
+    /// justification rather than riding along with the HOME fix.
+    pub fn rebind_workspace(&mut self, new_workspace: &Path) {
+        // Resolve against the OLD root before overwriting it.
+        if let Some(home) = &self.home_override
+            && let Some(suffix) = workspace_prefixed_relative_suffix(home, &self.workspace_dir)
+        {
+            self.home_override = Some(new_workspace.join(suffix));
+        }
+        self.workspace_dir = new_workspace.to_path_buf();
     }
 
     pub fn prompt_summary(&self) -> String {
@@ -4641,6 +4821,295 @@ mod tests {
         );
     }
 
+    // ── agents.<alias>.env: env_vars + home_override resolution ─────
+
+    fn cfg_for_env_tests(root: &Path) -> crate::schema::Config {
+        let mut cfg = crate::schema::Config {
+            data_dir: root.join("data"),
+            config_path: root.join("config.toml"),
+            ..crate::schema::Config::default()
+        };
+        cfg.risk_profiles.insert(
+            "default".into(),
+            crate::schema::RiskProfileConfig::default(),
+        );
+        cfg
+    }
+
+    #[test]
+    fn for_agent_home_mode_inherit_leaves_home_override_none() {
+        use crate::schema::AliasedAgentConfig;
+
+        let root = std::env::temp_dir().join(format!(
+            "zeroclaw-env-inherit-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let mut cfg = cfg_for_env_tests(&root);
+        cfg.agents.insert(
+            "agent_a".into(),
+            AliasedAgentConfig {
+                risk_profile: "default".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let policy = SecurityPolicy::for_agent(&cfg, "agent_a").unwrap();
+        assert!(policy.home_override.is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn for_agent_home_mode_workspace_resolves_under_agent_workspace_and_creates_dir() {
+        use crate::multi_agent::HomeMode;
+        use crate::schema::AliasedAgentConfig;
+
+        let root = std::env::temp_dir().join(format!(
+            "zeroclaw-env-workspace-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let mut cfg = cfg_for_env_tests(&root);
+        let mut agent = AliasedAgentConfig {
+            risk_profile: "default".into(),
+            ..AliasedAgentConfig::default()
+        };
+        agent.env.home_mode = HomeMode::Workspace;
+        cfg.agents.insert("agent_a".into(), agent);
+
+        let expected = cfg.agent_workspace_dir("agent_a").join("home");
+        let policy = SecurityPolicy::for_agent(&cfg, "agent_a").unwrap();
+
+        assert_eq!(policy.home_override, Some(expected.clone()));
+        assert!(expected.is_dir(), "HomeMode::Workspace must create the dir");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn for_agent_home_mode_custom_relative_path_resolves_inside_workspace() {
+        use crate::multi_agent::HomeMode;
+        use crate::schema::AliasedAgentConfig;
+
+        let root = std::env::temp_dir().join(format!(
+            "zeroclaw-env-custom-rel-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let mut cfg = cfg_for_env_tests(&root);
+        let mut agent = AliasedAgentConfig {
+            risk_profile: "default".into(),
+            ..AliasedAgentConfig::default()
+        };
+        agent.env.home_mode = HomeMode::Custom;
+        agent.env.home_path = Some(PathBuf::from("myhome"));
+        cfg.agents.insert("agent_a".into(), agent);
+
+        let expected = cfg.agent_workspace_dir("agent_a").join("myhome");
+        let policy = SecurityPolicy::for_agent(&cfg, "agent_a").unwrap();
+
+        assert_eq!(policy.home_override, Some(expected.clone()));
+        assert!(expected.is_dir());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn for_agent_home_mode_custom_absolute_path_outside_workspace_errors_without_unrestricted() {
+        use crate::multi_agent::HomeMode;
+        use crate::schema::AliasedAgentConfig;
+
+        let root = std::env::temp_dir().join(format!(
+            "zeroclaw-env-custom-abs-reject-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let outside = std::env::temp_dir().join(format!(
+            "zeroclaw-env-outside-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let mut cfg = cfg_for_env_tests(&root);
+        let mut agent = AliasedAgentConfig {
+            risk_profile: "default".into(),
+            ..AliasedAgentConfig::default()
+        };
+        agent.env.home_mode = HomeMode::Custom;
+        agent.env.home_path = Some(outside.clone());
+        cfg.agents.insert("agent_a".into(), agent);
+
+        let err = SecurityPolicy::for_agent(&cfg, "agent_a")
+            .expect_err("a HOME path outside the workspace must be rejected by default");
+        assert!(err.to_string().contains("home_path"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn for_agent_home_mode_custom_absolute_path_outside_workspace_allowed_with_unrestricted() {
+        use crate::multi_agent::HomeMode;
+        use crate::schema::AliasedAgentConfig;
+
+        let root = std::env::temp_dir().join(format!(
+            "zeroclaw-env-custom-abs-allow-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let outside = std::env::temp_dir().join(format!(
+            "zeroclaw-env-outside-allow-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let mut cfg = cfg_for_env_tests(&root);
+        let mut agent = AliasedAgentConfig {
+            risk_profile: "default".into(),
+            ..AliasedAgentConfig::default()
+        };
+        agent.env.home_mode = HomeMode::Custom;
+        agent.env.home_path = Some(outside.clone());
+        agent.workspace.unrestricted_filesystem = true;
+        cfg.agents.insert("agent_a".into(), agent);
+
+        let policy = SecurityPolicy::for_agent(&cfg, "agent_a").unwrap();
+        assert_eq!(policy.home_override, Some(outside.clone()));
+        assert!(outside.is_dir());
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn for_agent_home_mode_custom_without_home_path_errors() {
+        use crate::multi_agent::HomeMode;
+        use crate::schema::AliasedAgentConfig;
+
+        let root = std::env::temp_dir().join(format!(
+            "zeroclaw-env-custom-missing-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let mut cfg = cfg_for_env_tests(&root);
+        let mut agent = AliasedAgentConfig {
+            risk_profile: "default".into(),
+            ..AliasedAgentConfig::default()
+        };
+        agent.env.home_mode = HomeMode::Custom;
+        cfg.agents.insert("agent_a".into(), agent);
+
+        let err = SecurityPolicy::for_agent(&cfg, "agent_a")
+            .expect_err("HomeMode::Custom without home_path must error");
+        assert!(err.to_string().contains("home_path"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn for_agent_env_vars_propagate_from_agent_config() {
+        use crate::schema::AliasedAgentConfig;
+
+        let root = std::env::temp_dir().join(format!(
+            "zeroclaw-env-vars-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let mut cfg = cfg_for_env_tests(&root);
+        let mut agent = AliasedAgentConfig {
+            risk_profile: "default".into(),
+            ..AliasedAgentConfig::default()
+        };
+        agent.env.vars.insert("FOO".to_string(), "bar".to_string());
+        cfg.agents.insert("agent_a".into(), agent);
+
+        let policy = SecurityPolicy::for_agent(&cfg, "agent_a").unwrap();
+        assert_eq!(policy.env_vars.get("FOO"), Some(&"bar".to_string()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn from_profiles_leaves_env_vars_and_home_override_at_defaults() {
+        // agents.<alias>.env has no risk/runtime-profile source — only
+        // `for_agent` has the agent context to populate it.
+        let risk = crate::schema::RiskProfileConfig::default();
+        let policy = SecurityPolicy::from_profiles(&risk, None, Path::new("/ws"));
+        assert!(policy.env_vars.is_empty());
+        assert!(policy.home_override.is_none());
+    }
+
+    // ── rebind_workspace: bounded delegation retargeting ────────────
+
+    #[test]
+    fn rebind_workspace_re_roots_a_workspace_confined_home() {
+        // Bounded delegation onto the caller's workspace: the confinement
+        // moves with the workspace instead of pointing at the old root.
+        let mut policy = SecurityPolicy {
+            workspace_dir: PathBuf::from("/agents/worker/workspace"),
+            home_override: Some(PathBuf::from("/agents/worker/workspace/home")),
+            ..SecurityPolicy::default()
+        };
+        policy.rebind_workspace(Path::new("/agents/caller/workspace"));
+
+        assert_eq!(
+            policy.workspace_dir,
+            PathBuf::from("/agents/caller/workspace")
+        );
+        assert_eq!(
+            policy.home_override,
+            Some(PathBuf::from("/agents/caller/workspace/home")),
+            "a workspace-relative HOME must follow the workspace it is confined to"
+        );
+    }
+
+    #[test]
+    fn rebind_workspace_preserves_a_nested_home_suffix() {
+        let mut policy = SecurityPolicy {
+            workspace_dir: PathBuf::from("/agents/worker/workspace"),
+            home_override: Some(PathBuf::from("/agents/worker/workspace/nested/home")),
+            ..SecurityPolicy::default()
+        };
+        policy.rebind_workspace(Path::new("/agents/caller/workspace"));
+        assert_eq!(
+            policy.home_override,
+            Some(PathBuf::from("/agents/caller/workspace/nested/home"))
+        );
+    }
+
+    #[test]
+    fn rebind_workspace_leaves_a_non_workspace_relative_home_untouched() {
+        // Only reachable with workspace.unrestricted_filesystem: the
+        // operator picked an absolute path that was never derived from the
+        // workspace, so re-rooting it would override a deliberate choice.
+        let mut policy = SecurityPolicy {
+            workspace_dir: PathBuf::from("/agents/worker/workspace"),
+            home_override: Some(PathBuf::from("/srv/shared-home")),
+            ..SecurityPolicy::default()
+        };
+        policy.rebind_workspace(Path::new("/agents/caller/workspace"));
+
+        assert_eq!(
+            policy.workspace_dir,
+            PathBuf::from("/agents/caller/workspace")
+        );
+        assert_eq!(
+            policy.home_override,
+            Some(PathBuf::from("/srv/shared-home")),
+            "an absolute, non-workspace-relative HOME must not be re-rooted"
+        );
+    }
+
+    #[test]
+    fn rebind_workspace_without_a_home_override_only_moves_the_workspace() {
+        // Regression guard: rebinding must not invent a confinement where
+        // the agent had none (that would be a silent behavior change).
+        let mut policy = SecurityPolicy {
+            workspace_dir: PathBuf::from("/agents/worker/workspace"),
+            home_override: None,
+            ..SecurityPolicy::default()
+        };
+        policy.rebind_workspace(Path::new("/agents/caller/workspace"));
+
+        assert_eq!(
+            policy.workspace_dir,
+            PathBuf::from("/agents/caller/workspace")
+        );
+        assert!(policy.home_override.is_none());
+    }
+
     // ── Edge cases: from_config preserves tracker ────────────
 
     #[test]
@@ -5534,6 +6003,126 @@ mod tests {
             err,
             EscalationViolation::ShellEnvPassthroughExpanded { ref variable }
             if variable == "AWS_SECRET_ACCESS_KEY"
+        ));
+    }
+
+    #[test]
+    fn ensure_no_escalation_accepts_env_var_matching_parent_value() {
+        let parent = SecurityPolicy {
+            env_vars: BTreeMap::from([("NODE_ENV".to_string(), "production".to_string())]),
+            ..parent_policy_for_escalation_tests()
+        };
+        let child = SecurityPolicy {
+            env_vars: BTreeMap::from([("NODE_ENV".to_string(), "production".to_string())]),
+            ..parent.clone()
+        };
+        assert!(child.ensure_no_escalation_beyond(&parent).is_ok());
+    }
+
+    #[test]
+    fn ensure_no_escalation_rejects_new_env_var_not_in_parent() {
+        let parent = parent_policy_for_escalation_tests();
+        let child = SecurityPolicy {
+            env_vars: BTreeMap::from([("GITHUB_TOKEN".to_string(), "leaked".to_string())]),
+            ..parent.clone()
+        };
+        let err = child
+            .ensure_no_escalation_beyond(&parent)
+            .expect_err("child adding an env_vars entry the parent never set must be rejected");
+        assert!(matches!(
+            err,
+            EscalationViolation::EnvVarNotInParent { ref variable }
+            if variable == "GITHUB_TOKEN"
+        ));
+    }
+
+    #[test]
+    fn ensure_no_escalation_rejects_env_var_value_override() {
+        let parent = SecurityPolicy {
+            env_vars: BTreeMap::from([("NODE_ENV".to_string(), "production".to_string())]),
+            ..parent_policy_for_escalation_tests()
+        };
+        let child = SecurityPolicy {
+            env_vars: BTreeMap::from([("NODE_ENV".to_string(), "development".to_string())]),
+            ..parent.clone()
+        };
+        let err = child
+            .ensure_no_escalation_beyond(&parent)
+            .expect_err("child overriding a parent-set env var value must be rejected");
+        assert!(matches!(
+            err,
+            EscalationViolation::EnvVarNotInParent { ref variable }
+            if variable == "NODE_ENV"
+        ));
+    }
+
+    #[test]
+    fn ensure_no_escalation_accepts_home_override_none_when_parent_none() {
+        let parent = parent_policy_for_escalation_tests();
+        let child = parent.clone();
+        assert!(child.ensure_no_escalation_beyond(&parent).is_ok());
+    }
+
+    #[test]
+    fn ensure_no_escalation_accepts_home_override_inside_parent_home() {
+        let parent = SecurityPolicy {
+            home_override: Some(PathBuf::from("/workspace/home")),
+            ..parent_policy_for_escalation_tests()
+        };
+        let child = SecurityPolicy {
+            home_override: Some(PathBuf::from("/workspace/home/nested")),
+            ..parent.clone()
+        };
+        assert!(child.ensure_no_escalation_beyond(&parent).is_ok());
+    }
+
+    #[test]
+    fn ensure_no_escalation_accepts_home_override_inside_parent_workspace_when_parent_home_none() {
+        let parent = parent_policy_for_escalation_tests();
+        let child = SecurityPolicy {
+            home_override: Some(PathBuf::from("/workspace/home")),
+            ..parent.clone()
+        };
+        assert!(child.ensure_no_escalation_beyond(&parent).is_ok());
+    }
+
+    #[test]
+    fn ensure_no_escalation_rejects_home_override_outside_parent_boundary() {
+        let parent = parent_policy_for_escalation_tests();
+        let child = SecurityPolicy {
+            home_override: Some(PathBuf::from("/etc/somewhere-else")),
+            ..parent.clone()
+        };
+        let err = child
+            .ensure_no_escalation_beyond(&parent)
+            .expect_err("child home_override outside the parent's boundary must be rejected");
+        assert!(matches!(
+            err,
+            EscalationViolation::HomeOverrideNotInParent { ref path }
+            if path == std::path::Path::new("/etc/somewhere-else")
+        ));
+    }
+
+    #[test]
+    fn ensure_no_escalation_rejects_child_dropping_parent_home_override() {
+        // `None` is the LEAST confined value (it inherits the daemon's
+        // real $HOME), so a child may narrow the parent's confinement but
+        // never drop it — same direction as forbidden_paths.
+        let parent = SecurityPolicy {
+            home_override: Some(PathBuf::from("/workspace/home")),
+            ..parent_policy_for_escalation_tests()
+        };
+        let child = SecurityPolicy {
+            home_override: None,
+            ..parent.clone()
+        };
+        let err = child
+            .ensure_no_escalation_beyond(&parent)
+            .expect_err("child dropping the parent's HOME confinement must be rejected");
+        assert!(matches!(
+            err,
+            EscalationViolation::HomeOverrideDroppedByChild { ref parent_path }
+            if parent_path == std::path::Path::new("/workspace/home")
         ));
     }
 

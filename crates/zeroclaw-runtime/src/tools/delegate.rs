@@ -497,7 +497,12 @@ impl DelegateTool {
             target_policy.tracker = self.security.tracker.clone();
 
             if self.security.risk_profile_name == target_policy.risk_profile_name {
-                target_policy.workspace_dir = self.security.workspace_dir.clone();
+                // Not a plain field assignment: a workspace-confined HOME
+                // (agents.<alias>.env.home_mode) is resolved against the
+                // target's own workspace, so it has to be re-rooted onto the
+                // caller's alongside it or the bounded run writes its
+                // dotfiles outside the workspace it is actually using.
+                target_policy.rebind_workspace(&self.security.workspace_dir);
             }
         }
 
@@ -6917,6 +6922,56 @@ mod tests {
         assert!(
             chain.contains("[risk_profiles.narrow].delegation_policy mode = \"allow\""),
             "expected exact remediation path in forbidden-policy diagnostic, got: {chain}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_delegate_re_roots_workspace_confined_home_onto_caller_workspace() {
+        // Bounded delegation retargets the delegate onto the caller's
+        // workspace. A HOME confined to the target's own workspace has to
+        // move with it, or the bounded run writes its dotfiles/caches into a
+        // workspace it is not otherwise using.
+        use zeroclaw_config::multi_agent::HomeMode;
+
+        // Equal max_actions puts both agents on the `narrow` profile, which
+        // is what gates the workspace rebind.
+        let mut config = (*config_with_two_agents("caller", 5, "target", 5)).clone();
+        config
+            .agents
+            .get_mut("caller")
+            .unwrap()
+            .delegates
+            .push(DelegateTargetConfig::bounded("target"));
+        config.agents.get_mut("target").unwrap().env.home_mode = HomeMode::Workspace;
+        let config = Arc::new(config);
+
+        let caller_workspace = config.agent_workspace_dir("caller");
+        let target_workspace = config.agent_workspace_dir("target");
+
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let mut delegate_agents = HashMap::new();
+        for (name, agent) in &config.agents {
+            delegate_agents.insert(name.clone(), agent.clone());
+        }
+        let tool = DelegateTool::new(delegate_agents, None, caller_policy)
+            .with_root_config(config.clone())
+            .with_caller_alias("caller");
+
+        let resolved = tool
+            .policy_for_target("target")
+            .expect("bounded same-profile delegate resolves");
+
+        assert_eq!(resolved.workspace_dir, caller_workspace);
+        assert_eq!(
+            resolved.home_override,
+            Some(caller_workspace.join("home")),
+            "bounded delegation must carry the HOME confinement onto the caller's workspace"
+        );
+        assert_ne!(
+            resolved.home_override,
+            Some(target_workspace.join("home")),
+            "HOME must not stay pinned to the target's own workspace after the rebind"
         );
     }
 
