@@ -121,6 +121,7 @@ pub mod method {
     pub const SOPS_GET: &str = "sops/get";
     pub const SOPS_GRAPH: &str = "sops/graph";
     pub const SOPS_RUN: &str = "sops/run";
+    pub const SOPS_RUNS: &str = "sops/runs";
     pub const SOPS_RUN_OVERLAY: &str = "sops/run-overlay";
     pub const SOPS_SAVE: &str = "sops/save";
     pub const SOPS_CREATE: &str = "sops/create";
@@ -1384,6 +1385,23 @@ impl RpcClient {
             .ok_or_else(|| anyhow::Error::msg("sops/run: response missing run_id"))
     }
 
+    /// List run summaries, optionally filtered to one SOP by name. The
+    /// daemon returns `{ "runs": [SopRunSummary...] }`; rows that fail to
+    /// deserialize are impossible by construction (every view field
+    /// defaults), so a newer daemon cannot break this surface.
+    // Staged for the SOP pane status-icon surface; no pane consumer yet.
+    #[allow(dead_code)]
+    pub async fn sops_runs(&self, sop: Option<&str>) -> Result<Vec<SopRunSummaryView>> {
+        let value: Value = self
+            .call(method::SOPS_RUNS, serde_json::json!({ "sop": sop }))
+            .await?;
+        let runs = value
+            .get("runs")
+            .cloned()
+            .ok_or_else(|| anyhow::Error::msg("sops/runs: response missing runs"))?;
+        serde_json::from_value(runs).map_err(Into::into)
+    }
+
     pub async fn sops_save(&self, sop: Value) -> Result<Value> {
         self.call(method::SOPS_SAVE, serde_json::json!({ "sop": sop }))
             .await
@@ -1562,7 +1580,12 @@ impl RpcClient {
     }
 
     pub async fn doctor_run(&self) -> Result<DoctorRunResult> {
-        self.call(method::DOCTOR_RUN, serde_json::json!({})).await
+        self.call_with_timeout(
+            method::DOCTOR_RUN,
+            serde_json::json!({}),
+            std::time::Duration::from_secs(30),
+        )
+        .await
     }
 
     pub async fn cost_query(&self, agent: Option<&str>) -> Result<CostSummaryResult> {
@@ -2595,6 +2618,64 @@ pub struct TriggerSourceRegistryView {
     pub operators: Vec<ConditionOpSpecView>,
 }
 
+/// Run status as serialized by the runtime's `SopRunStatus`. Unknown
+/// variants from a newer daemon fold into [`SopRunStatusView::Unknown`]
+/// so an older zerocode keeps rendering rather than dropping the run.
+// Staged for the SOP pane status-icon surface; no pane consumer yet.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SopRunStatusView {
+    #[default]
+    Pending,
+    Running,
+    WaitingApproval,
+    PausedCheckpoint,
+    Completed,
+    Failed,
+    Cancelled,
+    #[serde(other)]
+    Unknown,
+}
+
+impl SopRunStatusView {
+    /// True while the run is parked on an operator decision (approval gate
+    /// or deterministic checkpoint).
+    // Staged for the status-icon surface; consumed by the icon aggregation rule.
+    #[allow(dead_code)]
+    pub fn needs_input(self) -> bool {
+        matches!(self, Self::WaitingApproval | Self::PausedCheckpoint)
+    }
+
+    /// True once the run has reached a terminal state.
+    // Staged for the status-icon surface; consumed by the icon aggregation rule.
+    #[allow(dead_code)]
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+    }
+}
+
+/// One run row from `sops/runs`; mirrors the runtime `SopRunSummary`.
+/// Every field defaults so a field added daemon-side never breaks an
+/// older zerocode.
+// Staged for the SOP pane status-icon surface; no pane consumer yet.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct SopRunSummaryView {
+    pub run_id: String,
+    pub sop_name: String,
+    pub status: SopRunStatusView,
+    pub current_step: u32,
+    pub total_steps: u32,
+    pub started_at: String,
+    pub completed_at: Option<String>,
+    pub trigger_source: String,
+    /// True while the run is live in the engine's active set rather than
+    /// a retained terminal record.
+    pub active: bool,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SwitchRule {
     pub name: String,
@@ -3484,6 +3565,97 @@ mod sop_method_tests {
             .unwrap()
             .unwrap();
         assert_eq!(view.nodes.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn sops_runs_sends_filter_and_parses_summaries() {
+        let (rpc, mut write_rx) = make_rpc();
+        let client = RpcClient::with_rpc(rpc.clone());
+
+        let task = tokio::spawn(async move { client.sops_runs(Some("deploy")).await });
+
+        let line = tokio::time::timeout(std::time::Duration::from_secs(2), write_rx.recv())
+            .await
+            .expect("client.sops_runs must send a wire request")
+            .unwrap();
+        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(req["method"], "sops/runs");
+        assert_eq!(req["params"]["sop"], "deploy");
+
+        let id = req["id"].as_str().unwrap().to_string();
+        rpc.dispatch_response(
+            &id,
+            Some(json!({
+                "runs": [
+                    {
+                        "run_id": "run-1",
+                        "sop_name": "deploy",
+                        "status": "waiting_approval",
+                        "current_step": 2,
+                        "total_steps": 5,
+                        "started_at": "2026-08-02T00:00:00Z",
+                        "completed_at": null,
+                        "trigger_source": "manual",
+                        "active": true
+                    },
+                    {
+                        "run_id": "run-0",
+                        "sop_name": "deploy",
+                        "status": "some_future_status",
+                        "current_step": 5,
+                        "total_steps": 5,
+                        "started_at": "2026-08-01T00:00:00Z",
+                        "completed_at": "2026-08-01T00:05:00Z",
+                        "trigger_source": "cron",
+                        "active": false,
+                        "some_future_field": {"nested": true}
+                    }
+                ]
+            })),
+            None,
+        );
+
+        let runs = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("client.sops_runs must resolve after the response is dispatched")
+            .unwrap()
+            .unwrap();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].status, SopRunStatusView::WaitingApproval);
+        assert!(runs[0].status.needs_input());
+        assert!(runs[0].active);
+        assert_eq!(
+            runs[1].status,
+            SopRunStatusView::Unknown,
+            "a status from a newer daemon must fold to Unknown, not fail the whole list"
+        );
+        assert!(!runs[1].status.is_terminal());
+    }
+
+    #[tokio::test]
+    async fn sops_runs_unfiltered_sends_null_and_requires_runs_key() {
+        let (rpc, mut write_rx) = make_rpc();
+        let client = RpcClient::with_rpc(rpc.clone());
+
+        let task = tokio::spawn(async move { client.sops_runs(None).await });
+
+        let line = tokio::time::timeout(std::time::Duration::from_secs(2), write_rx.recv())
+            .await
+            .expect("client.sops_runs must send a wire request")
+            .unwrap();
+        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(req["method"], "sops/runs");
+        assert_eq!(req["params"]["sop"], serde_json::Value::Null);
+
+        let id = req["id"].as_str().unwrap().to_string();
+        rpc.dispatch_response(&id, Some(json!({"not_runs": []})), None);
+
+        let err = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("client.sops_runs must resolve after the response is dispatched")
+            .unwrap()
+            .expect_err("a response without `runs` must error, not silently return empty");
+        assert!(err.to_string().contains("missing runs"));
     }
 
     #[tokio::test]
