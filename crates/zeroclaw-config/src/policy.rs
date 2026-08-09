@@ -539,6 +539,78 @@ fn expand_user_path(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+/// Resolve `path` to its real target, following symlinks component by component.
+///
+/// Unlike [`Path::canonicalize`] this does NOT require the target to exist, so a
+/// path whose leaf is about to be created (`touch link/new.txt`) still resolves,
+/// while a symlinked component is followed to its target even when that target
+/// does not exist yet (a *dangling* symlink `link -> /outside/new` — the write
+/// would still land outside, so it must be resolved and blocked, exactly as
+/// `file_write` blocks writing through a symlink leaf). Lexical `.`/`..` are
+/// applied without touching the filesystem. Symlink chains are bounded to guard
+/// against cycles: exhausting the hop budget returns `None` ("could not
+/// resolve"), and callers fail closed by BLOCKING the path - a crafted cycle
+/// never falls back to the literal input. An unreadable link is kept as a
+/// literal component while resolution continues on its ancestors.
+fn resolve_symlinked_path(path: &Path) -> Option<PathBuf> {
+    let mut suffix: Vec<std::ffi::OsString> = Vec::new();
+    let mut current = path.to_path_buf();
+    // Bounds the number of `..`-style retries plus symlink hops so a symlink
+    // cycle cannot spin forever. `None` on exhaustion means "could not resolve";
+    // the caller FAILS CLOSED (blocks), so a crafted deep/cyclic symlink chain
+    // cannot exhaust the budget and fall back to an allowed in-workspace path.
+    let mut budget: u32 = 64;
+    loop {
+        // Canonicalizing the deepest EXISTING prefix normalizes it the same way
+        // `is_resolved_path_allowed` normalizes the workspace root (e.g. `/tmp`
+        // vs its real location), so ordinary in-workspace paths stay in-workspace.
+        if let Ok(resolved) = current.canonicalize() {
+            let mut result = resolved;
+            for component in suffix.iter().rev() {
+                result.push(component);
+            }
+            return Some(result);
+        }
+        // A *dangling* symlink cannot be canonicalized (its target does not
+        // exist), yet a write through it still lands at the target. Follow it
+        // explicitly so the resolved path reflects where the write would go.
+        // Only symlink hops consume the budget (a symlink cycle is the only way
+        // to loop forever); stripping non-existent trailing components is bounded
+        // by the finite path depth, so a deeply-nested create is NOT false-blocked.
+        if current
+            .symlink_metadata()
+            .is_ok_and(|m| m.file_type().is_symlink())
+            && let Ok(target) = std::fs::read_link(&current)
+        {
+            if budget == 0 {
+                return None;
+            }
+            budget -= 1;
+            current = if target.is_absolute() {
+                target
+            } else {
+                current
+                    .parent()
+                    .map(|parent| parent.join(&target))
+                    .unwrap_or(target)
+            };
+            continue;
+        }
+        // Otherwise strip the trailing (non-existent) component and retry on the
+        // parent. An absolute input terminates at the filesystem root, which
+        // always canonicalizes; running out of components should be unreachable
+        // for the absolute inputs the caller passes, so treat it as unresolvable
+        // and fail closed rather than trusting the literal path.
+        match (current.file_name(), current.parent()) {
+            (Some(name), Some(parent)) if !parent.as_os_str().is_empty() => {
+                suffix.push(name.to_os_string());
+                current = parent.to_path_buf();
+            }
+            _ => return None,
+        }
+    }
+}
+
 fn is_null_device(path: &Path) -> bool {
     #[cfg(not(target_os = "windows"))]
     {
@@ -1582,17 +1654,91 @@ impl SecurityPolicy {
     /// Return the first path-like argument blocked by path policy.
     /// This is best-effort token parsing for shell commands and is intended
     /// as a safety gate before command execution.
+    /// String-level command path guard: flags a path argument that is absolute
+    /// and outside the workspace, uses `..` traversal, a `~user` form, or a
+    /// forbidden prefix. Does NOT resolve symlinks, so it is safe for callers
+    /// whose working directory is NOT the workspace (e.g. cron jobs run in
+    /// `data_dir`). Shell/skill tools, which run IN the workspace, should use
+    /// [`SecurityPolicy::forbidden_workspace_path_argument`], which additionally
+    /// follows in-workspace symlinks to block escapes.
     pub fn forbidden_path_argument(&self, command: &str) -> Option<String> {
+        self.forbidden_path_argument_impl(command, false)
+    }
+
+    /// Like [`SecurityPolicy::forbidden_path_argument`] but for a command that
+    /// runs IN the workspace: each workspace-relative path argument is also
+    /// resolved (following symlinks, including dangling ones) and re-checked
+    /// against the workspace boundary, catching an in-workspace symlink that
+    /// points outside for the argument forms this static scan can see.
+    ///
+    /// This is best-effort, defense-in-depth hardening over a token-scanned
+    /// command line - NOT a complete workspace boundary, and NOT equivalent to
+    /// the file tools, which resolve an operation-aware target at the call site.
+    /// It flags a *path-shaped* argument (one with a separator, e.g. `link/x`, a
+    /// redirect target, or an absolute / `..` form) that escapes via an
+    /// in-workspace symlink. It does NOT, and cannot from a static parse, cover:
+    /// a *bare* argument with no separator (`cat somelink`) that is a symlink; a
+    /// path computed at run time via variable expansion or command substitution
+    /// (`$VAR`, `$(...)`), `eval`, or a write done inside an executed script
+    /// (`sh ./x.sh`, where only the script path is scanned); a quoted path
+    /// holding whitespace (`"link dir/out"`), which the whitespace tokenizer
+    /// fragments; read-vs-write direction (an argument may be read or written, so
+    /// a resolved target allowed for EITHER passes, unlike the operation-aware
+    /// file tools); or non-Unix relative forms (a `link\file` path on Windows). A
+    /// shell command is Turing-complete; complete containment is the execution
+    /// boundary (the OS sandbox and the broader granular sandbox-policy work),
+    /// not this preflight.
+    pub fn forbidden_workspace_path_argument(&self, command: &str) -> Option<String> {
+        self.forbidden_path_argument_impl(command, true)
+    }
+
+    fn forbidden_path_argument_impl(
+        &self,
+        command: &str,
+        resolve_workspace: bool,
+    ) -> Option<String> {
         let forbidden_candidate = |raw: &str| {
             let candidate = strip_wrapping_quotes(raw).trim();
             if candidate.is_empty() || candidate.contains("://") {
                 return None;
             }
-            if looks_like_path(candidate) && !self.is_path_allowed(candidate) {
-                Some(candidate.to_string())
-            } else {
-                None
+            if !looks_like_path(candidate) {
+                return None;
             }
+            // String-level policy: absolute paths outside the workspace, `..`
+            // traversal, `~user` forms, and forbidden prefixes.
+            if !self.is_path_allowed(candidate) {
+                return Some(candidate.to_string());
+            }
+            // A workspace-relative argument can still escape the boundary via a
+            // symlink whose target is outside the workspace: the string check
+            // above passes because the literal path has no `..` and is not
+            // absolute, yet the real target is elsewhere. The file tools already
+            // block this by canonicalizing before checking; mirror that here for
+            // the path-shaped argument forms this static scan can see (a full
+            // boundary needs the execution-time sandbox). Resolve the deepest
+            // existing ancestor (the leaf may be about to be created, e.g.
+            // `touch link/new.txt`) and re-check the resolved target with the
+            // symlink-aware policy.
+            // For a command that runs IN the workspace, also resolve symlinks and
+            // re-check: a workspace-relative arg can point outside via an
+            // in-workspace symlink, which the string check above misses. A
+            // command argument may be read OR written, so accept the resolved
+            // target if it is allowed for EITHER (mirrors the string
+            // `is_path_allowed`, which honors both read-only and write-only
+            // roots). Fail closed otherwise: a target outside every allowed root
+            // is blocked, and so is one that cannot be resolved at all (a symlink
+            // cycle exhausting the hop budget) - `None` means "unresolvable", not
+            // "allowed" - so a crafted chain cannot dodge the check.
+            if resolve_workspace {
+                match self.resolve_command_path_argument(candidate) {
+                    Some(resolved)
+                        if self.is_resolved_path_allowed(&resolved)
+                            || self.is_resolved_path_readable(&resolved) => {}
+                    _ => return Some(candidate.to_string()),
+                }
+            }
+            None
         };
         let forbidden_non_redirect_candidate = |raw: &str| {
             let candidate = strip_wrapping_quotes(raw).trim();
@@ -1699,6 +1845,31 @@ impl SecurityPolicy {
         }
 
         None
+    }
+
+    /// Resolve a shell command path argument to the canonical target used for
+    /// workspace-boundary checks. Relative arguments are taken relative to the
+    /// workspace directory; `~` is expanded. Because a command may be about to
+    /// CREATE the leaf (e.g. `touch dir/new.txt`), symlinks are resolved on the
+    /// deepest existing ancestor and any non-existent trailing components are
+    /// re-appended, so an in-workspace symlink pointing outside is followed to
+    /// its real target. Relative arguments are joined onto the workspace
+    /// directory BEFORE resolving. Returns `None` when no trustworthy target
+    /// exists: a null byte in the input, or an unresolvable path (a symlink
+    /// cycle exhausting the resolver's hop budget). Callers MUST treat `None`
+    /// as a block (fail closed), never as "nothing to re-check" - see
+    /// `forbidden_path_argument_impl`.
+    fn resolve_command_path_argument(&self, candidate: &str) -> Option<PathBuf> {
+        if candidate.contains('\0') {
+            return None;
+        }
+        let expanded = expand_user_path(candidate);
+        let joined = if expanded.is_absolute() {
+            expanded
+        } else {
+            self.workspace_dir.join(expanded)
+        };
+        resolve_symlinked_path(&joined)
     }
 
     /// Check if a file path is allowed (no path traversal, within workspace)
@@ -4727,6 +4898,170 @@ mod tests {
         assert!(
             !policy.is_resolved_path_allowed(&resolved),
             "symlink-resolved path outside workspace must be blocked"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Regression for the shell workspace-boundary bypass: a direct path-shaped
+    /// command argument that reaches outside the workspace through an
+    /// in-workspace symlink must be blocked. The leaf may not exist yet (the
+    /// command is about to create it), so resolution must follow the symlinked
+    /// ancestor.
+    #[cfg(unix)]
+    #[test]
+    fn forbidden_path_argument_blocks_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "zeroclaw_test_shell_symlink_escape_{}",
+            std::process::id()
+        ));
+        let workspace = root.join("workspace");
+        let outside = root.join("outside_target");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        // `link` inside the workspace points at the outside directory.
+        symlink(&outside, workspace.join("link")).unwrap();
+
+        let policy = SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            ..SecurityPolicy::default()
+        };
+
+        // Writing a NEW file through the symlink (leaf does not exist yet).
+        assert_eq!(
+            policy
+                .forbidden_workspace_path_argument("touch link/new.txt")
+                .as_deref(),
+            Some("link/new.txt"),
+            "creating a file through an in-workspace symlink to outside must be blocked"
+        );
+        // Redirect target through the symlink.
+        assert!(
+            policy
+                .forbidden_workspace_path_argument("echo hi > link/out.txt")
+                .is_some(),
+            "shell redirect through an escaping symlink must be blocked"
+        );
+        // Reading an existing file through the symlink.
+        std::fs::write(outside.join("secret.txt"), b"x").unwrap();
+        assert!(
+            policy
+                .forbidden_workspace_path_argument("cat link/secret.txt")
+                .is_some(),
+            "reading through an escaping symlink must be blocked"
+        );
+
+        // A DANGLING symlink (its target directory does not exist yet) still
+        // escapes on write, so it must be blocked even though it cannot be
+        // `canonicalize`d.
+        symlink(outside.join("nonexistent_dir"), workspace.join("dangling")).unwrap();
+        assert!(
+            policy
+                .forbidden_workspace_path_argument("echo x > dangling/new.txt")
+                .is_some(),
+            "writing through a dangling symlink to outside must be blocked"
+        );
+
+        // A symlink CYCLE exhausts the resolver's hop budget. It must fail
+        // CLOSED (block), not fall back to the pristine in-workspace path.
+        symlink(workspace.join("cycle_b"), workspace.join("cycle_a")).unwrap();
+        symlink(workspace.join("cycle_a"), workspace.join("cycle_b")).unwrap();
+        assert!(
+            policy
+                .forbidden_workspace_path_argument("cat cycle_a/file")
+                .is_some(),
+            "an unresolvable symlink cycle must fail closed (be blocked)"
+        );
+
+        // Scoping check: the STRING-only guard (used by cron, whose cwd is NOT
+        // the workspace) must NOT resolve symlinks, so it does not over-block a
+        // workspace-relative path here. The resolve step is scoped to the
+        // workspace-cwd variant used above.
+        assert_eq!(
+            policy.forbidden_path_argument("cat link/secret.txt"),
+            None,
+            "string-only guard must not resolve symlinks (keeps cron unaffected)"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Non-regression: a symlink that stays INSIDE the workspace, and ordinary
+    /// workspace-relative paths, must still be allowed after the resolve check.
+    #[cfg(unix)]
+    #[test]
+    fn forbidden_path_argument_allows_in_workspace_paths() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "zeroclaw_test_shell_in_workspace_{}",
+            std::process::id()
+        ));
+        let workspace = root.join("workspace");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(workspace.join("real_dir")).unwrap();
+        std::fs::create_dir_all(workspace.join("sub")).unwrap();
+
+        // `inside` points at another directory WITHIN the workspace.
+        symlink(workspace.join("real_dir"), workspace.join("inside")).unwrap();
+
+        let policy = SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            ..SecurityPolicy::default()
+        };
+
+        assert_eq!(
+            policy.forbidden_workspace_path_argument("touch inside/new.txt"),
+            None,
+            "an in-workspace symlink target must remain allowed"
+        );
+        assert_eq!(
+            policy.forbidden_workspace_path_argument("touch sub/out.txt"),
+            None,
+            "an ordinary workspace-relative path must remain allowed"
+        );
+        assert_eq!(
+            policy.forbidden_workspace_path_argument("echo hi > sub/out.txt"),
+            None,
+            "an ordinary workspace-relative redirect target must remain allowed"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Non-regression: a path under an `allowed_roots_read_only` grant (outside
+    /// the workspace) must stay READABLE - the command guard checks read OR
+    /// write, so the resolve step must not drop read-only roots.
+    #[cfg(unix)]
+    #[test]
+    fn forbidden_path_argument_allows_read_only_root() {
+        let root = std::env::temp_dir().join(format!(
+            "zeroclaw_test_shell_read_only_root_{}",
+            std::process::id()
+        ));
+        let workspace = root.join("workspace");
+        let shared = root.join("shared_readonly");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::write(shared.join("data.txt"), b"x").unwrap();
+
+        let policy = SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            allowed_roots_read_only: vec![shared.clone()],
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        };
+
+        let cmd = format!("cat {}/data.txt", shared.display());
+        assert_eq!(
+            policy.forbidden_workspace_path_argument(&cmd),
+            None,
+            "reading under an allowed read-only root must remain allowed"
         );
 
         let _ = std::fs::remove_dir_all(&root);

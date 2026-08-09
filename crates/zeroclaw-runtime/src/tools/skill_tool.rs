@@ -204,7 +204,7 @@ impl Tool for SkillShellTool {
             }
         }
 
-        if let Some(path) = self.security.forbidden_path_argument(&command) {
+        if let Some(path) = self.security.forbidden_workspace_path_argument(&command) {
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),

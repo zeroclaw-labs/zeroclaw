@@ -1145,7 +1145,7 @@ mod secret_field_tests {
 #[cfg(test)]
 mod resource_key_tests {
     // Pins `MapKeySection::resource_key`, the discriminator that
-    // `ensure_map_key_for_prop_path` (in the `zeroclawlabs` binary crate)
+    // `ensure_map_key_for_prop_path` (in the `zeroclaw` binary crate)
     // filters on: `true` for sections keyed by a value drawn from another
     // domain (a model id, tool name, …) that may itself contain dots;
     // `false` for sections keyed by a short operator-chosen alias.
