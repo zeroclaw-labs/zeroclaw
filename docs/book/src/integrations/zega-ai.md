@@ -10,9 +10,9 @@ relates-to:
 
 # ZEGA AI (External Integration & Bridge Specification)
 
-[ZEGA AI](https://github.com/siabang35/zega.ai) is an autonomous Solana Pay merchant fintech platform built natively on the [ZeroClaw](https://github.com/zeroclaw-labs/zeroclaw) agentic framework. ZEGA connects to the ZeroClaw v0.8.x gateway daemon via a standalone TypeScript bridge package (`@zega/zeroclaw-bridge`), while leveraging ZeroClaw's Rust runtime, SOP engine, skills system, and security risk profiles.
+[ZEGA AI](https://github.com/siabang35/zega.ai) is an autonomous Solana Pay merchant platform built to integrate with the [ZeroClaw](https://github.com/zeroclaw-labs/zeroclaw) agentic framework. ZEGA connects to the ZeroClaw gateway daemon via a standalone TypeScript bridge package (`@zega/zeroclaw-bridge`), providing typed gateway pairing, status checks, and offline resilience for web applications.
 
-> **Status:** Production-Hardened Integration. The TypeScript bridge package and settlement engine have been verified against the official ZeroClaw Rust binary (`v0.8.3`). All API routes, timing-safe webhooks, atomic PostgreSQL triggers, and OWASP Level 3 prompt injection guards are fully implemented and covered by an automated test suite (**89/89 PASS**).
+> **Status:** Community Integration Reference. This specification documents the client-side bridge contract provided by `@zega/zeroclaw-bridge` to pair with a ZeroClaw daemon over HTTP.
 
 ## Gateway Connectivity & Pairing
 
@@ -70,53 +70,18 @@ Upstream handler: `handle_pair` (`crates/zeroclaw-gateway/src/lib.rs`).
 
 | Component | Role |
 |---|---|
-| `ZeroClawGatewayClient` | HTTP client featuring `AbortController` timeouts (1.2s non-blocking ping), exponential backoff, and graceful offline fallback states when the daemon is unreachable. |
-| `ZeroClawAuthManager` | Coordinates pairing credentials (enhanced → legacy fallback) and generates `Authorization: Bearer <token>` headers for all authenticated daemon interactions. |
-| Version Matrix | Client-side version compatibility checker targeting numeric bounds `>=0.8.0 <0.9.0-alpha` (pinned target `v0.8.3`). Strips pre-release suffixes prior to numeric component comparison (`major.minor.patch`). |
+| `ZeroClawGatewayClient` | HTTP client featuring `AbortController` timeouts (1.5s default ping), exponential backoff, and graceful offline fallback states when the daemon is unreachable. |
+| `ZeroClawAuthManager` | Coordinates pairing credentials (enhanced → legacy fallback) and generates `Authorization: Bearer <token>` headers for authenticated daemon interactions. |
+| Version Matrix | Client-side version compatibility checker targeting numeric bounds `>=0.8.0 <0.9.0-alpha`. Strips pre-release suffixes prior to numeric component comparison (`major.minor.patch`). |
 
-## Native ZeroClaw Configuration & Runtime
+## Inspected Bridge Smoke Tests
 
-ZEGA configures the official ZeroClaw Rust binary (`v0.8.3`) using native `config.toml` declarations:
+The bridge package (`packages/zeroclaw-bridge/`) includes an offline smoke test suite (`pnpm --filter @zega/zeroclaw-bridge test:smoke`) validating:
 
-- **Multi-LLM Failover Engine**: Primary `groq/llama-3.3-70b-versatile` with automatic failover to `google/gemini-1.5-flash` and `deepseek-v3`.
-- **Supervised Risk Profile**: Auto-approves read queries (`http_request`, `web_fetch`) while explicitly excluding `transfer` and `sign_transaction`.
-- **MCP Client Support**: Connects to Helius DAS MCP via SSE for read-only RPC queries and SendAI MCP via stdio for Solana Actions.
-- **Multi-Channel Adapters**: Integrates HMAC-SHA256 webhooks (`x-zeroclaw-signature`), Telegram Bot API for POS cashier commands, and WhatsApp.
-
-## Native ZeroClaw Composition in ZEGA AI
-
-ZEGA composes ZeroClaw's stock agent primitives to deliver an autonomous merchant terminal:
-
-### 1. Standard Operating Procedures (SOPs)
-
-- **`payment-reconciliation` (Cron Trigger `*/30s`)**: Periodically queries pending invoice reference keys on Solana Devnet via `getSignaturesForAddress` and `getTransaction`, verifying recipient pubkeys and posting confirmed settlements to ZEGA terminal views.
-- **`refund-approval` (Channel Trigger)**: Handles customer refund requests. Automatically screens inputs for prompt injection; if safe, halts at an approval checkpoint (`kind: checkpoint`, `policy: merchant-refund`, `quorum: 1`) requiring human merchant confirmation before proceeding.
-- **`defi-guardian` (Cron Trigger `*/5m`)**: Monitors price feed volatility and liquidity alerts via Jupiter & Switchboard.
-- **`balance-alert` (Cron Trigger `*/15m`)**: Monitors merchant wallet SOL balances for operational threshold alerts.
-
-### 2. Skills & Response Shaping
-
-- **`solana-pay`**: Constructs unsigned Solana Pay URLs with single-use reference keys. Enforces response shaping capped at `<200 tokens` per step to prevent context window bloat.
-- **`solana-blinks`**: Renders shareable Solana Actions and `dial.to` Blink URLs.
-- **`merchant-memory`**: Interacts with ZeroClaw's relationship memory graph to log customer history and payment telemetry.
-- **`defi-guardian`**: Queries Jupiter price feeds and fallback oracle quotes.
-
-### 3. Keyless Custody & Security Invariants
-
-- **Tier 1 (Keyless Agent)**: The LLM and ZeroClaw agent never access, hold, or sign with private keys. All transactions are signed client-side via Phantom or Solflare wallets.
-- **Atomic Replay Protection**: PostgreSQL kernel constraint (`tx_signature` `UNIQUE`) and trigger `trg_sync_invoice_to_settlement` ensure database-backed signature deduplication and deterministic settlement persistence.
-- **OWASP Prompt Injection Guard**: Level 3 regex threat screening blocks prompt injection attacks (e.g. "Ignore previous instructions", "Jailbreak refund") before reaching approval gates.
-
-## What the Test Suite Covers
-
-The bridge and integration suite (`pnpm test` / `pnpm --filter @zega/api test`) validates 89 automated test specs covering:
-
-- Numeric version parsing, compatibility matrix bounds, and error class hierarchies.
-- Auth manager initialization and `Authorization` header formatting.
-- Gateway client offline resilience and graceful error handling.
-- HMAC-SHA256 timing-safe signature verification (`crypto.timingSafeEqual`).
-- Atomic database conflict resolution (`on_conflict=tx_signature`) and OWASP Level 3 prompt injection defense.
+- Version parsing and SemVer boundary checking.
+- Enhanced-to-legacy pairing fallback logic and rate-limit error escalation.
+- Bearer token header construction and `ZeroClawGatewayClient` timeout behavior.
 
 ## External Reference
 
-For source code, PRDs, and monorepo implementation details, visit the [ZEGA AI Repository](https://github.com/siabang35/zega.ai) or inspect the bridge package at reviewed commit [`f99104367a6b06815cf478120b247d042fa7b1a5`](https://github.com/siabang35/zega.ai/tree/f99104367a6b06815cf478120b247d042fa7b1a5/packages/zeroclaw-bridge).
+For source code, package sources, and repository implementation details, visit the [ZEGA AI Repository](https://github.com/siabang35/zega.ai) or inspect the bridge package at reviewed commit [`f99104367a6b06815cf478120b247d042fa7b1a5`](https://github.com/siabang35/zega.ai/tree/f99104367a6b06815cf478120b247d042fa7b1a5/packages/zeroclaw-bridge).
