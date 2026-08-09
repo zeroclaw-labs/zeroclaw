@@ -488,41 +488,50 @@ impl Drop for EdgeTtsTempArtifact {
                 let path = self.path.clone();
                 let _ = std::thread::Builder::new()
                     .name("edge-tts-reaper".to_string())
-                    .spawn(move || reap_and_remove(child, path));
+                    .spawn(move || reap_and_remove(child, path, EDGE_TTS_REAP_GRACE));
             }
         }
     }
 }
 
-/// Reap the child until it exits or [`EDGE_TTS_REAP_GRACE`] elapses, escalating
-/// to a hard kill on timeout, then remove the temp file. Runs on a detached
-/// [`std::thread`] so it never depends on a Tokio runtime's lifetime and never
-/// blocks an executor worker. Synchronous-only ([`tokio::process::Child::try_wait`]
-/// / [`tokio::process::Child::start_kill`]) so it needs no runtime context.
-fn reap_and_remove(mut child: tokio::process::Child, path: PathBuf) {
+/// Reap the child until it exits or `grace` elapses, escalating to a hard kill
+/// on timeout, then remove the temp file only after child exit is confirmed
+/// following the hard kill. Runs on a detached [`std::thread`] so it never
+/// depends on a Tokio runtime's lifetime and never blocks an executor worker.
+/// Synchronous-only ([`tokio::process::Child::try_wait`] /
+/// [`tokio::process::Child::start_kill`]) so it needs no runtime context.
+///
+/// The reap-before-delete contract is not relaxed on the hard-escalation path:
+/// `remove_file` runs only once `try_wait` reports the child as exited after a
+/// successful `start_kill`. A still-terminating child can retain the output
+/// handle on Windows and make the unlink fail, leaving exactly the artifact
+/// this cleanup is meant to remove, so the reaper stays responsible until the
+/// exit is confirmed rather than deleting on a fixed timer.
+fn reap_and_remove(mut child: tokio::process::Child, path: PathBuf, grace: std::time::Duration) {
     let grace_started = std::time::Instant::now();
-    let grace = EDGE_TTS_REAP_GRACE;
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
             Ok(None) if std::time::Instant::now() - grace_started < grace => {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
-            // Grace expired (or an unrecoverable wait error): hard kill, then
-            // give it a short final window to be reaped before removing the
-            // file, so deletion cannot race the terminating child.
+            // Grace expired (or an unrecoverable wait error): hard kill and
+            // stay responsible until exit is confirmed.
             _ => {
                 let _ = child.start_kill();
-                let hard_started = std::time::Instant::now();
-                let hard_budget = std::time::Duration::from_millis(500);
+                // Once start_kill succeeded, keep waiting until try_wait
+                // confirms the child exited before touching the file. A wait
+                // error here means the child can no longer report a status at
+                // all (already gone or reapable by nothing further), so
+                // deleting is safe.
                 loop {
-                    if matches!(child.try_wait(), Ok(Some(_))) {
-                        break;
+                    match child.try_wait() {
+                        Ok(Some(_)) => break,
+                        Ok(None) => {
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                        }
+                        Err(_) => break,
                     }
-                    if std::time::Instant::now() - hard_started >= hard_budget {
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(50));
                 }
                 break;
             }
@@ -1790,6 +1799,21 @@ mod tests {
             );
         });
 
+        // The reaper runs on its own std thread and finishes independently of
+        // the runtime's lifetime. Wait for the artifact to be removed so the
+        // test proves the promised cleanup rather than leaking its own fixture
+        // (the child exits on its own after ~3 s, well inside the reap grace).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if !artifact_path.exists() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("cancellation reaper never removed the temp artifact");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
         let _ = std::fs::remove_file(&script_path);
     }
 
@@ -1864,6 +1888,94 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
+
+        let _ = std::fs::remove_file(&script_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn edge_tts_reaper_confirms_hard_kill_exit_before_removing_artifact() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Force the hard-escalation path of `reap_and_remove`: a child that
+        // ignores SIGTERM and would otherwise outlive the default five-second
+        // grace. A test-kit `grace` well under the child's lifetime makes the
+        // escalation fire quickly. The reaper must remain responsible for the
+        // child until `try_wait` confirms it exited after the hard kill, and
+        // only then remove the artifact: it must not delete on a fixed timer
+        // while the child is still terminating (a race Windows exposes because
+        // a live child can retain the output handle and make `remove_file`
+        // fail, leaving exactly the artifact this cleanup is meant to remove).
+        let temp_dir = std::env::temp_dir();
+        let script_path =
+            temp_dir.join(format!("zeroclaw_edgetts_test_{}.sh", uuid::Uuid::new_v4()));
+        let artifact_path =
+            temp_dir.join(format!("zeroclaw_edgetts_out_{}.mp3", uuid::Uuid::new_v4()));
+        let script = script_path.to_str().unwrap();
+        let out = artifact_path.to_str().unwrap();
+        // Hold the artifact open and ignore the graceful TERM, so the graceful
+        // window passes and only the hard kill can end the child. A busy loop
+        // keeps the tracked shell itself alive (no orphaned `sleep` to linger
+        // after the SIGKILL); the reaper's hard kill is the sole way out.
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\n\
+                 : > \"{out}\"\n\
+                 trap '' TERM\n\
+                 while :; do :; done\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Spawn the child inside a current-thread runtime (as synthesis does),
+        // then hand it to the detached reaper thread exactly as `Drop` does.
+        // The reaper runs its own short grace (well under the child's 30 s
+        // lifetime), so it is guaranteed to reach the hard-kill branch while
+        // the child is still ignoring TERM.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+        let (child, child_pid) = rt.block_on(async {
+            let child = tokio::process::Command::new(script)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn fake child");
+            let pid = child.id().expect("child pid");
+            (child, pid)
+        });
+        drop(rt);
+
+        reap_and_remove(
+            child,
+            artifact_path.clone(),
+            std::time::Duration::from_millis(150),
+        );
+
+        // The reaper removes the artifact only after `try_wait` confirms the
+        // child exited, so poll until the artifact disappears and, at that
+        // exact moment, assert the child is no longer alive: the reap
+        // necessarily preceded the removal. If the old fixed-timer branch had
+        // deleted while the child was still terminating, this ordering check
+        // catches it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if !artifact_path.exists() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("Edge TTS artifact was never removed by the hard-kill reaper");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let still_alive = unsafe { libc::kill(child_pid as i32, 0) } == 0;
+        assert!(
+            !still_alive,
+            "the child must be reaped before (or by the moment) the artifact disappears"
+        );
 
         let _ = std::fs::remove_file(&script_path);
     }
