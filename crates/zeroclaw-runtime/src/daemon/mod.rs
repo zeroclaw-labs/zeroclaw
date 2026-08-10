@@ -958,7 +958,7 @@ pub async fn run(
                 DaemonExit::Reload => "reload requested",
             },
         ),
-        Err(error) => crate::health::mark_component_error("daemon", &format!("{error:#}")),
+        Err(error) => crate::health::mark_component_error("daemon", format!("{error:#}")),
     }
 
     channels_cancel.cancel();
