@@ -77,6 +77,17 @@ pub(crate) async fn try_recover_context_overflow(
         // One rule: drop oldest whole turns until we are under a budget
         // forced below the current size. Never splits a tool_use/tool_result
         // pair, never silently shrinks a result. Whole turns or nothing.
+        //
+        // NOTE (message-history-only accounting): `tokens_now`/`tokens_after`
+        // here describe RAW message history only — the same estimate the
+        // pre-existing retry sizing uses. They do NOT cover the full
+        // provider-facing population (multimodal-normalized image payloads or
+        // native tool schemas), so a schema- or image-driven overflow can
+        // retry an oversized request while these values read small. The
+        // distinct recovery reason and the `Estimated` provenance keep them
+        // from being presented as calibrated provider-request accounting; the
+        // retry-sizing limitation itself predates this token-accounting
+        // feature.
         let tokens_now = estimate_history_tokens(history);
         let budget = tokens_now.saturating_mul(2) / 3;
         let owned = std::mem::take(history);

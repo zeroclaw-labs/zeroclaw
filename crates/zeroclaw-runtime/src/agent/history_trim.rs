@@ -258,8 +258,36 @@ fn next_boundary_after(boundaries: &[usize], current: usize) -> usize {
         .unwrap_or(current)
 }
 
-fn count_turns(history: &[ChatMessage]) -> usize {
+pub(crate) fn count_turns(history: &[ChatMessage]) -> usize {
     history.iter().filter(|m| is_turn_boundary(m)).count()
+}
+
+/// Drop the oldest whole turn (after leading system messages and an optional
+/// breadcrumb), preserving the most recent whole turn and the system prefix.
+/// Returns how many messages were dropped — zero when only the newest turn
+/// remains, which the caller treats as the unsatisfiable floor rather than
+/// silently claiming the history fits.
+pub(crate) fn drop_oldest_whole_turn(history: &mut Vec<ChatMessage>) -> usize {
+    let leading_system = history.iter().take_while(|m| is_system(m)).count();
+    let crumb = breadcrumb();
+    let crumb_present = history
+        .get(leading_system)
+        .is_some_and(|m| m.role == crumb.role && m.content == crumb.content);
+    let body_start = leading_system + usize::from(crumb_present);
+    let body = &history[body_start..];
+    let boundaries: Vec<usize> = body
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| is_turn_boundary(m))
+        .map(|(i, _)| body_start + i)
+        .collect();
+    if boundaries.len() <= 1 {
+        return 0;
+    }
+    let drop_end = next_boundary_after(&boundaries, boundaries[0]);
+    let dropped = drop_end - body_start;
+    history.drain(body_start..drop_end);
+    dropped
 }
 
 /// Front breadcrumb injected after the system messages so the model SEES that
