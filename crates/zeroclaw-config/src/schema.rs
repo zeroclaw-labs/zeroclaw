@@ -13898,8 +13898,13 @@ pub struct TelegramConfig {
     /// isolated conversation context (matches the existing behavior). When
     /// `false`, all members of a group chat share one session scoped to the
     /// chat (and forum topic, when present), so the agent keeps full
-    /// conversation context regardless of which member writes. 1-on-1 chats
-    /// are unaffected (chat_id is already unique per user-bot pair).
+    /// conversation context regardless of which member writes. Sharing the
+    /// session shares its session-scoped controls too: any member's `/new`
+    /// resets the shared history for the whole group/topic, and a member's
+    /// session-level `/model` route override applies to everyone in it —
+    /// while `/stop` and message debouncing stay personal to each sender.
+    /// 1-on-1 chats are unaffected (chat_id is already unique per user-bot
+    /// pair).
     #[tab(Behavior)]
     #[serde(default = "default_true")]
     pub per_user_session: bool,

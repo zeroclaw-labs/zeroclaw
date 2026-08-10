@@ -257,7 +257,7 @@ logging is enabled, events are also written under the install directory at
 | `Telegram polling conflict (409)` | More than one process is using the same bot token. Stop the duplicate daemon or channel process. |
 | Group messages are ignored | With `mention_only = true`, mention the bot or reply directly to one of its messages. Direct messages are still processed. |
 | Draft edits report `Too Many Requests` | Increase `channels.telegram.<alias>.draft_update_interval_ms` or disable streaming. |
-| Teammates in one group or forum topic do not see each other's context | Group sessions are keyed per sender by default. Set `channels.telegram.<alias>.per_user_session = false` to share one session per chat (and per forum topic, when present). Direct messages are unaffected. |
+| Teammates in one group or forum topic do not see each other's context | Group sessions are keyed per sender by default. Set `channels.telegram.<alias>.per_user_session = false` to share one session per chat (and per forum topic, when present). The shared session shares its controls: any member's `/new` resets the conversation for the whole group/topic, and a session-level `/model` override applies to every member, while `/stop` stays personal to each sender. Direct messages are unaffected. |
 
 The full Telegram field list is generated from the live configuration schema:
 
