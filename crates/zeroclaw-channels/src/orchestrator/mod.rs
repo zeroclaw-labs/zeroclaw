@@ -5389,8 +5389,12 @@ async fn process_channel_message_body(
     // Audio transcription already ran in phase 1 (before route selection);
     // an audio-only message never reaches the image warm (fnd-001
     // zero-overhead constraint — a transcript-only turn does not wait on a
-    // catalog-backed request).
+    // catalog-backed request). `describe_images` gates the entire phase so an
+    // operator who disabled image description never incurs the catalog-backed
+    // warm or capability lookup for an image attachment (no image marker or
+    // capability decision is produced in that configuration).
     if ctx.media_pipeline.enabled
+        && ctx.media_pipeline.describe_images
         && msg
             .attachments
             .iter()
@@ -27494,6 +27498,96 @@ This is an example JSON object for profile settings."#;
         assert!(
             !sent_messages.is_empty(),
             "the audio-only turn should still complete and produce an assistant reply"
+        );
+    }
+
+    #[tokio::test]
+    async fn media_pipeline_does_not_warm_capabilities_when_describe_images_disabled() {
+        // Regression for the 2026-08-09 review: phase 2 warmed the effective
+        // provider's catalog metadata for ANY image attachment even when the
+        // operator disabled image description (`media_pipeline.describe_images
+        // = false`). No image marker or capability decision is produced in
+        // that configuration, so the warm is an avoidable external request and
+        // latency regression on an explicitly disabled feature. The phase-2
+        // guard now includes `describe_images`; the cataloged leaf records
+        // warm calls, so an unexpected warm is directly observable.
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let leaf = Arc::new(CatalogOnlyVisionModelProvider {
+            calls: Default::default(),
+            warm_calls: Arc::new(AtomicUsize::new(0)),
+            catalog_loaded: AtomicBool::new(false),
+        });
+        let wrapper: Arc<dyn ModelProvider> =
+            Arc::new(zeroclaw_providers::reliable::ReliableModelProvider::new(
+                "test",
+                vec![(
+                    "primary".into(),
+                    Box::new(Arc::clone(&leaf)) as Box<dyn ModelProvider>,
+                )],
+                0,
+                0,
+            ));
+
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            wrapper,
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            model: Arc::new("catalog-image-model".to_string()),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig {
+                enabled: true,
+                transcribe_audio: false, // focus the test on the image warm
+                describe_images: false,  // the feature is explicitly disabled
+                ..Default::default()
+            },
+            ..(*runtime_ctx).clone()
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-image-no-describe".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-image-no-describe".to_string(),
+                content: "please handle this".to_string(),
+                channel: "test-channel".into(),
+                channel_alias: None,
+                timestamp: 1,
+                passive_context: false,
+                explicitly_addressed: false,
+                conversation_scope: zeroclaw_api::channel::ChannelConversationScope::Sender,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![zeroclaw_api::media::MediaAttachment {
+                    file_name: "photo.png".to_string(),
+                    data: vec![0u8; 16],
+                    mime_type: Some("image/png".to_string()),
+                }],
+                subject: None,
+                internal_sop_event: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(
+            leaf.warm_calls.load(Ordering::SeqCst),
+            0,
+            "an image message with describe_images disabled must not invoke the \
+             catalog-backed capability warm"
+        );
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert!(
+            !sent_messages.is_empty(),
+            "the image turn with describe_images disabled should still complete \
+             and produce an assistant reply"
         );
     }
 
