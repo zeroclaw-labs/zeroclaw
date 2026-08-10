@@ -259,7 +259,8 @@ impl V2Config {
         // selected (see the struct doc above the fold).
         match folded {
             GlobalFold::Producer(source) => {
-                let (family, alias, _) = normalize_provider_type(&source, "default");
+                let (raw_type, _) = split_colon_url_provider(&source);
+                let (family, alias, _) = normalize_provider_type(&raw_type, "default");
                 provenance
                     .entry((family, alias))
                     .or_default()
@@ -974,7 +975,14 @@ fn fold_providers_globals_into_models(
                                 && existing_url == url
                         })
                     });
-                let source_key = (!equivalent_existing).then(|| raw_type.clone());
+                // Preserve the full colon-bearing selector as the producer
+                // identity when it carries a URL. Recording only the stripped
+                // prefix here would collapse `custom:https://B` to `custom` and
+                // dedupe against an existing bare `custom` producer, so the
+                // non-equivalent URL selector would fail to make the slot
+                // ambiguous and the bare reference could rewrite against the
+                // wrong URI.
+                let source_key = (!equivalent_existing).then(|| s.to_string());
                 (canonical, alias, url, extras, source_key, false)
             }
             None => match aliased_models.keys().len() {
