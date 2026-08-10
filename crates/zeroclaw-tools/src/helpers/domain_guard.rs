@@ -99,7 +99,9 @@ pub use zeroclaw_infra::net_guard::is_private_or_local_host;
 // ── private IP classification helpers ─────────────────────────────
 // Re-exported from the shared infra primitive so the tool layer and the
 // plugin host share one implementation (see zeroclaw-infra::net_guard).
-pub(crate) use zeroclaw_infra::net_guard::{is_non_global_v4, is_non_global_v6};
+pub(crate) use zeroclaw_infra::net_guard::{
+    is_non_global_v4, is_non_global_v6, nat64_embedded_ipv4,
+};
 
 pub(crate) fn is_cloud_metadata_ip(ip: std::net::IpAddr) -> bool {
     const EC2_IMDS_V4: std::net::Ipv4Addr = std::net::Ipv4Addr::new(169, 254, 169, 254);
@@ -148,27 +150,6 @@ pub(crate) fn is_cloud_metadata_ip(ip: std::net::IpAddr) -> bool {
                     None => false,
                 }
         }
-    }
-}
-
-/// RFC 6052 well-known NAT64/DNS64 prefix `64:ff9b::/96`. DNS64 embeds the
-/// IPv4 answer in the low 32 bits of the synthesized address, so e.g.
-/// `64:ff9b::a9fe:a9fe` embeds `169.254.169.254`. A hostname whose DNS64
-/// answer is one of these forms would otherwise pass the `is_non_global_v6`
-/// gate (the prefix is not classified as non-global) and reach a
-/// credential/metadata endpoint through the `allowed_private_hosts`
-/// carve-out.
-pub(crate) fn nat64_embedded_ipv4(v6: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
-    let octets = v6.octets();
-    let well_known_prefix = [
-        0x00, 0x64, 0xff, 0x9b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    ];
-    if octets[..12] == well_known_prefix {
-        Some(std::net::Ipv4Addr::new(
-            octets[12], octets[13], octets[14], octets[15],
-        ))
-    } else {
-        None
     }
 }
 
@@ -584,6 +565,62 @@ mod tests {
             err.contains("cloud metadata address"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn validate_resolved_ips_blocks_nat64_rfc1918_on_public_path() {
+        // RFC 6052 DNS64/NAT64 (64:ff9b::/96) embedding a private IPv4:
+        // 64:ff9b::a00:1 is translated to 10.0.0.1 on the wire. The normal
+        // public validator (no `allowed_private_hosts` opt-in) must classify
+        // the synthesized form as non-global, not treat it as globally
+        // routable — otherwise a DNS64 hostname reaches the translated
+        // private target.
+        let ips = ["64:ff9b::a00:1".parse().unwrap()];
+        let err = validate_resolved_ips_are_public("internal.test", &ips)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("non-global address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_resolved_ips_blocks_nat64_loopback_on_public_path() {
+        // 64:ff9b::7f00:1 embeds 127.0.0.1.
+        let ips = ["64:ff9b::7f00:1".parse().unwrap()];
+        let err = validate_resolved_ips_are_public("loopback.test", &ips)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("non-global address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_resolved_ips_blocks_nat64_link_local_on_public_path() {
+        // 64:ff9b::a9fe:1 embeds 169.254.0.1 (link-local, not a metadata
+        // address) — still non-global.
+        let ips = ["64:ff9b::a9fe:1".parse().unwrap()];
+        let err = validate_resolved_ips_are_public("link-local.test", &ips)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("non-global address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_resolved_ips_allows_nat64_public_target_on_public_path() {
+        // A NAT64 form embedding a genuinely public IPv4 (64:ff9b::808:808
+        // embeds 8.8.8.8) reaches the same public endpoint as the IPv4 form
+        // and must NOT be rejected — the non-global classification follows
+        // the embedded address, not the prefix.
+        let ips = ["64:ff9b::808:808".parse().unwrap()];
+        validate_resolved_ips_are_public("public.test", &ips)
+            .expect("NAT64 embedding a public IPv4 must pass the public validator");
     }
 
     #[test]

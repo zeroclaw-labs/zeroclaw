@@ -2088,6 +2088,40 @@ mod tests {
         );
     }
 
+    /// NAT64/DNS64 SSRF regression: on the non-allowlisted path, a hostname
+    /// whose DNS64 answer is a synthesized IPv6 embedding a non-global IPv4
+    /// (RFC 1918 / loopback / link-local) must be rejected. Before the shared
+    /// `is_non_global_v6` primitive classified RFC 6052 forms, these were
+    /// treated as globally routable and the client would connect to the
+    /// translated private target — a live SSRF bypass without any opt-in.
+    #[test]
+    fn ssrf_check_endpoint_rejects_nat64_non_global_targets_without_opt_in() {
+        for (ip, host) in [
+            ("64:ff9b::a00:1", "internal.example.com"), // embeds 10.0.0.1
+            ("64:ff9b::7f00:1", "loopback.example.com"), // embeds 127.0.0.1
+            ("64:ff9b::a9fe:1", "link-local.example.com"), // embeds 169.254.0.1
+        ] {
+            let addr = std::net::SocketAddr::new(ip.parse().unwrap(), 80);
+            let err = ssrf_check_endpoint(host, &[addr], &[])
+                .expect_err("empty allowlist must reject a NAT64-synthesized non-global target");
+            let msg = err.to_lowercase();
+            assert!(
+                msg.contains("private")
+                    || msg.contains("non-global")
+                    || msg.contains("loopback")
+                    || msg.contains("link-local"),
+                "NAT64 target {ip} ({host}) must be rejected on the public path; got: {err}"
+            );
+        }
+
+        // Positive control: a NAT64 form embedding a genuinely public IPv4
+        // (64:ff9b::808:808 embeds 8.8.8.8) reaches the same public endpoint
+        // as the IPv4 form and must NOT be rejected.
+        let public_addr = std::net::SocketAddr::new("64:ff9b::808:808".parse().unwrap(), 443);
+        ssrf_check_endpoint("public.example.com", &[public_addr], &[])
+            .expect("NAT64 embedding a public IPv4 must pass without opt-in");
+    }
+
     /// Operator-visibility contract for the SSRF audit events: every blocked
     /// endpoint emits a WARN rejection, an allowlisted host whose resolved
     /// addresses actually use the private carve-out emits an INFO admission,

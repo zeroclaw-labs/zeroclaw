@@ -1692,8 +1692,8 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
     use zeroclaw_config::schema::{
-        ApprovalGroupConfig, ApprovalPolicyConfig, BrowserConfig, Config, MemoryConfig,
-        SopApprovalConfig,
+        ApprovalGroupConfig, ApprovalPolicyConfig, BrowserConfig, Config, FileDownloadConfig,
+        MemoryConfig, SopApprovalConfig,
     };
 
     #[tokio::test]
@@ -3331,6 +3331,109 @@ mod tests {
         assert!(
             names.contains(&"shell"),
             "positive control: the registry must still be populated"
+        );
+    }
+
+    /// Runtime-level regression for the live-config factory seam used by
+    /// file_download. Constructing the tool registry through
+    /// `all_tools_with_runtime` with a live config handle must wire the
+    /// allowlist resolver to the canonical config, so a `config/set` mutation
+    /// revokes an opt-in without rebuilding the tool.
+    #[tokio::test]
+    async fn file_download_factory_seam_reflects_live_config_revocation() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method, matchers::path};
+
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        // Run a real local listener so the allowlisted path can succeed,
+        // proving we passed the SSRF gate.
+        let server = MockServer::start().await;
+        let port = server.address().port();
+        Mock::given(method("GET"))
+            .and(path("/x"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"ok"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut root_config = test_config(&tmp);
+        root_config.file_download = FileDownloadConfig {
+            url: Some(format!("http://127.0.0.1:{port}/x")),
+            allowed_private_hosts: vec!["127.0.0.1".into()],
+            ..FileDownloadConfig::default()
+        };
+
+        let live = Arc::new(parking_lot::RwLock::new(root_config.clone()));
+
+        let tools = all_tools_with_runtime(
+            Arc::new(Config::default()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            Arc::new(NativeRuntime::new()),
+            mem,
+            None,
+            None,
+            &BrowserConfig::default(),
+            &zeroclaw_config::schema::HttpRequestConfig::default(),
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &root_config,
+            None,
+            false,
+            None,
+            None,
+            None,
+            Some(live.clone()),
+        )
+        .tools;
+
+        let file_download = tools
+            .iter()
+            .find(|t| t.name() == "file_download")
+            .expect("file_download tool must be registered when [file_download].url is set");
+
+        let args = serde_json::json!({ "document_id": "doc-1", "dest_path": "out.bin" });
+
+        // Side 1: live allowlist contains 127.0.0.1 → validation passes and
+        // the request reaches the local listener.
+        let result1 = file_download
+            .execute(args.clone())
+            .await
+            .expect("tool execute must return a ToolResult")
+            .success;
+        assert!(
+            result1,
+            "allowlisted 127.0.0.1 must pass the SSRF gate and download"
+        );
+
+        // Side 2: operator revokes the opt-in via live config — no rebuild.
+        live.write().file_download.allowed_private_hosts.clear();
+
+        let result2 = file_download
+            .execute(args)
+            .await
+            .expect("tool execute must return a ToolResult");
+        assert!(
+            !result2.success,
+            "after revoking the live allowlist entry the request must be rejected"
+        );
+        let err2 = result2.error.unwrap_or_default().to_lowercase();
+        assert!(
+            err2.contains("private")
+                || err2.contains("non-global")
+                || err2.contains("loopback")
+                || err2.contains("link-local"),
+            "127.0.0.1 must be rejected by the SSRF gate after live-config revocation; got: {err2}"
         );
     }
 }

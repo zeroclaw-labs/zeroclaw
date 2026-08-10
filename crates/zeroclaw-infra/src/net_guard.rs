@@ -55,8 +55,33 @@ pub fn is_non_global_v4(v4: std::net::Ipv4Addr) -> bool {
         || (a == 198 && (18..=19).contains(&b)) // Benchmarking (198.18.0.0/15)
 }
 
+/// RFC 6052 well-known NAT64/DNS64 prefix `64:ff9b::/96`. DNS64 embeds the
+/// IPv4 answer in the low 32 bits of the synthesized address, so e.g.
+/// `64:ff9b::a9fe:a9fe` embeds `169.254.169.254` and `64:ff9b::a00:1`
+/// embeds `10.0.0.1`. A hostname whose DNS64 answer is one of these forms
+/// reaches the embedded IPv4 through the translator, so SSRF gates must
+/// classify the embedded address — not treat the prefix as globally routable.
+#[must_use]
+pub fn nat64_embedded_ipv4(v6: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    let octets = v6.octets();
+    let well_known_prefix = [
+        0x00, 0x64, 0xff, 0x9b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+    if octets[..12] == well_known_prefix {
+        Some(std::net::Ipv4Addr::new(
+            octets[12], octets[13], octets[14], octets[15],
+        ))
+    } else {
+        None
+    }
+}
+
 /// True when an IPv6 address is not globally routable (loopback, ULA,
-/// link-local, documentation, multicast, or an IPv4-mapped non-global v4).
+/// link-local, documentation, multicast, an IPv4-mapped non-global v4, or an
+/// RFC 6052 NAT64/DNS64 form embedding a non-global v4). The NAT64 branch
+/// matters for SSRF: a DNS64-synthesized address is translated to its
+/// embedded IPv4 on the wire, so `64:ff9b::a00:1` must be rejected just like
+/// the `10.0.0.1` it reaches.
 #[must_use]
 pub fn is_non_global_v6(v6: std::net::Ipv6Addr) -> bool {
     let segs = v6.segments();
@@ -67,6 +92,7 @@ pub fn is_non_global_v6(v6: std::net::Ipv6Addr) -> bool {
         || (segs[0] & 0xffc0) == 0xfe80 // Link-local (fe80::/10)
         || (segs[0] == 0x2001 && segs[1] == 0x0db8) // Documentation (2001:db8::/32)
         || v6.to_ipv4_mapped().is_some_and(is_non_global_v4)
+        || nat64_embedded_ipv4(v6).is_some_and(is_non_global_v4)
 }
 
 #[cfg(test)]
@@ -112,6 +138,58 @@ mod tests {
         assert!(!is_non_global_v6(
             "::ffff:1.1.1.1".parse::<Ipv6Addr>().unwrap()
         ));
+    }
+
+    #[test]
+    fn nat64_v6_follows_embedded_v4_classification() {
+        // RFC 6052 well-known prefix 64:ff9b::/96 — the synthesized address is
+        // translated to its embedded IPv4 on the wire, so classification must
+        // follow the embedded address.
+        assert!(
+            is_non_global_v6("64:ff9b::a00:1".parse::<Ipv6Addr>().unwrap()),
+            "64:ff9b::a00:1 embeds 10.0.0.1 (RFC 1918) and must be non-global"
+        );
+        assert!(
+            is_non_global_v6("64:ff9b::7f00:1".parse::<Ipv6Addr>().unwrap()),
+            "64:ff9b::7f00:1 embeds 127.0.0.1 (loopback) and must be non-global"
+        );
+        assert!(
+            is_non_global_v6("64:ff9b::a9fe:a9fe".parse::<Ipv6Addr>().unwrap()),
+            "64:ff9b::a9fe:a9fe embeds 169.254.169.254 (link-local) and must be non-global"
+        );
+        // A NAT64 form embedding a genuinely public IPv4 must stay allowed —
+        // it reaches the same public endpoint the IPv4 form would.
+        assert!(
+            !is_non_global_v6("64:ff9b::808:808".parse::<Ipv6Addr>().unwrap()),
+            "64:ff9b::808:808 embeds 8.8.8.8 (public) and must remain global"
+        );
+        // Non-64:ff9b prefixes are not NAT64 forms: the same low-32-bits
+        // pattern under a globally routable prefix (2001:4860::/32 is Google's
+        // global range) must not be classified through the NAT64 branch.
+        assert!(!is_non_global_v6(
+            "2001:4860::a00:1".parse::<Ipv6Addr>().unwrap()
+        ));
+    }
+
+    #[test]
+    fn nat64_embedded_ipv4_extracts_well_known_prefix() {
+        assert_eq!(
+            nat64_embedded_ipv4("64:ff9b::a9fe:a9fe".parse::<Ipv6Addr>().unwrap()),
+            Some(Ipv4Addr::new(169, 254, 169, 254)),
+        );
+        assert_eq!(
+            nat64_embedded_ipv4("64:ff9b::a00:1".parse::<Ipv6Addr>().unwrap()),
+            Some(Ipv4Addr::new(10, 0, 0, 1)),
+        );
+        assert_eq!(
+            nat64_embedded_ipv4("2001:db8::1".parse::<Ipv6Addr>().unwrap()),
+            None
+        );
+        assert_eq!(
+            nat64_embedded_ipv4("64:ff9b::1:2:3:4".parse::<Ipv6Addr>().unwrap()),
+            None,
+            "bits above the embedded IPv4 must not be accepted"
+        );
     }
 
     #[test]
