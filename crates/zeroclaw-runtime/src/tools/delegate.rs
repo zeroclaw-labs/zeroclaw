@@ -429,6 +429,54 @@ impl DelegateTool {
         self
     }
 
+    /// Rebuild the delegate state carried into a spawned execution path
+    /// (`execute_background` and `execute_parallel` both construct their inner
+    /// `DelegateTool` through this seam). The caller supplies the pieces that
+    /// cannot be re-shared cheaply — the effective policy for the spawned run
+    /// and the per-run workspace / cancellation token — while every shared
+    /// handle is re-cloned here.
+    ///
+    /// Crucially the live-config handle is re-captured (`self.live_config`),
+    /// so an independent agentic target registry rebuilt by the spawned run
+    /// keeps observing the canonical config — e.g. a `config/set` revocation
+    /// of `image_gen.allowed_private_hosts` — instead of falling back to the
+    /// construction-time `root_config` snapshot. A spawned run hard-coding
+    /// `live_config: None` here reopens the policy-revocation gap this PR
+    /// closes for the parent path.
+    fn for_spawned_execution(
+        &self,
+        security: Arc<SecurityPolicy>,
+        workspace_dir: PathBuf,
+        cancellation_token: CancellationToken,
+    ) -> DelegateTool {
+        DelegateTool {
+            agents: Arc::clone(&self.agents),
+            security,
+            global_credential: self.global_credential.clone(),
+            provider_runtime_options: self.provider_runtime_options.clone(),
+            // Monotonic descent on spawned execution paths — was `self.depth`
+            // (verbatim copy), which left the `>= max_depth` check inert. A
+            // chain of background/parallel re-delegations now saturates at
+            // `max_delegation_depth`, matching the documented
+            // `with_depth(parent.depth + 1)` intent.
+            depth: self.depth + 1,
+            parent_tools: Arc::clone(&self.parent_tools),
+            runtime: self.runtime.clone(),
+            multimodal_config: self.multimodal_config.clone(),
+            delegate_config: self.delegate_config.clone(),
+            workspace_dir,
+            cancellation_token,
+            memory: self.memory.clone(),
+            providers_models: Arc::clone(&self.providers_models),
+            risk_profiles: Arc::clone(&self.risk_profiles),
+            runtime_profiles: Arc::clone(&self.runtime_profiles),
+            skill_bundles: Arc::clone(&self.skill_bundles),
+            root_config: self.root_config.clone(),
+            live_config: self.live_config.clone(),
+            caller_alias: self.caller_alias.clone(),
+        }
+    }
+
     /// Set the owning agent's alias so it can be excluded from the
     /// advertised delegation roster (an agent must never delegate to
     /// itself).
@@ -1537,20 +1585,6 @@ impl DelegateTool {
                 .await;
         }
 
-        let agents = Arc::clone(&self.agents);
-        let security = target_policy;
-        let global_credential = self.global_credential.clone();
-        let provider_runtime_options = self.provider_runtime_options.clone();
-        // Monotonic descent: was `self.depth` (verbatim copy), which left the
-        // `self.depth >= max_depth` check inert — a chain of background delegations never
-        // escalated depth. Matches the documented `with_depth(parent.depth + 1)` intent.
-        // Behavior change: deep background re-delegation now saturates at `max_delegation_depth`.
-        let depth = self.depth + 1;
-        let parent_tools = Arc::clone(&self.parent_tools);
-        let runtime = self.runtime.clone();
-        let multimodal_config = self.multimodal_config.clone();
-        let delegate_config = self.delegate_config.clone();
-        let workspace_dir = self.workspace_dir.clone();
         let child_token = self.cancellation_token.child_token();
         // Register the live token so `cancel_task` can actually abort THIS task (removed
         // when it settles, in the spawned closure below).
@@ -1558,40 +1592,20 @@ impl DelegateTool {
             .lock()
             .insert(task_id.clone(), child_token.clone());
         let task_id_clone = task_id.clone();
-        let providers_models = Arc::clone(&self.providers_models);
-        let risk_profiles = Arc::clone(&self.risk_profiles);
-        let runtime_profiles = Arc::clone(&self.runtime_profiles);
-        let skill_bundles = Arc::clone(&self.skill_bundles);
-        let root_config = self.root_config.clone();
-        let caller_alias = self.caller_alias.clone();
-        let memory = self.memory.clone();
+        // Rebuild the delegate state for the spawned run BEFORE the spawn so the
+        // live-config handle is captured here (see `for_spawned_execution`). The
+        // target policy was resolved above; the per-run workspace and token belong
+        // to this task.
+        let inner = self.for_spawned_execution(
+            target_policy,
+            self.workspace_dir.clone(),
+            child_token.clone(),
+        );
         let parent_session_key = current_tool_loop_session_key();
         let __zc_delegate_alias = agent_name_owned.clone();
 
         zeroclaw_spawn::spawn!(
             scope_delegate_session_key(parent_session_key, async move {
-                let inner = DelegateTool {
-                    agents,
-                    security,
-                    global_credential,
-                    provider_runtime_options,
-                    depth,
-                    parent_tools,
-                    runtime,
-                    multimodal_config,
-                    delegate_config,
-                    workspace_dir: workspace_dir.clone(),
-                    cancellation_token: child_token.clone(),
-                    memory,
-                    providers_models,
-                    risk_profiles,
-                    runtime_profiles,
-                    skill_bundles,
-                    live_config: None,
-                    root_config,
-                    caller_alias,
-                };
-
                 let args_inner = json!({
                     "agent": agent_name_owned,
                     "prompt": full_prompt,
@@ -1789,57 +1803,24 @@ impl DelegateTool {
         // Spawn all agents concurrently
         let mut handles = Vec::with_capacity(agent_names.len());
         for agent_name in &agent_names {
-            let agents = Arc::clone(&self.agents);
-            let security = Arc::clone(&self.security);
-            let global_credential = self.global_credential.clone();
-            let provider_runtime_options = self.provider_runtime_options.clone();
-            // Monotonic descent on the parallel path — was `self.depth` (verbatim copy),
-            // leaving the `>= max_depth` check inert (see the background path above).
-            // Behavior change: deep parallel re-delegation now saturates at `max_delegation_depth`.
-            let depth = self.depth + 1;
-            let parent_tools = Arc::clone(&self.parent_tools);
-            let runtime = self.runtime.clone();
-            let multimodal_config = self.multimodal_config.clone();
-            let delegate_config = self.delegate_config.clone();
-            let workspace_dir = self.workspace_dir.clone();
-            let cancellation_token = self.cancellation_token.child_token();
             let agent_name = agent_name.clone();
             let prompt = prompt.to_string();
             let args_clone = args.clone();
-            let providers_models = Arc::clone(&self.providers_models);
-            let risk_profiles = Arc::clone(&self.risk_profiles);
-            let runtime_profiles = Arc::clone(&self.runtime_profiles);
-            let skill_bundles = Arc::clone(&self.skill_bundles);
             let receipt_scope = parent_receipt_scope.clone();
-            let root_config = self.root_config.clone();
-            let caller_alias = self.caller_alias.clone();
             let session_key = parent_session_key.clone();
-            let memory = self.memory.clone();
             let __zc_delegate_alias = agent_name.clone();
+            // Rebuild the delegate state for the spawned run BEFORE the spawn so the
+            // live-config handle is captured here (see `for_spawned_execution`). The
+            // parallel fan-out keeps the caller's policy; the per-run workspace and
+            // token belong to this fan-out.
+            let inner = self.for_spawned_execution(
+                Arc::clone(&self.security),
+                self.workspace_dir.clone(),
+                self.cancellation_token.child_token(),
+            );
 
             handles.push(zeroclaw_spawn::spawn!(
                 async move {
-                    let inner = DelegateTool {
-                        agents,
-                        security,
-                        global_credential,
-                        provider_runtime_options,
-                        depth,
-                        parent_tools,
-                        runtime,
-                        multimodal_config,
-                        delegate_config,
-                        workspace_dir,
-                        cancellation_token,
-                        memory,
-                        providers_models,
-                        risk_profiles,
-                        runtime_profiles,
-                        skill_bundles,
-                        root_config,
-                        live_config: None,
-                        caller_alias,
-                    };
                     let agent_name_for_return = agent_name.clone();
                     let result = scope_delegate_session_key(session_key, async move {
                         crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
@@ -7658,6 +7639,140 @@ mod tests {
         assert!(
             !second.iter().any(|t| t.name() == "image_gen"),
             "independent delegate must observe the live config revocation: image_gen \
+             must be dropped when the live allowlist is malformed (snapshot fallback \
+             would keep it registered)"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawned_delegate_rebuild_observes_live_config_revocation() {
+        // Regression for the reviewer finding that the `execute_background` and
+        // `execute_parallel` spawn paths rebuilt their inner `DelegateTool` with
+        // `live_config: None`, so an independent agentic target launched with
+        // `background: true` or through `parallel` fell back to the
+        // construction-time `root_config` snapshot and could retain a revoked
+        // `image_gen.allowed_private_hosts` carve-out. Both spawn paths now build
+        // that inner tool through `for_spawned_execution`; this test drives the
+        // seam and proves the spawned delegate keeps observing the canonical live
+        // config rather than the snapshot.
+        //
+        // Observable: `ImageGenTool::new_with_config_resolver` validates the
+        // allowlist at construction, so whether `image_gen` registers in the
+        // independent target's registry reveals which allowlist source the
+        // spawned delegate read.
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, ImageGenConfig, RiskProfileConfig, RuntimeProfileConfig,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        // Snapshot carries a LEGAL allowlist, so a reverted wiring (snapshot
+        // fallback) would always register image_gen and this test would fail on
+        // the malformed-live case below.
+        config.image_gen = ImageGenConfig {
+            enabled: true,
+            default_model: "fal-ai/flux/schnell".into(),
+            api_key_env: "FAL_API_KEY".into(),
+            allowed_private_hosts: vec!["127.0.0.1".into()],
+        };
+        config.risk_profiles.insert(
+            "caller".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                allowed_tools: vec!["echo_tool".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "target".to_string(),
+            RiskProfileConfig {
+                allowed_tools: vec!["image_gen".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.runtime_profiles.insert(
+            "agentic".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "caller".into(),
+                model_provider: "ollama.caller".into(),
+                delegates: vec![DelegateTargetConfig {
+                    agent: "target".to_string(),
+                    mode: DelegateExecutionMode::Independent,
+                }],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "target".into(),
+                runtime_profile: "agentic".into(),
+                model_provider: "ollama.target".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let config = Arc::new(config);
+        // The live handle starts as a clone of the (legal) snapshot config.
+        let live = Arc::new(RwLock::new((*config).clone()));
+
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let tool = DelegateTool::new(config.agents.clone(), None, Arc::clone(&caller_policy))
+            .with_root_config(Arc::clone(&config))
+            .with_live_config(Some(Arc::clone(&live)))
+            .with_caller_alias("caller")
+            .with_runtime(Arc::new(DelegateTestRuntime))
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+
+        // Rebuild the delegate state exactly as `execute_background` /
+        // `execute_parallel` do before their spawn (`for_spawned_execution`
+        // is the single construction site both paths use).
+        let spawned = tool.for_spawned_execution(
+            Arc::clone(&caller_policy),
+            tool.workspace_dir.clone(),
+            tool.cancellation_token.child_token(),
+        );
+
+        async fn build_target(tool: &DelegateTool) -> Vec<Box<dyn Tool>> {
+            let target_policy = tool
+                .policy_for_target("target")
+                .expect("independent target policy resolves");
+            tool.independent_agentic_tools_for_target("target", target_policy)
+                .await
+                .expect("target-owned registry builds")
+                .tools
+        }
+
+        // Legal live allowlist → image_gen registers in the independent target.
+        let first = build_target(&spawned).await;
+        assert!(
+            first.iter().any(|t| t.name() == "image_gen"),
+            "spawned delegate must register image_gen with a legal live allowlist"
+        );
+
+        // Mutate the shared live config to a MALFORMED allowlist. The snapshot
+        // `root_config` still carries the legal entry, so a reverted spawn
+        // (inner `live_config: None`) would keep image_gen registered and this
+        // assertion would fail.
+        live.write().image_gen.allowed_private_hosts = vec!["bad entry with space".into()];
+        let second = build_target(&spawned).await;
+        assert!(
+            !second.iter().any(|t| t.name() == "image_gen"),
+            "spawned delegate must observe the live config revocation: image_gen \
              must be dropped when the live allowlist is malformed (snapshot fallback \
              would keep it registered)"
         );
