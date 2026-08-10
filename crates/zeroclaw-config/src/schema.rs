@@ -13901,7 +13901,7 @@ pub struct TelegramConfig {
     /// conversation context regardless of which member writes. Sharing the
     /// session shares its session-scoped controls too: any member's `/new`
     /// resets the shared history for the whole group/topic, and a member's
-    /// session-level `/model` route override applies to everyone in it —
+    /// session-level `/model` route override applies to everyone in it,
     /// while `/stop` and message debouncing stay personal to each sender.
     /// 1-on-1 chats are unaffected (chat_id is already unique per user-bot
     /// pair).
