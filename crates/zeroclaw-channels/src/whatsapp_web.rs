@@ -426,6 +426,21 @@ impl WhatsAppWebChannel {
         let sender = sender_jid.user().to_string();
         let chat = info.source.chat.to_string();
 
+        // Use the native WhatsApp message id so that ack_reactions
+        // (add_reaction/remove_reaction) can build a correct MessageKey
+        // targeting the inbound message. Fall back to a UUID when the
+        // id is missing (should be rare).
+        let native_msg_id = if info.id.is_empty() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "WhatsApp message missing native id, falling back to UUID"
+            );
+            uuid::Uuid::new_v4().to_string()
+        } else {
+            info.id.clone()
+        };
+
         let allowed_peers = (context.peer_resolver)();
         let sender_resolution = Self::resolve_sender_allowlist(
             client,
@@ -646,6 +661,7 @@ impl WhatsAppWebChannel {
                 Vec::new(),
                 true,
                 conversation_scope,
+                native_msg_id,
             )
             .await;
             return;
@@ -732,6 +748,7 @@ impl WhatsAppWebChannel {
             attachments,
             false,
             conversation_scope,
+            native_msg_id,
         )
         .await;
     }
@@ -1276,10 +1293,11 @@ impl WhatsAppWebChannel {
         attachments: Vec<MediaAttachment>,
         passive_context: bool,
         conversation_scope: ChannelConversationScope,
+        id: String,
     ) {
         if let Err(e) = tx
             .send(ChannelMessage {
-                id: uuid::Uuid::new_v4().to_string(),
+                id,
                 channel: "whatsapp".to_string(),
                 channel_alias: Some(alias.to_string()),
                 sender: sender.to_string(),
