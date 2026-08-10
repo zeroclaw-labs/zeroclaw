@@ -26,7 +26,7 @@ pub(crate) fn record_llm_failure(
     };
     ctx.observer.record_event(&ObserverEvent::LlmResponse {
         model_provider: ctx.provider_name.to_string(),
-        model: ctx.model.to_string(),
+        model: ctx.model.clone(),
         duration: llm_started_at.elapsed(),
         success: false,
         error_message: Some(safe_error.clone()),

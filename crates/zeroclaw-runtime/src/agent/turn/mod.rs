@@ -76,6 +76,7 @@ use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_api::agent::TurnEvent;
 use zeroclaw_api::channel::Channel;
+use zeroclaw_api::hook::HookResult;
 use zeroclaw_api::ingress::{IngressContext, IngressDecision};
 use zeroclaw_providers::{ChatMessage, ModelProvider};
 
@@ -230,6 +231,32 @@ impl<'a> TurnState<'a> {
         self.synced = self.canonical.as_ref().map_or(0, |c| c.len());
     }
 
+    /// Take the not-yet-synced canonical messages (for the hook to mutate).
+    /// Returns an empty vec when canonical is absent.
+    fn take_pending(&mut self) -> Vec<ChatMessage> {
+        match self.canonical {
+            Some(ref mut canonical) => {
+                if self.synced > canonical.len() {
+                    self.synced = 0;
+                }
+                canonical.split_off(self.synced)
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// Write a batch of messages to both buffers and solidify them into
+    /// history. With a canonical buffer the messages are appended to it and
+    /// its not-yet-synced tail (including these messages) is cloned into
+    /// history; without one they go straight into history.
+    fn extend_dual(&mut self, msgs: Vec<ChatMessage>) {
+        match self.canonical {
+            Some(ref mut canonical) => canonical.extend(msgs),
+            None => self.history.extend(msgs),
+        }
+        self.sync_pending();
+    }
+
     /// Advance the cursor past all current canonical messages.  Call after
     /// external code modifies both buffers (e.g. `drive_live_sop_actions`).
     fn mark_all_synced(&mut self) {
@@ -281,6 +308,40 @@ impl<'a> TurnState<'a> {
         *self.history = history;
         result
     }
+
+    /// Locate the last user message: canonical first, then history. Used by
+    /// `ingress_policy` to read the original user input.
+    fn last_user_text(&self) -> Option<&str> {
+        if let Some(ref canonical) = self.canonical
+            && let Some(m) = canonical.iter().rev().find(|m| m.role == "user")
+        {
+            return Some(m.content.as_str());
+        }
+        self.history
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .map(|m| m.content.as_str())
+    }
+
+    /// Return the search start index for `memory_inject`. Not a precise
+    /// position — the injector walks forward from here to the first user
+    /// message. Called pre-loop (before sync).
+    /// - canonical has a user → that user syncs to `history[old len]`,
+    ///   so return `history.len()`.
+    /// - canonical empty/None/no user → the user is already in history;
+    ///   return the last user index (a direct hit).
+    fn initial_user_mark(&self) -> usize {
+        if let Some(ref canonical) = self.canonical
+            && canonical.iter().any(|m| m.role == "user")
+        {
+            return self.history.len();
+        }
+        self.history
+            .iter()
+            .rposition(|m| m.role == "user")
+            .unwrap_or(0)
+    }
 }
 
 pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
@@ -316,7 +377,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             ResolvedModelAccess {
                 model_provider,
                 provider_name,
-                model,
+                model: initial_model,
                 temperature,
             },
         tools_registry,
@@ -340,17 +401,15 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         knobs,
     } = exec;
 
+    // Mutable model — hooks may modify it. Start from the resolved model.
+    let mut model = initial_model.to_string();
+
     let mut turn_state = TurnState::new(raw_history, raw_canonical);
 
-    turn_state.sync_pending();
-
     let ingress_policy_cfg = IngressPolicy::default();
-    let p1_text = turn_state
-        .history
-        .iter()
-        .rev()
-        .find(|m| m.role == "user")
-        .map_or("", |m| m.content.as_str());
+
+    // ingress_policy reads the original p1 (canonical first, history fallback).
+    let p1_text = turn_state.last_user_text().unwrap_or("");
     match ingress_policy(p1_text, &ingress, &ingress_policy_cfg) {
         // DEFAULT — the only arm reachable under the default policy. Proceed
         // into the loop exactly as today.
@@ -372,44 +431,8 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         }
     }
 
-    if let Some(turn_memory) = &memory {
-        let has_session = turn_memory.sessions.iter().any(Option::is_some);
-        if let crate::agent::memory_inject::InjectPolicy::Inject {
-            exclude_conversation,
-        } = crate::agent::memory_inject::resolve_inject_policy(
-            ingress.origin,
-            has_session,
-            turn_memory.suppress,
-        ) && let Some(last_user_idx) = turn_state.history.iter().rposition(|m| m.role == "user")
-            // Idempotence: a model-switch retry re-enters the engine with the
-            // same history; the preamble must not stack.
-            && !turn_state.history[last_user_idx]
-                .content
-                .starts_with(zeroclaw_memory::MEMORY_CONTEXT_OPEN)
-        {
-            let scopes: Vec<Option<&str>> =
-                turn_memory.sessions.iter().map(|s| s.as_deref()).collect();
-            let context = crate::agent::memory_inject::render_memory_context(
-                turn_memory.handle,
-                observer,
-                &turn_memory.query,
-                &scopes,
-                &turn_memory.cfg,
-                exclude_conversation,
-                TurnMeta {
-                    agent_alias,
-                    parent_agent_alias,
-                    turn_id,
-                    channel_name,
-                },
-            )
-            .await;
-            if !context.is_empty() {
-                let existing = &turn_state.history[last_user_idx].content;
-                turn_state.history[last_user_idx].content = format!("{context}{existing}");
-            }
-        }
-    }
+    // Search start for memory_inject (computed pre-sync, used after round-0 sync).
+    let memory_mark = turn_state.initial_user_mark();
 
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -442,10 +465,10 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
     // Shared-ref context for the turn step functions. Every `&mut` the loop
     // owns stays a loop local passed as an explicit argument (RUN_SHEET
     // `turn.context.TurnCtx`).
-    let ctx = TurnCtx {
+    let mut ctx = TurnCtx {
         observer,
         provider_name,
-        model,
+        model: model.clone(),
         temperature,
         approval,
         channel_name,
@@ -471,6 +494,10 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         std::collections::HashMap::new();
 
     for iteration in 0..max_iterations {
+        // Collect steering for this round (every iteration, so nothing is
+        // delayed). The hook sees the not-yet-synced canonical delta plus
+        // these steering messages as its mutable `new_messages`.
+        let mut steering_msgs: Vec<ChatMessage> = Vec::new();
         for steering_message in drain_steering_messages(&mut steering) {
             match ingress_policy(&steering_message, &ingress, &ingress_policy_cfg) {
                 // DEFAULT — append the injection to history exactly as today.
@@ -488,8 +515,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 // (do not append it) when it is.
                 IngressDecision::Drop { .. } => continue,
             }
-            let msg = ChatMessage::user(steering_message);
-            turn_state.push_dual(msg);
+            steering_msgs.push(ChatMessage::user(steering_message));
         }
 
         let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
@@ -498,7 +524,72 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             .as_ref()
             .is_some_and(CancellationToken::is_cancelled)
         {
+            // Persist this round's steering and any pending canonical before
+            // the cancelled return.
+            turn_state.extend_dual(steering_msgs);
             return Err(ToolLoopCancelled.into());
+        }
+
+        // ═══ before_llm_call hook ═══
+        // Runs after cancellation (a cancelled turn never fires a hook) but
+        // before budget/trimming so hook-added messages survive early exits
+        // and reach the budget estimate. `new_messages` is the not-yet-synced
+        // canonical delta plus this round's steering — the true unsent delta.
+        let mut pending = turn_state.take_pending();
+        pending.extend(steering_msgs);
+        if let Some(hooks) = hooks
+            && let HookResult::Cancel(reason) = hooks
+                .run_before_llm_call(turn_state.history, &mut pending, &mut model)
+                .await
+        {
+            anyhow::bail!("before_llm_call hook cancelled: {reason}");
+        }
+
+        // Write back the hook-modified messages and solidify them into
+        // history.
+        turn_state.extend_dual(pending);
+
+        // ═══ memory_inject (round 0 only, after sync) ═══
+        // Inject memory context into the original user message, not steering.
+        // The user message is found by walking forward from `memory_mark`.
+        if iteration == 0
+            && let Some(turn_memory) = &memory
+        {
+            let has_session = turn_memory.sessions.iter().any(Option::is_some);
+            if let crate::agent::memory_inject::InjectPolicy::Inject {
+                exclude_conversation,
+            } = crate::agent::memory_inject::resolve_inject_policy(
+                ingress.origin,
+                has_session,
+                turn_memory.suppress,
+            ) && let Some(idx) = (memory_mark..turn_state.history.len())
+                .find(|&i| turn_state.history[i].role == "user")
+                && !turn_state.history[idx]
+                    .content
+                    .starts_with(zeroclaw_memory::MEMORY_CONTEXT_OPEN)
+            {
+                let scopes: Vec<Option<&str>> =
+                    turn_memory.sessions.iter().map(|s| s.as_deref()).collect();
+                let context = crate::agent::memory_inject::render_memory_context(
+                    turn_memory.handle,
+                    observer,
+                    &turn_memory.query,
+                    &scopes,
+                    &turn_memory.cfg,
+                    exclude_conversation,
+                    TurnMeta {
+                        agent_alias,
+                        parent_agent_alias,
+                        turn_id,
+                        channel_name,
+                    },
+                )
+                .await;
+                if !context.is_empty() {
+                    let existing = &turn_state.history[idx].content;
+                    turn_state.history[idx].content = format!("{context}{existing}");
+                }
+            }
         }
 
         // Shared iteration budget: parent + subagents share a global counter
@@ -608,7 +699,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         if let Some(ref callback) = model_switch_callback
             && let Ok(guard) = callback.lock()
             && let Some((new_model_provider, new_model)) = guard.as_ref()
-            && (new_model_provider != provider_name || new_model != model)
+            && (new_model_provider != provider_name || *new_model != model)
         {
             ::zeroclaw_log::record!(
                 INFO,
@@ -639,7 +730,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             turn_state.history,
             multimodal_config,
             provider_name,
-            model,
+            &model,
         )?;
 
         let (active_model_provider, active_model_provider_name, active_model): (
@@ -653,8 +744,13 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 resolved.model.as_str(),
             )
         } else {
-            (model_provider, provider_name, model)
+            (model_provider, provider_name, &model)
         };
+        // Sync the effective dispatch model to ctx so downstream functions
+        // (provider call, on_llm_input, cost accounting, observers) read the
+        // same model that is actually dispatched — the hook-modified model,
+        // or the vision-resolved model when vision routing activated.
+        ctx.model = active_model.to_string();
         iteration_tool_specs.refresh_native_tool_mode(active_model_provider);
         let IterationToolSpecs {
             ref tool_specs,
@@ -1126,7 +1222,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             &loop_ignore_tools,
             max_tool_result_chars,
             collected_receipts,
-            model,
+            &model,
             iteration,
             turn_id,
         )?;
@@ -1138,7 +1234,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 pacing,
                 &mut consecutive_identical_outputs,
                 &mut last_tool_output_hash,
-                model,
+                &model,
                 iteration,
                 turn_id,
             )?;
@@ -1166,7 +1262,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 turn_state.history,
                 model_provider,
                 provider_name,
-                model,
+                &model,
                 temperature,
                 tools_registry,
                 observer,
@@ -1222,7 +1318,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         model_provider,
         turn_state.history,
         provider_name,
-        model,
+        &model,
         temperature,
         pacing,
         cancellation_token.as_ref(),
@@ -3669,6 +3765,475 @@ mod sop_step_reassembly_tests {
             step.output.contains("child-provider") && step.output.contains("child-model"),
             "the step failure must name the CHILD's own requested switch: {}",
             step.output
+        );
+    }
+}
+
+#[cfg(test)]
+mod before_llm_call_hook_tests {
+    use super::*;
+    use crate::hooks::HookRunner;
+    use crate::observability::NoopObserver;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use zeroclaw_api::hook::{HookHandler, HookResult};
+    use zeroclaw_config::schema::{MultimodalConfig, PacingConfig};
+    use zeroclaw_providers::{ChatRequest, ChatResponse, ToolCall};
+
+    // ── test helpers ────────────────────────────────────────────────────
+
+    /// Provider that returns a final text immediately (no tool calls),
+    /// causing the loop to exit after a single LLM invocation.
+    struct OneShotProvider;
+
+    impl zeroclaw_api::attribution::Attributable for OneShotProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "OneShotProvider"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for OneShotProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("final answer".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            Ok(ChatResponse {
+                text: Some("final answer".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    /// Hook that records how many times `before_llm_call` was called,
+    /// and optionally cancels.
+    struct RecordingHook {
+        call_count: Arc<AtomicUsize>,
+        should_cancel: AtomicBool,
+    }
+
+    impl RecordingHook {
+        fn new(cancel: bool) -> (Self, Arc<AtomicUsize>) {
+            let count = Arc::new(AtomicUsize::new(0));
+            (
+                Self {
+                    call_count: Arc::clone(&count),
+                    should_cancel: AtomicBool::new(cancel),
+                },
+                count,
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl HookHandler for RecordingHook {
+        fn name(&self) -> &str {
+            "recording-hook"
+        }
+
+        async fn before_llm_call(
+            &self,
+            _history: &[ChatMessage],
+            _new_messages: &mut Vec<ChatMessage>,
+            _model: &mut String,
+        ) -> HookResult<()> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            if self.should_cancel.load(Ordering::SeqCst) {
+                HookResult::Cancel("test cancel".into())
+            } else {
+                HookResult::Continue(())
+            }
+        }
+    }
+
+    // ── tests ───────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn hook_fires_before_first_llm_call() {
+        let (hook, call_count) = RecordingHook::new(false);
+        let mut runner = HookRunner::new();
+        runner.register(Box::new(hook));
+
+        let provider = OneShotProvider;
+        let empty_tools: &[Box<dyn crate::tools::Tool>] = &[];
+        let mm_cfg = MultimodalConfig::default();
+        let pacing_cfg = PacingConfig::default();
+        let knobs = LoopKnobs::default();
+        let mut history = vec![ChatMessage::user("hello")];
+
+        let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &provider,
+                    provider_name: "mock",
+                    model: "mock-model",
+                    temperature: None,
+                },
+                tools_registry: empty_tools,
+                observer: &NoopObserver {},
+                silent: true,
+                approval: None,
+                multimodal_config: &mm_cfg,
+                config: None,
+                max_tool_iterations: 5,
+                hooks: Some(&runner),
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &pacing_cfg,
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 30_000,
+                context_token_budget: 100_000,
+                receipt_generator: None,
+                knobs: &knobs,
+            },
+            history: &mut history,
+            channel_name: "cli",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            ingress: IngressContext::sub_turn(),
+            memory: None,
+            agent_alias: None,
+            turn_id: "test-turn",
+        })
+        .await;
+
+        assert!(result.is_ok(), "turn must succeed: {result:?}");
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "hook must fire exactly once before the first LLM call"
+        );
+    }
+
+    #[tokio::test]
+    async fn hook_cancel_aborts_turn() {
+        let (hook, call_count) = RecordingHook::new(true); // cancel
+        let mut runner = HookRunner::new();
+        runner.register(Box::new(hook));
+
+        let provider = OneShotProvider;
+        let empty_tools: &[Box<dyn crate::tools::Tool>] = &[];
+        let mm_cfg = MultimodalConfig::default();
+        let pacing_cfg = PacingConfig::default();
+        let knobs = LoopKnobs::default();
+        let mut history = vec![ChatMessage::user("hello")];
+
+        let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &provider,
+                    provider_name: "mock",
+                    model: "mock-model",
+                    temperature: None,
+                },
+                tools_registry: empty_tools,
+                observer: &NoopObserver {},
+                silent: true,
+                approval: None,
+                multimodal_config: &mm_cfg,
+                config: None,
+                max_tool_iterations: 5,
+                hooks: Some(&runner),
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &pacing_cfg,
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 30_000,
+                context_token_budget: 100_000,
+                receipt_generator: None,
+                knobs: &knobs,
+            },
+            history: &mut history,
+            channel_name: "cli",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            ingress: IngressContext::sub_turn(),
+            memory: None,
+            agent_alias: None,
+            turn_id: "test-turn",
+        })
+        .await;
+
+        assert!(result.is_err(), "turn must fail after cancel");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("before_llm_call hook cancelled"),
+            "error must mention hook cancellation: {err_msg}"
+        );
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "cancel must happen in the round-0 hook call"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_hooks_configured_behavior_unchanged() {
+        let provider = OneShotProvider;
+        let empty_tools: &[Box<dyn crate::tools::Tool>] = &[];
+        let mm_cfg = MultimodalConfig::default();
+        let pacing_cfg = PacingConfig::default();
+        let knobs = LoopKnobs::default();
+        let mut history = vec![ChatMessage::user("hello")];
+
+        let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &provider,
+                    provider_name: "mock",
+                    model: "mock-model",
+                    temperature: None,
+                },
+                tools_registry: empty_tools,
+                observer: &NoopObserver {},
+                silent: true,
+                approval: None,
+                multimodal_config: &mm_cfg,
+                config: None,
+                max_tool_iterations: 5,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &pacing_cfg,
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 30_000,
+                context_token_budget: 100_000,
+                receipt_generator: None,
+                knobs: &knobs,
+            },
+            history: &mut history,
+            channel_name: "cli",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            ingress: IngressContext::sub_turn(),
+            memory: None,
+            agent_alias: None,
+            turn_id: "test-turn",
+        })
+        .await;
+
+        assert!(result.is_ok(), "turn must succeed without hooks");
+        assert_eq!(
+            result.unwrap(),
+            "final answer",
+            "provider response must reach caller"
+        );
+    }
+
+    /// Provider that returns one tool call, then a final answer (2 rounds).
+    struct OneToolThenFinalProvider;
+
+    impl zeroclaw_api::attribution::Attributable for OneToolThenFinalProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "OneToolThenFinalProvider"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for OneToolThenFinalProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("unused".to_string())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            let has_tool_message = request.messages.iter().any(|m| m.role == "tool");
+            if has_tool_message {
+                Ok(ChatResponse {
+                    text: Some("final after tool".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                })
+            } else {
+                Ok(ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call_1".to_string(),
+                        name: "echo".to_string(),
+                        arguments: "{}".to_string(),
+                        extra_content: None,
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+    }
+
+    /// Minimal tool that returns a success result, used to drive
+    /// the loop past round 0.
+    struct EchoTool;
+
+    zeroclaw_api::tool_attribution!(EchoTool, zeroclaw_api::attribution::ToolKind::Plugin);
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for EchoTool {
+        fn name(&self) -> &str {
+            "echo"
+        }
+        fn description(&self) -> &str {
+            "echo"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "echo-out".into(),
+                error: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn loop_hook_fires_on_round_1_without_steering() {
+        let (hook, call_count) = RecordingHook::new(false);
+        let mut runner = HookRunner::new();
+        runner.register(Box::new(hook));
+
+        let provider = OneToolThenFinalProvider;
+        let tools: Vec<Box<dyn crate::tools::Tool>> = vec![Box::new(EchoTool)];
+        let mm_cfg = MultimodalConfig::default();
+        let pacing_cfg = PacingConfig::default();
+        let knobs = LoopKnobs::default();
+        let mut history = vec![ChatMessage::user("hello")];
+
+        let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &provider,
+                    provider_name: "mock",
+                    model: "mock-model",
+                    temperature: None,
+                },
+                tools_registry: &tools,
+                observer: &NoopObserver {},
+                silent: true,
+                approval: None,
+                multimodal_config: &mm_cfg,
+                config: None,
+                max_tool_iterations: 5,
+                hooks: Some(&runner),
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &pacing_cfg,
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 30_000,
+                context_token_budget: 100_000,
+                receipt_generator: None,
+                knobs: &knobs,
+            },
+            history: &mut history,
+            channel_name: "cli",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            ingress: IngressContext::sub_turn(),
+            memory: None,
+            agent_alias: None,
+            turn_id: "test-turn",
+        })
+        .await;
+
+        assert!(result.is_ok(), "turn must succeed: {result:?}");
+        // Round 0 fires once (canonical + no steering). Round 1 fires again
+        // (new tool results, even without steering) — one invocation per LLM
+        // dispatch.
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            2,
+            "round-0 (1) + round-1 (1) = 2 hook calls"
         );
     }
 }

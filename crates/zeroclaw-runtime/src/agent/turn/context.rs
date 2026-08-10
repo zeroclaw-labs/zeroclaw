@@ -13,7 +13,7 @@ use zeroclaw_config::schema::PacingConfig;
 pub(crate) struct TurnCtx<'a> {
     pub(crate) observer: &'a dyn Observer,
     pub(crate) provider_name: &'a str,
-    pub(crate) model: &'a str,
+    pub(crate) model: String,
     pub(crate) temperature: Option<f64>,
     pub(crate) approval: Option<&'a ApprovalManager>,
     pub(crate) channel_name: &'a str,

@@ -194,12 +194,13 @@ impl HookRunner {
 
     pub async fn run_before_llm_call(
         &self,
-        messages: &mut Vec<ChatMessage>,
+        history: &[ChatMessage],
+        new_messages: &mut Vec<ChatMessage>,
         model: &mut String,
     ) -> HookResult<()> {
         for h in &self.handlers {
             let hook_name = h.name();
-            match AssertUnwindSafe(h.before_llm_call(messages, model))
+            match AssertUnwindSafe(h.before_llm_call(history, new_messages, model))
                 .catch_unwind()
                 .await
             {
@@ -525,7 +526,8 @@ mod tests {
 
         async fn before_llm_call(
             &self,
-            _messages: &mut Vec<ChatMessage>,
+            _history: &[ChatMessage],
+            _new_messages: &mut Vec<ChatMessage>,
             _model: &mut String,
         ) -> HookResult<()> {
             panic!("simulated before_llm_call panic");
@@ -556,7 +558,8 @@ mod tests {
 
         async fn before_llm_call(
             &self,
-            _messages: &mut Vec<ChatMessage>,
+            _history: &[ChatMessage],
+            _new_messages: &mut Vec<ChatMessage>,
             _model: &mut String,
         ) -> HookResult<()> {
             HookResult::Cancel("blocked by non-prompt cancel hook".into())
@@ -699,7 +702,8 @@ mod tests {
             }
             async fn before_llm_call(
                 &self,
-                _messages: &mut Vec<ChatMessage>,
+                _history: &[ChatMessage],
+                _new_messages: &mut Vec<ChatMessage>,
                 _model: &mut String,
             ) -> HookResult<()> {
                 self.count.fetch_add(1, Ordering::SeqCst);
@@ -714,12 +718,18 @@ mod tests {
             count: Arc::clone(&count),
         }));
 
-        let mut messages = vec![ChatMessage {
+        let history = vec![ChatMessage {
+            role: "system".into(),
+            content: "sys".into(),
+        }];
+        let mut new_messages = vec![ChatMessage {
             role: "user".into(),
             content: "hi".into(),
         }];
-        let mut model = "gpt-4o".into();
-        let result = runner.run_before_llm_call(&mut messages, &mut model).await;
+        let mut model = "gpt-4o".to_string();
+        let result = runner
+            .run_before_llm_call(&history, &mut new_messages, &mut model)
+            .await;
 
         assert!(
             result.is_cancel(),

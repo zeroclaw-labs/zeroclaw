@@ -101,7 +101,7 @@ pub(crate) async fn announce_llm_request(
 
     // Fire void hook before LLM call
     if let Some(hooks) = ctx.hooks {
-        hooks.fire_llm_input(history, ctx.model).await;
+        hooks.fire_llm_input(history, &ctx.model).await;
     }
 
     llm_started_at
@@ -338,7 +338,7 @@ mod payload_capture_tests {
             parent_agent_alias: None,
             observer,
             provider_name: "stub",
-            model: "stub-model",
+            model: "stub-model".to_string(),
             temperature: None,
             approval: None,
             channel_name: "test",

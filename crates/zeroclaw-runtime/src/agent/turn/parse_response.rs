@@ -136,7 +136,7 @@ pub(crate) async fn interpret_chat_response(
 
     ctx.observer.record_event(&ObserverEvent::LlmResponse {
         model_provider: ctx.provider_name.to_string(),
-        model: ctx.model.to_string(),
+        model: ctx.model.clone(),
         duration: llm_started_at.elapsed(),
         success: true,
         error_message: None,
@@ -154,7 +154,7 @@ pub(crate) async fn interpret_chat_response(
     let call_cost_usd = resp
         .usage
         .as_ref()
-        .and_then(|usage| record_tool_loop_cost_usage(ctx.provider_name, ctx.model, usage))
+        .and_then(|usage| record_tool_loop_cost_usage(ctx.provider_name, &ctx.model, usage))
         .map(|(_total_tokens, cost_usd)| cost_usd);
 
     // Per-LLM-call usage event, right after the observer success event
@@ -461,7 +461,7 @@ mod cost_usd_regression_tests {
             parent_agent_alias: None,
             observer: &crate::observability::NoopObserver,
             provider_name: provider,
-            model,
+            model: model.to_string(),
             temperature: None,
             approval: None,
             channel_name: "",
