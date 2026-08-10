@@ -1,4 +1,6 @@
 pub mod dora;
+#[cfg(feature = "observability-langfuse")]
+pub mod langfuse;
 pub mod log;
 pub mod multi;
 pub mod noop;
@@ -18,6 +20,8 @@ pub use self::log::LogObserver;
 pub use self::multi::MultiObserver;
 #[cfg(feature = "observability-otel")]
 use self::otel_config::OtelContentConfig;
+#[cfg(feature = "observability-langfuse")]
+pub use langfuse::LangfuseObserver;
 pub use noop::NoopObserver;
 #[cfg(feature = "observability-otel")]
 pub use otel::OtelObserver;
