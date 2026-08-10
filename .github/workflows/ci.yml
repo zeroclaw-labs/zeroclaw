@@ -357,6 +357,15 @@ jobs:
             args: --workspace --exclude zeroclaw-desktop --no-default-features
             sys_deps: ""
             rustflags: -D warnings
+          # Lint already denies warnings with --all-targets, but only at
+          # --features ci-all. Feature-gated call sites are live there, so a
+          # helper whose gate is wider than its callers reads as used and the
+          # drift lands green. This row compiles the test targets on the
+          # default surface, where that mismatch is visible.
+          - name: default features, all targets
+            args: --workspace --exclude zeroclaw-desktop --all-targets
+            sys_deps: ""
+            rustflags: -D warnings
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
