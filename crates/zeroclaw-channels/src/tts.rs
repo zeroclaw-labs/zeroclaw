@@ -446,7 +446,12 @@ fn graceful_kill(child: &mut tokio::process::Child) {
 /// local-unlink); the pending-reap branch removes it inside the reaper thread.
 /// If the OS refuses to create the reaper thread (resource pressure), `Drop`
 /// recovers the still-owned child and reaps inline so the artifact is still
-/// removed rather than leaked.
+/// removed rather than leaked. That rare fallback is synchronous and bounded:
+/// it performs the same bounded wait and hard-kill escalation on the calling
+/// thread, so under thread exhaustion a cancelled synthesis can occupy the
+/// dropping task for up to [`EDGE_TTS_REAP_GRACE`] instead of parking the reap
+/// off-worker. This is the accepted tradeoff for the exceptional no-thread
+/// case; the normal spawn-success path never blocks a worker.
 struct EdgeTtsTempArtifact {
     path: PathBuf,
     child: Option<tokio::process::Child>,
