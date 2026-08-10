@@ -255,12 +255,21 @@ async fn enforce_reported_budget(
     context_token_budget: usize,
     event_tx: Option<&tokio::sync::mpsc::Sender<TurnEvent>>,
     observer: &dyn crate::observability::Observer,
+    // The multimodal boundary the NEXT request will re-normalize retained
+    // history through. A short `[IMAGE:...]` marker in raw history can become a
+    // large base64 provider payload, so selection and the recount must describe
+    // the same provider-facing population actually sent next — not the raw
+    // transcript the marker-only estimate sees.
+    multimodal_config: &zeroclaw_config::schema::MultimodalConfig,
+    degrade_strip_images: bool,
+    mut image_cache: Option<&mut zeroclaw_providers::multimodal::LocalImageCache>,
 ) {
     if context_token_budget == 0 || reported_input_tokens <= context_token_budget {
         return;
     }
     let pre_trim_estimated = reported_population_estimated;
     let taken = std::mem::take(history);
+    let taken_len = taken.len();
     let mut result = crate::agent::history_trim::trim_to_reported_budget(
         taken,
         context_token_budget,
@@ -268,17 +277,76 @@ async fn enforce_reported_budget(
         reported_population_estimated,
         tool_schema_tokens,
     );
-    if result.trimmed {
-        let mut trimmed = result.history;
+    let mut trimmed = result.history;
+    let mut trimmed_any = result.trimmed;
+    let ratio = reported_input_tokens as f64 / pre_trim_estimated.max(1) as f64;
+    // Re-trim against the provider-facing population. The initial raw-based
+    // selection can no-op (or under-trim) when image markers make the raw
+    // estimate look small: a short `[IMAGE:...]` marker in raw history becomes a
+    // large base64 provider payload on the next request. Re-normalize the
+    // retained set through the multimodal boundary; while the calibrated
+    // prepared count still exceeds the budget, drop the oldest whole turn and
+    // re-check, stopping at the newest-turn/schema floor rather than silently
+    // claiming it fits.
+    let mut tokens_after: usize;
+    loop {
+        let provider_facing = match prepare_messages_for_iteration(
+            &trimmed,
+            multimodal_config,
+            degrade_strip_images,
+            image_cache.as_deref_mut(),
+        )
+        .await
+        {
+            Ok(prepared) => crate::agent::history::estimate_history_tokens(&prepared.messages),
+            // Preparation failure (e.g. a system-only history): fall back to the
+            // raw estimate so enforcement still runs.
+            Err(_) => crate::agent::history::estimate_history_tokens(&trimmed),
+        };
+        tokens_after = ((provider_facing + tool_schema_tokens) as f64 * ratio).round() as usize;
+        if tokens_after <= context_token_budget {
+            break;
+        }
+        let dropped = crate::agent::history_trim::drop_oldest_whole_turn(&mut trimmed);
+        if dropped == 0 {
+            break;
+        }
+        trimmed_any = true;
+    }
+    if trimmed_any || trimmed.len() < taken_len {
+        // The trim is real: insert the model-visible breadcrumb. It is part of
+        // the NEXT provider request, so recount the prepared retained
+        // population with it included and, if the crumb pushes the calibrated
+        // count over the budget, drop the oldest whole turn again (stopping at
+        // the newest-turn/schema floor).
         crate::agent::history_trim::insert_breadcrumb_deduped(&mut trimmed);
-        // Recompute the calibrated post-trim count from the final provider
-        // history (breadcrumb included) so `tokens_after` describes exactly
-        // what is sent, not the pre-breadcrumb kept set.
-        let ratio = reported_input_tokens as f64 / pre_trim_estimated.max(1) as f64;
-        result.tokens_after = ((crate::agent::history::estimate_history_tokens(&trimmed)
-            + tool_schema_tokens) as f64
-            * ratio)
-            .round() as usize;
+        loop {
+            let provider_facing = match prepare_messages_for_iteration(
+                &trimmed,
+                multimodal_config,
+                degrade_strip_images,
+                image_cache.as_deref_mut(),
+            )
+            .await
+            {
+                Ok(prepared) => crate::agent::history::estimate_history_tokens(&prepared.messages),
+                Err(_) => crate::agent::history::estimate_history_tokens(&trimmed),
+            };
+            tokens_after = ((provider_facing + tool_schema_tokens) as f64 * ratio).round() as usize;
+            if tokens_after <= context_token_budget {
+                break;
+            }
+            let dropped = crate::agent::history_trim::drop_oldest_whole_turn(&mut trimmed);
+            if dropped == 0 {
+                break;
+            }
+        }
+        // Recompute the structural counts against the final retained set so the
+        // emitted event reflects the re-trim, not just the first raw pass. The
+        // breadcrumb adds one synthetic user message on top of `taken`'s count.
+        result.dropped_messages = taken_len.saturating_sub(trimmed.len().saturating_sub(1));
+        result.kept_turns = crate::agent::history_trim::count_turns(&trimmed).saturating_sub(1);
+        result.tokens_after = tokens_after;
         *history = trimmed;
         if let Some(tx) = event_tx {
             let _ = tx
@@ -290,7 +358,8 @@ async fn enforce_reported_budget(
                     tokens_before: Some(result.tokens_before as u64),
                     tokens_after: Some(result.tokens_after as u64),
                     // The pre-trim count is provider-reported; the post-trim
-                    // count is an estimate scaled to the provider figure.
+                    // count is an estimate of the prepared retained population
+                    // scaled to the provider figure.
                     tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Provider),
                     tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
                 })
@@ -312,7 +381,7 @@ async fn enforce_reported_budget(
             },
         );
     } else {
-        *history = result.history;
+        *history = trimmed;
     }
 }
 
@@ -1258,6 +1327,9 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     context_token_budget,
                     event_tx.as_ref(),
                     observer,
+                    multimodal_config,
+                    degrade_strip_images,
+                    image_cache.as_deref_mut(),
                 )
                 .await;
             }
@@ -1529,14 +1601,40 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         }
 
         if let Some(reported) = reported_input_tokens {
+            // Rebuild the tool specs for the NEXT iteration: `tool_search`
+            // may have activated deferred MCP tools during this round, and
+            // `build_iteration_tool_specs` only adds them on the following
+            // iteration. The post-tool trim must reserve that next
+            // provider-facing schema population, or a materially large newly
+            // activated schema can push the next request over the budget even
+            // though this iteration's reported-budget check passed.
+            let next_schema_tokens = match build_iteration_tool_specs(
+                model_provider,
+                tools_registry,
+                excluded_tools,
+                activated_tools,
+            ) {
+                Ok(mut next_specs) => {
+                    next_specs.refresh_native_tool_mode(active_model_provider);
+                    if next_specs.use_native_tools {
+                        crate::agent::history::estimate_tool_schema_tokens(&next_specs.tool_specs)
+                    } else {
+                        0
+                    }
+                }
+                Err(_) => tool_schema_tokens,
+            };
             enforce_reported_budget(
                 turn_state.history,
                 reported as usize,
                 reported_population_estimated,
-                tool_schema_tokens,
+                next_schema_tokens,
                 context_token_budget,
                 event_tx.as_ref(),
                 observer,
+                multimodal_config,
+                degrade_strip_images,
+                image_cache.as_deref_mut(),
             )
             .await;
         }
@@ -2617,6 +2715,9 @@ mod reported_budget_tests {
             budget,
             None,
             &NoopObserver,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            false,
+            None,
         )
         .await;
         assert!(
@@ -2647,6 +2748,9 @@ mod reported_budget_tests {
             estimated * 4,
             None,
             &NoopObserver,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            false,
+            None,
         )
         .await;
         let after: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
@@ -2682,6 +2786,9 @@ mod reported_budget_tests {
             0,
             None,
             &NoopObserver,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            false,
+            None,
         )
         .await;
         let after: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
@@ -2703,6 +2810,9 @@ mod reported_budget_tests {
             budget,
             Some(&tx),
             &NoopObserver,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            false,
+            None,
         )
         .await;
 
@@ -2760,6 +2870,9 @@ mod reported_budget_tests {
             budget,
             Some(&tx),
             &NoopObserver,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            false,
+            None,
         )
         .await;
 
@@ -2784,6 +2897,173 @@ mod reported_budget_tests {
         assert_eq!(
             tokens_after, expected,
             "calibration must use the measured-request population, not post-append history"
+        );
+    }
+
+    #[tokio::test]
+    async fn enforce_retrims_against_the_prepared_population_for_retained_images() {
+        // An `[IMAGE:...]` marker is a short string in raw history, but the
+        // prepared provider request expands it into a large base64 payload.
+        // Selection and the emitted recount must describe that provider-facing
+        // population, not the raw marker: a reported over-budget request with a
+        // retained image must actually trim, and `tokens_after` must match the
+        // next provider request (prepared retained messages + schemas), even
+        // when the raw marker-only estimate looks small.
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("shot.png");
+        // Minimal PNG signature — enough for MIME detection.
+        std::fs::write(
+            &image_path,
+            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+        )
+        .unwrap();
+        let marker = format!("[IMAGE:{}]", image_path.display());
+        let big = "x".repeat(2000);
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user(format!("turn1 {marker}")),
+            ChatMessage::assistant("a1".to_string()),
+            ChatMessage::user(format!("turn2 {big}")),
+            ChatMessage::assistant("a2".to_string()),
+            ChatMessage::user("turn3 short".to_string()),
+            ChatMessage::assistant("final answer".to_string()),
+        ];
+        let config = zeroclaw_config::schema::MultimodalConfig::default();
+        let mut image_cache = zeroclaw_providers::multimodal::LocalImageCache::new();
+        // The measured population is the PREPARED one, exactly as the runtime
+        // measures it (`reported_population_estimated` from `prepared_messages`).
+        let prepared =
+            prepare_messages_for_iteration(&history, &config, false, Some(&mut image_cache))
+                .await
+                .expect("preparation must succeed for the regression");
+        let prepared_estimated = crate::agent::history::estimate_history_tokens(&prepared.messages);
+        let raw_estimated = crate::agent::history::estimate_history_tokens(&history);
+        assert!(
+            prepared_estimated > raw_estimated,
+            "image expansion must make the prepared population larger than the raw marker estimate"
+        );
+
+        let reported = prepared_estimated * 4;
+        let budget = reported / 2;
+        let before = history.len();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        enforce_reported_budget(
+            &mut history,
+            reported,
+            prepared_estimated,
+            0,
+            budget,
+            Some(&tx),
+            &NoopObserver,
+            &config,
+            false,
+            Some(&mut image_cache),
+        )
+        .await;
+
+        // The reported over-budget request must trim even though the raw
+        // marker-only estimate would have looked far smaller.
+        assert!(
+            history.len() < before,
+            "a reported over-budget request with a retained image must be trimmed"
+        );
+
+        let event = rx
+            .recv()
+            .await
+            .expect("a trim must emit a HistoryTrimmed event");
+        let tokens_after = match event {
+            TurnEvent::HistoryTrimmed { tokens_after, .. } => {
+                tokens_after.expect("reported-budget trim must carry token accounting")
+            }
+            other => panic!("expected HistoryTrimmed, got {other:?}"),
+        };
+
+        // The emitted count must describe the prepared retained population
+        // (breadcrumb included) — the exact next provider request — not the raw
+        // retained marker estimate.
+        let retained_prepared =
+            prepare_messages_for_iteration(&history, &config, false, Some(&mut image_cache))
+                .await
+                .expect("preparation of the retained history must succeed");
+        let ratio = reported as f64 / prepared_estimated.max(1) as f64;
+        let expected = (crate::agent::history::estimate_history_tokens(&retained_prepared.messages)
+            as f64
+            * ratio)
+            .round() as u64;
+        assert_eq!(
+            tokens_after, expected,
+            "tokens_after must describe the prepared retained population sent next"
+        );
+    }
+
+    #[tokio::test]
+    async fn enforce_reserves_room_for_next_iteration_deferred_schema_population() {
+        // `tool_search` can activate deferred MCP tools during a tool round; the
+        // NEXT iteration's `build_iteration_tool_specs` then includes them. The
+        // post-tool enforcement must reserve that next schema population, or a
+        // materially large newly activated schema lets the next request exceed
+        // the configured budget. The reserved count must stay within budget
+        // (or report the unsatisfiable schema-floor case) rather than silently
+        // claiming the next request fits.
+        let mut history = big_history();
+        let estimated = crate::agent::history::estimate_history_tokens(&history);
+        let reported = estimated * 4;
+        let budget = reported / 2;
+        // A materially large native tool schema that deferred activation adds.
+        let spec = crate::tools::ToolSpec::new(
+            "large_deferred_mcp_tool",
+            "a deferred MCP tool with a very large parameter schema",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "payload": {
+                        "type": "string",
+                        "description": "big".repeat(500),
+                    }
+                }
+            }),
+        );
+        let next_schema_tokens = crate::agent::history::estimate_tool_schema_tokens(&[spec]);
+        assert!(
+            next_schema_tokens > 0,
+            "a large deferred schema must contribute a nonzero token estimate"
+        );
+
+        let before = history.len();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        enforce_reported_budget(
+            &mut history,
+            reported,
+            estimated,
+            next_schema_tokens,
+            budget,
+            Some(&tx),
+            &NoopObserver,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            false,
+            None,
+        )
+        .await;
+
+        let event = rx
+            .recv()
+            .await
+            .expect("a trim must emit a HistoryTrimmed event");
+        let tokens_after = match event {
+            TurnEvent::HistoryTrimmed { tokens_after, .. } => {
+                tokens_after.expect("reported-budget trim must carry token accounting")
+            }
+            other => panic!("expected HistoryTrimmed, got {other:?}"),
+        };
+        assert!(
+            history.len() < before,
+            "reserving the next-iteration schema population must still trim the over-budget history"
+        );
+        assert!(
+            tokens_after <= budget as u64,
+            "retained messages plus the next-iteration schema population must fit the budget \
+             (tokens_after {tokens_after}, budget {budget})"
         );
     }
 }
