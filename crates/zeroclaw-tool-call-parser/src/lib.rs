@@ -559,13 +559,26 @@ pub fn contains_truncated_fullwidth_dsml_envelope(text: &str) -> bool {
     false
 }
 
-fn contains_truncated_ascii_dsml_envelope(text: &str) -> bool {
+pub fn contains_truncated_ascii_dsml_envelope(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     let Some(open_idx) = lower.find("<|dsml|>") else {
         return false;
     };
-    let lower_after = &lower[open_idx + 8..];
-    !lower_after.contains("</|dsml|>") && text[open_idx + 8..].trim_start().starts_with('{')
+    let after = &text[open_idx + "<|dsml|>".len()..];
+    if lower[open_idx + "<|dsml|>".len()..].contains("</|dsml|>") {
+        return false;
+    }
+    let body = after.trim_start();
+    if body.starts_with('{') || body.starts_with('[') {
+        let mut stream = serde_json::Deserializer::from_str(body).into_iter::<serde_json::Value>();
+        return matches!(stream.next(), Some(Ok(_)));
+    }
+    body.starts_with("invoke")
+        || body.starts_with("parameter")
+        || body.starts_with("tool_calls")
+        || body.contains("<invoke")
+        || body.contains("<parameter")
+        || body.contains("tool_calls>")
 }
 
 fn has_malformed_tool_protocol_text_signal(text: &str) -> bool {
@@ -964,195 +977,236 @@ fn parse_minimax_invoke_calls(response: &str) -> Option<(String, Vec<ParsedToolC
     Some((text, calls))
 }
 
-fn parse_fullwidth_dsml_tool_calls(response: &str) -> Option<(String, Vec<ParsedToolCall>)> {
-    parse_dsml_tool_calls_with_delimiter(response, "｜")
-        .or_else(|| parse_dsml_tool_calls_with_delimiter(response, "＼"))
-}
-
-/// Removes complete fullwidth DSML envelopes (either delimiter) so the leftover
-/// text can be scanned again for ASCII or other tagged tool calls.
-fn strip_fullwidth_dsml_envelopes(response: &str) -> String {
-    let mut stripped = response.to_string();
-    for delim in ["｜", "＼"] {
-        let open_wrapper = format!("<{delim}DSML{delim}tool_calls>");
-        let close_wrapper = format!("</{delim}DSML{delim}tool_calls>");
-        let mut out = String::with_capacity(stripped.len());
-        let mut scan = 0usize;
-        while let Some(rel_open) = stripped[scan..].find(&open_wrapper) {
-            let open_idx = scan + rel_open;
-            let body_start = open_idx + open_wrapper.len();
-            if is_inside_markdown_fence(&stripped, open_idx) {
-                scan = open_idx + open_wrapper.len();
-                continue;
-            }
-            let Some(rel_close) = stripped[body_start..].find(&close_wrapper) else {
-                break;
-            };
-            let close_idx = body_start + rel_close;
-            out.push_str(&stripped[..open_idx]);
-            stripped = stripped[close_idx + close_wrapper.len()..].to_string();
-            scan = 0;
-        }
-        if !out.is_empty() {
-            stripped = format!("{out}{stripped}");
-        }
-    }
-    stripped
-}
-
-fn parse_dsml_tool_calls_with_delimiter(
-    response: &str,
-    delim: &str,
-) -> Option<(String, Vec<ParsedToolCall>)> {
-    let (invoke_re, parameter_re, markup_re) = dsml_regexes(delim);
-    let open_wrapper = format!("<{delim}DSML{delim}tool_calls>");
-    let close_wrapper = format!("</{delim}DSML{delim}tool_calls>");
+fn parse_fullwidth_dsml_body(body: &str, delim: &str) -> Vec<ParsedToolCall> {
+    let invoke_open = format!("<{delim}DSML{delim}invoke");
+    let invoke_close = format!("</{delim}DSML{delim}invoke>");
+    let param_open = format!("<{delim}DSML{delim}parameter");
+    let param_close = format!("</{delim}DSML{delim}parameter>");
 
     let mut calls = Vec::new();
-    let mut text_parts = Vec::new();
-    let mut last_end = 0usize;
-
     let mut scan = 0usize;
-    while let Some(rel_open) = response[scan..].find(&open_wrapper) {
-        let open_idx = scan + rel_open;
-        let body_start = open_idx + open_wrapper.len();
-        if is_inside_markdown_fence(response, open_idx) {
-            scan = open_idx + open_wrapper.len();
-            continue;
-        }
-        let Some(rel_close) = response[body_start..].find(&close_wrapper) else {
+    while let Some(rel) = body[scan..].find(&invoke_open) {
+        let invoke_start = scan + rel;
+        let Some(open_end_rel) = body[invoke_start..].find('>') else {
             break;
         };
-        let close_idx = body_start + rel_close;
-
-        let before = &response[last_end..open_idx];
-        if !before.trim().is_empty() {
-            text_parts.push(before.trim().to_string());
-        }
-        last_end = close_idx + close_wrapper.len();
-
-        let body = &response[body_start..close_idx];
-        for cap in invoke_re.captures_iter(body) {
-            let Some(full_invoke) = cap.get(0) else {
-                continue;
-            };
-            if is_inside_markdown_fence(response, body_start + full_invoke.start()) {
+        let open_tag = &body[invoke_start..invoke_start + open_end_rel + 1];
+        let name = extract_dsml_attr(open_tag, "name");
+        let body_start = invoke_start + open_end_rel + 1;
+        let next_open_rel = body[body_start..].find(&invoke_open);
+        let close_rel = body[body_start..].find(&invoke_close);
+        let invoke_end = match (next_open_rel, close_rel) {
+            (Some(n), Some(c)) if c < n => body_start + c,
+            (Some(n), Some(_)) => {
+                scan = body_start + n;
                 continue;
             }
-
-            let name = cap
-                .get(1)
-                .map(|m| m.as_str().trim())
-                .filter(|v| !v.is_empty());
-            let inner = cap.get(2).map(|m| m.as_str()).unwrap_or("").trim();
-            let Some(name) = name else {
-                continue;
-            };
-
-            let mut args = serde_json::Map::new();
-            let mut saw_parameter = false;
-            let mut malformed_parameter = false;
-            for param_cap in parameter_re.captures_iter(inner) {
-                let key = param_cap
-                    .get(1)
-                    .map(|m| m.as_str().trim())
-                    .filter(|v| !v.is_empty());
-                let string_val = param_cap.get(2).map(|m| m.as_str());
-                let is_string = match string_val {
-                    Some(v) if v.eq_ignore_ascii_case("true") => true,
-                    Some(v) if v.eq_ignore_ascii_case("false") => false,
-                    _ => {
-                        malformed_parameter = true;
-                        continue;
-                    }
-                };
-                let raw_value = param_cap.get(3).map(|m| m.as_str()).unwrap_or("");
-                let Some(key) = key else {
-                    continue;
-                };
-                saw_parameter = true;
-
-                let parsed = if is_string {
-                    serde_json::Value::String(raw_value.to_string())
-                } else {
-                    let value = raw_value.trim();
-                    match serde_json::from_str::<serde_json::Value>(value) {
-                        Ok(json) => json,
-                        Err(_) => {
-                            malformed_parameter = true;
-                            continue;
-                        }
-                    }
-                };
-                args.insert(key.to_string(), parsed);
-            }
-
-            if malformed_parameter {
+            (Some(n), None) => {
+                scan = body_start + n;
                 continue;
             }
+            (None, Some(c)) => body_start + c,
+            (None, None) => break,
+        };
+        let inner = &body[body_start..invoke_end];
+        let Some(name) = name.map(str::trim).filter(|v| !v.is_empty()) else {
+            scan = invoke_end + invoke_close.len();
+            continue;
+        };
+        let Some(args) = parse_dsml_parameters(inner, &param_open, &param_close) else {
+            // Malformed nested parameter(s): reject the whole invoke.
+            scan = invoke_end + invoke_close.len();
+            continue;
+        };
+        calls.push(ParsedToolCall {
+            name: name.to_string(),
+            arguments: serde_json::Value::Object(args),
+            tool_call_id: None,
+        });
+        scan = invoke_end + invoke_close.len();
+    }
+    calls
+}
 
-            if args.is_empty() && !saw_parameter {
-                if let Some(first_json) = extract_json_values(inner).into_iter().next() {
-                    match first_json {
-                        serde_json::Value::Object(obj) => args = obj,
-                        other => {
-                            args.insert("value".to_string(), other);
-                        }
-                    }
-                } else if !inner.is_empty() {
-                    args.insert(
-                        "content".to_string(),
-                        serde_json::Value::String(inner.to_string()),
-                    );
+fn parse_dsml_parameters(
+    inner: &str,
+    param_open: &str,
+    param_close: &str,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let mut args = serde_json::Map::new();
+    let mut saw_parameter = false;
+    let mut scan = 0usize;
+    while let Some(rel) = inner[scan..].find(param_open) {
+        let pstart = scan + rel;
+        let open_end_rel = inner[pstart..].find('>')?;
+        let ptag = &inner[pstart..pstart + open_end_rel + 1];
+        let (key, string_val) = (
+            extract_dsml_attr(ptag, "name")?,
+            extract_dsml_attr(ptag, "string")?,
+        );
+        let is_string = match string_val.trim().to_ascii_lowercase().as_str() {
+            "true" => true,
+            "false" => false,
+            _ => return None,
+        };
+        let value_start = pstart + open_end_rel + 1;
+        let next_open_rel = inner[value_start..].find(param_open);
+        let close_rel = inner[value_start..].find(param_close);
+        let close_rel = match (next_open_rel, close_rel) {
+            (Some(n), Some(c)) if n < c => return None,
+            (Some(_), Some(c)) => c,
+            (Some(_), None) => return None,
+            (None, Some(c)) => c,
+            (None, None) => return None,
+        };
+        let raw_value = &inner[value_start..value_start + close_rel];
+        saw_parameter = true;
+        let parsed = if is_string {
+            serde_json::Value::String(raw_value.to_string())
+        } else {
+            match serde_json::from_str::<serde_json::Value>(raw_value.trim()) {
+                Ok(json) => json,
+                Err(_) => return None,
+            }
+        };
+        args.insert(key.trim().to_string(), parsed);
+        scan = value_start + close_rel + param_close.len();
+    }
+    if !saw_parameter {
+        if let Some(first_json) = extract_json_values(inner).into_iter().next() {
+            match first_json {
+                serde_json::Value::Object(obj) => args = obj,
+                other => {
+                    args.insert("value".to_string(), other);
                 }
             }
-
-            calls.push(ParsedToolCall {
-                name: name.to_string(),
-                arguments: serde_json::Value::Object(args),
-                tool_call_id: None,
-            });
+        } else if !inner.trim().is_empty() {
+            args.insert(
+                "content".to_string(),
+                serde_json::Value::String(inner.trim().to_string()),
+            );
         }
-        scan = close_idx;
+    }
+    Some(args)
+}
+
+fn extract_dsml_attr<'a>(tag: &'a str, attr: &str) -> Option<&'a str> {
+    let lower = tag.to_ascii_lowercase();
+    let mut search = 0usize;
+    while let Some(rel) = lower[search..].find(attr) {
+        let idx = search + rel;
+        search = idx + attr.len();
+        let after = &tag[idx + attr.len()..];
+        let after_trim = after.trim_start();
+        let Some(rest) = after_trim.strip_prefix('=') else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let Some(rest) = rest.strip_prefix('"') else {
+            continue;
+        };
+        let Some(end) = rest.find('"') else {
+            continue;
+        };
+        return Some(&rest[..end]);
+    }
+    None
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct MarkdownFenceTracker {
+    delim: Option<char>,
+    open_len: usize,
+    info: Option<String>,
+}
+
+impl MarkdownFenceTracker {
+    pub fn feed_line(&mut self, line: &str) {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        match self.delim {
+            Some(delim) => {
+                if fence_close_line(line, delim, self.open_len) {
+                    self.delim = None;
+                    self.open_len = 0;
+                    self.info = None;
+                }
+            }
+            None => {
+                if let Some((delim, open_len)) = fence_open_line(line) {
+                    self.delim = Some(delim);
+                    self.open_len = open_len;
+                    let indent = line.len() - line.trim_start_matches(' ').len();
+                    self.info = Some(line[indent + open_len..].trim().to_string());
+                }
+            }
+        }
     }
 
-    if calls.is_empty() {
+    pub fn is_inside(&self) -> bool {
+        self.delim.is_some()
+    }
+
+    pub fn active(&self) -> Option<(char, usize)> {
+        self.delim.map(|delim| (delim, self.open_len))
+    }
+
+    pub fn info(&self) -> Option<&str> {
+        self.info.as_deref()
+    }
+}
+
+fn fence_open_line(line: &str) -> Option<(char, usize)> {
+    let indent = line.len() - line.trim_start_matches(' ').len();
+    if indent > 3 {
         return None;
     }
-
-    let after = response[last_end..].trim();
-    if !after.is_empty() {
-        text_parts.push(after.to_string());
+    let rest = &line[indent..];
+    let delim = rest.chars().next()?;
+    if delim != '`' && delim != '~' {
+        return None;
     }
+    let run = rest.chars().take_while(|&c| c == delim).count();
+    (run >= 3).then_some((delim, run))
+}
 
-    let text = markup_re
-        .replace_all(&text_parts.join("\n"), "")
-        .trim()
-        .to_string();
-
-    Some((text, calls))
+fn fence_close_line(line: &str, delim: char, open_len: usize) -> bool {
+    let Some((d, run)) = fence_open_line(line) else {
+        return false;
+    };
+    if d != delim || run < open_len {
+        return false;
+    }
+    let indent = line.len() - line.trim_start_matches(' ').len();
+    line[indent + run..].trim().is_empty()
 }
 
 fn is_inside_markdown_fence(response: &str, byte_idx: usize) -> bool {
-    let up_to = &response[..byte_idx];
-    (up_to.match_indices("```").count() + up_to.match_indices("~~~").count()) % 2 == 1
+    let mut tracker = MarkdownFenceTracker::default();
+    for line in response[..byte_idx.min(response.len())].split_inclusive('\n') {
+        tracker.feed_line(line.trim_end_matches(['\n']));
+    }
+    tracker.is_inside()
 }
 
-fn dsml_regexes(delim: &str) -> (Regex, Regex, Regex) {
-    let delim_re = regex::escape(delim);
-    let invoke = Regex::new(&format!(
-        r#"(?is)<{delim_re}DSML{delim_re}\s*invoke\b[^>]*\bname\s*=\s*"([^"]+)"[^>]*>(.*?)</{delim_re}DSML{delim_re}\s*invoke\s*>"#
-    ))
-    .expect("DSML invoke regex must compile");
-    let parameter = Regex::new(&format!(
-        r#"(?is)<{delim_re}DSML{delim_re}\s*parameter\b[^>]*\bname\s*=\s*"([^"]+)"[^>]*\bstring\s*=\s*"([^"]+)"[^>]*>(.*?)</{delim_re}DSML{delim_re}\s*parameter\s*>"#
-    ))
-    .expect("DSML parameter regex must compile");
-    let markup = Regex::new(&format!(
-        r"(?is)</?{delim_re}DSML{delim_re}\s*(?:tool_calls|invoke|parameter)\b[^>]*>"
-    ))
-    .expect("DSML markup regex must compile");
-    (invoke, parameter, markup)
+fn markdown_fence_block_end(response: &str, byte_idx: usize) -> usize {
+    let mut tracker = MarkdownFenceTracker::default();
+    for line in response[..byte_idx.min(response.len())].split_inclusive('\n') {
+        tracker.feed_line(line.trim_end_matches(['\n']));
+    }
+    let Some((delim, open_len)) = tracker.active() else {
+        return response.len();
+    };
+    let from = byte_idx.min(response.len());
+    let rest = &response[from..];
+    let mut scan = 0;
+    while let Some(nl) = rest[scan..].find('\n') {
+        let line = &rest[scan..scan + nl];
+        if fence_close_line(line, delim, open_len) {
+            return from + scan + nl + 1;
+        }
+        scan += nl + 1;
+    }
+    response.len()
 }
 
 const TOOL_CALL_OPEN_TAGS: [&str; 10] = [
@@ -1185,6 +1239,29 @@ fn find_first_tag<'a>(haystack: &str, tags: &'a [&'a str]) -> Option<(usize, &'a
     tags.iter()
         .filter_map(|tag| haystack.find(tag).map(|idx| (idx, *tag)))
         .min_by_key(|(idx, _)| *idx)
+}
+
+const FULLWIDTH_WRAPPER_OPENS: [&str; 2] = ["<｜DSML｜tool_calls>", "<＼DSML＼tool_calls>"];
+
+fn fullwidth_wrapper_delim(open_tag: &str) -> Option<&'static str> {
+    if open_tag.starts_with("<｜DSML｜tool_calls>") {
+        Some("｜")
+    } else if open_tag.starts_with("<＼DSML＼tool_calls>") {
+        Some("＼")
+    } else {
+        None
+    }
+}
+
+fn find_first_open_tag(haystack: &str) -> Option<(usize, &'static str)> {
+    let ascii = find_first_tag(haystack, &TOOL_CALL_OPEN_TAGS);
+    let fullwidth = find_first_tag(haystack, &FULLWIDTH_WRAPPER_OPENS);
+    match (ascii, fullwidth) {
+        (Some(a), Some(f)) => Some(if a.0 <= f.0 { a } else { f }),
+        (Some(a), None) => Some(a),
+        (None, Some(f)) => Some(f),
+        (None, None) => None,
+    }
 }
 
 fn extract_first_json_value_with_end(input: &str) -> Option<(serde_json::Value, usize)> {
@@ -2021,33 +2098,15 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
         return (minimax_text, minimax_calls);
     }
 
-    // Fullwidth DSML (DeepSeek-V4 `｜DSML｜` envelope) needs dedicated
-    // parameter handling. Extract its envelopes, then feed the leftover text
-    // through the generic loop so mixed ASCII + fullwidth envelopes still
-    // resolve into one call set and all narration is captured once.
-    let dsml_remaining;
-    if let Some((_, fw_calls)) = parse_fullwidth_dsml_tool_calls(response)
-        && !fw_calls.is_empty()
-    {
-        calls.extend(fw_calls);
-        dsml_remaining = strip_fullwidth_dsml_envelopes(response);
-        remaining = dsml_remaining.as_str();
-    }
-    while let Some((start, open_tag)) = find_first_tag(remaining, &TOOL_CALL_OPEN_TAGS) {
+    while let Some((start, open_tag)) = find_first_open_tag(remaining) {
         if is_inside_markdown_fence(remaining, start) {
             let before = &remaining[..start];
             if !before.trim().is_empty() {
                 text_parts.push(before.trim().to_string());
             }
-            let after_start = start + open_tag.len();
-            remaining = match remaining[after_start..].find("```") {
-                Some(rel_close) => {
-                    let block_end = after_start + rel_close + 3;
-                    text_parts.push(remaining[start..block_end].trim().to_string());
-                    &remaining[block_end..]
-                }
-                None => "",
-            };
+            let block_end = markdown_fence_block_end(remaining, start);
+            text_parts.push(remaining[start..block_end].trim().to_string());
+            remaining = &remaining[block_end..];
             continue;
         }
 
@@ -2055,6 +2114,28 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
         let before = &remaining[..start];
         if !before.trim().is_empty() {
             text_parts.push(before.trim().to_string());
+        }
+
+        if let Some(delim) = fullwidth_wrapper_delim(open_tag) {
+            let open_wrapper = format!("<{delim}DSML{delim}tool_calls>");
+            let close_wrapper = format!("</{delim}DSML{delim}tool_calls>");
+            let after_open = &remaining[start + open_wrapper.len()..];
+            if let Some(close_idx) = after_open.find(&close_wrapper) {
+                let body = &after_open[..close_idx];
+                let fw_calls = parse_fullwidth_dsml_body(body, delim);
+                if fw_calls.is_empty() {
+                    let env_end = start + open_wrapper.len() + close_idx + close_wrapper.len();
+                    text_parts.push(remaining[start..env_end].trim().to_string());
+                    remaining = &remaining[env_end..];
+                } else {
+                    calls.extend(fw_calls);
+                    remaining = &after_open[close_idx + close_wrapper.len()..];
+                }
+            } else {
+                remaining = &remaining[start..];
+                break;
+            }
+            continue;
         }
 
         let Some(close_tag) = (match open_tag {
@@ -2161,6 +2242,11 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
 
             if resolved {
                 continue;
+            }
+
+            if matches!(open_tag, "<|DSML|>" | "<|dsml|>") {
+                remaining = &remaining[start..];
+                break;
             }
 
             // No cross-alias close tag resolved — fall back to JSON recovery
@@ -3019,17 +3105,20 @@ After text."#;
 
     #[test]
     fn parse_tool_calls_ascii_dsml_unclosed_envelope_no_recovery() {
-        // An unclosed <|DSML|> tag has no matching </|DSML|> — the
-        // detection layer must flag it as a parse issue so the execution
-        // engine can refuse to run calls recovered from unclosed envelopes.
         let response = "<|DSML|>\n\
             {\"name\":\"shell\",\"arguments\":{\"command\":\"id\"}}\n\
             trailing text";
 
+        let (text, calls) = parse_tool_calls(response);
         assert!(
-            detect_tool_call_parse_issue(response, &[]).is_some(),
+            calls.is_empty(),
+            "unclosed ASCII DSML must not yield a recoverable call"
+        );
+        assert!(
+            detect_tool_call_parse_issue(response, &calls).is_some(),
             "unclosed ASCII DSML must be flagged as a parse issue"
         );
+        assert!(text.contains("<|DSML|>"), "envelope text is retained");
     }
 
     #[test]
@@ -3048,6 +3137,60 @@ After text."#;
         assert_eq!(calls.len(), 0);
         assert!(text.contains("uname -a"));
         assert!(text.contains("End of example."));
+    }
+
+    #[test]
+    fn parse_tool_calls_longer_tilde_fence_contains_shorter_run() {
+        let response = "Example:\n\
+            ~~~~xml\n\
+            <｜DSML｜tool_calls>\n\
+            <｜DSML｜invoke name=\"shell\">\n\
+            <｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter>\n\
+            </｜DSML｜invoke>\n\
+            </｜DSML｜tool_calls>\n\
+            ~~~\n\
+            ~~~~\n\
+            End.";
+
+        let (text, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 0);
+        assert!(text.contains("<｜DSML｜tool_calls>"));
+        assert!(text.contains("End."));
+    }
+
+    #[test]
+    fn parse_tool_calls_mixed_fence_delimiters_keep_block_open() {
+        let response = "Example:\n\
+            ~~~xml\n\
+            ```text\n\
+            <｜DSML｜tool_calls>\n\
+            <｜DSML｜invoke name=\"shell\">\n\
+            <｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter>\n\
+            </｜DSML｜invoke>\n\
+            </｜DSML｜tool_calls>\n\
+            ```\n\
+            ~~~\n\
+            End.";
+
+        let (text, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 0);
+        assert!(text.contains("<｜DSML｜tool_calls>"));
+        assert!(text.contains("End."));
+    }
+
+    #[test]
+    fn parse_tool_calls_inline_delimiter_text_does_not_open_fence() {
+        let response = "Here is ``` some inline text and a call:\n\
+            <｜DSML｜tool_calls>\n\
+            <｜DSML｜invoke name=\"shell\">\n\
+            <｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter>\n\
+            </｜DSML｜invoke>\n\
+            </｜DSML｜tool_calls>";
+
+        let (text, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert!(text.contains("Here is ``` some inline text and a call:"));
     }
 
     #[test]
@@ -3233,8 +3376,8 @@ After text."#;
 
         let (text, calls) = parse_tool_calls(response);
         assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].name, "file_read");
-        assert_eq!(calls[1].name, "shell");
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[1].name, "file_read");
         assert!(text.contains("Start."));
         assert!(text.contains("Mid."));
         assert!(text.contains("End."));
@@ -3265,6 +3408,97 @@ After text."#;
         assert!(text.contains("End."));
         assert!(!text.contains("<|DSML|>"));
         assert!(!text.contains("｜DSML｜"));
+    }
+
+    #[test]
+    fn parse_tool_calls_fullwidth_dsml_missing_string_attribute_rejects_invoke() {
+        let response = "<｜DSML｜tool_calls>\n\
+            <｜DSML｜invoke name=\"shell\">\n\
+            <｜DSML｜parameter name=\"command\">ls</｜DSML｜parameter>\n\
+            </｜DSML｜invoke>\n\
+            </｜DSML｜tool_calls>";
+
+        let (text, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 0);
+        assert!(text.contains("｜DSML｜"));
+    }
+
+    #[test]
+    fn parse_tool_calls_fullwidth_dsml_reordered_attributes_still_parse() {
+        let response = "<｜DSML｜tool_calls>\n\
+            <｜DSML｜invoke name=\"shell\">\n\
+            <｜DSML｜parameter string=\"true\" name=\"command\">ls</｜DSML｜parameter>\n\
+            </｜DSML｜invoke>\n\
+            </｜DSML｜tool_calls>";
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.trim().is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
+            "ls"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_fullwidth_dsml_unclosed_parameter_rejects_invoke() {
+        // An unclosed parameter tag must reject the whole invoke.
+        let response = "<｜DSML｜tool_calls>\n\
+            <｜DSML｜invoke name=\"shell\">\n\
+            <｜DSML｜parameter name=\"command\" string=\"true\">ls\n\
+            </｜DSML｜invoke>\n\
+            </｜DSML｜tool_calls>";
+
+        let (text, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 0);
+        assert!(text.contains("｜DSML｜"));
+    }
+
+    #[test]
+    fn parse_tool_calls_fullwidth_dsml_unclosed_invoke_keeps_valid_sibling() {
+        let response = "<｜DSML｜tool_calls>\n\
+            <｜DSML｜invoke name=\"shell\">\n\
+            <｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter>\n\
+            <｜DSML｜invoke name=\"file_read\">\n\
+            <｜DSML｜parameter name=\"path\" string=\"true\">a.txt</｜DSML｜parameter>\n\
+            </｜DSML｜invoke>\n\
+            </｜DSML｜tool_calls>";
+
+        let (text, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "file_read");
+        assert!(
+            !text.contains("shell"),
+            "the unclosed invoke must not be merged into the valid sibling"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_mixed_fullwidth_delimiter_families_in_source_order() {
+        let response = "Start.\n\
+            <｜DSML｜tool_calls>\n\
+            <｜DSML｜invoke name=\"file_read\">\n\
+            <｜DSML｜parameter name=\"path\" string=\"true\">a.txt</｜DSML｜parameter>\n\
+            </｜DSML｜invoke>\n\
+            </｜DSML｜tool_calls>\n\
+            Mid.\n\
+            <＼DSML＼tool_calls>\n\
+            <＼DSML＼invoke name=\"shell\">\n\
+            <＼DSML＼parameter name=\"command\" string=\"true\">ls</＼DSML＼parameter>\n\
+            </＼DSML＼invoke>\n\
+            </＼DSML＼tool_calls>\n\
+            End.";
+
+        let (text, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "file_read");
+        assert_eq!(calls[1].name, "shell");
+        assert!(text.contains("Start."));
+        assert!(text.contains("Mid."));
+        assert!(text.contains("End."));
+        assert!(!text.contains("｜DSML｜"));
+        assert!(!text.contains("＼DSML＼"));
     }
 
     #[test]
@@ -4418,13 +4652,18 @@ Done."#;
     fn detect_tool_call_parse_issue_flags_truncated_dsml() {
         let truncated = r#"<|DSML|>
 {"name":"shell","arguments":{"command":"pwd"}}"#;
+        let (_, calls) = parse_tool_calls(truncated);
         assert!(
-            detect_tool_call_parse_issue(truncated, &[]).is_some(),
+            calls.is_empty(),
+            "truncated DSML must not recover an executable call"
+        );
+        assert!(
+            detect_tool_call_parse_issue(truncated, &calls).is_some(),
             "truncated DSML must be flagged as a tool-call parse issue"
         );
         assert!(
-            looks_like_tool_protocol_envelope(truncated),
-            "truncated DSML must look like a tool protocol envelope"
+            contains_truncated_ascii_dsml_envelope(truncated),
+            "truncated ASCII DSML must be detected as an unclosed envelope"
         );
     }
 

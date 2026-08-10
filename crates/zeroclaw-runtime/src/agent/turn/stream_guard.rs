@@ -3,16 +3,37 @@
 use super::protocol_detect::{
     complete_json_fence_protocol_state, complete_non_protocol_json, contains_close_tag_marker,
     find_embedded_protocol_candidate_start, find_incomplete_protocol_candidate_start,
-    longest_suffix_matching_prefix, protocol_envelope_end, starts_suspicious_protocol_prefix,
+    first_protocol_envelope_end, longest_suffix_matching_prefix, starts_suspicious_protocol_prefix,
     starts_suspicious_tag_or_fence_prefix, suppressed_continuation_trailing,
     trailing_partial_close_fragment,
 };
 use std::collections::HashSet;
 use zeroclaw_tool_call_parser::{
-    ToolProtocolEnvelopeKind, classify_tool_protocol_envelope, contains_tool_protocol_tag_call,
+    MarkdownFenceTracker, ToolProtocolEnvelopeKind, classify_tool_protocol_envelope,
+    contains_tool_protocol_tag_call, contains_truncated_ascii_dsml_envelope,
+    contains_truncated_fullwidth_dsml_envelope,
     looks_like_malformed_tool_protocol_envelope_for_known_tools, looks_like_tool_protocol_envelope,
     looks_like_tool_protocol_example, tool_protocol_envelope_mentions_known_tool,
 };
+
+fn is_documentation_fence(fence: &MarkdownFenceTracker) -> bool {
+    let Some((delim, _)) = fence.active() else {
+        return false;
+    };
+    match delim {
+        '~' => true,
+        '`' => {
+            let lower = fence.info().unwrap_or("").trim().to_ascii_lowercase();
+            !(lower.starts_with("tool_call")
+                || lower.starts_with("toolcall")
+                || lower.starts_with("tool-call")
+                || lower.starts_with("invoke")
+                || lower.starts_with("json")
+                || lower.starts_with("tool "))
+        }
+        _ => false,
+    }
+}
 
 #[derive(Debug, Default)]
 pub(crate) struct StreamTextGuard {
@@ -25,6 +46,8 @@ pub(crate) struct StreamTextGuard {
     has_active_tools: bool,
     pub(crate) suppress_forwarding: bool,
     pub(crate) suppressed_protocol: bool,
+    fence: MarkdownFenceTracker,
+    fence_pending: String,
 }
 
 impl StreamTextGuard {
@@ -42,6 +65,10 @@ impl StreamTextGuard {
     }
 
     pub(crate) fn push(&mut self, chunk: &str) -> Option<String> {
+        if self.fence_forward_documentation(chunk) {
+            return Some(chunk.to_string());
+        }
+
         let mut chunk = chunk.to_string();
         if !self.pending_partial_close.is_empty() {
             self.pending_partial_close.push_str(&chunk);
@@ -59,6 +86,30 @@ impl StreamTextGuard {
             return release;
         }
         self.push_impl(&chunk)
+    }
+
+    fn fence_forward_documentation(&mut self, chunk: &str) -> bool {
+        let marker = find_embedded_protocol_candidate_start(chunk)
+            .or_else(|| find_incomplete_protocol_candidate_start(chunk))
+            .unwrap_or(chunk.len());
+
+        let mut replay = self.fence.clone();
+        let mut pending = self.fence_pending.clone();
+        pending.push_str(&chunk[..marker]);
+        while let Some(nl) = pending.find('\n') {
+            let line = pending[..nl].to_string();
+            pending = pending[nl + 1..].to_string();
+            replay.feed_line(&line);
+        }
+        let forward = is_documentation_fence(&replay);
+
+        self.fence_pending.push_str(chunk);
+        while let Some(nl) = self.fence_pending.find('\n') {
+            let line = self.fence_pending[..nl].to_string();
+            self.fence_pending = self.fence_pending[nl + 1..].to_string();
+            self.fence.feed_line(&line);
+        }
+        forward
     }
 
     fn push_impl(&mut self, chunk: &str) -> Option<String> {
@@ -174,12 +225,34 @@ impl StreamTextGuard {
         if !narration.is_empty() {
             parts.push(narration.to_string());
         }
-        if let Some(trailing) = self.trailing_after_envelope() {
-            let trailing = trailing.trim();
-            if !trailing.is_empty() {
-                parts.push(trailing.to_string());
+
+        let mut scan = self
+            .pending_candidate_start
+            .unwrap_or(0)
+            .min(self.pending.len());
+        loop {
+            let start = match find_embedded_protocol_candidate_start(&self.pending[scan..]) {
+                Some(rel) => scan + rel,
+                None => scan,
+            };
+            let Some(end) = first_protocol_envelope_end(&self.pending, start) else {
+                // Incomplete envelope at the tail: fail closed, do not forward.
+                break;
+            };
+            let between = self.pending[scan..start].trim();
+            if !between.is_empty() {
+                parts.push(between.to_string());
+            }
+            scan = end;
+        }
+        let tail = &self.pending[scan..];
+        if !self.tail_has_protocol_signal(tail) {
+            let tail = tail.trim();
+            if !tail.is_empty() {
+                parts.push(tail.to_string());
             }
         }
+
         self.pending.clear();
         self.pending_candidate_start = None;
         self.suppressed_protocol = true;
@@ -191,15 +264,25 @@ impl StreamTextGuard {
         }
     }
 
-    fn trailing_after_envelope(&self) -> Option<String> {
-        let start = self
-            .pending_candidate_start
-            .unwrap_or(0)
-            .min(self.pending.len());
-        let candidate = self.pending.get(start..)?;
-        let envelope_end = protocol_envelope_end(candidate, 0)?;
-        let trailing = candidate.get(envelope_end..)?;
-        (!trailing.trim().is_empty()).then(|| trailing.to_string())
+    fn tail_has_protocol_signal(&self, tail: &str) -> bool {
+        if find_embedded_protocol_candidate_start(tail).is_some()
+            || starts_suspicious_protocol_prefix(tail)
+            || contains_tool_protocol_tag_call(tail)
+            || contains_truncated_ascii_dsml_envelope(tail)
+            || contains_truncated_fullwidth_dsml_envelope(tail)
+            || looks_like_malformed_tool_protocol_envelope_for_known_tools(
+                tail,
+                &self.known_tool_names,
+            )
+        {
+            return true;
+        }
+        tail.match_indices(['{', '[']).any(|(idx, _)| {
+            looks_like_malformed_tool_protocol_envelope_for_known_tools(
+                &tail[idx..],
+                &self.known_tool_names,
+            )
+        })
     }
 
     fn continuation_of_suppressed_protocol(&self, chunk: &str) -> bool {
@@ -276,6 +359,10 @@ impl StreamTextGuard {
     fn should_suppress_protocol_candidate(&self, text: &str) -> bool {
         if looks_like_tool_protocol_example(text) {
             return false;
+        }
+
+        if contains_truncated_ascii_dsml_envelope(text) {
+            return true;
         }
 
         if looks_like_malformed_tool_protocol_envelope_for_known_tools(text, &self.known_tool_names)
@@ -836,5 +923,120 @@ mod tests {
 
         assert_eq!(guard.finish(), None);
         assert!(guard.suppressed_protocol);
+    }
+
+    #[test]
+    fn opening_marker_split_after_bare_angle_bracket_is_recognized() {
+        let mut guard = shell_guard();
+
+        assert_eq!(guard.push("Do it. <"), None);
+        assert_eq!(guard.push("|DSML|>\n"), None);
+        assert_eq!(
+            guard.push("{\"name\":\"shell\",\"arguments\":{\"cmd\":\"ls\"}}"),
+            Some("Do it.".to_string())
+        );
+        assert_eq!(guard.push("\n</|DSML|>"), None);
+        assert_eq!(guard.finish(), None);
+        assert!(
+            guard.suppressed_protocol,
+            "envelope opened across a bare '<' boundary must be suppressed"
+        );
+    }
+
+    #[test]
+    fn fullwidth_opening_marker_split_after_bare_angle_bracket_is_recognized() {
+        let mut guard = shell_guard();
+
+        assert_eq!(guard.push("Do it. <"), None);
+        assert_eq!(guard.push("｜DSML｜tool_calls>\n"), None);
+        assert_eq!(
+            guard.push("<｜DSML｜invoke name=\"shell\">\n<｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter>\n"),
+            None
+        );
+        // The envelope completes here: narration is released and the envelope
+        // itself is suppressed, never forwarded.
+        assert_eq!(
+            guard.push("</｜DSML｜invoke>\n</｜DSML｜tool_calls>"),
+            Some("Do it.".to_string())
+        );
+        assert_eq!(guard.finish(), None);
+        assert!(
+            guard.suppressed_protocol,
+            "fullwidth envelope opened across a bare '<' boundary must be suppressed"
+        );
+    }
+
+    #[test]
+    fn closing_marker_split_after_bare_angle_bracket_is_suppressed() {
+        let mut guard = shell_guard();
+
+        assert_eq!(guard.push("<|DSML|>\n"), None);
+        assert_eq!(
+            guard.push("{\"name\":\"shell\",\"arguments\":{\"cmd\":\"ls\"}}"),
+            None
+        );
+        // The closing `</|DSML|>` is split as `<` + `/|DSML|>`.
+        assert_eq!(guard.push("\n<"), None);
+        assert_eq!(guard.push("/|DSML|>"), None);
+        assert_eq!(guard.finish(), None);
+        assert!(
+            guard.suppressed_protocol,
+            "closing marker split across a bare '<' boundary must not leak"
+        );
+    }
+
+    #[test]
+    fn same_delta_sequential_envelopes_preserve_narration_between() {
+        let mut guard = shell_guard();
+
+        let delta = "<|DSML|>invoke name=\"shell\"><|DSML|>parameter name=\"command\" string=\"true\">ls</|DSML|>parameter></|DSML|>invoke></|DSML|>tool_calls> \
+            Done step one. \
+            <|DSML|>invoke name=\"file_read\"><|DSML|>parameter name=\"path\" string=\"true\">a.txt</|DSML|>parameter></|DSML|>invoke></|DSML|>tool_calls> \
+            All done.";
+        assert_eq!(
+            guard.push(delta),
+            Some("Done step one. All done.".to_string())
+        );
+        assert_eq!(guard.finish(), None);
+        assert!(
+            guard.suppressed_protocol,
+            "same-delta sequential envelopes must be suppressed"
+        );
+    }
+
+    #[test]
+    fn same_delta_dsml_then_json_envelope_reclassifies_suffix() {
+        let mut guard = shell_guard();
+
+        let delta = "<|DSML|>invoke name=\"shell\"><|DSML|>parameter name=\"command\" string=\"true\">ls</|DSML|>parameter></|DSML|>invoke></|DSML|>tool_calls> \
+            narration {\"tool_calls\":[{\"function\":{\"name\":\"shell\",\"arguments\":\"{}\"}}]} \
+            trailing";
+        assert_eq!(
+            guard.push(delta),
+            Some("narration trailing".to_string()),
+            "the JSON tool envelope after narration must be suppressed, not forwarded"
+        );
+        assert_eq!(guard.finish(), None);
+        assert!(guard.suppressed_protocol);
+    }
+
+    #[test]
+    fn streamed_tilde_fenced_dsml_example_stays_visible() {
+        let mut guard = shell_guard();
+
+        assert_eq!(
+            guard.push("~~~xml\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"shell\">\n"),
+            Some("~~~xml\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"shell\">\n".to_string()),
+            "quoted tilde-fenced documentation must remain visible"
+        );
+        assert_eq!(
+            guard.push("<｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>\n~~~\nEnd."),
+            Some("<｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>\n~~~\nEnd.".to_string())
+        );
+        assert_eq!(guard.finish(), None);
+        assert!(
+            !guard.suppressed_protocol,
+            "tilde-fenced documentation must not be suppressed"
+        );
     }
 }
