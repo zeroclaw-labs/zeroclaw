@@ -81,7 +81,7 @@ OS-level sandboxing fields live on the same risk profile. See [Sandboxing](./san
 
 The shell tool runs in a minimal environment by default; expose specific env vars via the risk profile. Secrets (`API_KEY`, `_TOKEN`, `_SECRET`, `_PASSWORD` patterns) are *never* passed through automatically; list them explicitly or fetch from the secrets store inside the command.
 
-This is a NAME allowlist: `risk_profiles.<name>.shell-env-passthrough` only says which var *names* may be copied, and the *values* always come from the daemon's own trusted ambient environment. It is distinct from `agents.<alias>.env.vars` (see [Filesystem components → Environment](../agents/filesystem.md#environment)), which sets explicit `KEY=VALUE` pairs and, optionally, a workspace-confined `HOME`, per agent. Both are fully operator-authored config — a delegated subagent cannot expand either beyond what its parent already grants (see the escalation checks in `SecurityPolicy::ensure_no_escalation_beyond`).
+This is a NAME allowlist: `risk_profiles.<name>.shell-env-passthrough` only says which var *names* may be copied, and the *values* always come from the daemon's own trusted ambient environment. It is distinct from `agents.<alias>.env.vars` (see [Filesystem components → Environment](../agents/filesystem.md#environment)), which sets explicit `KEY=VALUE` pairs and, optionally, a workspace-confined `HOME`, per agent. Both are fully operator-authored config: a delegated subagent cannot expand either beyond what its parent already grants (see the escalation checks in `SecurityPolicy::ensure_no_escalation_beyond`).
 
 ## Per-channel stricter autonomy
 
