@@ -70,17 +70,19 @@ Upstream handler: `handle_pair` (`crates/zeroclaw-gateway/src/lib.rs`).
 
 | Component | Role |
 |---|---|
-| `ZeroClawGatewayClient` | HTTP client featuring `AbortController` timeouts (1.5s default ping), exponential backoff, and graceful offline fallback states when the daemon is unreachable. |
+| `ZeroClawGatewayClient` | HTTP client featuring `AbortController` timeouts (5 s default request/health timeout), exponential backoff, and graceful offline fallback states when the daemon is unreachable. |
 | `ZeroClawAuthManager` | Coordinates pairing credentials (enhanced → legacy fallback) and generates `Authorization: Bearer <token>` headers for authenticated daemon interactions. |
 | Version Matrix | Client-side version compatibility checker targeting numeric bounds `>=0.8.0 <0.9.0-alpha`. Strips pre-release suffixes prior to numeric component comparison (`major.minor.patch`). |
 
 ## Inspected Bridge Smoke Tests
 
-The bridge package (`packages/zeroclaw-bridge/`) includes an offline smoke test suite (`pnpm --filter @zega/zeroclaw-bridge test:smoke`) validating:
+The bridge package (`packages/zeroclaw-bridge/`) includes an offline smoke test suite (`pnpm --filter @zega/zeroclaw-bridge test:smoke`) with 18 assertions validating:
 
-- Version parsing and SemVer boundary checking.
-- Enhanced-to-legacy pairing fallback logic and rate-limit error escalation.
-- Bearer token header construction and `ZeroClawGatewayClient` timeout behavior.
+- SemVer parsing/comparison and version-compatibility boundary checking.
+- Auth-manager token storage, bearer-header construction, and offline `getState()` behavior.
+- Error constructor correctness for gateway error types.
+
+> **Limitation:** The smoke suite does not start a ZeroClaw daemon, exchange a pairing code, or call a live gateway endpoint. Pairing fallback and rate-limit escalation branches (implemented in `src/auth.ts`) are not covered by the pinned smoke script.
 
 ## External Reference
 
