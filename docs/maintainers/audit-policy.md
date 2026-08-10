@@ -102,6 +102,10 @@ Live, deny+audit (both files):
   derive/attribute macro helper. Still in `cargo deny`'s resolved graph
   via `matrix-sdk` dev-deps (`aquamarine`) in `zeroclaw-channels`, so it
   needs the ignore in both files.
+- **`bitmaps` (`RUSTSEC-2026-0247`)**: unmaintained bitmap helper.
+  Still in `cargo deny`'s resolved graph via `imbl` → Matrix SDK
+  dev-dependencies pulled by `zeroclaw-channels`, so it needs the ignore
+  in both files. Tracking #9899.
 
 Live, audit-only (`cargo deny`'s resolved graph no longer pulls these
 in, but they remain in `Cargo.lock` and `cargo audit` reads the whole
@@ -179,9 +183,13 @@ unaffected by the advisory):
   `Cargo.lock`. `rand` is removed from both files because every
   locked version (0.8.6, 0.9.4, 0.10.1) is patched per the advisory,
   not because the crate left `Cargo.lock`. Remaining deny+audit live
-  ignores: `rustls-pemfile`, `proc-macro-error2`. Remaining
-  audit-only ignores: `rustls-webpki` (4) plus the 19 lockfile-stale
-  entries above.
+  ignores: `rustls-pemfile`, `proc-macro-error2`, `bitmaps`.
+  Remaining audit-only ignores: `rustls-webpki` (4) plus the 19
+  lockfile-stale entries above.
+- **#9899**: *Triage and remove bitmaps unmaintained advisory waiver
+  (`RUSTSEC-2026-0247`).* Tracks the temporary allowlist for the
+  `bitmaps` crate while the `imbl` → Matrix SDK dev-dependency chain
+  still pulls it into `cargo deny`'s resolved graph.
 - **#8059**: *Policy cleanup: deny.toml ignored-advisory tracking,
   multiple-versions, wildcards.* piiiico's RFC on adding per-entry
   rationale to `deny.toml` ignore blocks. This doc is the
