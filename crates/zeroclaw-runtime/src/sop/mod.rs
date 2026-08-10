@@ -201,6 +201,23 @@ pub fn resolve_sops_dir(workspace_dir: &Path, config_dir: Option<&str>) -> PathB
     }
 }
 
+/// Whether SOP runtime state should be constructed for this configuration.
+///
+/// Callers previously gated construction on `[sop] sops_dir` being *set*, which
+/// contradicted the documented contract — `sops_dir` is an optional override, and
+/// when omitted the runtime resolves the default `<workspace>/sops`. The engine
+/// itself already honours that default (see [`load_sops`]), so gating on the
+/// override meant a populated `<workspace>/sops` was never read by the daemon:
+/// SOPs loaded for `sop list` yet silently never ran.
+///
+/// The gate is therefore the resolved directory *existing*, which is the same
+/// question [`load_sops_from_directory`] asks. Removing (or never creating) the
+/// directory remains the rollback path, and an explicit `sops_dir` pointing
+/// somewhere absent still disables SOPs exactly as before.
+pub fn sops_enabled(config: &SopConfig, workspace_dir: &Path) -> bool {
+    resolve_sops_dir(workspace_dir, config.sops_dir.as_deref()).is_dir()
+}
+
 /// Resolve `<sops_dir>/<name>`, accepting only a single normal path
 /// component so caller-controlled names cannot escape the SOP root.
 fn resolve_sop_dir(sops_dir: &Path, name: &str) -> Result<PathBuf> {
@@ -1149,6 +1166,154 @@ mod tests {
         assert_eq!(
             resolve_sops_dir(workspace, Some("")),
             workspace.join("sops")
+        );
+    }
+
+    /// Write a minimal, valid SOP under `<dir>/<name>/SOP.toml`.
+    fn write_sop(dir: &Path, name: &str) {
+        let sop_dir = dir.join(name);
+        std::fs::create_dir_all(&sop_dir).expect("create SOP dir");
+        std::fs::write(
+            sop_dir.join("SOP.toml"),
+            format!(
+                r#"
+[sop]
+name = "{name}"
+description = "regression fixture"
+version = "1.0.0"
+
+[[triggers]]
+type = "manual"
+"#
+            ),
+        )
+        .expect("write SOP.toml");
+    }
+
+    /// Regression for #9779.
+    ///
+    /// `sops_dir` is an optional override; omitting it must resolve the
+    /// documented `<workspace>/sops` default. Before the fix every construction
+    /// site gated on the override being *set*, so a populated default directory
+    /// was visible to `sop list` yet the daemon never built an engine for it and
+    /// SOPs silently never ran.
+    #[test]
+    fn sops_enabled_when_sops_dir_is_omitted_and_default_dir_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_sop(&tmp.path().join("sops"), "default-dir-sop");
+
+        let config = SopConfig {
+            sops_dir: None,
+            ..Default::default()
+        };
+
+        assert!(
+            sops_enabled(&config, tmp.path()),
+            "an omitted sops_dir with a populated <workspace>/sops must enable SOPs"
+        );
+
+        // The gate and the loader must agree: enabling construction is only
+        // meaningful if the engine then actually reads definitions from there.
+        let loaded = load_sops(tmp.path(), config.sops_dir.as_deref(), SopExecutionMode::Auto);
+        assert_eq!(loaded.len(), 1, "definitions must load from the default dir");
+        assert_eq!(loaded[0].name, "default-dir-sop");
+    }
+
+    /// The rollback path survives: no directory, no SOP runtime.
+    #[test]
+    fn sops_disabled_when_default_dir_is_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = SopConfig {
+            sops_dir: None,
+            ..Default::default()
+        };
+        assert!(
+            !sops_enabled(&config, tmp.path()),
+            "absent <workspace>/sops must leave SOPs disabled"
+        );
+    }
+
+    /// An explicit override still wins, and still disables when it points nowhere.
+    #[test]
+    fn sops_enabled_follows_an_explicit_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_sop(&tmp.path().join("custom"), "override-sop");
+
+        let configured = SopConfig {
+            sops_dir: Some("custom".into()),
+            ..Default::default()
+        };
+        assert!(
+            sops_enabled(&configured, tmp.path()),
+            "an explicit sops_dir that exists must enable SOPs"
+        );
+
+        let missing = SopConfig {
+            sops_dir: Some("nope".into()),
+            ..Default::default()
+        };
+        assert!(
+            !sops_enabled(&missing, tmp.path()),
+            "an explicit sops_dir that does not exist must leave SOPs disabled"
+        );
+    }
+
+    /// The invariant the bug violated, stated directly: the gate must never
+    /// suppress a directory the loader would have read definitions from.
+    ///
+    /// The old `sops_dir.is_some()` gate broke exactly this — omitted override
+    /// plus a populated `<workspace>/sops` meant `load_sops` would return a SOP
+    /// while the gate said "no engine". Any future gate that is stricter than
+    /// the loader fails here.
+    #[test]
+    fn the_gate_never_suppresses_a_directory_the_loader_would_read() {
+        for override_dir in [None, Some(""), Some("custom"), Some("absent")] {
+            for create_default in [false, true] {
+                for create_custom in [false, true] {
+                    let tmp = tempfile::tempdir().unwrap();
+                    if create_default {
+                        write_sop(&tmp.path().join("sops"), "in-default");
+                    }
+                    if create_custom {
+                        write_sop(&tmp.path().join("custom"), "in-custom");
+                    }
+
+                    let config = SopConfig {
+                        sops_dir: override_dir.map(str::to_owned),
+                        ..Default::default()
+                    };
+                    let loaded = load_sops(
+                        tmp.path(),
+                        config.sops_dir.as_deref(),
+                        SopExecutionMode::Auto,
+                    );
+
+                    if !loaded.is_empty() {
+                        assert!(
+                            sops_enabled(&config, tmp.path()),
+                            "gate refused an engine while the loader would read {} SOP(s) \
+                             (override={override_dir:?}, default_dir={create_default}, \
+                             custom_dir={create_custom})",
+                            loaded.len()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A file where the directory should be is not a SOPs root.
+    #[test]
+    fn sops_disabled_when_default_path_is_a_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("sops"), b"not a directory").unwrap();
+        let config = SopConfig {
+            sops_dir: None,
+            ..Default::default()
+        };
+        assert!(
+            !sops_enabled(&config, tmp.path()),
+            "a regular file at <workspace>/sops must not enable SOPs"
         );
     }
 

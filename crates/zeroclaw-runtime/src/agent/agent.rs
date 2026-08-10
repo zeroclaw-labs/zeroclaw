@@ -1522,13 +1522,14 @@ impl Agent {
             None
         };
 
-        // SOP loading is gated on `[sop] sops_dir`: unset disables all SOP
-        // runtime behavior, matching the documented rollback path.
-        // If caller provided an engine (daemon path), use it; otherwise
-        // build our own (CLI/standalone path) only when the gate is set.
+        // SOP loading is gated on the resolved SOPs directory existing: `[sop]
+        // sops_dir` is an optional override, and omitting it resolves the
+        // documented `<workspace>/sops` default. Removing that directory is the
+        // rollback path. If the caller provided an engine (daemon path), use it;
+        // otherwise build our own (CLI/standalone path) when the gate passes.
         let (sop_engine, sop_audit) = match (sop_engine, sop_audit) {
             (Some(engine), Some(audit)) => (Some(engine), Some(audit)),
-            (None, None) if config.sop.sops_dir.is_some() => {
+            (None, None) if crate::sop::sops_enabled(&config.sop, &config.data_dir) => {
                 let mem: Arc<dyn zeroclaw_memory::Memory> =
                     zeroclaw_memory::create_memory_for_agent(config, agent_alias, None).await?;
                 // CLI / standalone path: no channel map is wired here, so the route
