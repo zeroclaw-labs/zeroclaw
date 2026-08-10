@@ -18,6 +18,25 @@ const PROMPT_EXAMPLE_TZ: &str = "zeroclaw cron add '0 9 * * 1-5' 'Good morning' 
 const PROMPT_EXAMPLE: &str =
     "zeroclaw cron add '*/30 * * * *' 'Check system health' --agent sentinel --prompt";
 const SHELL_EXAMPLE: &str = "zeroclaw cron add '*/5 * * * *' 'echo ok' --agent sentinel";
+const ADD_AT_PARENT_EXAMPLE: &str =
+    "zeroclaw cron add-at 2025-01-15T14:00:00Z 'Send reminder' --agent sentinel --prompt";
+const ADD_EVERY_PARENT_EXAMPLE: &str =
+    "zeroclaw cron add-every 60000 'Ping heartbeat' --agent sentinel --prompt";
+const ONCE_PARENT_EXAMPLE: &str =
+    "zeroclaw cron once 30m 'Run backup in 30 minutes' --agent sentinel --prompt";
+
+const ADD_AT_CHILD_EXAMPLES: &[&str] = &[
+    "zeroclaw cron add-at --agent morning-shift --prompt 2025-01-15T14:00:00Z 'Send reminder'",
+    "zeroclaw cron add-at --agent morning-shift --prompt 2025-12-31T23:59:00Z 'Happy New Year!'",
+];
+const ADD_EVERY_CHILD_EXAMPLES: &[&str] = &[
+    "zeroclaw cron add-every --agent triage --prompt 60000 'Ping heartbeat'",
+    "zeroclaw cron add-every --agent triage --prompt 3600000 'Hourly report'",
+];
+const ONCE_CHILD_EXAMPLES: &[&str] = &[
+    "zeroclaw cron once --agent ops-bot --prompt 30m 'Run backup in 30 minutes'",
+    "zeroclaw cron once --agent researcher --prompt 2h 'Follow up on deployment'",
+];
 
 /// Isolated config dir that pins the CLI locale to English.
 fn english_config_dir(tmp: &Path) {
@@ -48,11 +67,38 @@ fn cron_parent_help_shows_runnable_examples() {
     let tmp = tempfile::tempdir().unwrap();
     english_config_dir(tmp.path());
     let stdout = assert_success(&run(tmp.path(), &["cron", "--help"]));
-    for example in [PROMPT_EXAMPLE_TZ, PROMPT_EXAMPLE, SHELL_EXAMPLE] {
+    for example in [
+        PROMPT_EXAMPLE_TZ,
+        PROMPT_EXAMPLE,
+        SHELL_EXAMPLE,
+        ADD_AT_PARENT_EXAMPLE,
+        ADD_EVERY_PARENT_EXAMPLE,
+        ONCE_PARENT_EXAMPLE,
+    ] {
         assert!(
             stdout.contains(example),
             "cron --help must show a runnable example, missing: {example}"
         );
+    }
+}
+
+#[test]
+fn cron_one_shot_and_interval_help_show_runnable_prompt_examples() {
+    let tmp = tempfile::tempdir().unwrap();
+    english_config_dir(tmp.path());
+
+    for (subcommand, examples) in [
+        ("add-at", ADD_AT_CHILD_EXAMPLES),
+        ("add-every", ADD_EVERY_CHILD_EXAMPLES),
+        ("once", ONCE_CHILD_EXAMPLES),
+    ] {
+        let stdout = assert_success(&run(tmp.path(), &["cron", subcommand, "--help"]));
+        for example in examples {
+            assert!(
+                stdout.contains(example),
+                "cron {subcommand} --help must show a runnable prompt example, missing: {example}"
+            );
+        }
     }
 }
 
