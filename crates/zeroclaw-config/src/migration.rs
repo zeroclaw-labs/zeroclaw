@@ -1356,6 +1356,51 @@ vision_model_provider = "custom"
     }
 
     #[test]
+    fn v2_explicit_default_provider_colon_url_over_bare_custom_stays_fail_closed() {
+        // The existing source is a BARE `custom` entry (its uri lives in the
+        // config), while `default_provider = "custom:https://B"` selects a
+        // different URL. The URL is part of the selector's source identity, so
+        // it is not an equivalent overlay of the bare producer. Registering the
+        // selector under only the stripped `custom` prefix would dedupe against
+        // the existing bare `custom` producer and leave a single-producer slot,
+        // letting the bare vision reference rewrite to `custom.default` and
+        // consume the global credential against URI A despite the selector
+        // naming URL B.
+        let raw = r#"
+schema_version = 2
+
+[providers]
+default_provider = "custom:https://b.example.invalid/v1"
+api_key = "global-key"
+default_model = "vision-model"
+
+[providers.models.custom]
+uri = "https://a.example.invalid/v1"
+model = "vision-model"
+
+[multimodal]
+vision_model_provider = "custom"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("custom"),
+            "a colon-URL default_provider over a bare custom producer must leave \
+             the bare reference fail-closed rather than rewrite against URI A"
+        );
+        let alias = cfg
+            .providers
+            .models
+            .find("custom", "default")
+            .expect("the migrated custom.default alias must exist");
+        assert_eq!(
+            alias.uri.as_deref(),
+            Some("https://a.example.invalid/v1"),
+            "the bare producer's uri must survive the non-equivalent overlay"
+        );
+    }
+
+    #[test]
     fn v2_globals_create_missing_default_alias_beside_non_default_alias() {
         // No `default_provider`, only a non-default alias (`openai.codex` from
         // `openai-codex`), and global `[providers]` values. The globals fold
