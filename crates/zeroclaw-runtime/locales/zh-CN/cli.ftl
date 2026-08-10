@@ -817,6 +817,7 @@ channel-runtime-progress-finalizing-response = 正在完成回复
 channel-runtime-new-session = 对话历史已清除。重新开始。
 channel-runtime-stop-sent = 已发送停止信号。
 channel-runtime-stop-no-task = 此发送者范围内没有正在执行的任务。
+channel-runtime-conversation-busy = 此会话待处理的消息过多，本条消息已被丢弃。请等待回复，或发送 /stop 清空您排队中的请求。
 channel-runtime-model-empty = 模型 ID 不能为空。请使用 `/model <model-id>`。
 channel-runtime-model-switched = 已切换到模型 `{ $model }`（model_provider：`{ $provider }`）。上下文已保留。
 channel-runtime-agent-scope-rejected = 发送者 `{ $sender }` 无权在 agent `{ $agent }` 上执行 `/model --agent`。请改用 `/model --user { $model }`（仅本次会话生效），或请管理员将 peer group 的 `admin_for_agent_scope` 设为 `true` 并将你列为成员。

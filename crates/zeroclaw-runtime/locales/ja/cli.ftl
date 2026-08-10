@@ -818,6 +818,7 @@ channel-runtime-progress-finalizing-response = 応答を最終処理中
 channel-runtime-new-session = 会話履歴を消去しました。新しく開始します。
 channel-runtime-stop-sent = 停止シグナルを送信しました。
 channel-runtime-stop-no-task = この送信者スコープに実行中のタスクはありません。
+channel-runtime-conversation-busy = この会話には保留中のメッセージが多すぎるため、このメッセージは破棄されました。返信を待つか、/stop を送信して待機中のリクエストを消去してください。
 channel-runtime-model-empty = モデル ID は空にできません。`/model <model-id>` を使用してください。
 channel-runtime-model-switched = モデルを `{ $model }`（model_provider: `{ $provider }`）に切り替えました。コンテキストは保持されています。
 channel-runtime-agent-scope-rejected = 送信者 `{ $sender }` はエージェント `{ $agent }` で `/model --agent` を実行する権限がありません。セッション限定の上書きには `/model --user { $model }` を使用するか、管理者にあなたをメンバーとして `admin_for_agent_scope = true` のピアグループへ登録するよう依頼してください。
