@@ -4169,10 +4169,12 @@ async fn async_main(command: clap::Command) -> Result<()> {
             zeroclaw_runtime::restart::record_launch();
 
             // Reload loop. `daemon::run` returns DaemonExit::Shutdown on
-            // SIGINT/SIGTERM (loop ends) or DaemonExit::Reload on SIGUSR1
-            // (loop re-reads config from disk and re-runs). The PID stays
-            // the same across reloads — only the in-process subsystems
-            // tear down + re-instantiate.
+            // SIGINT/SIGTERM (loop ends) or DaemonExit::Reload when the
+            // in-process reload channel fires, which the gateway reload
+            // endpoint and the RPC config/reload method both write (loop
+            // re-reads config from disk and re-runs). The PID stays the same
+            // across reloads — only the in-process subsystems tear down +
+            // re-instantiate.
             let mut current_config = config;
             // Nag task for the degraded-security warning, scoped to the
             // current config. Re-evaluated each reload iteration so a repaired
@@ -7675,6 +7677,22 @@ fn warn_verifiable_intent_withheld(config: &Config) {
     );
 }
 
+/// Operator-facing text for the repeating degraded-security warning.
+///
+/// Split out so a regression can assert it names only signals the daemon
+/// registers. `daemon::run` handles SIGINT, SIGTERM and SIGHUP; reload arrives
+/// on the in-process channel the gateway reload endpoint writes. Naming any
+/// other signal here would tell an operator to send one whose default
+/// disposition terminates the process.
+fn degraded_security_nag_message(sections: &str, config_path: &str) -> String {
+    format!(
+        "Running with DEGRADED security: sections ({sections}) were reset to \
+         defaults and `--allow-degraded-security` was set. The posture may be \
+         weaker than intended — repair {config_path}, then restart or POST \
+         /admin/reload, as soon as possible."
+    )
+}
+
 fn gate_security_posture(
     config: &zeroclaw::config::Config,
     allow_degraded: bool,
@@ -7705,12 +7723,7 @@ fn gate_security_posture(
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                     .with_attrs(::serde_json::json!({ "degraded_security": sections })),
-                &format!(
-                    "Running with DEGRADED security: sections ({sections}) were reset to \
-                     defaults and `--allow-degraded-security` was set. The posture may be \
-                     weaker than intended — repair {config_path} and reload \
-                     (SIGUSR1 / `zeroclaw admin reload`) as soon as possible."
-                )
+                &degraded_security_nag_message(&sections, &config_path)
             );
         }
     });
@@ -9746,6 +9759,27 @@ mod tests {
         });
 
         assert!((final_temperature - 0.7).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn degraded_security_nag_names_only_handled_signals() {
+        // The daemon registers exactly these three, in
+        // crates/zeroclaw-runtime/src/daemon/mod.rs. Reload arrives on the
+        // in-process channel the gateway reload endpoint writes, not on a
+        // signal. Any other SIG* in operator guidance names something whose
+        // default disposition terminates the daemon.
+        const HANDLED: [&str; 3] = ["SIGINT", "SIGTERM", "SIGHUP"];
+
+        let message = degraded_security_nag_message("security", "/tmp/config.toml");
+        for token in message.split(|c: char| !c.is_ascii_alphanumeric()) {
+            let Some(suffix) = token.strip_prefix("SIG") else {
+                continue;
+            };
+            assert!(
+                !suffix.is_empty() && HANDLED.contains(&token),
+                "operator guidance names the unhandled signal {token}"
+            );
+        }
     }
 
     #[tokio::test]
