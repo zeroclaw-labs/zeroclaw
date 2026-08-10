@@ -9,6 +9,7 @@ ignore = [
     # When a fix lands, remove from BOTH files.
     "RUSTSEC-2025-0134",  # rustls-pemfile unmaintained; transitive dep awaiting upstream migration to rustls-pki-types
     "RUSTSEC-2026-0173",  # proc-macro-error2 unmaintained; in cargo-deny's resolved graph via matrix-sdk dev-deps; tracking #8519
+    "RUSTSEC-2026-0247",  # bitmaps unmaintained; in cargo-deny's resolved graph via imbl/Matrix SDK dev-deps; tracking #9899
 
     # ── cargo-audit reads the full Cargo.lock, so it flags advisories for
     # crates that cargo-deny (graph-aware) does not pull into the resolved

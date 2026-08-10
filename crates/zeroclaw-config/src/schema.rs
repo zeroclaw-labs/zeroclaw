@@ -4477,6 +4477,60 @@ impl Config {
             })
     }
 
+    /// Resolve the memory backend kind that operator-facing status surfaces should report.
+    ///
+    /// Status output should describe the effective backend selection, not whether a
+    /// dotted storage alias happened to resolve to a typed `storage.<kind>.<alias>`
+    /// entry. Bare backends like `sqlite` remain valid and resolve to their backend
+    /// kind even when no explicit `storage.sqlite.default` stanza is present.
+    ///
+    /// When `agent_alias` is provided, an agent-scoped backend override wins.
+    /// Otherwise the install-wide `[memory].backend` selection is used, falling back
+    /// to the documented default `sqlite` when the field is blank.
+    #[must_use]
+    pub fn resolve_status_memory_backend_kind(&self, agent_alias: Option<&str>) -> &'static str {
+        if let Some(alias) = agent_alias.map(str::trim).filter(|alias| !alias.is_empty())
+            && let Some(agent) = self.agents.get(alias)
+        {
+            return match agent.memory.backend {
+                crate::multi_agent::MemoryBackendKind::None => "none",
+                crate::multi_agent::MemoryBackendKind::Sqlite => "sqlite",
+                crate::multi_agent::MemoryBackendKind::Postgres => "postgres",
+                crate::multi_agent::MemoryBackendKind::Qdrant => "qdrant",
+                crate::multi_agent::MemoryBackendKind::Lucid => "lucid",
+                crate::multi_agent::MemoryBackendKind::Markdown => "markdown",
+            };
+        }
+
+        let backend = self.memory.backend.trim();
+        let kind = backend
+            .split_once('.')
+            .map_or(backend, |(kind, _)| kind)
+            .trim();
+        if kind.is_empty() {
+            return "sqlite";
+        }
+        if kind.eq_ignore_ascii_case("none") {
+            return "none";
+        }
+        if kind.eq_ignore_ascii_case("sqlite") {
+            return "sqlite";
+        }
+        if kind.eq_ignore_ascii_case("postgres") {
+            return "postgres";
+        }
+        if kind.eq_ignore_ascii_case("qdrant") {
+            return "qdrant";
+        }
+        if kind.eq_ignore_ascii_case("markdown") {
+            return "markdown";
+        }
+        if kind.eq_ignore_ascii_case("lucid") {
+            return "lucid";
+        }
+        "none"
+    }
+
     /// Resolve the active storage backend for the memory subsystem.
     ///
     /// `MemoryConfig.backend` is a dotted reference (`<backend>.<alias>`) into
@@ -23221,6 +23275,7 @@ impl HasPropKind for serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+    use crate::multi_agent::{AgentMemoryConfig, MemoryBackendKind};
 
     // ── Nextcloud Talk: one normalized bot secret for both directions ──
     //
@@ -23310,6 +23365,36 @@ mod tests {
             nc_cfg(Some(""), Some("   ")).resolve_bot_secret().unwrap(),
             None
         );
+    }
+
+    #[::core::prelude::v1::test]
+    fn status_memory_backend_uses_agent_sqlite_when_top_level_backend_is_omitted() {
+        let mut cfg = Config::default();
+        cfg.memory.backend.clear();
+        cfg.acp.default_agent = Some("atlas".to_string());
+
+        let atlas = AliasedAgentConfig {
+            memory: AgentMemoryConfig {
+                backend: MemoryBackendKind::Sqlite,
+            },
+            ..Default::default()
+        };
+        cfg.agents.insert("atlas".to_string(), atlas);
+
+        assert_eq!(cfg.resolve_active_storage().kind(), "none");
+        assert_eq!(
+            cfg.resolve_status_memory_backend_kind(cfg.acp.default_agent.as_deref()),
+            "sqlite"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn status_memory_backend_uses_bare_sqlite_when_no_storage_alias_is_materialized() {
+        let mut cfg = Config::default();
+        cfg.memory.backend = "sqlite".to_string();
+
+        assert_eq!(cfg.resolve_active_storage().kind(), "none");
+        assert_eq!(cfg.resolve_status_memory_backend_kind(None), "sqlite");
     }
 
     #[::core::prelude::v1::test]

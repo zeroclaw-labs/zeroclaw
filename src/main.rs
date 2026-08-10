@@ -3386,6 +3386,10 @@ async fn fetch_locales(locale: &str, catalog: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+fn status_memory_backend_for_banner(config: &crate::config::schema::Config) -> &'static str {
+    config.resolve_status_memory_backend_kind(config.acp.default_agent.as_deref())
+}
+
 fn main() -> Result<()> {
     let command = Cli::command();
 
@@ -4551,7 +4555,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     t("cli-status-service-stopped", "🔴 Service:       stopped")
                 );
             }
-            let effective_memory_backend = config.resolve_active_storage().kind();
+            let effective_memory_backend = status_memory_backend_for_banner(&config);
             let heartbeat_value = if config.heartbeat.enabled {
                 let interval_minutes = config.heartbeat.interval_minutes.to_string();
                 let heartbeat_every_fallback = format!("every {}min", interval_minutes);
@@ -8422,6 +8426,35 @@ mod tests {
         let mut line = String::from("abcdefgh");
         cap_line_utf8_safe(&mut line, 4);
         assert_eq!(line, "abcd");
+    }
+
+    #[test]
+    fn status_banner_case_a_uses_effective_agent_sqlite_when_top_level_backend_is_omitted() {
+        use crate::config::schema::{AliasedAgentConfig, Config};
+        use zeroclaw_config::multi_agent::{AgentMemoryConfig, MemoryBackendKind};
+
+        let mut cfg = Config::default();
+        cfg.memory.backend.clear();
+        cfg.acp.default_agent = Some("atlas".to_string());
+
+        let mut atlas = AliasedAgentConfig::default();
+        atlas.memory = AgentMemoryConfig {
+            backend: MemoryBackendKind::Sqlite,
+        };
+        cfg.agents.insert("atlas".to_string(), atlas);
+
+        assert_eq!(status_memory_backend_for_banner(&cfg), "sqlite");
+    }
+
+    #[test]
+    fn status_banner_case_b_uses_global_sqlite_when_storage_default_alias_is_absent() {
+        use crate::config::schema::Config;
+
+        let mut cfg = Config::default();
+        cfg.memory.backend = "sqlite".to_string();
+
+        assert_eq!(cfg.resolve_active_storage().kind(), "none");
+        assert_eq!(status_memory_backend_for_banner(&cfg), "sqlite");
     }
 
     #[test]
