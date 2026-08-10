@@ -133,10 +133,9 @@ pub async fn run_local_listener(
     };
 
     platform::prepare_parent(&path).await?;
-    platform::remove_stale(&path).await?;
-
-    let (mut listener, _endpoint_guard) =
-        platform::bind(&path).context("binding local IPC endpoint")?;
+    let (mut listener, _endpoint_guard) = platform::bind(&path)
+        .await
+        .context("binding local IPC endpoint")?;
 
     platform::secure_endpoint(&path).await;
 
@@ -230,9 +229,9 @@ pub async fn run_local_listener(
 #[cfg(unix)]
 mod platform {
     use anyhow::{Context, Result};
-    use std::fs::Metadata;
+    use std::fs::{File, Metadata, OpenOptions, TryLockError};
     use std::io::ErrorKind;
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     use std::path::{Path, PathBuf};
     use tokio::net::{UnixListener, UnixStream};
 
@@ -258,6 +257,55 @@ mod platform {
         }
     }
 
+    /// Serializes the complete Unix endpoint lifecycle across daemon processes.
+    ///
+    /// The sibling lock file is intentionally persistent: unlinking it would
+    /// let two processes open different lock inodes and both believe they own
+    /// cleanup authority. The kernel releases the advisory lock when this file
+    /// handle is dropped or the process exits.
+    pub(super) struct EndpointLock {
+        _file: File,
+    }
+
+    impl EndpointLock {
+        pub(super) fn acquire(path: &Path) -> Result<Self> {
+            let mut lock_name = path.as_os_str().to_os_string();
+            lock_name.push(".lock");
+            let lock_path = PathBuf::from(lock_name);
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&lock_path)
+                .with_context(|| {
+                    format!(
+                        "opening local IPC endpoint lifecycle lock {}",
+                        lock_path.display()
+                    )
+                })?;
+
+            match file.try_lock() {
+                Ok(()) => Ok(Self { _file: file }),
+                Err(TryLockError::WouldBlock) => Err(std::io::Error::new(
+                    ErrorKind::AddrInUse,
+                    format!(
+                        "local IPC endpoint lifecycle is already owned at {}",
+                        path.display()
+                    ),
+                )
+                .into()),
+                Err(TryLockError::Error(error)) => Err(error).with_context(|| {
+                    format!(
+                        "locking local IPC endpoint lifecycle at {}",
+                        lock_path.display()
+                    )
+                }),
+            }
+        }
+    }
+
     /// Removes the bound socket only while the path still names this listener.
     ///
     /// A path can be unlinked and rebound while the original listener remains
@@ -266,6 +314,7 @@ mod platform {
     pub struct EndpointGuard {
         path: PathBuf,
         identity: SocketIdentity,
+        _lock: EndpointLock,
     }
 
     impl Drop for EndpointGuard {
@@ -338,7 +387,11 @@ mod platform {
         }
     }
 
-    pub fn bind(path: &Path) -> Result<(LocalListener, EndpointGuard)> {
+    pub(super) async fn bind_locked(
+        path: &Path,
+        lock: EndpointLock,
+    ) -> Result<(LocalListener, EndpointGuard)> {
+        remove_stale(path).await?;
         let listener = UnixListener::bind(path).context("binding unix socket")?;
         let identity = SocketIdentity::read(path).context("identifying bound unix socket")?;
         Ok((
@@ -346,8 +399,14 @@ mod platform {
             EndpointGuard {
                 path: path.to_path_buf(),
                 identity,
+                _lock: lock,
             },
         ))
+    }
+
+    pub async fn bind(path: &Path) -> Result<(LocalListener, EndpointGuard)> {
+        let lock = EndpointLock::acquire(path)?;
+        bind_locked(path, lock).await
     }
 
     pub async fn secure_endpoint(path: &Path) {
@@ -404,13 +463,7 @@ mod platform {
         Ok(())
     }
 
-    pub async fn remove_stale(_path: &Path) -> Result<()> {
-        // Named pipes are cleaned up when the last handle closes; there is
-        // no "stale" file equivalent.
-        Ok(())
-    }
-
-    pub fn bind(path: &Path) -> Result<(LocalListener, EndpointGuard)> {
+    pub async fn bind(path: &Path) -> Result<(LocalListener, EndpointGuard)> {
         let name = path_to_pipe_name(path);
         let listener = ServerOptions::new()
             .first_pipe_instance(true)
@@ -737,6 +790,80 @@ mod tests {
             .expect("the incumbent listener should stop after cancellation")
             .unwrap()
             .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn concurrent_stale_start_is_serialized_before_cleanup() {
+        use std::os::unix::fs::MetadataExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let sock_path = tmp.path().join("daemon.sock");
+        let stale_listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
+        drop(stale_listener);
+
+        let stale_metadata = std::fs::symlink_metadata(&sock_path).unwrap();
+        let stale_identity = (stale_metadata.dev(), stale_metadata.ino());
+
+        // Pause the first startup immediately after it owns cleanup authority.
+        // A concurrent startup must fail before it can inspect or unlink the
+        // stale endpoint, then the lock owner can complete the bind.
+        let first_lock = platform::EndpointLock::acquire(&sock_path).unwrap();
+        let contender = match platform::bind(&sock_path).await {
+            Ok(_) => panic!("a concurrent startup must not enter stale cleanup"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            contender
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(ErrorKind::AddrInUse)
+        );
+
+        let current_metadata = std::fs::symlink_metadata(&sock_path).unwrap();
+        assert_eq!(
+            (current_metadata.dev(), current_metadata.ino()),
+            stale_identity,
+            "the losing startup must not mutate the stale endpoint"
+        );
+
+        let (listener, guard) = platform::bind_locked(&sock_path, first_lock).await.unwrap();
+        assert!(tokio::net::UnixStream::connect(&sock_path).await.is_ok());
+
+        drop(listener);
+        drop(guard);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn endpoint_lock_is_held_through_guard_cleanup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock_path = tmp.path().join("daemon.sock");
+        let (listener, guard) = platform::bind(&sock_path).await.unwrap();
+
+        std::fs::remove_file(&sock_path).unwrap();
+        let replacement = tokio::net::UnixListener::bind(&sock_path).unwrap();
+
+        let contender = match platform::EndpointLock::acquire(&sock_path) {
+            Ok(_) => panic!("the endpoint lock must remain held until guard cleanup finishes"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            contender
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(ErrorKind::AddrInUse)
+        );
+
+        drop(listener);
+        drop(guard);
+
+        assert!(
+            tokio::net::UnixStream::connect(&sock_path).await.is_ok(),
+            "guard cleanup must preserve a replacement endpoint"
+        );
+        let _next_owner = platform::EndpointLock::acquire(&sock_path).unwrap();
+        drop(replacement);
     }
 
     #[cfg(unix)]
