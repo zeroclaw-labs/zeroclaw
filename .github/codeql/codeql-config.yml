@@ -3,6 +3,20 @@
 # We intentionally ignore integration tests under `tests/` because they often
 # contain security-focused fixtures (example secrets, malformed payloads, etc.)
 # that can trigger false positives in security queries.
-
 paths-ignore:
     - tests/**
+
+# Query-level suppressions.
+#
+# `paths-ignore` filters by file path, so it cannot exclude findings that live
+# in inline `#[cfg(test)]` modules inside a `src/*.rs` file — the production and
+# test code share one path. `rust/hard-coded-cryptographic-value` fires only on
+# such in-test values today (deterministic unit-test nonces like "nonce-1", the
+# `TEST_SECRET` fixture, and SASL PLAIN test vectors), producing 27 "critical"
+# alerts with zero true positives. Real hard-coded-secret coverage is provided
+# by gitleaks (sec-audit.yml) and Semgrep, which scan production paths without
+# this rule's Rust false-positive rate. Exclude just this one query rather than
+# training reviewers to ignore the Security tab.
+query-filters:
+    - exclude:
+        id: rust/hard-coded-cryptographic-value
