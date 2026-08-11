@@ -1,7 +1,7 @@
 ---
 type: reference
 status: accepted
-last-reviewed: 2026-06-29
+last-reviewed: 2026-07-17
 relates-to:
   - FND-001
   - ADR-003
@@ -59,11 +59,15 @@ omits the compiled component.
 These are real limits of the current host, not style preferences. Know them
 before you design around a capability that is not there.
 
-- **`logging`, config injection, and host-fed inbound are wired; tool and channel
-  adapters also implement `http_client`.** Of the permissions a manifest can
-  declare, `config_read` injects the plugin's own config section. An
-  `http_client` grant is necessary for outbound `wasi:http`, but the adapter must
-  also opt into the host surface. Memory intentionally remains HTTP-free until
+- **`logging`, typed config, instance-scoped secrets and durable state,
+  `http_client`, and host-fed inbound are wired.** Of the permissions a
+  manifest can declare, `config_read` exposes the plugin's own schema-validated
+  public config. A tool or channel schema can designate secrets withheld from
+  public config and resolved in authorized service calls. `state_read` and
+  `state_write` gate encrypted, compare-and-swap state owned by the exact
+  admitted instance. An `http_client` grant is necessary for outbound
+  `wasi:http`, but the capability adapter must also opt into that host surface.
+  Tool and channel adapters do; memory intentionally remains HTTP-free until
   its network boundary has component-level coverage. Filesystem and
   memory-access permissions are still accepted by the manifest schema but
   inert: their host functions are not yet registered in the linker. See
@@ -73,8 +77,10 @@ before you design around a capability that is not there.
   through ambient WASI. A tool or channel plugin with an `http_client` grant
   gets outbound `wasi:http` because those adapters opt in; it cannot listen.
   Channel plugins that must receive inbound traffic do not open a listener
-  themselves: the host runs the listener and feeds messages through the
-  `inbound` import, which the plugin drains from its `poll-message` export.
+  themselves. A host producer can feed messages through the `inbound` import,
+  which the plugin drains from `poll-message`. A webhook-capable channel can
+  instead advertise a single host-owned HTTP route and authenticate and decode
+  each raw request through `parse-webhook`.
 - **A 32-bit boundary.** The target is `wasm32-wasip2`. Guest memory is a 32-bit
   address space and the component ABI lowers offsets as 32-bit regardless of
   host word size. Large values (for example a channel attachment's raw bytes)
@@ -93,16 +99,19 @@ ZeroClaw plugins are WebAssembly components defined by WIT interfaces under
 `wit/v0/` and hosted through direct `wasmtime` (`crates/zeroclaw-plugins`). A
 plugin is compiled to a WASI Preview 2 component (`wasm32-wasip2`) that exports
 one of the plugin worlds (`tool-plugin`, `channel-plugin`, `memory-plugin`) and
-imports the host `logging` interface.
+imports the host interfaces declared by that world in `wit/v0/`.
 
 The host lives in `crates/zeroclaw-plugins/src/component.rs`. It holds one
 async-enabled `wasmtime::Engine`, generates the world bindings with
 `wasmtime::component::bindgen!` from `wit/v0`, and wires a sandboxed WASI p2
-surface into each world's linker. Per-call host state (`PluginState`) carries a
+surface into each world's linker. Per-store host state (`PluginState`) carries a
 `WasiCtx` built with no preopens and no network, plus the `ResourceTable` WASI
-requires. The only host import wired into the linker is `logging`; a plugin's
-ambient authority is therefore the sandboxed WASI context and nothing else (see
-Host imports).
+requires, its host-issued scope, and typed live service handles. Every world
+imports `logging`; tool imports `secrets`, while channel imports `config`,
+`secrets`, and `inbound`. A granted `http_client` permission additionally
+attaches and links `wasi:http`.
+The world declarations and the admitted scope remain the canonical contracts
+for that surface (see Host imports).
 
 The three world bridges map each WIT world onto the runtime's native traits:
 
@@ -117,17 +126,27 @@ hold a warm store guarded by an async mutex for the lifetime of the plugin.
 
 Tool plugins are discovered and registered end to end: the runtime walks
 `channel_plugin_details()`'s tool counterpart and builds a `WasmTool` for each.
-The channel host adapter (`WasmChannel`, its `wasi:http` gating, `configure`
-jail, and host-fed `inbound` queue) is complete and unit-covered, and
+The channel host adapter (`WasmChannel`, its `wasi:http` gating, point-of-use
+config services, and host-fed `inbound` queue) is complete and unit-covered, and
 `PluginHost::channel_plugin_details()` exposes the wasm-backed channel plugins
-to register. Wiring those into the live orchestrator (the discovery-to-channel
-loop in the runtime, plus a per-vendor host listener that drains its transport
-into each channel's `inbound` queue) is the remaining seam and lands with the
-runtime channel-registration change, not this host slice. The memory bridge
-(`WasmMemory`) is in the same position one step earlier: the adapter implements
-the full `Memory` trait against the `memory-plugin` world, but the host does not
-yet expose a memory counterpart to `channel_plugin_details()` and the runtime
-does not yet construct a `WasmMemory` as a configurable backend.
+to register. The runtime admits enabled `[channels.plugin.<alias>]` declarations
+owned by enabled agents, constructs them from the exact component bytes admitted
+by the host, and supervises them in the ordinary channel listener lifecycle.
+Explicit channel declarations do not require `plugins.auto_discover`; that flag
+controls package-scoped tool and skill discovery. One deterministic
+`plugins.max_active_instances` decision covers all three logical capability
+types, with explicit channels admitted before auto-discovered candidates.
+
+The generic host-owned producer that feeds a channel's `inbound` queue remains
+available for vendor tunnels and polling clients. For HTTP push transports, a
+channel can advertise `webhook-ingress`; the daemon then owns the route, queue,
+deadline, rate limiting, and idempotency while a disposable component instance
+authenticates and decodes the raw request. The memory bridge (`WasmMemory`) is
+one step earlier:
+the adapter implements the full `Memory` trait against the `memory-plugin`
+world, but the host does not yet expose a memory counterpart to
+`channel_plugin_details()` and the runtime does not yet construct a
+`WasmMemory` as a configurable backend.
 
 ## Plugin structure
 
@@ -266,19 +285,31 @@ bundle (`validate_manifest_shape` in `host.rs`).
 `crates/zeroclaw-plugins/src/lib.rs`. Read the enum for the canonical set.
 
 Be aware of the gap between declared and enforced: in the component host today
-`config_read` and `http_client` have behavioral effect. `runtime.rs` passes a
-tool plugin's resolved config section into `execute` only when the manifest
-grants `config_read`, and strips any caller-supplied `__config` so the section
-cannot be spoofed; a channel plugin receives the same section through its
-`configure` export under the same rule. `http_client` is a necessary grant, not
-a complete authority decision: the capability adapter must also construct the
-HTTP context and link `wasi:http`. Tool and channel adapters opt in after grant
-validation. The memory adapter deliberately does not, so granting
-`http_client` to a memory scope alone adds no network surface. The remaining
-variants (`file_read`, `file_write`, `memory_read`, `memory_write`) are accepted
-by the manifest schema but are not yet wired to a host import: declaring them
-grants nothing on its own. They reserve the names for the host functions that
-will gate them (see Host imports below).
+`config_read`, `http_client`, `state_read`, and `state_write` have behavioral
+effect. Requesting
+`config_read` requires a `config_schema`, and declaring that schema without the
+permission is also rejected. Before a tool or channel component is used, the
+host resolves its effective grant, materializes the plugin's operator values to
+typed JSON, and validates the complete object. `runtime.rs` strips any
+caller-supplied `__config` before injecting validated non-secret values into a
+tool call; direct top-level string properties marked `x-secret: true` are
+omitted from public config and read through the host-scoped `secrets` import.
+Tools receive that service during `execute`. Channels receive public config
+through `config.get` and secrets through `secrets.get` during `configure` and
+operational calls, while instantiation and static metadata discovery remain
+unavailable. `http_client` is a necessary grant, not a complete authority
+decision: the capability adapter must also construct the HTTP context and link
+`wasi:http`. Tool and channel adapters opt in after grant validation. The
+memory adapter deliberately does not, so granting `http_client` to a memory
+scope alone adds no network surface. The state permissions independently gate
+the `state.get` and `state.put`/`delete`
+imports for tool and channel service frames. Package, capability, and binding
+come only from the admitted host scope; a guest supplies no namespace. The
+remaining variants
+(`file_read`, `file_write`, `memory_read`, `memory_write`) are accepted by the
+manifest schema but are not yet wired to a host import: declaring them grants
+nothing on its own. They reserve the names for the host functions that will
+gate them (see Host imports below).
 
 ## WIT interfaces
 
@@ -293,8 +324,10 @@ signatures.
 
 `wit/v0/` defines three worlds, bound by `bindgen!` in `component.rs`. Each
 imports `logging` (host) and exports `plugin-info` plus its primary interface:
-`tool-plugin` exports `tool`, `channel-plugin` exports `channel`,
-`memory-plugin` exports `memory`. The required (no-default) exports for each
+`tool-plugin` exports `tool`, `channel-plugin` exports `channel`, and
+`memory-plugin` exports `memory`. Tool also imports `secrets` and `state`;
+channel imports `config`, `secrets`, `state`, and `inbound`. The required
+(no-default) exports for each
 world are listed in the world's doc comment in its `.wit` file.
 
 ### `tool` interface
@@ -344,8 +377,9 @@ is breaking and requires a new `vN+1/` directory.
 
 Host functions are imported by the plugin and provided by the runtime. Every
 world's linker wires `logging` (via the host impl in `component_logging.rs`,
-linked alongside `add_wasi` in `component.rs`). The `channel-plugin` world also
-imports `inbound`, the host-fed message queue a channel drains from
+linked alongside `add_wasi` in `component.rs`). Tool and channel link the
+instance-scoped `secrets` service. Channel also imports `config` for its typed
+public object and `inbound` for the host-fed message queue it drains from
 `poll-message`. Tool and channel adapters link outbound `wasi:http` only after
 the admitted scope grants `http_client` (`PluginStoreSpec::with_granted_http`
 and `add_wasi_http` in `component.rs`). Memory withholds both the context and
@@ -353,6 +387,13 @@ linker surface. The filesystem and memory-access permissions remain inert: the
 host functions that would gate them are not yet wired into the linker. A
 plugin's ambient authority is the WASI context (no preopens, no ambient network)
 plus exactly the host imports its grants and adapter opt-ins jointly enable.
+
+ZeroClaw-owned imports share a fixed safety budget per host-dispatched service
+frame. The canonical ceiling is `MAX_HOST_CALLS_PER_FRAME` in
+`crates/zeroclaw-plugins/src/component.rs`. On exhaustion, logging becomes a
+no-op, inbound polling reports empty, and public-config or secret reads return
+`unavailable`. A new frame resets the budget. This ceiling is fixed host policy,
+not duplicated operator configuration.
 
 ### `inbound`
 
@@ -369,6 +410,35 @@ inbound-pending: func() -> u32;
 
 The host side owns an `InboundQueue` per channel; `WasmChannel::inbound` hands a
 clone to the listener task so enqueued traffic is visible to the plugin's drain.
+
+### Channel webhook ingress
+
+A channel that includes `webhook-ingress` in `channel-capabilities` may expose
+one single-segment path with `webhook-path`. The daemon registers that logical
+instance at `GET /plugin/<path>` and `POST /plugin/<path>`. Empty paths, `.` and
+`..`, embedded `/`, and ambiguous claims are rejected by the host; guest
+metadata cannot choose a different channel alias or route owner.
+
+The gateway passes lower-cased raw headers and the bounded raw body to
+`parse-webhook`. Before dispatch, the host removes caller-supplied copies of the
+reserved `x-webhook-method` and `x-webhook-query` headers and regenerates them
+from the actual request. The guest must authenticate the platform request before
+returning messages, normally by reading the current public config and scoped
+secret with `config.get` and `secrets.get` in that call. It returns either a
+list of inbound messages or a typed `unauthorized` / `bad-request` rejection.
+For a provider verification handshake, one message with channel
+`__webhook_reply__` returns its content as the HTTP 200 body without enqueueing
+an agent message. The content is limited to 4 KiB (4096 UTF-8 bytes); an
+oversized response produces a fixed 502 response and no delivery.
+The host replaces guest-supplied channel identity with the admitted `plugin`
+endpoint, checks each sender against the current `peer_groups` policy for that
+alias, and only then applies gateway idempotency to non-empty message IDs.
+
+Webhook parsing uses a fresh store built from the exact admitted component
+bytes. Cancellation discards that disposable store, so a stalled request does
+not retain the warm channel mutex or block later polling and outbound calls.
+The supervised `listen` invocation owns both polling and webhook queue drain;
+there is no second detached startup path for webhook-capable channels.
 
 ### `logging`
 
@@ -387,33 +457,158 @@ variant on purpose. Do not call `wasi:logging` directly, plugin events would be
 formatted inconsistently and would not reach all of the destinations
 `zeroclaw_log` writes to.
 
-### Per-plugin config (`__config`)
+### `config`
+
+`wit/v0/config.wit` is imported by the channel world. It returns the current
+schema-validated, non-secret object as JSON:
+
+```wit
+get: func() -> result<json-string, config-error>;
+```
+
+The object preserves the types declared by `config_schema`; properties marked
+`x-secret: true` are omitted. The service is available during `configure` and
+operational channel exports. It returns `access-denied` when the admitted
+instance lacks the effective `config_read` grant. Calls during component
+initialization or static metadata discovery, resolver or validation failure,
+and host-call budget exhaustion return `unavailable` without exposing internal
+detail.
+
+`config.get` is point-of-use access, not a load-time snapshot. A compliant
+channel plugin **must** call it in each operation that uses config and must not
+retain its returned object in warm guest state. This is a plugin conformance
+rule: after returning JSON to trusted guest code, the host cannot prevent a
+malicious component from copying it.
+
+### `secrets`
+
+`wit/v0/secrets.wit` is imported by the tool and channel worlds. The guest
+supplies only a top-level property name:
+
+```wit
+get: func(name: string) -> result<string, secret-error>;
+```
+
+The host derives package, capability, binding, and effective grants from the
+admitted `PluginInstanceScope`; none are guest inputs. Only direct top-level
+string properties marked `x-secret: true` in the manifest schema are readable.
+Tools can read them while the host dispatches `execute`. Channels can read them
+during `configure` and operational calls such as send, poll, health, and
+capability-gated actions. Component initialization and static metadata exports
+return `unavailable` without resolving config. Within one channel service frame,
+every `config.get` and `secrets.get` uses one resolved canonical config revision;
+that frame is dropped on every exit path. A compliant plugin therefore observes
+a same-binding public/secret rotation together on its next operation.
+`access-denied`, `not-found`, and `unavailable` deliberately reveal no resolver
+or schema detail. Successful reads return plaintext to the trusted guest. The
+service prevents public injection and cross-instance selection; it is not an
+egress proxy that keeps the value hidden from plugin code. A compliant channel
+plugin **must** resolve secrets at each point of use and must not retain a second
+copy in warm state. The host cannot enforce non-retention after returning the
+plaintext.
+
+Secret property names use the same portable plugin-local grammar as state keys:
+1–128 ASCII bytes containing only letters, digits, `_`, `-`, or `.`. URI, path,
+namespace, control, and non-ASCII syntax is rejected during manifest admission.
+
+### `state`
+
+`wit/v0/state.wit` is imported by the tool and channel worlds. It provides
+encrypted durable byte values owned by the exact admitted package, capability,
+and binding:
+
+```wit
+get: func(key: string) -> result<option<state-entry>, state-error>;
+put: func(key: string, value: list<u8>, expected-revision: option<u64>)
+    -> result<u64, state-error>;
+delete: func(key: string, expected-revision: u64) -> result<_, state-error>;
+```
+
+`state_read` permits `get`; `state_write` permits `put` and `delete`. `none` on
+`put` is an absent-key compare-and-swap, while `some(revision)` must match the
+current revision exactly. Writes return the new revision. Keys use the portable
+plugin-local grammar above and cannot select another instance. State is
+available only during tool execution and channel service frames; static calls,
+host-call budget exhaustion, storage/key failures, and integrity failures return
+closed errors. Fixed per-instance entry, value, and total-size quotas return
+`quota-exceeded` rather than partially committing a write.
+
+The runtime stores one authenticated envelope per value in
+`data/plugin-state.db`, encrypted with the install's existing `.secret_key`.
+The database contains only keyed blind indexes and `enc2:` ciphertext. Missing
+or replaced install keys fail closed and are never silently regenerated while
+durable rows exist. Back up the database and `.secret_key` together.
+
+### Per-plugin config (`__config` and `config.get`)
 
 **Permission:** `config_read`
 
-A plugin does not read process environment variables. For tool plugins the host
-resolves the plugin's own config section (the per-entry `config` map under the
-`plugins.entries` schema) and injects it into the `execute` input under the
-reserved `__config` key, but only when the manifest grants `config_read`:
+A plugin does not read process environment variables. Its manifest must pair
+`config_read` with a Draft 2020-12 `config_schema`; either one without the other
+is an invalid manifest. The schema root must be an object with a `properties`
+map and `additionalProperties = false`. Each top-level property must declare
+one of `string`, `boolean`, `integer`, `number`, `array`, or `object`, directly
+or through a package-local JSON Pointer. Tool and channel consumers may set
+`x-secret: true` on a direct top-level string property; nested, false, or
+non-boolean markers and secret non-string properties are rejected.
+Unknown keys, malformed encodings, and constraint violations reject the
+instance before values are delivered to guest code.
+
+The operator's canonical `plugins.entries.<instance-key>.config` values remain
+a secret-marked string map in memory and are encrypted when persisted. The host
+derives the versioned `zpi1_…` entry key from the full package, capability, and
+binding identity; this lets different packages and capability worlds safely
+reuse aliases such as `main`. Channel bindings select the package under
+`[channels.plugin.<alias>]` and agents own them through the ordinary
+`plugin.<alias>` channel reference; neither surface stores operator values.
+The admitted package manifest selects the schema.
+A `string` value is stored directly; `boolean`,
+`integer`, and `number` values use JSON scalar text such as `"true"`, `"4"`,
+or `"0.5"`; `array` and `object` values use JSON text such as
+`'["urgent","ops"]'` or `'{"region":"us-east"}'`. The host materializes and
+validates the complete data into typed JSON for each use, then partitions every
+property exactly once. For a tool, non-secret values are injected under the
+reserved `__config` key:
 
 ```json
 {
   "prompt": "a sunset",
-  "__config": { "api_key": "...", "base_url": "..." }
+  "__config": {
+    "retry_limit": 4,
+    "enabled": true,
+    "labels": ["urgent", "ops"]
+  }
 }
 ```
 
-`runtime.rs` strips any caller-supplied `__config` before injecting the resolved
-section, so the section cannot be spoofed, and withholds it entirely when the
-permission is absent. Operators populate this section through the configuration
-surfaces above (zerocode, the CLI, the gateway) rather than hand-editing a
-file, with one current exception: a freshly installed plugin has no
-`plugins.entries` entry yet, and `config set` cannot materialize a missing
-natural-key entry, so the first entry must be added to the file by hand
-(tracked in issue #8636). The section's keys are whatever the plugin's schema
-declares. The field is marked secret, so CLI-written values encrypt at rest
-under the adjacent `.secret_key`; hand-written plaintext values are also
-accepted at load. A plugin only ever sees its own section.
+The omitted `api_key` is read explicitly with `secrets.get("api_key")` if its
+schema marks it secret. `runtime.rs` strips any caller-supplied `__config`
+before injecting the public section, so the section cannot be spoofed. Tool
+public injection and secret reads within one `execute` frame share one resolved
+live-config revision; the frame is dropped on success, error, trap, panic, or
+cancellation. A channel's `configure` export has no config parameter. It calls
+`config.get` for the public object and `secrets.get` for secret properties, as
+does each later operational export that uses configuration. Both imports within
+one call share one resolved revision. The host drops that materialized view on
+success, error, trap, panic, or cancellation. Public config and credential
+changes within the same logical binding are therefore available together on the
+next operation when the compliant guest resolves both at point of use.
+
+When the manifest requests `config_read` but the host does not effectively
+grant it, resolution substitutes an empty object and validates that object
+before guest code runs. A schema with required fields fails closed during
+construction. If the empty object is valid, tools omit the empty `__config`,
+while channel `config.get` and `secrets.get` return `access-denied`. A plugin
+only ever sees its own section.
+
+Channel static metadata exports cannot call either config service and are read
+once at load. Changing a bot/account identity or any config-derived capability,
+self-handle, mention, or multi-message delay therefore requires channel
+lifecycle reconstruction; ordinary public config and credential rotation for
+the same logical binding does not.
+Tool and channel are the current config consumers. The memory world has no
+config import yet, so memory plugins must not request `config_read` until that
+ABI and runtime wiring land.
 
 ## WASI Component Host
 
@@ -485,9 +680,10 @@ plugin boundary as 32-bit by construction.
 
 Plugin manifests may carry an Ed25519 signature
 (`crates/zeroclaw-plugins/src/signature.rs`). The signature is base64url-encoded
-over the canonical manifest bytes (the TOML with the `signature` and
-`publisher_key` lines stripped); the publisher's public key is hex-encoded. The
-host enforces one of three modes from `plugins.security.signature_mode`:
+over the canonical manifest bytes (the parsed TOML with only the exact root
+`signature` and `publisher_key` entries removed); the publisher's public key is
+hex-encoded. Nested schema properties with those names remain signed. The host
+enforces one of three modes from `plugins.security.signature_mode`:
 
 | Mode | Unsigned plugin | Untrusted or invalid signature |
 |------|-----------------|--------------------------------|
@@ -497,6 +693,10 @@ host enforces one of three modes from `plugins.security.signature_mode`:
 
 Verification runs at both discovery and install. Discovery skips a plugin that
 fails its policy rather than aborting the whole host; install returns the error.
+For executable plugins, `strict` mode additionally requires the signed manifest
+to declare `wasm_sha256`. The host confines `wasm_path`, rejects symlinks, reads
+one stable file generation, verifies that digest, and gives adapters only those
+admitted bytes. A declared digest is enforced in every signature mode.
 
 ## Writing a plugin in Rust
 
@@ -553,33 +753,36 @@ cp -r my-plugin/ ~/.zeroclaw/plugins/my-plugin/
 
 ## Configuration
 
-You rarely hand-edit TOML to configure a plugin. ZeroClaw exposes the plugin
-config schema through every surface, and each surface writes the same underlying
-state through the schema mirror (the one current exception: seeding a fresh
-plugin's `plugins.entries` entry, per the note under Per-plugin config). Pick
-whichever fits the moment:
+Operator values currently enter through generic string-map storage: edit
+`[[plugins.entries]]` in TOML, or use `zeroclaw config set` after a tool install
+has seeded its package-name binding entry. `zeroclaw plugin info <package>`
+prints the same key for migration and later edits. Schema-driven forms and
+inline field help are not implemented yet. The current surfaces are:
 
-- **zerocode** the interactive config editor. Walk to the plugins section and
-  set fields with validation and inline help.
-- **The CLI** for plugin lifecycle. `zeroclaw plugin` provides `list`, `search`,
-  `install`, `remove`, `info`, and `migrate`. `zeroclaw config set` adjusts
-  individual plugin config fields.
-- **The web gateway** for a dashboard view. `GET /api/plugins` reports the
+- **The CLI** handles plugin lifecycle with `list`, `search`, `install`,
+  `remove`, `info`, and `migrate`. `zeroclaw config set` writes individual raw
+  plugin values; it does not interpret the plugin's schema.
+- **zerocode** can edit ZeroClaw's static plugin-host settings, but does not yet
+  generate per-plugin fields from `config_schema`.
+- **The web gateway** is read-only for plugins: `GET /api/plugins` reports the
   loaded plugins and whether the system is enabled.
-- **The plugin schema**, if you are the plugin author. Your config surface is
-  defined by the schema, not by asking operators to write TOML. The host injects
-  an author-defined config section into the plugin at call time (see Per-plugin
-  config), so what an operator fills in is whatever your schema declares.
+- **The host** validates `config_schema` when admitting the package and
+  validates/materializes operator values again before guest use.
+- **The manifest schema**, for plugin authors, is the sole type and validation
+  contract at the guest boundary. Define every supported key and constraint
+  there; do not duplicate that contract in a host runtime config struct. Guest
+  code should deserialize the host-validated JSON into its native typed struct.
 
-The schema mirror is what makes this work: the plugin config types in
+The static config schema supplies the generic storage and secret-marking path,
+not a dynamic per-plugin editor. The plugin config types in
 `crates/zeroclaw-config/src/schema.rs` carry `#[prefix = "plugins"]`,
 `#[prefix = "plugins.entries"]`, and `#[prefix = "plugins.security"]`, and the
-`Configurable` derive turns each prefixed field into a path every surface reads
-and writes. Secret fields (a plugin entry's `config` map is marked `#[secret]`)
-encrypt at rest under the adjacent `.secret_key`. The canonical fields,
-defaults, and the `signature_mode` values live in the
+`Configurable` derive turns each prefixed field into a generic config path.
+Secret fields (a plugin entry's `config` map is marked `#[secret]`) encrypt at
+rest under the adjacent `.secret_key`. The canonical fields,
+defaults, and the `signature_mode` values for host configuration live in the
 [Config reference](../reference/index.md); that schema is the source of truth,
-not this page.
+while each plugin manifest is the source of truth for its private config shape.
 
 ### Build features
 

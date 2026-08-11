@@ -80,12 +80,17 @@ The manifest declares two orthogonal things:
   it marks a markdown [skill bundle](../tools/skill-bundles.md) riding the
   install machinery, not code, and needs no component.
 - **Permissions**: what host services the plugin's code may *reach*. The
-  `PluginPermission` enum in the same file. Today `config_read` is enforced,
-  and `http_client` is the necessary grant for adapters that implement outbound
-  `wasi:http`. Tool and channel adapters enable that surface; memory
-  intentionally does not yet. The filesystem and memory-access permissions are
-  accepted by the schema but not yet backed by host functions, so declaring
-  them grants nothing.
+  `PluginPermission` enum in the same file. Today `config_read` (tool and
+  channel adapters receive their own schema-materialized, validated config, and
+  tools can resolve schema-designated secrets during `execute`) and
+  `http_client` have behavioral effect. The HTTP permission is the necessary
+  grant for adapters that implement outbound `wasi:http`: tool and channel
+  enable that surface, while memory intentionally does not yet.
+  `config_read` must be paired with the manifest's `config_schema`; either one
+  without the other is rejected. Channel-capable manifests cannot use
+  `x-secret` yet. The filesystem and memory-access permissions are accepted by
+  the schema but not yet backed by host functions, so declaring them grants
+  nothing.
 
 ## The worlds
 
@@ -118,10 +123,11 @@ a precompiled `.cwasm`. Each plugin instantiation gets:
 - a `Store` carrying the sandboxed WASI context, the resource table, the
   optional HTTP context, and the fuel budget;
 - a `Linker` with exactly the imports its world, grants, and adapter support call
-  for: `logging` always, `inbound` for channels, and `wasi:http` for tool and
-  channel adapters only when the manifest grants `http_client`. Memory creates
-  neither an HTTP context nor an HTTP linker. Each adapter cross-checks its
-  context and linker at instantiation (`ensure_http_coherent`).
+  for: `logging` always, `secrets` for tools, `inbound` for channels, and
+  `wasi:http` for tool and channel adapters only when the manifest grants
+  `http_client`. Memory creates neither an HTTP context nor an HTTP linker. Each
+  adapter cross-checks its context and linker at instantiation
+  (`ensure_http_coherent`).
 
 Tool calls are stateless by construction: `WasmTool::execute` builds a fresh
 store, runs the call, and drops it. Channels and memory backends are stateful

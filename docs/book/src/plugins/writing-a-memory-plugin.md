@@ -169,10 +169,11 @@ edges:
 
 {{#include ../_snippets/plugin-manifest-fields.md}}
 
-For a memory backend: `capabilities` containing `memory`, and `config_read` if
-the backend needs connection settings. Do not rely on `http_client` yet: a grant
-alone cannot widen the memory adapter, which currently exposes no network
-surface.
+For a memory backend: `capabilities` containing `memory`. Do not request
+`config_read` yet: admission requires a schema, but the current memory world has
+no export through which the host can deliver the resulting object. Do not rely
+on `http_client` either: a grant alone cannot widen the memory adapter, which
+currently exposes no network surface.
 
 {{#include ../_snippets/plugin-build-component.md}}
 

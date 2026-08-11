@@ -23,6 +23,39 @@ Local-bound by default. Over-the-network access requires TLS termination at
 the gateway or in front of it; the per-property and PATCH endpoints are not
 safe to expose unauthenticated regardless of TLS posture.
 
+## Plugin webhook ingress
+
+`GET /plugin/<path>` and `POST /plugin/<path>` are the transport boundary for a
+channel plugin that advertises webhook ingress. They are not
+pairing-authenticated: the plugin verifies the platform signature against its
+own canonical channel config while decoding the raw headers and body. The
+gateway still applies the same per-client webhook rate limiter and
+trusted-forwarded-header policy as `POST /webhook`, plus the global 64 KiB
+request-body ceiling.
+
+The host removes caller-supplied copies of `x-webhook-method` and
+`x-webhook-query`, then supplies those reserved headers from the actual HTTP
+request. A plugin can answer a provider verification handshake without
+enqueueing an agent message by returning one `__webhook_reply__` message. The
+message content becomes the HTTP 200 response body when it is at most 4 KiB
+(4096 UTF-8 bytes). An oversized response is rejected with the fixed 502 body
+`invalid plugin webhook response`.
+
+Public failures are deliberately fixed: `401 unauthorized webhook`,
+`400 invalid webhook`, `429` admission/queue rejection, `502 invalid plugin
+webhook response`, `503` unavailable, and `504 webhook processing timed out`.
+Plugin rejection text and runtime traps are logged internally and never
+reflected to an unauthenticated caller. Request cancellation reaches the
+component parser itself; timed-out parser stores are discarded so a later
+webhook cannot be blocked by the prior request.
+
+After successful guest authentication and parsing, non-empty provider message
+IDs use the gateway's existing bounded idempotency store. The reservation is
+kept only after the normalized message reaches the channel queue, so an invalid,
+timed-out, or undeliverable request does not consume its retry identity. If two
+enabled plugin instances declare the same webhook path, every claimant is
+withheld; startup iteration order never chooses an alias implicitly.
+
 ## Discovering the surface
 
 Two endpoints answer the question "what can I do here?":

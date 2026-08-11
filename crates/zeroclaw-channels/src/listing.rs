@@ -194,6 +194,11 @@ const CHANNEL_COMPILE_SPECS: &[ChannelCompileSpec] = &[
         compiled: cfg!(feature = "channel-webhook"),
     },
     ChannelCompileSpec {
+        schema_name: Some("Plugin"),
+        type_keys: &["plugin"],
+        compiled: zeroclaw_runtime::plugin_runtime::WASM_PLUGIN_SUPPORT_COMPILED,
+    },
+    ChannelCompileSpec {
         schema_name: None,
         type_keys: &["acp-server", "acp_server"],
         compiled: cfg!(feature = "channel-acp-server"),
@@ -295,6 +300,10 @@ mod tests {
             is_channel_type_compiled("linq"),
             cfg!(feature = "channel-linq")
         );
+        assert_eq!(
+            is_channel_type_compiled("plugin"),
+            zeroclaw_runtime::plugin_runtime::WASM_PLUGIN_SUPPORT_COMPILED
+        );
     }
 
     #[test]
@@ -336,6 +345,13 @@ mod tests {
             "default".to_string(),
             zeroclaw_config::schema::SlackConfig::default(),
         );
+        cfg.plugin.insert(
+            "mail".to_string(),
+            zeroclaw_config::schema::PluginChannelConfig {
+                package: "email-plugin".to_string(),
+                enabled: true,
+            },
+        );
 
         let names: BTreeSet<_> = configured_uncompiled_channels(&cfg)
             .into_iter()
@@ -343,6 +359,10 @@ mod tests {
             .collect();
 
         assert_eq!(names.contains("Slack"), !cfg!(feature = "channel-slack"));
+        assert_eq!(
+            names.contains("Plugin"),
+            !zeroclaw_runtime::plugin_runtime::WASM_PLUGIN_SUPPORT_COMPILED
+        );
     }
 
     #[test]
