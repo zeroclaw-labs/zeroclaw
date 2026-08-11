@@ -246,11 +246,7 @@ impl V2Config {
 
         // V3 ModelProviderConfig absorbed the V2 [providers] globals
         // (api_key, default_model, etc.) inline; fold them down.
-        let folded = fold_providers_globals_into_models(
-            &mut new_providers,
-            &mut aliased_models,
-            &provenance,
-        );
+        let folded = fold_providers_globals_into_models(&mut new_providers, &mut aliased_models);
         // Reflect the fold in alias provenance so the later bare-vision rewrite
         // never reads authority the fold did not earn. An explicit
         // `default_provider` or the synthesized OpenRouter fallback registers as
@@ -286,9 +282,9 @@ impl V2Config {
         // the migrated V3 alias: runtime resolves only dotted `<family>.<alias>`
         // refs to typed alias config, so a bare ref reaches the legacy
         // configless construction path and loses the alias's api_key. Rewrite
-        // it to the migrated alias only when every producer of that alias slot
-        // is equivalent to the reference's canonical variant.
-        rewrite_bare_vision_provider_reference(&mut passthrough, &provenance);
+        // it to the migrated alias only when the alias slot's effective source
+        // identity matches the reference's canonical variant.
+        rewrite_bare_vision_provider_reference(&mut passthrough, &aliased_models, &provenance);
 
         // V3 dropped cost.prices: the V2 keys ("<provider>/<model>")
         // don't carry the V3 alias path, so remapping is fragile.
@@ -826,23 +822,60 @@ fn alias_provider_models(
     (aliased, provenance)
 }
 
+/// Whether the materialized alias entry at `aliased_models[family][alias]`
+/// carries the effective source identity the reference or selector names: for
+/// every variant extra the spelling implies (endpoint/auth_mode/wire_api/uri),
+/// the entry must hold that exact value, and a colon-URL form additionally
+/// requires the entry's `uri` to equal the reference URL. Comparing against the
+/// materialized values (after operator overrides) rather than re-normalizing
+/// the raw producer key is what lets an override such as
+/// `[providers.models.qwen] endpoint = "intl"` count as the `intl` endpoint a
+/// `qwen-intl` reference names, while a genuinely different effective variant
+/// still fails closed.
+fn effective_source_identity_matches(
+    aliased_models: &toml::Table,
+    family: &str,
+    alias: &str,
+    expected_extras: &[(&'static str, toml::Value)],
+    expected_url: Option<&str>,
+) -> bool {
+    let Some(toml::Value::Table(family_table)) = aliased_models.get(family) else {
+        return false;
+    };
+    let Some(toml::Value::Table(alias_table)) = family_table.get(alias) else {
+        return false;
+    };
+    if let Some(url) = expected_url
+        && alias_table.get("uri").and_then(toml::Value::as_str) != Some(url)
+    {
+        return false;
+    }
+    expected_extras
+        .iter()
+        .all(|(field, expected)| alias_table.get(*field) == Some(expected))
+}
+
 /// Rewrite a `[multimodal] vision_model_provider` reference to the dotted
 /// `<family>.<alias>` form the runtime resolves. The reference is resolved
 /// through the same [`normalize_provider_type`] mapping used by
 /// [`alias_provider_models`], so legacy spellings select their migrated alias:
 /// `grok` -> `xai.default`, `openai-codex` -> `openai.codex`,
 /// `opencode-go` -> `opencode.go`, and dot-bearing `llama.cpp` ->
-/// `llamacpp.default`. The rewrite only happens when EVERY raw producer of the
-/// target `(family, alias)` slot canonicalizes to the same variant as the
-/// reference (same family, alias, and extras). That preserves raw-provider
+/// `llamacpp.default`. The rewrite only happens when the target `(family,
+/// alias)` slot has exactly one raw producer AND that slot's EFFECTIVE source
+/// identity (the actual endpoint/auth_mode/uri values after operator
+/// overrides) matches the reference's expected identity — see
+/// [`effective_source_identity_matches`]. That preserves raw-provider
 /// provenance: a bare or variant reference is never redirected to an alias
 /// supplied by a differently-named source, and a collided slot (e.g. `qwen`
-/// plus `qwen-intl` both writing `qwen.default`) is left unchanged. Colon-URL
-/// refs and already-valid dotted refs that do not canonicalize to a configured
-/// alias are left untouched, and an unknown family stays as-is so the runtime
-/// keeps failing closed on an unknown provider.
+/// plus `qwen-intl` both writing `qwen.default`) is left unchanged. A
+/// colon-URL reference is rewritten only when its full URL identity matches
+/// the sole producer of the migrated alias; unmatched or collided colon
+/// references, already-valid dotted refs, and unknown families are left
+/// untouched so the runtime keeps failing closed.
 fn rewrite_bare_vision_provider_reference(
     passthrough: &mut toml::Table,
+    aliased_models: &toml::Table,
     provenance: &std::collections::HashMap<(String, String), std::collections::BTreeSet<String>>,
 ) {
     let Some(toml::Value::Table(multimodal)) = passthrough.get_mut("multimodal") else {
@@ -851,11 +884,12 @@ fn rewrite_bare_vision_provider_reference(
     let Some(toml::Value::String(reference)) = multimodal.get("vision_model_provider") else {
         return;
     };
-    if reference.contains(':') {
-        return;
-    }
+    // A colon-URL reference (`custom:https://...`) keeps its URL as part of
+    // the source identity; other colon-bearing strings do not canonicalize to
+    // a configured alias and fall through to the no-match preserve below.
+    let (reference_type, reference_url) = split_colon_url_provider(reference);
     let (canonical_family, canonical_alias, reference_extras) =
-        normalize_provider_type(reference, "default");
+        normalize_provider_type(&reference_type, "default");
     let Some(producers) = provenance.get(&(canonical_family.clone(), canonical_alias.clone()))
     else {
         // No source produced the alias the reference names (unknown family,
@@ -870,15 +904,13 @@ fn rewrite_bare_vision_provider_reference(
     if producers.len() != 1 {
         return;
     }
-    // The producer must canonicalize to the same variant as the reference.
-    // Colon-URL producers (`custom:https://...`) are split back to their prefix
-    // before normalization so they match a bare `custom` reference.
-    let all_equivalent = producers.iter().all(|key| {
-        let (raw_type, _url) = split_colon_url_provider(key);
-        let (family, alias, extras) = normalize_provider_type(&raw_type, "default");
-        family == canonical_family && alias == canonical_alias && extras == reference_extras
-    });
-    if !all_equivalent {
+    if !effective_source_identity_matches(
+        aliased_models,
+        &canonical_family,
+        &canonical_alias,
+        &reference_extras,
+        reference_url.as_deref(),
+    ) {
         return;
     }
     multimodal.insert(
@@ -905,7 +937,6 @@ enum GlobalFold {
 fn fold_providers_globals_into_models(
     new_providers: &mut toml::Table,
     aliased_models: &mut toml::Table,
-    provenance: &std::collections::HashMap<(String, String), std::collections::BTreeSet<String>>,
 ) -> GlobalFold {
     let g_api_key = new_providers.remove("api_key");
     let g_api_url = new_providers.remove("api_url");
@@ -951,31 +982,30 @@ fn fold_providers_globals_into_models(
                 let (raw_type, url) = split_colon_url_provider(s);
                 let (canonical, alias, extras) = normalize_provider_type(&raw_type, "default");
                 // The explicit selector is an equivalent overlay of an existing
-                // slot only when the slot's recorded producer has the SAME
-                // source identity: canonical family, alias, variant extras
-                // (endpoint/auth_mode/uri), and — for colon-URL forms — the
-                // same URL. Checking only that the slot exists is not enough: a
-                // `qwen-intl` default_provider over a `qwen`-materialized
-                // `qwen.default` differs by endpoint, and two distinct
-                // `custom:https://...` selectors differ by URL. In those cases
-                // the selector names a different source, so it must register as
-                // a distinct producer (making the slot ambiguous and leaving the
-                // bare vision reference fail-closed) rather than be suppressed
-                // and let the rewrite consume a credential against the wrong
-                // endpoint.
-                let equivalent_existing = provenance
-                    .get(&(canonical.clone(), alias.clone()))
-                    .is_some_and(|producers| {
-                        producers.iter().any(|key| {
-                            let (existing_type, existing_url) = split_colon_url_provider(key);
-                            let (family, fam_alias, fam_extras) =
-                                normalize_provider_type(&existing_type, "default");
-                            family == canonical
-                                && fam_alias == alias
-                                && fam_extras == extras
-                                && existing_url == url
-                        })
-                    });
+                // slot only when the slot's EFFECTIVE source identity matches:
+                // the materialized alias must hold the variant extras the
+                // selector implies (endpoint/auth_mode/uri) and, for colon-URL
+                // forms, the same URL as its `uri`. Checking only that the slot
+                // exists is not enough: a `qwen-intl` default_provider over a
+                // `qwen`-materialized `qwen.default` differs by endpoint, and
+                // two distinct `custom:https://...` selectors differ by URL.
+                // Comparing against the materialized values (rather than
+                // re-normalizing the raw producer key) also lets an operator
+                // override — e.g. `[providers.models.qwen] endpoint = "intl"`
+                // or a bare `custom` whose configured `uri` is already B — count
+                // as equivalent even when the raw producer spelling differs. In
+                // the non-equivalent cases the selector names a different
+                // source, so it must register as a distinct producer (making the
+                // slot ambiguous and leaving the bare vision reference
+                // fail-closed) rather than be suppressed and let the rewrite
+                // consume a credential against the wrong endpoint.
+                let equivalent_existing = effective_source_identity_matches(
+                    aliased_models,
+                    &canonical,
+                    &alias,
+                    &extras,
+                    url.as_deref(),
+                );
                 // Preserve the full colon-bearing selector as the producer
                 // identity when it carries a URL. Recording only the stripped
                 // prefix here would collapse `custom:https://B` to `custom` and
