@@ -315,6 +315,36 @@ For this plugin: `name` and `version` matching what `plugin-info` reports,
 The tool adapter implements `wasi:http`, but links it only after that grant is
 validated; without both adapter support and the grant there is no HTTP surface.
 
+The matching manifest contract for the typed `RedactConfig` is:
+
+```toml
+name = "my-redact-plugin"
+version = "0.1.0"
+wasm_path = "my_redact_plugin.wasm"
+capabilities = ["tool"]
+permissions = ["config_read"]
+
+[config_schema]
+"$schema" = "https://json-schema.org/draft/2020-12/schema"
+type = "object"
+additionalProperties = false
+
+[config_schema.properties.replacement]
+type = "string"
+minLength = 1
+
+[config_schema.properties.redact_emails]
+type = "boolean"
+
+[config_schema.properties.patterns]
+type = "array"
+items = { type = "string" }
+```
+
+These properties are optional, matching the guest's defaults. For a credential
+that must exist, add its name to `required` in `[config_schema]`; a denied grant
+or missing value will then prevent the component from starting.
+
 ### Tools that call the network
 
 Arguably the most common real-world tool shape is not a pure transform like

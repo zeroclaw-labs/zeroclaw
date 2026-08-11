@@ -1,4 +1,4 @@
-//! Minimal channel component used by the plugin-host integration tests.
+//! Minimal channel component used by the plugin-host scoped-secret tests.
 
 #[cfg(target_family = "wasm")]
 mod component {
@@ -10,11 +10,19 @@ mod component {
 
     use exports::zeroclaw::plugin::channel::{
         ApprovalRequest, ApprovalResponse, ChannelCapabilities, Guest as Channel, InboundMessage,
-        SendMessage,
+        SendMessage, WebhookRejection,
     };
     use exports::zeroclaw::plugin::plugin_info::Guest as PluginInfo;
+    use zeroclaw::plugin::config::{ConfigError, get as config_get};
+    use zeroclaw::plugin::secrets::{SecretError, get as secret_get};
+    use zeroclaw::plugin::state::{StateError, get as state_get, put as state_put};
 
     struct FixtureChannel;
+
+    fn current_public_config() -> Result<serde_json::Value, String> {
+        let config = config_get().map_err(|_| "expected point-of-use public config".to_string())?;
+        serde_json::from_str(&config).map_err(|_| "expected public config object".to_string())
+    }
 
     impl PluginInfo for FixtureChannel {
         fn plugin_name() -> String {
@@ -31,11 +39,74 @@ mod component {
             "channel-fixture".to_string()
         }
 
-        fn configure(_config: String) -> Result<(), String> {
+        fn configure() -> Result<(), String> {
+            let config = current_public_config()?;
+            let public = config
+                .as_object()
+                .ok_or_else(|| "expected public config object".to_string())?;
+            if public
+                .get("retry_count")
+                .and_then(serde_json::Value::as_u64)
+                != Some(5)
+            {
+                return Err("expected typed retry_count config".to_string());
+            }
+            if public
+                .get("credential_epoch")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(str::is_empty)
+            {
+                return Err("expected credential_epoch config".to_string());
+            }
+            if public.len() != 2 {
+                return Err("expected only public config".to_string());
+            }
+            if !matches!(secret_get("retry_count"), Err(SecretError::NotFound)) {
+                return Err("public property was exposed as a secret".to_string());
+            }
+            let token = secret_get("api_token")
+                .map_err(|_| "expected scoped api_token secret".to_string())?;
+            if token.is_empty() {
+                return Err("expected non-empty api_token secret".to_string());
+            }
+            let current = state_get("channel-session")
+                .map_err(|_| "expected scoped channel state".to_string())?;
+            let expected = current.as_ref().map(|entry| entry.revision);
+            let revision = state_put("channel-session", token.as_bytes(), expected)
+                .map_err(|_| "expected scoped channel state write".to_string())?;
+            if revision != expected.unwrap_or(0) + 1 {
+                return Err("unexpected channel state revision".to_string());
+            }
+
             Ok(())
         }
 
-        fn send(_message: SendMessage) -> Result<(), String> {
+        fn send(message: SendMessage) -> Result<(), String> {
+            let config = current_public_config()?;
+            let epoch = config
+                .get("credential_epoch")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "expected credential_epoch config".to_string())?;
+            if !matches!(secret_get("retry_count"), Err(SecretError::NotFound)) {
+                return Err("public property was exposed as a secret".to_string());
+            }
+            let token = secret_get("api_token")
+                .map_err(|_| "expected api_token during channel operation".to_string())?;
+            let state = state_get("channel-session")
+                .map_err(|_| "expected channel state during operation".to_string())?
+                .ok_or_else(|| "expected configured channel state".to_string())?;
+            if state.value != token.as_bytes() {
+                let next_revision =
+                    state_put("channel-session", token.as_bytes(), Some(state.revision))
+                        .map_err(|_| "expected CAS update after credential rotation".to_string())?;
+                if next_revision != state.revision + 1 {
+                    return Err("unexpected rotated channel state revision".to_string());
+                }
+            }
+            if message.content != format!("{epoch}:{token}") {
+                return Err("message did not use one current config revision".to_string());
+            }
+
             Ok(())
         }
 
@@ -59,7 +130,16 @@ mod component {
         }
 
         fn get_channel_capabilities() -> ChannelCapabilities {
-            ChannelCapabilities::HEALTH_CHECK | ChannelCapabilities::SELF_HANDLE
+            if matches!(config_get(), Err(ConfigError::Unavailable))
+                && matches!(secret_get("api_token"), Err(SecretError::Unavailable))
+                && matches!(state_get("channel-session"), Err(StateError::Unavailable))
+            {
+                ChannelCapabilities::HEALTH_CHECK
+                    | ChannelCapabilities::SELF_HANDLE
+                    | ChannelCapabilities::WEBHOOK_INGRESS
+            } else {
+                ChannelCapabilities::empty()
+            }
         }
 
         fn health_check() -> bool {
@@ -67,7 +147,10 @@ mod component {
         }
 
         fn self_handle() -> Option<String> {
-            Some("@fixture".to_string())
+            (matches!(config_get(), Err(ConfigError::Unavailable))
+                && matches!(secret_get("api_token"), Err(SecretError::Unavailable))
+                && matches!(state_get("channel-session"), Err(StateError::Unavailable)))
+            .then(|| "@fixture".to_string())
         }
 
         fn self_addressed_mention() -> Option<String> {
@@ -179,6 +262,46 @@ mod component {
 
         fn supports_free_form_ask() -> bool {
             true
+        }
+
+        fn webhook_path() -> Option<String> {
+            Some("fixture".to_string())
+        }
+
+        fn parse_webhook(
+            headers: Vec<(String, String)>,
+            body: Vec<u8>,
+        ) -> Result<Vec<InboundMessage>, WebhookRejection> {
+            let secret = secret_get("api_token").map_err(|_| {
+                WebhookRejection::Unauthorized("webhook credential unavailable".to_string())
+            })?;
+            let presented = headers
+                .iter()
+                .find(|(name, _)| name == "x-fixture-secret")
+                .map(|(_, value)| value.as_str());
+            if presented != Some(secret.as_str()) {
+                return Err(WebhookRejection::Unauthorized(
+                    "bad fixture signature".to_string(),
+                ));
+            }
+            if body == b"stall-parse" {
+                std::thread::sleep(std::time::Duration::from_secs(60));
+            }
+            let content = String::from_utf8(body)
+                .map_err(|_| WebhookRejection::BadRequest("non-utf8 body".to_string()))?;
+            Ok(vec![InboundMessage {
+                id: "webhook-1".to_string(),
+                sender: "webhook".to_string(),
+                reply_target: "webhook".to_string(),
+                content,
+                channel: "guest-channel".to_string(),
+                channel_alias: Some("guest-alias".to_string()),
+                timestamp: 0,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: Vec::new(),
+                subject: None,
+            }])
         }
     }
 

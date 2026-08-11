@@ -114,16 +114,14 @@ auto-deny. Fail closed.
 
 ## Inbound message shape
 
-Translate platform events into `inbound-message` records faithfully. The
-runtime's threading logic keys off the platform payload fields, while routing
-identity comes only from the host-issued endpoint
+Translate platform events into `inbound-message` records faithfully; the
+runtime's session and threading logic keys off these fields
 (`channel.wit`, `from_wit_inbound` in `wasm_channel.rs`):
 
 - `id`, `sender`, `content`: the basics. `reply-target` is where a response
   should go (channel ID, chat ID, email address).
-- `channel` and `channel-alias` are legacy hints retained in the v0 record. The
-  host ignores both for routing and stamps the admitted channel type and
-  configured binding, so a plugin cannot select another owner or session.
+- `channel` is the platform type identifier; `channel-alias` distinguishes
+  multiple bot instances of the same platform and feeds distinct session IDs.
 - `thread-ts` carries the platform's thread identifier for threaded replies;
   `subject` exists for email threading.
 - `interruption-scope-id` groups messages for interruption/cancellation.
@@ -237,6 +235,51 @@ For a channel: `capabilities` containing `channel`, and almost certainly both
 channel adapter implements outbound `wasi:http`, but links it only after that
 grant is validated; without both pieces, `send` has no network path to the
 platform.
+
+Pair `config_read` with the schema consumed by `ChannelConfig`:
+
+```toml
+name = "my-platform"
+version = "0.1.0"
+wasm_path = "my_platform.wasm"
+capabilities = ["channel"]
+permissions = ["config_read", "http_client"]
+
+[config_schema]
+"$schema" = "https://json-schema.org/draft/2020-12/schema"
+type = "object"
+additionalProperties = false
+required = ["api_token"]
+
+[config_schema.properties.api_token]
+type = "string"
+minLength = 1
+
+[config_schema.properties.default_recipient]
+type = "string"
+
+[config_schema.properties.timeout_secs]
+type = "integer"
+minimum = 1
+maximum = 120
+```
+
+The operator still stores `timeout_secs` as the encrypted string `"10"`; the
+host turns it into the JSON integer `10` and enforces the range before
+`configure` runs. Arrays and objects use JSON text in operator storage and
+arrive as real arrays and objects. Because `api_token` is required, withholding
+`config_read` fails closed instead of starting a channel with no credentials.
+Each channel instance selects the `plugins.entries` key derived from its full
+package, `channel` capability, and binding identity while reusing this one
+package-owned schema. Identical aliases in different packages therefore remain
+isolated.
+
+> **Credential limitation.** Do not add `x-secret` to this channel schema.
+> The current channel world has no `secrets` import, and admission rejects any
+> channel-capable manifest containing that marker. Credentials therefore arrive
+> in the one typed `configure` object and remain in warm guest state. A channel
+> migration that requires scoped reads or rotation must remain built in until a
+> coherent warm-store secret lifecycle lands.
 
 ## Build and install
 
