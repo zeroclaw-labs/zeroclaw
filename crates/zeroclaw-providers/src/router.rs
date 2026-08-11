@@ -353,6 +353,21 @@ impl ModelProvider for RouterModelProvider {
             .unwrap_or_default()
     }
 
+    async fn resolve_capabilities_for_model(
+        &self,
+        model: &str,
+    ) -> anyhow::Result<crate::traits::ProviderCapabilities> {
+        let (provider_idx, resolved_model) = self.resolve(model);
+        match self.model_providers.get(provider_idx) {
+            Some((_, provider)) => {
+                provider
+                    .resolve_capabilities_for_model(&resolved_model)
+                    .await
+            }
+            None => Ok(Default::default()),
+        }
+    }
+
     async fn warm_capabilities_metadata(&self) {
         // Warm every routed provider: route selection happens inside the
         // synchronous capability gate, so each candidate (e.g. a credentialed

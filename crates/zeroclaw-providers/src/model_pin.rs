@@ -83,6 +83,18 @@ impl ModelProvider for ModelPinnedProvider {
         self.inner.capabilities_for_model(&self.pinned_model)
     }
 
+    async fn resolve_capabilities_for_model(
+        &self,
+        _model: &str,
+    ) -> anyhow::Result<super::traits::ProviderCapabilities> {
+        // The pinned model selects the effective capabilities; delegate the
+        // whole resolve (warm + query) so a catalog outage on the inner
+        // provider fails the turn instead of degrading to the family default.
+        self.inner
+            .resolve_capabilities_for_model(&self.pinned_model)
+            .await
+    }
+
     async fn warm_capabilities_metadata(&self) {
         self.inner.warm_capabilities_metadata().await
     }

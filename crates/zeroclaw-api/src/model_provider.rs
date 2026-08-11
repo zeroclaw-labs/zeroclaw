@@ -460,6 +460,26 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
         capabilities
     }
 
+    /// Resolve the effective capabilities for `model`, atomically warming any
+    /// metadata the query depends on (e.g. a cached model catalog).
+    ///
+    /// Unlike a [`Self::warm_capabilities_metadata`] call followed by
+    /// [`Self::capabilities_for_model`], a failure to load that metadata
+    /// surfaces as an `Err` instead of silently degrading to the family
+    /// default. A caller at an image gate must treat an `Err` as "capability
+    /// unknown", never as "no vision": a transient metadata outage must not be
+    /// interpreted as an authoritative negative capability result that strips
+    /// an image attachment and dispatches a text-only request.
+    ///
+    /// Default implementation mirrors [`Self::capabilities_for_model`] for
+    /// providers whose capability query has no external metadata to warm.
+    async fn resolve_capabilities_for_model(
+        &self,
+        model: &str,
+    ) -> anyhow::Result<ProviderCapabilities> {
+        Ok(self.capabilities_for_model(model))
+    }
+
     /// Warm any process-wide metadata the synchronous [`Self::capabilities_for_model`]
     /// may depend on (e.g. a cached model catalog). Called once per turn from
     /// async context, before the capability gate runs, so the sync query can
@@ -730,6 +750,13 @@ impl<T: ModelProvider + ?Sized> ModelProvider for Arc<T> {
 
     async fn warm_capabilities_metadata(&self) {
         self.as_ref().warm_capabilities_metadata().await
+    }
+
+    async fn resolve_capabilities_for_model(
+        &self,
+        model: &str,
+    ) -> anyhow::Result<ProviderCapabilities> {
+        self.as_ref().resolve_capabilities_for_model(model).await
     }
 
     fn default_max_tokens(&self) -> u32 {

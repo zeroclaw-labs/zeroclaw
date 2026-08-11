@@ -5080,21 +5080,6 @@ fn record_passive_context(ctx: &ChannelRuntimeContext, msg: &ChannelMessage, his
     );
 }
 
-/// Decide whether the channel media pipeline may preserve image bytes as an
-/// `IMAGE:data:...` marker. Model-aware: the agent's configured model decides,
-/// not the family-level flag — a cataloged image-input model (e.g. Pixtral
-/// under a pure-compatible Mistral family whose provider default has no
-/// vision) must keep the marker even when the family says no vision. A
-/// configured vision provider also enables image preservation regardless of
-/// the primary model.
-fn media_pipeline_vision_available(
-    provider: &dyn ModelProvider,
-    model: &str,
-    has_vision_provider: bool,
-) -> bool {
-    provider.capabilities_for_model(model).vision || has_vision_provider
-}
-
 /// Build the transcription manager for the media pipeline, or `None` when no
 /// transcription provider is available. Shared by the route-independent
 /// preprocessing phase (runs before route selection) and the image phase
@@ -5384,14 +5369,15 @@ async fn process_channel_message_body(
     // ── Media pipeline phase 2 (model-aware): image attachments ──
     // Runs after the effective route and provider are resolved so the
     // image-marker decision uses the selected provider/model, not the startup
-    // default. The catalog is warmed first so a credentialed compatible
-    // provider resolves per-model vision instead of the family default.
+    // default. The capabilities are resolved atomically (warm + query in one
+    // owner) so a credentialed compatible provider answers per-model vision
+    // from the models.dev catalog instead of the family default.
     // Audio transcription already ran in phase 1 (before route selection);
-    // an audio-only message never reaches the image warm (fnd-001
+    // an audio-only message never reaches the image resolve (fnd-001
     // zero-overhead constraint — a transcript-only turn does not wait on a
     // catalog-backed request). `describe_images` gates the entire phase so an
     // operator who disabled image description never incurs the catalog-backed
-    // warm or capability lookup for an image attachment (no image marker or
+    // resolve or capability lookup for an image attachment (no image marker or
     // capability decision is produced in that configuration).
     if ctx.media_pipeline.enabled
         && ctx.media_pipeline.describe_images
@@ -5400,17 +5386,40 @@ async fn process_channel_message_body(
             .iter()
             .any(|a| a.kind() == media_pipeline::MediaKind::Image)
     {
-        // Warm the effective provider's capability metadata (e.g. the models.dev
-        // catalog) so the image-preservation decision below resolves per-model
-        // vision instead of silently falling back to the family default. The
-        // leaf provider records its own warning on failure; this call never
-        // propagates an error.
-        active_model_provider.warm_capabilities_metadata().await;
-        let vision = media_pipeline_vision_available(
-            active_model_provider.as_ref(),
-            route.model.as_str(),
-            ctx.multimodal.vision_model_provider.is_some(),
-        );
+        // A catalog outage or retry-backoff must NOT be read as "no vision":
+        // it would silently strip the image to a plain annotation and dispatch
+        // a text-only request as though the model had seen it. Fail the turn
+        // visibly instead of degrading to the family default.
+
+        let capabilities = match active_model_provider
+            .resolve_capabilities_for_model(route.model.as_str())
+            .await
+        {
+            Ok(capabilities) => capabilities,
+            Err(err) => {
+                let safe_err = zeroclaw_providers::sanitize_api_error(&err.to_string());
+                let message = channel_runtime_cli_string_with_args(
+                    "channel-runtime-media-catalog-unavailable",
+                    &[
+                        ("provider", route.model_provider.as_str()),
+                        ("error", safe_err.as_str()),
+                    ],
+                );
+                if let Some(channel) = target_channel.as_ref() {
+                    let _ = channel.send(&SendMessage::reply_to(&msg, message)).await;
+                }
+                reconcile_early_ack(
+                    ctx.as_ref(),
+                    &msg,
+                    target_channel.as_ref(),
+                    early_ack_task,
+                    Some("\u{26A0}\u{FE0F}"),
+                )
+                .await;
+                return;
+            }
+        };
+        let vision = capabilities.vision || ctx.multimodal.vision_model_provider.is_some();
         let pipeline = media_pipeline::MediaPipeline::new(
             &ctx.media_pipeline,
             None, // transcription already ran in phase 1
@@ -14498,22 +14507,143 @@ api_key = "anthropic-key"
     fn media_pipeline_vision_uses_model_aware_capability() {
         // Regression for the channel media boundary: the family-level
         // `supports_vision()` flag is false for this provider, yet the
-        // configured model is cataloged as image-input — the pipeline must
-        // keep the `IMAGE:data:...` marker for that model, and only for it.
+        // configured model is cataloged as image-input — the image phase must
+        // preserve the `IMAGE:data:...` marker for that model, and only for
+        // it. The `has_vision_provider` disjunct now lives inline in the
+        // orchestrator's image phase (covered by the channel regression).
         let provider = CatalogVisionModelProvider;
         assert!(
-            media_pipeline_vision_available(&provider, "pixtral-x", false),
+            provider.capabilities_for_model("pixtral-x").vision,
             "cataloged image-input model must preserve the image marker"
         );
         assert!(
-            !media_pipeline_vision_available(&provider, "mistral-text-model", false),
+            !provider.capabilities_for_model("mistral-text-model").vision,
             "text-only model must not preserve the image marker"
         );
-        // A configured vision provider enables image preservation regardless
-        // of the primary model's per-model capability.
+    }
+
+    /// Provider whose per-model capability resolve fails — the catalog-outage
+    /// shape the phase-2 image gate must surface instead of silently stripping
+    /// the image to a plain annotation and dispatching a text-only request.
+    struct CatalogUnavailableProvider {
+        chat_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for CatalogUnavailableProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.chat_calls.fetch_add(1, Ordering::SeqCst);
+            Ok("ok".to_string())
+        }
+
+        async fn resolve_capabilities_for_model(
+            &self,
+            _model: &str,
+        ) -> anyhow::Result<zeroclaw_api::model_provider::ProviderCapabilities> {
+            anyhow::bail!("models.dev catalog is temporarily unavailable");
+        }
+
+        fn capabilities_for_model(
+            &self,
+            _model: &str,
+        ) -> zeroclaw_api::model_provider::ProviderCapabilities {
+            zeroclaw_api::model_provider::ProviderCapabilities::default()
+        }
+
+        fn supports_vision(&self) -> bool {
+            false
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for CatalogUnavailableProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "CatalogUnavailableProvider"
+        }
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_fails_visibly_when_image_catalog_unavailable() {
+        // Production-shaped regression for the phase-2 image gate: a catalog
+        // outage must NOT be read as "no vision". The image must not be
+        // silently stripped to a plain annotation and a text-only request
+        // dispatched — the turn fails visibly with the catalog-outage message
+        // and no model request is ever made.
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let chat_calls = Arc::new(AtomicUsize::new(0));
+        let provider = CatalogUnavailableProvider {
+            chat_calls: Arc::clone(&chat_calls),
+        };
+        // Pin the stub's own behavior before the arc is handed to the turn:
+        // its capability resolve must fail, otherwise the regression asserts
+        // nothing.
         assert!(
-            media_pipeline_vision_available(&provider, "mistral-text-model", true),
-            "a configured vision provider keeps attachments"
+            provider
+                .resolve_capabilities_for_model("test-model")
+                .await
+                .is_err(),
+            "catalog-unavailable stub must fail capability resolve"
+        );
+
+        let mut msg = message_sent_hook_test_message();
+        msg.attachments = vec![zeroclaw_api::media::MediaAttachment {
+            file_name: "photo.jpg".to_string(),
+            data: vec![0u8; 50],
+            mime_type: Some("image/jpeg".to_string()),
+        }];
+
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(provider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        // Enable the phase-2 image gate exactly like the production assembly
+        // and the sibling image-marker regressions do.
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig {
+                enabled: true,
+                describe_images: true,
+                ..Default::default()
+            },
+            ..(*runtime_ctx).clone()
+        });
+
+        process_channel_message(runtime_ctx, msg, CancellationToken::new()).await;
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert_eq!(
+            sent_messages.len(),
+            1,
+            "exactly one visible failure message, got: {:?}",
+            *sent_messages
+        );
+        // Every locale of the outage key opens with the warning glyph, so this
+        // stays locale-independent.
+        assert!(
+            sent_messages[0].starts_with("chat-42:\u{26A0}\u{FE0F}"),
+            "the catalog outage must surface to the user, got: {}",
+            sent_messages[0]
+        );
+        drop(sent_messages);
+        assert_eq!(
+            chat_calls.load(Ordering::SeqCst),
+            0,
+            "no model request may be dispatched when the image gate cannot resolve vision"
         );
     }
 
@@ -15196,6 +15326,9 @@ api_key = "anthropic-key"
         observer: Arc<dyn Observer>,
         tools: Vec<Box<dyn Tool>>,
     ) -> Arc<ChannelRuntimeContext> {
+        // Phase-2 media pipeline must follow the test's prompt_config, not a
+        // hard-coded default, so image-phase regressions can enable it via Config.
+        let media_pipeline_config = prompt_config.media_pipeline.clone();
         // Auto-approve the registered tools so the turn actually executes them
         // instead of short-circuiting on a denial, which would skip the
         // tool-phase lifecycle emissions entirely.
@@ -15251,7 +15384,7 @@ api_key = "anthropic-key"
                 whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
-            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+            media_pipeline: media_pipeline_config,
             transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks,
@@ -27231,15 +27364,15 @@ This is an example JSON object for profile settings."#;
 
     /// Provider whose family-level capability has NO vision, but whose
     /// `capabilities_for_model` marks the configured model as image-capable
-    /// once the capability catalog is warmed — the "catalog-only image model"
+    /// once the capability catalog is resolved — the "catalog-only image model"
     /// shape (e.g. Pixtral under a pure compatible family where the models.dev
-    /// catalog carries the per-model modality). Before the warm call the
+    /// catalog carries the per-model modality). Before the atomic resolve the
     /// catalog is empty and per-model vision falls back to the family default,
     /// exactly like a credentialed compatible provider in a fresh process.
-    /// Records messages and warm invocations.
+    /// Records messages and capability resolves.
     struct CatalogOnlyVisionModelProvider {
         calls: std::sync::Mutex<Vec<Vec<(String, String)>>>,
-        warm_calls: std::sync::Arc<AtomicUsize>,
+        resolve_calls: std::sync::Arc<AtomicUsize>,
         catalog_loaded: AtomicBool,
     }
 
@@ -27263,9 +27396,15 @@ This is an example JSON object for profile settings."#;
             }
         }
 
-        async fn warm_capabilities_metadata(&self) {
+        async fn resolve_capabilities_for_model(
+            &self,
+            model: &str,
+        ) -> anyhow::Result<zeroclaw_api::model_provider::ProviderCapabilities> {
+            // Atomic capability resolve: loading the catalog is the provider's
+            // job, and success makes the sync gate below catalog-aware.
             self.catalog_loaded.store(true, Ordering::SeqCst);
-            self.warm_calls.fetch_add(1, Ordering::SeqCst);
+            self.resolve_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.capabilities_for_model(model))
         }
 
         async fn chat_with_system(
@@ -27310,17 +27449,17 @@ This is an example JSON object for profile settings."#;
     async fn media_pipeline_preserves_image_marker_for_catalog_only_vision_model() {
         // Regression for the channel media boundary: the image-preservation
         // decision must run AFTER the effective route/provider are resolved and
-        // the capability catalog is warmed, so a catalog-only image model keeps
-        // the `IMAGE:data:...` marker. Before the fix the decision ran against
-        // the startup provider with an empty catalog and fell back to the
-        // family default (no vision), dropping the marker before any turn could
-        // restore the bytes.
+        // the capability catalog is resolved, so a catalog-only image model
+        // keeps the `IMAGE:data:...` marker. Before the fix the decision ran
+        // against the startup provider with an empty catalog and fell back to
+        // the family default (no vision), dropping the marker before any turn
+        // could restore the bytes.
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
         let leaf = Arc::new(CatalogOnlyVisionModelProvider {
             calls: Default::default(),
-            warm_calls: Arc::new(AtomicUsize::new(0)),
+            resolve_calls: Arc::new(AtomicUsize::new(0)),
             catalog_loaded: AtomicBool::new(false),
         });
         // Production shape: the effective provider is the resilient composite
@@ -27382,8 +27521,8 @@ This is an example JSON object for profile settings."#;
         .await;
 
         assert!(
-            leaf.warm_calls.load(Ordering::SeqCst) >= 1,
-            "the resilient wrapper must delegate the warm call to the cataloged leaf"
+            leaf.resolve_calls.load(Ordering::SeqCst) >= 1,
+            "the resilient wrapper must delegate the capability resolve to the cataloged leaf"
         );
 
         {
@@ -27414,19 +27553,19 @@ This is an example JSON object for profile settings."#;
     }
 
     #[tokio::test]
-    async fn media_pipeline_does_not_warm_capabilities_for_audio_only_message() {
+    async fn media_pipeline_does_not_resolve_capabilities_for_audio_only_message() {
         // Regression for the 2026-08-08 review (fnd-001 zero-overhead): an
         // audio-only channel message must never invoke the catalog-backed
-        // capability warm. Before the fix, phase 2 warmed the effective
-        // provider whenever ANY attachment existed; it now fires only when an
-        // IMAGE attachment is present. The cataloged leaf records warm calls,
-        // so an unexpected warm is directly observable.
+        // capability resolve. Before the fix, phase 2 warmed the effective
+        // provider whenever ANY attachment existed; it now resolves only when
+        // an IMAGE attachment is present. The cataloged leaf records resolve
+        // calls, so an unexpected resolve is directly observable.
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
         let leaf = Arc::new(CatalogOnlyVisionModelProvider {
             calls: Default::default(),
-            warm_calls: Arc::new(AtomicUsize::new(0)),
+            resolve_calls: Arc::new(AtomicUsize::new(0)),
             catalog_loaded: AtomicBool::new(false),
         });
         // Production shape: the effective provider is the resilient composite
@@ -27489,9 +27628,9 @@ This is an example JSON object for profile settings."#;
         .await;
 
         assert_eq!(
-            leaf.warm_calls.load(Ordering::SeqCst),
+            leaf.resolve_calls.load(Ordering::SeqCst),
             0,
-            "an audio-only message must not invoke the catalog-backed capability warm"
+            "an audio-only message must not invoke the catalog-backed capability resolve"
         );
 
         let sent_messages = channel_impl.sent_messages.lock().await;
@@ -27502,21 +27641,21 @@ This is an example JSON object for profile settings."#;
     }
 
     #[tokio::test]
-    async fn media_pipeline_does_not_warm_capabilities_when_describe_images_disabled() {
-        // Regression for the 2026-08-09 review: phase 2 warmed the effective
+    async fn media_pipeline_does_not_resolve_capabilities_when_describe_images_disabled() {
+        // Regression for the 2026-08-09 review: phase 2 resolved the effective
         // provider's catalog metadata for ANY image attachment even when the
         // operator disabled image description (`media_pipeline.describe_images
         // = false`). No image marker or capability decision is produced in
-        // that configuration, so the warm is an avoidable external request and
-        // latency regression on an explicitly disabled feature. The phase-2
-        // guard now includes `describe_images`; the cataloged leaf records
-        // warm calls, so an unexpected warm is directly observable.
+        // that configuration, so the resolve is an avoidable external request
+        // and latency regression on an explicitly disabled feature. The
+        // phase-2 guard now includes `describe_images`; the cataloged leaf
+        // records resolve calls, so an unexpected resolve is observable.
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
         let leaf = Arc::new(CatalogOnlyVisionModelProvider {
             calls: Default::default(),
-            warm_calls: Arc::new(AtomicUsize::new(0)),
+            resolve_calls: Arc::new(AtomicUsize::new(0)),
             catalog_loaded: AtomicBool::new(false),
         });
         let wrapper: Arc<dyn ModelProvider> =
@@ -27577,10 +27716,10 @@ This is an example JSON object for profile settings."#;
         .await;
 
         assert_eq!(
-            leaf.warm_calls.load(Ordering::SeqCst),
+            leaf.resolve_calls.load(Ordering::SeqCst),
             0,
             "an image message with describe_images disabled must not invoke the \
-             catalog-backed capability warm"
+             catalog-backed capability resolve"
         );
 
         let sent_messages = channel_impl.sent_messages.lock().await;

@@ -47,6 +47,46 @@ static CATALOG_FETCH_OVERRIDE: std::sync::Mutex<
     Option<Arc<dyn Fn() -> CatalogFetchFuture + Send + Sync>>,
 > = std::sync::Mutex::new(None);
 
+/// RAII guard that installs a catalog-fetch override for the process-global
+/// lifecycle, so a test can make `ensure_catalog_loaded` fail (or answer)
+/// without network access. Held for the test's duration; restores the previous
+/// override (usually `None`) on drop. Serializes with the catalog-global lock
+/// so it never races another test mutating the shared catalog state.
+#[cfg(test)]
+pub(crate) struct CatalogFetchOverrideGuard {
+    _previous: Option<Arc<dyn Fn() -> CatalogFetchFuture + Send + Sync>>,
+    _lock: tokio::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl CatalogFetchOverrideGuard {
+    /// Install `fetcher` as the process-global catalog fetch. The returned
+    /// guard must outlive the assertions that depend on the override.
+    pub(crate) async fn install(
+        fetcher: impl Fn() -> CatalogFetchFuture + Send + Sync + 'static,
+    ) -> Self {
+        let lock = __private_test_catalog_lock().await;
+        let fetcher = Arc::new(fetcher);
+        let mut slot = CATALOG_FETCH_OVERRIDE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous = slot.replace(fetcher);
+        Self {
+            _previous: previous,
+            _lock: lock,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for CatalogFetchOverrideGuard {
+    fn drop(&mut self) {
+        if let Ok(mut slot) = CATALOG_FETCH_OVERRIDE.lock() {
+            *slot = self._previous.take();
+        }
+    }
+}
+
 /// Run the catalog fetch, honoring the test override when installed. The
 /// override lock is released before awaiting the fetch (the boxed future does
 /// not borrow it), so a fetch that internally awaits is never blocked on the

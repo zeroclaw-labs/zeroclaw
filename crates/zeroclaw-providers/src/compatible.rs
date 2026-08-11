@@ -2585,6 +2585,23 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         }
     }
 
+    async fn resolve_capabilities_for_model(
+        &self,
+        model: &str,
+    ) -> anyhow::Result<zeroclaw_api::model_provider::ProviderCapabilities> {
+        // Per-model vision for a credentialed compatible provider is
+        // authoritative from the models.dev catalog. If the catalog cannot be
+        // loaded, that is an outage or retry-backoff state — not proof the
+        // model lacks vision. Surface the error so a caller at an image gate
+        // fails the turn instead of silently stripping the attachment; the
+        // legacy WARN-and-fallback `warm_capabilities_metadata` path is
+        // retained for callers that only best-effort warm.
+        if self.models_dev_key.is_some() {
+            crate::models_dev::ensure_catalog_loaded().await?;
+        }
+        Ok(self.capabilities_for_model(model))
+    }
+
     async fn warm_capabilities_metadata(&self) {
         // Credentialed compatible providers list models through their native
         // `/models` endpoint and may never trigger a models.dev listing, so the
@@ -5571,6 +5588,57 @@ mod tests {
         assert!(
             !provider.capabilities_for_model("text-model").vision,
             "cataloged text-only model must not resolve vision"
+        );
+    }
+
+    /// A compatible provider without a models.dev credential has no catalog to
+    /// consult, so the async resolve must return its own family default — never
+    /// an error. This is the credential-less baseline the image gate relies on:
+    /// only credentialed providers can surface a catalog outage as a capability
+    /// error (and they do so loudly, per the channel regression).
+    #[tokio::test]
+    async fn resolve_capabilities_for_model_without_catalog_key_returns_provider_default() {
+        let provider = make_model_provider("test", "https://example.com", None);
+        let capabilities = provider
+            .resolve_capabilities_for_model("some-model")
+            .await
+            .expect("credential-less compatible provider must resolve from its own defaults");
+        assert!(
+            !capabilities.vision,
+            "without a models.dev key the family default (no vision) must stand"
+        );
+    }
+
+    /// The orchestrator calls the capability resolve through a trait object.
+    /// This pins that the credentialed compatible override (catalog fetch →
+    /// `Err`) surfaces through that object instead of silently falling back
+    /// to the trait default — i.e. the image gate's failure path is reachable
+    /// in production, not just on the concrete type.
+    #[tokio::test]
+    async fn resolve_capabilities_dyn_dispatch_honors_compatible_override() {
+        use crate::models_dev::CatalogFetchOverrideGuard;
+
+        // Forced catalog outage through the process-global override; this test
+        // runs alone in its process so the cached-catalog OnceCell is empty.
+        let _guard = CatalogFetchOverrideGuard::install(|| {
+            Box::pin(async { Err(anyhow::Error::msg("models.dev catalog unavailable")) })
+        })
+        .await;
+
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("dyn-dispatch")
+            .base_url("https://example.com/v1")
+            .credential(Some("fake-key"))
+            .auth_style(AuthStyle::Bearer)
+            .models_dev_key("dyn-dispatch-key")
+            .build();
+        let dyn_provider: std::sync::Arc<dyn ModelProvider> = std::sync::Arc::new(provider);
+        let result = dyn_provider
+            .resolve_capabilities_for_model("some-model")
+            .await;
+        assert!(
+            result.is_err(),
+            "dyn dispatch must honor the credentialed compatible override (Err on catalog failure), got {result:?}"
         );
     }
 

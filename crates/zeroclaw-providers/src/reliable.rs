@@ -1469,6 +1469,24 @@ impl ModelProvider for ReliableModelProvider {
         capabilities
     }
 
+    async fn resolve_capabilities_for_model(
+        &self,
+        model: &str,
+    ) -> anyhow::Result<crate::traits::ProviderCapabilities> {
+        // The gate aggregates per-model vision across every child, so a
+        // catalog outage on ANY child must fail the whole resolution rather
+        // than letting the aggregate silently report the family default
+        // (which would strip an image attachment and dispatch a text-only
+        // request).
+        for entry in &self.model_providers {
+            entry
+                .provider()
+                .resolve_capabilities_for_model(model)
+                .await?;
+        }
+        Ok(self.capabilities_for_model(model))
+    }
+
     async fn warm_capabilities_metadata(&self) {
         // Delegate to every child: the synchronous `capabilities_for_model`
         // gate aggregates per-model vision across all entries, so each child
