@@ -192,6 +192,16 @@ allowed_numbers = ["1234567890"]
 }
 
 #[test]
+fn daemon_guidance_does_not_advertise_unhandled_sigusr1() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let main_source = std::fs::read_to_string(root.join("src/main.rs")).unwrap();
+    assert!(
+        !main_source.contains("SIGUSR1"),
+        "daemon guidance must not advertise the unsupported SIGUSR1 reload path"
+    );
+}
+
+#[test]
 fn daemon_feedback_follows_foreground_job_control_transitions() {
     let (_foreground_config, foreground_obstruction, foreground_port, foreground_command) =
         daemon_fixture();

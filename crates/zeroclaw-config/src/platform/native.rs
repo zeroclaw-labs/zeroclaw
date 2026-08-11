@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 #[cfg(not(target_os = "windows"))]
 use zeroclaw_api::platform::is_android;
-use zeroclaw_api::runtime_traits::RuntimeAdapter;
+use zeroclaw_api::runtime_traits::{RuntimeAdapter, ShellDialect};
 
 pub fn windows_cmd_shell_raw_arg(command: &str) -> String {
     format!("\"{command}\"")
@@ -96,6 +96,20 @@ impl RuntimeAdapter for NativeRuntime {
         true
     }
 
+    fn shell_dialect(&self) -> ShellDialect {
+        // Must match the shell `build_shell_command` actually spawns below:
+        // `cmd.exe /C` on Windows, POSIX `sh -c` (incl. Android) everywhere
+        // else. This is the only sink that reports `WindowsCmd`.
+        #[cfg(target_os = "windows")]
+        {
+            ShellDialect::WindowsCmd
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            ShellDialect::Posix
+        }
+    }
+
     fn build_shell_command(
         &self,
         command: &str,
@@ -129,6 +143,25 @@ impl RuntimeAdapter for NativeRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn native_shell_dialect_is_windows_cmd_on_windows() {
+        // Native execution on Windows runs through `cmd.exe /C`, so the policy
+        // must see `WindowsCmd` and accept the `nul` null device there.
+        assert_eq!(
+            NativeRuntime::new().shell_dialect(),
+            ShellDialect::WindowsCmd
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn native_shell_dialect_is_posix_off_windows() {
+        // Unix native (including Android) runs through POSIX `sh -c`, where
+        // `nul` is an ordinary filename — the policy must not treat it as safe.
+        assert_eq!(NativeRuntime::new().shell_dialect(), ShellDialect::Posix);
+    }
 
     #[test]
     fn native_name() {

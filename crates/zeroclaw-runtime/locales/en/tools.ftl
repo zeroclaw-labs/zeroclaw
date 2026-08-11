@@ -149,6 +149,20 @@ tool-pushover = Send a Pushover notification to your device. Requires PUSHOVER_T
 tool-schedule = Manage scheduled shell-only tasks. Actions: create/add/once/list/get/cancel/remove/pause/resume. WARNING: This tool creates shell jobs whose output is only logged, NOT delivered to any channel. To send a scheduled message to Discord/Telegram/Slack/Matrix, use the cron_add tool with job_type='agent' and a delivery config like {"{"}"mode":"announce","channel":"discord","to":"<channel_id>"{"}"}.
 
 tool-screenshot = Capture a screenshot of the current screen. Returns the file path and base64-encoded PNG data.
+tool-browser-screenshot-error-path-not-allowed = Screenshot path '{ $path }' is not in the workspace allowlist
+tool-browser-screenshot-error-parent-not-exist = Screenshot path '{ $path }' parent directory '{ $parent }' does not exist
+tool-browser-screenshot-error-path-outside-workspace = Screenshot path '{ $path }' resolves to '{ $canonical }' which is outside the workspace
+tool-browser-screenshot-error-missing-filename = Screenshot path '{ $path }' is missing a filename component
+tool-browser-screenshot-error-runtime-config-target = Cannot write screenshot to runtime config path '{ $target }'
+tool-browser-screenshot-error-symlink-target = Cannot write screenshot to symlink target '{ $target }'
+tool-browser-screenshot-error-path-not-utf8 = Screenshot path '{ $path }' resolves to a non-UTF-8 pathname; refusing to write through a lossy conversion
+tool-browser-screenshot-error-computeruse-non-string-path = Screenshot 'path' parameter must be a string, got { $path }
+tool-browser-screenshot-error-non-string-path = Screenshot 'path' must be a string or absent
+tool-browser-screenshot-error-args-not-object = Screenshot arguments must be a JSON object
+tool-browser-screenshot-error-sidecar-no-png-data = computer-use sidecar did not return PNG data
+tool-browser-screenshot-error-sidecar-empty-png = computer-use sidecar returned an empty screenshot payload
+tool-browser-screenshot-error-sidecar-not-png = computer-use sidecar returned a non-PNG screenshot payload
+tool-browser-screenshot-error-sidecar-non-json-success = computer-use sidecar returned a non-JSON success response for a path-bearing screenshot; the requested file was not written
 
 tool-security-ops = Security operations tool for managed cybersecurity services. Actions: triage_alert (classify/prioritize alerts), run_playbook (execute incident response steps), parse_vulnerability (parse scan results), generate_report (create security posture reports), list_playbooks (list available playbooks), alert_stats (summarize alert metrics).
 
