@@ -53,7 +53,7 @@ impl ToolArtifact {
         })
     }
 }
-
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum TurnEvent {
     /// A text chunk from the LLM response (may arrive many times).
@@ -106,15 +106,32 @@ pub enum TurnEvent {
     },
     /// Per-LLM-call token usage and cost; a turn may emit several, one per
     /// model call. `None` means "unavailable for this call", not zero.
+    /// The `provider_ref` and `model` identify the provider and model that
+    /// actually served this call, accounting for vision routing, reliable
+    /// fallback, and mid-turn provider switches.
+    ///
+    /// **Source-breaking change notice (for downstream crates):**
+    /// Adding required `provider_ref: String` and `model: String` fields to
+    /// this variant breaks exhaustive `match` on `TurnEvent` in downstream
+    /// Rust crates. Code using `..` rest patterns is unaffected. This is an
+    /// intentional API evolution to ensure coherent identity tracking across
+    /// provider switches.
     Usage {
         input_tokens: Option<u64>,
         /// Tokens served from the provider's prompt cache (e.g. Anthropic
-        /// `cache_read_input_tokens`, OpenAI `cached_tokens`). These count
-        /// toward the context window and must be added to `input_tokens` to
-        /// get the true total context size.
+        /// `cache_read_input_tokens`, OpenAI `cached_tokens`). Subset of
+        /// `input_tokens` — adding would double-count.
         cached_input_tokens: Option<u64>,
         output_tokens: Option<u64>,
         cost_usd: Option<f64>,
+        /// The `<type>.<alias>` config reference of the provider that served
+        /// this call. Used for accurate context window resolution and cost
+        /// attribution when vision routing or provider switches are active.
+        provider_ref: String,
+        /// The model that actually served this call. When vision routing or
+        /// a reliable fallback selects a different model, this carries the
+        /// served model — not the turn-start model.
+        model: String,
     },
 }
 

@@ -921,6 +921,72 @@ fn is_observability_telemetry(event: &serde_json::Value) -> bool {
     event.get("source").and_then(serde_json::Value::as_str) == Some("observability")
 }
 
+/// Per-provider usage snapshot in the `usage_by_provider` done-frame array.
+#[derive(Debug, Clone, Default)]
+struct ProviderUsageEntry {
+    provider_ref: String,
+    model: String,
+    input_tokens: u64,
+    output_tokens: u64,
+    cached_input_tokens: u64,
+    cost_usd: f64,
+}
+
+/// Scalar inputs to build a done-frame JSON.
+/// `usage_by_provider` is kept as a separate arg (different concern).
+#[derive(Debug, Clone)]
+struct DoneFrameMeta<'a> {
+    full_response: &'a str,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    tokens_used: Option<u64>,
+    cost_usd: Option<f64>,
+    model: &'a str,
+    provider: &'a str,
+    provider_ref: &'a str,
+    max_context_tokens: u64,
+    model_context_window: Option<u64>,
+    last_input_tokens: Option<u64>,
+    last_serving_provider_ref: Option<&'a str>,
+    last_serving_model: Option<&'a str>,
+}
+
+/// Build the `done`-frame JSON.
+/// `provider` is alias-only for backward compatibility;
+/// `provider_ref` carries the full `<type>.<alias>` ref.
+fn build_done_frame_json(
+    meta: &DoneFrameMeta,
+    usage_by_provider: &[ProviderUsageEntry],
+) -> serde_json::Value {
+    let mut done = serde_json::json!({
+        "type": "done",
+        "full_response": meta.full_response,
+        "input_tokens": meta.input_tokens,
+        "output_tokens": meta.output_tokens,
+        "tokens_used": meta.tokens_used,
+        "cost_usd": meta.cost_usd,
+        "model": meta.model,
+        "provider": meta.provider,
+        "provider_ref": meta.provider_ref,
+        "max_context_tokens": meta.max_context_tokens,
+        "last_input_tokens": meta.last_input_tokens,
+        "last_serving_provider_ref": meta.last_serving_provider_ref,
+        "last_serving_model": meta.last_serving_model,
+        "usage_by_provider": usage_by_provider.iter().map(|e| serde_json::json!({
+            "provider_ref": e.provider_ref,
+            "model": e.model,
+            "input_tokens": e.input_tokens,
+            "output_tokens": e.output_tokens,
+            "cached_input_tokens": e.cached_input_tokens,
+            "cost_usd": e.cost_usd,
+        })).collect::<Vec<_>>(),
+    });
+    if let Some(window) = meta.model_context_window {
+        done["model_context_window"] = serde_json::Value::from(window);
+    }
+    done
+}
+
 /// Process a single chat message through the agent and send the response.
 /// Uses [`Agent::turn_streamed`] so that intermediate text chunks, tool calls,
 /// and tool results are forwarded to the WebSocket client in real time.
@@ -960,10 +1026,6 @@ async fn process_chat_message(
         ))
     });
 
-    // Resolve context budget for this agent. Wire field is named
-    // `max_context_tokens` and must track the runtime-profile budget
-    // (same source Zerocode's context meter uses), not the provider
-    // model-window helper which falls back to 32_000 when unset.
     let max_context_tokens = {
         let cfg = state.config.read();
         cfg.effective_max_context_tokens(&turn_alias) as u64
@@ -1043,10 +1105,19 @@ async fn process_chat_message(
     let mut total_input_tokens: Option<u64> = None;
     let mut total_output_tokens: Option<u64> = None;
 
+    // Most recent serving provider/model from usage events (for done-frame metadata).
+    let mut last_provider_ref: Option<String> = None;
+    let mut last_model: Option<String> = None;
+
     // Track the most recent absolute provider-reported prompt size
     // (replaces on each TurnEvent::Usage; not accumulated).
     // Used for accurate context-bar rendering on the client.
     let mut last_input_tokens: Option<u64> = None;
+
+    // Per-provider breakdown — preserves identity of every LLM call so the
+    // done frame can attribute tokens/cost across provider switches.
+    let mut usage_by_provider: std::collections::HashMap<String, ProviderUsageEntry> =
+        std::collections::HashMap::new();
 
     let forward_fut = async {
         let mut cancel_drained = false;
@@ -1170,16 +1241,41 @@ async fn process_chat_message(
                     let ws_msg = match event {
                         TurnEvent::Usage {
                             input_tokens,
-                            cached_input_tokens: _,
+                            cached_input_tokens,
                             output_tokens,
-                            cost_usd: _,
+                            cost_usd,
+                            provider_ref,
+                            model: served_model,
                         } => {
+                            last_provider_ref = Some(provider_ref.clone());
+                            last_model = Some(served_model.clone());
                             if let Some(it) = input_tokens {
                                 total_input_tokens = Some(total_input_tokens.unwrap_or(0) + it);
                                 last_input_tokens = Some(it);
                             }
                             if let Some(ot) = output_tokens {
                                 total_output_tokens = Some(total_output_tokens.unwrap_or(0) + ot);
+                            }
+                            // Per-provider breakdown accumulation
+                            let entry = usage_by_provider
+                                .entry(provider_ref.clone())
+                                .or_insert_with(|| ProviderUsageEntry {
+                                    provider_ref: provider_ref.clone(),
+                                    ..Default::default()
+                                });
+                            entry.model = served_model.clone();
+                            if let Some(it) = input_tokens {
+                                entry.input_tokens = entry.input_tokens.saturating_add(it);
+                            }
+                            if let Some(ot) = output_tokens {
+                                entry.output_tokens = entry.output_tokens.saturating_add(ot);
+                            }
+                            if let Some(ct) = cached_input_tokens {
+                                entry.cached_input_tokens =
+                                    entry.cached_input_tokens.saturating_add(ct);
+                            }
+                            if let Some(cu) = cost_usd {
+                                entry.cost_usd += cu;
                             }
                             continue;
                         }
@@ -1219,6 +1315,7 @@ async fn process_chat_message(
                             "type": "plan",
                             "entries": entries,
                         }),
+                        _ => continue,
                     };
                     let _ = sender.send(Message::Text(ws_msg.to_string().into())).await;
                 }
@@ -1304,10 +1401,17 @@ async fn process_chat_message(
         }
 
         // Broadcast agent_end event
+        let cancel_model = last_model.as_deref().unwrap_or(&turn_model);
+        let cancel_provider_alias = last_provider_ref
+            .as_deref()
+            .map(|r| r.split('.').next_back().unwrap_or(r))
+            .unwrap_or(&provider_label);
+        let cancel_provider_ref = last_provider_ref.as_deref().unwrap_or(&provider_label);
         let _ = state.event_tx.send(serde_json::json!({
             "type": "agent_end",
-            "model_provider": provider_label,
-            "model": turn_model,
+            "model_provider": cancel_provider_alias,
+            "model": cancel_model,
+            "provider_ref": cancel_provider_ref,
         }));
 
         // Trace the cancelled turn so the doctor / replay tool sees it
@@ -1317,8 +1421,9 @@ async fn process_chat_message(
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Cancel)
                 .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                 .with_attrs(::serde_json::json!({
-                    "model_provider": provider_label,
-                    "model": turn_model,
+                    "model_provider": cancel_provider_alias,
+                    "model": cancel_model,
+                    "provider_ref": cancel_provider_ref,
                     "session_key": session_key,
                     "reason": "interrupted by user",
                     "cancelled": true,
@@ -1390,18 +1495,61 @@ async fn process_chat_message(
                 .filter(|usage| usage.input_tokens > 0 || usage.output_tokens > 0)
                 .map(|usage| usage.cost_usd);
 
-            let done = serde_json::json!({
-                "type": "done",
-                "full_response": outcome.response,
-                "input_tokens": total_input_tokens,
-                "output_tokens": total_output_tokens,
-                "tokens_used": total_tokens,
-                "cost_usd": cost_usd,
-                "model": turn_model,
-                "provider": provider_label,
-                "max_context_tokens": max_context_tokens,
-                "last_input_tokens": last_input_tokens,
-            });
+            // Resolve context_window from the last-served provider's config.
+            let (model_context_window, provider_ref_label) =
+                if let Some(ref provider_ref) = last_provider_ref {
+                    let cfg = state.config.read();
+                    let window = cfg
+                        .model_provider_context_window_opt(provider_ref)
+                        .map(|v| v as u64);
+                    // Display label: use alias part of provider_ref (after the dot), or full ref if no dot
+                    let label = provider_ref.split('.').next_back().unwrap_or(provider_ref);
+                    (window, label.to_string())
+                } else {
+                    let (_, live_provider, _) = agent.attribution_fields();
+                    if live_provider.is_empty() {
+                        (None, provider_label.clone())
+                    } else {
+                        let cfg = state.config.read();
+                        let window = cfg
+                            .model_provider_context_window_opt(&live_provider)
+                            .map(|v| v as u64);
+                        let label = live_provider
+                            .split('.')
+                            .next_back()
+                            .unwrap_or(&live_provider);
+                        (window, label.to_string())
+                    }
+                };
+            // Use the last served model from usage events when available so
+            // the terminal metadata is one coherent tuple with the provider.
+            let effective_model = last_model.as_deref().unwrap_or(&turn_model);
+            // Full provider_ref for the done frame: last served ref when
+            // available, otherwise fall back to the turn-start provider label.
+            let provider_ref_full = last_provider_ref.as_deref().unwrap_or(&provider_label);
+            // Deterministic ordering: sort by provider_ref so the wire
+            // format is stable (avoids flaky assertions in tests).
+            let usage_by_provider_vec: Vec<ProviderUsageEntry> = {
+                let mut entries: Vec<_> = usage_by_provider.into_values().collect();
+                entries.sort_by(|a, b| a.provider_ref.cmp(&b.provider_ref));
+                entries
+            };
+            let meta = DoneFrameMeta {
+                full_response: &outcome.response,
+                input_tokens: total_input_tokens,
+                output_tokens: total_output_tokens,
+                tokens_used: total_tokens,
+                cost_usd,
+                model: effective_model,
+                provider: &provider_ref_label,
+                provider_ref: provider_ref_full,
+                max_context_tokens,
+                model_context_window,
+                last_input_tokens,
+                last_serving_provider_ref: last_provider_ref.as_deref(),
+                last_serving_model: last_model.as_deref(),
+            };
+            let done = build_done_frame_json(&meta, &usage_by_provider_vec);
             let _ = sender.send(Message::Text(done.to_string().into())).await;
 
             // Set session state to idle
@@ -1412,8 +1560,9 @@ async fn process_chat_message(
             // Broadcast agent_end event
             let _ = state.event_tx.send(serde_json::json!({
                 "type": "agent_end",
-                "model_provider": provider_label,
-                "model": turn_model,
+                "model_provider": provider_ref_label,
+                "model": effective_model,
+                "provider_ref": provider_ref_full,
             }));
 
             // Append a runtime-trace.jsonl record so a `zeroclaw doctor`
@@ -1424,8 +1573,9 @@ async fn process_chat_message(
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
                     .with_outcome(::zeroclaw_log::EventOutcome::Success)
                     .with_attrs(::serde_json::json!({
-                        "model_provider": provider_label,
-                        "model": turn_model,
+                        "model_provider": provider_ref_label,
+                        "model": effective_model,
+                        "provider_ref": provider_ref_full,
                         "session_key": session_key,
                         "input_tokens": total_input_tokens,
                         "output_tokens": total_output_tokens,
@@ -2174,5 +2324,214 @@ mod tests {
             Some("WaitingApproval"),
             "the gate is cleared once an authorized WS member approves"
         );
+    }
+
+    /// done-frame model_context_window: present when the provider has an
+    /// explicit `context_window`, absent when it does not.
+    #[test]
+    fn done_frame_model_context_window_presence_tracks_provider_config() {
+        use std::collections::HashMap;
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config, RuntimeProfileConfig};
+
+        // (provider_alias, context_window, expected_model_window,
+        // expected_max_context_tokens)
+        let cases: &[(&str, Option<usize>, Option<u64>, u64)] = &[
+            // Provider has no context_window — field must be absent.
+            ("openrouter.default", None, None, 128_000),
+            // Provider sets context_window — field must appear on the wire.
+            (
+                "openrouter.glm-5.2",
+                Some(1_000_000),
+                Some(1_000_000),
+                800_000,
+            ),
+        ];
+
+        for &(provider_alias, context_window, expected_window, expected_max_ctx) in cases {
+            let mut runtime_profiles = HashMap::new();
+            runtime_profiles.insert(
+                "coding".to_string(),
+                RuntimeProfileConfig {
+                    max_context_tokens: Some(expected_max_ctx as usize),
+                    ..RuntimeProfileConfig::default()
+                },
+            );
+
+            let (vendor, model_alias) = provider_alias.split_once('.').unwrap();
+            let mut agents = HashMap::new();
+            agents.insert(
+                "coder".to_string(),
+                AliasedAgentConfig {
+                    enabled: true,
+                    runtime_profile: "coding".into(),
+                    model_provider: provider_alias.into(),
+                    ..AliasedAgentConfig::default()
+                },
+            );
+
+            let mut providers = zeroclaw_config::providers::Providers::default();
+            let entry = providers
+                .models
+                .ensure(vendor, model_alias)
+                .expect("ensure creates entry");
+            if let Some(w) = context_window {
+                entry.context_window = Some(w);
+            }
+
+            let cfg = Config {
+                agents,
+                runtime_profiles,
+                providers,
+                ..Config::default()
+            };
+
+            let max_ctx = cfg.effective_max_context_tokens("coder") as u64;
+            let model_ctx_window = cfg
+                .model_provider_context_window_opt(provider_alias)
+                .map(|v| v as u64);
+            assert_eq!(
+                model_ctx_window, expected_window,
+                "model_provider_context_window_opt({provider_alias}) must return {expected_window:?}"
+            );
+
+            let meta = DoneFrameMeta {
+                full_response: "ok",
+                input_tokens: Some(100),
+                output_tokens: Some(50),
+                tokens_used: Some(150),
+                cost_usd: Some(0.001),
+                model: "glm-5.2",
+                provider: vendor,
+                provider_ref: provider_alias,
+                max_context_tokens: max_ctx,
+                model_context_window: model_ctx_window,
+                last_input_tokens: Some(100),
+                last_serving_provider_ref: Some(provider_alias),
+                last_serving_model: Some("glm-5.2"),
+            };
+            let done = build_done_frame_json(&meta, &[]);
+            let v: serde_json::Value = serde_json::from_str(&done.to_string()).unwrap();
+
+            assert_eq!(v["type"], "done");
+            assert_eq!(
+                v["max_context_tokens"], expected_max_ctx,
+                "profile budget must be emitted"
+            );
+            // REQ-B2: full provider_ref present, alias-only provider unchanged
+            assert_eq!(v["provider_ref"], provider_alias);
+            assert_eq!(v["last_serving_provider_ref"], provider_alias);
+            assert_eq!(v["last_serving_model"], "glm-5.2");
+            assert!(
+                v["usage_by_provider"].as_array().unwrap().is_empty(),
+                "usage_by_provider must be empty when no Usage events accumulated"
+            );
+            if let Some(window) = expected_window {
+                assert_eq!(
+                    v["model_context_window"], window,
+                    "done-frame must carry the provider's explicit context_window"
+                );
+            } else {
+                assert!(
+                    v.get("model_context_window").is_none(),
+                    "model_context_window must be absent when provider has no context_window"
+                );
+            }
+        }
+    }
+
+    /// Regression: done-frame model_context_window follows the live provider
+    /// after either a session/configure A→B switch or an in-turn model switch,
+    /// not the static agent alias. Both paths use the same shared resolver.
+    #[test]
+    fn done_frame_model_window_follows_live_provider_switch() {
+        use std::collections::HashMap;
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config, RuntimeProfileConfig};
+
+        // (switched_provider_alias, scenario_label)
+        let cases: &[(&str, &str)] = &[
+            ("ollama.provider-b", "session/configure switch"),
+            ("ollama.llama3", "in-turn model_switch"),
+        ];
+
+        for &(live_provider_ref, label) in cases {
+            let mut runtime_profiles = HashMap::new();
+            runtime_profiles.insert(
+                "coding".to_string(),
+                RuntimeProfileConfig {
+                    max_context_tokens: Some(800_000),
+                    ..RuntimeProfileConfig::default()
+                },
+            );
+
+            let mut agents = HashMap::new();
+            agents.insert(
+                "coder".to_string(),
+                AliasedAgentConfig {
+                    enabled: true,
+                    runtime_profile: "coding".into(),
+                    model_provider: "openrouter.glm-5.2".into(),
+                    ..AliasedAgentConfig::default()
+                },
+            );
+
+            let mut providers = zeroclaw_config::providers::Providers::default();
+            // Provider A (static binding) — no context_window.
+            providers
+                .models
+                .ensure("openrouter", "glm-5.2")
+                .expect("ensure A");
+            // Provider B (switched-to) — has context_window.
+            let (b_vendor, b_alias) = live_provider_ref.split_once('.').unwrap();
+            providers
+                .models
+                .ensure(b_vendor, b_alias)
+                .expect("ensure B")
+                .context_window = Some(1_000_000);
+
+            let cfg = Config {
+                agents,
+                runtime_profiles,
+                providers,
+                ..Config::default()
+            };
+
+            let model_ctx_window = cfg
+                .model_provider_context_window_opt(live_provider_ref)
+                .map(|v| v as u64);
+            assert_eq!(
+                model_ctx_window,
+                Some(1_000_000),
+                "resolver must return B's window for {label}, not A's"
+            );
+
+            let max_ctx = cfg.effective_max_context_tokens("coder") as u64;
+            let meta = DoneFrameMeta {
+                full_response: "ok",
+                input_tokens: Some(100),
+                output_tokens: Some(50),
+                tokens_used: Some(150),
+                cost_usd: Some(0.001),
+                model: "glm-5.2",
+                provider: "openrouter",
+                provider_ref: live_provider_ref,
+                max_context_tokens: max_ctx,
+                model_context_window: model_ctx_window,
+                last_input_tokens: Some(100),
+                last_serving_provider_ref: Some(live_provider_ref),
+                last_serving_model: Some("glm-5.2"),
+            };
+            let done = build_done_frame_json(&meta, &[]);
+            let v: serde_json::Value = serde_json::from_str(&done.to_string()).unwrap();
+
+            assert_eq!(v["type"], "done");
+            assert_eq!(
+                v["model_context_window"], 1_000_000,
+                "done-frame must carry B's live window after {label}, not A's static alias window"
+            );
+            // REQ-B2: full provider_ref present, alias-only provider unchanged
+            assert_eq!(v["provider_ref"], live_provider_ref);
+            assert_eq!(v["last_serving_provider_ref"], live_provider_ref);
+            assert_eq!(v["last_serving_model"], "glm-5.2");
+        }
     }
 }

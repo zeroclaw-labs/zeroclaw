@@ -442,7 +442,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
     // Shared-ref context for the turn step functions. Every `&mut` the loop
     // owns stays a loop local passed as an explicit argument (RUN_SHEET
     // `turn.context.TurnCtx`).
-    let ctx = TurnCtx {
+    let mut ctx = TurnCtx {
         observer,
         provider_name,
         model,
@@ -461,6 +461,8 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         turn_id,
         agent_alias,
         parent_agent_alias,
+        serving_provider_name: None,
+        serving_model: None,
     };
 
     // Cross-agent SOP step contexts memoized for the WHOLE turn (see the
@@ -654,6 +656,17 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             )
         } else {
             (model_provider, provider_name, model)
+        };
+        // Vision routing override: set the per-iteration serving identity.
+        ctx.serving_provider_name = if vision_model_provider_box.is_some() {
+            Some(active_model_provider_name.to_string())
+        } else {
+            None
+        };
+        ctx.serving_model = if vision_model_provider_box.is_some() {
+            Some(active_model.to_string())
+        } else {
+            None
         };
         iteration_tool_specs.refresh_native_tool_mode(active_model_provider);
         let IterationToolSpecs {
