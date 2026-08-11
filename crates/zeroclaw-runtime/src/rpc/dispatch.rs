@@ -19,9 +19,9 @@ use zeroclaw_config::schema::Config;
 
 use zeroclaw_api::jsonrpc::error_codes::*;
 use zeroclaw_api::jsonrpc::{
-    JSONRPC_VERSION, JsonRpcError, JsonRpcFrame, JsonRpcNotification, JsonRpcResponse, RpcOutbound,
-    SopDecideRequest, SopRunOverlayRequest, SopRunRequest, SopRunResponse, SopRunsRequest,
-    SopSaveRequest, SopSelectRequest,
+    JSONRPC_VERSION, JsonRpcError, JsonRpcFrame, JsonRpcFrameErrorKind, JsonRpcNotification,
+    JsonRpcResponse, RpcOutbound, SopDecideRequest, SopRunOverlayRequest, SopRunRequest,
+    SopRunResponse, SopRunsRequest, SopSaveRequest, SopSelectRequest,
 };
 use zeroclaw_api::model_provider::ChatMessage;
 use zeroclaw_api::runtime_status::RuntimeConfigKind;
@@ -661,12 +661,7 @@ impl RpcDispatcher {
             }
         };
 
-        let error_id = value
-            .get("id")
-            .filter(|id| matches!(id, Value::String(_) | Value::Number(_) | Value::Null))
-            .cloned()
-            .unwrap_or(Value::Null);
-        let frame: JsonRpcFrame = match serde_json::from_value(value) {
+        let frame = match JsonRpcFrame::from_value(value) {
             Ok(frame) => frame,
             Err(e) => {
                 ::zeroclaw_log::record!(
@@ -677,8 +672,22 @@ impl RpcDispatcher {
                         .with_attrs(serde_json::json!({ "line_len": line.len() })),
                     "Rejected invalid JSON-RPC frame"
                 );
-                self.send_error(error_id, INVALID_REQUEST, &format!("Invalid request: {e}"))
-                    .await;
+                match e.kind() {
+                    JsonRpcFrameErrorKind::Request => {
+                        let id = e.request_id().cloned().unwrap_or(Value::Null);
+                        self.send_error(id, INVALID_REQUEST, &format!("Invalid request: {e}"))
+                            .await;
+                    }
+                    JsonRpcFrameErrorKind::Response => {}
+                    JsonRpcFrameErrorKind::Ambiguous => {
+                        self.send_error(
+                            Value::Null,
+                            INVALID_REQUEST,
+                            &format!("Invalid request: {e}"),
+                        )
+                        .await;
+                    }
+                }
                 return;
             }
         };
@@ -9926,28 +9935,27 @@ mod tests {
         assert_eq!(response["id"], id, "line: {line}");
     }
 
+    async fn assert_process_line_drops_invalid_response(line: &str) {
+        let (mut dispatcher, mut rx) = make_bidi_test_dispatcher();
+        dispatcher.process_line_for_test(line).await;
+
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "an invalid response must not produce another response: {line}"
+        );
+    }
+
     #[tokio::test]
     async fn process_line_distinguishes_syntax_and_envelope_errors() {
         assert_process_line_error("{", PARSE_ERROR, Value::Null).await;
 
-        let invalid = [
-            (r#"{"jsonrpc":"2.0"}"#, Value::Null),
-            (r#"{"jsonrpc":"2.0","result":true}"#, Value::Null),
+        let invalid_requests = [
             (r#"{"jsonrpc":"1.0","method":"status","id":1}"#, json!(1)),
-            (
-                r#"{"jsonrpc":"2.0","id":2,"result":true,"error":{"code":-1,"message":"bad"}}"#,
-                json!(2),
-            ),
-            (r#"{"jsonrpc":"2.0","id":3}"#, json!(3)),
-            (
-                r#"{"jsonrpc":"2.0","id":4,"error":{"code":"bad","message":"bad"}}"#,
-                json!(4),
-            ),
-            (
-                r#"{"jsonrpc":"2.0","id":{"nested":5},"result":true}"#,
-                Value::Null,
-            ),
             (r#"{"jsonrpc":"2.0","method":null,"id":6}"#, json!(6)),
+            (r#"{"jsonrpc":"2.0","method":null,"id":null}"#, Value::Null),
             (
                 r#"{"jsonrpc":"2.0","method":"status","params":true,"id":7}"#,
                 json!(7),
@@ -9956,11 +9964,116 @@ mod tests {
                 r#"{"jsonrpc":"2.0","method":"status","params":null,"id":8}"#,
                 json!(8),
             ),
+            (
+                r#"{"jsonrpc":"2.0","method":"status","params":null}"#,
+                Value::Null,
+            ),
         ];
 
-        for (line, id) in invalid {
+        for (line, id) in invalid_requests {
             assert_process_line_error(line, INVALID_REQUEST, id).await;
         }
+
+        let ambiguous = [
+            "null",
+            r#"{"jsonrpc":"2.0"}"#,
+            r#"{"jsonrpc":"2.0","id":3}"#,
+            r#"{"jsonrpc":"2.0","method":"status","id":9,"result":true}"#,
+        ];
+        for line in ambiguous {
+            assert_process_line_error(line, INVALID_REQUEST, Value::Null).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn process_line_drops_malformed_response_frames_without_reply() {
+        let invalid_responses = [
+            r#"{"id":"zc-out-0","result":true}"#,
+            r#"{"jsonrpc":"1.0","id":"zc-out-0","result":true}"#,
+            r#"{"jsonrpc":"2.0","result":true}"#,
+            r#"{"jsonrpc":"2.0","id":2,"result":true,"error":{"code":-1,"message":"bad"}}"#,
+            r#"{"jsonrpc":"2.0","id":null,"result":true,"error":{"code":-1,"message":"bad"}}"#,
+            r#"{"jsonrpc":"2.0","id":4,"error":{"code":"bad","message":"bad"}}"#,
+            r#"{"jsonrpc":"2.0","id":{"nested":5},"result":true}"#,
+            r#"{"jsonrpc":"2.0","id":10,"result":true,"params":{}}"#,
+        ];
+
+        for line in invalid_responses {
+            assert_process_line_drops_invalid_response(line).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_response_cannot_complete_opposite_direction_same_id_request() {
+        let (mut dispatcher, mut daemon_writer_rx) = make_bidi_test_dispatcher();
+        let daemon_rpc = dispatcher.rpc_for_test();
+        let daemon_wait_rpc = Arc::clone(&daemon_rpc);
+        let daemon_waiter = zeroclaw_spawn::spawn!(async move {
+            daemon_wait_rpc.request("ask_user", json!({"q": "?"})).await
+        });
+
+        let daemon_request: Value = serde_json::from_str(
+            &daemon_writer_rx
+                .recv()
+                .await
+                .expect("daemon outbound request"),
+        )
+        .expect("valid daemon request");
+
+        let (client_writer_tx, mut client_writer_rx) = tokio::sync::mpsc::channel(4);
+        let client_rpc = Arc::new(RpcOutbound::new(client_writer_tx));
+        let client_wait_rpc = Arc::clone(&client_rpc);
+        let client_waiter =
+            zeroclaw_spawn::spawn!(
+                async move { client_wait_rpc.request("status", Value::Null).await }
+            );
+        let client_request: Value = serde_json::from_str(
+            &client_writer_rx
+                .recv()
+                .await
+                .expect("client outbound request"),
+        )
+        .expect("valid client request");
+
+        let shared_id = format!("{}0", zeroclaw_api::jsonrpc::OUTBOUND_ID_PREFIX);
+        assert_eq!(daemon_request["id"], json!(&shared_id));
+        assert_eq!(client_request["id"], json!(&shared_id));
+
+        let malformed = format!(
+            r#"{{"jsonrpc":"2.0","id":"{shared_id}","result":null,"error":{{"code":-32600,"message":"bad"}}}}"#
+        );
+        dispatcher.process_line_for_test(&malformed).await;
+
+        assert!(
+            matches!(
+                daemon_writer_rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "malformed response must not generate a same-ID reply"
+        );
+        assert_eq!(daemon_rpc.pending_count(), 1);
+        assert_eq!(client_rpc.pending_count(), 1);
+
+        let valid_daemon_response =
+            format!(r#"{{"jsonrpc":"2.0","id":"{shared_id}","result":{{"answer":"blue"}}}}"#);
+        dispatcher
+            .process_line_for_test(&valid_daemon_response)
+            .await;
+        let daemon_result = tokio::time::timeout(std::time::Duration::from_secs(1), daemon_waiter)
+            .await
+            .expect("daemon request remained resolvable")
+            .expect("daemon waiter task")
+            .expect("daemon result");
+        assert_eq!(daemon_result, json!({"answer": "blue"}));
+        assert_eq!(client_rpc.pending_count(), 1);
+
+        assert!(client_rpc.dispatch_validated_response(&shared_id, Ok(json!({"status": "ready"}))));
+        let client_result = tokio::time::timeout(std::time::Duration::from_secs(1), client_waiter)
+            .await
+            .expect("client request remained resolvable")
+            .expect("client waiter task")
+            .expect("client result");
+        assert_eq!(client_result, json!({"status": "ready"}));
     }
 
     #[tokio::test]
