@@ -645,11 +645,11 @@ Examples:
 Add a one-shot task that fires at a specific RFC3339 timestamp with explicit Z or offset.
 
 The timestamp must include an explicit Z or numeric offset \
-(e.g. 2025-01-15T14:00:00Z or 2025-01-15T09:00:00-05:00).
+(e.g. 2099-01-15T14:00:00Z or 2099-01-15T09:00:00-05:00).
 
 Examples:
-  zeroclaw cron add-at --agent morning-shift --prompt 2025-01-15T14:00:00Z 'Send reminder'
-  zeroclaw cron add-at --agent morning-shift --prompt 2025-12-31T23:59:00Z 'Happy New Year!'")]
+  zeroclaw cron add-at --agent morning-shift --prompt 2099-01-15T14:00:00Z 'Send reminder'
+  zeroclaw cron add-at --agent morning-shift --prompt 2099-12-31T23:59:00Z 'Happy New Year!'")]
     AddAt {
         /// One-shot RFC3339 timestamp with explicit Z or offset
         at: String,
