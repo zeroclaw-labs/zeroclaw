@@ -1,0 +1,102 @@
+package zeroclaw:plugin@0.1.0;
+
+/// Host-mediated outbound WebSocket client shared by tool and channel plugins.
+///
+/// The guest owns application protocol semantics while the host owns DNS,
+/// destination policy, TCP/TLS setup, the upgrade handshake, bounded transport
+/// queues, and socket cleanup. A connection is a real Component Model resource:
+/// dropping it, or dropping its Wasmtime store, cancels the socket and releases
+/// the shared cross-transport egress lease.
+interface websocket {
+    /// One guest-supplied HTTP upgrade header.
+    record header {
+        name: string,
+        value: string,
+    }
+
+    /// Typed connection inputs. TLS profiles are host-owned names whose trust
+    /// and optional client identity are resolved from canonical instance state.
+    record connect-options {
+        url: string,
+        headers: list<header>,
+        subprotocols: list<string>,
+        tls-profile: option<string>,
+    }
+
+    /// A complete WebSocket application message.
+    variant message {
+        text(string),
+        binary(list<u8>),
+    }
+
+    /// RFC 6455 close status. Unknown registered and application values remain
+    /// represented without collapsing them into strings.
+    variant close-code {
+        normal,
+        going-away,
+        protocol-error,
+        unsupported-data,
+        invalid-payload,
+        policy-violation,
+        message-too-big,
+        mandatory-extension,
+        internal-error,
+        service-restart,
+        try-again-later,
+        other(u16),
+    }
+
+    /// A peer close frame. `closed(none)` means the peer ended without one.
+    record close-frame {
+        code: close-code,
+        reason: string,
+    }
+
+    /// Stable, detail-free transport outcomes safe to expose to a guest.
+    enum websocket-error {
+        invalid-options,
+        reserved-header,
+        invalid-subprotocol,
+        invalid-close,
+        access-denied,
+        destination-denied,
+        dns-failed,
+        connection-limit,
+        timeout,
+        connect-failed,
+        tls-failed,
+        handshake-failed,
+        payload-too-large,
+        queue-full,
+        closed,
+        protocol-error,
+        unavailable,
+    }
+
+    /// One ordered inbound event. Messages already queued before a terminal
+    /// event are always returned first.
+    variant event {
+        message(message),
+        closed(option<close-frame>),
+        failed(websocket-error),
+    }
+
+    /// One live, host-owned socket and its authorization lease.
+    resource connection {
+        /// Queue one complete text or binary message without unbounded buffering.
+        send: func(message: message) -> result<_, websocket-error>;
+
+        /// Drain one event without blocking; `none` means no event is ready.
+        receive: func() -> result<option<event>, websocket-error>;
+
+        /// Start a graceful close handshake. Dropping the resource cancels it.
+        close: func(frame: option<close-frame>) -> result<_, websocket-error>;
+
+        /// Subprotocol selected by the server during the upgrade handshake.
+        negotiated-subprotocol: func() -> result<option<string>, websocket-error>;
+    }
+
+    /// Resolve policy, pin DNS, dial, and complete the upgrade under one host
+    /// deadline. The returned resource retains the egress lease until dropped.
+    connect: func(options: connect-options) -> result<connection, websocket-error>;
+}
