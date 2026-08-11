@@ -237,30 +237,32 @@ impl Tool for SendViaTool {
 
         // Character count, not byte length: the rule excludes 1–2 *character*
         // names, and a short multibyte name (e.g. a 1-char CJK alias) has a
-        // byte length >= 3 that a `.len()` check would wrongly admit.
+        // byte length >= 3 that a `.len()` check would wrongly admit. Counted
+        // on the ORIGINAL configured name, before lowercasing: Unicode
+        // lowercase can expand one scalar into several (e.g. 'İ' → "i̇"), and
+        // counting afterwards would let an excluded-length name through.
         let long_enough = |s: &str| s.chars().count() >= MIN_DYNAMIC_TRIGGER_LEN;
 
         // Live views, mirroring resolve_target: recomputed per call so config
         // reloads (channels, peer groups) take effect without a registry rebuild.
         for key in self.channel_map.read().keys() {
-            let lower = key.to_lowercase();
-            if let Some((channel_type, alias)) = lower.split_once('.') {
+            if let Some((channel_type, alias)) = key.split_once('.') {
                 if long_enough(channel_type) {
-                    triggers.insert(channel_type.to_string());
+                    triggers.insert(channel_type.to_lowercase());
                 }
+                let alias_lower = alias.to_lowercase();
                 // "default" is an implementation alias, not user wording.
-                if alias != "default" && long_enough(alias) {
-                    triggers.insert(alias.to_string());
+                if alias_lower != "default" && long_enough(alias) {
+                    triggers.insert(alias_lower);
                 }
             }
-            if long_enough(&lower) {
-                triggers.insert(lower);
+            if long_enough(key) {
+                triggers.insert(key.to_lowercase());
             }
         }
         for group in (self.agent_peer_groups)().keys() {
-            let lower = group.to_lowercase();
-            if long_enough(&lower) {
-                triggers.insert(lower);
+            if long_enough(group) {
+                triggers.insert(group.to_lowercase());
             }
         }
 
@@ -705,6 +707,40 @@ mod tests {
         let triggers = tool.inner.invocation_triggers();
         assert!(!triggers.iter().any(|t| t == "東"));
         assert!(triggers.iter().any(|t| t == "東京都"));
+    }
+
+    #[test]
+    fn name_length_is_counted_before_lowercase_expansion() {
+        // Unicode lowercase can expand a scalar: 'İ' (U+0130) lowercases to
+        // "i\u{307}" (two scalars). A two-character configured name like "İs"
+        // becomes three scalars after lowercasing, so a post-lowercase count
+        // would wrongly admit a name the 1–2 character rule excludes. The
+        // floor must be applied to the original configured name.
+        let name = "İs";
+        assert_eq!(name.chars().count(), 2);
+        assert!(name.to_lowercase().chars().count() >= MIN_DYNAMIC_TRIGGER_LEN);
+
+        let (tool, _routing) = make_tool(
+            vec![("telegram.default", Arc::new(StubChannel::new("telegram")))],
+            HashMap::from([(name.to_string(), pg("telegram", &["ana"]))]),
+        );
+        let triggers = tool.inner.invocation_triggers();
+        assert!(
+            !triggers.iter().any(|t| t == &name.to_lowercase()),
+            "case-expanding two-character name must stay excluded; got {triggers:?}"
+        );
+
+        // A three-character name containing the same expanding scalar still
+        // clears the rule and lands lowercased.
+        let (tool, _routing) = make_tool(
+            vec![("telegram.default", Arc::new(StubChannel::new("telegram")))],
+            HashMap::from([("İst".to_string(), pg("telegram", &["ana"]))]),
+        );
+        let triggers = tool.inner.invocation_triggers();
+        assert!(
+            triggers.iter().any(|t| t == &"İst".to_lowercase()),
+            "three-character name must remain a trigger after lowercasing"
+        );
     }
 
     fn pg_with_peers(channel: &str, agents: &[&str], peers: &[&str]) -> PeerGroupConfig {
