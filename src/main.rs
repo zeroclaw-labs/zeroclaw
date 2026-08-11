@@ -4206,10 +4206,10 @@ async fn async_main(command: clap::Command) -> Result<()> {
             zeroclaw_runtime::restart::record_launch();
 
             // Reload loop. `daemon::run` returns DaemonExit::Shutdown on
-            // SIGINT/SIGTERM (loop ends) or DaemonExit::Reload on SIGUSR1
-            // (loop re-reads config from disk and re-runs). The PID stays
-            // the same across reloads — only the in-process subsystems
-            // tear down + re-instantiate.
+            // SIGINT/SIGTERM (loop ends) or DaemonExit::Reload after a
+            // `POST /admin/reload` request (loop re-reads config from disk and
+            // re-runs). The PID stays the same across reloads — only the
+            // in-process subsystems tear down + re-instantiate.
             let mut current_config = config;
             // Nag task for the degraded-security warning, scoped to the
             // current config. Re-evaluated each reload iteration so a repaired
@@ -7745,8 +7745,8 @@ fn gate_security_posture(
                 &format!(
                     "Running with DEGRADED security: sections ({sections}) were reset to \
                      defaults and `--allow-degraded-security` was set. The posture may be \
-                     weaker than intended — repair {config_path} and reload \
-                     (SIGUSR1 / `zeroclaw admin reload`) as soon as possible."
+                     weaker than intended — repair {config_path} and restart \
+                     the process as soon as possible."
                 )
             );
         }
