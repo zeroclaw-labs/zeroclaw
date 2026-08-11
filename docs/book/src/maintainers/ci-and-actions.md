@@ -10,7 +10,7 @@ Fires on every PR targeting `master` and on trusted pushes to `master`.
 Composite job with multiple matrix legs:
 
 - **fmt**: `cargo fmt --all -- --check`
-- **lint**: `cargo clippy --workspace --exclude zeroclaw-desktop --all-targets --features ci-all -- -D warnings`, plus two architecture guards (`cargo test --test architecture`): config-write isolation and Fluent coverage (no bare user-facing strings)
+- **lint**: `cargo clippy --workspace --exclude zeroclaw-desktop --all-targets --features ci-all -- -D warnings`, then `cargo doc --no-deps --workspace --exclude zeroclaw-desktop` (rustdoc warnings are fatal via `.cargo/config.toml` `build.rustdocflags`; desktop is excluded to match `xtask build_api` / docs-deploy and avoid GTK/`glib-sys` on the lint runner), plus architecture guards (`cargo test --test architecture`): config-write isolation and Fluent coverage (no bare user-facing strings), and the comment hygiene gate
 - **build**: matrix: `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-pc-windows-msvc`
 - **check**: all features plus a workspace-wide, warnings-fatal no-default-features pass (excluding `zeroclaw-desktop`)
 - **check-32bit**: `i686-unknown-linux-gnu` with no default features
