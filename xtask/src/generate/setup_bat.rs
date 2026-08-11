@@ -269,9 +269,15 @@ mod tests {
         let presets = render_presets(&root()).unwrap();
         let (_, dist_and_rest) = presets.split_once(":build_dist").unwrap();
         let (dist, _) = dist_and_rest.split_once("goto :do_build").unwrap();
-        assert!(dist.contains("channel-matrix"));
-        assert!(dist.contains("whatsapp-web"));
-        assert!(!dist.contains("channel-slack"));
+        for feature in spec::resolve_feature_list(&root(), &Selection::Dist).unwrap() {
+            assert!(
+                dist.contains(&feature),
+                "dist feature {feature} not rendered"
+            );
+        }
+        for feature in spec::features_outside_dist(&root()).unwrap() {
+            assert!(!dist.contains(&feature), "{feature} leaked into lean dist");
+        }
     }
 
     #[test]

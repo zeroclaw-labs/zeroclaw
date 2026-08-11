@@ -68,7 +68,7 @@ fn no_channel_handle_caches_peer_authorization_state() {
 
 fn workspace_root() -> std::path::PathBuf {
     // `CARGO_MANIFEST_DIR` for the workspace's top-level crate (the
-    // `zeroclawlabs` binary) — that's where `cargo test` invokes from.
+    // `zeroclaw` binary) — that's where `cargo test` invokes from.
     let here = Path::new(env!("CARGO_MANIFEST_DIR"));
     here.to_path_buf()
 }

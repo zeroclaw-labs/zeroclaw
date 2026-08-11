@@ -8,6 +8,7 @@ on:
       - Dockerfile.debian
       - Dockerfile.alpine
       - Dockerfile.ci
+      - Containerfile
       - docker-compose.yml
       - docker-compose.alpine.yml
       - .dockerignore
@@ -39,13 +40,26 @@ jobs:
         id: detect
         run: |
           changed_files=$(git diff --name-only HEAD^1 HEAD^2)
+          containerfile_required=false
+          if [ -z "$changed_files" ] || \
+             printf '%s\n' "$changed_files" | grep -Eq '^(Containerfile|\.github/workflows/docker-image-pr\.yml)$'; then
+            containerfile_required=true
+          fi
+
           if [ -n "$changed_files" ] && \
              ! printf '%s\n' "$changed_files" | grep -Eqv '^(docker-compose\.yml|docker-compose\.alpine\.yml)$'; then
             prebuilt_images=false
             source_matrix='{"include":[{"dockerfile":"Dockerfile.alpine","platform":"linux/amd64","tag":"zeroclaw-pr-source-alpine:build","cache-scope":"docker-source-alpine-amd64"}]}'
+          elif [ -n "$changed_files" ] && \
+               ! printf '%s\n' "$changed_files" | grep -Eqv '^Containerfile$'; then
+            prebuilt_images=false
+            source_matrix='{"include":[{"dockerfile":"Containerfile","platform":"linux/amd64","tag":"zeroclaw-pr-source-all-features:build","cache-scope":"containerfile-source-all-features-amd64"}]}'
           else
             prebuilt_images=true
             source_matrix='{"include":[{"dockerfile":"Dockerfile","platform":"linux/amd64","tag":"zeroclaw-pr-source-default:build","cache-scope":"docker-source-default-amd64"},{"dockerfile":"Dockerfile","platform":"linux/arm64","tag":"zeroclaw-pr-source-default:build","cache-scope":"docker-source-default-arm64"},{"dockerfile":"Dockerfile.debian","platform":"linux/amd64","tag":"zeroclaw-pr-source-debian:build","cache-scope":"docker-source-debian"},{"dockerfile":"Dockerfile.alpine","platform":"linux/amd64","tag":"zeroclaw-pr-source-alpine:build","cache-scope":"docker-source-alpine-amd64"},{"dockerfile":"Dockerfile.alpine","platform":"linux/arm64","tag":"zeroclaw-pr-source-alpine:build","cache-scope":"docker-source-alpine-arm64"}]}'
+            if [ "$containerfile_required" = true ]; then
+              source_matrix=$(jq -c '.include += [{"dockerfile":"Containerfile","platform":"linux/amd64","tag":"zeroclaw-pr-source-all-features:build","cache-scope":"containerfile-source-all-features-amd64"}]' <<< "$source_matrix")
+            fi
           fi
           echo "prebuilt_images=$prebuilt_images" >> "$GITHUB_OUTPUT"
           echo "source_matrix=$source_matrix" >> "$GITHUB_OUTPUT"
@@ -108,13 +122,13 @@ jobs:
 
   # Compiles the real source Dockerfiles (not the pre-built-binary `*.ci`
   # variants above). The default and Alpine Dockerfiles are built for both
-  # supported platforms, proving the arm64 cross-compilation paths before a tag
-  # triggers docker-publish.yml; `Dockerfile.debian` stays amd64-only until the
-  # same cross-build support lands there. `push: false` and `contents: read`
-  # only — this never publishes. Split per matrix entry so the slow arm64
-  # cross-builds do not serialize behind the others.
+  # supported platforms, while the all-features Containerfile is validated on
+  # amd64 when it or this workflow changes. `Dockerfile.debian` stays amd64-only
+  # until the same cross-build support lands there. `push: false` and
+  # `contents: read` only — this never publishes. Split per matrix entry so the
+  # slow arm64 cross-builds do not serialize behind the others.
   source-images:
-    name: Dockerfile Source Build (no push)
+    name: Source Image Build (no push)
     needs: changes
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -137,7 +151,7 @@ jobs:
           platforms: ${{ matrix.platform }}
           tags: ${{ matrix.tag }}
           cache-from: type=gha,scope=${{ matrix.cache-scope }}
-          cache-to: type=gha,scope=${{ matrix.cache-scope }},mode=max
+          cache-to: type=gha,scope=${{ matrix.cache-scope }},mode=max,ignore-error=true
 
       - name: Smoke Alpine binaries
         if: matrix.dockerfile == 'Dockerfile.alpine' && matrix.platform == 'linux/amd64'
