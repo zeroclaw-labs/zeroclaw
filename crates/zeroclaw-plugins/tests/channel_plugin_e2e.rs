@@ -1,4 +1,4 @@
-//! End-to-end fixture for the host's channel-component adapter.
+//! End-to-end fixture for the host's channel-component adapter and scoped secrets.
 //!
 //! The source fixture is a workspace member and is built on demand into a
 //! separate target directory so the nested Cargo invocation cannot contend
@@ -6,19 +6,29 @@
 
 #![cfg(feature = "plugins-wasm-cranelift")]
 
+mod support;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
 use zeroclaw_api::attribution::Attributable;
 use zeroclaw_api::channel::{Channel, SendMessage};
 use zeroclaw_plugins::component::{HostInboundMessage, PluginLimits};
+use zeroclaw_plugins::config::{PluginConfigResolver, resolve_plugin_config};
 use zeroclaw_plugins::endpoint::PluginChannelEndpoint;
+use zeroclaw_plugins::event::{
+    PluginEventDispatcher, PluginEventEnvelope, PluginEventError, PluginEventResolution,
+    PluginEventRouteResolver, PluginEventRouter, ResolvedPluginEventRoute,
+};
 use zeroclaw_plugins::instance::PluginInstanceScope;
+use zeroclaw_plugins::services::PluginHostServices;
 use zeroclaw_plugins::wasm_channel::WasmChannel;
-use zeroclaw_plugins::{PluginCapability, PluginManifest};
+use zeroclaw_plugins::{PluginCapability, PluginManifest, PluginPermission};
+
+use support::{admit_fixture, state_service};
 
 fn fixture() -> PathBuf {
     static FIXTURE: OnceLock<PathBuf> = OnceLock::new();
@@ -64,32 +74,135 @@ fn limits() -> PluginLimits {
     }
 }
 
-async fn channel(binding: &str) -> WasmChannel {
-    let manifest = PluginManifest {
-        name: "channel-fixture".to_string(),
-        version: "0.0.0".to_string(),
-        description: None,
-        author: None,
-        wasm_path: Some("channel-fixture.wasm".to_string()),
-        capabilities: vec![PluginCapability::Channel],
-        permissions: vec![],
-        signature: None,
-        publisher_key: None,
-    };
-    let scope =
-        PluginInstanceScope::from_manifest(&manifest, PluginCapability::Channel, binding, [])
-            .expect("admit fixture scope");
-    let endpoint = PluginChannelEndpoint::new(scope, "plugin").expect("bind fixture endpoint");
+fn manifest() -> PluginManifest {
+    toml::from_str(include_str!(
+        "fixtures/channel-fixture/plugin-manifest.toml"
+    ))
+    .expect("parse canonical channel fixture manifest")
+}
 
-    WasmChannel::from_wasm(endpoint, &fixture(), &HashMap::new(), limits())
+type InstanceConfig = HashMap<String, String>;
+type CanonicalConfig = Arc<RwLock<HashMap<String, InstanceConfig>>>;
+
+fn instance_config(epoch: &str, token: &str) -> InstanceConfig {
+    HashMap::from([
+        ("retry_count".to_string(), "5".to_string()),
+        ("credential_epoch".to_string(), epoch.to_string()),
+        ("api_token".to_string(), token.to_string()),
+    ])
+}
+
+fn canonical_config(binding: &str, epoch: &str, token: &str) -> CanonicalConfig {
+    Arc::new(RwLock::new(HashMap::from([(
+        binding.to_string(),
+        instance_config(epoch, token),
+    )])))
+}
+
+fn host_services(config: CanonicalConfig) -> PluginHostServices {
+    let manifest = manifest();
+    let resolver = PluginConfigResolver::new(move |scope| {
+        let configured = config.read().expect("lock canonical fixture config");
+        let values = configured.get(scope.id().binding()).ok_or_else(|| {
+            zeroclaw_plugins::error::PluginError::InvalidConfig(
+                "missing canonical fixture binding".to_string(),
+            )
+        })?;
+        resolve_plugin_config(&manifest, scope, Some(values))
+    });
+    PluginHostServices::new(resolver, state_service(), support::egress_service())
+}
+
+struct AcceptingDispatcher;
+
+#[async_trait::async_trait]
+impl PluginEventDispatcher for AcceptingDispatcher {
+    async fn dispatch(
+        &self,
+        _route: ResolvedPluginEventRoute,
+        _event: PluginEventEnvelope,
+    ) -> Result<(), PluginEventError> {
+        Ok(())
+    }
+}
+
+fn accepting_router() -> PluginEventRouter {
+    let resolver = PluginEventRouteResolver::new(|instance, _| {
+        Ok(PluginEventResolution::Authorized(
+            ResolvedPluginEventRoute::agent(instance, "fixture-agent")?,
+        ))
+    });
+    PluginEventRouter::new(resolver, Arc::new(AcceptingDispatcher))
+}
+
+struct RecordingDispatcher {
+    sender: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+}
+
+#[async_trait::async_trait]
+impl PluginEventDispatcher for RecordingDispatcher {
+    async fn dispatch(
+        &self,
+        _route: ResolvedPluginEventRoute,
+        event: PluginEventEnvelope,
+    ) -> Result<(), PluginEventError> {
+        self.sender
+            .send(event.into_message())
+            .await
+            .map_err(|_| PluginEventError::DispatchFailed("test receiver closed".to_string()))
+    }
+}
+
+fn recording_router(
+    sender: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+) -> PluginEventRouter {
+    let resolver = PluginEventRouteResolver::new(|instance, _| {
+        Ok(PluginEventResolution::Authorized(
+            ResolvedPluginEventRoute::agent(instance, "fixture-agent")?,
+        ))
+    });
+    PluginEventRouter::new(resolver, Arc::new(RecordingDispatcher { sender }))
+}
+
+async fn build_channel(binding: &str, services: &PluginHostServices) -> WasmChannel {
+    build_channel_with_router(binding, services, accepting_router()).await
+}
+
+async fn build_channel_with_router(
+    binding: &str,
+    services: &PluginHostServices,
+    event_router: PluginEventRouter,
+) -> WasmChannel {
+    let manifest = manifest();
+    let scope = PluginInstanceScope::from_manifest(
+        &manifest,
+        PluginCapability::Channel,
+        binding,
+        [
+            PluginPermission::ConfigRead,
+            PluginPermission::StateRead,
+            PluginPermission::StateWrite,
+        ],
+    )
+    .expect("admit fixture scope");
+    let endpoint = PluginChannelEndpoint::new(scope, "plugin").expect("bind fixture endpoint");
+    let component = admit_fixture(&fixture(), &manifest);
+
+    WasmChannel::from_wasm(endpoint, &component, services, limits(), event_router)
         .await
         .expect("instantiate fixture channel")
 }
 
-fn outbound() -> SendMessage {
+async fn channel(binding: &str) -> WasmChannel {
+    let config = canonical_config(binding, "v1", &format!("token-{binding}"));
+    let services = host_services(config);
+    build_channel(binding, &services).await
+}
+
+fn outbound(content: &str, recipient: &str) -> SendMessage {
     SendMessage {
-        content: "hello".to_string(),
-        recipient: "room".to_string(),
+        content: content.to_string(),
+        recipient: recipient.to_string(),
         subject: None,
         thread_ts: None,
         cancellation_token: None,
@@ -102,14 +215,17 @@ fn outbound() -> SendMessage {
 
 #[tokio::test]
 async fn channel_component_runs_through_host_ingress() {
-    let channel = channel("main").await;
+    let config = canonical_config("main", "v1", "token-main");
+    let services = host_services(config);
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1);
+    let channel = build_channel_with_router("main", &services, recording_router(event_tx)).await;
 
     assert_eq!(channel.name(), "plugin");
     assert_eq!(channel.alias(), "main");
     assert_eq!(channel.self_handle().as_deref(), Some("@fixture"));
     assert!(channel.health_check().await);
     channel
-        .send(&outbound())
+        .send(&outbound("v1:token-main", "main"))
         .await
         .expect("fixture accepts send");
 
@@ -125,9 +241,9 @@ async fn channel_component_runs_through_host_ingress() {
         ..Default::default()
     });
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
     let listener = zeroclaw_spawn::spawn!(async move { channel.listen(tx).await });
-    let message = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+    let message = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
         .await
         .expect("fixture message arrives before timeout")
         .expect("listener remains connected");
@@ -147,6 +263,139 @@ async fn channel_component_runs_through_host_ingress() {
         .await
         .expect_err("aborting listen must cancel its polling loop");
     assert!(error.is_cancelled());
+}
+
+#[tokio::test]
+async fn channel_listener_drops_events_denied_by_live_host_routing() {
+    let config = canonical_config("main", "v1", "token-main");
+    let services = host_services(config);
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1);
+    let resolver = PluginEventRouteResolver::new(|_, _| Ok(PluginEventResolution::Denied));
+    let router =
+        PluginEventRouter::new(resolver, Arc::new(RecordingDispatcher { sender: event_tx }));
+    let channel = build_channel_with_router("main", &services, router).await;
+    let inbound = channel.inbound();
+    inbound.enqueue(HostInboundMessage {
+        id: "denied-1".to_string(),
+        sender: "blocked".to_string(),
+        reply_target: "room".to_string(),
+        content: "must not dispatch".to_string(),
+        channel: "guest-channel".to_string(),
+        channel_alias: Some("guest-alias".to_string()),
+        timestamp: 8,
+        ..Default::default()
+    });
+
+    let (lifecycle_tx, mut native_rx) = tokio::sync::mpsc::channel(1);
+    let listener = zeroclaw_spawn::spawn!(async move { channel.listen(lifecycle_tx).await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while inbound.pending() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("fixture drains denied event");
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), event_rx.recv())
+            .await
+            .is_err(),
+        "denied event must never reach the shared dispatcher"
+    );
+    assert!(
+        native_rx.try_recv().is_err(),
+        "plugin events must never bypass the typed router via Channel::listen"
+    );
+    assert!(
+        !listener.is_finished(),
+        "an authorization denial must not restart a healthy listener"
+    );
+    listener.abort();
+    let error = listener
+        .await
+        .expect_err("aborting listen must cancel its polling loop");
+    assert!(error.is_cancelled());
+}
+
+#[tokio::test]
+async fn channel_secrets_are_scoped_per_alias_at_point_of_use() {
+    let config = Arc::new(RwLock::new(HashMap::from([
+        ("main".to_string(), instance_config("v1", "token-main")),
+        ("backup".to_string(), instance_config("v1", "token-backup")),
+    ])));
+    let services = host_services(config);
+    let (main, backup) = tokio::join!(
+        build_channel("main", &services),
+        build_channel("backup", &services)
+    );
+
+    main.send(&outbound("v1:token-main", "main"))
+        .await
+        .expect("main alias reads its own secret");
+    backup
+        .send(&outbound("v1:token-backup", "backup"))
+        .await
+        .expect("backup alias reads its own secret");
+    assert!(
+        main.send(&outbound("v1:token-backup", "main"))
+            .await
+            .is_err(),
+        "main alias must reject the backup secret"
+    );
+    assert!(
+        backup
+            .send(&outbound("v1:token-main", "backup"))
+            .await
+            .is_err(),
+        "backup alias must reject the main secret"
+    );
+}
+
+#[tokio::test]
+async fn warm_channel_resolves_one_rotated_config_revision_at_point_of_use() {
+    let config = canonical_config("main", "v1", "token-main");
+    let services = host_services(Arc::clone(&config));
+    let channel = build_channel("main", &services).await;
+
+    channel
+        .send(&outbound("v1:token-main", "main"))
+        .await
+        .expect("channel reads the initial canonical config revision");
+
+    {
+        let mut config = config.write().expect("lock canonical fixture config");
+        let main = config
+            .get_mut("main")
+            .expect("main canonical fixture binding");
+        main.insert("credential_epoch".to_string(), "v2".to_string());
+        main.insert("api_token".to_string(), "rotated-main".to_string());
+    }
+
+    assert!(
+        channel
+            .send(&outbound("v1:token-main", "main"))
+            .await
+            .is_err(),
+        "warm channel must not retain the previous config revision"
+    );
+    assert!(
+        channel
+            .send(&outbound("v1:rotated-main", "main"))
+            .await
+            .is_err(),
+        "new secret must not pair with stale public config"
+    );
+    assert!(
+        channel
+            .send(&outbound("v2:token-main", "main"))
+            .await
+            .is_err(),
+        "new public config must not pair with the stale secret"
+    );
+    channel
+        .send(&outbound("v2:rotated-main", "main"))
+        .await
+        .expect("warm channel reads one rotated canonical config revision");
 }
 
 #[tokio::test]

@@ -1,7 +1,6 @@
 //! Channel adapter: `WasmChannel` implements `zeroclaw_api::channel::Channel`
 //! backed by the `channel-plugin` component world.
 
-use crate::PluginPermission;
 use crate::component::InboundQueue;
 use crate::component::bindings::channel::ChannelPlugin;
 use crate::component::bindings::channel::exports::zeroclaw::plugin::channel::{
@@ -10,14 +9,15 @@ use crate::component::bindings::channel::exports::zeroclaw::plugin::channel::{
     MediaAttachment as WitMediaAttachment, SendMessage as WitSendMessage,
 };
 use crate::component::{
-    PluginState, PluginStoreSpec, call_plugin, engine, load_component, wt, wt_instantiate,
+    PluginState, PluginStoreSpec, call_channel, call_channel_store, call_store, engine,
+    load_component, wt, wt_instantiate,
 };
 use crate::endpoint::PluginChannelEndpoint;
-use crate::instance::PluginGrantSet;
+use crate::event::{PluginEventError, PluginEventRouter};
+use crate::host::AdmittedComponent;
+use crate::services::PluginHostServices;
 use anyhow::Result;
 use async_trait::async_trait;
-use std::collections::HashMap;
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -32,9 +32,13 @@ use zeroclaw_api::media::MediaAttachment;
 /// A channel backed by a WIT component-model plugin.
 pub struct WasmChannel {
     endpoint: PluginChannelEndpoint,
+    event_router: Option<PluginEventRouter>,
     capabilities: ChannelCapabilities,
     state: Mutex<(Store<PluginState>, ChannelPlugin)>,
     inbound: InboundQueue,
+    // Static component metadata, fixed for one admitted logical binding.
+    // Changing the external account or these capabilities requires rebuilding
+    // the channel; point-of-use config refresh is only for that same binding.
     cached_self_handle: Option<String>,
     cached_self_addressed_mention: Option<String>,
     cached_multi_message_delay_ms: u64,
@@ -61,18 +65,6 @@ impl Attributable for WasmChannel {
     }
 }
 
-/// Resolve the JSON config section handed to a channel plugin's `configure`.
-/// Withheld (an empty object) unless the admitted scope grants `ConfigRead`, so a
-/// plugin without the permission can never be configured with another channel's
-/// secrets. Mirrors the tool-plugin `__config` rule.
-fn resolve_configure_json(config: &HashMap<String, String>, grants: &PluginGrantSet) -> String {
-    if grants.allows(PluginPermission::ConfigRead) {
-        serde_json::to_string(config).unwrap_or_else(|_| "{}".to_string())
-    } else {
-        "{}".to_string()
-    }
-}
-
 fn build_linker(http: bool) -> Result<Linker<PluginState>> {
     let mut linker = Linker::new(engine());
     crate::component::add_wasi(&mut linker)?;
@@ -93,74 +85,121 @@ fn build_linker(http: bool) -> Result<Linker<PluginState>> {
 }
 
 impl WasmChannel {
+    /// Construct a production channel whose inbound events must enter the
+    /// host-owned typed event router.
     pub async fn from_wasm(
         endpoint: PluginChannelEndpoint,
-        wasm_path: &Path,
-        config: &HashMap<String, String>,
+        component: &AdmittedComponent,
+        services: &PluginHostServices,
+        limits: crate::component::PluginLimits,
+        event_router: PluginEventRouter,
+    ) -> Result<Self> {
+        Self::from_wasm_with_router(endpoint, component, services, limits, Some(event_router)).await
+    }
+
+    /// Construct a channel only for health checks and tests that never dispatch
+    /// inbound traffic. If the guest does emit a message, the listen loop fails
+    /// closed instead of bypassing the typed host router.
+    pub async fn from_wasm_without_event_dispatch(
+        endpoint: PluginChannelEndpoint,
+        component: &AdmittedComponent,
+        services: &PluginHostServices,
         limits: crate::component::PluginLimits,
     ) -> Result<Self> {
-        let component = load_component(wasm_path)?;
+        Self::from_wasm_with_router(endpoint, component, services, limits, None).await
+    }
+
+    async fn from_wasm_with_router(
+        endpoint: PluginChannelEndpoint,
+        component: &AdmittedComponent,
+        services: &PluginHostServices,
+        limits: crate::component::PluginLimits,
+        event_router: Option<PluginEventRouter>,
+    ) -> Result<Self> {
+        services.resolve_config(endpoint.scope())?;
+        let component = load_component(component)?;
         let inbound = InboundQueue::default();
         let mut store = crate::component::new_store(
-            PluginStoreSpec::new(endpoint.scope().clone(), limits)
+            PluginStoreSpec::new(endpoint.scope().clone(), services.clone(), limits)
                 .with_granted_http()
                 .with_inbound(inbound.clone()),
         );
         let http = store.data().http_enabled();
         let linker = build_linker(http)?;
         crate::component::ensure_http_coherent(&store, http)?;
-        let bindings = wt_instantiate(
-            ChannelPlugin::instantiate_async(&mut store, &component, &linker).await,
-            "failed to instantiate channel plugin",
-        )?;
+        let bindings: Result<_> = call_store!(store, async |store: &mut Store<PluginState>| {
+            wt_instantiate(
+                ChannelPlugin::instantiate_async(store, &component, &linker).await,
+                "failed to instantiate channel plugin",
+            )
+        });
+        let bindings = bindings?;
 
         let channel = bindings.zeroclaw_plugin_channel();
 
-        // Hand the plugin its resolved config once, before any other call. The
-        // section is withheld unless the admitted scope grants `ConfigRead`, matching
-        // the tool-plugin `__config` rule, so a plugin without the permission is
-        // configured with an empty object rather than another channel's secrets.
-        let config_json = resolve_configure_json(config, endpoint.scope().grants());
-        wt(
-            channel.call_configure(&mut store, &config_json).await,
-            "channel.configure trapped",
-        )?
-        .map_err(anyhow::Error::msg)?;
-
-        let capabilities = wt(
-            channel.call_get_channel_capabilities(&mut store).await,
-            "channel.get-channel-capabilities failed",
-        )?;
-
-        let cached_self_handle = if capabilities.contains(ChannelCapabilities::SELF_HANDLE) {
-            wt(
-                channel.call_self_handle(&mut store).await,
-                "channel.self-handle failed",
-            )?
-        } else {
-            None
-        };
-        let cached_self_addressed_mention =
-            if capabilities.contains(ChannelCapabilities::SELF_ADDRESSED_MENTION) {
+        // Let the plugin initialize before static discovery. Config stays
+        // host-owned and is available through point-of-use imports in this
+        // channel-service frame.
+        let configure_result: Result<()> =
+            call_channel_store!(store, async |store: &mut Store<PluginState>| {
                 wt(
-                    channel.call_self_addressed_mention(&mut store).await,
-                    "channel.self-addressed-mention failed",
+                    channel.call_configure(store).await,
+                    "channel.configure trapped",
+                )?
+                .map_err(anyhow::Error::msg)
+            });
+        configure_result?;
+
+        let static_exports: Result<_> = call_store!(store, async |store: &mut Store<
+            PluginState,
+        >| {
+            let capabilities = wt(
+                channel.call_get_channel_capabilities(&mut *store).await,
+                "channel.get-channel-capabilities failed",
+            )?;
+            let cached_self_handle = if capabilities.contains(ChannelCapabilities::SELF_HANDLE) {
+                wt(
+                    channel.call_self_handle(&mut *store).await,
+                    "channel.self-handle failed",
                 )?
             } else {
                 None
             };
-        let cached_multi_message_delay_ms =
-            if capabilities.contains(ChannelCapabilities::MULTI_MESSAGE_DELAY_MS) {
-                wt(
-                    channel.call_multi_message_delay_ms(&mut store).await,
-                    "channel.multi-message-delay-ms failed",
-                )?
-            } else {
-                800
-            };
+            let cached_self_addressed_mention =
+                if capabilities.contains(ChannelCapabilities::SELF_ADDRESSED_MENTION) {
+                    wt(
+                        channel.call_self_addressed_mention(&mut *store).await,
+                        "channel.self-addressed-mention failed",
+                    )?
+                } else {
+                    None
+                };
+            let cached_multi_message_delay_ms =
+                if capabilities.contains(ChannelCapabilities::MULTI_MESSAGE_DELAY_MS) {
+                    wt(
+                        channel.call_multi_message_delay_ms(store).await,
+                        "channel.multi-message-delay-ms failed",
+                    )?
+                } else {
+                    800
+                };
+            Ok((
+                capabilities,
+                cached_self_handle,
+                cached_self_addressed_mention,
+                cached_multi_message_delay_ms,
+            ))
+        });
+        let (
+            capabilities,
+            cached_self_handle,
+            cached_self_addressed_mention,
+            cached_multi_message_delay_ms,
+        ) = static_exports?;
 
         Ok(Self {
             endpoint,
+            event_router,
             capabilities,
             state: Mutex::new((store, bindings)),
             inbound,
@@ -252,7 +291,7 @@ impl Channel for WasmChannel {
 
     async fn send(&self, message: &SendMessage) -> Result<()> {
         let wit_msg = to_wit_send(message);
-        call_plugin!(
+        call_channel!(
             self,
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
                 wt(
@@ -275,25 +314,43 @@ impl Channel for WasmChannel {
         // orchestrator owns cancellation and restart supervision; detaching a
         // second task here would make every apparent exit leak another loop.
         loop {
-            let polled = {
-                let mut guard = self.state.lock().await;
-                let (ref mut store, ref mut bindings) = *guard;
-                crate::component::refuel(store);
-                bindings
-                    .zeroclaw_plugin_channel()
-                    .call_poll_message(store)
-                    .await
-            };
+            let polled = call_channel!(
+                self,
+                async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
+                    bindings
+                        .zeroclaw_plugin_channel()
+                        .call_poll_message(store)
+                        .await
+                }
+            );
             match polled {
                 Ok(Some(wit_msg)) => {
                     mark_poll_healthy(&self.poll_healthy, true);
                     backoff = INITIAL_BACKOFF;
-                    if tx
-                        .send(from_wit_inbound(wit_msg, &self.endpoint))
-                        .await
-                        .is_err()
-                    {
-                        return Ok(());
+                    let message = from_wit_inbound(wit_msg, &self.endpoint);
+                    let Some(router) = self.event_router.as_ref() else {
+                        return Err(anyhow::Error::msg(
+                            "channel plugin emitted inbound traffic while event dispatch was disabled",
+                        ));
+                    };
+                    if let Err(error) = router.submit(&self.endpoint, message).await {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Reject
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "channel": self.endpoint.channel_type(),
+                                "channel_alias": self.endpoint.alias(),
+                                "error": error.to_string(),
+                            })),
+                            "channel plugin event rejected by host routing"
+                        );
+                        if matches!(error, PluginEventError::DispatchFailed(_)) {
+                            return Err(anyhow::Error::new(error));
+                        }
                     }
                     continue;
                 }
@@ -334,7 +391,7 @@ impl Channel for WasmChannel {
         {
             return true;
         }
-        let result: Result<bool> = call_plugin!(
+        let result: Result<bool> = call_channel!(
             self,
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
                 wt(
@@ -374,7 +431,7 @@ impl Channel for WasmChannel {
             return Ok(());
         }
         let recipient = recipient.to_string();
-        call_plugin!(
+        call_channel!(
             self,
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
                 wt(
@@ -394,7 +451,7 @@ impl Channel for WasmChannel {
             return Ok(());
         }
         let recipient = recipient.to_string();
-        call_plugin!(
+        call_channel!(
             self,
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
                 wt(
@@ -419,7 +476,7 @@ impl Channel for WasmChannel {
             return Ok(None);
         }
         let wit_msg = to_wit_send(message);
-        call_plugin!(
+        call_channel!(
             self,
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
                 wt(
@@ -446,7 +503,7 @@ impl Channel for WasmChannel {
             message_id.to_string(),
             text.to_string(),
         );
-        call_plugin!(
+        call_channel!(
             self,
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
                 wt(
@@ -478,7 +535,7 @@ impl Channel for WasmChannel {
             message_id.to_string(),
             text.to_string(),
         );
-        call_plugin!(
+        call_channel!(
             self,
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
                 wt(
@@ -511,7 +568,7 @@ impl Channel for WasmChannel {
             message_id.to_string(),
             text.to_string(),
         );
-        call_plugin!(
+        call_channel!(
             self,
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
                 wt(
@@ -534,7 +591,7 @@ impl Channel for WasmChannel {
             return Ok(());
         }
         let (recipient, message_id) = (recipient.to_string(), message_id.to_string());
-        call_plugin!(
+        call_channel!(
             self,
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
                 wt(
@@ -570,7 +627,7 @@ impl Channel for WasmChannel {
             message_id.to_string(),
             emoji.to_string(),
         );
-        call_plugin!(
+        call_channel!(
             self,
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
                 wt(
@@ -597,7 +654,7 @@ impl Channel for WasmChannel {
             message_id.to_string(),
             emoji.to_string(),
         );
-        call_plugin!(
+        call_channel!(
             self,
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
                 wt(
@@ -617,7 +674,7 @@ impl Channel for WasmChannel {
             return Ok(());
         }
         let (channel_id, message_id) = (channel_id.to_string(), message_id.to_string());
-        call_plugin!(
+        call_channel!(
             self,
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
                 wt(
@@ -640,7 +697,7 @@ impl Channel for WasmChannel {
             return Ok(());
         }
         let (channel_id, message_id) = (channel_id.to_string(), message_id.to_string());
-        call_plugin!(
+        call_channel!(
             self,
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
                 wt(
@@ -668,7 +725,7 @@ impl Channel for WasmChannel {
             return Ok(());
         }
         let (channel_id, message_id) = (channel_id.to_string(), message_id.to_string());
-        call_plugin!(
+        call_channel!(
             self,
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
                 wt(
@@ -696,7 +753,7 @@ impl Channel for WasmChannel {
         }
         let recipient = recipient.to_string();
         let wit_req = to_wit_approval_request(request);
-        call_plugin!(
+        call_channel!(
             self,
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
                 let out = wt(
@@ -727,7 +784,7 @@ impl Channel for WasmChannel {
         let question = question.to_string();
         let choices = choices.to_vec();
         let timeout_secs = timeout.as_secs();
-        call_plugin!(
+        call_channel!(
             self,
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
                 wt(
@@ -752,6 +809,7 @@ impl Channel for WasmChannel {
 mod tests {
     use super::*;
     use crate::PluginCapability;
+    use crate::config::PluginConfigResolver;
 
     #[test]
     fn media_round_trip() {
@@ -788,31 +846,29 @@ mod tests {
         assert!(poll_health_ok(&flag), "recovers after a clean poll");
     }
 
-    #[test]
-    fn configure_withholds_section_without_config_read() {
-        let mut config = HashMap::new();
-        config.insert("api_key".to_string(), "secret".to_string());
-        let scope = crate::instance::test_scope(
-            PluginCapability::Channel,
-            "main",
-            [PluginPermission::HttpClient],
-        );
-        let json = resolve_configure_json(&config, scope.grants());
-        assert_eq!(json, "{}", "no ConfigRead means an empty config object");
-    }
+    #[tokio::test]
+    async fn channel_validates_config_before_loading_guest_code() {
+        let scope = crate::instance::test_scope(PluginCapability::Channel, "main", []);
+        let endpoint = PluginChannelEndpoint::new(scope, "plugin").unwrap();
+        let services = crate::services::test_services(PluginConfigResolver::new(|_| {
+            Err(crate::error::PluginError::InvalidConfig(
+                "invalid-before-load".to_string(),
+            ))
+        }));
+        let component = AdmittedComponent::test_component(b"not-a-component");
+        let result = WasmChannel::from_wasm_without_event_dispatch(
+            endpoint,
+            &component,
+            &services,
+            crate::component::test_limits(0),
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("invalid config must reject registration"),
+            Err(error) => error,
+        };
 
-    #[test]
-    fn configure_passes_section_with_config_read() {
-        let mut config = HashMap::new();
-        config.insert("identity".to_string(), "on-call".to_string());
-        let scope = crate::instance::test_scope(
-            PluginCapability::Channel,
-            "main",
-            [PluginPermission::ConfigRead],
-        );
-        let json = resolve_configure_json(&config, scope.grants());
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["identity"], "on-call", "granted section round-trips");
+        assert!(error.to_string().contains("invalid-before-load"));
     }
 
     #[test]
