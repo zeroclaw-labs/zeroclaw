@@ -6,10 +6,13 @@ wit/
   v0/                 ← zeroclaw:plugin@0.x (experimental → stable)
     .frozen           ← created when v0 stabilizes; absent = experimental
     channel.wit
+    config.wit
     logging.wit
     memory.wit
     plugin-info.wit
     README.md
+    secrets.wit
+    sockets.wit
     tool.wit
     types.wit
   v1/                 ← (future) breaking changes → zeroclaw:plugin@1.0.0
@@ -43,9 +46,10 @@ Each `vN/` directory maps to one WIT package major version. Minor bumps (0.2,
 2. **At release** — remove `@unstable`, add `@since(version = 0.x.0)`.
    `bindgen!` callers without a feature gate now see the item automatically.
 
-All current content in `wit/v0/` is gated behind
-`@unstable(feature = plugins-wit-v0)`. It graduates when the first
-stable Component Model release ships.
+Current base-world content in `wit/v0/` is gated behind
+`@unstable(feature = plugins-wit-v0)`. Optional socket imports use the additional
+`plugins-wit-v0-sockets` gate. They graduate when the corresponding Component
+Model contracts stabilize.
 
 #### Host compatibility window
 
@@ -75,6 +79,22 @@ declared stable. After it exists:
   addressed before merge.
 
 #### Migration guide for plugin authors
+
+**Current experimental V0:** the tool and channel worlds import the `secrets`
+interface, and the channel world also imports `config`. Channel `configure`
+changed from `configure(config: string)` to `configure()`. Rebuild both kinds of
+component against the current `wit/v0/` definitions before installing them on
+this host. Channel authors must update source to call `config.get` for the typed
+public object during `configure` and again in every operational export that
+uses config; call `secrets.get` at the same point of use and do not retain either
+value in warm guest state. Tool authors keep the existing `__config` injection
+and `secrets.get`-during-`execute` contract. Publish each rebuilt component's new
+registry digest, and re-sign if any signature-covered manifest content changes.
+Prebuilt components from the earlier experimental worlds are not a conformance
+target; this is an intentional pre-stability break while `wit/v0/.frozen` is
+absent. Tool and channel authors that need TCP, direct TLS, or STARTTLS can opt
+into `plugins-wit-v0-sockets`, request `socket_client`, and rebuild; components
+that do not opt in keep the base world unchanged.
 
 **Targeting a minor bump (e.g. 0.1 → 0.2):** recompile. No source changes
 needed for items added via `@since`.
