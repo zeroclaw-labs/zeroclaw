@@ -263,8 +263,96 @@ mod platform {
     /// let two processes open different lock inodes and both believe they own
     /// cleanup authority. The kernel releases the advisory lock when this file
     /// handle is dropped or the process exits.
+    ///
+    /// Because `ZEROCLAW_SOCKET` may place the sibling in a shared directory,
+    /// acquisition fails closed unless the directory entry and the opened
+    /// inode provide stable, current-user ownership; see
+    /// [`require_trusted_lock_dir`] and [`require_trusted_lock_file`].
+    #[derive(Debug)]
     pub(super) struct EndpointLock {
         _file: File,
+    }
+
+    /// Rejects lock directories whose entries another local user could seed
+    /// or replace.
+    ///
+    /// A directory is trustworthy when it is owned by the current user or
+    /// root and is not group/other-writable — unless the sticky bit is set,
+    /// which restricts unlink and rename to the entry owner and keeps
+    /// `/tmp`-style shared socket directories usable.
+    fn require_trusted_lock_dir(lock_path: &Path) -> Result<()> {
+        let parent = match lock_path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        let metadata = std::fs::metadata(parent).with_context(|| {
+            format!(
+                "inspecting local IPC endpoint lock directory {}",
+                parent.display()
+            )
+        })?;
+        let euid = unsafe { libc::geteuid() };
+        let mode = metadata.mode();
+        if metadata.uid() != euid && metadata.uid() != 0 {
+            anyhow::bail!(
+                "local IPC endpoint lock directory {} is owned by uid {}; \
+                 it must belong to the daemon user or root",
+                parent.display(),
+                metadata.uid()
+            );
+        }
+        if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+            anyhow::bail!(
+                "local IPC endpoint lock directory {} is writable by other \
+                 users without the sticky bit; its entries could be replaced. \
+                 Restrict it (chmod go-w or +t) or point ZEROCLAW_SOCKET at a \
+                 private directory",
+                parent.display()
+            );
+        }
+        Ok(())
+    }
+
+    /// Rejects pre-existing lock entries that do not provide the guarantees a
+    /// freshly created lock would have.
+    ///
+    /// The inode must be a regular file owned by the current user with no
+    /// group/other access, and still linked at the time of inspection. A
+    /// foreign-owned or permissive entry could be locked by another local
+    /// user to block startup, or unlinked and recreated by its owner to hand
+    /// two daemons different lock inodes.
+    fn require_trusted_lock_file(metadata: &Metadata, lock_path: &Path) -> Result<()> {
+        if !metadata.file_type().is_file() {
+            anyhow::bail!(
+                "local IPC endpoint lock {} is not a regular file; remove it \
+                 or choose a different socket path",
+                lock_path.display()
+            );
+        }
+        let euid = unsafe { libc::geteuid() };
+        if metadata.uid() != euid {
+            anyhow::bail!(
+                "local IPC endpoint lock {} is owned by uid {}, not the \
+                 daemon user; remove it or choose a different socket path",
+                lock_path.display(),
+                metadata.uid()
+            );
+        }
+        if metadata.mode() & 0o077 != 0 {
+            anyhow::bail!(
+                "local IPC endpoint lock {} is accessible to other users \
+                 (mode {:o}); restrict it to 0600 or remove it",
+                lock_path.display(),
+                metadata.mode() & 0o7777
+            );
+        }
+        if metadata.nlink() == 0 {
+            anyhow::bail!(
+                "local IPC endpoint lock {} was unlinked while being opened",
+                lock_path.display()
+            );
+        }
+        Ok(())
     }
 
     impl EndpointLock {
@@ -272,6 +360,7 @@ mod platform {
             let mut lock_name = path.as_os_str().to_os_string();
             lock_name.push(".lock");
             let lock_path = PathBuf::from(lock_name);
+            require_trusted_lock_dir(&lock_path)?;
             let file = OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -285,9 +374,35 @@ mod platform {
                         lock_path.display()
                     )
                 })?;
+            let metadata = file.metadata().with_context(|| {
+                format!(
+                    "inspecting local IPC endpoint lifecycle lock {}",
+                    lock_path.display()
+                )
+            })?;
+            require_trusted_lock_file(&metadata, &lock_path)?;
 
             match file.try_lock() {
-                Ok(()) => Ok(Self { _file: file }),
+                Ok(()) => {
+                    // The directory entry must still name the locked inode.
+                    // A swap between open and lock would let a second daemon
+                    // lock the replacement and re-enter the split-ownership
+                    // race this lock exists to prevent.
+                    let current = SocketIdentity::read(&lock_path).with_context(|| {
+                        format!(
+                            "confirming local IPC endpoint lifecycle lock {}",
+                            lock_path.display()
+                        )
+                    })?;
+                    if current != SocketIdentity::from_metadata(&metadata) {
+                        anyhow::bail!(
+                            "local IPC endpoint lock {} was replaced while being \
+                             acquired; refusing to share lifecycle ownership",
+                            lock_path.display()
+                        );
+                    }
+                    Ok(Self { _file: file })
+                }
                 Err(TryLockError::WouldBlock) => Err(std::io::Error::new(
                     ErrorKind::AddrInUse,
                     format!(
@@ -329,6 +444,14 @@ mod platform {
         data_dir.join("daemon.sock")
     }
 
+    /// Creates the endpoint directory and tightens it to owner-only access.
+    ///
+    /// The chmod is best-effort on purpose: a directory this process just
+    /// created is already chmoddable, while a pre-existing shared directory
+    /// (e.g. `/tmp` for an external `ZEROCLAW_SOCKET`) rejects it and is
+    /// instead vetted by [`require_trusted_lock_dir`] before the lifecycle
+    /// lock is acquired. That check — not this chmod — is what decides
+    /// whether the directory is safe to hold the lock.
     pub async fn prepare_parent(path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -864,6 +987,94 @@ mod tests {
         );
         let _next_owner = platform::EndpointLock::acquire(&sock_path).unwrap();
         drop(replacement);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn endpoint_lock_rejects_symlinked_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock_path = tmp.path().join("daemon.sock");
+        let target = tmp.path().join("elsewhere");
+        std::fs::write(&target, b"").unwrap();
+        std::os::unix::fs::symlink(&target, tmp.path().join("daemon.sock.lock")).unwrap();
+
+        platform::EndpointLock::acquire(&sock_path)
+            .expect_err("a symlinked lock entry must not be followed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn endpoint_lock_rejects_non_regular_entry() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let sock_path = tmp.path().join("daemon.sock");
+        let lock_path = tmp.path().join("daemon.sock.lock");
+        let c_path = std::ffi::CString::new(lock_path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+
+        platform::EndpointLock::acquire(&sock_path)
+            .expect_err("a non-regular lock entry must be rejected");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn endpoint_lock_rejects_preexisting_permissive_entry() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let sock_path = tmp.path().join("daemon.sock");
+        let lock_path = tmp.path().join("daemon.sock.lock");
+        std::fs::write(&lock_path, b"").unwrap();
+        std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        platform::EndpointLock::acquire(&sock_path)
+            .expect_err("a lock entry accessible to other users must be rejected");
+
+        // Restricting the entry restores acquisition without recreating it.
+        std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let _lock = platform::EndpointLock::acquire(&sock_path)
+            .expect("a private pre-existing entry is usable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn endpoint_lock_rejects_swappable_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let shared = tmp.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        // Group-writable without the sticky bit: any group member could
+        // unlink and recreate the lock entry.
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o770)).unwrap();
+        let sock_path = shared.join("daemon.sock");
+
+        platform::EndpointLock::acquire(&sock_path)
+            .expect_err("a directory with replaceable entries must be rejected");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn endpoint_lock_supports_sticky_shared_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // The /tmp shape a documented external ZEROCLAW_SOCKET override can
+        // point into: world-writable, but the sticky bit restricts unlink
+        // and rename to the entry owner, so the lock inode is stable.
+        let tmp = tempfile::tempdir().unwrap();
+        let shared = tmp.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        let sock_path = shared.join("daemon.sock");
+
+        let (listener, guard) = platform::bind(&sock_path).await.unwrap();
+        assert!(
+            tokio::net::UnixStream::connect(&sock_path).await.is_ok(),
+            "an external socket path in a sticky shared directory must serve"
+        );
+        drop(listener);
+        drop(guard);
     }
 
     #[cfg(unix)]
