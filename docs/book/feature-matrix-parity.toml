@@ -74,10 +74,6 @@ hermes = "supported"
 openclaw = "none"
 hermes = "none"
 
-[channels.wati]
-openclaw = "none"
-hermes = "none"
-
 [channels.nextcloud]
 openclaw = "supported"
 hermes = "none"

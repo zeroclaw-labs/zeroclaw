@@ -8,6 +8,7 @@ use super::types::*;
 const RPC_RELOAD_REPLY_FLUSH_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
 const RPC_RELOAD_GATEWAY_SHUTDOWN_DELAY: std::time::Duration =
     std::time::Duration::from_millis(200);
+const PROBE_MODEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 use crate::agent::agent::TurnEvent;
 use crate::sop::SopGraphExt;
 use serde::Serialize;
@@ -25,6 +26,7 @@ use zeroclaw_api::jsonrpc::{
 };
 use zeroclaw_api::model_provider::ChatMessage;
 use zeroclaw_api::runtime_status::RuntimeConfigKind;
+use zeroclaw_commands::{CommandSurface, commands_for_surface};
 
 /// Wire protocol version. Bump on breaking changes.
 pub const RPC_PROTOCOL_VERSION: u64 = 1;
@@ -910,6 +912,17 @@ impl RpcDispatcher {
             .iter()
             .map(|(_, name)| (*name).to_string())
             .collect();
+        let commands = commands_for_surface(CommandSurface::Tui)
+            .map(|spec| CommandDescriptor {
+                id: spec.id.as_str().to_string(),
+                name: spec.name.to_string(),
+                aliases: spec
+                    .aliases
+                    .iter()
+                    .map(|alias| (*alias).to_string())
+                    .collect(),
+            })
+            .collect();
 
         to_result(InitializeResult {
             protocol_version: RPC_PROTOCOL_VERSION,
@@ -918,6 +931,7 @@ impl RpcDispatcher {
             tui_id: Some(tui_id),
             tui_sig,
             capabilities,
+            commands,
         })
     }
 
@@ -964,9 +978,36 @@ impl RpcDispatcher {
 
     async fn handle_doctor_run(&self) -> RpcResult {
         let config = self.ctx.config.read().clone();
-        let results = crate::doctor::run_structured(&config).await;
+        self.run_doctor(Box::pin(crate::doctor::probe_models(&config)))
+            .await
+    }
+
+    /// Serialize a Doctor run into the `doctor/run` response. The probe future
+    /// is injectable so tests can force both sides of the timeout deadline
+    /// deterministically; the production path passes `Box::pin(probe_models)`.
+    async fn run_doctor(
+        &self,
+        probe: std::pin::Pin<
+            Box<dyn std::future::Future<Output = Vec<crate::doctor::DiagResult>> + Send + '_>,
+        >,
+    ) -> RpcResult {
+        let config = self.ctx.config.read().clone();
+        let (results, timed_out_phase) =
+            crate::doctor::run_structured_with_probe(&config, PROBE_MODEL_TIMEOUT, probe).await;
         let summary = doctor_summary(&results);
-        to_result(DoctorRunResult { results, summary })
+        // Read enabled + path from the one canonical active-writer accessor.
+        // The runtime `ctx.config.observability.log_persistence` snapshot is
+        // updated immediately by `config/set` while `zeroclaw-log` installs its
+        // writer state only at startup or daemon reload — gating on the config
+        // here would advertise a stale path (or omit a live one) during the
+        // config/reload window the Doctor diagnostics issue calls out.
+        let log_path = zeroclaw_log::active_log_path().map(|p| p.to_string_lossy().to_string());
+        to_result(DoctorRunResult {
+            results,
+            summary,
+            log_path,
+            timed_out_phase,
+        })
     }
 
     // ── TUI handlers ─────────────────────────────────────────────
@@ -6798,11 +6839,17 @@ mod tests {
             tui_id: None,
             tui_sig: None,
             capabilities: vec![],
+            commands: vec![],
         };
         let val = to_result(r).unwrap();
         assert_eq!(val["protocol_version"], 1);
         assert_eq!(val["server_version"], "0.1.0");
         assert_eq!(val["server_pid"], 42);
+        assert_eq!(
+            val["commands"],
+            json!([]),
+            "new daemons must serialize an authoritative empty catalogue"
+        );
     }
 
     #[test]
@@ -6882,6 +6929,27 @@ mod tests {
         assert!(result.is_ok(), "initialize should succeed; got {result:?}");
         assert!(dispatcher.client_elicitation_caps.form);
         assert!(!dispatcher.client_elicitation_caps.url);
+    }
+
+    #[tokio::test]
+    async fn initialize_advertises_canonical_tui_command_descriptors() {
+        let (mut dispatcher, _sessions) =
+            make_acp_test_dispatcher(zeroclaw_config::schema::Config::default());
+        let result = dispatcher
+            .handle_initialize(&serde_json::json!({
+                "protocol_version": RPC_PROTOCOL_VERSION
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result["commands"],
+            serde_json::json!([
+                {"id": "help", "name": "help"},
+                {"id": "new", "name": "new", "aliases": ["new-session"]},
+                {"id": "model", "name": "model"}
+            ])
+        );
     }
 
     #[tokio::test]
@@ -7073,6 +7141,224 @@ mod tests {
         assert!(sessions.get_agent("scoped-a").await.is_none());
         assert!(sessions.get_agent("scoped-b").await.is_none());
         assert!(sessions.get_agent("scoped-c").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn doctor_run_omits_log_path_when_persistence_is_disabled() {
+        // Serialize against the other tests that mutate the process-global
+        // writer state (the two transition tests below) and install an
+        // explicit disabled writer so the assertion cannot observe a writer
+        // another parallel test installed.
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        zeroclaw_log::init_from_config(
+            &zeroclaw_log::LogConfig {
+                log_persistence: "none".into(),
+                log_persistence_path: "state/runtime-trace.jsonl".into(),
+                ..Default::default()
+            },
+            tmp.path(),
+        );
+        let mut config = make_acp_test_config(&tmp);
+        // Doctor must not advertise any path regardless of the config snapshot.
+        config.observability.log_persistence = zeroclaw_config::schema::LogPersistence::None;
+        let (dispatcher, _sessions) = make_acp_test_dispatcher(config);
+
+        let result = dispatcher
+            .handle_doctor_run()
+            .await
+            .expect("doctor/run must succeed");
+        let obj = result.as_object().expect("result must be an object");
+        assert!(
+            obj.get("log_path").map(|v| v.is_null()).unwrap_or(true),
+            "log_path must be null when no writer is active; got: {:?}",
+            obj.get("log_path")
+        );
+    }
+
+    /// Config/reload window, scenario A: the daemon started with an
+    /// ACTIVE writer (rolling), then `config/set` flipped
+    /// `observability.log_persistence` to `none` WITHOUT a daemon reload.
+    /// The writer still persists, so Doctor must still advertise the path —
+    /// gating on the `ctx.config` snapshot would hide a live log.
+    #[tokio::test]
+    async fn doctor_reports_active_writer_path_after_config_set_to_none_without_reload() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        zeroclaw_log::init_from_config(
+            &zeroclaw_log::LogConfig {
+                log_persistence: "rolling".into(),
+                log_persistence_path: "state/runtime-trace.jsonl".into(),
+                ..Default::default()
+            },
+            tmp.path(),
+        );
+
+        let mut config = make_acp_test_config(&tmp);
+        config.observability.log_persistence = zeroclaw_config::schema::LogPersistence::None;
+        let (dispatcher, _sessions) = make_acp_test_dispatcher(config);
+
+        let result = dispatcher
+            .handle_doctor_run()
+            .await
+            .expect("doctor/run must succeed");
+        let obj = result.as_object().expect("result must be an object");
+        let log_path = obj.get("log_path").and_then(|v| v.as_str());
+        assert!(
+            matches!(log_path, Some(p) if p.ends_with("runtime-trace.jsonl")),
+            "an active writer must be advertised even when the config snapshot says none; got: {:?}",
+            obj.get("log_path")
+        );
+
+        // Restore a disabled writer so later tests start from a clean state.
+        zeroclaw_log::init_from_config(
+            &zeroclaw_log::LogConfig {
+                log_persistence: "none".into(),
+                log_persistence_path: "state/runtime-trace.jsonl".into(),
+                ..Default::default()
+            },
+            tmp.path(),
+        );
+    }
+
+    /// Config/reload window, scenario B: the daemon started with
+    /// persistence DISABLED, then `config/set` flipped it to `rolling`
+    /// WITHOUT a daemon reload. No writer is installed, so Doctor must NOT
+    /// advertise the disabled writer's stale resolved path.
+    #[tokio::test]
+    async fn doctor_omits_log_path_after_config_set_to_rolling_without_reload_when_writer_disabled()
+    {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        zeroclaw_log::init_from_config(
+            &zeroclaw_log::LogConfig {
+                log_persistence: "none".into(),
+                log_persistence_path: "state/runtime-trace.jsonl".into(),
+                ..Default::default()
+            },
+            tmp.path(),
+        );
+
+        let mut config = make_acp_test_config(&tmp);
+        config.observability.log_persistence = zeroclaw_config::schema::LogPersistence::Rolling;
+        let (dispatcher, _sessions) = make_acp_test_dispatcher(config);
+
+        let result = dispatcher
+            .handle_doctor_run()
+            .await
+            .expect("doctor/run must succeed");
+        let obj = result.as_object().expect("result must be an object");
+        assert!(
+            obj.get("log_path").map(|v| v.is_null()).unwrap_or(true),
+            "log_path must stay null when no writer is installed, even if the config says rolling; got: {:?}",
+            obj.get("log_path")
+        );
+    }
+
+    /// RPC-boundary coverage for the probe-timeout branch: a controlled
+    /// never-completing probe must yield a `doctor/run` response whose
+    /// serialized JSON carries `timed_out_phase`, preserves the earlier
+    /// diagnostics, and appends the localized timeout warning exactly once.
+    #[tokio::test]
+    async fn doctor_run_timeout_serializes_partial_result() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (dispatcher, _sessions) = make_acp_test_dispatcher(config);
+
+        // Force the timeout branch deterministically — no reliance on a real
+        // network endpoint hanging or not.
+        let result = dispatcher
+            .run_doctor(Box::pin(std::future::pending::<
+                Vec<crate::doctor::DiagResult>,
+            >()))
+            .await
+            .expect("doctor/run must succeed");
+        let obj = result.as_object().expect("result must be an object");
+
+        assert_eq!(
+            obj.get("timed_out_phase").and_then(|v| v.as_str()),
+            Some("probe_models"),
+            "serialized response must carry timed_out_phase='probe_models'"
+        );
+
+        // Earlier diagnostics survive in the serialized results.
+        let results = obj
+            .get("results")
+            .and_then(|v| v.as_array())
+            .expect("results must be an array");
+        assert!(
+            results
+                .iter()
+                .any(|r| r.get("category").and_then(|c| c.as_str()) == Some("config")),
+            "serialized results must retain config diagnostics after timeout"
+        );
+        assert!(
+            results
+                .iter()
+                .any(|r| r.get("category").and_then(|c| c.as_str()) == Some("workspace")),
+            "serialized results must retain workspace diagnostics after timeout"
+        );
+
+        // The timeout warning is appended exactly once in the serialized output.
+        let warning = crate::i18n::get_required_cli_string("cli-doctor-probe-timeout-message");
+        let warns = results
+            .iter()
+            .filter(|r| r.get("message").and_then(|m| m.as_str()) == Some(warning.as_str()))
+            .count();
+        assert_eq!(
+            warns, 1,
+            "serialized results must append the timeout warning exactly once"
+        );
+    }
+
+    /// RPC-boundary coverage for the under-deadline branch: a probe that
+    /// completes immediately with a real result must have that result retained
+    /// in the serialized `doctor/run` response, with `timed_out_phase` absent.
+    #[tokio::test]
+    async fn doctor_run_under_deadline_retains_probe_results() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (dispatcher, _sessions) = make_acp_test_dispatcher(config);
+
+        let probe_result = crate::doctor::DiagResult {
+            severity: crate::doctor::Severity::Ok,
+            category: "probe.mock".into(),
+            message: "mock probe ok".into(),
+        };
+        let result = dispatcher
+            .run_doctor(Box::pin(async move { vec![probe_result] }))
+            .await
+            .expect("doctor/run must succeed");
+        let obj = result.as_object().expect("result must be an object");
+
+        // timed_out_phase is None → skipped on the wire.
+        assert!(
+            obj.get("timed_out_phase")
+                .map(|v| v.is_null())
+                .unwrap_or(true),
+            "under-deadline response must not carry timed_out_phase"
+        );
+
+        // The completed probe result survives in the serialized output.
+        let results = obj
+            .get("results")
+            .and_then(|v| v.as_array())
+            .expect("results must be an array");
+        assert!(
+            results
+                .iter()
+                .any(|r| r.get("message").and_then(|m| m.as_str()) == Some("mock probe ok")),
+            "serialized results must retain the completed probe result"
+        );
+
+        // No timeout warning leaks into the under-deadline response.
+        let warning = crate::i18n::get_required_cli_string("cli-doctor-probe-timeout-message");
+        assert!(
+            !results
+                .iter()
+                .any(|r| r.get("message").and_then(|m| m.as_str()) == Some(warning.as_str())),
+            "under-deadline response must not contain the timeout warning"
+        );
     }
 
     #[tokio::test]

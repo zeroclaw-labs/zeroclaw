@@ -461,10 +461,11 @@ impl Chat {
         match result {
             Ok(session) => {
                 let resumed_sid = resume.as_deref().map(|_| session.session_id.clone());
-                let mut state = ChatState::new(
+                let mut state = ChatState::with_shared_commands(
                     session.session_id,
                     agent_alias.to_string(),
                     self.todo_settings,
+                    self.rpc.commands(),
                 );
                 state.cwd = session.workspace_dir;
                 Self::refresh_model_identity(&self.rpc, &mut state).await;
@@ -5282,10 +5283,20 @@ pub struct ChatState {
 }
 
 impl ChatState {
+    #[cfg(test)]
     pub fn new(
         session_id: String,
         agent_alias: String,
         todo_settings: crate::todo_tracker::TodoTrackerSettings,
+    ) -> Self {
+        Self::with_shared_commands(session_id, agent_alias, todo_settings, &[])
+    }
+
+    fn with_shared_commands(
+        session_id: String,
+        agent_alias: String,
+        todo_settings: crate::todo_tracker::TodoTrackerSettings,
+        commands: &[crate::wire::CommandDescriptor],
     ) -> Self {
         Self {
             session_id,
@@ -5298,7 +5309,7 @@ impl ChatState {
             first_message: None,
             git_hash: None,
             git_branch_last_fetch: None,
-            input_bar: InputBarState::new(),
+            input_bar: InputBarState::with_shared_commands(commands),
             entries: Vec::new(),
             streaming_text: String::new(),
             streaming_thought: String::new(),
@@ -6821,6 +6832,64 @@ mod tests {
             "myagent".to_string(),
             crate::todo_tracker::TodoTrackerSettings::default(),
         )
+    }
+
+    fn command_action_from_initialize(
+        response: serde_json::Value,
+        command: &str,
+    ) -> InputBarAction {
+        let commands = crate::client::parse_initialize_response(&response)
+            .expect("matching-version initialize response parses");
+        let mut state = ChatState::with_shared_commands(
+            "sess-1".to_string(),
+            "myagent".to_string(),
+            crate::todo_tracker::TodoTrackerSettings::default(),
+            &commands.commands,
+        );
+        state.input_bar.insert_text(command);
+        state.input_bar.submit_current_input_for_test()
+    }
+
+    #[test]
+    fn old_daemon_without_command_catalogue_preserves_shared_actions() {
+        let response = serde_json::json!({
+            "server_version": env!("CARGO_PKG_VERSION")
+        });
+
+        assert!(matches!(
+            command_action_from_initialize(response.clone(), "/help"),
+            InputBarAction::OpenHelp
+        ));
+        assert!(matches!(
+            command_action_from_initialize(response.clone(), "/model"),
+            InputBarAction::OpenModelPicker
+        ));
+        assert!(matches!(
+            command_action_from_initialize(response.clone(), "/new"),
+            InputBarAction::RestartSession
+        ));
+        assert!(matches!(
+            command_action_from_initialize(response, "/new-session"),
+            InputBarAction::RestartSession
+        ));
+    }
+
+    #[test]
+    fn present_empty_command_catalogue_remains_authoritative() {
+        let response = serde_json::json!({
+            "server_version": env!("CARGO_PKG_VERSION"),
+            "commands": []
+        });
+
+        for command in ["/help", "/model", "/new", "/new-session"] {
+            match command_action_from_initialize(response.clone(), command) {
+                InputBarAction::Submit { text, attachments } => {
+                    assert_eq!(text.as_deref(), Some(command));
+                    assert!(attachments.is_empty());
+                }
+                _ => panic!("present empty catalogue must submit {command} as ordinary input"),
+            }
+        }
     }
 
     fn transcript_snapshot(area: Rect, rows: &[&str]) -> TranscriptSnapshot {

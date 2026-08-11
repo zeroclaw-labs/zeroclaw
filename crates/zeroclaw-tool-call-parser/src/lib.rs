@@ -524,6 +524,20 @@ fn looks_like_malformed_tagged_tool_protocol_envelope(text: &str) -> bool {
         || lower.contains("tool_call_id")
 }
 
+/// JSON keys naming a tool-call container. Business JSON does not carry these.
+const TOOL_PROTOCOL_CONTAINER_KEYS: [&str; 3] =
+    ["\"tool_calls\"", "\"toolcalls\"", "\"function_call\""];
+
+/// JSON keys carrying a tool call's correlation id.
+const TOOL_PROTOCOL_CALL_ID_KEYS: [&str; 2] = ["\"call_id\"", "\"tool_call_id\""];
+
+/// Every key that identifies a payload as tool protocol on its own.
+fn tool_protocol_json_identifying_keys() -> impl Iterator<Item = &'static str> {
+    TOOL_PROTOCOL_CONTAINER_KEYS
+        .into_iter()
+        .chain(TOOL_PROTOCOL_CALL_ID_KEYS)
+}
+
 fn has_malformed_tool_protocol_text_signal(text: &str) -> bool {
     let trimmed = text.trim_start();
     let lower = trimmed.to_ascii_lowercase();
@@ -539,13 +553,51 @@ fn has_malformed_tool_protocol_text_signal(text: &str) -> bool {
         && (text.contains("\"content\"")
             || text.contains("\"result\"")
             || text.contains("\"output\""));
-    let has_protocol_container = text.contains("\"tool_calls\"")
-        || text.contains("\"toolcalls\"")
-        || text.contains("\"function_call\"");
+    let has_protocol_container = TOOL_PROTOCOL_CONTAINER_KEYS
+        .iter()
+        .any(|key| text.contains(key));
     let has_arguments = text.contains("\"arguments\"") || text.contains("\"parameters\"");
-    let has_call_id = text.contains("\"call_id\"") || text.contains("\"tool_call_id\"");
+    let has_call_id = TOOL_PROTOCOL_CALL_ID_KEYS
+        .iter()
+        .any(|key| text.contains(key));
 
     has_tool_result_shape || (has_protocol_container && has_arguments && has_call_id)
+}
+
+/// Whether `text` is a tool-protocol JSON payload that has not finished
+/// arriving.
+///
+/// The completed-envelope classifiers need the whole value: they parse it, or
+/// they look for a corroborating second key. A streaming consumer cannot wait
+/// for either — the frame it is deciding about is on screen now, and the key
+/// that gives the payload away may be the only one that has arrived. So this
+/// deliberately trips on a *single* protocol key.
+///
+/// Being eager is the safe direction here and not in the completed case: a
+/// held-back partial costs one frame and is re-rendered by the next delta,
+/// whereas a rendered protocol envelope stays visible until the turn ends, or
+/// indefinitely if the turn fails first. `false` for anything that already
+/// parses as a complete JSON value, which the ordinary classifiers then judge
+/// on their own terms.
+pub fn looks_like_incomplete_tool_protocol_json(text: &str) -> bool {
+    let trimmed = text.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let json_like =
+        trimmed.starts_with('{') || trimmed.starts_with('[') || lower.starts_with("```json");
+    if !json_like {
+        return false;
+    }
+
+    if let Some(body) = json_fence_body(trimmed) {
+        return looks_like_incomplete_tool_protocol_json(body);
+    }
+
+    // A complete value is not this function's business.
+    if serde_json::from_str::<serde_json::Value>(trimmed).is_ok() {
+        return false;
+    }
+
+    tool_protocol_json_identifying_keys().any(|key| trimmed.contains(key))
 }
 
 fn malformed_text_mentions_known_tool(text: &str, known_tool_names: &HashSet<String>) -> bool {
@@ -2338,6 +2390,44 @@ pub fn build_native_assistant_history_from_parsed_calls(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incomplete_protocol_json_trips_on_a_single_identifying_key() {
+        // One key is enough while the value is still arriving: the corroborating
+        // key may simply not have been emitted yet.
+        assert!(looks_like_incomplete_tool_protocol_json(
+            "{\"tool_call_id\":\"call_1\","
+        ));
+        assert!(looks_like_incomplete_tool_protocol_json(
+            "{\"tool_calls\":[{\"name\":\"shell\""
+        ));
+        assert!(looks_like_incomplete_tool_protocol_json(
+            "{\"function_call\":{\"arguments\":\"{\\\"a\\\":1"
+        ));
+        // An unclosed JSON fence is the same payload with a wrapper.
+        assert!(looks_like_incomplete_tool_protocol_json(
+            "```json\n{\"tool_call_id\":\"c1\","
+        ));
+    }
+
+    #[test]
+    fn incomplete_protocol_json_ignores_complete_values_and_business_json() {
+        // Complete values belong to the ordinary classifiers, which can parse
+        // them and judge them properly.
+        assert!(!looks_like_incomplete_tool_protocol_json(
+            "{\"tool_call_id\":\"call_1\",\"content\":\"done\"}"
+        ));
+        // Business JSON carries none of the identifying keys, so a half-arrived
+        // config still streams.
+        assert!(!looks_like_incomplete_tool_protocol_json(
+            "{\"retries\": 3, \"timeout_ms\":"
+        ));
+        // Prose is not JSON, however much it talks about tool calls.
+        assert!(!looks_like_incomplete_tool_protocol_json(
+            "The \"tool_call_id\" field identifies the call."
+        ));
+        assert!(!looks_like_incomplete_tool_protocol_json(""));
+    }
 
     #[test]
     fn build_native_assistant_history_returns_none_for_empty_calls() {

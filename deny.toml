@@ -15,6 +15,12 @@ ignore = [
     # proc-macro-error2 -- unmaintained derive/attribute macro helper; still in
     # the resolved graph via matrix-sdk dev-deps (aquamarine) in zeroclaw-channels
     { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 unmaintained; transitive macro helper via matrix-sdk dev-deps; tracking #8519" },
+    # bitmaps -- repository archived 2026-05-03, all versions affected, no safe
+    # upgrade available. Reached only transitively:
+    # matrix-sdk -> eyeball-im -> imbl -> bitmaps. Upstream tracking issue
+    # matrix-org/matrix-rust-sdk#6859 asks matrix-sdk to move off the imbl stack;
+    # drop this entry once a matrix-sdk release no longer pulls bitmaps.
+    { id = "RUSTSEC-2026-0247", reason = "bitmaps unmaintained; transitive via matrix-sdk -> eyeball-im -> imbl; no safe upgrade; upstream matrix-org/matrix-rust-sdk#6859" },
 ]
 
 [licenses]

@@ -83,9 +83,9 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry-alpine-${TARGETARCH},target=/u
     esac \
     && rustup target add "$RUST_TARGET" \
     && if [ -n "$ZEROCLAW_CARGO_FLAGS" ]; then \
-         cargo zigbuild --release --locked --target "$RUST_TARGET" -p zeroclawlabs -p zerocode $ZEROCLAW_CARGO_FLAGS; \
+         cargo zigbuild --release --locked --target "$RUST_TARGET" -p zeroclaw -p zerocode $ZEROCLAW_CARGO_FLAGS; \
        else \
-         cargo zigbuild --release --locked --target "$RUST_TARGET" -p zeroclawlabs -p zerocode; \
+         cargo zigbuild --release --locked --target "$RUST_TARGET" -p zeroclaw -p zerocode; \
        fi
 RUN rm -rf src benches crates xtask tools/fill-translations
 
@@ -107,10 +107,9 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry-alpine-${TARGETARCH},target=/u
       amd64) RUST_TARGET=x86_64-unknown-linux-musl ;; \
       *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
     esac \
-    && rm -rf target/"$RUST_TARGET"/release/.fingerprint/zeroclawlabs-* \
-           target/"$RUST_TARGET"/release/deps/zeroclawlabs-* \
-           target/"$RUST_TARGET"/release/incremental/zeroclawlabs-* \
-           target/"$RUST_TARGET"/release/.fingerprint/zeroclaw-* \
+    && rm -rf target/"$RUST_TARGET"/release/.fingerprint/zeroclaw-* \
+           target/"$RUST_TARGET"/release/deps/zeroclaw-* \
+           target/"$RUST_TARGET"/release/incremental/zeroclaw-* \
            target/"$RUST_TARGET"/release/deps/zeroclaw_* \
            target/"$RUST_TARGET"/release/incremental/zeroclaw_* \
            target/"$RUST_TARGET"/release/.fingerprint/xtask-* \
@@ -124,9 +123,9 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry-alpine-${TARGETARCH},target=/u
            target/release/.fingerprint/zerocode-* \
            target/release/build/zerocode-* \
     && if [ -n "$ZEROCLAW_CARGO_FLAGS" ]; then \
-         cargo zigbuild --release --locked --target "$RUST_TARGET" -p zeroclawlabs -p zerocode $ZEROCLAW_CARGO_FLAGS; \
+         cargo zigbuild --release --locked --target "$RUST_TARGET" -p zeroclaw -p zerocode $ZEROCLAW_CARGO_FLAGS; \
        else \
-         cargo zigbuild --release --locked --target "$RUST_TARGET" -p zeroclawlabs -p zerocode; \
+         cargo zigbuild --release --locked --target "$RUST_TARGET" -p zeroclaw -p zerocode; \
        fi \
     && cp target/"$RUST_TARGET"/release/zeroclaw /app/zeroclaw \
     && cp target/"$RUST_TARGET"/release/zerocode /app/zerocode
