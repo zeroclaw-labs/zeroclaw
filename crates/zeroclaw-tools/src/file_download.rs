@@ -145,7 +145,8 @@ impl FileDownloadTool {
     ///
     /// - [`parse_endpoint_url`] — returns transport_host (for reqwest binding),
     ///   policy_host (for SSRF policy comparison), and port.
-    /// - [`resolve_endpoint_ips`] — DNS resolution using policy_host (short-circuits on IP literals).
+    /// - [`resolve_endpoint_ips`] — DNS resolution using transport_host
+    ///   (short-circuits on IP literals).
     /// - [`ssrf_check_endpoint`] — applies the private-host / metadata policy
     ///   using policy_host and emits the operator-audit WARN/INFO log signals.
     ///
@@ -156,7 +157,13 @@ impl FileDownloadTool {
         raw_url: &str,
     ) -> Result<(String, Vec<std::net::SocketAddr>), String> {
         let (transport_host, policy_host, port) = parse_endpoint_url(raw_url)?;
-        let resolved_addrs = (self.endpoint_resolver)(policy_host.to_string(), port).await?;
+        // Resolve the exact transport hostname, which may carry a terminal DNS
+        // dot. A trailing dot marks an absolute name, so resolving it forces an
+        // explicitly absolute lookup: resolver search-list behavior cannot
+        // substitute a different relative name, and the validated address set
+        // is guaranteed to belong to the exact hostname reqwest connects to.
+        // `policy_host` is retained only for allowlist comparison + diagnostics.
+        let resolved_addrs = (self.endpoint_resolver)(transport_host.to_string(), port).await?;
         let allowed = normalize_allowed_private_hosts(&(self.allowed_private_hosts_resolver)());
         ssrf_check_endpoint(&policy_host, &resolved_addrs, &allowed)?;
         // Return transport_host for resolve_to_addrs binding — this preserves
@@ -285,18 +292,25 @@ fn parse_endpoint_url(raw_url: &str) -> Result<(String, String, u16), String> {
     if url.is_empty() {
         return Err(tool_msg("tool-file-download-error-disabled"));
     }
-    if !url.starts_with("http://") && !url.starts_with("https://") {
-        return Err(tool_msg_with_args(
-            "tool-file-download-error-bad-scheme",
-            &[("url", url)],
-        ));
-    }
     let parsed = reqwest::Url::parse(url).map_err(|e| {
         tool_msg_with_args(
             "tool-file-download-error-invalid-url",
             &[("err", &e.to_string())],
         )
     })?;
+    // URL schemes are case-insensitive (RFC 3986 §3.1). `reqwest::Url`
+    // lowercases the scheme during parse, so compare against the parsed
+    // scheme rather than a case-sensitive string prefix — an operator-written
+    // `HTTPS://...` endpoint is valid and must not regress to a scheme error.
+    match parsed.scheme() {
+        "http" | "https" => {}
+        _ => {
+            return Err(tool_msg_with_args(
+                "tool-file-download-error-bad-scheme",
+                &[("url", url)],
+            ));
+        }
+    }
     let port = parsed.port_or_known_default().ok_or_else(|| {
         tool_msg_with_args(
             "tool-file-download-error-invalid-url",
@@ -319,14 +333,15 @@ fn parse_endpoint_url(raw_url: &str) -> Result<(String, String, u16), String> {
     Ok((transport_host, policy_host, port))
 }
 
-/// DNS resolution for `(policy_host, port)`. IP literals short-circuit
+/// DNS resolution for `(host, port)`. IP literals short-circuit
 /// to a one-element vector (no I/O) — `ssrf_check_endpoint` then
 /// classifies the literal directly. Hostnames go through
 /// `tokio::net::lookup_host` and the address set is collected.
 ///
-/// Uses `policy_host` (canonical, no trailing dot) because DNS resolvers
-/// ignore trailing dots — `"files.corp.lan."` and `"files.corp.lan"`
-/// resolve to the same addresses.
+/// The caller passes the exact `transport_host`, which may carry a terminal
+/// DNS dot. A trailing dot marks an absolute name, so resolving it forces an
+/// explicitly absolute lookup and prevents resolver search-list behavior from
+/// substituting a different relative name than the one being validated.
 async fn resolve_endpoint_ips(host: &str, port: u16) -> Result<Vec<std::net::SocketAddr>, String> {
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         return Ok(vec![std::net::SocketAddr::new(ip, port)]);
@@ -1823,6 +1838,133 @@ mod tests {
         assert_eq!(transport, "10.0.0.5");
         assert_eq!(policy, "10.0.0.5");
         assert_eq!(port, 9000);
+    }
+
+    #[test]
+    fn parse_endpoint_url_accepts_uppercase_scheme() {
+        // URL schemes are case-insensitive (RFC 3986 §3.1): an operator
+        // may write `HTTPS://...` and it must not regress to a scheme error.
+        let (transport, policy, port) =
+            parse_endpoint_url("HTTPS://Example.com.:8443/api").unwrap();
+        assert_eq!(transport, "example.com.");
+        assert_eq!(policy, "example.com");
+        assert_eq!(port, 8443);
+
+        // Mixed-case scheme also accepted; non-http(s) schemes still rejected.
+        let (transport, _, _) = parse_endpoint_url("HtTp://example.com:8080/x").unwrap();
+        assert_eq!(transport, "example.com");
+        let err = parse_endpoint_url("ftp://example.com:21/x").unwrap_err();
+        assert!(
+            err.contains("http://") || err.contains("scheme"),
+            "non-http scheme must still be rejected; got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolver_seam_receives_exact_dotted_transport_host() {
+        // The preflight resolver must receive the exact transport hostname
+        // (terminal DNS dot preserved) for a dotted URL. `policy_host` strips
+        // the dot for allowlist comparison, but the DNS lookup must be for the
+        // absolute name — otherwise resolver search-list behavior can
+        // substitute a different relative name whose addresses get validated
+        // and then pinned to the request.
+        let captured = Arc::new(std::sync::Mutex::new(String::new()));
+        let tmp = TempDir::new().unwrap();
+        let config = FileDownloadConfig {
+            url: Some("http://files.corp.lan.:8080/x".into()),
+            allowed_private_hosts: vec!["files.corp.lan".into()],
+            ..FileDownloadConfig::default()
+        };
+        let snapshot = config.allowed_private_hosts.clone();
+        let endpoint_resolver: EndpointResolver = Arc::new({
+            let captured = Arc::clone(&captured);
+            move |host: String, port: u16| -> Pin<Box<dyn Future<Output = ResolveResult> + Send>> {
+                *captured.lock().unwrap() = host.clone();
+                Box::pin(async move {
+                    Ok(vec![std::net::SocketAddr::new(
+                        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                        port,
+                    )])
+                })
+            }
+        });
+        let tool = FileDownloadTool::new_with_endpoint_resolver(
+            test_security(tmp.path().to_path_buf(), AutonomyLevel::Full),
+            config,
+            true,
+            move || snapshot.clone(),
+            endpoint_resolver,
+        );
+        let (transport, addrs) = tool
+            .validate_endpoint_host("http://files.corp.lan.:8080/x")
+            .await
+            .expect("dotted allowlisted host must validate");
+        assert_eq!(
+            *captured.lock().unwrap(),
+            "files.corp.lan.",
+            "the resolver must receive the exact dotted transport host"
+        );
+        assert_eq!(transport, "files.corp.lan.");
+        assert_eq!(addrs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn execute_validates_and_connects_exact_dotted_transport_host() {
+        // Production-path identity: the validated address set (returned by the
+        // resolver, then bound via resolve_to_addrs) must belong to the exact
+        // dotted transport hostname the request connects to. If validation had
+        // resolved a dot-stripped name, the pinned addresses could come from a
+        // different service than the request's absolute host.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/probe"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"hit"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = TempDir::new().unwrap();
+        let config = FileDownloadConfig {
+            url: Some(format!(
+                "http://files.corp.invalid.:{}/probe",
+                server.address().port()
+            )),
+            allowed_private_hosts: vec!["files.corp.invalid".into()],
+            ..FileDownloadConfig::default()
+        };
+        let captured = Arc::new(std::sync::Mutex::new(String::new()));
+        let bound = *server.address();
+        let snapshot = config.allowed_private_hosts.clone();
+        let endpoint_resolver: EndpointResolver = Arc::new({
+            let captured = Arc::clone(&captured);
+            move |host: String, _port: u16| -> Pin<Box<dyn Future<Output = ResolveResult> + Send>> {
+                *captured.lock().unwrap() = host.clone();
+                Box::pin(async move { Ok(vec![bound]) })
+            }
+        });
+        let tool = FileDownloadTool::new_with_endpoint_resolver(
+            test_security(tmp.path().to_path_buf(), AutonomyLevel::Full),
+            config,
+            true,
+            move || snapshot.clone(),
+            endpoint_resolver,
+        );
+
+        let result = tool
+            .execute(json!({ "document_id": "doc-1", "dest_path": "out.bin" }))
+            .await
+            .expect("tool execute must return a ToolResult");
+        assert!(
+            result.success,
+            "dotted hostname must download through the validated address set"
+        );
+        assert_eq!(
+            *captured.lock().unwrap(),
+            "files.corp.invalid.",
+            "validation must resolve the exact dotted transport host"
+        );
+        // wiremock's expect(1) is the authoritative detector that the request
+        // connected through the validated address set.
     }
 
     #[test]

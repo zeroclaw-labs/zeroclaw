@@ -1512,6 +1512,7 @@ pub fn all_tools_with_runtime(
         .with_runtime_profiles(root_config.runtime_profiles.clone())
         .with_skill_bundles(root_config.skill_bundles.clone())
         .with_root_config(config.clone())
+        .with_live_config(live_config.clone())
         .with_caller_alias(agent_alias);
         tool_arcs.push(Arc::new(delegate_tool));
         Some(parent_tools)

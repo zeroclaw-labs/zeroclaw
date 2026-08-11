@@ -1584,7 +1584,11 @@ impl Agent {
             tui_env,
             sop_engine,
             sop_audit,
-            None,
+            // Thread the live config handle (when present) into the registry so
+            // live `config/set` reloads reach the file_download SSRF allowlist
+            // resolver — the construction-time snapshot must never outlive a
+            // policy revocation. `from_live_config_*` callers pass `Some`.
+            live_config.clone(),
         );
         // Skills are loaded here and handed to `assemble`, which owns skill
         // registration and resolves builtin/MCP elevation against the pre-filter

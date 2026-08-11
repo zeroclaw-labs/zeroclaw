@@ -151,6 +151,13 @@ pub struct DelegateTool {
     /// time. When unset (legacy unit-test constructors), DelegateTool falls
     /// back to using `self.security` for the spawned inner DelegateTool.
     root_config: Option<Arc<Config>>,
+    /// Live config handle threaded from the parent registry so independent /
+    /// background / parallel delegate target registries (built through
+    /// [`Self::independent_agentic_tools_for_target`]) observe `config/set`
+    /// reloads — e.g. a `file_download` SSRF allowlist revocation — instead of
+    /// falling back to the construction-time `root_config` snapshot. Unset for
+    /// legacy unit-test constructors.
+    live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
     /// Alias of the agent that owns this DelegateTool. Excluded from the
     /// advertised roster so an agent is never offered itself as a
     /// delegation target. Empty when unset (legacy unit-test constructors).
@@ -266,6 +273,7 @@ impl DelegateTool {
             runtime_profiles: Arc::new(HashMap::new()),
             skill_bundles: Arc::new(HashMap::new()),
             root_config: None,
+            live_config: None,
             caller_alias: String::new(),
         }
     }
@@ -313,6 +321,7 @@ impl DelegateTool {
             runtime_profiles: Arc::new(HashMap::new()),
             skill_bundles: Arc::new(HashMap::new()),
             root_config: None,
+            live_config: None,
             caller_alias: String::new(),
         }
     }
@@ -413,6 +422,20 @@ impl DelegateTool {
     /// canonical agent config at delegate time.
     pub fn with_root_config(mut self, config: Arc<Config>) -> Self {
         self.root_config = Some(config);
+        self
+    }
+
+    /// Attach the live config handle so independent delegate target registries
+    /// (built through [`Self::independent_agentic_tools_for_target`]) read live
+    /// policy — such as the `file_download` SSRF allowlist — after `config/set`
+    /// reloads instead of falling back to the construction-time `root_config`
+    /// snapshot. `None` (legacy unit-test constructors) keeps the snapshot
+    /// fallback exactly as before.
+    pub fn with_live_config(
+        mut self,
+        live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    ) -> Self {
+        self.live_config = live_config;
         self
     }
 
@@ -758,7 +781,11 @@ impl DelegateTool {
             None,
             None,
             None,
-            None,
+            // Live config handle threaded from the parent registry so this
+            // independent target registry observes `config/set` reloads (e.g.
+            // a file_download SSRF allowlist revocation) instead of building
+            // from the construction-time snapshot.
+            self.live_config.clone(),
         );
 
         let target_workspace = config.agent_workspace_dir(agent_name);
@@ -1562,6 +1589,7 @@ impl DelegateTool {
         let runtime_profiles = Arc::clone(&self.runtime_profiles);
         let skill_bundles = Arc::clone(&self.skill_bundles);
         let root_config = self.root_config.clone();
+        let live_config = self.live_config.clone();
         let caller_alias = self.caller_alias.clone();
         let memory = self.memory.clone();
         let parent_session_key = current_tool_loop_session_key();
@@ -1587,6 +1615,7 @@ impl DelegateTool {
                     runtime_profiles,
                     skill_bundles,
                     root_config,
+                    live_config,
                     caller_alias,
                 };
 
@@ -1810,6 +1839,7 @@ impl DelegateTool {
             let skill_bundles = Arc::clone(&self.skill_bundles);
             let receipt_scope = parent_receipt_scope.clone();
             let root_config = self.root_config.clone();
+            let live_config = self.live_config.clone();
             let caller_alias = self.caller_alias.clone();
             let session_key = parent_session_key.clone();
             let memory = self.memory.clone();
@@ -1835,6 +1865,7 @@ impl DelegateTool {
                         runtime_profiles,
                         skill_bundles,
                         root_config,
+                        live_config,
                         caller_alias,
                     };
                     let agent_name_for_return = agent_name.clone();
@@ -7798,6 +7829,154 @@ mod tests {
         assert!(
             !tool_names.contains(&"echo_tool"),
             "independent target must not inherit parent-only tools"
+        );
+    }
+
+    /// Production-path regression for the live-config forwarding boundary: an
+    /// independent agentic delegate rebuilds its target registry through
+    /// `all_tools_with_runtime`. The DelegateTool must thread the parent's live
+    /// config handle into that rebuild, so a `config/set` revocation of the
+    /// `file_download` SSRF allowlist is observed on the target's next dispatch
+    /// — the already-built target registry must not keep using a
+    /// construction-time snapshot of the policy.
+    #[tokio::test]
+    async fn independent_delegate_file_download_observes_live_config_revocation() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method, matchers::path};
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, DelegateTargetConfig, FileDownloadConfig,
+            RiskProfileConfig, RuntimeProfileConfig,
+        };
+
+        let server = MockServer::start().await;
+        let port = server.address().port();
+        Mock::given(method("GET"))
+            .and(path("/x"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"ok"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.risk_profiles.insert(
+            "caller".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "target".to_string(),
+            RiskProfileConfig {
+                allowed_tools: vec!["file_download".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.runtime_profiles.insert(
+            "agentic".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "caller".into(),
+                model_provider: "ollama.caller".into(),
+                delegates: vec![DelegateTargetConfig {
+                    agent: "target".to_string(),
+                    mode: DelegateExecutionMode::Independent,
+                }],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "target".into(),
+                runtime_profile: "agentic".into(),
+                model_provider: "ollama.target".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.file_download = FileDownloadConfig {
+            url: Some(format!("http://127.0.0.1:{port}/x")),
+            allowed_private_hosts: vec!["127.0.0.1".into()],
+            ..FileDownloadConfig::default()
+        };
+
+        let live = Arc::new(RwLock::new(config.clone()));
+        let config = Arc::new(config);
+
+        // Ensure the target workspace exists so file_download's destination
+        // parent canonicalizes on the success path.
+        tokio::fs::create_dir_all(config.agent_workspace_dir("target"))
+            .await
+            .expect("target workspace dir created");
+
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let tool = DelegateTool::new(config.agents.clone(), None, Arc::clone(&caller_policy))
+            .with_root_config(Arc::clone(&config))
+            .with_live_config(Some(Arc::clone(&live)))
+            .with_caller_alias("caller")
+            .with_runtime(Arc::new(DelegateTestRuntime))
+            .with_parent_tools(Arc::new(RwLock::new(Vec::new())));
+
+        let target_policy = tool
+            .policy_for_target("target")
+            .expect("independent target policy resolves");
+        let independent = tool
+            .independent_agentic_tools_for_target("target", target_policy)
+            .await
+            .expect("target-owned registry builds");
+        let file_download = independent
+            .tools
+            .iter()
+            .find(|t| t.name() == "file_download")
+            .expect(
+                "independent target registry must include file_download when [file_download].url is set",
+            );
+
+        let args = serde_json::json!({ "document_id": "doc-1", "dest_path": "out.bin" });
+
+        // Side 1: the live allowlist admits 127.0.0.1 → the target registry
+        // reaches the local listener through the SSRF gate.
+        let result1 = file_download
+            .execute(args.clone())
+            .await
+            .expect("tool execute must return a ToolResult");
+        assert!(
+            result1.success,
+            "allowlisted 127.0.0.1 must pass the SSRF gate and download through the independent delegate"
+        );
+
+        // Side 2: operator revokes the opt-in via live config — the already-built
+        // target registry must reject on its next dispatch without a rebuild.
+        live.write().file_download.allowed_private_hosts.clear();
+        let result2 = file_download
+            .execute(args)
+            .await
+            .expect("tool execute must return a ToolResult");
+        assert!(
+            !result2.success,
+            "after revoking the live allowlist entry the independent delegate must reject the request"
+        );
+        let err2 = result2.error.unwrap_or_default().to_lowercase();
+        assert!(
+            err2.contains("private")
+                || err2.contains("non-global")
+                || err2.contains("loopback")
+                || err2.contains("link-local"),
+            "127.0.0.1 must be rejected by the SSRF gate after live-config revocation; got: {err2}"
         );
     }
 
