@@ -23,8 +23,10 @@ Last verified against the `v0.8.2` release cycle.
 7. [Versioned documentation deployment](#step-7-versioned-documentation-deployment)
 
 That is the entire process. Everything else (Docker, website redeploy, Scoop,
-AUR, Homebrew, Discord, tweet) runs automatically as downstream jobs. You do not
-need to do anything for those unless a job explicitly fails.
+AUR, Discord, tweet) runs automatically as downstream jobs. Homebrew Core
+detects the stable GitHub release through its own autobump service. You do not
+need to do anything for those unless a job explicitly fails or Homebrew's
+external bump remains stale.
 
 ---
 
@@ -59,13 +61,18 @@ Bump `workspace.package.version` in the workspace `Cargo.toml`, then run the two
 
 This updates README badges, the Tauri config, and workflow description
 examples, then regenerates every spec-driven install surface via
-`cargo generate installers`: setup.bat, `dist/aur/PKGBUILD`,
-`dist/scoop/zeroclaw.json`, `flake.nix`, the Dockerfile/Containerfile feature
-sets, and `dev/ci/docker-tags.toml`. Those surfaces derive their version and
-feature lists from the canonical install spec (`Cargo.toml` plus
-`[package.metadata.zeroclaw]`), so the bump keeps them in step automatically;
-never hand-edit a generated region. This script also refreshes the Nix git
-dependency hashes (`nix/hashes.json`) via `scripts/dev/refresh-nix-hashes.sh`.
+`cargo generate installers`: install.sh, setup.bat, `dist/aur/PKGBUILD`,
+`dist/aur/.SRCINFO`, `dist/scoop/zeroclaw.json`, `flake.nix`, the Dockerfile/Containerfile feature
+sets, `dev/ci/docker-tags.toml`, `docs/book/src/_snippets/install.md`, the Unix
+fast-path blocks in README/platform docs, and the Windows prebuilt block in
+`docs/book/src/setup/windows.md`.
+Version, feature, and application-packaging values come from `Cargo.toml` and
+`[package.metadata.zeroclaw]`; the four stable installation routes come from
+typed contracts in `xtask/src/generate/spec.rs`. The bump keeps these surfaces
+in step automatically, so never hand-edit a generated region. Live release
+availability remains hand-authored and is not inferred by the generator. This
+script also refreshes the Nix git dependency hashes (`nix/hashes.json`) via
+`scripts/dev/refresh-nix-hashes.sh`.
 
 ### Refresh and pin translations
 
@@ -185,6 +192,17 @@ real `GITHUB_TOKEN` to every workflow run:
 
    </div>
 
+   Artifact-producing jobs need an `act` artifact-service protocol that
+   `actions/upload-artifact` v7 and `actions/download-artifact` v8 require,
+   and **no currently released version of `act` implements it** (checked
+   through the latest release as of this writing). The helper preflights the
+   installed `act` version before starting a job that uses the pinned
+   artifact actions and fails closed: it will not attempt the job on an
+   unverified version. Until a compatible `act` release ships and is
+   verified against a real artifact round-trip, use the GitHub-hosted
+   fallback below for any artifact-producing or artifact-consuming job; that
+   is the recommended path today, not a rare exception.
+
 3. Install Docker Engine or Docker Desktop from
    <https://docs.docker.com/engine/install/>. On Linux, add yourself to
    the `docker` group so you don't need `sudo`. `act` also works with
@@ -247,6 +265,40 @@ value never lands in argv), and sets `--artifact-server-path` so
 `actions/upload-artifact` and `actions/download-artifact` work between
 jobs. All of that is plain `act` underneath; the script just removes
 the flag soup.
+
+Before any artifact-producing or artifact-consuming job starts, the helper
+checks the resolved standalone `act` or `gh act` version against an internal
+compatibility threshold (`act` >= an unreachable sentinel, currently
+`999.0.0`). That threshold is **not** a version to go install; no released
+`act` version satisfies it, and it only moves to a real, specific version
+once a real artifact round-trip has been verified against that release. Every
+currently released `act` version fails the preflight before the build starts
+and points to GitHub-hosted Actions; do not downgrade the pinned artifact
+actions to make a local runner pass.
+
+For `--all`, compatibility is checked across the complete selected job set
+before the first job starts. If any selected job needs the artifact service,
+the sweep fails closed (no currently released `act` clears the threshold) and
+exits without running a partial subset. `--all --no-allowlist` follows the
+same compatibility policy.
+
+Local artifact preflight failures are expected on every currently released
+`act`, not an occasional hiccup. Push the exact commit to GitHub and use the
+hosted workflow as the validation fallback for artifact-bearing jobs. The
+read-only cross-platform build can be dispatched safely and watched from the
+CLI:
+
+```sh
+gh workflow run cross-platform-build-manual.yml --ref <validation-branch>
+gh run list --workflow cross-platform-build-manual.yml --branch <validation-branch> --limit 1
+gh run watch <run-id> --exit-status
+```
+
+Do not trigger `release-stable-manual.yml` early as a dry-run substitute: that
+workflow publishes after its environment approvals. Record the local artifact
+jobs as skipped because of the version policy, use the hosted cross-platform
+build for the artifact round trip, and leave the protected stable-release run
+for Step 4.
 
 ### `--all` only runs jobs on a dry-run-safe allowlist
 
@@ -356,6 +408,9 @@ Once `publish` completes, confirm:
 [ ] GitHub Release exists at /releases/tag/vX.Y.Z and is marked Latest
 [ ] Release notes are non-empty
 [ ] SHA256SUMS asset is present and non-empty
+[ ] Both SPDX and CycloneDX SBOM assets are present
+[ ] Exactly one zeroclaw-vX.Y.Z-verification.tar.gz asset is present
+[ ] No loose *.bundle, *.attestation.jsonl, or *.intoto.jsonl assets are present
 [ ] At least one binary archive is downloadable (spot-check linux x86_64)
 [ ] Prebuilt Docker and generated Docker matrix jobs are green
 ```
@@ -369,12 +424,20 @@ inside the stable release workflow. You do not need a separate Docker check if
 all release jobs are green. If a maintainer instead starts the release by
 pushing a `vX.Y.Z` tag, Docker Publish starts as a separate tag-triggered run;
 confirm that sibling run is green before treating container publication as
-complete. Distribution channels need separate attention only when their jobs
-show red.
+complete. Scoop and AUR need separate attention only when their jobs show red.
+Homebrew Core is external to this workflow; its
+[autobump service](https://docs.brew.sh/Autobump) checks eligible formulae on
+its own schedule.
 
 Consumers who want to verify signatures, SBOMs, or SLSA provenance on the
 published artifacts can follow
 [Release artifact verification](./release-verification.md).
+
+After any release-attestation workflow change, a human maintainer must also run
+the online and disconnected verification rehearsal in
+`docs/maintainers/release-attestation-runbook.md` before closing the tracking
+issue. A local workflow lint or `act` run does not replace that release-level
+check because neither can mint GitHub's production OIDC attestation.
 
 ---
 
@@ -460,10 +523,78 @@ you typed the wrong version. Fix the mismatch and re-trigger.
 **An environment gate timed out:** Re-run only the timed-out job. No need to
 restart the workflow.
 
-**A distribution channel job failed (Scoop, AUR, Homebrew):** Each has a
-corresponding manually-triggerable sub-workflow. Re-run the specific one with
-`dry_run: true` first to confirm the fix, then `dry_run: false`. These are
-nice-to-have: a failed Scoop job does not invalidate the release itself.
+**A Scoop or AUR distribution job failed:** Each has a corresponding
+manually-triggerable sub-workflow. Re-run the specific one with `dry_run: true`
+first to confirm the fix, then `dry_run: false`. These are nice-to-have: a
+failed distribution job does not invalidate the release itself. For Scoop
+credential failures, use Scoop Bucket Canary instead of treating a generic dry
+run as credential proof; the canary enables the fail-closed
+`credential_canary` path.
+
+**The `scoop` job failed with `remote: Permission ... denied to <account>` (403):**
+A permissions problem, not a manifest problem: the bucket token is dead or
+under-scoped. Rotate the token per
+[Rotating `SCOOP_BUCKET_TOKEN`](./ci-and-actions.md#rotating-scoop_bucket_token),
+then dispatch Scoop Bucket Canary to confirm the fix without writing to the
+bucket. Rerun the Scoop publisher with `dry_run: false` and confirm the bucket
+landed the new version. Bucket-side Excavator recovery remains pending on
+`zeroclaw-labs/scoop-zeroclaw#1`, repository workflow write permission, and a
+maintainer smoke test; do not wait for it to repair a release until those steps
+are complete.
+
+**Weekly `Scoop Bucket Canary` went red:** The token has expired or lost write.
+Same rotation path. Fix it before the next release.
+
+**Homebrew Core is stale:** Homebrew is not a release-workflow job. Check the
+[Homebrew autobump status and documented manual bump
+path](https://docs.brew.sh/Autobump) instead of adding a repository fork token.
+
+**The AUR job failed with `The AUR is down due to maintenance`:** An upstream
+outage, not a credential problem. `AUR_SSH_KEY` is fine if the log shows a key
+fingerprint under `SSH key diagnostics` and the failure came from the server
+rather than from SSH. The publisher retries five times over roughly seven
+minutes, with a hard job timeout. Each attempt reclones the current package and
+stops instead of downgrading it if another run has already published a newer
+version. Reaching the maintenance error means the window outlasted the retry
+budget. Wait for `aur.archlinux.org` to come back, then re-dispatch Pub AUR Package at the
+release tag with `dry_run: true`, then `dry_run: false`. Confirm the result with
+`curl -fsS 'https://aur.archlinux.org/rpc/v5/info?arg%5B%5D=zeroclawlabs'`, or
+just dispatch AUR Freshness Check. Skipping this leaves the AUR silently behind
+until the weekly check catches it.
+
+**The AUR is newer than a deliberately rolled-back stable release:** Verify the
+rollback tag and package contents. If the published package has a nonzero
+`epoch` that the rollback tag does not contain, do not re-dispatch the old tag:
+release metadata comes from the immutable tag, so default-branch edits cannot
+change that run. Instead, prepare a forward-numbered stable release containing
+the reverted code, add the matching `epoch=` assignment to
+`dist/aur/PKGBUILD`, run `cargo generate installers` to regenerate
+`dist/aur/.SRCINFO`, review both files, merge, and cut a new release tag. The
+freshness check remains red until that tag is published. Never use
+`allow_downgrade` to cross an epoch boundary. For a rollback within the same
+epoch, run the manual Pub AUR
+Package workflow once with `dry_run: true` to validate metadata generation and
+the target side of the version guard, then run it with `dry_run: false` and
+`allow_downgrade: true`. The non-dry-run guard additionally compares the fresh
+AUR clone. That override exists only on manual dispatch; the reusable interface
+does not declare the input and therefore cannot request it. Never use it to
+bypass malformed AUR metadata or an unexplained version mismatch.
+
+**Publishing stopped because package files differ at the same version:** The
+publisher intentionally refuses to replace different files at an existing
+`epoch:pkgver-pkgrel` tuple. Inspect the diff. An authorized AUR maintainer must
+either restore the canonical PKGBUILD and `.SRCINFO` generated from that release
+tag, or merge a corrected source change and ship it under a new stable release
+tag. Editing the default branch and re-dispatching the old tag cannot work,
+because the publisher reads metadata from the immutable tag.
+
+**Publishing reports a non-numeric or otherwise malformed current AUR
+version:** The automated publisher intentionally fails closed, and
+`allow_downgrade` cannot bypass malformed metadata. An authorized AUR maintainer
+must repair the package with a manual AUR push to a well-formed
+`epoch:pkgver-pkgrel`, verify it through the AUR RPC, and then re-dispatch the
+normal publisher. Do not weaken the guard to make malformed published state
+comparable.
 
 ---
 

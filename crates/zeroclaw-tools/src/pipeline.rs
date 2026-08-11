@@ -6,6 +6,8 @@ use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::PipelineConfig;
 
+use crate::tool_search::ToolAccessPolicy;
+
 /// Errors specific to pipeline execution.
 #[derive(Debug, Clone, Serialize, thiserror::Error)]
 pub enum PipelineError {
@@ -68,15 +70,27 @@ pub struct PipelineTool {
     config: PipelineConfig,
     tools: Vec<Arc<dyn Tool>>,
     allowed_set: HashSet<String>,
+    access_policy: Option<ToolAccessPolicy>,
 }
 
 impl PipelineTool {
+    pub const NAME: &'static str = "execute_pipeline";
+
     pub fn new(config: PipelineConfig, tools: Vec<Arc<dyn Tool>>) -> Self {
+        Self::with_access_policy(config, tools, None)
+    }
+
+    pub fn with_access_policy(
+        config: PipelineConfig,
+        tools: Vec<Arc<dyn Tool>>,
+        access_policy: Option<ToolAccessPolicy>,
+    ) -> Self {
         let allowed_set: HashSet<String> = config.allowed_tools.iter().cloned().collect();
         Self {
             config,
             tools,
             allowed_set,
+            access_policy,
         }
     }
 
@@ -88,15 +102,37 @@ impl PipelineTool {
             .map(|t| t.as_ref())
     }
 
+    fn policy_allows_exact_name(&self, name: &str) -> bool {
+        let Some(policy) = self.access_policy.as_ref() else {
+            return true;
+        };
+        let denied = policy
+            .denied
+            .as_ref()
+            .is_some_and(|tools| tools.iter().any(|tool| tool == name));
+        let allowed = policy
+            .allowed
+            .as_ref()
+            .is_none_or(|tools| tools.iter().any(|tool| tool == name));
+        let caller_allowed = policy
+            .caller_allowed
+            .as_ref()
+            .is_none_or(|tools| tools.iter().any(|tool| tool == name));
+        !denied && allowed && caller_allowed
+    }
+
     /// Validate the pipeline request before execution.
     fn validate(&self, request: &PipelineRequest) -> std::result::Result<(), PipelineError> {
         if request.steps.len() > self.config.max_steps {
             return Err(PipelineError::TooManySteps(self.config.max_steps));
         }
 
-        // Check all tools are on the allowlist before executing any.
+        // Validate the full request before any sequential or parallel step starts.
         for step in &request.steps {
-            if !self.allowed_set.contains(&step.tool) {
+            let globally_allowed = self.allowed_set.contains(&step.tool);
+            let caller_allowed = self.policy_allows_exact_name(&step.tool);
+            let child_exists = self.find_tool(&step.tool).is_some();
+            if !globally_allowed || !caller_allowed || !child_exists {
                 return Err(PipelineError::UnknownTool(step.tool.clone()));
             }
         }
@@ -221,7 +257,7 @@ impl PipelineTool {
 #[async_trait]
 impl Tool for PipelineTool {
     fn name(&self) -> &str {
-        "execute_pipeline"
+        Self::NAME
     }
 
     fn description(&self) -> &str {
@@ -584,7 +620,19 @@ mod tests {
             max_steps: 20,
             allowed_tools: vec!["shell".to_string(), "file_read".to_string()],
         };
-        let tool = PipelineTool::new(config, vec![]);
+        let tool = PipelineTool::new(
+            config,
+            vec![
+                Arc::new(EchoTool {
+                    name: "shell".into(),
+                    output: String::new(),
+                }),
+                Arc::new(EchoTool {
+                    name: "file_read".into(),
+                    output: String::new(),
+                }),
+            ],
+        );
 
         let request = PipelineRequest {
             steps: vec![
@@ -620,6 +668,141 @@ mod tests {
         };
 
         assert!(tool.validate(&request).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_step_denied_by_agent_policy() {
+        let config = PipelineConfig {
+            enabled: true,
+            max_steps: 20,
+            allowed_tools: vec!["shell".to_string(), "file_read".to_string()],
+        };
+        let policy = ToolAccessPolicy {
+            allowed: Some(vec![
+                "file_read".to_string(),
+                PipelineTool::NAME.to_string(),
+            ]),
+            ..ToolAccessPolicy::default()
+        };
+        let tool = PipelineTool::with_access_policy(
+            config,
+            vec![Arc::new(EchoTool {
+                name: "shell".into(),
+                output: String::new(),
+            })],
+            Some(policy),
+        );
+        let request = PipelineRequest {
+            steps: vec![PipelineStep {
+                tool: "shell".into(),
+                args: serde_json::json!({}),
+            }],
+            parallel: false,
+            result: PipelineResultMode::default(),
+        };
+
+        let err = tool.validate(&request).unwrap_err();
+        assert!(matches!(err, PipelineError::UnknownTool(ref name) if name == "shell"));
+    }
+
+    #[test]
+    fn validate_allows_intersection_of_pipeline_and_agent_policy() {
+        let config = PipelineConfig {
+            enabled: true,
+            max_steps: 20,
+            allowed_tools: vec!["shell".to_string(), "file_read".to_string()],
+        };
+        let policy = ToolAccessPolicy {
+            allowed: Some(vec![
+                "file_read".to_string(),
+                PipelineTool::NAME.to_string(),
+            ]),
+            ..ToolAccessPolicy::default()
+        };
+        let tool = PipelineTool::with_access_policy(
+            config,
+            vec![Arc::new(EchoTool {
+                name: "file_read".into(),
+                output: String::new(),
+            })],
+            Some(policy),
+        );
+        let request = PipelineRequest {
+            steps: vec![PipelineStep {
+                tool: "file_read".into(),
+                args: serde_json::json!({}),
+            }],
+            parallel: false,
+            result: PipelineResultMode::default(),
+        };
+
+        assert!(tool.validate(&request).is_ok());
+    }
+
+    #[test]
+    fn validate_uses_exact_names_for_every_policy_ceiling() {
+        let config = PipelineConfig {
+            enabled: true,
+            max_steps: 20,
+            allowed_tools: vec!["shell".to_string(), "plugin__danger".to_string()],
+        };
+        let cases = [
+            (
+                "namespaced plugin is not MCP-auto-admitted",
+                "plugin__danger",
+                ToolAccessPolicy {
+                    allowed: Some(vec![PipelineTool::NAME.to_string()]),
+                    ..ToolAccessPolicy::default()
+                },
+            ),
+            (
+                "denylist wins",
+                "shell",
+                ToolAccessPolicy {
+                    denied: Some(vec!["shell".to_string()]),
+                    ..ToolAccessPolicy::default()
+                },
+            ),
+            (
+                "caller allowlist narrows",
+                "shell",
+                ToolAccessPolicy {
+                    caller_allowed: Some(vec![PipelineTool::NAME.to_string()]),
+                    ..ToolAccessPolicy::default()
+                },
+            ),
+            (
+                "explicit empty allowlist denies all",
+                "shell",
+                ToolAccessPolicy {
+                    allowed: Some(Vec::new()),
+                    ..ToolAccessPolicy::default()
+                },
+            ),
+        ];
+
+        for (case, step, policy) in cases {
+            let tool = PipelineTool::with_access_policy(
+                config.clone(),
+                vec![Arc::new(EchoTool {
+                    name: step.to_string(),
+                    output: String::new(),
+                })],
+                Some(policy),
+            );
+            let request = PipelineRequest {
+                steps: vec![PipelineStep {
+                    tool: step.to_string(),
+                    args: serde_json::json!({}),
+                }],
+                parallel: false,
+                result: PipelineResultMode::default(),
+            };
+            assert!(
+                matches!(tool.validate(&request), Err(PipelineError::UnknownTool(_))),
+                "{case}"
+            );
+        }
     }
 
     // ── Template resolution ────────────────────────────────

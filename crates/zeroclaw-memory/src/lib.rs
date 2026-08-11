@@ -1757,11 +1757,9 @@ if [ "${{1:-}}" = "store" ]; then
   printf 'store-start:%s\n' "${{2:-}}" >> "{}"
   case "${{2:-}}" in
     fast_store:*)
-      sleep 0.1
       printf 'fast-store-complete\n' >> "{}"
       ;;
     slow_store:*)
-      sleep 1.2
       printf 'slow-store-complete\n' >> "{}"
       ;;
   esac
@@ -1769,7 +1767,6 @@ if [ "${{1:-}}" = "store" ]; then
 fi
 if [ "${{1:-}}" = "context" ]; then
   printf 'context-start\n' >> "{}"
-  sleep 1.0
   printf 'context-complete\n' >> "{}"
   cat <<'EOF'
 <lucid-context>
@@ -1824,18 +1821,25 @@ backend = "lucid.selected"
 
 [storage.lucid.selected]
 binary_path = "{selected_cmd}"
-recall_timeout_ms = 200
-store_timeout_ms = 500
+recall_timeout_ms = 10000
+store_timeout_ms = 20000
 
 [storage.lucid.decoy]
 binary_path = "{decoy_cmd}"
-recall_timeout_ms = 900
-store_timeout_ms = 900
+recall_timeout_ms = 30000
+store_timeout_ms = 40000
 "#
         );
         let mut config: Config = toml::from_str(&raw).expect("parse Lucid aliases");
         config.data_dir = tmp.path().to_path_buf();
         config.validate().expect("Lucid aliases must validate");
+
+        let local = SqliteMemory::new("sqlite", tmp.path()).unwrap();
+        let configured = build_lucid_memory(tmp.path(), local, config.resolve_active_storage());
+        let (lucid_cmd, recall_timeout, store_timeout) = configured.test_process_config();
+        assert_eq!(lucid_cmd, selected_cmd);
+        assert_eq!(recall_timeout, std::time::Duration::from_secs(10));
+        assert_eq!(store_timeout, std::time::Duration::from_secs(20));
 
         let memory =
             create_memory_from_config(&config, None).expect("build Lucid memory from parsed alias");
@@ -1860,14 +1864,13 @@ store_timeout_ms = 900
             .unwrap();
         let entries = memory.recall("factory", 5, None, None, None).await.unwrap();
 
-        tokio::time::sleep(std::time::Duration::from_millis(1_300)).await;
         let selected_calls = fs::read_to_string(&selected_log).unwrap_or_default();
         assert!(selected_calls.contains("store-start:fast_store:"));
         assert!(selected_calls.contains("fast-store-complete"));
         assert!(selected_calls.contains("store-start:slow_store:"));
-        assert!(!selected_calls.contains("slow-store-complete"));
+        assert!(selected_calls.contains("slow-store-complete"));
         assert!(selected_calls.contains("context-start"));
-        assert!(!selected_calls.contains("context-complete"));
+        assert!(selected_calls.contains("context-complete"));
         assert!(!decoy_log.exists(), "unselected Lucid alias was invoked");
         assert!(
             entries
@@ -1877,7 +1880,7 @@ store_timeout_ms = 900
         assert!(
             entries
                 .iter()
-                .all(|entry| !entry.content.contains("Factory-selected remote result"))
+                .any(|entry| entry.content.contains("Factory-selected remote result"))
         );
     }
 
@@ -1898,13 +1901,13 @@ backend = "lucid.selected"
 
 [storage.lucid.selected]
 binary_path = "{selected_cmd}"
-recall_timeout_ms = 200
-store_timeout_ms = 500
+recall_timeout_ms = 10000
+store_timeout_ms = 20000
 
 [storage.lucid.decoy]
 binary_path = "{decoy_cmd}"
-recall_timeout_ms = 900
-store_timeout_ms = 900
+recall_timeout_ms = 30000
+store_timeout_ms = 40000
 "#
         );
         let mut config: Config = toml::from_str(&raw).expect("parse Lucid aliases");

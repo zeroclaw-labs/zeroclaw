@@ -53,6 +53,7 @@ futures-util = { version = "0.3", default-features = false, features = ["sink"] 
 # Serialization
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
+socket2 = "0.6"
 
 # Error handling
 anyhow = "1.0"
@@ -85,6 +86,10 @@ rand = "0.10"
 rcgen = "0.13"
 tempfile = "3.26"
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
+# Real WebSocket client used to drive the `/acp` route end-to-end in
+# acp::tests (front-door proof for the gateway ACP surface). A plain
+# non-TLS loopback connection needs only the `connect` feature, no TLS.
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect"] }
 wiremock = "0.6"
 
 [features]
@@ -102,7 +107,6 @@ channel-email = ["zeroclaw-channels/channel-email"]
 channel-linq = ["zeroclaw-channels/channel-linq"]
 channel-nextcloud = ["zeroclaw-channels/channel-nextcloud"]
 channel-nostr = ["zeroclaw-channels/channel-nostr"]
-channel-wati = ["zeroclaw-channels/channel-wati"]
 channel-wechat = ["zeroclaw-channels/channel-wechat"]
 channel-whatsapp-cloud = ["zeroclaw-channels/channel-whatsapp-cloud"]
 whatsapp-web = ["zeroclaw-channels/whatsapp-web"]

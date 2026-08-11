@@ -153,6 +153,9 @@ pub struct GitChannel {
     /// accessors. The provider remains the source of truth; this is a
     /// memo of the value it returned.
     identity: parking_lot::Mutex<Option<SelfIdentity>>,
+    /// Senders already warned about falling outside the peer allowlist, so the
+    /// WARN fires once per sender per process instead of once per event.
+    warned_unauthorized: parking_lot::Mutex<HashSet<String>>,
     /// Last draft-edit instant per comment id (throttle).
     draft_edits: parking_lot::Mutex<HashMap<String, Instant>>,
 }
@@ -171,6 +174,7 @@ impl GitChannel {
             provider,
             identity: parking_lot::Mutex::new(None),
             draft_edits: parking_lot::Mutex::new(HashMap::new()),
+            warned_unauthorized: parking_lot::Mutex::new(HashSet::new()),
         })
     }
 
@@ -188,6 +192,7 @@ impl GitChannel {
             provider,
             identity: parking_lot::Mutex::new(None),
             draft_edits: parking_lot::Mutex::new(HashMap::new()),
+            warned_unauthorized: parking_lot::Mutex::new(HashSet::new()),
         }
     }
 
@@ -375,12 +380,27 @@ impl GitChannel {
             return true;
         };
         if !self.is_user_allowed(&msg.sender) {
-            ::zeroclaw_log::record!(
-                DEBUG,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"sender": msg.sender})),
-                "ignoring git event from unauthorized user"
-            );
+            // First drop for a sender is a WARN: with an empty or misconfigured
+            // allowlist this branch eats every event (including `sop`-routed PR
+            // lifecycle events), and at DEBUG the operator sees "routed to SOP
+            // ingress" followed by nothing. Repeats stay DEBUG so a busy public
+            // repo cannot turn this into log spam.
+            if self.warned_unauthorized.lock().insert(msg.sender.clone()) {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"sender": msg.sender})),
+                    "git channel dropping events from sender outside the peer \
+                     allowlist (repeats for this sender log at DEBUG)"
+                );
+            } else {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"sender": msg.sender})),
+                    "ignoring git event from unauthorized user"
+                );
+            }
             return true;
         }
         tx.send(msg).await.is_ok()
@@ -449,6 +469,22 @@ impl Channel for GitChannel {
             );
         }
         let plan = TransportPlan::from_routes(&self.cfg.events);
+
+        // Fail loudly on the one misconfiguration that silently disables the
+        // whole channel: an empty resolved peer allowlist drops EVERY inbound
+        // event — peer checks apply to `sop` routes too — and the only trace
+        // was a DEBUG line per event. Resolved once here for the diagnostic;
+        // per-event checks still resolve live.
+        if (self.peer_resolver)().is_empty() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"alias": self.alias})),
+                "git channel peer allowlist resolves to EMPTY: every inbound event \
+                 will be dropped; add a [peer_groups.<name>] with channel = \"git\" \
+                 (or \"git.<alias>\") and external_peers ([\"*\"] accepts any author)"
+            );
+        }
 
         ::zeroclaw_log::record!(
             INFO,

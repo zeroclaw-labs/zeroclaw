@@ -26,9 +26,14 @@ on:
         required: false
         default: true
         type: boolean
+      allow_downgrade:
+        description: "Explicitly allow a manual rollback to an older AUR package version"
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
-  group: aur-publish-${{ github.run_id }}
+  group: aur-publish-${{ github.repository }}-${{ inputs.dry_run }}
   cancel-in-progress: false
 
 permissions:
@@ -38,13 +43,29 @@ jobs:
   publish-aur:
     name: Update AUR Package
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
       RELEASE_TAG: ${{ inputs.release_tag }}
       DRY_RUN: ${{ inputs.dry_run }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Check out publisher automation
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
+
+      - name: Validate release tag input
+        shell: bash
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::release_tag must be vX.Y.Z format."
+            exit 1
+          fi
+
+      - name: Check out release package metadata
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: refs/tags/${{ inputs.release_tag }}
+          path: release-source
 
       - name: Validate and compute metadata
         id: meta
@@ -52,14 +73,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::release_tag must be vX.Y.Z format."
-            exit 1
-          fi
-
           version="${RELEASE_TAG#v}"
-          tarball_url="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${RELEASE_TAG}.tar.gz"
-          tarball_sha="$(curl -fsSL "$tarball_url" | sha256sum | awk '{print $1}')"
+          tarball_url="https://github.com/zeroclaw-labs/zeroclaw/archive/refs/tags/${RELEASE_TAG}.tar.gz"
+          tarball_sha="$(curl --connect-timeout 15 --max-time 120 -fsSL "$tarball_url" | sha256sum | awk '{print $1}')"
 
           if [[ -z "$tarball_sha" ]]; then
             echo "::error::Could not compute SHA256 for source tarball."
@@ -91,14 +107,16 @@ jobs:
           pkgbuild_file="$(mktemp)"
           sed -e "s/^pkgver=.*/pkgver=${VERSION}/" \
               -e "s/^sha256sums=.*/sha256sums=('${TARBALL_SHA}')/" \
-              dist/aur/PKGBUILD > "$pkgbuild_file"
+              release-source/dist/aur/PKGBUILD > "$pkgbuild_file"
 
           echo "pkgbuild_file=$pkgbuild_file" >> "$GITHUB_OUTPUT"
 
-          echo "### Generated PKGBUILD" >> "$GITHUB_STEP_SUMMARY"
-          echo '```bash' >> "$GITHUB_STEP_SUMMARY"
-          cat "$pkgbuild_file" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### Generated PKGBUILD"
+            echo '```bash'
+            cat "$pkgbuild_file"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Generate .SRCINFO
         id: srcinfo
@@ -114,14 +132,59 @@ jobs:
               -e "s/sha256sums = .*/sha256sums = ${TARBALL_SHA}/" \
               -e "s|zeroclawlabs-[0-9.]*.tar.gz|zeroclawlabs-${VERSION}.tar.gz|g" \
               -e "s|/v[0-9.]*\.tar\.gz|/v${VERSION}.tar.gz|g" \
-              dist/aur/.SRCINFO > "$srcinfo_file"
+              release-source/dist/aur/.SRCINFO > "$srcinfo_file"
 
           echo "srcinfo_file=$srcinfo_file" >> "$GITHUB_OUTPUT"
 
-      - name: Push to AUR
-        if: inputs.dry_run == false
+      - name: Validate generated AUR metadata
         shell: bash
         env:
+          PKGBUILD_FILE: ${{ steps.pkgbuild.outputs.pkgbuild_file }}
+          SRCINFO_FILE: ${{ steps.srcinfo.outputs.srcinfo_file }}
+          TARBALL_SHA: ${{ steps.meta.outputs.tarball_sha }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          if ! bash -n "$PKGBUILD_FILE"; then
+            echo "::error::Generated PKGBUILD is not valid Bash syntax."
+            exit 2
+          fi
+
+          require_exact_line() {
+            local file="$1"
+            local expected="$2"
+            local label="$3"
+            local count
+            count="$(grep -Fxc -- "$expected" "$file" || true)"
+            if [[ "$count" != 1 ]]; then
+              echo "::error::Generated ${label} must contain exactly one canonical line; found ${count}."
+              exit 2
+            fi
+          }
+
+          expected_pkgbuild_source="source=(\"\${pkgname}-\${pkgver}.tar.gz::https://github.com/zeroclaw-labs/zeroclaw/archive/refs/tags/v\${pkgver}.tar.gz\")"
+          expected_pkgbuild_sha="sha256sums=('${TARBALL_SHA}')"
+          printf -v expected_srcinfo_source '\tsource = zeroclawlabs-%s.tar.gz::https://github.com/zeroclaw-labs/zeroclaw/archive/refs/tags/v%s.tar.gz' "$VERSION" "$VERSION"
+          printf -v expected_srcinfo_sha '\tsha256sums = %s' "$TARBALL_SHA"
+
+          require_exact_line "$PKGBUILD_FILE" "$expected_pkgbuild_source" "PKGBUILD source"
+          require_exact_line "$PKGBUILD_FILE" "$expected_pkgbuild_sha" "PKGBUILD checksum"
+          require_exact_line "$SRCINFO_FILE" "$expected_srcinfo_source" ".SRCINFO source"
+          require_exact_line "$SRCINFO_FILE" "$expected_srcinfo_sha" ".SRCINFO checksum"
+
+          bash scripts/release/aur_version_guard.sh \
+            "$SRCINFO_FILE" "$SRCINFO_FILE" \
+            "$PKGBUILD_FILE" "$PKGBUILD_FILE"
+
+      - name: Push to AUR
+        if: inputs.dry_run == false
+        timeout-minutes: 12
+        shell: bash
+        env:
+          # Safety comes from workflow_call not declaring allow_downgrade; the
+          # architecture test pins that reusable interface closed.
+          ALLOW_DOWNGRADE: ${{ inputs.allow_downgrade || false }}
           AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
           PKGBUILD_FILE: ${{ steps.pkgbuild.outputs.pkgbuild_file }}
           SRCINFO_FILE: ${{ steps.srcinfo.outputs.srcinfo_file }}
@@ -145,6 +208,9 @@ jobs:
             IdentityFile ~/.ssh/aur
             User aur
             StrictHostKeyChecking accept-new
+            ConnectTimeout 30
+            ServerAliveInterval 15
+            ServerAliveCountMax 2
           SSH_CONFIG
           chmod 600 ~/.ssh/config
 
@@ -153,27 +219,100 @@ jobs:
           ssh-keygen -l -f ~/.ssh/aur || { echo "::error::AUR_SSH_KEY is not a valid SSH private key"; exit 1; }
           echo "::endgroup::"
 
-          # Test SSH connectivity before attempting clone — fail fast with actionable error
-          if ! ssh -T -o BatchMode=yes -o ConnectTimeout=10 aur@aur.archlinux.org 2>&1 | grep -qi "authenticated"; then
-            echo "::warning::SSH connectivity test did not confirm authentication."
-            echo "::warning::Ensure the AUR_SSH_KEY public key is registered at https://aur.archlinux.org/account (SSH Keys tab) for the account that owns the zeroclaw package."
-          fi
+          work_root="$(mktemp -d)"
+          trap 'rm -rf "$work_root"' EXIT
 
-          tmp_dir="$(mktemp -d)"
-          git clone ssh://aur@aur.archlinux.org/zeroclawlabs.git "$tmp_dir/aur"
+          # aur.archlinux.org takes scheduled maintenance windows, and a window
+          # that overlaps a release used to drop that release from the AUR
+          # permanently: the job did one unretried clone, failed, and nothing
+          # re-checked afterwards. Retry the whole clone-to-push unit rather
+          # than the clone alone, so a retry always rebases onto whatever the
+          # AUR currently has instead of pushing a stale tree.
+          #
+          # Every step is guarded with `|| return 1`: `set -e` is suppressed
+          # inside a function invoked from an `if` condition, so an unguarded
+          # failure here would fall through to the next command.
+          publish_attempt() {
+            local attempt="$1"
+            local work_dir="${work_root}/attempt-${attempt}"
 
-          cp "$PKGBUILD_FILE" "$tmp_dir/aur/PKGBUILD"
-          cp "$SRCINFO_FILE" "$tmp_dir/aur/.SRCINFO"
+            # A successful clone is the authoritative authentication check. AUR's
+            # `ssh -T` response is not a stable machine-readable success contract.
+            git clone --quiet ssh://aur@aur.archlinux.org/zeroclawlabs.git "$work_dir" || return 1
 
-          cd "$tmp_dir/aur"
-          git config user.name "zeroclaw-bot"
-          git config user.email "bot@zeroclaw.dev"
-          git add PKGBUILD .SRCINFO
-          git diff --cached --quiet && { echo "No changes to push."; exit 0; }
-          git commit -m "zeroclawlabs ${VERSION}"
-          git push origin HEAD
+            # The clone is the only authoritative view of the AUR at this attempt.
+            # Reject a delayed older workflow before it can overwrite a newer
+            # package. Guard failures are permanent for this run, not transient
+            # AUR failures, so the caller must not retry them.
+            guard_command=(bash "$GITHUB_WORKSPACE/scripts/release/aur_version_guard.sh")
+            if [[ "$ALLOW_DOWNGRADE" == "true" ]]; then
+              guard_command+=(--allow-downgrade)
+            fi
+            guard_command+=( \
+              "$SRCINFO_FILE" "$work_dir/.SRCINFO" \
+              "$PKGBUILD_FILE" "$work_dir/PKGBUILD" \
+            )
+            "${guard_command[@]}" || return $?
 
-          echo "AUR package updated to ${VERSION}"
+            cp "$PKGBUILD_FILE" "$work_dir/PKGBUILD" || return 1
+            cp "$SRCINFO_FILE" "$work_dir/.SRCINFO" || return 1
+
+            git -C "$work_dir" config user.name "zeroclaw-bot" || return 1
+            git -C "$work_dir" config user.email "bot@zeroclaw.dev" || return 1
+            git -C "$work_dir" add PKGBUILD .SRCINFO || return 1
+
+            if git -C "$work_dir" diff --cached --quiet; then
+              echo "No changes to push; the AUR is already at ${VERSION}."
+              return 0
+            fi
+
+            git -C "$work_dir" commit --quiet -m "zeroclawlabs ${VERSION}" || return 1
+            git -C "$work_dir" push --quiet origin HEAD || return 1
+
+            echo "AUR package updated to ${VERSION}"
+          }
+
+          max_attempts=5
+          delay=30
+
+          for attempt in $(seq 1 "$max_attempts"); do
+            if publish_attempt "$attempt"; then
+              exit 0
+            else
+              attempt_status=$?
+            fi
+
+            case "$attempt_status" in
+              1)
+                ;;
+              2)
+                echo "::error::AUR publish stopped because package metadata is missing, malformed, or inconsistent. Repair the named files; malformed published metadata requires an authorized manual AUR push."
+                exit 1
+                ;;
+              3)
+                echo "::error::AUR publish stopped to prevent a downgrade. Release metadata is pinned to the immutable tag: if the published epoch exceeds this tag's epoch, preserve that epoch in source and cut a new release tag; never use allow_downgrade across epochs. Otherwise verify the rollback before using a manual non-dry-run dispatch with allow_downgrade: true."
+                exit 1
+                ;;
+              4)
+                echo "::error::AUR publish stopped because package files changed without a version-tuple change. The release tag is immutable: an authorized AUR maintainer must restore the canonical tagged files, or a corrected source change must ship under a new release tag."
+                exit 1
+                ;;
+              *)
+                echo "::error::AUR version guard failed with unexpected status ${attempt_status}; refusing to classify it as a retryable AUR outage."
+                exit 1
+                ;;
+            esac
+
+            if (( attempt < max_attempts )); then
+              echo "::warning::AUR publish attempt ${attempt}/${max_attempts} failed; retrying in ${delay}s."
+              sleep "$delay"
+              delay=$(( delay * 2 ))
+            fi
+          done
+
+          echo "::error::AUR publish failed after ${max_attempts} attempts."
+          echo "::error::If the log above shows 'The AUR is down due to maintenance', this is an upstream outage rather than a credential problem: re-dispatch Pub AUR Package at ${RELEASE_TAG} once aur.archlinux.org is reachable."
+          exit 1
 
       - name: Summary
         shell: bash

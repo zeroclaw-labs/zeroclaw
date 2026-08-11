@@ -9,6 +9,7 @@ use crate::tools::{Tool, ToolOutput, ToolResult};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
+use zeroclaw_api::agent::TurnEvent;
 use zeroclaw_config::schema::{AliasedAgentConfig, MemoryConfig};
 use zeroclaw_memory::{self, Memory};
 
@@ -1469,12 +1470,10 @@ fn native_dispatcher_converts_tool_results_to_tool_messages() {
     assert_eq!(messages.len(), 2);
     assert_eq!(messages[0].role, "tool");
     assert_eq!(messages[1].role, "tool");
-    assert!(messages[0].content.contains("[IMAGE:"));
-    assert!(
-        messages[0]
-            .content
-            .contains(&image_path.display().to_string())
-    );
+    let payload: serde_json::Value = serde_json::from_str(&messages[0].content).unwrap();
+    let content = payload["content"].as_str().unwrap();
+    assert!(content.contains("[IMAGE:"));
+    assert!(content.contains(&image_path.display().to_string()));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1556,5 +1555,89 @@ async fn run_single_delegates_to_turn() {
     assert!(
         !response.is_empty(),
         "Expected non-empty response from run_single"
+    );
+}
+
+#[tokio::test]
+async fn turn_history_has_exact_one_user_one_assistant() {
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![text_response(
+        "hello back",
+    )]));
+    let mut agent = build_agent_with(
+        model_provider,
+        vec![Box::new(EchoTool)],
+        Box::new(NativeToolDispatcher),
+    );
+
+    let _ = agent.turn("hi").await.unwrap();
+    let history = agent.history();
+
+    // First turn: system + user + assistant = 3
+    assert_eq!(
+        history.len(),
+        3,
+        "single-exchange turn should produce system + user + assistant, got {}: {history:?}",
+        history.len()
+    );
+
+    let roles: Vec<&str> = history
+        .iter()
+        .filter_map(|m| match m {
+            ConversationMessage::Chat(c) => Some(c.role.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        roles,
+        vec!["system", "user", "assistant"],
+        "history role sequence"
+    );
+
+    // No duplicate user messages
+    let user_count = roles.iter().filter(|&&r| r == "user").count();
+    assert_eq!(user_count, 1, "exactly one user message, no duplicates");
+}
+
+#[tokio::test]
+async fn turn_streamed_history_no_duplicate_user_message() {
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![text_response(
+        "streamed back",
+    )]));
+    let mut agent = build_agent_with(
+        model_provider,
+        vec![Box::new(EchoTool)],
+        Box::new(NativeToolDispatcher),
+    );
+
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+    let (_response, new_msgs) = agent.turn_streamed("hi", event_tx, None).await.unwrap();
+    // Drain events
+    while event_rx.try_recv().is_ok() {}
+
+    // Returned messages: exactly one user and one assistant.
+    let returned_user_count = new_msgs
+        .iter()
+        .filter(|m| matches!(m, ConversationMessage::Chat(c) if c.role == "user"))
+        .count();
+    assert_eq!(
+        returned_user_count, 1,
+        "returned new_msgs must have exactly one user, got {returned_user_count}: {new_msgs:?}"
+    );
+    assert!(
+        new_msgs
+            .iter()
+            .any(|m| matches!(m, ConversationMessage::Chat(c) if c.role == "assistant")),
+        "returned new_msgs must include an assistant: {new_msgs:?}"
+    );
+
+    // Durable history: exactly one user message (no duplicates).
+    let history = agent.history();
+    let history_user_count = history
+        .iter()
+        .filter(|m| matches!(m, ConversationMessage::Chat(c) if c.role == "user"))
+        .count();
+    assert_eq!(
+        history_user_count, 1,
+        "exactly one user message after turn_streamed, got {history_user_count}: {history:?}"
     );
 }

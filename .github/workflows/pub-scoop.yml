@@ -12,9 +12,15 @@ on:
         required: false
         default: false
         type: boolean
+      credential_canary:
+        description: "Require bucket credentials and exercise push authorization"
+        required: false
+        default: false
+        type: boolean
     secrets:
       SCOOP_BUCKET_TOKEN:
-        required: false
+        description: "Fine-grained token with Contents write on the Scoop bucket"
+        required: true
   workflow_dispatch:
     inputs:
       release_tag:
@@ -25,6 +31,11 @@ on:
         description: "Generate manifest only (no push)"
         required: false
         default: true
+        type: boolean
+      credential_canary:
+        description: "Require bucket credentials and exercise push authorization"
+        required: false
+        default: false
         type: boolean
 
 concurrency:
@@ -41,40 +52,48 @@ jobs:
     env:
       RELEASE_TAG: ${{ inputs.release_tag }}
       DRY_RUN: ${{ inputs.dry_run }}
+      CREDENTIAL_CANARY: ${{ inputs.credential_canary }}
       SCOOP_BUCKET_REPO: ${{ vars.SCOOP_BUCKET_REPO }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
 
-      - name: Validate Scoop publish access
-        if: inputs.dry_run == false
+      - name: Validate Scoop publish configuration
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}
+          GIT_TERMINAL_PROMPT: "0"
         run: |
           set -euo pipefail
 
-          if [[ -z "${SCOOP_BUCKET_REPO:-}" ]]; then
-            echo "::error::Repository variable SCOOP_BUCKET_REPO is required when dry_run=false."
+          gate_result="$(bash scripts/release/scoop_credential_gate.sh)"
+          if [[ "$gate_result" == "skip" ]]; then
+            exit 0
+          fi
+          if [[ "$gate_result" != "probe" ]]; then
+            echo "::error::Unexpected Scoop credential gate result."
             exit 1
           fi
-          if [[ -z "${GH_TOKEN:-}" ]]; then
-            echo "::error::Repository secret SCOOP_BUCKET_TOKEN is required when dry_run=false."
+
+          # A credential canary and every configured publish or dry run exercise
+          # the same authorization path. The gate above only permits a missing
+          # credential for a generic standalone dry run.
+          probe_dir="$(mktemp -d)"
+          trap 'rm -rf "$probe_dir"' EXIT
+          gh auth setup-git
+          git clone --depth=1 "https://github.com/${SCOOP_BUCKET_REPO}.git" "$probe_dir/bucket"
+
+          # Exercise GitHub's receive-pack authorization without changing the
+          # bucket. REST repository metadata is not an authoritative push test
+          # for every token type.
+          if ! git -C "$probe_dir/bucket" push --dry-run origin HEAD; then
+            echo "::error::SCOOP_BUCKET_TOKEN cannot push to ${SCOOP_BUCKET_REPO}."
+            echo "::error::Use a fine-grained token scoped to this repository with Contents: Read and write."
             exit 1
           fi
-          if [[ "$SCOOP_BUCKET_REPO" != */* ]]; then
-            echo "::error::SCOOP_BUCKET_REPO must be in owner/repo format."
-            exit 1
-          fi
-          if ! gh api "repos/${SCOOP_BUCKET_REPO}" >/dev/null 2>&1; then
-            echo "::error::SCOOP_BUCKET_TOKEN cannot access ${SCOOP_BUCKET_REPO}."
-            exit 1
-          fi
-          if ! gh api "repos/${SCOOP_BUCKET_REPO}" --jq '.permissions.push' 2>/dev/null | grep -q true; then
-            echo "::error::SCOOP_BUCKET_TOKEN cannot prove push access to ${SCOOP_BUCKET_REPO}. Update the token or SCOOP_BUCKET_REPO before running a non-dry-run release."
-            exit 1
-          fi
+
+          echo "SCOOP_BUCKET_TOKEN can push to ${SCOOP_BUCKET_REPO}."
 
       - name: Validate and compute metadata
         id: meta
@@ -88,12 +107,17 @@ jobs:
           fi
 
           version="${RELEASE_TAG#v}"
-          zip_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/zeroclaw-x86_64-pc-windows-msvc.zip"
-          sums_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/SHA256SUMS"
+          if ! metadata="$(bash scripts/release/scoop_metadata.sh dist/scoop/zeroclaw.json "$version")"; then
+            echo "::error::could not derive Scoop release metadata from the canonical manifest"
+            exit 1
+          fi
+          zip_url="$(jq -er '.zip_url' <<<"$metadata")"
+          asset_name="$(jq -er '.asset_name' <<<"$metadata")"
+          sums_url="$(jq -er '.sums_url' <<<"$metadata")"
 
-          sha256="$(curl -fsSL "$sums_url" | grep 'zeroclaw-x86_64-pc-windows-msvc.zip' | awk '{print $1}')"
+          sha256="$(curl -fsSL "$sums_url" | awk -v asset="$asset_name" '$2 == asset {print $1}')"
 
-          if [[ -z "$sha256" ]]; then
+          if [[ ! "$sha256" =~ ^[0-9a-f]{64}$ ]]; then
             echo "::error::Could not find Windows binary hash in SHA256SUMS for ${RELEASE_TAG}."
             exit 1
           fi
@@ -122,38 +146,27 @@ jobs:
           set -euo pipefail
 
           manifest_file="$(mktemp)"
-          cat > "$manifest_file" <<MANIFEST
-          {
-              "version": "${VERSION}",
-              "description": "Zero overhead. Zero compromise. 100% Rust. The fastest, smallest AI assistant.",
-              "homepage": "https://github.com/zeroclaw-labs/zeroclaw",
-              "license": "MIT|Apache-2.0",
-              "architecture": {
-                  "64bit": {
-                      "url": "${ZIP_URL}",
-                      "hash": "${SHA256}",
-                      "bin": ["zeroclaw.exe", "zerocode.exe"]
-                  }
-              },
-              "checkver": {
-                  "github": "https://github.com/zeroclaw-labs/zeroclaw"
-              },
-              "autoupdate": {
-                  "architecture": {
-                      "64bit": {
-                          "url": "https://github.com/zeroclaw-labs/zeroclaw/releases/download/v\$version/zeroclaw-x86_64-pc-windows-msvc.zip"
-                      }
-                  },
-                  "hash": {
-                      "url": "https://github.com/zeroclaw-labs/zeroclaw/releases/download/v\$version/SHA256SUMS",
-                      "regex": "([a-f0-9]{64})\\\\s+zeroclaw-x86_64-pc-windows-msvc\\\\.zip"
-                  }
-              }
-          }
-          MANIFEST
+          jq \
+            --arg version "$VERSION" \
+            --arg url "$ZIP_URL" \
+            --arg hash "$SHA256" \
+            '
+              .version = $version
+              | .architecture["64bit"].url = $url
+              | .architecture["64bit"].hash = $hash
+            ' \
+            dist/scoop/zeroclaw.json > "$manifest_file"
 
-          jq '.' "$manifest_file" > "${manifest_file}.formatted"
-          mv "${manifest_file}.formatted" "$manifest_file"
+          jq -e \
+            --arg version "$VERSION" \
+            --arg url "$ZIP_URL" \
+            --arg hash "$SHA256" \
+            '
+              .version == $version
+              and .architecture["64bit"].url == $url
+              and .architecture["64bit"].hash == $hash
+            ' \
+            "$manifest_file" >/dev/null
 
           echo "manifest_file=$manifest_file" >> "$GITHUB_OUTPUT"
 
@@ -168,6 +181,7 @@ jobs:
         if: inputs.dry_run == false
         shell: bash
         env:
+          GIT_TERMINAL_PROMPT: "0"
           GH_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}
           MANIFEST_FILE: ${{ steps.manifest.outputs.manifest_file }}
           VERSION: ${{ steps.meta.outputs.version }}
@@ -179,8 +193,12 @@ jobs:
             exit 1
           fi
 
+          # Push access was already proven by the authoritative probe in
+          # "Validate Scoop publish configuration" earlier in this job.
           tmp_dir="$(mktemp -d)"
-          gh repo clone "${SCOOP_BUCKET_REPO}" "$tmp_dir/bucket" -- --depth=1
+          trap 'rm -rf "$tmp_dir"' EXIT
+          gh auth setup-git
+          git clone --depth=1 "https://github.com/${SCOOP_BUCKET_REPO}.git" "$tmp_dir/bucket"
 
           mkdir -p "$tmp_dir/bucket/bucket"
           cp "$MANIFEST_FILE" "$tmp_dir/bucket/bucket/zeroclaw.json"
@@ -189,8 +207,11 @@ jobs:
           git config user.name "zeroclaw-bot"
           git config user.email "bot@zeroclaw.dev"
           git add bucket/zeroclaw.json
+          git diff --cached --quiet && {
+            echo "Scoop manifest is already at ${VERSION}."
+            exit 0
+          }
           git commit -m "zeroclaw ${VERSION}"
-          gh auth setup-git
           git push origin HEAD
 
           echo "Scoop manifest updated to ${VERSION}"

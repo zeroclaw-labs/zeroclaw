@@ -43,6 +43,7 @@ impl SkillDocument {
         write_optional(&mut out, "version", self.frontmatter.version.as_deref());
         write_optional(&mut out, "category", self.frontmatter.category.as_deref());
         write_tags(&mut out, &self.frontmatter.tags);
+        write_bool(&mut out, "always", self.frontmatter.always);
         write_slash_options(&mut out, &self.frontmatter.slash_options);
         out.push_str("---\n");
         if !self.body.is_empty() {
@@ -103,7 +104,13 @@ fn parse_frontmatter(src: &str) -> Result<SkillFrontmatter, DocumentParseError> 
             continue;
         }
         if let Some((ref key, ref mut parts)) = multiline {
-            if line.starts_with(' ') || line.starts_with('\t') {
+            // A blank/whitespace-only line is a paragraph break *inside* the
+            // block scalar, not a terminator — keep collecting. Only a
+            // non-indented, non-empty line (a real next key) ends the scalar.
+            // Mirrors `parse_simple_frontmatter` in skills/mod.rs so service
+            // read/write cannot truncate multi-paragraph descriptions the
+            // agent loader still sees.
+            if line.starts_with(' ') || line.starts_with('\t') || line.trim().is_empty() {
                 parts.push(line.trim().to_string());
                 continue;
             }
@@ -177,6 +184,7 @@ fn assign(fm: &mut SkillFrontmatter, key: &str, value: &str) {
         "author" => fm.author = Some(value.to_string()),
         "version" => fm.version = Some(value.to_string()),
         "category" => fm.category = Some(value.to_string()),
+        "always" => fm.always = value.eq_ignore_ascii_case("true"),
         _ => {}
     }
 }
@@ -216,6 +224,14 @@ fn write_tags(out: &mut String, tags: &[String]) {
         return;
     }
     let _ = writeln!(out, "tags: [{}]", tags.join(", "));
+}
+
+/// Serialize a bool flag, omitted when `false` (the default) so an
+/// `always`-less skill round-trips byte-identical.
+fn write_bool(out: &mut String, key: &str, value: bool) {
+    if value {
+        let _ = writeln!(out, "{key}: true");
+    }
 }
 
 fn indent_of(line: &str) -> usize {
@@ -485,6 +501,41 @@ mod tests {
     }
 
     #[test]
+    fn parses_block_scalar_description_keeps_blank_line_paragraph_break() {
+        // A blank line is a paragraph break *inside* a YAML block scalar, not a
+        // terminator. SkillDocument must match the runtime loader here so
+        // service edits cannot shrink multi-paragraph descriptions.
+        let content = "---\nname: x\ndescription: >-\n  para one\n\n  para two\n---\n# Body\n";
+        let doc = SkillDocument::parse(content).unwrap();
+        assert!(
+            doc.frontmatter.description.contains("para one"),
+            "first paragraph missing: {:?}",
+            doc.frontmatter.description
+        );
+        assert!(
+            doc.frontmatter.description.contains("para two"),
+            "second paragraph after blank line was truncated: {:?}",
+            doc.frontmatter.description
+        );
+        assert_eq!(doc.frontmatter.name, "x");
+        assert_eq!(doc.body.trim(), "# Body");
+    }
+
+    #[test]
+    fn block_scalar_description_round_trips_across_blank_paragraph() {
+        let content = "---\nname: x\ndescription: >-\n  para one\n\n  para two\n---\nbody\n";
+        let doc = SkillDocument::parse(content).unwrap();
+        let serialized = doc.serialize();
+        let again = SkillDocument::parse(&serialized).unwrap();
+        assert!(
+            again.frontmatter.description.contains("para one")
+                && again.frontmatter.description.contains("para two"),
+            "round-trip lost paragraph: {:?}",
+            again.frontmatter.description
+        );
+    }
+
+    #[test]
     fn parses_optional_flat_fields() {
         let content = "---\nname: x\ndescription: y\nlicense: MIT\nauthor: alice\nversion: 0.1.0\ncategory: coding\n---\n";
         let doc = SkillDocument::parse(content).unwrap();
@@ -548,11 +599,36 @@ mod tests {
                 version: Some("0.2.0".into()),
                 category: Some("coding".into()),
                 tags: vec!["slash".into(), "ops".into()],
+                always: false,
                 slash_options: Vec::new(),
             },
             body: "# Code Review\n\nReviews diffs.\n".into(),
         };
         let parsed = SkillDocument::parse(&original.serialize()).unwrap();
+        assert_eq!(parsed.frontmatter, original.frontmatter);
+    }
+
+    #[test]
+    fn round_trips_always_true_flag() {
+        let original = SkillDocument {
+            frontmatter: SkillFrontmatter {
+                name: "security-policy".into(),
+                description: "Critical safety rules the agent must never skip.".into(),
+                always: true,
+                ..Default::default()
+            },
+            body: "# Security Policy\n\nNever skip the safety review.\n".into(),
+        };
+        let serialized = original.serialize();
+        assert!(
+            serialized.contains("always: true"),
+            "serialize() must emit the always flag when true:\n{serialized}"
+        );
+        let parsed = SkillDocument::parse(&serialized).unwrap();
+        assert!(
+            parsed.frontmatter.always,
+            "always: true must survive the serialize -> parse round-trip"
+        );
         assert_eq!(parsed.frontmatter, original.frontmatter);
     }
 

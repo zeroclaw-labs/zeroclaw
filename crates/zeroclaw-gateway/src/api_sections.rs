@@ -857,6 +857,11 @@ pub async fn handle_section_select(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "default".to_string());
 
+    // Held through the swap at the end of this handler so a concurrent
+    // config writer can't land between this read and the save below.
+    let _cfg_guard = std::sync::Arc::clone(&state.config_write_lock)
+        .lock_owned()
+        .await;
     let mut working = state.config.read().clone();
 
     use zeroclaw_config::sections::Section;
@@ -1083,6 +1088,115 @@ pub async fn handle_section_select(
 mod tests {
     use super::*;
 
+    const DEV_CONFIG_TEMPLATE: &str = include_str!("../../../dev/config.template.toml");
+    const DEV_HARNESS_TEMPLATE: &str = include_str!("../../../dev/config.harness-test.toml");
+
+    fn parse_dev_template(raw: &str, name: &str) -> zeroclaw_config::schema::Config {
+        toml::from_str(raw).unwrap_or_else(|err| panic!("{name} must parse as schema V3: {err}"))
+    }
+
+    fn assert_common_dev_template_contract(cfg: &zeroclaw_config::schema::Config) {
+        assert_eq!(cfg.schema_version, 3);
+
+        let provider = cfg
+            .providers
+            .models
+            .ollama
+            .get("default")
+            .expect("Ollama default provider must exist");
+        assert_eq!(provider.base.model.as_deref(), Some("llama3.2"));
+        assert_eq!(
+            provider.base.uri.as_deref(),
+            Some("http://host.docker.internal:11434")
+        );
+        assert_eq!(provider.base.api_key, None);
+        assert_eq!(provider.base.temperature, Some(0.7));
+
+        let agent = cfg.agents.get("default").expect("default agent must exist");
+        assert!(agent.enabled);
+        assert_eq!(agent.model_provider.as_str(), "ollama.default");
+        assert_eq!(agent.risk_profile.as_str(), "default");
+        assert_eq!(agent.runtime_profile.as_str(), "default");
+        assert_eq!(
+            cfg.agent_workspace_dir("default"),
+            std::path::PathBuf::from("/zeroclaw-data/workspace")
+        );
+
+        let risk = cfg
+            .risk_profiles
+            .get("default")
+            .expect("default risk profile must exist");
+        assert_eq!(
+            risk.level,
+            zeroclaw_config::autonomy::AutonomyLevel::Supervised
+        );
+        assert!(cfg.runtime_profile_for_agent("default").is_some());
+
+        let status = derive_section_status(cfg);
+        assert!(!status.needs_quickstart, "missing: {:?}", status.missing);
+        assert_eq!(status.reason, "has_dispatchable_agent");
+
+        assert_eq!(cfg.gateway.port, 42617);
+        assert_eq!(cfg.gateway.host, "[::]");
+        assert!(cfg.gateway.allow_public_bind);
+        assert!(!cfg.gateway.require_pairing);
+    }
+
+    #[test]
+    fn dev_config_template_preserves_dispatch_contract() {
+        let cfg = parse_dev_template(DEV_CONFIG_TEMPLATE, "dev/config.template.toml");
+        assert_common_dev_template_contract(&cfg);
+
+        assert_eq!(
+            cfg.gateway.web_dist_dir.as_deref(),
+            Some("/usr/share/zeroclawlabs/web/dist")
+        );
+        assert!(!cfg.cost.enabled);
+        assert_eq!(cfg.cost.daily_limit_usd, 10.0);
+        assert_eq!(cfg.cost.monthly_limit_usd, 100.0);
+        assert_eq!(cfg.cost.warn_at_percent, 80);
+        assert!(!cfg.cost.allow_override);
+    }
+
+    #[test]
+    fn dev_harness_template_preserves_runtime_contract() {
+        let cfg = parse_dev_template(DEV_HARNESS_TEMPLATE, "dev/config.harness-test.toml");
+        assert_common_dev_template_contract(&cfg);
+
+        let runtime = cfg
+            .runtime_profile_for_agent("default")
+            .expect("harness agent must resolve its runtime profile");
+        assert_eq!(runtime.max_tool_iterations, 50);
+        assert_eq!(runtime.max_tool_result_chars, Some(50_000));
+        assert_eq!(runtime.max_context_tokens, Some(32_000));
+        assert!(!runtime.context_compression.enabled);
+        assert_eq!(runtime.context_compression.tool_result_retrim_chars, 2_000);
+        assert_eq!(
+            cfg.risk_profiles["default"].auto_approve,
+            [
+                "file_read",
+                "file_write",
+                "file_edit",
+                "memory_recall",
+                "memory_store",
+                "web_search_tool",
+                "web_fetch",
+                "calculator",
+                "glob_search",
+                "content_search",
+                "image_info",
+                "git_operations",
+            ]
+        );
+
+        assert_eq!(cfg.memory.backend, "sqlite");
+        assert!(cfg.memory.auto_save);
+        assert!(cfg.memory.hygiene_enabled);
+        assert_eq!(cfg.memory.archive_after_days, 7);
+        assert_eq!(cfg.memory.purge_after_days, 30);
+        assert_eq!(cfg.memory.embedding_provider, "none");
+    }
+
     #[test]
     fn build_agent_options_returns_every_configured_alias() {
         let mut cfg = zeroclaw_config::schema::Config::default();
@@ -1261,6 +1375,7 @@ mod tests {
             std::sync::Arc::new(zeroclaw_memory::NoneMemory::new("none"));
         AppState {
             config: std::sync::Arc::new(parking_lot::RwLock::new(config)),
+            config_write_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             model_provider: std::sync::Arc::new(crate::UnconfiguredModelProvider),
             model: "test-model".to_string(),
             temperature: None,
@@ -1297,8 +1412,6 @@ mod tests {
             nextcloud_talk: std::collections::HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk_webhook_secret: std::collections::HashMap::new(),
-            #[cfg(feature = "channel-wati")]
-            wati: std::collections::HashMap::new(),
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: std::sync::Arc::new(zeroclaw_runtime::observability::NoopObserver),
@@ -1310,6 +1423,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: std::sync::Arc::new(crate::nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: crate::nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,

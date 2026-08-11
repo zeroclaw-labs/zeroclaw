@@ -4,8 +4,13 @@ fluent = "run --release -p xtask --bin fluent --"
 web = "run --release -p xtask --bin web --"
 generate = "run --release -p xtask --bin generate --"
 
+# Keep the docs-site theme in `xtask::mdbook::refs::build_api`, not here:
+# `[build] rustdocflags` also reaches `cargo test --doc` and can duplicate
+# `--default-theme` under Rust 1.96+. Warning denial stays here so repository
+# `cargo doc` / `cargo test --doc` invocations that do not set `RUSTDOCFLAGS`
+# fail on rustdoc warnings (Cargo replaces config flags when the env is set).
 [build]
-rustdocflags = ["--default-theme=ayu"]
+rustdocflags = ["-D", "warnings"]
 
 [target.x86_64-unknown-linux-musl]
 rustflags = ["-C", "link-arg=-static"]

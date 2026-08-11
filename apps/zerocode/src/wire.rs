@@ -7,6 +7,16 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+// ── Initialize shapes ───────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommandDescriptor {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub aliases: Vec<String>,
+}
+
 // ── Doctor result shapes ────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -38,6 +48,11 @@ pub struct DoctorSummary {
 pub struct DoctorRunResult {
     pub results: Vec<DoctorResultEntry>,
     pub summary: DoctorSummary,
+    /// Resolved active log persistence path from the daemon, if available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timed_out_phase: Option<String>,
 }
 
 #[cfg(test)]
