@@ -81,6 +81,9 @@ jobs:
       - name: Test translation release submodule handling
         run: scripts/release/refresh-translations.test.sh
 
+      - name: Test monthly outdated result classification
+        run: bash scripts/ci/monthly_outdated_result.test.sh
+
       - name: Guard release attestation contract
         run: python3 scripts/ci/release_attestation_contract_test.py
 

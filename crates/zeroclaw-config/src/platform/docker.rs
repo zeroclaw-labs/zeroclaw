@@ -1,5 +1,6 @@
 use crate::schema::DockerRuntimeConfig;
 use anyhow::{Context, Result};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use zeroclaw_api::runtime_traits::RuntimeAdapter;
 
@@ -80,6 +81,75 @@ impl DockerRuntime {
 
         Ok(resolved)
     }
+
+    fn build_shell_command_inner(
+        &self,
+        command: &str,
+        workspace_dir: &Path,
+        env_keys: &[&OsStr],
+    ) -> anyhow::Result<tokio::process::Command> {
+        let mut process = tokio::process::Command::new("docker");
+        process
+            .arg("run")
+            .arg("--rm")
+            .arg("--init")
+            .arg("--interactive");
+
+        let network = self.config.network.trim();
+        if !network.is_empty() {
+            process.arg("--network").arg(network);
+        }
+
+        if let Some(memory_limit_mb) = self.config.memory_limit_mb.filter(|mb| *mb > 0) {
+            process.arg("--memory").arg(format!("{memory_limit_mb}m"));
+        }
+
+        if let Some(cpu_limit) = self.config.cpu_limit.filter(|cpus| *cpus > 0.0) {
+            process.arg("--cpus").arg(cpu_limit.to_string());
+        }
+
+        if self.config.read_only_rootfs {
+            process.arg("--read-only");
+        }
+
+        for key in env_keys {
+            let key = docker_env_key(key)?;
+            process.arg("--env").arg(key);
+        }
+
+        if self.config.mount_workspace {
+            let host_workspace = self.workspace_mount_path(workspace_dir).with_context(|| {
+                format!(
+                    "Failed to validate workspace mount path {}",
+                    workspace_dir.display()
+                )
+            })?;
+
+            process
+                .arg("--volume")
+                .arg(format!("{}:/workspace:rw", host_workspace.display()))
+                .arg("--workdir")
+                .arg("/workspace");
+        }
+
+        process
+            .arg(self.config.image.trim())
+            .arg("sh")
+            .arg("-c")
+            .arg(command);
+
+        Ok(process)
+    }
+}
+
+fn docker_env_key(key: &OsStr) -> Result<&str> {
+    let key = key
+        .to_str()
+        .context("Docker runtime environment passthrough key must be valid UTF-8")?;
+    if key.is_empty() || key.contains('=') {
+        anyhow::bail!("Docker runtime environment passthrough key must be a variable name");
+    }
+    Ok(key)
 }
 
 impl RuntimeAdapter for DockerRuntime {
@@ -118,52 +188,16 @@ impl RuntimeAdapter for DockerRuntime {
         command: &str,
         workspace_dir: &Path,
     ) -> anyhow::Result<tokio::process::Command> {
-        let mut process = tokio::process::Command::new("docker");
-        process
-            .arg("run")
-            .arg("--rm")
-            .arg("--init")
-            .arg("--interactive");
+        self.build_shell_command_inner(command, workspace_dir, &[])
+    }
 
-        let network = self.config.network.trim();
-        if !network.is_empty() {
-            process.arg("--network").arg(network);
-        }
-
-        if let Some(memory_limit_mb) = self.config.memory_limit_mb.filter(|mb| *mb > 0) {
-            process.arg("--memory").arg(format!("{memory_limit_mb}m"));
-        }
-
-        if let Some(cpu_limit) = self.config.cpu_limit.filter(|cpus| *cpus > 0.0) {
-            process.arg("--cpus").arg(cpu_limit.to_string());
-        }
-
-        if self.config.read_only_rootfs {
-            process.arg("--read-only");
-        }
-
-        if self.config.mount_workspace {
-            let host_workspace = self.workspace_mount_path(workspace_dir).with_context(|| {
-                format!(
-                    "Failed to validate workspace mount path {}",
-                    workspace_dir.display()
-                )
-            })?;
-
-            process
-                .arg("--volume")
-                .arg(format!("{}:/workspace:rw", host_workspace.display()))
-                .arg("--workdir")
-                .arg("/workspace");
-        }
-
-        process
-            .arg(self.config.image.trim())
-            .arg("sh")
-            .arg("-c")
-            .arg(command);
-
-        Ok(process)
+    fn build_shell_command_with_env_keys(
+        &self,
+        command: &str,
+        workspace_dir: &Path,
+        env_keys: &[&OsStr],
+    ) -> anyhow::Result<tokio::process::Command> {
+        self.build_shell_command_inner(command, workspace_dir, env_keys)
     }
 }
 
@@ -213,6 +247,53 @@ mod tests {
         assert!(debug.contains("1.5"));
         assert!(debug.contains("--workdir"));
         assert!(debug.contains("echo hello"));
+    }
+
+    #[test]
+    fn docker_build_shell_command_forwards_env_keys_without_values() {
+        let cfg = DockerRuntimeConfig {
+            image: "alpine:3.20".into(),
+            mount_workspace: false,
+            ..DockerRuntimeConfig::default()
+        };
+        let runtime = DockerRuntime::new(cfg);
+        let secret_value = "secret-value-should-not-appear-in-docker-args";
+
+        let command = runtime
+            .build_shell_command_with_env_keys(
+                "printf '%s' \"$ZC_CLI_TOKEN\"",
+                &std::env::temp_dir(),
+                &[
+                    std::ffi::OsStr::new("ZC_CLI_TOKEN"),
+                    std::ffi::OsStr::new("OPENAI_API_KEY"),
+                ],
+            )
+            .unwrap();
+        let debug = format!("{command:?}");
+
+        assert!(debug.contains("--env"));
+        assert!(debug.contains("ZC_CLI_TOKEN"));
+        assert!(debug.contains("OPENAI_API_KEY"));
+        assert!(!debug.contains("ZC_CLI_TOKEN="));
+        assert!(!debug.contains("OPENAI_API_KEY="));
+        assert!(!debug.contains(secret_value));
+    }
+
+    #[test]
+    fn docker_build_shell_command_rejects_env_key_values() {
+        let runtime = DockerRuntime::new(DockerRuntimeConfig {
+            mount_workspace: false,
+            ..DockerRuntimeConfig::default()
+        });
+
+        let result = runtime.build_shell_command_with_env_keys(
+            "echo hello",
+            &std::env::temp_dir(),
+            &[std::ffi::OsStr::new("ZC_CLI_TOKEN=secret")],
+        );
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("variable name"));
     }
 
     #[test]
