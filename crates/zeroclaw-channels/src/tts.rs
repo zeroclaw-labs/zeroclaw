@@ -451,7 +451,11 @@ fn graceful_kill(child: &mut tokio::process::Child) {
 /// thread, so under thread exhaustion a cancelled synthesis can occupy the
 /// dropping task for up to [`EDGE_TTS_REAP_GRACE`] instead of parking the reap
 /// off-worker. This is the accepted tradeoff for the exceptional no-thread
-/// case; the normal spawn-success path never blocks a worker.
+/// case; the normal spawn-success path never blocks a worker. On every reaper
+/// path the artifact is removed only after child exit is confirmed; if the
+/// hard kill fails, status observation errors, or the child never confirms an
+/// exit within the bound, the reaper gives up without unlinking rather than
+/// racing the delete against a possibly-live child.
 struct EdgeTtsTempArtifact {
     path: PathBuf,
     child: Option<tokio::process::Child>,
@@ -539,43 +543,91 @@ impl Drop for EdgeTtsTempArtifact {
 /// Synchronous-only ([`tokio::process::Child::try_wait`] /
 /// [`tokio::process::Child::start_kill`]) so it needs no runtime context.
 ///
-/// The reap-before-delete contract is not relaxed on the hard-escalation path:
-/// `remove_file` runs only once `try_wait` reports the child as exited after a
-/// successful `start_kill`. A still-terminating child can retain the output
-/// handle on Windows and make the unlink fail, leaving exactly the artifact
-/// this cleanup is meant to remove, so the reaper stays responsible until the
-/// exit is confirmed rather than deleting on a fixed timer.
+/// The reap-before-delete contract is not relaxed on any path: `remove_file`
+/// runs only once `try_wait` reports the child as exited. A still-terminating
+/// child can retain the output handle on Windows and make the unlink fail,
+/// leaving exactly the artifact this cleanup is meant to remove, so the reaper
+/// stays responsible until the exit is confirmed rather than deleting on a
+/// fixed timer.
+///
+/// The whole sequence is bounded by one absolute deadline (`grace` from the
+/// call), so the inline thread-spawn-failure fallback in `Drop` blocks the
+/// dropping thread for at most `grace` total. A small confirmation budget is
+/// reserved at the tail of that window for the hard kill to be observed. If
+/// the kill request fails, `try_wait` keeps erroring, or the child never
+/// confirms an exit before the deadline, the reaper gives up WITHOUT removing
+/// the file: a status-observation error does not establish that the child
+/// exited, so unlinking on it would reintroduce the delete-before-exit race.
 fn reap_and_remove(mut child: tokio::process::Child, path: PathBuf, grace: std::time::Duration) {
-    let grace_started = std::time::Instant::now();
+    reap_and_remove_with(&path, grace, |op| match op {
+        ReapOp::Observe => child.try_wait(),
+        ReapOp::Kill => child
+            .start_kill()
+            .map(|()| None::<std::process::ExitStatus>),
+    });
+}
+
+/// What the reaper is asking the seam to do on the child.
+enum ReapOp {
+    /// Report child status (`Ok(Some)` = exited).
+    Observe,
+    /// Request a hard kill.
+    Kill,
+}
+
+/// Bounded reap-and-remove body with a deterministic failure seam.
+///
+/// `op` performs the requested [`ReapOp`] and returns child status; the
+/// production wrapper closes over the [`tokio::process::Child`], while tests
+/// inject a closure that forces kill or wait failures without a real child.
+///
+/// Only an `Ok(Some)` observation removes the file. A kill request failure, a
+/// `try_wait` error, or a child that never confirms an exit before the
+/// `grace` deadline leaves the artifact in place (fail-closed) and returns.
+fn reap_and_remove_with(
+    path: &std::path::Path,
+    grace: std::time::Duration,
+    mut op: impl FnMut(ReapOp) -> std::io::Result<Option<std::process::ExitStatus>>,
+) {
+    // One absolute deadline bounds the graceful window AND the post-hard-kill
+    // confirmation, so neither the detached reaper thread nor the inline
+    // `Drop` fallback can live forever.
+    let deadline = std::time::Instant::now() + grace;
+    // Reserve a small confirmation budget at the tail of the window so a hard
+    // kill has time to be observed before the deadline expires. When `grace`
+    // is smaller than the budget (tests pass 150 ms), the budget shrinks to
+    // fit and the hard kill is requested immediately.
+    let confirm_budget = std::time::Duration::from_millis(250).min(grace);
+    let mut hard_killed = false;
     loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if std::time::Instant::now() - grace_started < grace => {
-                std::thread::sleep(std::time::Duration::from_millis(50));
+        match op(ReapOp::Observe) {
+            Ok(Some(_)) => {
+                // Exit confirmed: safe to unlink.
+                let _ = std::fs::remove_file(path);
+                return;
             }
-            // Grace expired (or an unrecoverable wait error): hard kill and
-            // stay responsible until exit is confirmed.
-            _ => {
-                let _ = child.start_kill();
-                // Once start_kill succeeded, keep waiting until try_wait
-                // confirms the child exited before touching the file. A wait
-                // error here means the child can no longer report a status at
-                // all (already gone or reapable by nothing further), so
-                // deleting is safe.
-                loop {
-                    match child.try_wait() {
-                        Ok(Some(_)) => break,
-                        Ok(None) => {
-                            std::thread::sleep(std::time::Duration::from_millis(50));
-                        }
-                        Err(_) => break,
-                    }
+            Ok(None) | Err(_) => {
+                // `Err` gets the same escalation as an unconfirmed running
+                // child: a status-observation error does not establish exit,
+                // so a kill is still attempted, but the file is never removed
+                // without an `Ok(Some)` confirmation.
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if !hard_killed && remaining <= confirm_budget {
+                    let _ = op(ReapOp::Kill);
+                    hard_killed = true;
                 }
-                break;
+                if remaining.is_zero() {
+                    // Bounded: exit was never confirmed before the deadline
+                    // (kill failed, wait kept erroring, or a child that
+                    // refuses to die). Drop the child — `kill_on_drop` still
+                    // requests a final kill — and leave the file in place
+                    // rather than racing the unlink against a live child.
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
             }
         }
     }
-    let _ = std::fs::remove_file(&path);
 }
 
 impl EdgeTtsProvider {
@@ -705,15 +757,19 @@ impl TtsProvider for EdgeTtsProvider {
                 Ok(Err(err)) => {
                     reader.abort();
                     let _ = reader.await;
-                    let _ = child.kill().await;
-                    let _ = child.wait().await;
+                    // Bound the kill-and-wait by the same absolute provider
+                    // deadline used above, so a child that ignores the kill
+                    // cannot hold `synthesize` past the provider timeout; the
+                    // artifact guard's `Drop` still owns the final reap.
+                    let _ = tokio::time::timeout_at(deadline, child.kill()).await;
+                    let _ = tokio::time::timeout_at(deadline, child.wait()).await;
                     return Err(err).context("Failed to wait for edge-tts subprocess");
                 }
                 Err(_elapsed) => {
                     reader.abort();
                     let _ = reader.await;
-                    let _ = child.kill().await;
-                    let _ = child.wait().await;
+                    let _ = tokio::time::timeout_at(deadline, child.kill()).await;
+                    let _ = tokio::time::timeout_at(deadline, child.wait()).await;
                     bail!("Edge TTS subprocess timed out");
                 }
             }
@@ -2016,6 +2072,64 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&script_path);
+    }
+
+    #[test]
+    fn edge_tts_reaper_is_bounded_and_preserves_artifact_when_kill_fails() {
+        // The hard kill fails (start_kill errors) and the child never exits,
+        // so try_wait keeps returning Ok(None). The reaper must stay bounded
+        // by the grace deadline instead of looping forever, and must NOT
+        // remove the artifact: exit was never confirmed, so unlinking on that
+        // branch would reintroduce the delete-before-exit race.
+        let temp_dir = std::env::temp_dir();
+        let artifact_path =
+            temp_dir.join(format!("zeroclaw_edgetts_out_{}.mp3", uuid::Uuid::new_v4()));
+        std::fs::write(&artifact_path, b"stub").unwrap();
+
+        let grace = std::time::Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        reap_and_remove_with(&artifact_path, grace, |op| match op {
+            ReapOp::Observe => Ok(None),
+            ReapOp::Kill => Err(std::io::Error::other("hard kill failed")),
+        });
+        assert!(
+            started.elapsed() < grace * 2,
+            "the reaper must be bounded even when the hard kill fails"
+        );
+        assert!(
+            artifact_path.exists(),
+            "a failed hard kill must not remove the artifact without a confirmed exit"
+        );
+
+        let _ = std::fs::remove_file(&artifact_path);
+    }
+
+    #[test]
+    fn edge_tts_reaper_is_bounded_and_preserves_artifact_when_wait_errors() {
+        // try_wait keeps erroring, which does not establish that the child
+        // exited. The reaper must remain bounded and must not treat the error
+        // as permission to remove the artifact.
+        let temp_dir = std::env::temp_dir();
+        let artifact_path =
+            temp_dir.join(format!("zeroclaw_edgetts_out_{}.mp3", uuid::Uuid::new_v4()));
+        std::fs::write(&artifact_path, b"stub").unwrap();
+
+        let grace = std::time::Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        reap_and_remove_with(&artifact_path, grace, |op| match op {
+            ReapOp::Observe => Err(std::io::Error::other("status observation failed")),
+            ReapOp::Kill => Ok(None),
+        });
+        assert!(
+            started.elapsed() < grace * 2,
+            "the reaper must be bounded even when status observation errors"
+        );
+        assert!(
+            artifact_path.exists(),
+            "a wait error must not remove the artifact without a confirmed exit"
+        );
+
+        let _ = std::fs::remove_file(&artifact_path);
     }
 
     #[cfg(unix)]
