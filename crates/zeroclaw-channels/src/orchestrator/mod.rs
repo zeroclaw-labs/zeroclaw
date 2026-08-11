@@ -27554,12 +27554,12 @@ This is an example JSON object for profile settings."#;
 
     #[tokio::test]
     async fn media_pipeline_does_not_resolve_capabilities_for_audio_only_message() {
-        // Regression for the 2026-08-08 review (fnd-001 zero-overhead): an
-        // audio-only channel message must never invoke the catalog-backed
-        // capability resolve. Before the fix, phase 2 warmed the effective
-        // provider whenever ANY attachment existed; it now resolves only when
-        // an IMAGE attachment is present. The cataloged leaf records resolve
-        // calls, so an unexpected resolve is directly observable.
+        // Zero-overhead invariant: an audio-only channel message must never
+        // invoke the catalog-backed capability resolve. Phase 2 resolves the
+        // effective provider only when an IMAGE attachment is present; a
+        // transcript-only turn does not wait on a catalog-backed request. The
+        // cataloged leaf records resolve calls, so an unexpected resolve is
+        // directly observable.
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -27642,14 +27642,13 @@ This is an example JSON object for profile settings."#;
 
     #[tokio::test]
     async fn media_pipeline_does_not_resolve_capabilities_when_describe_images_disabled() {
-        // Regression for the 2026-08-09 review: phase 2 resolved the effective
-        // provider's catalog metadata for ANY image attachment even when the
-        // operator disabled image description (`media_pipeline.describe_images
-        // = false`). No image marker or capability decision is produced in
-        // that configuration, so the resolve is an avoidable external request
-        // and latency regression on an explicitly disabled feature. The
-        // phase-2 guard now includes `describe_images`; the cataloged leaf
-        // records resolve calls, so an unexpected resolve is observable.
+        // Explicitly disabled image description must not incur the catalog
+        // resolve: when `media_pipeline.describe_images = false`, no image
+        // marker or capability decision is produced, so resolving the catalog
+        // would be an avoidable external request and latency regression on an
+        // explicitly disabled feature. Phase 2 therefore gates the resolve on
+        // `describe_images`; the cataloged leaf records resolve calls, so an
+        // unexpected resolve is observable.
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -27732,15 +27731,14 @@ This is an example JSON object for profile settings."#;
 
     #[tokio::test]
     async fn media_transcription_feeds_route_classification_before_route_selection() {
-        // Regression for the 2026-08-05 review, production-shaped per the
-        // 2026-08-08 follow-up: the media pipeline's transcription phase is
-        // route-independent and must run BEFORE route classification. A routing
-        // keyword that appears only in an audio transcript must drive route
-        // selection through the REAL `process_channel_message` path — not by
-        // manually calling `process_route_independent` and the classifier. The
-        // transcript is produced by a wiremock-backed local_whisper provider
-        // (the production typed-provider registration path), and the matched
-        // route's provider is what receives the turn.
+        // The media pipeline's transcription phase is route-independent and
+        // must run BEFORE route classification. A routing keyword that appears
+        // only in an audio transcript must drive route selection through the
+        // real `process_channel_message` path — not by manually calling
+        // `process_route_independent` and the classifier. The transcript is
+        // produced by a wiremock-backed local_whisper provider (the production
+        // typed-provider registration path), and the matched route's provider
+        // is what receives the turn.
 
         // 1. Mock transcription endpoint (local_whisper wire format).
         let transcribe_server = wiremock::MockServer::start().await;
