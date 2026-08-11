@@ -42,7 +42,6 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "channel.signal",
     "channel.slack",
     "channel.telegram",
-    "channel.wati",
     "channel.wechat",
     "channel.whatsapp",
     "tool.browser",
@@ -122,6 +121,11 @@ pub struct Config {
     /// section is impossible to miss.
     #[serde(skip)]
     pub degraded_sections: Vec<String>,
+    /// Retired WATI config section roots detected before migration and typed
+    /// deserialization erase them. Never serialized; the CLI surfaces each
+    /// path on stderr so an operator cannot miss the retired channel.
+    #[serde(skip)]
+    pub retired_wati_config_sections: Vec<String>,
     /// Config file schema version.
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
@@ -13185,10 +13189,6 @@ pub struct ChannelsConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub linq: HashMap<String, LinqConfig>,
-    /// WATI WhatsApp Business API channel instances (`[channels.wati.<alias>]`).
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    #[nested]
-    pub wati: HashMap<String, WatiConfig>,
     /// Nextcloud Talk bot channel instances (`[channels.nextcloud_talk.<alias>]`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
@@ -13401,12 +13401,6 @@ impl ChannelsConfig {
                 configured: !self.linq.is_empty(),
             },
             ChannelInfo {
-                kind: "wati",
-                name: "WATI",
-                desc: "WhatsApp via WATI Business API",
-                configured: !self.wati.is_empty(),
-            },
-            ChannelInfo {
                 kind: "nextcloud",
                 name: "NextCloud Talk",
                 desc: "NextCloud Talk platform",
@@ -13575,7 +13569,6 @@ impl ChannelsConfig {
             || self.signal.values().any(|c| c.enabled)
             || self.whatsapp.values().any(|c| c.enabled)
             || self.linq.values().any(|c| c.enabled)
-            || self.wati.values().any(|c| c.enabled)
             || self.nextcloud_talk.values().any(|c| c.enabled)
             || self.email.values().any(|c| c.enabled)
             || self.gmail_push.values().any(|c| c.enabled)
@@ -13610,7 +13603,7 @@ impl ChannelsConfig {
     /// amqp are fan-in listeners; voice_wake is input-only), so a name-addressed
     /// outbound surface such as `heartbeat.target` can refuse them at validation
     /// instead of accepting a target the delivery layer silently drops.
-    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 36] {
+    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 35] {
         [
             ("telegram", !self.telegram.is_empty(), true),
             ("discord", !self.discord.is_empty(), true),
@@ -13622,7 +13615,6 @@ impl ChannelsConfig {
             ("signal", !self.signal.is_empty(), true),
             ("whatsapp", !self.whatsapp.is_empty(), true),
             ("linq", !self.linq.is_empty(), true),
-            ("wati", !self.wati.is_empty(), true),
             ("nextcloud_talk", !self.nextcloud_talk.is_empty(), true),
             ("email", !self.email.is_empty(), true),
             ("gmail_push", !self.gmail_push.is_empty(), true),
@@ -13708,7 +13700,6 @@ impl Default for ChannelsConfig {
             signal: HashMap::new(),
             whatsapp: HashMap::new(),
             linq: HashMap::new(),
-            wati: HashMap::new(),
             nextcloud_talk: HashMap::new(),
             email: HashMap::new(),
             gmail_push: HashMap::new(),
@@ -15055,57 +15046,6 @@ impl ChannelConfig for LinqConfig {
     }
     fn desc() -> &'static str {
         "iMessage/RCS/SMS via Linq API"
-    }
-}
-
-/// WATI WhatsApp Business API channel configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "channels.wati"]
-pub struct WatiConfig {
-    /// Whether this channel is active. The runtime only loads channels whose
-    /// `enabled = true`. Default: `false` so an operator who pastes a partial
-    /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
-    /// live before the rest of its config is filled in.
-    #[tab(Behavior)]
-    #[serde(default)]
-    pub enabled: bool,
-    /// WATI API token (Bearer auth).
-    #[secret]
-    #[tab(Connection)]
-    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
-    pub api_token: String,
-    /// WATI API base URL (default: <https://live-mt-server.wati.io>).
-    #[tab(Advanced)]
-    #[serde(default = "default_wati_api_url")]
-    pub api_url: String,
-    /// Tenant ID for multi-channel setups (optional).
-    #[tab(Advanced)]
-    #[serde(default)]
-    pub tenant_id: Option<String>,
-    /// Per-channel proxy URL (http, https, socks5, socks5h).
-    /// Overrides the global `[proxy]` setting for this channel only.
-    #[tab(Advanced)]
-    #[serde(default)]
-    pub proxy_url: Option<String>,
-
-    /// Tools excluded from this channel's tool spec. When set, these tools
-    /// are not exposed to the model when responding via this channel.
-    #[tab(Behavior)]
-    #[serde(default)]
-    pub excluded_tools: Vec<String>,
-}
-
-fn default_wati_api_url() -> String {
-    "https://live-mt-server.wati.io".to_string()
-}
-
-impl ChannelConfig for WatiConfig {
-    fn name() -> &'static str {
-        "WATI"
-    }
-    fn desc() -> &'static str {
-        "WhatsApp via WATI Business API"
     }
 }
 
@@ -17833,6 +17773,7 @@ impl Default for Config {
             dirty_paths: std::collections::HashSet::new(),
             degraded_security: Vec::new(),
             degraded_sections: Vec::new(),
+            retired_wati_config_sections: Vec::new(),
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers: crate::providers::Providers::default(),
             model_routes: Vec::new(),
@@ -18694,6 +18635,26 @@ impl Config {
             .collect()
     }
 
+    /// Return retired WATI section roots before migration and typed
+    /// deserialization erase them. V1 used `[channels_config.wati]`; V2/V3
+    /// channel aliases use `[channels.wati.<alias>]`.
+    fn retired_wati_config_sections(raw_toml: &str) -> Vec<String> {
+        let raw: toml::Table = match raw_toml.parse() {
+            Ok(t) => t,
+            Err(_) => return Vec::new(),
+        };
+
+        ["channels", "channels_config"]
+            .into_iter()
+            .filter(|root| {
+                raw.get(*root)
+                    .and_then(toml::Value::as_table)
+                    .is_some_and(|channels| channels.contains_key("wati"))
+            })
+            .map(|root| format!("{root}.wati"))
+            .collect()
+    }
+
     /// Return `<kind>.<family>` entries under `[providers]` in `raw_toml`
     /// whose family is not a known typed slot (kinds: models, tts,
     /// transcription). Serde silently drops these sections at deserialize
@@ -18942,6 +18903,24 @@ impl Config {
                 .await
                 .context("Failed to read config file")?;
 
+            let retired_wati_config_sections = Self::retired_wati_config_sections(&contents);
+            for path in &retired_wati_config_sections {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "channel": "wati",
+                            "retired_config": path,
+                        })),
+                    &format!(
+                        "Retired WATI channel config section `{path}` is ignored because WATI \
+                         support was removed. Migrate to `[channels.whatsapp.<alias>]` using \
+                         the Cloud API or WhatsApp Web, then revoke the unused WATI API token."
+                    )
+                );
+            }
+
             // Deserialize the config with the standard TOML parser.
             //
             // Previously this used `serde_ignored::deserialize` for both
@@ -18977,6 +18956,7 @@ impl Config {
             let mut config: Config = salvage.config;
             config.degraded_security = salvage.dropped_security;
             config.degraded_sections = salvage.dropped;
+            config.retired_wati_config_sections = retired_wati_config_sections;
             if let Some(from_version) = stale_version {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -25863,6 +25843,7 @@ auto_save = true
             eval: crate::scattered_types::EvalHarnessConfig::default(),
             degraded_security: Vec::new(),
             degraded_sections: Vec::new(),
+            retired_wati_config_sections: Vec::new(),
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers: {
                 let mut p = crate::providers::Providers::default();
@@ -25968,7 +25949,6 @@ auto_save = true
                 signal: HashMap::new(),
                 whatsapp: HashMap::new(),
                 linq: HashMap::new(),
-                wati: HashMap::new(),
                 nextcloud_talk: HashMap::new(),
                 email: HashMap::new(),
                 gmail_push: HashMap::new(),
@@ -26849,6 +26829,7 @@ default_temperature = 0.7
             eval: crate::scattered_types::EvalHarnessConfig::default(),
             degraded_security: Vec::new(),
             degraded_sections: Vec::new(),
+            retired_wati_config_sections: Vec::new(),
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers,
             model_routes: Vec::new(),
@@ -27713,7 +27694,6 @@ allowed_users = ["@u:matrix.org"]
             signal: HashMap::new(),
             whatsapp: HashMap::new(),
             linq: HashMap::new(),
-            wati: HashMap::new(),
             nextcloud_talk: HashMap::new(),
             email: HashMap::new(),
             gmail_push: HashMap::new(),
@@ -28279,7 +28259,6 @@ allowed_numbers = ["+1", "+2"]
                 },
             )]),
             linq: HashMap::new(),
-            wati: HashMap::new(),
             nextcloud_talk: HashMap::new(),
             email: HashMap::new(),
             gmail_push: HashMap::new(),
@@ -29594,6 +29573,78 @@ default_model = "persisted-profile"
             // SAFETY: test-only, single-threaded test runner.
             unsafe { std::env::remove_var("HOME") };
         }
+        let _ = fs::remove_dir_all(temp_home).await;
+    }
+
+    #[test]
+    #[allow(clippy::large_futures)]
+    async fn load_or_init_warns_for_current_and_legacy_wati_config() {
+        let _env_guard = env_override_lock().await;
+        let temp_home =
+            std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
+        let _home_guard = EnvValueGuard::set("HOME", &temp_home);
+        let _config_guard = EnvValueGuard::remove("ZEROCLAW_CONFIG_DIR");
+        let _data_guard = EnvValueGuard::remove("ZEROCLAW_DATA_DIR");
+
+        let cases = [
+            (
+                "current",
+                r#"schema_version = 3
+
+[channels.wati.production]
+enabled = true
+api_token = "current-placeholder-token"
+"#,
+                "channels.wati",
+                "current-placeholder-token",
+            ),
+            (
+                "legacy",
+                r#"[channels_config.wati]
+enabled = true
+api_token = "legacy-placeholder-token"
+"#,
+                "channels_config.wati",
+                "legacy-placeholder-token",
+            ),
+        ];
+
+        for (case, raw, expected_path, secret_value) in cases {
+            let install = temp_home.join(case);
+            fs::create_dir_all(&install).await.unwrap();
+            fs::write(install.join("config.toml"), raw).await.unwrap();
+            let _workspace_guard = EnvValueGuard::set("ZEROCLAW_WORKSPACE", &install);
+            let mut rx = capture_log_events();
+
+            let config = Box::pin(Config::load_or_init()).await.unwrap();
+            let logs = drain_captured(&mut rx);
+
+            assert!(
+                config
+                    .channels_by_alias()
+                    .iter()
+                    .all(|entry| entry.channel_type != "wati"),
+                "retired WATI config must not re-enable a live channel"
+            );
+            assert_eq!(
+                config.retired_wati_config_sections,
+                vec![expected_path.to_string()],
+                "load-time diagnostics must preserve the retired section path"
+            );
+            assert!(
+                logs.contains("Retired WATI channel config section"),
+                "missing WATI retirement warning for {case}: {logs}"
+            );
+            assert!(
+                logs.contains(expected_path),
+                "warning must name {expected_path}: {logs}"
+            );
+            assert!(
+                !logs.contains(secret_value),
+                "warning must never copy retired WATI credentials into logs: {logs}"
+            );
+        }
+
         let _ = fs::remove_dir_all(temp_home).await;
     }
 
@@ -34862,6 +34913,29 @@ api_key = "op://zeroclaw/provider/openai-api-key"
         let mut tr_slots = crate::providers::TranscriptionProviders::slot_names().to_vec();
         tr_slots.sort_unstable();
         assert_eq!(tr_fields, tr_slots);
+    }
+
+    #[test]
+    async fn retired_wati_config_sections_cover_current_and_legacy_shapes() {
+        assert_eq!(
+            Config::retired_wati_config_sections(
+                "schema_version = 3\n[channels.wati.production]\nenabled = true\n",
+            ),
+            vec!["channels.wati".to_string()]
+        );
+        assert_eq!(
+            Config::retired_wati_config_sections(
+                "[channels_config.wati]\nenabled = true\napi_token = \"placeholder\"\n",
+            ),
+            vec!["channels_config.wati".to_string()]
+        );
+        assert!(
+            Config::retired_wati_config_sections(
+                "schema_version = 3\n[channels.whatsapp.production]\nenabled = true\n",
+            )
+            .is_empty()
+        );
+        assert!(Config::retired_wati_config_sections("not toml {{{").is_empty());
     }
 
     #[test]

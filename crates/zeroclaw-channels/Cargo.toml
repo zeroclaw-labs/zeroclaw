@@ -203,7 +203,6 @@ channels-full = [
   "channel-twitch",
   "channel-twitter",
   "channel-voice-call",
-  "channel-wati",
   "channel-wecom",
   "channel-wecom-ws",
   "channel-whatsapp-cloud",
@@ -257,7 +256,6 @@ channel-mqtt = ["dep:rumqttc"]
 channel-filesystem = ["dep:notify", "dep:glob"]
 channel-amqp = ["dep:lapin", "dep:tokio-executor-trait", "dep:tokio-reactor-trait", "dep:async-reactor-trait", "dep:p12-keystore", "dep:rustls-pemfile"]
 channel-linq = []
-channel-wati = []
 channel-nextcloud = []
 channel-mochat = []
 channel-wechat = [
