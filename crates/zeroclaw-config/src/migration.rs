@@ -1935,6 +1935,148 @@ vision_model_provider = "grok"
     }
 
     #[test]
+    fn v2_matching_colon_url_vision_reference_rewrites_to_alias() {
+        // A colon-URL reference whose full URL identity matches the sole
+        // producer of the migrated alias must rewrite to the dotted alias,
+        // otherwise the runtime's bare-provider construction path cannot
+        // consume the typed credentials that were just migrated.
+        let raw = r#"
+schema_version = 2
+
+[providers.models."custom:https://vision.example.invalid/v1"]
+api_key = "test-key"
+model = "vision-model"
+
+[multimodal]
+vision_model_provider = "custom:https://vision.example.invalid/v1"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("custom.default"),
+            "a colon-URL reference matching its sole producer must rewrite to the alias"
+        );
+        let alias = cfg
+            .providers
+            .models
+            .find("custom", "default")
+            .expect("migrated colon-URL entry must live at custom.default");
+        assert_eq!(
+            alias.uri.as_deref(),
+            Some("https://vision.example.invalid/v1"),
+            "the migrated alias must retain the source uri"
+        );
+        assert_eq!(alias.api_key.as_deref(), Some("test-key"));
+        assert_eq!(alias.model.as_deref(), Some("vision-model"));
+    }
+
+    #[test]
+    fn v2_unmatched_colon_url_vision_reference_left_alone() {
+        // A colon-URL reference naming a different URL than the sole producer
+        // must stay unchanged (fail-closed): rewriting it would consume the
+        // producer's credential against a different endpoint.
+        let raw = r#"
+schema_version = 2
+
+[providers.models."custom:https://vision.example.invalid/v1"]
+api_key = "test-key"
+model = "vision-model"
+
+[multimodal]
+vision_model_provider = "custom:https://other.example.invalid/v1"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("custom:https://other.example.invalid/v1"),
+            "a colon-URL reference whose URL differs from the sole producer must stay as-is"
+        );
+    }
+
+    #[test]
+    fn v2_effective_endpoint_override_matches_variant_reference() {
+        // `[providers.models.qwen]` with an explicit `endpoint = "intl"`
+        // override materializes qwen.default with the effective intl endpoint.
+        // The `qwen-intl` reference names exactly that effective identity, so
+        // the rewrite must fire even though the raw `qwen` key would normalize
+        // to the cn endpoint.
+        let raw = r#"
+schema_version = 2
+
+[providers.models.qwen]
+api_key = "test-key"
+model = "vision-model"
+endpoint = "intl"
+
+[multimodal]
+vision_model_provider = "qwen-intl"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("qwen.default"),
+            "a variant reference matching the effective endpoint override must rewrite"
+        );
+        let alias = cfg
+            .providers
+            .models
+            .find("qwen", "default")
+            .expect("migrated qwen entry must live at qwen.default");
+        assert_eq!(alias.api_key.as_deref(), Some("test-key"));
+        assert_eq!(
+            cfg.providers
+                .models
+                .qwen
+                .get("default")
+                .map(|c| &c.endpoint),
+            Some(&crate::schema::QwenEndpoint::Intl),
+            "the effective endpoint override must survive migration"
+        );
+    }
+
+    #[test]
+    fn v2_equivalent_bare_custom_colon_url_overlay_rewrites() {
+        // A bare `[providers.models.custom]` entry whose configured `uri` is
+        // already B is the SAME effective source as an explicit
+        // `default_provider = "custom:https://B"` overlay. The selector must
+        // not be counted as a second producer, so the bare `custom` reference
+        // rewrites to the credential-bearing alias.
+        let raw = r#"
+schema_version = 2
+
+[providers]
+default_provider = "custom:https://b.example.invalid/v1"
+api_key = "global-key"
+default_model = "vision-model"
+
+[providers.models.custom]
+uri = "https://b.example.invalid/v1"
+api_key = "custom-key"
+model = "vision-model"
+
+[multimodal]
+vision_model_provider = "custom"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("custom.default"),
+            "an equivalent colon-URL overlay must not strand the bare custom reference"
+        );
+        let alias = cfg
+            .providers
+            .models
+            .find("custom", "default")
+            .expect("migrated custom entry must live at custom.default");
+        assert_eq!(
+            alias.uri.as_deref(),
+            Some("https://b.example.invalid/v1"),
+            "the effective uri must survive the equivalent overlay"
+        );
+        assert_eq!(alias.api_key.as_deref(), Some("custom-key"));
+    }
+
+    #[test]
     fn provider_pruner_never_panics_on_non_table_shapes() {
         // Array-of-tables where a family map is expected, scalar [providers],
         // array alias value. The salvage path is the daemon's never-fail
