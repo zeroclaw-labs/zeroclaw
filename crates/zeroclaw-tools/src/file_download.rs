@@ -421,6 +421,41 @@ fn ssrf_check_endpoint(
     let ips: Vec<std::net::IpAddr> = resolved_addrs.iter().map(|sa| sa.ip()).collect();
     let private_allowed = domain_guard::host_matches_allowlist(policy_host, allowed_hosts);
 
+    // Fail closed on a resolved address that lies inside a declared NAT64
+    // translation prefix but cannot be extracted (a nonzero RFC 6052 "u"
+    // octet). A translator may still route such an address by its embedded
+    // IPv4, so it must never fall through to the ordinary-public-IPv6 path.
+    if let Some(ip) = ips.iter().find(|ip| match ip {
+        std::net::IpAddr::V6(v6) => {
+            zeroclaw_infra::net_guard::is_under_any_nat64_prefix(*v6, nat64_prefixes)
+                && declared_nat64_embedded_v4(std::net::IpAddr::V6(*v6), nat64_prefixes).is_none()
+        }
+        std::net::IpAddr::V4(_) => false,
+    }) {
+        let err = anyhow::Error::msg(format!(
+            "Blocked host '{policy_host}' resolved to {ip} inside a declared NAT64 prefix but with a nonzero 'u' octet; refusing to classify it as public IPv6"
+        ));
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "tool": "file_download",
+                    "host": policy_host,
+                    "ip": ip.to_string(),
+                })),
+            "file_download: rejected declared-prefix NAT64 address with nonzero 'u' octet"
+        );
+        return Err(tool_msg_with_args(
+            "tool-file-download-error-private-host",
+            &[
+                ("host", policy_host),
+                ("config_key", "file_download.allowed_private_hosts"),
+                ("err", &err.to_string()),
+            ],
+        ));
+    }
+
     // Cloud metadata / credential-delivery addresses are rejected regardless
     // of `allowed_private_hosts` (the schema contract at
     // `file_download.allowed_private_hosts` documents that the carve-out never
@@ -1624,7 +1659,15 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result.error.unwrap().contains("private"));
+        let err = result.error.unwrap();
+        assert!(
+            err.contains("cloud metadata") || err.contains("credential"),
+            "metadata rejection must be operator-visible as metadata; got: {err}"
+        );
+        assert!(
+            !err.contains("To allow this host"),
+            "metadata endpoint must not suggest an allowlist; got: {err}"
+        );
     }
 
     #[tokio::test]
@@ -1645,7 +1688,15 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result.error.unwrap().contains("private"));
+        let err = result.error.unwrap();
+        assert!(
+            err.contains("cloud metadata") || err.contains("credential"),
+            "credential-delivery rejection must be operator-visible as metadata; got: {err}"
+        );
+        assert!(
+            !err.contains("To allow this host"),
+            "credential-delivery endpoint must not suggest an allowlist; got: {err}"
+        );
     }
 
     #[tokio::test]
@@ -2472,6 +2523,86 @@ mod tests {
         let addr = std::net::SocketAddr::new("64:ff9b:1:a00:0:100::".parse().unwrap(), 80);
         ssrf_check_endpoint("internal.example.com", &[addr], &[], &[])
             .expect("undeclared network-specific prefix is outside auto-detection");
+    }
+
+    /// RFC 6052 §2.2 nonzero-suffix forms must be classified by their embedded
+    /// IPv4, not treated as ordinary public IPv6. A compliant translator
+    /// IGNORES nonzero reserved suffix bits (the RFC says it proceeds as if
+    /// they were zero), so `64:ff9b:1:a00:0:100:0:1` is routed to 10.0.0.1 on
+    /// the wire even though byte 15 is nonzero.
+    #[test]
+    fn ssrf_check_endpoint_rejects_declared_nat64_nonzero_suffix_private_without_opt_in() {
+        let prefixes = [zeroclaw_infra::net_guard::Nat64Prefix {
+            prefix: "64:ff9b:1::".parse().unwrap(),
+            len: 48,
+        }];
+        // 64:ff9b:1:a00:0:100:0:1 embeds 10.0.0.1 with nonzero suffix byte 15.
+        let addr = std::net::SocketAddr::new("64:ff9b:1:a00:0:100:0:1".parse().unwrap(), 80);
+        let err = ssrf_check_endpoint("internal.example.com", &[addr], &[], &prefixes)
+            .expect_err("nonzero-suffix declared NAT64 private target must be rejected");
+        assert!(
+            err.contains("non-global") || err.contains("private") || err.contains("10.0.0.1"),
+            "must be classified by the embedded IPv4; got: {err}"
+        );
+    }
+
+    /// A nonzero-suffix address under a declared prefix embedding a
+    /// metadata/credential IPv4 is rejected EVEN under an allowlist — same
+    /// contract as the zero-suffix form.
+    #[test]
+    fn ssrf_check_endpoint_rejects_declared_nat64_nonzero_suffix_metadata_even_allowlisted() {
+        let prefixes = [zeroclaw_infra::net_guard::Nat64Prefix {
+            prefix: "64:ff9b:1::".parse().unwrap(),
+            len: 48,
+        }];
+        // 64:ff9b:1:a9fe:a9:fe00:0:1 embeds 169.254.169.254 (EC2 IMDS) with
+        // nonzero suffix byte 15.
+        let addr = std::net::SocketAddr::new("64:ff9b:1:a9fe:a9:fe00:0:1".parse().unwrap(), 80);
+        for allowed in [
+            &["*".to_string()][..],
+            &["corp.example.com".to_string()][..],
+        ] {
+            let err = ssrf_check_endpoint("corp.example.com", &[addr], allowed, &prefixes)
+                .expect_err(
+                    "nonzero-suffix declared NAT64 metadata must be rejected under an allowlist",
+                );
+            assert!(
+                err.contains("cloud metadata") || err.contains("credential"),
+                "must be operator-visible as metadata; got: {err}"
+            );
+        }
+    }
+
+    /// Public positive control: a nonzero-suffix address under a declared
+    /// prefix embedding a public IPv4 still passes without opt-in, pinning the
+    /// intended prefix boundary.
+    #[test]
+    fn ssrf_check_endpoint_declared_nat64_nonzero_suffix_public_passes() {
+        let prefixes = [zeroclaw_infra::net_guard::Nat64Prefix {
+            prefix: "64:ff9b:1::".parse().unwrap(),
+            len: 48,
+        }];
+        // 64:ff9b:1:808:0:808:0:1 embeds 8.8.8.8 (public) with nonzero suffix
+        // byte 15. The declared prefix is the RFC 8215 local-use range, so it
+        // is a valid positive control for the /48 layout.
+        let addr = std::net::SocketAddr::new("64:ff9b:1:808:0:808:0:1".parse().unwrap(), 443);
+        ssrf_check_endpoint("public.example.com", &[addr], &[], &prefixes)
+            .expect("nonzero-suffix declared NAT64 embedding a public IPv4 must pass");
+    }
+
+    /// Fail-closed boundary: an address inside a declared prefix with a
+    /// nonzero RFC 6052 "u" octet cannot be extracted, so the gate rejects it
+    /// rather than letting it fall through to ordinary public IPv6.
+    #[test]
+    fn ssrf_check_endpoint_fails_closed_on_unextractable_declared_prefix_address() {
+        let prefixes = [zeroclaw_infra::net_guard::Nat64Prefix {
+            prefix: "64:ff9b:1::".parse().unwrap(),
+            len: 48,
+        }];
+        // 64:ff9b:1:a00:100:100:: has u octet byte 8 = 0x01 (nonzero).
+        let addr = std::net::SocketAddr::new("64:ff9b:1:a00:100:100::".parse().unwrap(), 80);
+        ssrf_check_endpoint("internal.example.com", &[addr], &[], &prefixes)
+            .expect_err("unextractable declared-prefix address must fail closed");
     }
 
     /// Production dispatch boundary: the declared-prefix resolver threaded

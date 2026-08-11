@@ -105,13 +105,39 @@ pub fn parse_nat64_prefix(cidr: &str) -> Option<Nat64Prefix> {
     }
 }
 
+/// True when `v6` lies inside the declared RFC 6052 translation range — its
+/// top `len` bits match `prefix`. Used to fail closed at a security gate when
+/// extraction is impossible (e.g. a nonzero "u" octet) instead of treating an
+/// unextractable in-range address as ordinary public IPv6.
+#[must_use]
+pub fn is_under_nat64_prefix(v6: std::net::Ipv6Addr, p: &Nat64Prefix) -> bool {
+    let addr = u128::from(v6);
+    let prefix_bits = u128::from(p.prefix);
+    // The top `len` bits must equal the declared prefix.
+    addr >> (128 - u32::from(p.len)) == prefix_bits >> (128 - u32::from(p.len))
+}
+
+/// True when `v6` lies inside any of the declared translation prefixes.
+#[must_use]
+pub fn is_under_any_nat64_prefix(v6: std::net::Ipv6Addr, declared: &[Nat64Prefix]) -> bool {
+    declared.iter().any(|p| is_under_nat64_prefix(v6, p))
+}
+
 /// Extract the IPv4 address embedded in `v6` under a declared network-specific
 /// prefix per RFC 6052 §2.2. The 32-bit IPv4 sits immediately after the
 /// prefix; for prefix lengths where it would straddle bit 64 the zero "u"
 /// octet is inserted at bits 64–71. Returns `None` unless the top `len` bits
-/// match the declared prefix, the "u" octet is zero, and the suffix bits are
-/// zero — so only a clean IPv4-embedded form is classified, never an unrelated
-/// address that merely shares the prefix.
+/// match the declared prefix and the "u" octet is zero.
+///
+/// Reserved suffix bits beyond the embedded IPv4 are deliberately NOT required
+/// to be zero. RFC 6052 §2.2 says an address translator that receives nonzero
+/// suffix bits SHOULD ignore their value and proceed as if they were zero, so
+/// a compliant network-specific translator routes a nonzero-suffix address to
+/// its embedded IPv4. Requiring zero suffix bits here would let a nonzero-
+/// suffix private/metadata embedding fall through to the ordinary-public-IPv6
+/// path at the SSRF gate. Callers that cannot accept an unextractable in-range
+/// address should combine this with [`is_under_any_nat64_prefix`] to fail
+/// closed.
 #[must_use]
 pub fn nat64_embedded_ipv4_under_prefix(
     v6: std::net::Ipv6Addr,
@@ -121,12 +147,10 @@ pub fn nat64_embedded_ipv4_under_prefix(
     if !matches!(len, 32 | 40 | 48 | 56 | 64 | 96) {
         return None;
     }
-    let addr = u128::from(v6);
-    let prefix_bits = u128::from(prefix);
-    // The top `len` bits must equal the declared prefix.
-    if addr >> (128 - u32::from(len)) != prefix_bits >> (128 - u32::from(len)) {
+    if !is_under_nat64_prefix(v6, &Nat64Prefix { prefix, len }) {
         return None;
     }
+    let addr = u128::from(v6);
     // Bit positions run MSB-first; `slice(lo, hi)` extracts bits [lo, hi).
     let slice = |lo: u32, hi: u32| -> u128 { (addr >> (128 - hi)) & ((1u128 << (hi - lo)) - 1) };
     // RFC 6052 §2.2: the zero "u" octet occupies bits 64–71 for every prefix
@@ -143,23 +167,6 @@ pub fn nat64_embedded_ipv4_under_prefix(
         96 => slice(96, 128),
         _ => unreachable!(),
     };
-    // Suffix bits beyond the embedded IPv4 must be zero. RFC 6052 says they
-    // SHOULD be; requiring them keeps extraction from classifying an address
-    // that only happens to share the prefix as an IPv4-embedded form.
-    let suffix_start: u32 = match len {
-        32 => 72,
-        40 => 80,
-        48 => 88,
-        56 => 96,
-        64 => 104,
-        96 => 128,
-        _ => unreachable!(),
-    };
-    // `(1 << (128 - suffix_start)) - 1` masks u128 bits [0, 128 - suffix_start),
-    // i.e. the MSB-first positions [suffix_start, 128) — the suffix bits.
-    if suffix_start < 128 && (addr & ((1u128 << (128 - suffix_start)) - 1)) != 0 {
-        return None;
-    }
     Some(std::net::Ipv4Addr::from(u32::try_from(v4).ok()?))
 }
 
@@ -420,23 +427,25 @@ mod tests {
             )
             .is_none()
         );
-        // Non-zero suffix bits must be rejected (here byte 11 for /48).
-        assert!(
+        // Non-zero suffix bits are IGNORED per RFC 6052 §2.2 (a translator
+        // receives them and proceeds as if they were zero): byte 11 is nonzero
+        // for /48 here, yet the embedded 10.0.0.1 is still extracted.
+        assert_eq!(
             nat64_embedded_ipv4_under_prefix(
                 "2001:db8:64:a00:0:101::".parse().unwrap(),
                 "2001:db8:64::".parse().unwrap(),
                 48,
-            )
-            .is_none()
+            ),
+            Some(Ipv4Addr::new(10, 0, 0, 1)),
         );
-        // Non-zero suffix for /64 (byte 13) must be rejected.
-        assert!(
+        // Non-zero suffix for /64 (byte 13) is likewise ignored.
+        assert_eq!(
             nat64_embedded_ipv4_under_prefix(
                 "2001:db8:64:0:a:0:101:0".parse().unwrap(),
                 "2001:db8:64::".parse().unwrap(),
                 64,
-            )
-            .is_none()
+            ),
+            Some(Ipv4Addr::new(10, 0, 0, 1)),
         );
         // Unsupported prefix lengths are not classified.
         assert!(
@@ -492,5 +501,62 @@ mod tests {
             nat64_embedded_ipv4_under_any("64:ff9b:1:7f00:0:100::".parse().unwrap(), &declared),
             Some(Ipv4Addr::new(127, 0, 0, 1)),
         );
+    }
+
+    #[test]
+    fn nat64_embedded_ipv4_ignores_nonzero_suffix_bits() {
+        // RFC 6052 §2.2: an address translator that receives nonzero reserved
+        // suffix bits SHOULD ignore their value and proceed as if they were
+        // zero, so a compliant network-specific translator routes these to
+        // their embedded IPv4. The extractor must classify them, not return
+        // None and let the address fall through to ordinary-public-IPv6 at the
+        // SSRF gate.
+        let declared = [Nat64Prefix {
+            prefix: "64:ff9b:1::".parse().unwrap(),
+            len: 48,
+        }];
+        // 64:ff9b:1:a00:0:100:0:1 -> 10.0.0.1 (nonzero suffix byte 15).
+        assert_eq!(
+            nat64_embedded_ipv4_under_any("64:ff9b:1:a00:0:100:0:1".parse().unwrap(), &declared),
+            Some(Ipv4Addr::new(10, 0, 0, 1)),
+        );
+        // 64:ff9b:1:a9fe:a9:fe00:0:1 -> 169.254.169.254 (metadata, nonzero
+        // suffix byte 15).
+        assert_eq!(
+            nat64_embedded_ipv4_under_any("64:ff9b:1:a9fe:a9:fe00:0:1".parse().unwrap(), &declared),
+            Some(Ipv4Addr::new(169, 254, 169, 254)),
+        );
+        // A nonzero "u" octet still rejects: the extractor cannot classify it,
+        // and callers fail closed via is_under_any_nat64_prefix instead.
+        assert!(
+            nat64_embedded_ipv4_under_any("64:ff9b:1:a00:100:100::".parse().unwrap(), &declared)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn is_under_any_nat64_prefix_matches_only_declared_ranges() {
+        let declared = [Nat64Prefix {
+            prefix: "64:ff9b:1::".parse().unwrap(),
+            len: 48,
+        }];
+        assert!(is_under_any_nat64_prefix(
+            "64:ff9b:1:a00:0:100:0:1".parse().unwrap(),
+            &declared
+        ));
+        // The same tail under an undeclared prefix is outside the range.
+        assert!(!is_under_any_nat64_prefix(
+            "64:ff9b:2::1".parse().unwrap(),
+            &declared
+        ));
+        assert!(!is_under_any_nat64_prefix(
+            "64:ff9b::1".parse().unwrap(),
+            &declared
+        ));
+        // No declared prefixes -> nothing is inside a range.
+        assert!(!is_under_any_nat64_prefix(
+            "64:ff9b:1::1".parse().unwrap(),
+            &[]
+        ));
     }
 }
