@@ -22,6 +22,7 @@ pub mod cloud_patterns;
 pub mod codex_cli;
 pub mod composio;
 pub mod content_search;
+pub mod dag_plan_execute;
 pub mod data_management;
 pub mod discord_search;
 pub mod email_imap;
