@@ -172,6 +172,20 @@ mod mention {
         }
         false
     }
+
+    /// Group `mention_only` admits either an explicit mention or a direct reply
+    /// to a bot message (Telegram parity: replies are unambiguous intent).
+    pub(super) fn admit_group_message(is_mentioned: bool, is_reply_to_bot: bool) -> bool {
+        is_mentioned || is_reply_to_bot
+    }
+
+    /// True when a Matrix event JSON `sender` equals `user_id`.
+    pub(super) fn sender_is_user(raw_json: &str, user_id: &UserId) -> bool {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(raw_json) else {
+            return false;
+        };
+        v.get("sender").and_then(|s| s.as_str()) == Some(user_id.as_str())
+    }
 }
 
 // ─── allowlist ─────────────────────────────────────────────────────────────
@@ -1652,12 +1666,42 @@ mod inbound {
         if ctx.config.mention_only && is_group_room(&room).await {
             let display_name = ctx.bot_display_name.read().await.clone();
             let mention_user_ids = extract_mentions_user_ids(&raw);
-            if !mention::is_mentioned(
+            let mentioned = mention::is_mentioned(
                 &ctx.bot_user_id,
                 display_name.as_deref(),
                 mention_user_ids.as_deref(),
                 &body,
-            ) {
+            );
+            // Reply-to-bot bypasses the mention gate (Telegram parity). Fetch the
+            // parent only when the body/mention list alone would drop the turn.
+            let reply_to_bot = if mentioned {
+                false
+            } else if let Some(reply_id) = extract_in_reply_to(&raw) {
+                match room.event(&reply_id, None).await {
+                    Ok(timeline_event) => mention::sender_is_user(
+                        timeline_event.into_raw().json().get(),
+                        &ctx.bot_user_id,
+                    ),
+                    Err(e) => {
+                        ::zeroclaw_log::record!(
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_attrs(::serde_json::json!({
+                                "error": format!("{e}"),
+                                "reply_id": reply_id,
+                            })),
+                            "matrix: failed to fetch reply parent for mention_only gate"
+                        );
+                        false
+                    }
+                }
+            } else {
+                false
+            };
+            if !mention::admit_group_message(mentioned, reply_to_bot) {
                 ::zeroclaw_log::record!(
                     DEBUG,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -4808,7 +4852,7 @@ mod tests {
     }
 
     mod mention {
-        use super::super::mention::is_mentioned;
+        use super::super::mention::{admit_group_message, is_mentioned, sender_is_user};
         use matrix_sdk::ruma::user_id;
 
         #[test]
@@ -4860,6 +4904,25 @@ mod tests {
                 None,
                 "no mention here"
             ));
+        }
+
+        #[test]
+        fn admit_group_message_allows_reply_to_bot_without_mention() {
+            assert!(admit_group_message(false, true));
+            assert!(admit_group_message(true, false));
+            assert!(admit_group_message(true, true));
+            assert!(!admit_group_message(false, false));
+        }
+
+        #[test]
+        fn sender_is_user_matches_bot_parent_event() {
+            let bot = user_id!("@bot:example.org");
+            let parent =
+                r#"{"sender":"@bot:example.org","type":"m.room.message","content":{"body":"hi"}}"#;
+            let other = r#"{"sender":"@alice:example.org","type":"m.room.message","content":{"body":"hi"}}"#;
+            assert!(sender_is_user(parent, bot));
+            assert!(!sender_is_user(other, bot));
+            assert!(!sender_is_user("not-json", bot));
         }
     }
 
