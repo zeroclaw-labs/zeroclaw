@@ -1250,6 +1250,10 @@ async fn process_attachments(
             } else {
                 Some(ct.to_string())
             },
+            // The saved name carries a uniqueness prefix, so `file_name` alone
+            // cannot identify the marker just rendered above; record the
+            // target verbatim instead.
+            marker_target: Some(marker_target.clone()),
         });
     }
 
@@ -2442,6 +2446,7 @@ impl Channel for DiscordChannel {
                                             return;
                                         }
 
+                                        let mut invoked_skill: Option<String> = None;
                                         let content = if command == "ask" {
                                             Some(prompt)
                                         } else {
@@ -2459,6 +2464,12 @@ impl Channel for DiscordChannel {
                                             };
                                             match specs.into_iter().find(|spec| spec.slug == command) {
                                                 Some(spec) => {
+                                                    // Carry the resolved identity alongside the
+                                                    // rendering: the prose below names the skill
+                                                    // but is not in a form a text matcher
+                                                    // recognizes, and a registered command must
+                                                    // still apply its skill's policy.
+                                                    invoked_skill = Some(spec.skill_name.clone());
                                                     skill_command_prompt(&spec, &input, &submitted)
                                                 }
                                                 None => None, // stale or foreign command
@@ -2494,6 +2505,7 @@ impl Channel for DiscordChannel {
                                             thread_ts: None,
                                             attachments: Vec::new(),
                                             subject: None,
+                                            invoked_skill,
 
                                             ..Default::default()};
                                         if tx.send(channel_msg).await.is_err() {
@@ -4227,6 +4239,77 @@ mod tests {
         );
     }
 
+    /// Discord saves attachments under a uniqueness-prefixed name while the
+    /// envelope keeps the sender's name, so the marker target and the file
+    /// name never match. Driving the real `process_attachments` through the
+    /// real pipeline proves the two are joined by recorded provenance rather
+    /// than by name — a basename comparison sends this image twice.
+    #[tokio::test]
+    async fn saved_attachment_marker_joins_to_its_envelope_through_the_pipeline() {
+        use crate::orchestrator::media_pipeline::MediaPipeline;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/attachments/1/photo.jpg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0xFFu8, 0xD8, 0xFF, 0xE0]))
+            .mount(&server)
+            .await;
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        let attachments = vec![serde_json::json!({
+            "filename": "photo.jpg",
+            "content_type": "image/jpeg",
+            "url": format!("{}/attachments/1/photo.jpg", server.uri()),
+        })];
+
+        let (text, media) = process_attachments(
+            &attachments,
+            &reqwest::Client::new(),
+            Some(workspace.path()),
+            None,
+        )
+        .await;
+
+        assert_eq!(media.len(), 1, "one attachment in, one envelope out");
+        let saved = media[0]
+            .marker_target
+            .as_deref()
+            .expect("a saved attachment must record the target it rendered");
+        assert!(
+            saved.contains("discord_files/"),
+            "expected a workspace save path, got: {saved}"
+        );
+        assert_ne!(
+            saved.rsplit('/').next().unwrap_or(saved),
+            media[0].file_name,
+            "the save name must differ from the sender name, or this test proves nothing"
+        );
+        assert!(
+            text.contains(&format!("[IMAGE:{saved}]")),
+            "rendered text must reference exactly the recorded target: {text}"
+        );
+
+        let config = zeroclaw_config::schema::MediaPipelineConfig {
+            enabled: true,
+            describe_images: true,
+            ..Default::default()
+        };
+        let enriched = MediaPipeline::new(&config, None, true)
+            .process(&text, &media)
+            .await;
+
+        assert_eq!(
+            enriched, text,
+            "a Discord-saved image must not be inlined a second time"
+        );
+        assert!(
+            !enriched.contains("IMAGE:data:"),
+            "no base64 copy may be added alongside the path marker: {enriched}"
+        );
+    }
+
     #[tokio::test]
     async fn interaction_answer_over_2000_chars_chunks_into_edit_plus_followup() {
         use wiremock::matchers::{method, path};
@@ -4458,6 +4541,9 @@ mod tests {
             slash_options: Vec::new(),
             always: false,
             location: None,
+            provider: None,
+            triggers: Vec::new(),
+            blocked_tools_with_image: Vec::new(),
         }
     }
 

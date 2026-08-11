@@ -19,6 +19,7 @@ pub mod pricing_catalog;
 pub mod prompt;
 pub mod system_prompt;
 pub mod thinking;
+pub mod tool_ceiling;
 pub mod tool_execution;
 pub mod tool_receipts;
 pub(crate) mod turn;

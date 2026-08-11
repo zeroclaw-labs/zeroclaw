@@ -283,7 +283,25 @@ impl<'a> TurnState<'a> {
     }
 }
 
-pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
+/// Run a tool-calling turn, publishing its exclusions as the capability
+/// ceiling for anything the turn starts.
+///
+/// The scope is established here rather than at each call site so the
+/// invariant holds structurally: every loop, parent or nested, inherits the
+/// ceiling it was started under and can only add to it. See
+/// [`crate::agent::tool_ceiling`].
+pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
+    let turn_exclusions = p.exec.excluded_tools.to_vec();
+    // Boxed to keep the added scope from deepening the loop's already large
+    // future type, which otherwise overflows auto-trait resolution.
+    crate::agent::tool_ceiling::with_tool_ceiling(
+        &turn_exclusions,
+        Box::pin(run_tool_call_loop_inner(p)),
+    )
+    .await
+}
+
+async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
     let model_switch_state = p
         .exec
         .model_switch_callback

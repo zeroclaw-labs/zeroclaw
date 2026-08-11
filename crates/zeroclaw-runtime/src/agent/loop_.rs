@@ -13171,6 +13171,9 @@ Let me check the result."#;
             slash_options: Vec::new(),
             always: false,
             location: Some(workspace.path().join("skills/deploy/SKILL.md")),
+            provider: None,
+            triggers: Vec::new(),
+            blocked_tools_with_image: Vec::new(),
         }];
 
         let risk_profile = RiskProfileConfig::default();
