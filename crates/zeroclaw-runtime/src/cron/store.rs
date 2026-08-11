@@ -496,6 +496,10 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
         // start, which rewrites every declarative column from the config.
         // Reject at this boundary rather than persist a value the next sync
         // discards, matching how `shell_output_format` is handled below.
+        //
+        // Ownership is checked before shape: a declarative job rejects any
+        // delivery patch, so reporting a missing recipient first would imply
+        // that correcting it would let the write through.
         if job.source == "declarative" {
             anyhow::bail!(
                 "Cron job '{job_id}': delivery is owned by [cron.{job_id}].delivery in \
@@ -503,6 +507,8 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
                  and restart the daemon."
             );
         }
+        // Match add_*_job: announce delivery must include channel + to.
+        validate_delivery_config(Some(&delivery))?;
         job.delivery = delivery;
     }
     if let Some(model) = patch.model {
@@ -2088,6 +2094,45 @@ mod tests {
         .unwrap_err();
 
         assert!(err.to_string().contains("delivery.to is required"));
+    }
+
+    #[test]
+    fn update_job_rejects_invalid_announce_delivery() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let job = add_shell_job(
+            &config,
+            "default",
+            Some("deliver-shell".into()),
+            Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "echo ok",
+            None,
+        )
+        .unwrap();
+
+        let err = update_job(
+            &config,
+            &job.id,
+            CronJobPatch {
+                delivery: Some(DeliveryConfig {
+                    mode: "announce".into(),
+                    channel: Some("discord".into()),
+                    to: None,
+                    thread_id: None,
+                    best_effort: true,
+                }),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("delivery.to is required"));
+        let stored = get_job(&config, &job.id).unwrap();
+        assert_ne!(stored.delivery.mode, "announce");
     }
 
     #[test]
