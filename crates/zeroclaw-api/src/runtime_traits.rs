@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 /// Runtime adapter that abstracts platform differences for the agent.
@@ -68,6 +69,22 @@ pub trait RuntimeAdapter: Send + Sync {
         command: &str,
         workspace_dir: &Path,
     ) -> anyhow::Result<tokio::process::Command>;
+
+    /// Build a shell command process with runtime-visible environment names.
+    ///
+    /// `env_keys` contains variable names selected by the caller for
+    /// passthrough. Implementations that need explicit forwarding, such as
+    /// container runtimes, should pass only these names across their runtime
+    /// boundary and rely on the spawned process environment for the values.
+    fn build_shell_command_with_env_keys(
+        &self,
+        command: &str,
+        workspace_dir: &Path,
+        env_keys: &[&OsStr],
+    ) -> anyhow::Result<tokio::process::Command> {
+        let _ = env_keys;
+        self.build_shell_command(command, workspace_dir)
+    }
 }
 
 #[cfg(test)]
@@ -148,5 +165,23 @@ mod tests {
 
         assert!(output.status.success());
         assert!(stdout.contains("hello-runtime"));
+    }
+
+    #[tokio::test]
+    async fn default_env_key_builder_delegates_to_shell_command() {
+        let runtime = DummyRuntime;
+        let mut cmd = runtime
+            .build_shell_command_with_env_keys(
+                "hello-env-key-runtime",
+                Path::new("."),
+                &[OsStr::new("ZC_RUNTIME_TOKEN")],
+            )
+            .unwrap();
+
+        let output = cmd.output().await.unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        assert!(output.status.success());
+        assert!(stdout.contains("hello-env-key-runtime"));
     }
 }
