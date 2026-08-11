@@ -9074,6 +9074,24 @@ pub struct FileDownloadConfig {
     /// See `web_fetch.allowed_private_hosts` for the matching shape.
     #[serde(default)]
     pub allowed_private_hosts: Vec<String>,
+
+    /// Network-specific RFC 6052 NAT64/DNS64 translation prefixes used by this
+    /// deployment, in IPv6 CIDR form (e.g. `"64:ff9b:1::/48"` or
+    /// `"2001:db8:64::/96"`). DNS64 synthesizes an IPv6 answer under one of
+    /// these prefixes for an IPv4-only hostname; the SSRF gate extracts the
+    /// embedded IPv4 (RFC 6052 §2.2) and classifies it exactly like the
+    /// built-in well-known `64:ff9b::/96` prefix — a private / loopback /
+    /// link-local / metadata target is rejected unless the host is allowlisted.
+    /// The well-known prefix is recognized automatically and never needs to be
+    /// declared here. A network-specific prefix is chosen by the operator and
+    /// cannot be detected from an address alone (RFC 8215 §5 forbids assuming
+    /// where an embedded IPv4 sits inside a local-use prefix), so it must be
+    /// declared; undeclared prefixes are ordinary address space and the gate
+    /// does not claim SSRF safety for them. Only the RFC 6052 §2.2 prefix
+    /// lengths (32, 40, 48, 56, 64, 96) are accepted; a malformed entry fails
+    /// the whole list closed to empty.
+    #[serde(default)]
+    pub nat64_prefixes: Vec<String>,
 }
 
 fn default_file_download_max_size_bytes() -> u64 {
@@ -9092,6 +9110,7 @@ impl Default for FileDownloadConfig {
             timeout_secs: default_file_download_timeout_secs(),
             headers: HashMap::new(),
             allowed_private_hosts: Vec::new(),
+            nat64_prefixes: Vec::new(),
         }
     }
 }

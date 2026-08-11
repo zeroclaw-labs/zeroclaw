@@ -76,6 +76,105 @@ pub fn nat64_embedded_ipv4(v6: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr>
     }
 }
 
+/// A network-specific RFC 6052 NAT64/DNS64 translation prefix declared by the
+/// operator. The well-known `64:ff9b::/96` prefix is built into
+/// [`nat64_embedded_ipv4`] and needs no declaration; any other prefix a
+/// deployment's DNS64 synthesizes under must be declared here, because a
+/// network-specific prefix is chosen by the operator and cannot be detected
+/// from an address alone (RFC 8215 §5 explicitly forbids assuming where an
+/// embedded IPv4 sits inside a local-use prefix).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Nat64Prefix {
+    pub prefix: std::net::Ipv6Addr,
+    /// RFC 6052 §2.2 prefix length: one of 32, 40, 48, 56, 64, 96.
+    pub len: u8,
+}
+
+/// Parse an IPv6 CIDR (`"2001:db8:64::/96"`) into a [`Nat64Prefix`]. Accepts
+/// only the RFC 6052 §2.2 prefix lengths (32, 40, 48, 56, 64, 96); a non-IPv6
+/// address or any other length returns `None` so callers can fail closed on a
+/// malformed entry.
+#[must_use]
+pub fn parse_nat64_prefix(cidr: &str) -> Option<Nat64Prefix> {
+    let (addr, len) = cidr.split_once('/')?;
+    let len: u8 = len.parse().ok()?;
+    let prefix = addr.parse::<std::net::Ipv6Addr>().ok()?;
+    match len {
+        32 | 40 | 48 | 56 | 64 | 96 => Some(Nat64Prefix { prefix, len }),
+        _ => None,
+    }
+}
+
+/// Extract the IPv4 address embedded in `v6` under a declared network-specific
+/// prefix per RFC 6052 §2.2. The 32-bit IPv4 sits immediately after the
+/// prefix; for prefix lengths where it would straddle bit 64 the zero "u"
+/// octet is inserted at bits 64–71. Returns `None` unless the top `len` bits
+/// match the declared prefix, the "u" octet is zero, and the suffix bits are
+/// zero — so only a clean IPv4-embedded form is classified, never an unrelated
+/// address that merely shares the prefix.
+#[must_use]
+pub fn nat64_embedded_ipv4_under_prefix(
+    v6: std::net::Ipv6Addr,
+    prefix: std::net::Ipv6Addr,
+    len: u8,
+) -> Option<std::net::Ipv4Addr> {
+    if !matches!(len, 32 | 40 | 48 | 56 | 64 | 96) {
+        return None;
+    }
+    let addr = u128::from(v6);
+    let prefix_bits = u128::from(prefix);
+    // The top `len` bits must equal the declared prefix.
+    if addr >> (128 - u32::from(len)) != prefix_bits >> (128 - u32::from(len)) {
+        return None;
+    }
+    // Bit positions run MSB-first; `slice(lo, hi)` extracts bits [lo, hi).
+    let slice = |lo: u32, hi: u32| -> u128 { (addr >> (128 - hi)) & ((1u128 << (hi - lo)) - 1) };
+    // RFC 6052 §2.2: the zero "u" octet occupies bits 64–71 for every prefix
+    // length below 96 (it is absent at /96, where the IPv4 fills the tail).
+    if len < 96 && slice(64, 72) != 0 {
+        return None;
+    }
+    let v4 = match len {
+        32 => slice(32, 64),
+        40 => (slice(40, 64) << 8) | slice(72, 80),
+        48 => (slice(48, 64) << 16) | slice(72, 88),
+        56 => (slice(56, 64) << 24) | slice(72, 96),
+        64 => slice(72, 104),
+        96 => slice(96, 128),
+        _ => unreachable!(),
+    };
+    // Suffix bits beyond the embedded IPv4 must be zero. RFC 6052 says they
+    // SHOULD be; requiring them keeps extraction from classifying an address
+    // that only happens to share the prefix as an IPv4-embedded form.
+    let suffix_start: u32 = match len {
+        32 => 72,
+        40 => 80,
+        48 => 88,
+        56 => 96,
+        64 => 104,
+        96 => 128,
+        _ => unreachable!(),
+    };
+    // `(1 << (128 - suffix_start)) - 1` masks u128 bits [0, 128 - suffix_start),
+    // i.e. the MSB-first positions [suffix_start, 128) — the suffix bits.
+    if suffix_start < 128 && (addr & ((1u128 << (128 - suffix_start)) - 1)) != 0 {
+        return None;
+    }
+    Some(std::net::Ipv4Addr::from(u32::try_from(v4).ok()?))
+}
+
+/// The IPv4 embedded in `v6` under any of the operator-declared prefixes, or
+/// `None` when it is not a clean IPv4-embedded form of any declared prefix.
+#[must_use]
+pub fn nat64_embedded_ipv4_under_any(
+    v6: std::net::Ipv6Addr,
+    declared: &[Nat64Prefix],
+) -> Option<std::net::Ipv4Addr> {
+    declared
+        .iter()
+        .find_map(|p| nat64_embedded_ipv4_under_prefix(v6, p.prefix, p.len))
+}
+
 /// True when an IPv6 address is not globally routable (loopback, ULA,
 /// link-local, documentation, multicast, an IPv4-mapped non-global v4, or an
 /// RFC 6052 NAT64/DNS64 form embedding a non-global v4). The NAT64 branch
@@ -219,5 +318,179 @@ mod tests {
         // RFC 2544 benchmarking range (198.18.0.0/15)
         assert!(is_non_global_v4(Ipv4Addr::new(198, 18, 0, 1)));
         assert!(is_non_global_v4(Ipv4Addr::new(198, 19, 255, 255)));
+    }
+
+    #[test]
+    fn parse_nat64_prefix_accepts_rfc6052_lengths_only() {
+        for (cidr, expected) in [
+            ("2001:db8:64::/32", 32u8),
+            ("2001:db8:64::/40", 40),
+            ("2001:db8:64::/48", 48),
+            ("2001:db8:64::/56", 56),
+            ("2001:db8:64::/64", 64),
+            ("64:ff9b:1::/96", 96),
+        ] {
+            let p = parse_nat64_prefix(cidr).unwrap();
+            assert_eq!(p.len, expected, "{cidr}");
+            assert_eq!(
+                p.prefix,
+                cidr.split('/')
+                    .next()
+                    .unwrap()
+                    .parse::<std::net::Ipv6Addr>()
+                    .unwrap(),
+                "{cidr}"
+            );
+        }
+        // Non-RFC 6052 lengths must be rejected so config can fail closed.
+        for bad in [
+            "2001:db8::/24",
+            "2001:db8::/0",
+            "2001:db8::/97",
+            "2001:db8::/128",
+        ] {
+            assert!(parse_nat64_prefix(bad).is_none(), "{bad}");
+        }
+        // Non-CIDR, IPv4, or unparsable input is rejected.
+        assert!(parse_nat64_prefix("2001:db8:64::").is_none());
+        assert!(parse_nat64_prefix("192.0.2.1/24").is_none());
+        assert!(parse_nat64_prefix("not-a-cidr").is_none());
+    }
+
+    #[test]
+    fn nat64_embedded_ipv4_under_prefix_matches_rfc6052_examples() {
+        // RFC 6052 §2.2 Table 1: the /48 prefix 2001:db8:122:: embeds
+        // 192.0.2.33 as 2001:db8:122:c000:2:2100:: (v4 split around the u octet).
+        assert_eq!(
+            nat64_embedded_ipv4_under_prefix(
+                "2001:db8:122:c000:2:2100::".parse().unwrap(),
+                "2001:db8:122::".parse().unwrap(),
+                48,
+            ),
+            Some(Ipv4Addr::new(192, 0, 2, 33)),
+        );
+        // /96: the v4 fills the tail.
+        assert_eq!(
+            nat64_embedded_ipv4_under_prefix(
+                "2001:db8:64::a00:1".parse().unwrap(),
+                "2001:db8:64::".parse().unwrap(),
+                96,
+            ),
+            Some(Ipv4Addr::new(10, 0, 0, 1)),
+        );
+    }
+
+    #[test]
+    fn nat64_embedded_ipv4_under_prefix_roundtrips_every_length() {
+        let prefix: Ipv6Addr = "2001:db8:64::".parse().unwrap();
+        // Vector addresses generated per RFC 6052 §2.2 for v4 = 10.0.0.1.
+        for (len, addr) in [
+            (32u8, "2001:db8:a00:1::"),
+            (40u8, "2001:db8:a:0:1::"),
+            (48u8, "2001:db8:64:a00:0:100::"),
+            (56u8, "2001:db8:64:a:0:1::"),
+            (64u8, "2001:db8:64:0:a:0:100:0"),
+            (96u8, "2001:db8:64::a00:1"),
+        ] {
+            assert_eq!(
+                nat64_embedded_ipv4_under_prefix(addr.parse().unwrap(), prefix, len),
+                Some(Ipv4Addr::new(10, 0, 0, 1)),
+                "len={len} addr={addr}"
+            );
+        }
+    }
+
+    #[test]
+    fn nat64_embedded_ipv4_under_prefix_rejects_non_matches() {
+        // Prefix bits must match the declared prefix exactly.
+        assert!(
+            nat64_embedded_ipv4_under_prefix(
+                "2001:db8:65::a00:1".parse().unwrap(),
+                "2001:db8:64::".parse().unwrap(),
+                96,
+            )
+            .is_none()
+        );
+        // A non-zero "u" octet (byte 8 for /48) must be rejected.
+        assert!(
+            nat64_embedded_ipv4_under_prefix(
+                "2001:db8:64:a00:100:100::".parse().unwrap(),
+                "2001:db8:64::".parse().unwrap(),
+                48,
+            )
+            .is_none()
+        );
+        // Non-zero suffix bits must be rejected (here byte 11 for /48).
+        assert!(
+            nat64_embedded_ipv4_under_prefix(
+                "2001:db8:64:a00:0:101::".parse().unwrap(),
+                "2001:db8:64::".parse().unwrap(),
+                48,
+            )
+            .is_none()
+        );
+        // Non-zero suffix for /64 (byte 13) must be rejected.
+        assert!(
+            nat64_embedded_ipv4_under_prefix(
+                "2001:db8:64:0:a:0:101:0".parse().unwrap(),
+                "2001:db8:64::".parse().unwrap(),
+                64,
+            )
+            .is_none()
+        );
+        // Unsupported prefix lengths are not classified.
+        assert!(
+            nat64_embedded_ipv4_under_prefix(
+                "2001:db8::1".parse().unwrap(),
+                "2001:db8::".parse().unwrap(),
+                24,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn nat64_embedded_ipv4_under_any_only_matches_declared_prefixes() {
+        let declared = [Nat64Prefix {
+            prefix: "2001:db8:64::".parse().unwrap(),
+            len: 96,
+        }];
+        assert_eq!(
+            nat64_embedded_ipv4_under_any("2001:db8:64::a00:1".parse().unwrap(), &declared),
+            Some(Ipv4Addr::new(10, 0, 0, 1)),
+        );
+        // The same tail under an undeclared prefix is not a NAT64 form.
+        assert_eq!(
+            nat64_embedded_ipv4_under_any("2001:db8:65::a00:1".parse().unwrap(), &declared),
+            None,
+        );
+        // No declared prefixes -> nothing is classified.
+        assert_eq!(
+            nat64_embedded_ipv4_under_any("2001:db8:64::a00:1".parse().unwrap(), &[]),
+            None,
+        );
+    }
+
+    #[test]
+    fn rfc8215_local_use_prefix_embeddings_classify_by_declared_length() {
+        // 64:ff9b:1::/48 is reserved for local-use translation (RFC 8215); when
+        // an operator declares it, the RFC 6052 §2.2 /48 layout is extracted so
+        // a DNS64-synthesized private/metadata target is not treated as global.
+        let declared = [Nat64Prefix {
+            prefix: "64:ff9b:1::".parse().unwrap(),
+            len: 48,
+        }];
+        assert_eq!(
+            nat64_embedded_ipv4_under_any("64:ff9b:1:a00:0:100::".parse().unwrap(), &declared),
+            Some(Ipv4Addr::new(10, 0, 0, 1)),
+        );
+        assert_eq!(
+            nat64_embedded_ipv4_under_any("64:ff9b:1:a9fe:a9:fe00::".parse().unwrap(), &declared),
+            Some(Ipv4Addr::new(169, 254, 169, 254)),
+        );
+        assert_eq!(
+            nat64_embedded_ipv4_under_any("64:ff9b:1:7f00:0:100::".parse().unwrap(), &declared),
+            Some(Ipv4Addr::new(127, 0, 0, 1)),
+        );
     }
 }

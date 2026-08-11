@@ -1242,15 +1242,23 @@ pub fn all_tools_with_runtime(
         .as_deref()
         .is_some_and(|u| !u.trim().is_empty())
     {
-        // The allowlist is resolved from canonical config at use time (live
-        // handle when present, snapshot fallback otherwise) — the same seam
-        // `image_gen` and `AgentPeerGroupResolver` use — so the tool never
-        // retains a second policy copy that goes stale on a `config/set`.
+        // The allowlist and the declared NAT64 prefixes are resolved from
+        // canonical config at use time (live handle when present, snapshot
+        // fallback otherwise) — the same seam `image_gen` and
+        // `AgentPeerGroupResolver` use — so the tool never retains a second
+        // policy copy that goes stale on a `config/set`.
         let allowlist_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
             if let Some(live) = live_config.clone() {
                 Arc::new(move || live.read().file_download.allowed_private_hosts.clone())
             } else {
                 let snapshot = root_config.file_download.allowed_private_hosts.clone();
+                Arc::new(move || snapshot.clone())
+            };
+        let nat64_prefixes_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
+            if let Some(live) = live_config.clone() {
+                Arc::new(move || live.read().file_download.nat64_prefixes.clone())
+            } else {
+                let snapshot = root_config.file_download.nat64_prefixes.clone();
                 Arc::new(move || snapshot.clone())
             };
         tool_arcs.push(Arc::new(
@@ -1259,6 +1267,7 @@ pub fn all_tools_with_runtime(
                 root_config.file_download.clone(),
                 persistent_writes,
                 move || allowlist_resolver(),
+                move || nat64_prefixes_resolver(),
             ),
         ));
     }

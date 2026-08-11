@@ -43,6 +43,13 @@ pub struct FileDownloadTool {
     /// never retains a stale policy copy per the single-source-of-truth rule
     /// (AGENTS.md).
     allowed_private_hosts_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    /// Resolves `nat64_prefixes` (operator-declared network-specific RFC 6052
+    /// NAT64/DNS64 translation prefixes) from the canonical config at use time.
+    /// Wired to the live `Config` handle by the channel daemon so a `config/set`
+    /// that adds or removes a declared prefix takes effect on the next dispatch;
+    /// one-shot callers fall back to the construction-time snapshot. Mirrors
+    /// `allowed_private_hosts_resolver`.
+    nat64_prefixes_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     /// DNS resolver seam, injectable so tests can observe that a rejected
     /// dispatch performs zero resolver I/O. Defaults to [`resolve_endpoint_ips`].
     endpoint_resolver: EndpointResolver,
@@ -74,10 +81,12 @@ impl FileDownloadTool {
         persistent_writes: bool,
     ) -> Self {
         let snapshot = config.allowed_private_hosts.clone();
+        let snapshot_prefixes = config.nat64_prefixes.clone();
         Self {
             security,
             config,
             allowed_private_hosts_resolver: Arc::new(move || snapshot.clone()),
+            nat64_prefixes_resolver: Arc::new(move || snapshot_prefixes.clone()),
             endpoint_resolver: default_endpoint_resolver(),
             persistent_writes,
         }
@@ -91,19 +100,22 @@ impl FileDownloadTool {
     ///
     /// The tool therefore never holds a second policy copy that can go stale,
     /// per the repository's single-source-of-truth rule (AGENTS.md).
-    pub fn new_with_persistence_and_resolver<F>(
+    pub fn new_with_persistence_and_resolver<F, P>(
         security: Arc<SecurityPolicy>,
         config: FileDownloadConfig,
         persistent_writes: bool,
         allowed_private_hosts_resolver: F,
+        nat64_prefixes_resolver: P,
     ) -> Self
     where
         F: Fn() -> Vec<String> + Send + Sync + 'static,
+        P: Fn() -> Vec<String> + Send + Sync + 'static,
     {
         Self {
             security,
             config,
             allowed_private_hosts_resolver: Arc::new(allowed_private_hosts_resolver),
+            nat64_prefixes_resolver: Arc::new(nat64_prefixes_resolver),
             endpoint_resolver: default_endpoint_resolver(),
             persistent_writes,
         }
@@ -114,20 +126,23 @@ impl FileDownloadTool {
     /// forbidding resolver to prove a rejected dispatch performs zero resolver
     /// I/O; production callers use the default [`resolve_endpoint_ips`].
     #[cfg(test)]
-    fn new_with_endpoint_resolver<F>(
+    fn new_with_endpoint_resolver<F, P>(
         security: Arc<SecurityPolicy>,
         config: FileDownloadConfig,
         persistent_writes: bool,
         allowed_private_hosts_resolver: F,
+        nat64_prefixes_resolver: P,
         endpoint_resolver: EndpointResolver,
     ) -> Self
     where
         F: Fn() -> Vec<String> + Send + Sync + 'static,
+        P: Fn() -> Vec<String> + Send + Sync + 'static,
     {
         Self {
             security,
             config,
             allowed_private_hosts_resolver: Arc::new(allowed_private_hosts_resolver),
+            nat64_prefixes_resolver: Arc::new(nat64_prefixes_resolver),
             endpoint_resolver,
             persistent_writes,
         }
@@ -165,7 +180,8 @@ impl FileDownloadTool {
         // `policy_host` is retained only for allowlist comparison + diagnostics.
         let resolved_addrs = (self.endpoint_resolver)(transport_host.to_string(), port).await?;
         let allowed = normalize_allowed_private_hosts(&(self.allowed_private_hosts_resolver)());
-        ssrf_check_endpoint(&policy_host, &resolved_addrs, &allowed)?;
+        let declared_prefixes = normalize_nat64_prefixes(&(self.nat64_prefixes_resolver)());
+        ssrf_check_endpoint(&policy_host, &resolved_addrs, &allowed, &declared_prefixes)?;
         // Return transport_host for resolve_to_addrs binding — this preserves
         // the exact hostname spelling (including trailing dot) that reqwest
         // will use as the key for its resolver override.
@@ -364,6 +380,24 @@ async fn resolve_endpoint_ips(host: &str, port: u16) -> Result<Vec<std::net::Soc
     Ok(addrs)
 }
 
+/// The IPv4 embedded in `ip` under any operator-declared network-specific
+/// NAT64 prefix, or `None` when it is not a clean IPv4-embedded form.
+///
+/// A network-specific prefix (RFC 8215 local-use `64:ff9b:1::/48`, or any
+/// operator-assigned prefix) cannot be detected from an address alone, so the
+/// declared-prefix set is the only source of truth for canonicalization.
+fn declared_nat64_embedded_v4(
+    ip: std::net::IpAddr,
+    prefixes: &[zeroclaw_infra::net_guard::Nat64Prefix],
+) -> Option<std::net::Ipv4Addr> {
+    match ip {
+        std::net::IpAddr::V6(v6) => {
+            zeroclaw_infra::net_guard::nat64_embedded_ipv4_under_any(v6, prefixes)
+        }
+        std::net::IpAddr::V4(_) => None,
+    }
+}
+
 /// Apply the shared SSRF policy. `policy_host` is canonical (no trailing dot)
 /// for allowlist comparison. `resolved_addrs` are the IPs for that policy host.
 /// The function preserves the operator-visibility audit signal: a WARN log on
@@ -382,6 +416,7 @@ fn ssrf_check_endpoint(
     policy_host: &str,
     resolved_addrs: &[std::net::SocketAddr],
     allowed_hosts: &[String],
+    nat64_prefixes: &[zeroclaw_infra::net_guard::Nat64Prefix],
 ) -> Result<(), String> {
     let ips: Vec<std::net::IpAddr> = resolved_addrs.iter().map(|sa| sa.ip()).collect();
     let private_allowed = domain_guard::host_matches_allowlist(policy_host, allowed_hosts);
@@ -391,11 +426,20 @@ fn ssrf_check_endpoint(
     // `file_download.allowed_private_hosts` documents that the carve-out never
     // lifts the metadata exclusion). Surface a DISTINCT error with no allowlist
     // suggestion — the generic private-host message would tell the operator to
-    // add a host that cannot be enabled.
-    if let Some(metadata_ip) = ips
-        .iter()
-        .find(|ip| domain_guard::is_cloud_metadata_ip(**ip))
-    {
+    // add a host that cannot be enabled. The shared classifier covers the
+    // built-in `64:ff9b::/96` well-known prefix; a declared network-specific
+    // prefix is canonicalized to its embedded IPv4 first, so a DNS64 answer
+    // under it can never reach a metadata/credential endpoint either.
+    let metadata_hit = ips.iter().find_map(|ip| {
+        if domain_guard::is_cloud_metadata_ip(*ip) {
+            Some((*ip, *ip))
+        } else {
+            declared_nat64_embedded_v4(*ip, nat64_prefixes)
+                .filter(|v4| domain_guard::is_cloud_metadata_ip(std::net::IpAddr::V4(*v4)))
+                .map(|v4| (*ip, std::net::IpAddr::V4(v4)))
+        }
+    });
+    if let Some((raw_ip, metadata_ip)) = metadata_hit {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
@@ -403,7 +447,7 @@ fn ssrf_check_endpoint(
                 .with_attrs(::serde_json::json!({
                     "tool": "file_download",
                     "host": policy_host,
-                    "ip": metadata_ip.to_string(),
+                    "ip": raw_ip.to_string(),
                 })),
             "file_download: rejected cloud metadata/credential endpoint host"
         );
@@ -420,7 +464,21 @@ fn ssrf_check_endpoint(
     let validation_err = if private_allowed {
         domain_guard::validate_resolved_ips_exclude_metadata(policy_host, &ips)
     } else {
-        domain_guard::validate_resolved_ips_are_public(policy_host, &ips)
+        // Operator-declared network-specific NAT64 prefixes: a DNS64 answer
+        // under one of them embedding a non-global IPv4 is rejected like the
+        // well-known `64:ff9b::/96` form (which the shared validator covers).
+        // The remediation is identical — allowlist the internal host — so the
+        // error flows through the same private-host path below.
+        match ips.iter().find_map(|ip| {
+            declared_nat64_embedded_v4(*ip, nat64_prefixes)
+                .filter(|v4| domain_guard::is_non_global_v4(*v4))
+                .map(|v4| (*ip, v4))
+        }) {
+            Some((ip, v4)) => Err(anyhow::Error::msg(format!(
+                "Blocked host '{policy_host}' resolved to non-global address {ip} (declared NAT64 prefix embeds {v4})"
+            ))),
+            None => domain_guard::validate_resolved_ips_are_public(policy_host, &ips),
+        }
     }
     .err();
 
@@ -452,7 +510,11 @@ fn ssrf_check_endpoint(
     // accurate.
     let resolved_uses_private = ips.iter().any(|ip| match ip {
         std::net::IpAddr::V4(v4) => domain_guard::is_non_global_v4(*v4),
-        std::net::IpAddr::V6(v6) => domain_guard::is_non_global_v6(*v6),
+        std::net::IpAddr::V6(v6) => {
+            domain_guard::is_non_global_v6(*v6)
+                || declared_nat64_embedded_v4(std::net::IpAddr::V6(*v6), nat64_prefixes)
+                    .is_some_and(domain_guard::is_non_global_v4)
+        }
     });
 
     if private_allowed && resolved_uses_private {
@@ -504,6 +566,39 @@ fn normalize_allowed_private_hosts(allowed: &[String]) -> Vec<String> {
 /// once per process. Drops the per-dispatch noise that would otherwise
 /// flood logs for a permanently-misconfigured entry.
 static NORMALIZE_WARNING_EMITTED: OnceLock<()> = OnceLock::new();
+
+/// Per-dispatch normalization of the canonical `config.nat64_prefixes` Vec.
+/// Parses each IPv6 CIDR into a [`Nat64Prefix`] (RFC 6052 §2.2 lengths only).
+/// On any malformed entry, emits a once-per-process WARN and falls back to an
+/// empty list — the well-known `64:ff9b::/96` prefix is still built into the
+/// shared classifiers, so a config typo narrows rather than widens the gate.
+/// Mirrors [`normalize_allowed_private_hosts`]'s fail-closed posture.
+fn normalize_nat64_prefixes(raw: &[String]) -> Vec<zeroclaw_infra::net_guard::Nat64Prefix> {
+    let parsed: Vec<_> = raw
+        .iter()
+        .filter_map(|s| zeroclaw_infra::net_guard::parse_nat64_prefix(s))
+        .collect();
+    if parsed.len() == raw.len() {
+        return parsed;
+    }
+    NORMALIZE_NAT64_WARNING_EMITTED.get_or_init(|| {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "tool": "file_download",
+                    "config_key": "file_download.nat64_prefixes",
+                })),
+            "file_download: failed to normalize nat64_prefixes; using empty list"
+        );
+    });
+    Vec::new()
+}
+
+/// Set by [`normalize_nat64_prefixes`] the first time a declared prefix fails
+/// to parse, so the WARN fires at most once per process.
+static NORMALIZE_NAT64_WARNING_EMITTED: OnceLock<()> = OnceLock::new();
 
 /// Build the reqwest client used to fetch the configured endpoint. The
 /// validated `(transport_host, resolved_addrs)` pair from
@@ -968,11 +1063,13 @@ mod tests {
             },
         );
         let snapshot = config.allowed_private_hosts.clone();
+        let snapshot_prefixes = config.nat64_prefixes.clone();
         FileDownloadTool::new_with_endpoint_resolver(
             security,
             config,
             true,
             move || snapshot.clone(),
+            move || snapshot_prefixes.clone(),
             endpoint_resolver,
         )
     }
@@ -1876,6 +1973,7 @@ mod tests {
             ..FileDownloadConfig::default()
         };
         let snapshot = config.allowed_private_hosts.clone();
+        let snapshot_prefixes = config.nat64_prefixes.clone();
         let endpoint_resolver: EndpointResolver = Arc::new({
             let captured = Arc::clone(&captured);
             move |host: String, port: u16| -> Pin<Box<dyn Future<Output = ResolveResult> + Send>> {
@@ -1893,6 +1991,7 @@ mod tests {
             config,
             true,
             move || snapshot.clone(),
+            move || snapshot_prefixes.clone(),
             endpoint_resolver,
         );
         let (transport, addrs) = tool
@@ -1935,6 +2034,7 @@ mod tests {
         let captured = Arc::new(std::sync::Mutex::new(String::new()));
         let bound = *server.address();
         let snapshot = config.allowed_private_hosts.clone();
+        let snapshot_prefixes = config.nat64_prefixes.clone();
         let endpoint_resolver: EndpointResolver = Arc::new({
             let captured = Arc::clone(&captured);
             move |host: String, _port: u16| -> Pin<Box<dyn Future<Output = ResolveResult> + Send>> {
@@ -1947,6 +2047,7 @@ mod tests {
             config,
             true,
             move || snapshot.clone(),
+            move || snapshot_prefixes.clone(),
             endpoint_resolver,
         );
 
@@ -2151,6 +2252,7 @@ mod tests {
             "public-looking.example.com",
             &[std::net::SocketAddr::from(([10, 0, 0, 5], 80))],
             &[],
+            &[],
         )
         .expect_err("private IP without opt-in must be rejected");
         assert!(
@@ -2169,6 +2271,7 @@ mod tests {
             "public-looking.example.com",
             &[std::net::SocketAddr::from(([10, 0, 0, 5], 80))],
             &["public-looking.example.com".into()],
+            &[],
         )
         .expect("allowlisted hostname with non-metadata private IP must pass");
 
@@ -2177,6 +2280,7 @@ mod tests {
         ssrf_check_endpoint(
             "public-looking.example.com",
             &[std::net::SocketAddr::from(([8, 8, 8, 8], 443))],
+            &[],
             &[],
         )
         .expect("public-IP hostname must pass without opt-in");
@@ -2194,6 +2298,7 @@ mod tests {
             "metadata.example.com",
             &[std::net::SocketAddr::from(([169, 254, 169, 254], 80))],
             &["*".into()],
+            &[],
         )
         .expect_err("metadata address must be rejected even under a wildcard allowlist");
         assert!(
@@ -2217,6 +2322,7 @@ mod tests {
         let err2 = ssrf_check_endpoint(
             "eks-credentials.example.com",
             &[std::net::SocketAddr::from(([169, 254, 170, 23], 80))],
+            &[],
             &[],
         )
         .expect_err("EKS credential address must be rejected");
@@ -2244,7 +2350,7 @@ mod tests {
             ("64:ff9b::a9fe:1", "link-local.example.com"), // embeds 169.254.0.1
         ] {
             let addr = std::net::SocketAddr::new(ip.parse().unwrap(), 80);
-            let err = ssrf_check_endpoint(host, &[addr], &[])
+            let err = ssrf_check_endpoint(host, &[addr], &[], &[])
                 .expect_err("empty allowlist must reject a NAT64-synthesized non-global target");
             let msg = err.to_lowercase();
             assert!(
@@ -2260,8 +2366,161 @@ mod tests {
         // (64:ff9b::808:808 embeds 8.8.8.8) reaches the same public endpoint
         // as the IPv4 form and must NOT be rejected.
         let public_addr = std::net::SocketAddr::new("64:ff9b::808:808".parse().unwrap(), 443);
-        ssrf_check_endpoint("public.example.com", &[public_addr], &[])
+        ssrf_check_endpoint("public.example.com", &[public_addr], &[], &[])
             .expect("NAT64 embedding a public IPv4 must pass without opt-in");
+    }
+
+    /// Operator-declared network-specific NAT64 prefix (RFC 6052 §2.2): a
+    /// DNS64 answer under a declared prefix embedding a non-global IPv4 must
+    /// be rejected on the empty-allowlist public path, exactly like the
+    /// built-in `64:ff9b::/96` well-known form. Unlike the well-known prefix,
+    /// a network-specific prefix cannot be detected from an address alone, so
+    /// this only closes the path once the operator declares it.
+    #[test]
+    fn ssrf_check_endpoint_rejects_declared_nat64_non_global_without_opt_in() {
+        let prefixes = [zeroclaw_infra::net_guard::Nat64Prefix {
+            prefix: "64:ff9b:1::".parse().unwrap(),
+            len: 48,
+        }];
+        // RFC 6052 §2.2 /48 embedding: bytes 6-7 + u + bytes 9-10.
+        for (ip, host) in [
+            ("64:ff9b:1:a00:0:100::", "internal.example.com"), // embeds 10.0.0.1
+            ("64:ff9b:1:7f00:0:100::", "loopback.example.com"), // embeds 127.0.0.1
+            ("64:ff9b:1:a9fe:0:100::", "link-local.example.com"), // embeds 169.254.0.1
+        ] {
+            let addr = std::net::SocketAddr::new(ip.parse().unwrap(), 80);
+            let err = ssrf_check_endpoint(host, &[addr], &[], &prefixes)
+                .expect_err("declared NAT64 prefix embedding a non-global target must be rejected");
+            let msg = err.to_lowercase();
+            assert!(
+                msg.contains("private")
+                    || msg.contains("non-global")
+                    || msg.contains("loopback")
+                    || msg.contains("link-local"),
+                "declared NAT64 target {ip} ({host}) must be rejected on the public path; got: {err}"
+            );
+        }
+    }
+
+    /// Declared-prefix metadata: an address under a declared prefix embedding
+    /// a metadata/credential IPv4 must be rejected EVEN when the host is
+    /// allowlisted — the carve-out never lifts the metadata exclusion, so a
+    /// DNS64 answer cannot route the gate to EC2 IMDS / ECS / EKS.
+    #[test]
+    fn ssrf_check_endpoint_rejects_declared_nat64_metadata_even_allowlisted() {
+        let prefixes = [zeroclaw_infra::net_guard::Nat64Prefix {
+            prefix: "64:ff9b:1::".parse().unwrap(),
+            len: 48,
+        }];
+        // 64:ff9b:1:a9fe:a9:fe00:: embeds 169.254.169.254 (EC2 IMDS).
+        let addr = std::net::SocketAddr::new("64:ff9b:1:a9fe:a9:fe00::".parse().unwrap(), 80);
+        for allowed in [
+            &["*".to_string()][..],
+            &["corp.example.com".to_string()][..],
+        ] {
+            let err = ssrf_check_endpoint("corp.example.com", &[addr], allowed, &prefixes)
+                .expect_err("declared NAT64 metadata must be rejected even under an allowlist");
+            assert!(
+                err.contains("cloud metadata") || err.contains("credential"),
+                "must be operator-visible as metadata; got: {err}"
+            );
+        }
+    }
+
+    /// Declared-prefix positive control + allowlist carve-out: a declared
+    /// prefix embedding a public IPv4 passes without opt-in; embedding a
+    /// private IPv4 is admitted only once the host is allowlisted (the same
+    /// carve-out the well-known form has).
+    #[test]
+    fn ssrf_check_endpoint_declared_nat64_public_and_carveout() {
+        // Declared prefix must be in genuine global unicast space: the base
+        // validator flags `2001:db8::/32` (RFC 3849 documentation) as
+        // non-global before NAT64 logic runs, which would mask this control.
+        let prefixes = [zeroclaw_infra::net_guard::Nat64Prefix {
+            prefix: "2606:4700:64::".parse().unwrap(),
+            len: 96,
+        }];
+        // 2606:4700:64::808:808 embeds 8.8.8.8 (public).
+        let public_addr = std::net::SocketAddr::new("2606:4700:64::808:808".parse().unwrap(), 443);
+        ssrf_check_endpoint("public.example.com", &[public_addr], &[], &prefixes)
+            .expect("declared NAT64 embedding a public IPv4 must pass without opt-in");
+
+        // 2606:4700:64::a00:1 embeds 10.0.0.1 (RFC 1918).
+        let private_addr = std::net::SocketAddr::new("2606:4700:64::a00:1".parse().unwrap(), 80);
+        ssrf_check_endpoint("internal.example.com", &[private_addr], &[], &prefixes)
+            .expect_err("declared NAT64 private target without opt-in must be rejected");
+        // Allowlisted hostname → admitted via the carve-out.
+        ssrf_check_endpoint(
+            "internal.example.com",
+            &[private_addr],
+            &["internal.example.com".into()],
+            &prefixes,
+        )
+        .expect("allowlisted hostname resolving through a declared NAT64 prefix must pass");
+    }
+
+    /// Negative control / explicit policy boundary: without declaring the
+    /// prefix, the same synthesized address is ordinary address space — the
+    /// gate cannot (and must not claim to) detect a network-specific prefix it
+    /// was not told about. This pins the operator-facing contract rather than
+    /// silently admitting the target as "SSRF-safe".
+    #[test]
+    fn ssrf_check_endpoint_undeclared_prefix_is_ordinary_address_space() {
+        // 64:ff9b:1:a00:0:100:: embeds 10.0.0.1 under the RFC 8215 local-use
+        // prefix, but with NO declared prefixes the shared well-known-only
+        // classifier treats it as globally routable.
+        let addr = std::net::SocketAddr::new("64:ff9b:1:a00:0:100::".parse().unwrap(), 80);
+        ssrf_check_endpoint("internal.example.com", &[addr], &[], &[])
+            .expect("undeclared network-specific prefix is outside auto-detection");
+    }
+
+    /// Production dispatch boundary: the declared-prefix resolver threaded
+    /// through the tool must reach `validate_endpoint_host`, so the real entry
+    /// point (not just the helper) rejects a DNS64 answer under a declared
+    /// prefix without any opt-in.
+    #[tokio::test]
+    async fn validate_endpoint_host_rejects_declared_nat64_non_global_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = FileDownloadConfig {
+            url: Some("http://internal.example.com/x".into()),
+            nat64_prefixes: vec!["64:ff9b:1::/48".into()],
+            ..FileDownloadConfig::default()
+        };
+        let snapshot_prefixes = config.nat64_prefixes.clone();
+        // The injected resolver answers with a DNS64-synthesized address under
+        // the declared 64:ff9b:1::/48 prefix embedding 10.0.0.1.
+        let endpoint_resolver: EndpointResolver = Arc::new(
+            move |_host: String,
+                  port: u16|
+                  -> Pin<Box<dyn Future<Output = ResolveResult> + Send>> {
+                Box::pin(async move {
+                    Ok(vec![std::net::SocketAddr::new(
+                        "64:ff9b:1:a00:0:100::".parse().unwrap(),
+                        port,
+                    )])
+                })
+            },
+        );
+        let tool = FileDownloadTool::new_with_endpoint_resolver(
+            test_security(tmp.path().to_path_buf(), AutonomyLevel::Full),
+            config,
+            true,
+            Vec::<String>::new,
+            move || snapshot_prefixes.clone(),
+            endpoint_resolver,
+        );
+        let err = tool
+            .validate_endpoint_host("http://internal.example.com/x")
+            .await
+            .unwrap_err();
+        let msg = err.to_lowercase();
+        assert!(
+            msg.contains("private")
+                || msg.contains("non-global")
+                || msg.contains("loopback")
+                || msg.contains("link-local"),
+            "dispatch must reject a declared-prefix NAT64 target; got: {err}"
+        );
     }
 
     /// Operator-visibility contract for the SSRF audit events: every blocked
@@ -2283,6 +2542,7 @@ mod tests {
             "blocked.example.com",
             &[std::net::SocketAddr::from(([10, 0, 0, 5], 80))],
             &[],
+            &[],
         )
         .expect_err("private IP without opt-in must be rejected");
 
@@ -2292,6 +2552,7 @@ mod tests {
             "corp-files.example.com",
             &[std::net::SocketAddr::from(([10, 0, 0, 9], 80))],
             &["corp-files.example.com".into()],
+            &[],
         )
         .expect("allowlisted private resolve must pass");
 
@@ -2301,6 +2562,7 @@ mod tests {
             "public.example.com",
             &[std::net::SocketAddr::from(([8, 8, 8, 8], 443))],
             &["*".into()],
+            &[],
         )
         .expect("public IP must pass");
 
@@ -2788,6 +3050,7 @@ mod tests {
         }));
 
         let resolver_live = Arc::clone(&live);
+        let resolver_live_nat64 = Arc::clone(&resolver_live);
         let tool = FileDownloadTool::new_with_persistence_and_resolver(
             test_security(tmp.path().to_path_buf(), AutonomyLevel::Full),
             FileDownloadConfig {
@@ -2801,6 +3064,13 @@ mod tests {
                     .read()
                     .file_download
                     .allowed_private_hosts
+                    .clone()
+            },
+            move || {
+                resolver_live_nat64
+                    .read()
+                    .file_download
+                    .nat64_prefixes
                     .clone()
             },
         );
