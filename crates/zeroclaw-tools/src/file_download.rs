@@ -180,7 +180,7 @@ impl FileDownloadTool {
         // `policy_host` is retained only for allowlist comparison + diagnostics.
         let resolved_addrs = (self.endpoint_resolver)(transport_host.to_string(), port).await?;
         let allowed = normalize_allowed_private_hosts(&(self.allowed_private_hosts_resolver)());
-        let declared_prefixes = normalize_nat64_prefixes(&(self.nat64_prefixes_resolver)());
+        let declared_prefixes = normalize_nat64_prefixes(&(self.nat64_prefixes_resolver)())?;
         ssrf_check_endpoint(&policy_host, &resolved_addrs, &allowed, &declared_prefixes)?;
         // Return transport_host for resolve_to_addrs binding — this preserves
         // the exact hostname spelling (including trailing dot) that reqwest
@@ -604,36 +604,34 @@ static NORMALIZE_WARNING_EMITTED: OnceLock<()> = OnceLock::new();
 
 /// Per-dispatch normalization of the canonical `config.nat64_prefixes` Vec.
 /// Parses each IPv6 CIDR into a [`Nat64Prefix`] (RFC 6052 §2.2 lengths only).
-/// On any malformed entry, emits a once-per-process WARN and falls back to an
-/// empty list — the well-known `64:ff9b::/96` prefix is still built into the
-/// shared classifiers, so a config typo narrows rather than widens the gate.
-/// Mirrors [`normalize_allowed_private_hosts`]'s fail-closed posture.
-fn normalize_nat64_prefixes(raw: &[String]) -> Vec<zeroclaw_infra::net_guard::Nat64Prefix> {
-    let parsed: Vec<_> = raw
-        .iter()
-        .filter_map(|s| zeroclaw_infra::net_guard::parse_nat64_prefix(s))
-        .collect();
-    if parsed.len() == raw.len() {
-        return parsed;
+/// A malformed entry fails the whole dispatch with an actionable, field-specific
+/// error. It must NOT fall back to an empty list: an empty declaration set
+/// treats every network-specific prefix as undeclared ordinary address space
+/// (the schema contract at `config.nat64_prefixes`), which would remove the
+/// declared-prefix policy at the SSRF boundary — a fail-open. The empty
+/// allowlist posture of [`normalize_allowed_private_hosts`] is fail-closed
+/// there (empty = reject every private host), but it is the wrong fail-closed
+/// state for a *prefix declaration*.
+fn normalize_nat64_prefixes(
+    raw: &[String],
+) -> Result<Vec<zeroclaw_infra::net_guard::Nat64Prefix>, String> {
+    let mut parsed = Vec::with_capacity(raw.len());
+    for entry in raw {
+        match zeroclaw_infra::net_guard::parse_nat64_prefix(entry) {
+            Some(p) => parsed.push(p),
+            None => {
+                return Err(tool_msg_with_args(
+                    "tool-file-download-error-invalid-nat64-prefix",
+                    &[
+                        ("prefix", entry),
+                        ("config_key", "file_download.nat64_prefixes"),
+                    ],
+                ));
+            }
+        }
     }
-    NORMALIZE_NAT64_WARNING_EMITTED.get_or_init(|| {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({
-                    "tool": "file_download",
-                    "config_key": "file_download.nat64_prefixes",
-                })),
-            "file_download: failed to normalize nat64_prefixes; using empty list"
-        );
-    });
-    Vec::new()
+    Ok(parsed)
 }
-
-/// Set by [`normalize_nat64_prefixes`] the first time a declared prefix fails
-/// to parse, so the WARN fires at most once per process.
-static NORMALIZE_NAT64_WARNING_EMITTED: OnceLock<()> = OnceLock::new();
 
 /// Build the reqwest client used to fetch the configured endpoint. The
 /// validated `(transport_host, resolved_addrs)` pair from
@@ -2651,6 +2649,57 @@ mod tests {
                 || msg.contains("loopback")
                 || msg.contains("link-local"),
             "dispatch must reject a declared-prefix NAT64 target; got: {err}"
+        );
+    }
+
+    /// Fail-closed contract for `config.nat64_prefixes`: a malformed entry must
+    /// reject the dispatch with a field-specific configuration error instead of
+    /// silently dropping the whole declared list. An empty list treats every
+    /// network-specific prefix as undeclared ordinary address space, which would
+    /// remove the declared-prefix SSRF policy (a fail-open). Reverting
+    /// `normalize_nat64_prefixes` to a `filter_map` empty fallback fails this
+    /// test: the mixed valid/malformed configuration would then let the
+    /// synthesized private target (10.0.0.1 under `64:ff9b:1::/48`) pass as
+    /// ordinary public IPv6.
+    #[tokio::test]
+    async fn validate_endpoint_host_rejects_malformed_nat64_prefixes_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = FileDownloadConfig {
+            url: Some("http://internal.example.com/x".into()),
+            nat64_prefixes: vec!["64:ff9b:1::/48".into(), "not-a-cidr".into()],
+            ..FileDownloadConfig::default()
+        };
+        let snapshot_prefixes = config.nat64_prefixes.clone();
+        // The injected resolver answers with a DNS64-synthesized address under
+        // the VALID declared 64:ff9b:1::/48 prefix embedding 10.0.0.1 — so a
+        // filter_map fallback would classify it as ordinary public IPv6.
+        let endpoint_resolver: EndpointResolver = Arc::new(
+            move |_host: String,
+                  port: u16|
+                  -> Pin<Box<dyn Future<Output = ResolveResult> + Send>> {
+                Box::pin(async move {
+                    Ok(vec![std::net::SocketAddr::new(
+                        "64:ff9b:1:a00:0:100::".parse().unwrap(),
+                        port,
+                    )])
+                })
+            },
+        );
+        let tool = FileDownloadTool::new_with_endpoint_resolver(
+            test_security(tmp.path().to_path_buf(), AutonomyLevel::Full),
+            config,
+            true,
+            Vec::<String>::new,
+            move || snapshot_prefixes.clone(),
+            endpoint_resolver,
+        );
+        let err = tool
+            .validate_endpoint_host("http://internal.example.com/x")
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("nat64_prefixes") && err.contains("not-a-cidr"),
+            "dispatch must reject the malformed nat64_prefixes entry with a field-specific error; got: {err}"
         );
     }
 

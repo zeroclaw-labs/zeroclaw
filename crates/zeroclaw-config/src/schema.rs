@@ -9089,7 +9089,10 @@ pub struct FileDownloadConfig {
     /// declared; undeclared prefixes are ordinary address space and the gate
     /// does not claim SSRF safety for them. Only the RFC 6052 §2.2 prefix
     /// lengths (32, 40, 48, 56, 64, 96) are accepted; a malformed entry fails
-    /// the whole list closed to empty.
+    /// the whole list and the gate rejects the dispatch with a field-specific
+    /// error, because falling back to an empty list would silently treat every
+    /// declared prefix as undeclared ordinary address space and remove the
+    /// network-specific SSRF policy.
     #[serde(default)]
     pub nat64_prefixes: Vec<String>,
 }
