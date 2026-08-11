@@ -37,7 +37,7 @@
 
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
-use dialoguer::{Password, Select};
+use dialoguer::Select;
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 use std::io::{BufRead, ErrorKind, Read, Write};
@@ -139,6 +139,32 @@ fn ta(key: &str, args: &[(&str, &str)], fallback: &str) -> String {
     }
 }
 
+/// Interactive secret prompt with pre-submit feedback.
+///
+/// The value stays hidden, but the prompt shows a bounded mask once the input
+/// buffer becomes non-empty.
+#[cfg(feature = "agent-runtime")]
+fn secret_prompt(prompt_text: &str, allow_empty: bool) -> Result<String> {
+    use std::io::IsTerminal;
+
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        bail!(ta(
+            "cli-secret-needs-tty",
+            &[],
+            "Secret input requires a terminal on stdin and stderr."
+        ));
+    }
+
+    let value = cli_input::SecretInput::new()
+        .with_prompt(prompt_text)
+        .interact()?;
+    if allow_empty || !value.trim().is_empty() {
+        Ok(value)
+    } else {
+        bail!(ta("cli-secret-empty", &[], "Value cannot be empty."))
+    }
+}
+
 #[cfg(feature = "agent-runtime")]
 fn qta(key: &str, args: &[(&str, &str)]) -> String {
     zeroclaw_runtime::i18n::get_required_cli_string_with_args(key, args)
@@ -183,18 +209,25 @@ fn json_value_to_setprop_string(
     value: &serde_json::Value,
     config: &Config,
     path: &str,
+    op_index: usize,
+    json: bool,
 ) -> Result<String> {
     let kind = config_patch_prop_kind(config, path);
-    zeroclaw_config::typed_value::coerce_for_set_prop(value, kind).map_err(|e| {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(::serde_json::json!({"path": path, "error": e.message.clone()})),
-            "config patch coercion rejected JSON value"
-        );
-        anyhow::Error::msg(e.message)
-    })
+    match zeroclaw_config::typed_value::coerce_for_set_prop(value, kind) {
+        Ok(value_str) => Ok(value_str),
+        Err(err) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"path": path, "error": err.message.clone()})),
+                "config patch coercion rejected JSON value"
+            );
+            let err = err.with_path(path).with_op_index(op_index);
+            let human = err.message.clone();
+            config_patch_fail_json_or_human(json, err, human)
+        }
+    }
 }
 
 fn config_patch_map_prop_error(err: anyhow::Error, path: &str, op_index: usize) -> ConfigApiError {
@@ -397,7 +430,8 @@ use config::Config;
 pub use zeroclaw::{
     AgentsCommands, ChannelCommands, ChannelsCommands, CronCommands, GatewayCommands,
     HardwareCommands, IntegrationCommands, MigrateCommands, PeripheralCommands, ProvidersCommands,
-    ServiceCommands, SkillBundleCommands, SkillCommands, SopCommands, SopGraphFormat,
+    ServiceCommands, ServiceLogStream, SkillBundleCommands, SkillCommands, SopCommands,
+    SopGraphFormat,
 };
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -766,9 +800,9 @@ an explicit IANA timezone.
 
 Examples:
   zeroclaw cron list
-  zeroclaw cron add '0 9 * * 1-5' 'Good morning' --tz America/New_York --agent
-  zeroclaw cron add '*/30 * * * *' 'Check system health' --agent
-  zeroclaw cron add '*/5 * * * *' 'echo ok'
+  zeroclaw cron add '0 9 * * 1-5' 'Good morning' --agent sentinel --prompt --tz America/New_York
+  zeroclaw cron add '*/30 * * * *' 'Check system health' --agent sentinel --prompt
+  zeroclaw cron add '*/5 * * * *' 'echo ok' --agent sentinel
   zeroclaw cron add-at 2025-01-15T14:00:00Z 'Send reminder' --agent
   zeroclaw cron add-every 60000 'Ping heartbeat'
   zeroclaw cron once 30m 'Run backup in 30 minutes' --agent
@@ -1236,7 +1270,7 @@ async fn run_quickstart_cli(
     api_key: Option<String>,
     agent: Option<String>,
 ) -> anyhow::Result<()> {
-    use dialoguer::{Confirm, Editor, FuzzySelect, Input, Password};
+    use dialoguer::{Confirm, Editor, FuzzySelect, Input};
     use zeroclaw_config::presets::{
         AgentIdentity, BuilderSubmission, ChannelQuickStart, MemoryChoice, ModelProviderChoice,
         RISK_PRESETS, SelectorChoice,
@@ -2522,6 +2556,19 @@ fn ensure_map_key_for_prop_path(config: &mut Config, prop_path: &str) -> Result<
         return Ok(false);
     };
 
+    // The alias already exists in the loaded config (e.g. a hyphenated cron
+    // alias the TOML loader accepts and `config get`/`config list` resolve):
+    // leave it alone. `create_map_key` applies the strict new-alias grammar,
+    // which would reject a valid loaded key. Mirror `Config::ensure_map_key_for_path`,
+    // which also skips creation for existing keys so alias validation runs only
+    // when auto-materializing a brand-new alias.
+    if config
+        .get_map_keys(section_path)
+        .is_some_and(|keys| keys.iter().any(|k| k == key))
+    {
+        return Ok(false);
+    }
+
     // Route through the shared `create_map_key_checked` (not raw
     // `create_map_key`) so this CLI path inherits the reserved `default`
     // agent guard from the one place it's defined, rather than re-deriving
@@ -2573,29 +2620,27 @@ fn prompt_for_field(
     desc: &zeroclaw_runtime::quickstart::FieldDescriptor,
     seed: Option<&str>,
 ) -> anyhow::Result<Option<String>> {
-    use dialoguer::{FuzzySelect, Input, Password};
+    use dialoguer::{FuzzySelect, Input};
     use zeroclaw_config::traits::PropKind;
     if !desc.help.is_empty() {
         println!("  {}", desc.help);
     }
     let prompt = desc.label.clone();
     if desc.is_secret {
-        // dialoguer 0.12 has no Esc-cancellable Password — only Ctrl+C
-        // (returns `ErrorKind::Interrupted` wrapped in `dialoguer::Error::IO`).
-        // Map that to `Ok(None)` so the caller treats it as "user backed
-        // out" instead of bubbling a confusing IO-error message.
-        match Password::new()
-            .with_prompt(prompt.clone())
-            .allow_empty_password(true)
-            .interact()
-        {
-            Ok(pw) => return Ok(Some(pw)),
+        match secret_prompt(&prompt, true) {
+            Ok(pw) => {
+                if !pw.is_empty() {
+                    eprintln!("{}", ta("cli-secret-received", &[], "  ✓ Secret received"));
+                }
+                return Ok(Some(pw));
+            }
             Err(e) => {
-                let io: std::io::Error = e.into();
-                if io.kind() == std::io::ErrorKind::Interrupted {
+                if e.downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::Interrupted)
+                {
                     return Ok(None);
                 }
-                return Err(io.into());
+                return Err(e);
             }
         }
     }
@@ -2626,7 +2671,7 @@ fn prompt_for_field(
         // field's true type (e.g. a bool) and rejects.
         input = input.default(d.to_string());
     }
-    // Same Ctrl+C-as-cancel mapping as the Password branch above.
+    // Same Ctrl+C-as-cancel mapping as the secret prompt branch above.
     match input.interact_text() {
         Ok(v) => Ok(Some(v)),
         Err(e) => {
@@ -3501,6 +3546,29 @@ async fn async_main(command: clap::Command) -> Result<()> {
         return Ok(());
     }
 
+    #[cfg(feature = "agent-runtime")]
+    if let Commands::Service {
+        service_command: ServiceCommands::RunLaunchdDaemon,
+        ..
+    } = &cli.command
+    {
+        let config_dir = cli
+            .config_dir
+            .as_deref()
+            .map(std::path::Path::new)
+            .context("launchd runner requires --config-dir")?;
+        return service::run_launchd_daemon(config_dir).await;
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    if let Commands::Service {
+        service_command: ServiceCommands::RunOpenrcLogWriter { stream },
+        ..
+    } = &cli.command
+    {
+        return service::run_openrc_log_writer(matches!(stream, ServiceLogStream::Stderr));
+    }
+
     // All other commands need config loaded first
     let mut config = Box::pin(Config::load_or_init()).await?;
     for section in config
@@ -3525,6 +3593,10 @@ async fn async_main(command: clap::Command) -> Result<()> {
     }
     #[cfg(feature = "agent-runtime")]
     observability::runtime_trace::init_from_config(&config.observability, &config.data_dir);
+    // Must follow the trace sink init above, or the record has no destination.
+    // The daemon reload arm calls the same helper against its reloaded config.
+    #[cfg(feature = "agent-runtime")]
+    warn_verifiable_intent_withheld(&config);
     #[cfg(feature = "agent-runtime")]
     if config.security.otp.enabled {
         let config_dir = config
@@ -4131,7 +4203,13 @@ async fn async_main(command: clap::Command) -> Result<()> {
             // config stops the warning and a freshly-degraded one starts it.
             let mut degraded_nag: Option<tokio::task::JoinHandle<()>> =
                 gate_security_posture(&current_config, allow_degraded_security)?;
+            let startup_feedback_enabled = !cli.verbose;
             loop {
+                if startup_feedback_enabled && daemon::stderr_is_interactive_foreground() {
+                    let mut stderr = std::io::stderr().lock();
+                    let _ = daemon::echo_daemon_starting_to_terminal(&mut stderr);
+                }
+
                 // Per-iteration clones so the subsystem closures (which
                 // `move`-capture) don't consume the outer bindings on the
                 // first iteration; reload would otherwise see a moved value.
@@ -4169,7 +4247,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 registry.register_gateway(Box::new({
                     let sop_e = sop_engine.clone();
                     let sop_a = sop_audit.clone();
-                    move |host, port, config, tx, reload_controls, tui_registry| {
+                    move |host, port, config, tx, reload_controls, tui_registry, ready_tx| {
                         let canvas_store = canvas_store_for_gateway.clone();
                         let sop_engine = sop_e.clone();
                         let sop_audit = sop_a.clone();
@@ -4184,6 +4262,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                                 Some(canvas_store),
                                 sop_engine,
                                 sop_audit,
+                                ready_tx,
                             ))
                             .await
                         })
@@ -4243,10 +4322,15 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     }
                 }));
 
-                registry.register_socket(Box::new(|ctx, cancel, client_count| {
+                registry.register_socket(Box::new(|ctx, cancel, client_count, ready_tx| {
                     Box::pin(async move {
-                        zeroclaw_runtime::rpc::local::run_local_listener(ctx, cancel, client_count)
-                            .await
+                        zeroclaw_runtime::rpc::local::run_local_listener(
+                            ctx,
+                            cancel,
+                            client_count,
+                            ready_tx,
+                        )
+                        .await
                     })
                 }));
 
@@ -4285,6 +4369,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     port,
                     registry,
                     ephemeral,
+                    startup_feedback_enabled,
                 ))
                 .await;
                 if let Some(handle) = sop_maintenance {
@@ -4308,6 +4393,11 @@ async fn async_main(command: clap::Command) -> Result<()> {
                             &current_config.observability,
                             &current_config.data_dir,
                         );
+                        // A reload applies config the process has not seen, so an
+                        // operator who just enabled the section learns why the tool
+                        // is still absent without having to restart.
+                        #[cfg(feature = "agent-runtime")]
+                        warn_verifiable_intent_withheld(&current_config);
                         if let Some(handle) = degraded_nag.take() {
                             handle.abort();
                         }
@@ -5432,10 +5522,12 @@ async fn async_main(command: clap::Command) -> Result<()> {
                             "  \u{26a0} {path} is an encrypted secret \u{2014} using masked input."
                         );
                     }
-                    let secret_value = dialoguer::Password::new()
-                        .with_prompt(format!("Enter value for {path}"))
-                        .interact()?;
-                    let secret_value = secret_value.trim().to_string();
+                    let secret_value = secret_prompt(&format!("Enter value for {path}"), false)?
+                        .trim()
+                        .to_string();
+                    if !secret_value.is_empty() {
+                        eprintln!("{}", ta("cli-secret-received", &[], "  ✓ Secret received"));
+                    }
                     if secret_value.is_empty() {
                         anyhow::bail!("Value cannot be empty.");
                     }
@@ -5822,28 +5914,38 @@ async fn async_main(command: clap::Command) -> Result<()> {
 
                     let result_entry: serde_json::Value = match op_name {
                         "add" | "replace" => {
-                            let value = op.get("value").ok_or_else(|| {
-                                ::zeroclaw_log::record!(
-                                    WARN,
-                                    ::zeroclaw_log::Event::new(
-                                        module_path!(),
-                                        ::zeroclaw_log::Action::Reject
-                                    )
-                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                    .with_attrs(
-                                        ::serde_json::json!({
-                                            "op": op_name,
-                                            "op_index": idx,
-                                            "path": path,
-                                        })
-                                    ),
-                                    "config patch op rejected: missing `value` field"
-                                );
-                                anyhow::Error::msg(format!(
-                                    "op[{idx}] `{op_name}` on `{path}`: missing `value` field"
-                                ))
-                            })?;
-                            let value_str = json_value_to_setprop_string(value, &config, &path)?;
+                            let value = match op.get("value") {
+                                Some(value) => value,
+                                None => {
+                                    ::zeroclaw_log::record!(
+                                        WARN,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Reject
+                                        )
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                        .with_attrs(
+                                            ::serde_json::json!({
+                                                "op": op_name,
+                                                "op_index": idx,
+                                                "path": path,
+                                            })
+                                        ),
+                                        "config patch op rejected: missing `value` field"
+                                    );
+                                    let message = format!(
+                                        "op[{idx}] `{op_name}` on `{path}`: missing `value` field"
+                                    );
+                                    let api_err = config_patch_json_value_type_error(
+                                        message.clone(),
+                                        Some(path.clone()),
+                                        Some(idx),
+                                    );
+                                    config_patch_fail_json_or_human(json, api_err, message)?
+                                }
+                            };
+                            let value_str =
+                                json_value_to_setprop_string(value, &config, &path, idx, json)?;
                             match config.set_prop_persistent(&path, &value_str) {
                                 Ok(()) => {}
                                 Err(err) => {
@@ -6361,10 +6463,10 @@ fn handle_estop_command(
                     );
                 }
                 if otp_code.is_none() {
-                    let entered = Password::new()
-                        .with_prompt("Enter OTP code")
-                        .allow_empty_password(false)
-                        .interact()?;
+                    let entered = secret_prompt("Enter OTP code", false)?;
+                    if !entered.is_empty() {
+                        eprintln!("{}", ta("cli-otp-received", &[], "  ✓ OTP received"));
+                    }
                     otp_code = Some(entered);
                 }
 
@@ -7029,7 +7131,10 @@ fn paircode_no_code_message(
 
     lines.push(String::new());
     lines.push("To inspect the running gateway:".into());
-    lines.push(format!("    open http://{host}:{port}"));
+    lines.push(format!(
+        "    open http://{}:{port}",
+        gateway_browser_host(host)
+    ));
     indent_paircode_lines(lines)
 }
 
@@ -7077,10 +7182,10 @@ fn indent_paircode_lines(lines: Vec<String>) -> String {
 
 #[cfg(feature = "agent-runtime")]
 fn read_auth_input(prompt: &str) -> Result<String> {
-    let input = Password::new()
-        .with_prompt(prompt)
-        .allow_empty_password(false)
-        .interact()?;
+    let input = secret_prompt(prompt, false)?;
+    if !input.is_empty() {
+        eprintln!("{}", ta("cli-secret-received", &[], "  ✓ Secret received"));
+    }
     Ok(input.trim().to_string())
 }
 
@@ -7573,6 +7678,27 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
     }
 }
 
+/// Tell the operator that `vi_verify` is withheld from the model-visible
+/// registry while no credential chain verifier exists.
+///
+/// Called once per config application: at process config load, and again when
+/// the daemon reload arm re-reads config from disk. Registry assembly is the
+/// wrong home for it, because that runs on ordinary gateway requests and on
+/// nested SOP and delegation rebuilds. Each call site must sit after its
+/// `runtime_trace::init_from_config`, or the record has no sink.
+#[cfg(feature = "agent-runtime")]
+fn warn_verifiable_intent_withheld(config: &Config) {
+    if !config.verifiable_intent.enabled {
+        return;
+    }
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+        "verifiable_intent: vi_verify is not registered as a model-callable tool because no credential chain verifier exists yet (see #9328)"
+    );
+}
+
 fn gate_security_posture(
     config: &zeroclaw::config::Config,
     allow_degraded: bool,
@@ -7927,7 +8053,7 @@ async fn run_gateway_if_enabled(
     // manually" message, None for tui_registry (no TUI socket), and None
     // for canvas_store so the gateway falls back to its own default.
     let result = Box::pin(gateway::run_gateway(
-        host, port, config, tx, None, None, None, None, None,
+        host, port, config, tx, None, None, None, None, None, None,
     ))
     .await;
     // Self-respawn after the listener is released, if an in-app upgrade
@@ -7969,6 +8095,14 @@ fn is_default_gateway_addr(host: &str, port: u16, default_host: &str, default_po
     host == default_host && port == default_port
 }
 
+fn gateway_browser_host(host: &str) -> &str {
+    match host {
+        "0.0.0.0" => "127.0.0.1",
+        "::" | "[::]" => "[::1]",
+        _ => host,
+    }
+}
+
 fn gateway_addr_in_use_message(
     host: &str,
     port: u16,
@@ -7985,7 +8119,10 @@ fn gateway_addr_in_use_message(
     ];
 
     if is_default_gateway_addr(host, port, default_host, default_port) {
-        lines.push(format!("    open http://{host}:{port}"));
+        lines.push(format!(
+            "    open http://{}:{port}",
+            gateway_browser_host(host)
+        ));
     }
 
     lines.push(gateway_paircode_recovery_command(
@@ -8131,6 +8268,34 @@ mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
     use std::net::TcpListener;
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn openrc_log_writer_cli_maps_only_known_streams() {
+        for (value, expected) in [
+            ("stdout", ServiceLogStream::Stdout),
+            ("stderr", ServiceLogStream::Stderr),
+        ] {
+            let cli = Cli::try_parse_from(["zeroclaw", "service", "run-openrc-log-writer", value])
+                .expect("internal OpenRC logger should parse");
+            assert!(matches!(
+                cli.command,
+                Commands::Service {
+                    service_command: ServiceCommands::RunOpenrcLogWriter { stream },
+                    ..
+                } if stream == expected
+            ));
+        }
+        assert!(
+            Cli::try_parse_from([
+                "zeroclaw",
+                "service",
+                "run-openrc-log-writer",
+                "/tmp/arbitrary.log"
+            ])
+            .is_err()
+        );
+    }
 
     #[test]
     fn probe_config_dir_extracts_global_flag_in_all_forms() {
@@ -8685,6 +8850,31 @@ mod tests {
 
     #[test]
     #[cfg(feature = "agent-runtime")]
+    fn paircode_no_code_message_uses_loopback_browser_hint_for_wildcard_hosts() {
+        let default = config::GatewayConfig::default();
+
+        for (host, browser_host) in [("0.0.0.0", "127.0.0.1"), ("::", "[::1]"), ("[::]", "[::1]")] {
+            let msg = paircode_no_code_message(
+                host,
+                9001,
+                &default.host,
+                default.port,
+                &PaircodeAction::Show,
+                true,
+                None,
+            );
+
+            assert!(
+                msg.contains(&format!("open http://{browser_host}:9001")),
+                "{msg}"
+            );
+            assert!(msg.contains(&format!("--port 9001 --host {host}")), "{msg}");
+            assert!(!msg.contains(&format!("open http://{host}:9001")), "{msg}");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
     fn paircode_no_code_message_omits_configured_default_host_port() {
         let msg = paircode_no_code_message(
             "192.168.1.20",
@@ -8748,6 +8938,19 @@ mod tests {
         assert!(msg.contains("zeroclaw gateway get-paircode --port 9001 --host 0.0.0.0"));
         assert!(msg.contains("zeroclaw gateway start --port 9002 --host 0.0.0.0"));
         assert!(msg.contains("lsof -nP -iTCP:9001 -sTCP:LISTEN"));
+    }
+
+    #[test]
+    fn gateway_addr_in_use_message_uses_loopback_browser_hint_for_wildcard_default() {
+        for (host, browser_host) in [("0.0.0.0", "127.0.0.1"), ("::", "[::1]"), ("[::]", "[::1]")] {
+            let msg = gateway_addr_in_use_message(host, 9001, host, 9001, None);
+
+            assert!(
+                msg.contains(&format!("open http://{browser_host}:9001")),
+                "{msg}"
+            );
+            assert!(!msg.contains(&format!("open http://{host}:9001")), "{msg}");
+        }
     }
 
     #[test]
@@ -9313,6 +9516,33 @@ mod tests {
     }
 
     #[test]
+    fn config_set_materializes_agent_workspace_path() {
+        let mut config = Config::default();
+        let raw = "agents.assistant.workspace.path";
+
+        let known: Vec<String> = config.prop_fields().into_iter().map(|f| f.name).collect();
+        let mut path = zeroclaw_config::helpers::resolve_field_path(&known, raw);
+        let created = ensure_map_key_for_prop_path(&mut config, &path)
+            .expect("agent alias and workspace path should materialize");
+        assert!(created, "missing agent alias should be created");
+
+        let known: Vec<String> = config.prop_fields().into_iter().map(|f| f.name).collect();
+        path = zeroclaw_config::helpers::resolve_field_path(&known, &path);
+        config
+            .set_prop_persistent(&path, "/srv/zeroclaw/assistant")
+            .expect("agent workspace path should be writable");
+
+        assert_eq!(path, raw);
+        assert_eq!(
+            config
+                .agents
+                .get("assistant")
+                .and_then(|agent| agent.workspace.path.as_deref()),
+            Some(std::path::Path::new("/srv/zeroclaw/assistant"))
+        );
+    }
+
+    #[test]
     fn ensure_map_key_rolls_back_alias_on_unknown_tail_field() {
         let mut config = Config::default();
         let path = "risk_profiles.newprofile.not_a_real_field";
@@ -9329,6 +9559,39 @@ mod tests {
                 .unwrap_or_default()
                 .is_empty(),
             "the tentatively-created alias must be rolled back, not left dangling",
+        );
+    }
+
+    #[test]
+    fn ensure_map_key_for_prop_path_leaves_existing_hyphenated_alias_alone() {
+        let mut config = Config::default();
+        config.cron.insert(
+            "morning-brief".to_string(),
+            zeroclaw_config::schema::CronJobDecl::default(),
+        );
+
+        let created = ensure_map_key_for_prop_path(&mut config, "cron.morning-brief.name")
+            .expect("an existing loaded alias must never be rejected by the create grammar");
+        assert!(
+            !created,
+            "the existing `morning-brief` alias must not be reported as newly created"
+        );
+        assert!(
+            config
+                .set_prop("cron.morning-brief.name", "Morning brief")
+                .is_ok(),
+            "setting a field on an existing hyphenated cron alias must succeed"
+        );
+        assert_eq!(
+            config.get_prop("cron.morning-brief.name").ok(),
+            Some("Morning brief".to_string())
+        );
+
+        let err = ensure_map_key_for_prop_path(&mut config, "cron.bad-alias.name")
+            .expect_err("creating a NEW hyphenated alias must still be rejected");
+        assert!(
+            err.to_string().contains("invalid character"),
+            "new-alias grammar must be preserved: {err}"
         );
     }
 

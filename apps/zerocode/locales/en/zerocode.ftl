@@ -15,8 +15,12 @@ zc-app-help-cycle-mode = Cycle mode
 zc-app-help-help = Help
 zc-app-help-reload = Reload daemon
 zc-app-help-quit = Quit
+zc-app-keybindings-title = Keybindings
+zc-app-help-filter-label = Filter
+zc-app-help-filter-placeholder = type a key or action…
+zc-app-help-no-matches = No matching keybindings
+zc-app-help-controls = { $cancel } clear/close · { $up }/{ $down } scroll · Type to filter
 
-zc-app-press-any-key-to-close = Press any key to close
 zc-app-reload-line-1 = The daemon process stays running (same PID), but every
 zc-app-reload-line-2 = subsystem tears down and re-initializes from the on-disk
 zc-app-reload-line-3 = config:
@@ -31,6 +35,7 @@ zc-app-reload-status-signalled = Daemon reload signalled — reconnecting…
 zc-app-reload-confirm-row = { $confirm_chord } = reload   { $cancel_chord } = cancel
 zc-error-daemon-version-mismatch = Version mismatch: zerocode is { $client_version } but the daemon is { $server_version }. Rebuild and restart the daemon from the same checkout as zerocode.
 zc-error-daemon-initialize-timeout = zerocode connected to the daemon, but initialization did not finish within { $seconds }s. Restart the daemon and try again.
+zc-error-spawned-daemon-startup = zerocode started an ephemeral daemon, but it failed to become ready: { $details }
 
 zc-zerocode-tab-theme = Theme
 zc-zerocode-tab-agent-theme = Agent Themes
@@ -105,6 +110,10 @@ zc-input-attach-error = Attach error: { $error }
 zc-input-detached = Detached: { $name }
 zc-input-invalid-index = Invalid index: { $index }
 zc-input-pending-attachments-header = Pending attachments:
+zc-input-attachment-manager-title = Pending attachments ({ $count })
+zc-input-attachment-manager-hint = { $navigate } select · { $remove } remove · { $close } close · /detach N
+zc-input-help-attachment-remove = Remove attachment
+zc-input-help-attachment-detach = Remove by index
 zc-input-clipboard-error = Clipboard error: { $error }
 
 zc-queue-empty = Nothing to send.
@@ -165,6 +174,9 @@ zc-doctor-detail-title = Detail
 zc-doctor-no-selection = No diagnostic selected
 zc-doctor-label-message = Message
 zc-doctor-help-mouse = Mouse: click filter/select, scroll wheel
+zc-doctor-error-daemon-timeout = The doctor check timed out. The daemon may be busy, unreachable, or processing a long-running request. Try again or check daemon connectivity.
+zc-doctor-partial-banner = ⚠ Partial results — model probing timed out
+zc-doctor-partial-hint = Some provider catalogs could not be reached. Results from config, workspace, and daemon checks are shown below. Press the refresh key to retry.
 
 zc-dashboard-tab-overview = Overview
 zc-dashboard-tab-sessions = Sessions
@@ -553,3 +565,5 @@ zc-config-footer-action-new-line = new line
 ## Inline hint shown on the selected config field row. The { $keys } placeholder
 ## is resolved from the current keybinding for ConfigTabAction::Enter.
 zc-config-field-edit-hint = { $keys } → press to edit
+
+zc-doctor-log-path = log: { $path }

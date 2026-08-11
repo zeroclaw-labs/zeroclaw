@@ -43,6 +43,7 @@ impl SkillDocument {
         write_optional(&mut out, "version", self.frontmatter.version.as_deref());
         write_optional(&mut out, "category", self.frontmatter.category.as_deref());
         write_tags(&mut out, &self.frontmatter.tags);
+        write_bool(&mut out, "always", self.frontmatter.always);
         write_slash_options(&mut out, &self.frontmatter.slash_options);
         out.push_str("---\n");
         if !self.body.is_empty() {
@@ -177,6 +178,7 @@ fn assign(fm: &mut SkillFrontmatter, key: &str, value: &str) {
         "author" => fm.author = Some(value.to_string()),
         "version" => fm.version = Some(value.to_string()),
         "category" => fm.category = Some(value.to_string()),
+        "always" => fm.always = value.eq_ignore_ascii_case("true"),
         _ => {}
     }
 }
@@ -216,6 +218,14 @@ fn write_tags(out: &mut String, tags: &[String]) {
         return;
     }
     let _ = writeln!(out, "tags: [{}]", tags.join(", "));
+}
+
+/// Serialize a bool flag, omitted when `false` (the default) so an
+/// `always`-less skill round-trips byte-identical.
+fn write_bool(out: &mut String, key: &str, value: bool) {
+    if value {
+        let _ = writeln!(out, "{key}: true");
+    }
 }
 
 fn indent_of(line: &str) -> usize {
@@ -548,11 +558,36 @@ mod tests {
                 version: Some("0.2.0".into()),
                 category: Some("coding".into()),
                 tags: vec!["slash".into(), "ops".into()],
+                always: false,
                 slash_options: Vec::new(),
             },
             body: "# Code Review\n\nReviews diffs.\n".into(),
         };
         let parsed = SkillDocument::parse(&original.serialize()).unwrap();
+        assert_eq!(parsed.frontmatter, original.frontmatter);
+    }
+
+    #[test]
+    fn round_trips_always_true_flag() {
+        let original = SkillDocument {
+            frontmatter: SkillFrontmatter {
+                name: "security-policy".into(),
+                description: "Critical safety rules the agent must never skip.".into(),
+                always: true,
+                ..Default::default()
+            },
+            body: "# Security Policy\n\nNever skip the safety review.\n".into(),
+        };
+        let serialized = original.serialize();
+        assert!(
+            serialized.contains("always: true"),
+            "serialize() must emit the always flag when true:\n{serialized}"
+        );
+        let parsed = SkillDocument::parse(&serialized).unwrap();
+        assert!(
+            parsed.frontmatter.always,
+            "always: true must survive the serialize -> parse round-trip"
+        );
         assert_eq!(parsed.frontmatter, original.frontmatter);
     }
 

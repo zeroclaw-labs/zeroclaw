@@ -1,0 +1,161 @@
+# syntax=docker/dockerfile:1.7-labs
+
+# >>> generated:base-arg-node-alpine from dev/ci/container-base-images.toml by `cargo generate installers` - do not edit <<<
+ARG ZEROCLAW_BASE_NODE_ALPINE=node:24-alpine3.23@sha256:595398b0081eacda8e1c4c5b97b76cd1020e4d58a8ebcb4843b9bca1e79e7436
+# >>> end generated:base-arg-node-alpine <<<
+# >>> generated:base-arg-rust-alpine from dev/ci/container-base-images.toml by `cargo generate installers` - do not edit <<<
+ARG ZEROCLAW_BASE_RUST_ALPINE=rust:1.96-alpine3.23@sha256:14b9b5f47dcc6644d0f0c1b35a2c2c5d0124f67159aaee28a348627523459b55
+# >>> end generated:base-arg-rust-alpine <<<
+# >>> generated:base-arg-alpine from dev/ci/container-base-images.toml by `cargo generate installers` - do not edit <<<
+ARG ZEROCLAW_BASE_ALPINE=alpine:3.23@sha256:fd791d74b68913cbb027c6546007b3f0d3bc45125f797758156952bc2d6daf40
+# >>> end generated:base-arg-alpine <<<
+
+FROM --platform=$BUILDPLATFORM ${ZEROCLAW_BASE_NODE_ALPINE} AS web-node
+
+FROM --platform=$BUILDPLATFORM ${ZEROCLAW_BASE_RUST_ALPINE} AS web-builder
+WORKDIR /app
+COPY --from=web-node /usr/local/bin/node /usr/local/bin/node
+COPY --from=web-node /usr/local/lib/node_modules /usr/local/lib/node_modules
+RUN apk add --no-cache g++ pkgconfig \
+    && ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+    && ln -s /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
+COPY web/package.json web/package-lock.json web/
+RUN cd web && npm ci --ignore-scripts
+COPY . .
+RUN mkdir -p apps/tauri/src \
+    && echo "fn main() {}" > apps/tauri/src/main.rs \
+    && echo "fn main() {}" > apps/tauri/build.rs
+RUN --mount=type=cache,id=zeroclaw-cargo-registry-alpine,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=zeroclaw-cargo-git-alpine,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=zeroclaw-web-target-alpine,target=/app/target,sharing=locked \
+    cargo web build
+
+FROM --platform=$BUILDPLATFORM ${ZEROCLAW_BASE_RUST_ALPINE} AS builder
+
+WORKDIR /app
+ARG TARGETARCH
+ARG CARGO_ZIGBUILD_VERSION=0.23.0
+# >>> generated:docker-features-arg by `cargo generate installers` - do not edit <<<
+ARG ZEROCLAW_CARGO_FLAGS="--no-default-features --features acp-bridge,agent-runtime,channel-acp-server,channel-discord,channel-email,channel-filesystem,channel-lark,channel-matrix,channel-telegram,channel-webhook,gateway,observability-prometheus,schema-export,whatsapp-web"
+# >>> end generated:docker-features-arg <<<
+
+RUN apk add --no-cache build-base perl pkgconfig zig \
+    && cargo install --locked --version "$CARGO_ZIGBUILD_VERSION" cargo-zigbuild
+
+COPY Cargo.toml Cargo.lock ./
+COPY --parents crates/*/Cargo.toml ./
+COPY --parents crates/zeroclaw-plugins/tests/fixtures/channel-fixture/Cargo.toml ./
+COPY --parents crates/zeroclaw-macros/src/ ./
+COPY apps/tauri/Cargo.toml apps/tauri/Cargo.toml
+COPY apps/zerocode/Cargo.toml apps/zerocode/Cargo.toml
+COPY tools/fill-translations/Cargo.toml tools/fill-translations/Cargo.toml
+COPY xtask/Cargo.toml xtask/Cargo.toml
+RUN mkdir -p src src/bin benches apps/tauri/src apps/zerocode/src tools/fill-translations/src xtask/src/bin \
+    && echo "fn main() {}" > src/main.rs \
+    && echo "" > src/lib.rs \
+    && echo "fn main() {}" > src/bin/zeroclaw-acp-bridge.rs \
+    && echo "fn main() {}" > benches/agent_benchmarks.rs \
+    && echo "fn main() {}" > apps/tauri/src/main.rs \
+    && echo "fn main() {}" > apps/tauri/build.rs \
+    && echo "fn main() {}" > apps/zerocode/src/main.rs \
+    && echo "fn main() {}" > apps/zerocode/build.rs \
+    && echo "fn main() {}" > tools/fill-translations/src/main.rs \
+    && echo "" > xtask/src/lib.rs \
+    && echo "fn main() {}" > xtask/src/bin/mdbook.rs \
+    && echo "fn main() {}" > xtask/src/bin/fluent.rs \
+    && echo "fn main() {}" > xtask/src/bin/web.rs \
+    && mkdir -p crates/zeroclaw-hardware/examples \
+    && echo "fn main() {}" > crates/zeroclaw-hardware/examples/esp32_sim.rs \
+    && mkdir -p crates/zeroclaw-plugins/tests/fixtures/channel-fixture/src \
+    && echo "" > crates/zeroclaw-plugins/tests/fixtures/channel-fixture/src/lib.rs \
+    && for d in crates/*/; do \
+        [ "$d" = "crates/zeroclaw-macros/" ] && continue; \
+        mkdir -p "${d}src"; \
+        printf '' > "${d}src/lib.rs"; \
+    done
+RUN --mount=type=cache,id=zeroclaw-cargo-registry-alpine-${TARGETARCH},target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=zeroclaw-cargo-git-alpine-${TARGETARCH},target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=zeroclaw-target-alpine-${TARGETARCH},target=/app/target,sharing=locked \
+    case "$TARGETARCH" in \
+      arm64) RUST_TARGET=aarch64-unknown-linux-musl ;; \
+      amd64) RUST_TARGET=x86_64-unknown-linux-musl ;; \
+      *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
+    esac \
+    && rustup target add "$RUST_TARGET" \
+    && if [ -n "$ZEROCLAW_CARGO_FLAGS" ]; then \
+         cargo zigbuild --release --locked --target "$RUST_TARGET" -p zeroclaw -p zerocode $ZEROCLAW_CARGO_FLAGS; \
+       else \
+         cargo zigbuild --release --locked --target "$RUST_TARGET" -p zeroclaw -p zerocode; \
+       fi
+RUN rm -rf src benches crates xtask tools/fill-translations
+
+COPY src/ src/
+COPY benches/ benches/
+COPY crates/ crates/
+COPY xtask/ xtask/
+COPY tools/fill-translations/ tools/fill-translations/
+COPY apps/zerocode/ apps/zerocode/
+COPY web/src/ web/src/
+COPY locales.toml .
+COPY *.rs .
+RUN touch src/main.rs apps/zerocode/src/main.rs
+RUN --mount=type=cache,id=zeroclaw-cargo-registry-alpine-${TARGETARCH},target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=zeroclaw-cargo-git-alpine-${TARGETARCH},target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=zeroclaw-target-alpine-${TARGETARCH},target=/app/target,sharing=locked \
+    case "$TARGETARCH" in \
+      arm64) RUST_TARGET=aarch64-unknown-linux-musl ;; \
+      amd64) RUST_TARGET=x86_64-unknown-linux-musl ;; \
+      *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
+    esac \
+    && rm -rf target/"$RUST_TARGET"/release/.fingerprint/zeroclaw-* \
+           target/"$RUST_TARGET"/release/deps/zeroclaw-* \
+           target/"$RUST_TARGET"/release/incremental/zeroclaw-* \
+           target/"$RUST_TARGET"/release/deps/zeroclaw_* \
+           target/"$RUST_TARGET"/release/incremental/zeroclaw_* \
+           target/"$RUST_TARGET"/release/.fingerprint/xtask-* \
+           target/"$RUST_TARGET"/release/deps/xtask-* \
+           target/"$RUST_TARGET"/release/.fingerprint/fill-translations-* \
+           target/"$RUST_TARGET"/release/deps/fill_translations-* \
+           target/"$RUST_TARGET"/release/.fingerprint/zerocode-* \
+           target/"$RUST_TARGET"/release/deps/zerocode-* \
+           target/"$RUST_TARGET"/release/incremental/zerocode-* \
+           target/"$RUST_TARGET"/release/build/zerocode-* \
+           target/release/.fingerprint/zerocode-* \
+           target/release/build/zerocode-* \
+    && if [ -n "$ZEROCLAW_CARGO_FLAGS" ]; then \
+         cargo zigbuild --release --locked --target "$RUST_TARGET" -p zeroclaw -p zerocode $ZEROCLAW_CARGO_FLAGS; \
+       else \
+         cargo zigbuild --release --locked --target "$RUST_TARGET" -p zeroclaw -p zerocode; \
+       fi \
+    && cp target/"$RUST_TARGET"/release/zeroclaw /app/zeroclaw \
+    && cp target/"$RUST_TARGET"/release/zerocode /app/zerocode
+RUN for binary in zeroclaw zerocode; do \
+      size=$(stat -c%s "/app/$binary"); \
+      if [ "$size" -lt 1000000 ]; then \
+        echo "ERROR: $binary is only ${size} bytes" >&2; \
+        exit 1; \
+      fi; \
+    done
+
+FROM ${ZEROCLAW_BASE_ALPINE} AS runtime
+
+RUN apk add --no-cache bash ca-certificates curl git tzdata \
+    && mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/data
+COPY --from=builder /app/zeroclaw /usr/local/bin/zeroclaw
+COPY --from=builder /app/zerocode /usr/local/bin/zerocode
+COPY --from=web-builder /app/web/dist /usr/share/zeroclawlabs/web/dist
+COPY dev/config.template.toml /zeroclaw-data/.zeroclaw/config.toml
+RUN chown -R 65534:65534 /zeroclaw-data
+
+ENV LANG=C.UTF-8
+ENV ZEROCLAW_DATA_DIR=/zeroclaw-data/data
+ENV HOME=/zeroclaw-data
+ENV ZEROCLAW_gateway__port=42617
+
+WORKDIR /zeroclaw-data
+USER 65534:65534
+EXPOSE 42617
+HEALTHCHECK --interval=60s --timeout=10s --retries=3 --start-period=10s \
+    CMD ["zeroclaw", "status", "--format=exit-code"]
+ENTRYPOINT ["zeroclaw"]
+CMD ["daemon"]

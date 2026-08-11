@@ -306,7 +306,9 @@ impl Tool for ShellTool {
                 return Ok(ToolResult {
                     success: false,
                     output: ToolOutput::default(),
-                    error: Some(format!("Failed to build runtime command: {e}")),
+                    error: Some(super::runtime_command_error::format_runtime_command_error(
+                        &e,
+                    )),
                 });
             }
         };
@@ -579,8 +581,9 @@ mod tests {
         let _ = zeroclaw_api::platform::is_android();
     }
     use super::*;
-    use crate::platform::{NativeRuntime, RuntimeAdapter};
+    use crate::platform::{DockerRuntime, NativeRuntime, RuntimeAdapter};
     use crate::security::{AutonomyLevel, SecurityPolicy};
+    use zeroclaw_config::schema::DockerRuntimeConfig;
     use zeroclaw_tools::wrappers::{PathGuardedTool, RateLimitedTool};
 
     #[tokio::test]
@@ -736,6 +739,35 @@ mod tests {
         assert!(result.success);
         assert!(result.output.trim().contains("hello"));
         assert!(result.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn shell_reports_invalid_docker_workspace_root() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir should be created");
+        let missing_root = workspace.path().join("missing-root");
+        let missing_root_text = missing_root.to_string_lossy().into_owned();
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: workspace.path().to_path_buf(),
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        });
+        let runtime = Arc::new(DockerRuntime::new(DockerRuntimeConfig {
+            allowed_workspace_roots: vec![missing_root_text.clone()],
+            ..DockerRuntimeConfig::default()
+        }));
+        let tool = ShellTool::new(security, runtime);
+
+        let result = tool
+            .execute(json!({"command": "echo hello"}))
+            .await
+            .expect("invalid Docker root should return a tool result");
+
+        assert!(!result.success);
+        let error = result.error.as_deref().unwrap_or("");
+        assert!(error.contains("Failed to canonicalize Docker workspace root"));
+        assert!(error.contains(missing_root_text.as_str()));
     }
 
     #[tokio::test]
@@ -895,6 +927,61 @@ mod tests {
                 .unwrap_or("")
                 .contains("Path blocked")
         );
+    }
+
+    /// End-to-end regression for the shell workspace-boundary bypass: driving
+    /// the REAL wrapped shell tool, a write through an in-workspace symlink
+    /// pointing outside must be refused before the command runs, and nothing may
+    /// be created at the target. This covers only the direct path-shaped
+    /// redirect form the static scan can see; dynamic forms (scripts,
+    /// expansion, races) are outside this layer.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_blocks_symlink_escape_end_to_end() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "zeroclaw_shell_e2e_symlink_escape_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let workspace = root.join("workspace");
+        let outside = root.join("outside");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        // `link` inside the workspace points at the outside directory.
+        symlink(&outside, workspace.join("link")).unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: workspace.clone(),
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        });
+        let tool = wrapped_shell(security);
+
+        let result = tool
+            .execute(json!({"command": "echo pwned > link/escape.txt", "approved": true}))
+            .await
+            .expect("shell tool must return a result");
+
+        assert!(!result.success, "the escaping write must be refused");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Path blocked"),
+            "expected a path-block error, got: {:?}",
+            result.error
+        );
+        assert!(
+            !outside.join("escape.txt").exists(),
+            "no file may be written outside the workspace through the symlink"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]

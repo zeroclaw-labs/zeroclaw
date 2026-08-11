@@ -484,4 +484,39 @@ mod tests {
         );
         assert_eq!(Role::System.attribution_field(), Some("system_alias"));
     }
+
+    #[test]
+    fn role_family_str_returns_stable_tags() {
+        assert_eq!(Role::Agent.family_str(), "agent");
+        assert_eq!(Role::Swarm.family_str(), "swarm");
+        assert_eq!(Role::Channel(ChannelKind::Discord).family_str(), "channel");
+        assert_eq!(Role::Tool(ToolKind::Shell).family_str(), "tool");
+        assert_eq!(Role::Cron(CronKind::Interval).family_str(), "cron");
+        assert_eq!(
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Anthropic)).family_str(),
+            "provider.model"
+        );
+        assert_eq!(
+            Role::Provider(ProviderKind::Tts(TtsProviderKind::ElevenLabs)).family_str(),
+            "provider.tts"
+        );
+        assert_eq!(
+            Role::Provider(ProviderKind::Transcription(
+                TranscriptionProviderKind::Whisper
+            ))
+            .family_str(),
+            "provider.transcription"
+        );
+        assert_eq!(
+            Role::Provider(ProviderKind::Tunnel(TunnelProviderKind::Ngrok)).family_str(),
+            "provider.tunnel"
+        );
+        assert_eq!(Role::Memory(MemoryKind::Sqlite).family_str(), "memory");
+        assert_eq!(Role::PeerGroup.family_str(), "peer_group");
+        assert_eq!(Role::Skill.family_str(), "skill");
+        assert_eq!(Role::Mcp.family_str(), "mcp");
+        assert_eq!(Role::Sop.family_str(), "sop");
+        assert_eq!(Role::Session.family_str(), "session");
+        assert_eq!(Role::System.family_str(), "system");
+    }
 }

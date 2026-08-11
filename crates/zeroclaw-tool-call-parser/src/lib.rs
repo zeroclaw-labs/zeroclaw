@@ -524,6 +524,20 @@ fn looks_like_malformed_tagged_tool_protocol_envelope(text: &str) -> bool {
         || lower.contains("tool_call_id")
 }
 
+/// JSON keys naming a tool-call container. Business JSON does not carry these.
+const TOOL_PROTOCOL_CONTAINER_KEYS: [&str; 3] =
+    ["\"tool_calls\"", "\"toolcalls\"", "\"function_call\""];
+
+/// JSON keys carrying a tool call's correlation id.
+const TOOL_PROTOCOL_CALL_ID_KEYS: [&str; 2] = ["\"call_id\"", "\"tool_call_id\""];
+
+/// Every key that identifies a payload as tool protocol on its own.
+fn tool_protocol_json_identifying_keys() -> impl Iterator<Item = &'static str> {
+    TOOL_PROTOCOL_CONTAINER_KEYS
+        .into_iter()
+        .chain(TOOL_PROTOCOL_CALL_ID_KEYS)
+}
+
 fn has_malformed_tool_protocol_text_signal(text: &str) -> bool {
     let trimmed = text.trim_start();
     let lower = trimmed.to_ascii_lowercase();
@@ -539,13 +553,51 @@ fn has_malformed_tool_protocol_text_signal(text: &str) -> bool {
         && (text.contains("\"content\"")
             || text.contains("\"result\"")
             || text.contains("\"output\""));
-    let has_protocol_container = text.contains("\"tool_calls\"")
-        || text.contains("\"toolcalls\"")
-        || text.contains("\"function_call\"");
+    let has_protocol_container = TOOL_PROTOCOL_CONTAINER_KEYS
+        .iter()
+        .any(|key| text.contains(key));
     let has_arguments = text.contains("\"arguments\"") || text.contains("\"parameters\"");
-    let has_call_id = text.contains("\"call_id\"") || text.contains("\"tool_call_id\"");
+    let has_call_id = TOOL_PROTOCOL_CALL_ID_KEYS
+        .iter()
+        .any(|key| text.contains(key));
 
     has_tool_result_shape || (has_protocol_container && has_arguments && has_call_id)
+}
+
+/// Whether `text` is a tool-protocol JSON payload that has not finished
+/// arriving.
+///
+/// The completed-envelope classifiers need the whole value: they parse it, or
+/// they look for a corroborating second key. A streaming consumer cannot wait
+/// for either — the frame it is deciding about is on screen now, and the key
+/// that gives the payload away may be the only one that has arrived. So this
+/// deliberately trips on a *single* protocol key.
+///
+/// Being eager is the safe direction here and not in the completed case: a
+/// held-back partial costs one frame and is re-rendered by the next delta,
+/// whereas a rendered protocol envelope stays visible until the turn ends, or
+/// indefinitely if the turn fails first. `false` for anything that already
+/// parses as a complete JSON value, which the ordinary classifiers then judge
+/// on their own terms.
+pub fn looks_like_incomplete_tool_protocol_json(text: &str) -> bool {
+    let trimmed = text.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let json_like =
+        trimmed.starts_with('{') || trimmed.starts_with('[') || lower.starts_with("```json");
+    if !json_like {
+        return false;
+    }
+
+    if let Some(body) = json_fence_body(trimmed) {
+        return looks_like_incomplete_tool_protocol_json(body);
+    }
+
+    // A complete value is not this function's business.
+    if serde_json::from_str::<serde_json::Value>(trimmed).is_ok() {
+        return false;
+    }
+
+    tool_protocol_json_identifying_keys().any(|key| trimmed.contains(key))
 }
 
 fn malformed_text_mentions_known_tool(text: &str, known_tool_names: &HashSet<String>) -> bool {
@@ -1516,7 +1568,7 @@ fn build_curl_command(url: &str) -> Option<String> {
         return None;
     }
 
-    let escaped = url.replace('\'', r#"'\\''"#);
+    let escaped = url.replace('\'', r#"'"'"'"#);
     Some(format!("curl -s '{}'", escaped))
 }
 
@@ -1629,15 +1681,14 @@ fn parse_glm_shortened_body(body: &str) -> Option<ParsedToolCall> {
             .trim_end_matches('/')
             .trim();
         (tool, attrs)
-    } else if let Some(gt_pos) = body.find('>') {
+    } else {
+        let gt_pos = body.find('>')?;
         // GLM shortened: `tool_name>value`
         let tool = body[..gt_pos].trim();
         let value = body[gt_pos + 1..].trim();
         // Strip trailing self-close markers that some models emit
         let value = value.trim_end_matches("/>").trim_end_matches('/').trim();
         (tool, value)
-    } else {
-        return None;
     };
 
     // Validate tool name: must be alphanumeric + underscore only
@@ -1741,6 +1792,14 @@ fn parse_glm_shortened_body(body: &str) -> Option<ParsedToolCall> {
     }
 
     None
+}
+
+fn malformed_tool_block_event(payload_len: usize) -> ::zeroclaw_log::Event {
+    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+        .with_attrs(::serde_json::json!({
+            "payload_len": payload_len,
+        }))
 }
 
 pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
@@ -2008,7 +2067,11 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
                     });
                 } else {
                     // Log a warning if we found a tool block but couldn't parse arguments
-                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"tool_name": tool_name, "inner": inner.chars().take(100).collect::<String>()})), "Found ```tool <name> block but could not parse JSON arguments");
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        malformed_tool_block_event(inner.len()),
+                        "Found ```tool <name> block but could not parse JSON arguments"
+                    );
                 }
             } else {
                 for value in json_values {
@@ -2327,6 +2390,44 @@ pub fn build_native_assistant_history_from_parsed_calls(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incomplete_protocol_json_trips_on_a_single_identifying_key() {
+        // One key is enough while the value is still arriving: the corroborating
+        // key may simply not have been emitted yet.
+        assert!(looks_like_incomplete_tool_protocol_json(
+            "{\"tool_call_id\":\"call_1\","
+        ));
+        assert!(looks_like_incomplete_tool_protocol_json(
+            "{\"tool_calls\":[{\"name\":\"shell\""
+        ));
+        assert!(looks_like_incomplete_tool_protocol_json(
+            "{\"function_call\":{\"arguments\":\"{\\\"a\\\":1"
+        ));
+        // An unclosed JSON fence is the same payload with a wrapper.
+        assert!(looks_like_incomplete_tool_protocol_json(
+            "```json\n{\"tool_call_id\":\"c1\","
+        ));
+    }
+
+    #[test]
+    fn incomplete_protocol_json_ignores_complete_values_and_business_json() {
+        // Complete values belong to the ordinary classifiers, which can parse
+        // them and judge them properly.
+        assert!(!looks_like_incomplete_tool_protocol_json(
+            "{\"tool_call_id\":\"call_1\",\"content\":\"done\"}"
+        ));
+        // Business JSON carries none of the identifying keys, so a half-arrived
+        // config still streams.
+        assert!(!looks_like_incomplete_tool_protocol_json(
+            "{\"retries\": 3, \"timeout_ms\":"
+        ));
+        // Prose is not JSON, however much it talks about tool calls.
+        assert!(!looks_like_incomplete_tool_protocol_json(
+            "The \"tool_call_id\" field identifies the call."
+        ));
+        assert!(!looks_like_incomplete_tool_protocol_json(""));
+    }
 
     #[test]
     fn build_native_assistant_history_returns_none_for_empty_calls() {
@@ -2746,6 +2847,54 @@ Done."#;
         );
         assert!(text.contains("I'll write a test file."));
         assert!(text.contains("Done."));
+    }
+
+    #[test]
+    fn malformed_tool_block_log_omits_model_controlled_content() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let secret_name = "sk_live_SECRET_IDENTIFIER";
+        let secret_body = "api_key=sk_live_SECRET_BODY";
+        let malformed_payload = format!("{secret_body}\n");
+        let expected_payload_len = malformed_payload.len() as u64;
+        let response = format!("```tool {secret_name}\n{malformed_payload}```");
+
+        let (_, calls) = parse_tool_calls(&response);
+        assert!(calls.is_empty());
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let event = 'search: loop {
+            while let Ok(event) = rx.try_recv() {
+                let matches_message = event.get("message").and_then(|value| value.as_str())
+                    == Some("Found ```tool <name> block but could not parse JSON arguments");
+                let matches_source = event
+                    .get("attributes")
+                    .and_then(|attributes| attributes.get("_file"))
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|file| file.ends_with("zeroclaw-tool-call-parser/src/lib.rs"));
+                if matches_message && matches_source {
+                    break 'search event;
+                }
+            }
+
+            assert!(
+                std::time::Instant::now() < deadline,
+                "malformed tool block should emit the expected canonical log event"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        let serialized = event.to_string();
+        assert!(!serialized.contains(secret_name));
+        assert!(!serialized.contains(secret_body));
+        assert!(event["attributes"].get("tool_name").is_none());
+        assert_eq!(
+            event["attributes"]["payload_len"].as_u64(),
+            Some(expected_payload_len)
+        );
     }
 
     #[test]
@@ -3606,12 +3755,18 @@ Done."#;
         let calls = parse_glm_style_tool_calls(response);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "shell");
-        assert!(calls[0].1["command"].as_str().unwrap().contains("curl"));
-        assert!(
-            calls[0].1["command"]
-                .as_str()
-                .unwrap()
-                .contains("example.com")
+        assert_eq!(calls[0].1["command"], "curl -s 'https://example.com'");
+    }
+
+    #[test]
+    fn parse_glm_style_quotes_url_apostrophes_and_metacharacters() {
+        let calls =
+            parse_glm_style_tool_calls("browser_open/url>https://example.com/it's;still=one");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "shell");
+        assert_eq!(
+            calls[0].1["command"],
+            r#"curl -s 'https://example.com/it'"'"'s;still=one'"#
         );
     }
 

@@ -110,35 +110,25 @@ pub async fn process_file_entry(
         });
     }
 
-    // 4. Sanitize filename.
+    // 4. Sanitize filename (display only; the on-disk name is the content hash).
     let sanitized = sanitize_filename(&filename);
 
-    // 5. Determine extension + write to workspace.
+    // 5. Persist through the shared hardened content-addressed writer: full-digest
+    // storage name and a directory-handle-bound, no-follow atomic write. This makes
+    // the RPC attachment path and the ACP/MCP blob path share one filesystem owner
+    // instead of duplicating decode/hash/naming/persistence with a plain,
+    // symlink-following `fs::write`. Marker and session dedup stay RPC-specific.
     let ext = std::path::Path::new(&sanitized)
         .extension()
         .map(|e| e.to_string_lossy().to_string())
         .unwrap_or_default();
-    let storage_name = if ext.is_empty() {
-        hex[..16].to_string()
-    } else {
-        format!("{}.{ext}", &hex[..16])
-    };
-    let upload_dir = std::path::Path::new(upload_root).join("uploads");
-    tokio::fs::create_dir_all(&upload_dir)
-        .await
-        .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cannot create upload dir: {e}")))?;
-    let dest = upload_dir.join(&storage_name);
-    tokio::fs::write(&dest, &bytes)
-        .await
-        .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cannot write upload: {e}")))?;
-
-    // Canonicalize so the marker always contains an absolute path —
-    // upload_root may be relative (e.g. ".") when no path was provided.
-    let canonical = tokio::fs::canonicalize(&dest)
-        .await
-        .unwrap_or_else(|_| dest.clone());
-    let canonical_display = canonical.to_string_lossy();
-    let workspace_path = strip_windows_verbatim_prefix(&canonical_display).into_owned();
+    let dest = zeroclaw_tools::embedded_resource::persist_content_addressed(
+        std::path::Path::new(upload_root),
+        &bytes,
+        &ext,
+    )
+    .map_err(|e| rpc_err(INTERNAL_ERROR, e.to_string()))?;
+    let workspace_path = strip_windows_verbatim_prefix(&dest.to_string_lossy()).into_owned();
 
     let kind = attachment_kind(&mime_type);
     let is_clipboard = matches!(entry.source, FileSource::Clipboard);
@@ -509,6 +499,51 @@ mod tests {
         );
         assert!(r.marker.contains(&r.workspace_path));
         assert!(!r.deduplicated);
+    }
+
+    // Consolidation: the RPC attachment writer now persists through the shared
+    // hardened content-addressed writer, so the on-disk name is the FULL SHA-256
+    // digest, not a 64-bit prefix. Proves the single-filesystem-owner delegation
+    // and that RPC no longer uses a collision-feasible truncated identity. The
+    // no-follow/handle-bound write property is covered by the shared writer's own
+    // regressions in `zeroclaw-tools`.
+    #[tokio::test]
+    async fn rpc_attachment_stores_under_full_digest_name() {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        use sha2::{Digest, Sha256};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().to_string_lossy().to_string();
+        let store = setup_store(&ws).await;
+
+        let bytes = b"rpc-consolidation-bytes";
+        let entry = FileEntry {
+            path: None,
+            data_b64: Some(STANDARD.encode(bytes)),
+            filename: Some("doc.pdf".into()),
+            mime_type: Some("application/pdf".into()),
+            source: FileSource::File,
+        };
+        let r = process_file_entry(&entry, "s1", &ws, false, &store)
+            .await
+            .unwrap();
+
+        let full_hex = format!("{:x}", Sha256::digest(bytes));
+        let name = Path::new(&r.workspace_path)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(
+            name,
+            format!("{full_hex}.pdf"),
+            "RPC storage name must be the full digest"
+        );
+        assert_ne!(
+            name,
+            format!("{}.pdf", &full_hex[..16]),
+            "must not use the old 64-bit prefix identity"
+        );
     }
 
     #[tokio::test]

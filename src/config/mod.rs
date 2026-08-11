@@ -153,7 +153,8 @@ mod tests {
         let nextcloud_talk = NextcloudTalkConfig {
             enabled: true,
             base_url: "https://cloud.example.com".into(),
-            app_token: "app-token".into(),
+            app_token: None,
+            bot_token: None,
             webhook_secret: None,
             proxy_url: None,
             bot_name: None,

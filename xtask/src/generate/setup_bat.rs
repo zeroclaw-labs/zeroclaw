@@ -1,9 +1,10 @@
 //! setup.bat renderer. The hand-written imperative glue (toolchain bootstrap,
 //! PATH, copy, quickstart, prebuilt download) stays in setup.bat; only the
 //! drift-prone data lives in sentinel-delimited regions this renderer owns.
-//! setup.bat has two such zones - the build-mode menu/routing and the per-mode
+//! setup.bat has three such zones: build-mode routing, per-mode presets, and
+//! post-install guidance.
 
-use super::spec::{self, Selection};
+use super::spec::{self, QUICKSTART_COMMAND, Selection, ZEROCODE_APP};
 use std::path::Path;
 
 /// A named generated zone, delimited by id-tagged sentinels so multiple regions
@@ -17,6 +18,32 @@ fn end(id: &str) -> String {
 
 const ZONE_MENU: &str = "menu";
 const ZONE_PRESETS: &str = "presets";
+const ZONE_POST_INSTALL: &str = "post-install";
+
+#[derive(Clone, Copy)]
+struct ZoneLayout {
+    zone: &'static str,
+    range_start: &'static str,
+    range_end: &'static str,
+}
+
+const ZONE_LAYOUTS: [ZoneLayout; 3] = [
+    ZoneLayout {
+        zone: ZONE_MENU,
+        range_start: ":: ---- Choose build mode ----",
+        range_end: ":: ---- Prebuilt binary ----",
+    },
+    ZoneLayout {
+        zone: ZONE_PRESETS,
+        range_start: ":: ---- Source build presets ----",
+        range_end: ":: ---- Build from source ----",
+    },
+    ZoneLayout {
+        zone: ZONE_POST_INSTALL,
+        range_start: "echo %BOLD%%GREEN%  ZeroClaw setup complete!%RESET%",
+        range_end: "echo   Alternative install via Scoop:",
+    },
+];
 
 /// Render the menu/routing zone body: non-interactive MODE routing plus the
 /// interactive numbered menu, walked from `Selection::menu()`. Option 1 is the
@@ -53,7 +80,7 @@ fn render_menu(_manifest_dir: &Path) -> String {
     out.push_str("if \"%CHOICE%\"==\"1\" goto :install_prebuilt\n");
     for (i, sel) in menu.iter().enumerate() {
         out.push_str(&format!(
-            "if \"%CHOICE%\"==\"{n}\" goto :build_{id}\n",
+            "if \"%CHOICE%\"==\"{n}\" (set \"MODE={id}\" & goto :build_{id})\n",
             n = i + 2,
             id = sel.id()
         ));
@@ -87,17 +114,109 @@ fn render_presets(manifest_dir: &Path) -> anyhow::Result<String> {
     Ok(out)
 }
 
+/// setup.bat is its own interactive installer surface. Its PATH and branch
+/// behavior intentionally do not inherit the manual PowerShell route contract;
+/// only shared command and app identities come from the canonical spec.
+fn render_post_install() -> String {
+    format!(
+        "echo   Next steps:\n\
+if /I \"%INSTALL_ROUTE%\"==\"prebuilt\" (\n\
+echo     1. PATH is ready in this terminal and future terminals\n\
+echo     2. Run: {QUICKSTART_COMMAND}\n\
+echo     3. Configure a model provider during Quickstart\n\
+echo     4. Launch the TUI when installed: {ZEROCODE_APP}\n\
+) else (\n\
+echo     1. PATH is ready in this terminal and future terminals\n\
+if /I \"%MODE%\"==\"minimal\" (\n\
+echo     2. Minimal build excludes quickstart ^({QUICKSTART_COMMAND} is unavailable^)\n\
+echo     3. Configure model providers with the supported config surface\n\
+echo     4. Use reduced CLI path: zeroclaw agent --message \"Hello\"\n\
+) else (\n\
+echo     2. Run: {QUICKSTART_COMMAND}\n\
+echo     3. Configure a model provider during Quickstart\n\
+echo     4. Launch the TUI when installed: {ZEROCODE_APP}\n\
+)\n\
+)"
+    )
+}
+
 /// The recommended default selection's id - what the prebuilt-fallback path
 /// jumps to. Derived, not hardcoded: `Dist` is the recommended build.
 pub fn fallback_build_id() -> &'static str {
     Selection::Dist.id()
 }
 
-/// Splice both generated zones into the current setup.bat, leaving all
-/// hand-written glue untouched. Errors if either zone's sentinels are missing.
+/// Splice all three generated zones into the current setup.bat, leaving all
+/// hand-written glue untouched. Errors if any zone's sentinels are missing.
 pub fn render_file(manifest_dir: &Path, current: &str) -> anyhow::Result<String> {
+    validate_zone_layouts(current)?;
     let with_menu = splice(current, ZONE_MENU, &render_menu(manifest_dir))?;
-    splice(&with_menu, ZONE_PRESETS, &render_presets(manifest_dir)?)
+    let with_presets = splice(&with_menu, ZONE_PRESETS, &render_presets(manifest_dir)?)?;
+    splice(&with_presets, ZONE_POST_INSTALL, &render_post_install())
+}
+
+fn unique_index(current: &str, needle: &str, label: &str) -> anyhow::Result<usize> {
+    let mut matches = current.match_indices(needle);
+    let first = matches
+        .next()
+        .ok_or_else(|| anyhow::Error::msg(format!("setup.bat missing {label}")))?;
+    anyhow::ensure!(
+        matches.next().is_none(),
+        "setup.bat {label} must appear exactly once"
+    );
+    Ok(first.0)
+}
+
+fn validate_zone_layouts(current: &str) -> anyhow::Result<()> {
+    let mut previous_end = 0;
+    for layout in ZONE_LAYOUTS {
+        let range_start = unique_index(
+            current,
+            layout.range_start,
+            &format!("{} range start", layout.zone),
+        )?;
+        let range_end = unique_index(
+            current,
+            layout.range_end,
+            &format!("{} range end", layout.zone),
+        )?;
+        anyhow::ensure!(
+            range_start < range_end,
+            "setup.bat generated:{} structural range is reversed",
+            layout.zone
+        );
+
+        let begin_marker = begin(layout.zone);
+        let end_marker = end(layout.zone);
+        let begin_at = unique_index(
+            current,
+            &begin_marker,
+            &format!("generated:{} BEGIN sentinel", layout.zone),
+        )?;
+        let end_at = unique_index(
+            current,
+            &end_marker,
+            &format!("generated:{} END sentinel", layout.zone),
+        )?;
+
+        anyhow::ensure!(
+            begin_at < end_at,
+            "setup.bat generated:{} sentinels are reversed",
+            layout.zone
+        );
+        anyhow::ensure!(
+            begin_at > range_start && end_at + end_marker.len() < range_end,
+            "setup.bat generated:{} zone is outside its structural range",
+            layout.zone
+        );
+        anyhow::ensure!(
+            begin_at >= previous_end,
+            "setup.bat generated:{} zone is out of order",
+            layout.zone
+        );
+        previous_end = end_at + end_marker.len();
+    }
+    Ok(())
 }
 
 fn splice(current: &str, zone: &str, body: &str) -> anyhow::Result<String> {
@@ -150,9 +269,15 @@ mod tests {
         let presets = render_presets(&root()).unwrap();
         let (_, dist_and_rest) = presets.split_once(":build_dist").unwrap();
         let (dist, _) = dist_and_rest.split_once("goto :do_build").unwrap();
-        assert!(dist.contains("channel-matrix"));
-        assert!(dist.contains("whatsapp-web"));
-        assert!(!dist.contains("channel-slack"));
+        for feature in spec::resolve_feature_list(&root(), &Selection::Dist).unwrap() {
+            assert!(
+                dist.contains(&feature),
+                "dist feature {feature} not rendered"
+            );
+        }
+        for feature in spec::features_outside_dist(&root()).unwrap() {
+            assert!(!dist.contains(&feature), "{feature} leaked into lean dist");
+        }
     }
 
     #[test]
@@ -168,6 +293,22 @@ mod tests {
         assert!(m.contains("if \"%MODE%\"==\"prebuilt\" goto :install_prebuilt"));
         for sel in Selection::menu() {
             assert!(m.contains(&format!("goto :build_{}", sel.id())));
+        }
+    }
+
+    #[test]
+    fn interactive_menu_records_the_selected_source_mode() {
+        let menu = render_menu(&root());
+        for (index, selection) in Selection::menu().iter().enumerate() {
+            let choice = index + 2;
+            assert!(
+                menu.contains(&format!(
+                    "if \"%CHOICE%\"==\"{choice}\" (set \"MODE={id}\" & goto :build_{id})",
+                    id = selection.id()
+                )),
+                "interactive choice {choice} must preserve MODE={} before routing",
+                selection.id()
+            );
         }
     }
 
@@ -190,8 +331,76 @@ mod tests {
         assert!(splice("nothing", ZONE_MENU, "x").is_err());
     }
 
+    fn zone_span(current: &str, zone: &str) -> (usize, usize) {
+        let begin_marker = begin(zone);
+        let end_marker = end(zone);
+        let start = current.find(&begin_marker).unwrap();
+        let finish = current.find(&end_marker).unwrap() + end_marker.len();
+        (start, finish)
+    }
+
+    #[test]
+    fn real_setup_bat_rejects_duplicate_zone_sentinels() {
+        let current = std::fs::read_to_string(root().join("setup.bat")).unwrap();
+        for zone in [ZONE_MENU, ZONE_PRESETS, ZONE_POST_INSTALL] {
+            let duplicate = format!("{}\n{}\nDUPLICATE\n{}\n", current, begin(zone), end(zone));
+            assert!(
+                render_file(&root(), &duplicate).is_err(),
+                "duplicate generated:{zone} sentinels must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn real_setup_bat_rejects_zone_relocation() {
+        let current = std::fs::read_to_string(root().join("setup.bat")).unwrap();
+        for zone in [ZONE_MENU, ZONE_PRESETS, ZONE_POST_INSTALL] {
+            let (start, finish) = zone_span(&current, zone);
+            let zone_text = &current[start..finish];
+            let without_zone = format!("{}{}", &current[..start], &current[finish..]);
+            let insertion = without_zone.find('\n').unwrap() + 1;
+            let relocated = format!(
+                "{}{}\n{}",
+                &without_zone[..insertion],
+                zone_text,
+                &without_zone[insertion..]
+            );
+            assert_ne!(current, relocated);
+            assert!(
+                render_file(&root(), &relocated).is_err(),
+                "relocated generated:{zone} zone must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn real_setup_bat_allows_adjacent_handwritten_edits() {
+        let current = std::fs::read_to_string(root().join("setup.bat")).unwrap();
+        let marker = begin(ZONE_MENU);
+        let customized = current.replacen(&marker, &format!(":: local note\n{marker}"), 1);
+        assert!(render_file(&root(), &customized).is_ok());
+    }
+
     #[test]
     fn fallback_is_recommended_dist() {
         assert_eq!(fallback_build_id(), "dist");
+    }
+
+    #[test]
+    fn windows_post_install_preserves_setup_bat_runtime_contract() {
+        let post_install = render_post_install();
+        assert!(post_install.contains("PATH is ready in this terminal and future terminals"));
+        assert!(!post_install.contains("Restart your terminal"));
+        assert!(post_install.contains(&format!("Run: {QUICKSTART_COMMAND}")));
+        assert!(post_install.contains(&format!("installed: {ZEROCODE_APP}")));
+    }
+
+    #[test]
+    fn real_setup_bat_contains_post_install_zone() {
+        let current = std::fs::read_to_string(root().join("setup.bat")).unwrap();
+        let once = render_file(&root(), &current).unwrap();
+        let twice = render_file(&root(), &once).unwrap();
+        assert!(once.contains("generated:post-install"));
+        assert_eq!(once, twice, "render must be idempotent");
     }
 }

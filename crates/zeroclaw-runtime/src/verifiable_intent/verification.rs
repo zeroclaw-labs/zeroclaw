@@ -228,8 +228,17 @@ fn check_allowed_merchant(
         );
     }
     let Some(merchant) = &fulfillment.merchant else {
-        // No merchant info in fulfillment — cannot validate, skip per spec.
-        return ConstraintCheckResult::ok(ct);
+        // Fail closed: the constraint is present but the fulfillment discloses
+        // no merchant to check against it, and an absent subject cannot satisfy
+        // an allowlist. Matches the VI reference implementation, which reports
+        // "Missing or invalid merchant in fulfillment" as a violation.
+        return ConstraintCheckResult::violation(
+            ct,
+            ViError::new(
+                ViErrorKind::MerchantNotAllowed,
+                "fulfillment discloses no merchant to check against the allowlist",
+            ),
+        );
     };
     if allowed_merchants.iter().any(|m| m.matches(merchant)) {
         ConstraintCheckResult::ok(ct)
@@ -259,7 +268,15 @@ fn check_allowed_payee(
         );
     }
     let Some(payee) = &fulfillment.payee else {
-        return ConstraintCheckResult::ok(ct);
+        // Fail closed, as in `check_allowed_merchant`: an absent payee cannot
+        // satisfy an allowlist.
+        return ConstraintCheckResult::violation(
+            ct,
+            ViError::new(
+                ViErrorKind::PayeeNotAllowed,
+                "fulfillment discloses no payee to check against the allowlist",
+            ),
+        );
     };
     if allowed_payees.iter().any(|p| p.matches(payee)) {
         ConstraintCheckResult::ok(ct)
@@ -290,16 +307,8 @@ fn check_payment_amount(
             ),
         );
     };
-    if let Some(actual_currency) = &fulfillment.currency
-        && actual_currency != currency
-    {
-        return ConstraintCheckResult::violation(
-            ct,
-            ViError::new(
-                ViErrorKind::CurrencyMismatch,
-                format!("expected {currency}, got {actual_currency}"),
-            ),
-        );
+    if let Err(err) = verify_fulfillment_currency(currency, fulfillment.currency.as_deref()) {
+        return ConstraintCheckResult::violation(ct, err);
     }
     if let Some(max_val) = max
         && actual_amount > max_val
@@ -341,16 +350,8 @@ fn check_payment_budget(
             ),
         );
     };
-    if let Some(actual_currency) = &fulfillment.currency
-        && actual_currency != currency
-    {
-        return ConstraintCheckResult::violation(
-            ct,
-            ViError::new(
-                ViErrorKind::CurrencyMismatch,
-                format!("expected {currency}, got {actual_currency}"),
-            ),
-        );
+    if let Err(err) = verify_fulfillment_currency(currency, fulfillment.currency.as_deref()) {
+        return ConstraintCheckResult::violation(ct, err);
     }
     // Single-transaction check: amount must not exceed budget.
     // Cumulative tracking is the payment network's responsibility.
@@ -364,6 +365,30 @@ fn check_payment_budget(
         );
     }
     ConstraintCheckResult::ok(ct)
+}
+
+fn verify_fulfillment_currency(expected: &str, actual: Option<&str>) -> Result<(), ViError> {
+    if expected.trim().is_empty() {
+        return Err(ViError::new(
+            ViErrorKind::CurrencyMismatch,
+            "payment constraint currency is empty",
+        ));
+    }
+    match actual {
+        Some(actual) if actual.trim().is_empty() => Err(ViError::new(
+            ViErrorKind::CurrencyMismatch,
+            format!("missing payment currency; expected {expected}"),
+        )),
+        Some(actual) if actual == expected => Ok(()),
+        Some(actual) => Err(ViError::new(
+            ViErrorKind::CurrencyMismatch,
+            format!("expected {expected}, got {actual}"),
+        )),
+        None => Err(ViError::new(
+            ViErrorKind::CurrencyMismatch,
+            format!("missing payment currency; expected {expected}"),
+        )),
+    }
 }
 
 fn check_line_items(
@@ -400,8 +425,14 @@ fn check_line_items(
     }
 
     // Total quantity check
-    let total_allowed: u32 = constraint_items.iter().map(|l| l.quantity).sum();
-    let total_actual: u32 = fulfillment_items.iter().map(|f| f.quantity).sum();
+    let total_allowed: u128 = constraint_items
+        .iter()
+        .map(|item| u128::from(item.quantity))
+        .sum();
+    let total_actual: u128 = fulfillment_items
+        .iter()
+        .map(|item| u128::from(item.quantity))
+        .sum();
     if total_actual > total_allowed {
         return ConstraintCheckResult::violation(
             ct,
@@ -544,6 +575,35 @@ mod tests {
         assert!(!result.satisfied);
     }
 
+    /// A fulfillment that omits the merchant must not satisfy a merchant
+    /// allowlist. Every `Fulfillment` field is `Option` with `Default` derived,
+    /// so a caller-supplied `{}` deserializes to all-`None` and would otherwise
+    /// clear the constraint it is being checked against.
+    #[test]
+    fn missing_merchant_does_not_satisfy_allowed_merchant() {
+        let allowed = vec![merchant("Store A", "https://store-a.example.com")];
+        let f = Fulfillment::default();
+        let result = check_allowed_merchant(&allowed, &f);
+        assert!(
+            !result.satisfied,
+            "an absent merchant must not satisfy an allowed-merchant constraint"
+        );
+        assert_eq!(result.violations[0].kind, ViErrorKind::MerchantNotAllowed);
+    }
+
+    /// The same for the payee allowlist.
+    #[test]
+    fn missing_payee_does_not_satisfy_allowed_payee() {
+        let allowed = vec![merchant("Payee A", "https://payee-a.example.com")];
+        let f = Fulfillment::default();
+        let result = check_allowed_payee(&allowed, &f);
+        assert!(
+            !result.satisfied,
+            "an absent payee must not satisfy an allowed-payee constraint"
+        );
+        assert_eq!(result.violations[0].kind, ViErrorKind::PayeeNotAllowed);
+    }
+
     #[test]
     fn line_items_valid() {
         let constraint_items = vec![LineItemEntry {
@@ -606,6 +666,57 @@ mod tests {
         };
         let result = check_line_items(&constraint_items, &f);
         assert!(!result.satisfied);
+    }
+
+    #[test]
+    fn allowed_line_item_quantity_total_does_not_wrap() {
+        let constraint_items = vec![
+            LineItemEntry {
+                id: "line-1".into(),
+                acceptable_items: vec![],
+                quantity: u32::MAX,
+            },
+            LineItemEntry {
+                id: "line-2".into(),
+                acceptable_items: vec![],
+                quantity: 1,
+            },
+        ];
+        let f = Fulfillment {
+            line_items: Some(vec![FulfillmentLineItem {
+                item_id: "SKU001".into(),
+                quantity: u32::MAX,
+            }]),
+            ..Default::default()
+        };
+
+        assert!(check_line_items(&constraint_items, &f).satisfied);
+    }
+
+    #[test]
+    fn fulfillment_line_item_quantity_total_does_not_wrap() {
+        let constraint_items = vec![LineItemEntry {
+            id: "line-1".into(),
+            acceptable_items: vec![],
+            quantity: u32::MAX,
+        }];
+        let f = Fulfillment {
+            line_items: Some(vec![
+                FulfillmentLineItem {
+                    item_id: "SKU001".into(),
+                    quantity: u32::MAX,
+                },
+                FulfillmentLineItem {
+                    item_id: "SKU002".into(),
+                    quantity: 1,
+                },
+            ]),
+            ..Default::default()
+        };
+
+        let result = check_line_items(&constraint_items, &f);
+        assert!(!result.satisfied);
+        assert_eq!(result.violations[0].kind, ViErrorKind::LineItemViolation);
     }
 
     #[test]
@@ -729,5 +840,43 @@ mod tests {
         let results = check_constraints(&constraints, &f, StrictnessMode::Strict);
         assert_eq!(results.len(), 2);
         assert!(results.iter().all(|r| r.satisfied));
+    }
+
+    #[test]
+    fn missing_or_empty_currency_fails_currency_bound_constraints() {
+        for (expected, currency) in [
+            ("USD", None),
+            ("USD", Some(String::new())),
+            ("USD", Some(" ".into())),
+            ("", Some(String::new())),
+            (" ", Some(" ".into())),
+        ] {
+            let constraints = vec![
+                Constraint::PaymentAmount {
+                    currency: expected.into(),
+                    min: None,
+                    max: Some(40000),
+                },
+                Constraint::PaymentBudget {
+                    currency: expected.into(),
+                    max: 50000,
+                },
+            ];
+            let fulfillment = Fulfillment {
+                amount: Some(20000),
+                currency,
+                ..Default::default()
+            };
+            let results = check_constraints(&constraints, &fulfillment, StrictnessMode::Strict);
+
+            assert_eq!(results.len(), 2);
+            assert_eq!(results[0].constraint_type, "payment.amount");
+            assert_eq!(results[1].constraint_type, "payment.budget");
+            for result in results {
+                assert!(!result.satisfied);
+                assert_eq!(result.violations.len(), 1);
+                assert_eq!(result.violations[0].kind, ViErrorKind::CurrencyMismatch);
+            }
+        }
     }
 }

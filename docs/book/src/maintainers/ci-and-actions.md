@@ -12,15 +12,16 @@ Composite job with multiple matrix legs:
 - **fmt**: `cargo fmt --all -- --check`
 - **lint**: `cargo clippy --workspace --exclude zeroclaw-desktop --all-targets --features ci-all -- -D warnings`, plus two architecture guards (`cargo test --test architecture`): config-write isolation and Fluent coverage (no bare user-facing strings)
 - **build**: matrix: `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-pc-windows-msvc`
-- **check**: all features + no-default-features
+- **check**: all features plus a workspace-wide, warnings-fatal no-default-features pass (excluding `zeroclaw-desktop`)
 - **check-32bit**: `i686-unknown-linux-gnu` with no default features
 - **bench**: benchmarks compile check
-- **test**: the standalone firmware protocol host gate from `scripts/ci/firmware_protocol_gate.sh`, plus `cargo nextest run --locked --workspace --exclude zeroclaw-desktop` on Linux
+- **test**: the standalone firmware protocol host gate from `scripts/ci/firmware_protocol_gate.sh` and `cargo nextest run --locked --workspace --exclude zeroclaw-desktop` on Linux
+- **parallel-runtime-test**: repeated same-process runtime/channel tests from `scripts/ci/parallel_runtime_test_gate.sh`, run in parallel with the main test job for relevant PR paths and unconditionally on `master` pushes and merge queue runs
 - **security**: `cargo deny check`
 - **nix-eval**: evaluates the NixOS module assertions (`nixos-module-eval` flake check)
 - **docs-style**: markdown lint, em-dash prose check, and changed-line link gate via `scripts/ci/docs_quality_gate.sh` and `scripts/ci/docs_links_gate.sh`
 
-`fmt` runs first as the cheap serial gate. Every other job declares `needs: [fmt]` and fans out after formatting passes; `CI Required Gate` aggregates every result. Branch protection pins the composite gate job. A PR cannot merge until this is green. The `master` push run keeps the same quality signal while seeding trusted Rust caches for later PR runs.
+`fmt` runs first as the cheap serial gate. Every other job declares `needs: [fmt]` directly or transitively and fans out after formatting passes; `CI Required Gate` aggregates every result. Branch protection pins the composite gate job. A PR cannot merge until this is green. The `master` push run keeps the same quality signal while seeding trusted Rust caches for later PR runs.
 
 Fresh required CI is normally the shared evidence for the Cargo surfaces it actually runs. A local rerun of the same Cargo command on the same head, target, and feature set is duplicate confidence, not a stronger proof. Before asking for extra Cargo or Clippy, compare the changed surface with the current workflow files and the actual checks on the PR. Extra validation belongs where the required gate does not prove the thing under review:
 
@@ -29,6 +30,8 @@ Fresh required CI is normally the shared evidence for the Cargo surfaces it actu
 - a desktop change did not trigger the desktop workflow;
 - a release target is outside the PR matrix and only covered by release/manual workflows;
 - stale, cancelled, skipped, or unavailable CI is not fresh evidence.
+
+When a definition or import is feature-gated, compare its `cfg` predicate with every consumer. Validate both the enabled configuration and each relevant disabled configuration: an enabled-feature pass proves the consumer still works, while the workspace-wide no-default-features check catches warning-producing mismatches such as unused private definitions or imports. Targeted feature combinations remain necessary when neither required CI configuration exercises the changed predicate.
 
 ### Daily Advisory Scan (`daily-audit.yml`)
 
@@ -41,6 +44,27 @@ Runs `npm audit --audit-level=high` daily at 09:23 UTC against `web/package-lock
 ### Weekly Trivy Image Scan (`trivy-scheduled.yml`)
 
 Scans the published `dist` and `default-features` GHCR images every Saturday and uploads HIGH/CRITICAL findings to the Security tab as SARIF. The scan is report-first (`exit-code: 0` for findings), but a missing expected image fails the job before Trivy setup with the absent tag and the owning publisher workflow named in the error.
+
+### Weekly Scoop Bucket Canary (`scoop-bucket-canary.yml`)
+
+Rehearses the Scoop publish path against the current stable release every Monday. It resolves the latest `vX.Y.Z` tag and calls `pub-scoop.yml` with both `dry_run: true` and `credential_canary: true`, so it exercises the real `SCOOP_BUCKET_TOKEN` against the real bucket without writing anything.
+
+`credential_canary` is the fail-closed part of that contract: a missing `SCOOP_BUCKET_REPO` or `SCOOP_BUCKET_TOKEN` fails the run, and configured credentials must reach the `git push --dry-run` authorization probe. A generic manual `pub-scoop.yml` run with only `dry_run: true` remains permissive for manifest generation and may skip that probe when credentials are unavailable; do not use the generic mode as credential-verification evidence.
+
+This exists because `SCOOP_BUCKET_TOKEN` is account-bound: it expires, and it silently loses write when the owning identity's collaborator grant on the bucket changes. Both have happened. Before the canary, the only thing that exercised the credential was the post-publish `scoop` job, so a dead token was discovered after the release was already cut and announced, and the bucket had to be updated by hand.
+
+The canary detects credential rot. It is deliberately not what keeps the bucket correct, and it is not wired into Release Stable: a dead package-manager credential must never gate or delay a release.
+
+#### How the Scoop bucket stays correct
+
+Today the release publisher is the only automated writer:
+
+1. **`pub-scoop.yml` pushes on release.** Scoop users see the new version immediately when this succeeds. It needs the cross-repo `SCOOP_BUCKET_TOKEN`, which is the fragile part.
+2. **Maintainers recover failed pushes.** Rotate or repair the token, dispatch Scoop Bucket Canary to verify it through the fail-closed `credential_canary` path, rerun the publisher with `dry_run: false`, and confirm the bucket manifest landed the release version.
+
+A bucket-side Excavator is proposed in [scoop-zeroclaw#1](https://github.com/zeroclaw-labs/scoop-zeroclaw/pull/1). Once that workflow is merged, the bucket repository grants Actions read/write workflow permission, and a maintainer smoke test proves that it commits an update, it can become a credential-independent recovery layer. Until all three conditions are satisfied, do not assume a failed publisher will self-heal.
+
+The `checkver` and `autoupdate` blocks are already load-bearing for the planned Excavator path. The current push path also uses `scripts/release/scoop_metadata.sh` to derive its release URL template from `autoupdate`, so both paths share one manifest contract. Do not remove those blocks, and do not hand-edit them out of `dist/scoop/zeroclaw.json`.
 
 ### PR Path Labeler (`pr-path-labeler.yml`)
 
@@ -66,7 +90,9 @@ Triggered on tag push (and `workflow_dispatch`); builds and publishes versioned 
 
 ### Docker Image PR Check (`docker-image-pr.yml`)
 
-Runs only when Docker image or release-Docker context files change. It prepares a smoke `docker-ctx` with the same helper used by the stable release workflow, then builds the default prebuilt image and the Debian compatibility prebuilt image from `Dockerfile.ci` without pushing either image. This catches image dependency and `COPY` path breakage before release without giving PR runs registry write permission or running on every PR.
+Runs only when Docker image, Compose, or release-Docker context files change. It validates the merged default-plus-Alpine Compose configuration and, for changes beyond Compose-only edits, builds the default and Debian prebuilt smoke images plus the source Dockerfiles without pushing them. The default and Alpine source images build for `linux/amd64` and `linux/arm64`; the Debian source image builds for `linux/amd64`.
+
+The all-features `Containerfile` source image builds for `linux/amd64` when that file or the Docker workflow changes. It uses an isolated cache scope and is neither loaded nor pushed. The Alpine amd64 lane runs both binaries, starts the built image through the merged Compose configuration, and checks the gateway health and dashboard surfaces. The Alpine arm64 lane is compile- and image-assembly coverage only. Compose-only changes use a reduced Alpine amd64 matrix so they still exercise the runtime contract without rebuilding unrelated images. All jobs have read-only repository permissions and no registry write permission.
 
 ### Docker Publish (`docker-publish.yml`)
 
@@ -82,6 +108,14 @@ Fires after a successful stable release. Posts the release notes to the communit
 
 Fires after a successful stable release. Posts an announcement tweet.
 
+### Weekly AUR Freshness Check (`aur-freshness-check.yml`)
+
+Compares the published `zeroclawlabs` AUR version against the current stable GitHub release every Monday, and fails if the AUR is behind.
+
+Publishing to the AUR is fire-and-forget: if `pub-aur.yml` fails, nothing re-checks, so the package silently falls behind. That is exactly what happened after v0.8.4. An `aur.archlinux.org` maintenance window overlapped the release, the single unretried clone failed with `The AUR is down due to maintenance`, and the package sat three weeks behind with no signal. The publisher now allows at most one active non-dry-run publish and retries to survive a short outage; GitHub may supersede an earlier queued real publish in the same concurrency group, while dry runs use a separate group. Every attempt reclones the authoritative package state and refuses to replace a newer `epoch:pkgver-pkgrel` tuple with an older one. A retry budget still cannot cover every failure, so this check is the backstop that turns a silent miss or superseded run into a visible one.
+
+If the AUR RPC is unreachable the check warns and passes rather than failing. An AUR outage is an upstream availability problem, not package staleness, and the next scheduled run re-checks. Staleness is durable, so a delayed detection is acceptable; a weekly page about someone else's maintenance window is not.
+
 Docs are built and published as part of the release pipeline rather than on every `master` push. Translation is a local-only workflow for dedicated translation-cache PRs, new locales, and release translation passes. Routine English docs PRs may defer broad generated `.po` churn. See [Docs & Translations](./docs-and-translations.md) for contributor guidance and the [Release Runbook](./release-runbook.md#refresh-and-pin-translations) for the release procedure.
 
 ## Manual and Advisory Workflows
@@ -94,7 +128,7 @@ First triage step for a new issue: check if the reported outdated crates have se
 
 ### Cross-Platform Build (`cross-platform-build-manual.yml`)
 
-Manual trigger for building release binaries across the full target matrix: Linux x86_64/aarch64 GNU plus armv7 and arm hard-float, macOS Intel/ARM, Windows x86_64, and `aarch64-linux-android` (built with the NDK). Use this to verify a branch compiles cleanly on non-Linux targets before tagging.
+Manual trigger for building release binaries across the full target matrix: Linux x86_64/aarch64 GNU and MUSL plus armv7 and arm hard-float, macOS Intel/ARM, Windows x86_64, and `aarch64-linux-android` (built with the NDK). Use this to verify a branch compiles cleanly on non-Linux targets before tagging.
 
 ### Cross-Platform Clippy (`cross-platform-clippy.yml`)
 
@@ -103,6 +137,11 @@ Manual and weekly scheduled advisory lint coverage on macOS aarch64 and Windows 
 ### Release Stable (`release-stable-manual.yml`)
 
 Manual trigger for the full release pipeline. Builds all targets, creates the GitHub Release, pushes the prebuilt `latest`, versioned, and `debian` Docker images to GHCR, calls the generated Docker variant matrix at the release tag, triggers the website redeploy, and invokes the distribution sub-workflows (Scoop, AUR, Discord, tweet). Homebrew Core detects new releases through its own autobump service. Two environment gates require maintainer approval mid-run: `github-releases` (the `publish` job) and `docker`.
+
+Downloadable assets use GitHub-hosted Build Level 2 attestations. Offline
+bundles and trusted-root material ship inside one verification archive, and
+both SBOM formats are checksummed and attested before the release is created.
+Cosign remains limited to GHCR image signing.
 
 See the [Release Runbook](./release-runbook.md) for the full procedure.
 
@@ -128,7 +167,7 @@ authoritative automation.
 | `AUR_SSH_KEY` | `pub-aur.yml` |
 | `DISCORD_WEBHOOK_URL` | `discord-release.yml` |
 | `TWITTER_ACCESS_TOKEN`, `TWITTER_ACCESS_TOKEN_SECRET`, `TWITTER_CONSUMER_API_KEY`, `TWITTER_CONSUMER_API_SECRET_KEY` | `tweet-release.yml` |
-| `SCOOP_BUCKET_TOKEN` | `pub-scoop.yml`; fine-grained PAT limited to `zeroclaw-labs/scoop-zeroclaw` with Contents read/write |
+| `SCOOP_BUCKET_TOKEN` | `pub-scoop.yml`, `release-stable-manual.yml`, `scoop-bucket-canary.yml`; fine-grained PAT limited to `zeroclaw-labs/scoop-zeroclaw` with Contents read/write |
 | `WEBSITE_REPO_PAT` | `release-stable-manual.yml` (triggers the website repo redeploy) |
 | `GITHUB_TOKEN` (automatic) | All workflows that push commits, open PRs, or push images to GHCR |
 
@@ -139,6 +178,43 @@ automatic `GITHUB_TOKEN` cannot write another repository. Keep
 `SCOOP_BUCKET_TOKEN` narrowly scoped to the bucket; do not reuse a maintainer's
 broad CLI token. The publisher checks write access with `git push --dry-run`,
 then uses the same Git transport for the real update.
+
+### Rotating `SCOOP_BUCKET_TOKEN`
+
+Because deploy keys are unavailable, this credential is a personal access token
+and therefore has two independent failure modes, both of which have bitten a
+release:
+
+1. **The token expires.** Fine-grained PATs have a maximum lifetime, so this
+   recurs on a fixed schedule whether or not anything else changes.
+2. **The owning identity loses write on the bucket.** The token can still be
+   valid while the account behind it is only a `read` collaborator. This
+   produces `remote: Permission to zeroclaw-labs/scoop-zeroclaw.git denied to
+   <account>` and HTTP 403, not an auth error, so it reads as a code problem
+   when it is a permissions problem.
+
+Own the token with the `ZeroClaw-Bot` account, never a personal account, so the
+release path does not depend on one maintainer's credentials. To rotate:
+
+1. As `ZeroClaw-Bot`, create a fine-grained PAT with **Resource owner**
+   `zeroclaw-labs`, **Repository access** limited to the single repository
+   `zeroclaw-labs/scoop-zeroclaw`, and **Repository permissions → Contents:
+   Read and write**. Nothing else.
+2. Confirm the org approved the token. Fine-grained PATs against an org
+   resource owner stay pending until approved, and a pending token authenticates
+   but cannot push.
+3. Confirm `ZeroClaw-Bot` still has `write` on the bucket:
+   `gh api repos/zeroclaw-labs/scoop-zeroclaw/collaborators/ZeroClaw-Bot/permission --jq '.role_name'`.
+   Step 1 does not grant repository access; it only scopes what the token may
+   use. A token cannot exceed the permissions its owner already holds.
+4. Set the secret:
+   `gh secret set SCOOP_BUCKET_TOKEN --repo zeroclaw-labs/zeroclaw`.
+5. Verify without touching the bucket by dispatching
+   [Scoop Bucket Canary](#weekly-scoop-bucket-canary-scoop-bucket-canaryyml).
+   A green run proves the new token can push.
+
+Record the expiry date somewhere durable when you rotate. The canary will catch
+an expired token within a week regardless, but only after it has already broken.
 
 ### AUR package ownership
 
@@ -183,18 +259,18 @@ All third-party refs are pinned to a full commit SHA with a trailing version com
 |---|---|---|
 | `actions/checkout` (`v6.0.2`) | Most workflows | Repository checkout |
 | `actions/cache` (`v4.2.3`, `v5.0.5`) | `docker-image-pr.yml`, `tweet-release.yml` | Generic dependency and Trivy database caching |
-| `actions/setup-node` (`v6.4.0`) | `release-stable-manual.yml`, `cross-platform-build-manual.yml` | Node toolchain for the web-dashboard build |
+| `actions/setup-node` (`v7.0.0`) | `ci-sbom.yml`, `ci.yml`, `cross-platform-build-manual.yml`, `daily-npm-audit.yml`, `release-stable-manual.yml` | Node toolchain for npm SBOM generation, web tests/audit, and web/desktop builds |
 | `actions/upload-artifact` (`v7.0.1`) | `release-stable-manual.yml`, `cross-platform-build-manual.yml`, `docker-publish.yml`, `trivy-scheduled.yml` | Upload build artifacts and Trivy SARIF handoff artifacts |
 | `actions/download-artifact` (`v8.0.1`) | `release-stable-manual.yml`, `cross-platform-build-manual.yml`, `docker-publish.yml` | Download build artifacts and Trivy SARIF handoff artifacts |
+| `actions/attest` (`v4.2.2`) | `release-stable-manual.yml` | Generate GitHub-hosted Build Level 2 provenance for release assets |
 | `actions/labeler` (`v6.1.0`) | `pr-path-labeler.yml` | Apply path/scope labels from `.github/labeler.yml` |
 | `dtolnay/rust-toolchain` (`stable`) | `ci.yml`, `release-stable-manual.yml`, `cross-platform-build-manual.yml`, `cross-platform-clippy.yml`, `daily-audit.yml`, `docs-deploy.yml` | Install Rust toolchain |
 | `Swatinem/rust-cache` (`v2.9.1`) | `ci.yml`, `release-stable-manual.yml`, `cross-platform-build-manual.yml`, `cross-platform-clippy.yml`, `docs-deploy.yml` | Cargo build/dependency caching |
 | `docker/setup-buildx-action` (`v3.11.1`, `v4.0.0`) | `release-stable-manual.yml`, `docker-publish.yml` | Docker Buildx setup |
 | `docker/login-action` (`v3.4.0`, `v4.1.0`) | `release-stable-manual.yml`, `docker-publish.yml`, `trivy-scheduled.yml` | GHCR authentication |
 | `docker/build-push-action` (`v6.18.0`, `v7.1.0`) | `release-stable-manual.yml`, `docker-publish.yml` | Multi-platform image build and push |
-| `sigstore/cosign-installer` (`v3.8.1`) | `release-stable-manual.yml`, `docker-publish.yml` | Install cosign for keyless signing of release assets and container images |
-| `anchore/sbom-action` (`v0.17.9`) | `release-stable-manual.yml` | Generate SPDX + CycloneDX SBOMs for each release |
-| `slsa-framework/slsa-github-generator` (`v2.1.0`) | `release-stable-manual.yml` | Reusable workflow that produces SLSA L2 provenance for release artifacts |
+| `sigstore/cosign-installer` (`v3.8.1`) | `release-stable-manual.yml`, `docker-publish.yml` | Install cosign for keyless GHCR container-image signing |
+| `anchore/sbom-action` (`v0.24.0`) | `release-stable-manual.yml` | Generate SPDX + CycloneDX SBOMs for each release |
 | `aquasecurity/trivy-action` (`v0.36.0`) | `docker-image-pr.yml`, `docker-publish.yml`, `trivy-scheduled.yml` | Report-only container vulnerability scanning |
 | `github/codeql-action/upload-sarif` (`v3.36.2`) | `docker-publish.yml`, `trivy-scheduled.yml` | Upload Trivy SARIF reports to the Security tab |
 | `github/codeql-action/init` (`v3`) | `ci-code-analysis.yml` | Initialize CodeQL Rust analysis |
@@ -211,7 +287,6 @@ Swatinem/rust-cache@*
 docker/*
 sigstore/cosign-installer@*
 anchore/sbom-action@*
-slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@*
 aquasecurity/trivy-action@*
 github/codeql-action/upload-sarif@*
 github/codeql-action/init@*
@@ -239,6 +314,7 @@ Any PR that adds or changes a `uses:` action source must include an allowlist im
 - All third-party action refs must be pinned to a full commit SHA (per the allowlist policy above).
 - Keep `ci.yml`, `dev/ci.sh`, and `.githooks/pre-push` aligned. Shared gates must live in `scripts/ci/`; each caller invokes the helper instead of copying its commands. For the standalone firmware protocol gate, the documented local entry point is `./dev/ci.sh firmware-protocol`.
 - Keep `scripts/ci/prepare_docker_context.sh`, `docker-image-pr.yml`, and the Docker job in `release-stable-manual.yml` aligned so PR validation exercises the same context shape the release workflow publishes.
+- Run `python3 scripts/ci/release_attestation_contract_test.py` after changing the release attestation, checksum, SBOM, or verification-archive sequence.
 - The `docs-style` gate job runs `bash scripts/ci/docs_quality_gate.sh` (markdown lint + em-dash prose check) and `bash scripts/ci/docs_links_gate.sh` (changed-line link gate). Run both scripts locally before pushing docs changes.
 
 ## Emergency rollback
