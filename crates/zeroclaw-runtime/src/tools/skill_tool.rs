@@ -241,6 +241,10 @@ impl Tool for SkillShellTool {
             cmd.env(SESSION_ID_ENV_VAR, session_id);
         }
 
+        // A skill's command template is operator-authored, but the model fills
+        // in its arguments, so this spawns on a model's behalf like any other.
+        cmd.env(zeroclaw_api::AGENT_SHELL_ENV_VAR, "1");
+
         let result =
             tokio::time::timeout(Duration::from_secs(self.timeout_secs), cmd.output()).await;
 

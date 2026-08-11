@@ -340,6 +340,12 @@ impl Tool for ShellTool {
             cmd.env(SESSION_ID_ENV_VAR, session_id);
         }
 
+        // Unconditional, unlike the session key above: the `zeroclaw` CLI runs
+        // with the operator's authority and no agent policy anywhere in the
+        // process, so it has to be able to recognise a model caller on every
+        // path, scoped turn or not.
+        cmd.env(zeroclaw_api::AGENT_SHELL_ENV_VAR, "1");
+
         // Overlay TUI env on top of the safe-env snapshot. TUI vars win on
         // conflict — the user's real PATH etc. should take precedence over
         // whatever the daemon process inherited.
@@ -1191,6 +1197,29 @@ mod tests {
         assert!(
             env_output_contains_key(&result.output, "PATH"),
             "PATH should be available in shell environment"
+        );
+    }
+
+    /// The `zeroclaw` CLI refuses to run when it sees this marker, because the
+    /// CLI carries operator authority and an agent invoking it escalates. The
+    /// marker has to be unconditional: `ZEROCLAW_SESSION_ID` looks like the same
+    /// signal but is only set on scoped turns, which would leave one-shot and
+    /// webhook paths silently unmarked.
+    #[tokio::test]
+    async fn shell_marks_every_spawned_command_as_agent_invoked() {
+        let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime());
+
+        let result = tool
+            .execute(json!({"command": env_print_command()}))
+            .await
+            .expect("environment print command should succeed");
+
+        assert!(result.success);
+        assert!(
+            env_output_contains_key(&result.output, zeroclaw_api::AGENT_SHELL_ENV_VAR),
+            "{} must be set on every agent-spawned command, got: {}",
+            zeroclaw_api::AGENT_SHELL_ENV_VAR,
+            result.output
         );
     }
 
