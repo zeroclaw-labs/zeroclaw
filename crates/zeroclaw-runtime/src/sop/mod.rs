@@ -1214,8 +1214,16 @@ type = "manual"
 
         // The gate and the loader must agree: enabling construction is only
         // meaningful if the engine then actually reads definitions from there.
-        let loaded = load_sops(tmp.path(), config.sops_dir.as_deref(), SopExecutionMode::Auto);
-        assert_eq!(loaded.len(), 1, "definitions must load from the default dir");
+        let loaded = load_sops(
+            tmp.path(),
+            config.sops_dir.as_deref(),
+            SopExecutionMode::Auto,
+        );
+        assert_eq!(
+            loaded.len(),
+            1,
+            "definitions must load from the default dir"
+        );
         assert_eq!(loaded[0].name, "default-dir-sop");
     }
 
