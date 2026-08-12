@@ -1585,10 +1585,14 @@ pub fn all_tools_with_runtime(
     // Pipeline tool (execute_pipeline) — multi-step tool chaining.
     if root_config.pipeline.enabled {
         let pipeline_tools: Vec<Arc<dyn Tool>> = tool_arcs.clone();
-        tool_arcs.push(Arc::new(PipelineTool::new(
-            root_config.pipeline.clone(),
-            pipeline_tools,
-        )));
+        let mut pipeline = PipelineTool::new(root_config.pipeline.clone(), pipeline_tools);
+        // Route child tools through the same emergency stop as direct dispatch,
+        // so a frozen tool cannot be run indirectly via `execute_pipeline`.
+        if let Some(guard) = crate::security::EstopChildGuard::from_config(root_config) {
+            pipeline =
+                pipeline.with_guard(Arc::new(guard) as Arc<dyn zeroclaw_api::tool::ChildToolGuard>);
+        }
+        tool_arcs.push(Arc::new(pipeline));
     }
 
     AllToolsResult {

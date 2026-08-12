@@ -190,11 +190,45 @@ impl<'a> EstopEnforcement<'a> {
         latched.clone()
     }
 
-    /// Construct enforcement context directly from parts, for tests that don't
-    /// build a whole `Config`.
-    #[cfg(test)]
-    pub(crate) fn from_parts(config: &'a EstopConfig, config_dir: &'a Path) -> Self {
+    /// Construct enforcement context directly from owned parts held elsewhere
+    /// (e.g. [`EstopChildGuard`]) or from tests that don't build a whole `Config`.
+    pub fn from_parts(config: &'a EstopConfig, config_dir: &'a Path) -> Self {
         Self { config, config_dir }
+    }
+}
+
+/// Owned emergency-stop gate for indirect execution paths — notably the
+/// `execute_pipeline` tool, which invokes child tools' `execute()` without going
+/// through the tool loop's direct dispatch. It holds an owned config + directory
+/// so it can live behind an `Arc<dyn ChildToolGuard>` inside the tools crate, and
+/// re-reads the live state on every check exactly as direct dispatch does, so a
+/// `zeroclaw estop` engaged from another process halts the next child call.
+#[derive(Debug, Clone)]
+pub struct EstopChildGuard {
+    config: EstopConfig,
+    config_dir: PathBuf,
+}
+
+impl EstopChildGuard {
+    /// Build the guard from the agent config, or `None` when estop is disabled or
+    /// the config directory is unknown — mirroring [`EstopEnforcement::from_config`].
+    pub fn from_config(config: &zeroclaw_config::schema::Config) -> Option<Self> {
+        if !config.security.estop.enabled {
+            return None;
+        }
+        let config_dir = config.config_path.parent()?.to_path_buf();
+        Some(Self {
+            config: config.security.estop.clone(),
+            config_dir,
+        })
+    }
+}
+
+impl zeroclaw_api::tool::ChildToolGuard for EstopChildGuard {
+    fn check(&self, canonical_tool_names: &[&str]) -> std::result::Result<(), String> {
+        EstopEnforcement::from_parts(&self.config, &self.config_dir)
+            .block_reason_any(canonical_tool_names)
+            .map_or(Ok(()), Err)
     }
 }
 
