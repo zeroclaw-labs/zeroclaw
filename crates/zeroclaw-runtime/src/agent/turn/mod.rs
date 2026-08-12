@@ -268,6 +268,7 @@ async fn enforce_reported_budget(
         return;
     }
     let pre_trim_estimated = reported_population_estimated;
+    let taken_had_crumb = crate::agent::history_trim::has_leading_breadcrumb(history);
     let taken = std::mem::take(history);
     let taken_len = taken.len();
     let mut result = crate::agent::history_trim::trim_to_reported_budget(
@@ -362,8 +363,16 @@ async fn enforce_reported_budget(
         }
         // Recompute the structural counts against the final retained set so the
         // emitted event reflects the re-trim, not just the first raw pass. The
-        // breadcrumb adds one synthetic user message on top of `taken`'s count.
-        result.dropped_messages = taken_len.saturating_sub(trimmed.len().saturating_sub(1));
+        // retained set always carries exactly one synthetic crumb; the taken
+        // population carried one only when it was itself the product of an
+        // earlier trim. Deriving the count from `taken_had_crumb` keeps a
+        // repeated trim from overstating newly dropped messages by one.
+        result.dropped_messages = taken_len.saturating_sub(
+            trimmed
+                .len()
+                .saturating_add(usize::from(taken_had_crumb))
+                .saturating_sub(1),
+        );
         result.kept_turns = crate::agent::history_trim::count_turns(&trimmed).saturating_sub(1);
         result.tokens_after = tokens_after;
         // A projection-triggered trim (prior provider count within budget but
@@ -3204,6 +3213,62 @@ mod reported_budget_tests {
         assert!(
             history.len() < before,
             "a projection-driven trim must actually shrink the retained history"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_trim_with_existing_crumb_does_not_overstate_dropped_messages() {
+        // A trim on history that ALREADY carries the model-visible breadcrumb
+        // (e.g. a projection-triggered trim immediately after a previous one)
+        // must not count the pre-existing crumb as a freshly dropped message:
+        // the crumb is present in both the taken and the retained set, so every
+        // message missing from the retained set is a genuinely dropped one.
+        let mut history = big_history();
+        crate::agent::history_trim::insert_breadcrumb_deduped(&mut history);
+        assert!(
+            history
+                .iter()
+                .any(|m| m.content == crate::agent::history_trim::breadcrumb().content),
+            "precondition: the fixture history carries the trim breadcrumb"
+        );
+        let taken_len = history.len();
+        let estimated = crate::agent::history::estimate_history_tokens(&history);
+        let reported = estimated * 4;
+        let budget = estimated / 2;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        enforce_reported_budget(
+            &mut history,
+            reported,
+            estimated,
+            0,
+            budget,
+            Some(&tx),
+            &NoopObserver,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            false,
+            None,
+        )
+        .await;
+        assert!(
+            history.len() < taken_len,
+            "an over-budget reported trim must shrink history"
+        );
+        let event = rx
+            .recv()
+            .await
+            .expect("the trim must emit a HistoryTrimmed event");
+        let dropped_messages = match event {
+            TurnEvent::HistoryTrimmed {
+                dropped_messages, ..
+            } => dropped_messages,
+            other => panic!("expected HistoryTrimmed, got {other:?}"),
+        };
+        assert_eq!(
+            dropped_messages as usize,
+            taken_len - history.len(),
+            "a pre-existing crumb must not be counted as a newly dropped message \
+             (dropped {dropped_messages}, taken {taken_len}, retained {})",
+            history.len()
         );
     }
 }

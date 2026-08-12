@@ -299,15 +299,23 @@ pub fn breadcrumb() -> ChatMessage {
 /// Insert the trim breadcrumb after the leading system messages, unless one is
 /// already sitting there.
 pub fn insert_breadcrumb_deduped(history: &mut Vec<ChatMessage>) {
-    let system_count = history.iter().take_while(|m| is_system(m)).count();
-    let crumb = breadcrumb();
-    let already_present = history
-        .get(system_count)
-        .is_some_and(|m| m.role == crumb.role && m.content == crumb.content);
-    if already_present {
+    if has_leading_breadcrumb(history) {
         return;
     }
-    history.insert(system_count, crumb);
+    let system_count = history.iter().take_while(|m| is_system(m)).count();
+    history.insert(system_count, breadcrumb());
+}
+
+/// Whether `history` already carries the synthetic trim breadcrumb after its
+/// leading system messages. A population that was itself the product of an
+/// earlier trim keeps its crumb, so accounting must not treat it as a fresh
+/// synthetic message.
+pub fn has_leading_breadcrumb(history: &[ChatMessage]) -> bool {
+    let system_count = history.iter().take_while(|m| is_system(m)).count();
+    let crumb = breadcrumb();
+    history
+        .get(system_count)
+        .is_some_and(|m| m.role == crumb.role && m.content == crumb.content)
 }
 
 /// Insert the trim breadcrumb into structured history after leading system
