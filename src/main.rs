@@ -5007,6 +5007,15 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 }));
 
                 let cancel = tokio_util::sync::CancellationToken::new();
+                // Single SIGINT consumer for the CLI path: cancel the
+                // shared lifecycle token. Channels subscribe via
+                // set_cancel_token so the same signal reaches all
+                // listeners deterministically.
+                let ctrlc_cancel = cancel.clone();
+                let _ctrlc_guard = ::zeroclaw_spawn::spawn!(async move {
+                    let _ = tokio::signal::ctrl_c().await;
+                    ctrlc_cancel.cancel();
+                });
                 let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
                     let mem: Arc<dyn zeroclaw_memory::Memory> =
                         Arc::from(zeroclaw_memory::create_memory_from_config(&config, None)?);
