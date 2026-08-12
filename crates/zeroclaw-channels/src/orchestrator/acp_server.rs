@@ -1721,6 +1721,13 @@ impl AcpServer {
                     )
                     .await
                     .err();
+                    // Reconcile the LIVE agent history to match the durable
+                    // projection: the tool loop appended a generic
+                    // `turn-interrupted-by-user` marker, but ACP records
+                    // cancellation as a structured, replay-only event. Drop the
+                    // live marker so the next prompt on this still-active session
+                    // does not re-send "[interrupted by user]" to the provider.
+                    session.agent.strip_trailing_interruption_marker();
                     TerminalOutcome::Cancelled { persist_error }
                 }
                 Err(failure) => {
@@ -5939,6 +5946,167 @@ mod tests {
             AcpServer::append_transcript(Some(store), "no-such-session".to_string(), Vec::new())
                 .await;
         assert!(empty.is_ok(), "an empty transcript is a no-op success");
+    }
+
+    #[tokio::test]
+    async fn cancel_then_next_prompt_does_not_resend_interruption_marker() {
+        use std::sync::Arc as StdArc;
+
+        use tokio::sync::Notify;
+        use zeroclaw_api::model_provider::ChatMessage;
+
+        // A provider that parks inside `chat` so the first turn is in flight and
+        // can be cancelled mid-turn.
+        struct BarrierProvider {
+            entered: StdArc<Notify>,
+            release: StdArc<Notify>,
+        }
+        impl zeroclaw_api::attribution::Attributable for BarrierProvider {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Provider(
+                    zeroclaw_api::attribution::ProviderKind::Model(
+                        zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "BarrierProvider"
+            }
+        }
+        #[async_trait]
+        impl zeroclaw_api::model_provider::ModelProvider for BarrierProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                Ok("done".to_string())
+            }
+            async fn chat(
+                &self,
+                _request: zeroclaw_api::model_provider::ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<zeroclaw_api::model_provider::ChatResponse> {
+                self.entered.notify_one();
+                self.release.notified().await;
+                Ok(zeroclaw_api::model_provider::ChatResponse {
+                    text: Some("done".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let server = Arc::new(AcpServer::new_with_store(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+            Arc::clone(&store),
+        ));
+        let session_id = server
+            .handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy(),
+                "agentAlias": "test-agent"
+            }))
+            .await
+            .expect("session/new must succeed")["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let entered = StdArc::new(Notify::new());
+        let release = StdArc::new(Notify::new());
+        {
+            let session = server
+                .sessions
+                .lock()
+                .await
+                .get(&session_id)
+                .cloned()
+                .expect("new session must be active");
+            session
+                .lock()
+                .await
+                .agent
+                .set_model_provider(Box::new(BarrierProvider {
+                    entered: StdArc::clone(&entered),
+                    release: StdArc::clone(&release),
+                }));
+        }
+
+        // First turn: park it in the provider, then cancel it mid-turn.
+        let prompt_server = Arc::clone(&server);
+        let prompt_sid = session_id.clone();
+        let prompt = zeroclaw_spawn::spawn!(async move {
+            prompt_server
+                .handle_session_prompt(
+                    &serde_json::json!({ "sessionId": prompt_sid, "prompt": "first prompt" }),
+                    &serde_json::json!(1),
+                )
+                .await
+        });
+        entered.notified().await;
+        server
+            .handle_session_cancel(&serde_json::json!({ "sessionId": session_id }))
+            .await
+            .expect("cancel resolves");
+        release.notify_one();
+        prompt
+            .await
+            .unwrap()
+            .expect("a cancelled turn is a terminal outcome, not an error");
+
+        // Swap in a provider that records the request it receives.
+        let requests: Arc<parking_lot::Mutex<Vec<Vec<ChatMessage>>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        {
+            let session = server
+                .sessions
+                .lock()
+                .await
+                .get(&session_id)
+                .cloned()
+                .expect("session must still be active after cancel");
+            session
+                .lock()
+                .await
+                .agent
+                .set_model_provider(Box::new(RecordingNativeProvider {
+                    requests: Arc::clone(&requests),
+                }));
+        }
+
+        // Second turn on the SAME active session must not resend the generic
+        // interruption marker to the provider.
+        server
+            .handle_session_prompt(
+                &serde_json::json!({ "sessionId": session_id, "prompt": "second prompt" }),
+                &serde_json::json!(2),
+            )
+            .await
+            .expect("the next prompt must reach the provider");
+
+        let marker = zeroclaw_runtime::i18n::get_required_cli_string("turn-interrupted-by-user");
+        let requests = requests.lock();
+        assert_eq!(requests.len(), 1, "expected exactly one provider request");
+        assert!(
+            !requests[0].iter().any(|m| m.content == marker),
+            "the interruption marker must not be re-sent to the next provider: {:?}",
+            requests[0]
+        );
+        assert!(
+            requests[0]
+                .iter()
+                .any(|m| m.role == "user" && m.content.contains("first prompt")),
+            "the earlier user prompt should still be present (only the marker is stripped): {:?}",
+            requests[0]
+        );
     }
 
     #[tokio::test]

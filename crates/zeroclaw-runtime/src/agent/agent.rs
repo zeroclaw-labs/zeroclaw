@@ -996,6 +996,29 @@ impl Agent {
         &self.history
     }
 
+    /// Remove the trailing assistant interruption marker
+    /// (`turn-interrupted-by-user`) the tool loop appends to live history when a
+    /// turn is cancelled, returning whether one was removed.
+    ///
+    /// External surfaces that project cancellation differently on their durable
+    /// transcript (the ACP channel records a structured, replay-only cancellation
+    /// event instead) call this so the generic marker is not re-sent to the
+    /// provider on the next turn of the same still-active session. The marker
+    /// string stays owned by the runtime here rather than being re-derived and
+    /// content-matched at the call site.
+    pub fn strip_trailing_interruption_marker(&mut self) -> bool {
+        let marker = crate::i18n::get_required_cli_string("turn-interrupted-by-user");
+        let is_marker = matches!(
+            self.history.last(),
+            Some(ConversationMessage::Chat(message))
+                if message.role == "assistant" && message.content == marker
+        );
+        if is_marker {
+            self.history.pop();
+        }
+        is_marker
+    }
+
     pub fn channel_handles(&self) -> &AgentChannelHandles {
         &self.channel_handles
     }
