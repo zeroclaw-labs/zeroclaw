@@ -57,7 +57,7 @@ pub fn build_system_prompt(
         identity_config,
         bootstrap_max_chars,
         false,
-        zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+        zeroclaw_config::schema::SkillsPromptInjectionMode::Compact,
         AutonomyLevel::default(),
     )
 }
@@ -82,7 +82,7 @@ pub fn build_system_prompt_with_tool_calls(
         bootstrap_max_chars,
         Some(&zeroclaw_config::schema::RiskProfileConfig::default()),
         false,
-        zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+        zeroclaw_config::schema::SkillsPromptInjectionMode::Compact,
         false,
         0,
         true,
@@ -146,6 +146,10 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     use std::fmt::Write;
     let mut prompt = String::with_capacity(8192);
     let has_tools = !tools.is_empty() || native_tool_specs_present;
+    let skills_prompt_mode = crate::skills::skills_prompt_mode_with_loader_fallback(
+        skills_prompt_mode,
+        tools.iter().any(|(name, _)| *name == "read_skill"),
+    );
 
     // ── 0. Anti-narration (top priority) ───────────────────────
     // When show_tool_calls is true, the model is allowed to describe

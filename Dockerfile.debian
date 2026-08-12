@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7-labs
 
 # >>> generated:base-arg-node from dev/ci/container-base-images.toml by `cargo generate installers` - do not edit <<<
-ARG ZEROCLAW_BASE_NODE=node:24-bookworm-slim@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d
+ARG ZEROCLAW_BASE_NODE=node:24-bookworm-slim@sha256:235600a8101ab264e117b1768e925532262668dc9b581ef1dd7d96ced463b8e7
 # >>> end generated:base-arg-node <<<
 # >>> generated:base-arg-rust-bookworm from dev/ci/container-base-images.toml by `cargo generate installers` - do not edit <<<
 ARG ZEROCLAW_BASE_RUST_BOOKWORM=rust:1.96-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663
@@ -70,6 +70,10 @@ COPY Cargo.toml Cargo.lock ./
 # no longer requires editing this file.  --parents preserves the
 # crates/<name>/Cargo.toml directory structure.
 COPY --parents crates/*/Cargo.toml ./
+# Nested workspace members (e.g. plugin test fixtures) are not matched by the
+# single-level crates/*/Cargo.toml glob above, so copy their manifests
+# explicitly to keep workspace manifest parsing intact during the pre-fetch.
+COPY --parents crates/zeroclaw-plugins/tests/fixtures/channel-fixture/Cargo.toml ./
 # apps/tauri: .dockerignore whitelists only Cargo.toml; src and build.rs are stubbed below.
 COPY apps/tauri/Cargo.toml apps/tauri/Cargo.toml
 # apps/zerocode: TUI app not shipped in the server image; copy only its manifest
@@ -102,14 +106,16 @@ RUN mkdir -p src src/bin benches apps/tauri/src apps/zerocode/src tools/fill-tra
     && echo "fn main() {}" > xtask/src/bin/web.rs \
     && mkdir -p crates/zeroclaw-hardware/examples \
     && echo "fn main() {}" > crates/zeroclaw-hardware/examples/esp32_sim.rs \
-    && for d in crates/*/; do mkdir -p "${d}src" && printf '' > "${d}src/lib.rs"; done
+    && for d in crates/*/; do mkdir -p "${d}src" && printf '' > "${d}src/lib.rs"; done \
+    && mkdir -p crates/zeroclaw-plugins/tests/fixtures/channel-fixture/src \
+    && printf '' > crates/zeroclaw-plugins/tests/fixtures/channel-fixture/src/lib.rs
 RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=zeroclaw-target,target=/app/target,sharing=locked \
     if [ -n "$ZEROCLAW_CARGO_FLAGS" ]; then \
-      cargo build --release --locked -p zeroclawlabs -p zerocode $ZEROCLAW_CARGO_FLAGS; \
+      cargo build --release --locked -p zeroclaw -p zerocode $ZEROCLAW_CARGO_FLAGS; \
     else \
-      cargo build --release --locked -p zeroclawlabs -p zerocode; \
+      cargo build --release --locked -p zeroclaw -p zerocode; \
     fi
 RUN rm -rf src benches crates xtask tools/fill-translations
 
@@ -131,10 +137,9 @@ RUN touch src/main.rs src/lib.rs apps/zerocode/src/main.rs
 RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=zeroclaw-target,target=/app/target,sharing=locked \
-    rm -rf target/release/.fingerprint/zeroclawlabs-* \
-           target/release/deps/zeroclawlabs-* \
-           target/release/incremental/zeroclawlabs-* \
-           target/release/.fingerprint/zeroclaw-* \
+    rm -rf target/release/.fingerprint/zeroclaw-* \
+           target/release/deps/zeroclaw-* \
+           target/release/incremental/zeroclaw-* \
            target/release/deps/zeroclaw_* \
            target/release/incremental/zeroclaw_* \
            target/release/.fingerprint/xtask-* \
@@ -145,9 +150,9 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
            target/release/deps/zerocode-* \
            target/release/incremental/zerocode-* && \
     if [ -n "$ZEROCLAW_CARGO_FLAGS" ]; then \
-      cargo build --release --locked -p zeroclawlabs -p zerocode $ZEROCLAW_CARGO_FLAGS; \
+      cargo build --release --locked -p zeroclaw -p zerocode $ZEROCLAW_CARGO_FLAGS; \
     else \
-      cargo build --release --locked -p zeroclawlabs -p zerocode; \
+      cargo build --release --locked -p zeroclaw -p zerocode; \
     fi && \
     cp target/release/zeroclaw /app/zeroclaw && \
     cp target/release/zerocode /app/zerocode && \

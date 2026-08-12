@@ -1,4 +1,27 @@
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+
+/// The shell dialect a runtime's [`build_shell_command`](RuntimeAdapter::build_shell_command)
+/// executes commands under.
+///
+/// The command-risk policy needs this to apply platform-specific safety rules —
+/// notably the null device: a POSIX shell treats `nul` as an ordinary relative
+/// filename (so `echo x >nul` would create/truncate a workspace file), while
+/// Windows `cmd.exe` resolves it to the discard-only null device. A redirect to
+/// `nul` is therefore only safe under [`ShellDialect::WindowsCmd`].
+///
+/// The dialect follows the *effective execution sink*, not merely the host OS:
+/// Docker and cron always run through `sh -c` and stay [`ShellDialect::Posix`]
+/// even on a Windows host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ShellDialect {
+    /// POSIX `sh`/`bash` semantics — Unix native execution, Docker `sh -c`,
+    /// and cron `sh -c`. The conservative default.
+    #[default]
+    Posix,
+    /// Windows `cmd.exe` semantics — native execution on a Windows host.
+    WindowsCmd,
+}
 
 /// Runtime adapter that abstracts platform differences for the agent.
 ///
@@ -52,6 +75,20 @@ pub trait RuntimeAdapter: Send + Sync {
         0
     }
 
+    /// Report the shell dialect that [`build_shell_command`](Self::build_shell_command)
+    /// executes commands under.
+    ///
+    /// Defaults to [`ShellDialect::Posix`]; only native execution on a Windows
+    /// host runs commands through `cmd.exe` and should override this to
+    /// [`ShellDialect::WindowsCmd`]. The command-risk policy consults this to
+    /// decide platform-specific safety (e.g. accepting a redirect to the `nul`
+    /// null device), so an adapter must report the dialect it *actually* runs
+    /// under — Docker and cron execute via `sh -c` and therefore stay POSIX
+    /// even on Windows.
+    fn shell_dialect(&self) -> ShellDialect {
+        ShellDialect::Posix
+    }
+
     /// Build a shell command process configured for this runtime.
     ///
     /// Constructs a [`tokio::process::Command`] that will execute `command`
@@ -68,6 +105,22 @@ pub trait RuntimeAdapter: Send + Sync {
         command: &str,
         workspace_dir: &Path,
     ) -> anyhow::Result<tokio::process::Command>;
+
+    /// Build a shell command process with runtime-visible environment names.
+    ///
+    /// `env_keys` contains variable names selected by the caller for
+    /// passthrough. Implementations that need explicit forwarding, such as
+    /// container runtimes, should pass only these names across their runtime
+    /// boundary and rely on the spawned process environment for the values.
+    fn build_shell_command_with_env_keys(
+        &self,
+        command: &str,
+        workspace_dir: &Path,
+        env_keys: &[&OsStr],
+    ) -> anyhow::Result<tokio::process::Command> {
+        let _ = env_keys;
+        self.build_shell_command(command, workspace_dir)
+    }
 }
 
 #[cfg(test)]
@@ -126,6 +179,15 @@ mod tests {
     }
 
     #[test]
+    fn default_shell_dialect_is_posix() {
+        // Any adapter that does not override `shell_dialect` (Docker, cron, and
+        // every non-native sink) runs commands through `sh -c`, so it must
+        // report POSIX. Only native execution on Windows overrides to cmd.exe.
+        let runtime = DummyRuntime;
+        assert_eq!(runtime.shell_dialect(), ShellDialect::Posix);
+    }
+
+    #[test]
     fn runtime_reports_capabilities() {
         let runtime = DummyRuntime;
 
@@ -148,5 +210,23 @@ mod tests {
 
         assert!(output.status.success());
         assert!(stdout.contains("hello-runtime"));
+    }
+
+    #[tokio::test]
+    async fn default_env_key_builder_delegates_to_shell_command() {
+        let runtime = DummyRuntime;
+        let mut cmd = runtime
+            .build_shell_command_with_env_keys(
+                "hello-env-key-runtime",
+                Path::new("."),
+                &[OsStr::new("ZC_RUNTIME_TOKEN")],
+            )
+            .unwrap();
+
+        let output = cmd.output().await.unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        assert!(output.status.success());
+        assert!(stdout.contains("hello-env-key-runtime"));
     }
 }

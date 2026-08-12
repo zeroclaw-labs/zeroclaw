@@ -1,9 +1,6 @@
 # Logs & observability
 
-Every event ZeroClaw emits flows through one crate: `zeroclaw-log`. The crate
-owns the on-disk JSONL schema, the in-process broadcast stream the dashboard
-reads, the bridge to the typed `Observer` (Prometheus / OTel), and the
-macros (`record!`, `scope!`, `spawn!`) that subsystems call.
+Every event ZeroClaw emits flows through one crate: `zeroclaw-log`. The crate owns the on-disk JSONL schema, the in-process broadcast stream the dashboard reads, the optional bridge to the typed `Observer` (Prometheus / OTel), and the macros (`record!`, `scope!`, `spawn!`) that subsystems call.
 
 This page covers what an operator needs: configuration, where the log lives,
 the shape of the events, and how to query them.
@@ -17,17 +14,13 @@ install produces a 200-event rolling JSONL at
 `~/.zeroclaw/data/state/runtime-trace.jsonl`, and the dashboard's Logs page
 works without further configuration.
 
-`log_persistence = "none"` disables persistence entirely. The broadcast
-stream (dashboard SSE) and the typed `Observer` bridge still receive
-events; only the JSONL writer is gated.
+`log_persistence = "none"` disables persistence entirely but does not gate the broadcast stream used by dashboard SSE. The optional typed `Observer` bridge is also independent of persistence, but it receives canonical log events only when explicitly bound; the current production bootstrap does not install that binding.
+
+Persistence is best-effort rather than a transactional audit guarantee. The Observer bridge, when bound, and broadcast delivery happen before the event is offered to a bounded background-writer queue. A full queue or worker write failure can leave an event out of JSONL. Periodic sync covers the current active file; daily rotation before a new UTC day's first append and size rotation after a threshold-crossing append can rename the active file without first syncing it, so the cadence does not bound durability for a just-rotated archive. See [Logging architecture](../architecture/logging.md#delivery-surfaces-have-different-guarantees) for the separate delivery contracts.
 
 ### Archive rotation (`log_persistence = "rotating"`)
 
-`rotating` persists every event like `full`, but ZeroClaw manages the active
-file: it is rotated to a timestamped archive on a size and/or daily boundary,
-and old archives are pruned by count and age. This differs from `rolling`,
-which trims old entries out of the active file; rotated events are preserved in
-archive files for later diagnostics.
+`rotating` applies no entry-count trim to events accepted by the background writer, like `full`, but ZeroClaw manages the active file: it is rotated to a timestamped archive on a size and/or daily boundary, and old archives are pruned by count and age. This differs from `rolling`, which trims old entries out of the active file; rotated events are preserved in archive files for later diagnostics.
 
 | Key | Default | Effect |
 | --- | --- | --- |
@@ -203,10 +196,7 @@ The dashboard's Logs page is the primary surface. Underneath:
 GET /api/logs
 ```
 
-Top-level filters (query params): `since_ts`, `until_ts`, `until_id`,
-`action`, `category`, `outcome`, `severity_min`, `trace_id`, `q`
-(substring across `message` + `attributes`), `hide_internal` (drops
-`event.category = "internal"`), `limit`.
+Top-level filters (query params): `since_ts`, `until_ts`, `until_line_offset`, `action`, `category`, `outcome`, `severity_min`, `trace_id`, `q` (substring across `message` + `attributes`), `hide_internal` (drops `event.category = "internal"`), `limit`. The legacy `until_id` field remains available for timestamp/ID cursor compatibility.
 
 Every other `?<key>=<value>` is treated as a per-attribution equality
 filter, the gateway validates the key against `is_attribution_field`
@@ -235,10 +225,9 @@ curl "$ZEROCLAW_GATEWAY/api/logs?trace_id=<value-from-a-prior-event>"
 
 </div>
 
-Pagination is reverse-cursor. The response includes
-`next_cursor: [timestamp, id] | null`; pass these back as `until_ts` +
-`until_id` to load older. `at_end: true` means the reader scanned the
-whole file for the current filter.
+Log pagination walks backward with a byte-offset cursor. While `at_end` is false, pass a non-null `next_cursor_line_offset` back as `until_line_offset` with the same non-cursor filters to load older events without re-reading newer bytes. Restart from the newest page after changing filters. Treat `at_end: true` as the signal to stop requesting older pages for that pagination walk. The legacy `next_cursor: [timestamp, id] | null` response remains for compatibility; using its timestamp/ID pair as `until_ts` and `until_id` for pagination is deprecated because the lexicographic ID tie-break can silently skip events with the same timestamp.
+
+`until_line_offset` is a position in the current active file, not a durable event checkpoint. Pure appends preserve it, but rolling trim, archive rotation, startup migration, and a configured path change replace the bytes or active file it refers to. Restart from the newest page after those boundaries rather than reusing an older offset. `/api/logs` reads only the active file; inspect timestamped archives directly when older rotated history is required.
 
 The `/api/status` response includes `daemon_started_at: string` (RFC
 3339), so a dashboard can default to "since daemon start" without an

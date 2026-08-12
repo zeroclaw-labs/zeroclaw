@@ -263,6 +263,67 @@ mod tests {
     }
 
     #[test]
+    fn spawned_daemon_startup_failure_formats_in_all_builtin_catalogues() {
+        let catalogues = [
+            ("en", EN_FTL),
+            ("es", include_str!("../locales/es/zerocode.ftl")),
+            ("fr", include_str!("../locales/fr/zerocode.ftl")),
+            ("ja", include_str!("../locales/ja/zerocode.ftl")),
+            ("zh-CN", include_str!("../locales/zh-CN/zerocode.ftl")),
+        ];
+
+        for (locale, source) in catalogues {
+            let failure = format_ftl_message(
+                source,
+                locale,
+                "zc-error-spawned-daemon-startup",
+                &[("details", "test failure")],
+            )
+            .unwrap_or_else(|| panic!("spawned-daemon failure must format for {locale}"));
+            assert!(failure.contains("test failure"));
+        }
+    }
+
+    #[test]
+    fn doctor_persistence_keys_present_in_all_builtin_catalogues() {
+        // The Doctor view surfaces four persistence keys in the detail panel.
+        // Every shipped catalogue must define them so the operator-facing
+        // diagnostics never fall back to a bare `{key}` placeholder.
+        let catalogues = [
+            ("en", EN_FTL),
+            ("es", include_str!("../locales/es/zerocode.ftl")),
+            ("fr", include_str!("../locales/fr/zerocode.ftl")),
+            ("ja", include_str!("../locales/ja/zerocode.ftl")),
+            ("zh-CN", include_str!("../locales/zh-CN/zerocode.ftl")),
+        ];
+
+        for (locale, source) in catalogues {
+            for key in [
+                "zc-doctor-error-daemon-timeout",
+                "zc-doctor-partial-banner",
+                "zc-doctor-partial-hint",
+            ] {
+                assert!(
+                    format_ftl_message(source, locale, key, &[]).is_some(),
+                    "{key} must be defined for {locale}"
+                );
+            }
+
+            let log_path = format_ftl_message(
+                source,
+                locale,
+                "zc-doctor-log-path",
+                &[("path", "/tmp/trace-2026-08-01.jsonl")],
+            )
+            .unwrap_or_else(|| panic!("zc-doctor-log-path must format for {locale}"));
+            assert!(
+                log_path.contains("/tmp/trace-2026-08-01.jsonl"),
+                "zc-doctor-log-path must embed the resolved path for {locale}: {log_path}"
+            );
+        }
+    }
+
+    #[test]
     fn missing_key_returns_brace_form() {
         let value = t("zc-definitely-not-a-real-key");
         assert_eq!(value, "{zc-definitely-not-a-real-key}");

@@ -793,11 +793,24 @@ impl Channel for WhatsAppChannel {
         self.send(&SendMessage::new(trimmed, recipient)).await
     }
 
+    /// Delegates to [`Self::request_approval_attributed`] and drops the
+    /// provenance, so the prompt/timeout logic lives in exactly one place.
     async fn request_approval(
         &self,
         recipient: &str,
         request: &ChannelApprovalRequest,
     ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
+        Ok(self
+            .request_approval_attributed(recipient, request)
+            .await?
+            .map(|attributed| attributed.response))
+    }
+
+    async fn request_approval_attributed(
+        &self,
+        recipient: &str,
+        request: &ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
         let token = crate::util::new_approval_token();
         let (tx_approval, rx_approval) = oneshot::channel();
         {
@@ -805,22 +818,38 @@ impl Channel for WhatsAppChannel {
             map.insert(token.clone(), tx_approval);
         }
 
-        let text = format!(
-            "APPROVAL REQUIRED [{}]\nTool: {}\nArgs: {}\n\nReply: \"{} yes\", \"{} no\", or \"{} always\"",
-            token, request.tool_name, request.arguments_summary, token, token, token
+        let text = crate::util::build_yesno_approval_prompt(
+            &token,
+            &request.tool_name,
+            &request.arguments_summary,
         );
         self.send(&SendMessage::new(text, recipient)).await?;
 
         let timeout = std::time::Duration::from_secs(self.approval_timeout_secs);
-        let response = match tokio::time::timeout(timeout, rx_approval).await {
-            Ok(Ok(response)) => response,
-            _ => {
+        // Only a real token-echo reply is an operator decision; the
+        // dropped-sender and timeout arms are the runtime denying on its own.
+        let attributed = match tokio::time::timeout(timeout, rx_approval).await {
+            Ok(Ok(response)) => {
+                zeroclaw_api::channel::AttributedApprovalResponse::operator(response)
+            }
+            Ok(Err(_)) => {
                 let mut map = PENDING_APPROVALS.lock().await;
                 map.remove(&token);
-                ChannelApprovalResponse::Deny
+                zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                    ChannelApprovalResponse::Deny,
+                    zeroclaw_api::channel::ApprovalSource::Unreachable,
+                )
+            }
+            Err(_) => {
+                let mut map = PENDING_APPROVALS.lock().await;
+                map.remove(&token);
+                zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                    ChannelApprovalResponse::Deny,
+                    zeroclaw_api::channel::ApprovalSource::TimedOut,
+                )
             }
         };
-        Ok(Some(response))
+        Ok(Some(attributed))
     }
 
     async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {

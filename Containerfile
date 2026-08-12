@@ -4,7 +4,7 @@
 # Alpine, no core-llvm-libgcc, no external deps for the GCC runtime.
 
 # ── Stage: config-gen (generate default config template) ────
-FROM docker.io/stagex/pallet-rust@sha256:2d90b9552412ee2c4fa2a13b489c2f28c044be7fb5d6a942bfd5a480a5c288fd AS config-gen
+FROM docker.io/stagex/pallet-rust@sha256:abe9b95c93a5afa271f69fcd5eb18c8cd405fe5df6491a63c9418e3a170573dc AS config-gen
 
 # Default config template consumed by build/build-fat. Single source of truth
 # so operators get a working config on first run without migration overhead.
@@ -38,10 +38,10 @@ RUN <<-EOF
 EOF
 
 # ── Stage: nodejs (reference for Node.js toolchain) ──────────
-FROM docker.io/stagex/pallet-nodejs@sha256:81bc04b9490a4f4401a8b6fd277736d75f1f0ad4bd98e8f6b4b3616e18b75f7b AS nodejs
+FROM docker.io/stagex/pallet-nodejs@sha256:5c96b25c18713976497a21c770057f2179c5014c5a025a02d2df9041d8f861f6 AS nodejs
 
 # ── Stage: web-build (web dashboard via xtask + npm build) ──
-FROM docker.io/stagex/pallet-rust@sha256:2d90b9552412ee2c4fa2a13b489c2f28c044be7fb5d6a942bfd5a480a5c288fd AS web-build
+FROM docker.io/stagex/pallet-rust@sha256:abe9b95c93a5afa271f69fcd5eb18c8cd405fe5df6491a63c9418e3a170573dc AS web-build
 
 WORKDIR /src
 COPY . .
@@ -76,13 +76,13 @@ RUN test -f /usr/lib/libunwind.so && ln -s libunwind.so /usr/lib/libgcc_s.so.1 |
 RUN npm ci --prefix web && npm install --prefix web lightningcss-linux-$(uname -m | sed 's/x86_64/x64/;s/aarch64/arm64/')-musl
 
 # Fetch cargo dependencies (network allowed)
-RUN --mount=type=cache,target=/root/.cargo/registry \
-    --mount=type=cache,target=/root/.cargo/git \
+RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/git,sharing=locked \
     cargo fetch --locked
 
 # Build the web dashboard (gen-api + typescript build), no network
-RUN --mount=type=cache,target=/root/.cargo/registry \
-    --mount=type=cache,target=/root/.cargo/git \
+RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/git,sharing=locked \
     --network=none \
     <<-EOF
     set -e
@@ -97,22 +97,22 @@ EOF
 # Single source of truth for "what passes" in the deterministic StageX
 # musl environment. Used by CI and developers as a pre-push gate.
 # Does NOT depend on web-build (creates a stub for compilation).
-FROM docker.io/stagex/pallet-rust@sha256:2d90b9552412ee2c4fa2a13b489c2f28c044be7fb5d6a942bfd5a480a5c288fd AS check
+FROM docker.io/stagex/pallet-rust@sha256:abe9b95c93a5afa271f69fcd5eb18c8cd405fe5df6491a63c9418e3a170573dc AS check
 
 WORKDIR /src
 COPY . .
 
 # Fetch all workspace dependencies (network available)
-RUN --mount=type=cache,target=/root/.cargo/registry \
-    --mount=type=cache,target=/root/.cargo/git \
+RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/git,sharing=locked \
     cargo fetch
 
 # Format + clippy (fully isolated — no network, reproducible)
 # -crt-static: the musl target defaults crt-static on, but host == target in
 # StageX, so proc-macro/build-script host artifacts cannot link statically.
 # This validates code correctness; the target static link is checked in build.
-RUN --mount=type=cache,target=/root/.cargo/registry \
-    --mount=type=cache,target=/root/.cargo/git \
+RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/git,sharing=locked \
     --network=none \
     <<-EOF
     set -e
@@ -143,8 +143,8 @@ EOF
 #   compiled by rustdoc as host artifacts that hit the musl static-link wall,
 #   and the criterion bench links a C dep (alloca) that the static link
 #   rejects. Both run in the standard CI Test/Benchmarks jobs.
-RUN --mount=type=cache,target=/root/.cargo/registry \
-    --mount=type=cache,target=/root/.cargo/git \
+RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/git,sharing=locked \
     <<-EOF
     set -e
     export RUSTFLAGS="-C target-feature=-crt-static"
@@ -152,19 +152,19 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
 EOF
 
 # ── Stage: build (zeroclaw + zerocode, default channels) ────
-FROM docker.io/stagex/pallet-rust@sha256:2d90b9552412ee2c4fa2a13b489c2f28c044be7fb5d6a942bfd5a480a5c288fd AS build
+FROM docker.io/stagex/pallet-rust@sha256:abe9b95c93a5afa271f69fcd5eb18c8cd405fe5df6491a63c9418e3a170573dc AS build
 
 WORKDIR /src
 COPY . .
 
 # Fetch all workspace dependencies (network available)
-RUN --mount=type=cache,target=/root/.cargo/registry \
-    --mount=type=cache,target=/root/.cargo/git \
+RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/git,sharing=locked \
     cargo fetch
 
 # Offline build: release binaries (validation moved to check stage)
-RUN --mount=type=cache,target=/root/.cargo/registry \
-    --mount=type=cache,target=/root/.cargo/git \
+RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/git,sharing=locked \
     --network=none \
     <<-EOF
     set -e
@@ -182,7 +182,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     # Build combined libstdc++.a from libc++.a + libc++abi.a (stagex ships LLVM libc++, not GCC libstdc++)
     (mkdir -p /tmp/libwrap/cxx /tmp/libwrap/cxxabi && cd /tmp/libwrap/cxx && ar x /usr/lib/libc++.a && cd /tmp/libwrap/cxxabi && ar x /usr/lib/libc++abi.a && ar rcs /usr/lib/libstdc++.a /tmp/libwrap/cxx/*.o /tmp/libwrap/cxxabi/*.o && rm -rf /tmp/libwrap)
 
-    # Release build — zeroclawlabs (daemon)
+    # Release build — zeroclaw (daemon)
     # >>> generated:container-standard by `cargo generate installers` - do not edit <<<
     ZEROCLAW_FEATURES="acp-bridge,agent-runtime,channel-acp-server,channel-discord,channel-email,channel-filesystem,channel-lark,channel-matrix,channel-telegram,channel-webhook,gateway,observability-prometheus,schema-export,whatsapp-web"
 # >>> end generated:container-standard <<<
@@ -193,7 +193,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
         --target "$TARGET" \
         --no-default-features \
         --features "${ZEROCLAW_FEATURES}" \
-        -p zeroclawlabs
+        -p zeroclaw
 
     # Release build — zerocode (TUI config manager)
     CARGO_TARGET_DIR=/target \
@@ -237,20 +237,20 @@ ENTRYPOINT ["/usr/bin/zeroclaw"]
 CMD ["daemon"]
 
 # ── Stage: build-fat (zeroclaw + zerocode, all channels) ────
-FROM docker.io/stagex/pallet-rust@sha256:2d90b9552412ee2c4fa2a13b489c2f28c044be7fb5d6a942bfd5a480a5c288fd AS build-fat
+FROM docker.io/stagex/pallet-rust@sha256:abe9b95c93a5afa271f69fcd5eb18c8cd405fe5df6491a63c9418e3a170573dc AS build-fat
 
 WORKDIR /src
 COPY . .
 
 # Fetch all workspace dependencies (network available)
 # Shares cache with the build stage via mount target
-RUN --mount=type=cache,target=/root/.cargo/registry \
-    --mount=type=cache,target=/root/.cargo/git \
+RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/git,sharing=locked \
     cargo fetch
 
 # Offline build: release binaries with all channels
-RUN --mount=type=cache,target=/root/.cargo/registry \
-    --mount=type=cache,target=/root/.cargo/git \
+RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/git,sharing=locked \
     --network=none \
     <<-EOF
     set -e
@@ -268,9 +268,9 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     # Build combined libstdc++.a from libc++.a + libc++abi.a (stagex ships LLVM libc++, not GCC libstdc++)
     (mkdir -p /tmp/libwrap/cxx /tmp/libwrap/cxxabi && cd /tmp/libwrap/cxx && ar x /usr/lib/libc++.a && cd /tmp/libwrap/cxxabi && ar x /usr/lib/libc++abi.a && ar rcs /usr/lib/libstdc++.a /tmp/libwrap/cxx/*.o /tmp/libwrap/cxxabi/*.o && rm -rf /tmp/libwrap)
 
-    # Release build — zeroclawlabs (all channels)
+    # Release build — zeroclaw (all channels)
     # >>> generated:container-fat by `cargo generate installers` - do not edit <<<
-    ZEROCLAW_FEATURES="acp-bridge,agent-runtime,browser-native,channel-acp-server,channel-amqp,channel-bluesky,channel-clawdtalk,channel-dingtalk,channel-discord,channel-email,channel-feishu,channel-filesystem,channel-git,channel-imessage,channel-irc,channel-lark,channel-line,channel-linq,channel-matrix,channel-mattermost,channel-mochat,channel-mqtt,channel-nextcloud,channel-nostr,channel-notion,channel-qq,channel-reddit,channel-signal,channel-slack,channel-telegram,channel-twitch,channel-twitter,channel-voice-call,channel-wati,channel-webhook,channel-wechat,channel-wecom,channel-wecom-ws,channel-whatsapp-cloud,dev-sim,gateway,hardware,memory-postgres,observability-otel,observability-prometheus,peripheral-rpi,plugins-wasm,plugins-wasm-cranelift,plugins-wasm-pulley,plugins-wasm-runtime-only,probe,provider-gitea,provider-github,sandbox-bubblewrap,sandbox-landlock,schema-export,webauthn,whatsapp-web"
+    ZEROCLAW_FEATURES="acp-bridge,agent-runtime,browser-native,channel-acp-server,channel-amqp,channel-bluesky,channel-clawdtalk,channel-dingtalk,channel-discord,channel-email,channel-feishu,channel-filesystem,channel-git,channel-imessage,channel-irc,channel-lark,channel-line,channel-linq,channel-matrix,channel-mattermost,channel-mochat,channel-mqtt,channel-nextcloud,channel-nostr,channel-notion,channel-qq,channel-reddit,channel-signal,channel-slack,channel-telegram,channel-twitch,channel-twitter,channel-voice-call,channel-webhook,channel-wechat,channel-wecom,channel-wecom-ws,channel-whatsapp-cloud,dev-sim,gateway,hardware,memory-postgres,observability-otel,observability-prometheus,peripheral-rpi,plugins-wasm,plugins-wasm-cranelift,plugins-wasm-pulley,plugins-wasm-runtime-only,probe,provider-gitea,provider-github,sandbox-bubblewrap,sandbox-landlock,schema-export,webauthn,whatsapp-web"
 # >>> end generated:container-fat <<<
     CARGO_TARGET_DIR=/target \
     cargo build \
@@ -279,7 +279,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
         --target "$TARGET" \
         --no-default-features \
         --features "${ZEROCLAW_FEATURES}" \
-        -p zeroclawlabs
+        -p zeroclaw
 
     # Release build — zerocode (TUI config manager)
     CARGO_TARGET_DIR=/target \

@@ -105,6 +105,7 @@ Applied automatically by `pr-path-labeler.yml`. Globs live in `.github/labeler.y
 | `dependencies` | `Cargo.toml`, `Cargo.lock`, `deny.toml`, `.github/dependabot.yml` |
 | `ci` | `.github/codeql/**`, `.github/workflows/**`, `.github/*.yaml`, `.github/*.yml`, `.github/*.json`, `.githooks/**` |
 | `core` | `src/*.rs` |
+| `cli` | `src/main.rs`, `src/lib.rs`, `src/commands/**`, `src/alias_cli/**`, `src/cli_input.rs`, `crates/zeroclaw-commands/**`, `crates/zeroclaw-runtime/src/cli_input.rs` |
 | `agent` | `src/agent/**`, `crates/zeroclaw-runtime/src/agent/**` |
 | `channel` | `src/channels/**`, `crates/zeroclaw-channels/src/**` |
 | `gateway` | `src/gateway/**`, `crates/zeroclaw-gateway/src/**` |
@@ -119,6 +120,10 @@ Applied automatically by `pr-path-labeler.yml`. Globs live in `.github/labeler.y
 | `security` | `src/security/**`, `crates/zeroclaw-runtime/src/security/**` |
 | `runtime` | `src/runtime/**`, `crates/zeroclaw-runtime/src/**` |
 | `quickstart` | `crates/zeroclaw-runtime/src/quickstart/**`, `crates/zeroclaw-gateway/src/api_quickstart.rs`, `apps/zerocode/src/quickstart_pane.rs`, `web/src/pages/quickstart/**` |
+| `desktop` | `apps/tauri/**` |
+| `hardware` | `src/hardware/**`, `crates/zeroclaw-hardware/**`, `crates/robot-kit/**`, `crates/aardvark-sys/**`, `firmware/**` |
+| `web` | `web/**` |
+| `zerocode` | `apps/zerocode/**` |
 | `provider` | `src/providers/**`, `crates/zeroclaw-providers/src/**` |
 | `service` | `src/service/**`, `crates/zeroclaw-runtime/src/service/**` |
 | `skillforge` | `src/skillforge/**`, `crates/zeroclaw-runtime/src/skillforge/**` |
@@ -156,6 +161,23 @@ Scoped path labels do not guarantee a same-prefix base label. Because `pr-path-l
 ### Manual component labels
 
 Some scoped component labels are manual routing labels rather than synchronized path labels.
+
+`domain:architecture` identifies cross-component ownership, source-of-truth, dependency-direction, interface/contract, and architecture-decision work. Do not apply it merely because an issue is an RFC.
+
+`domain:security` identifies cross-cutting trust-boundary or security-impact work, including work outside the base `security` source paths. These domain labels remain manual because path matching cannot infer architectural or security impact reliably.
+
+The following duplicate domain and product-surface labels are pending retirement. Do not apply them to new work. They remain live only until a separate exact operation packet migrates any remaining open references and deletes the definitions.
+
+| Retiring label | Canonical replacement |
+|---|---|
+| `domain:channels` | `channel` plus the applicable `channel:*` label |
+| `domain:ci` | `type:ci`; add path-owned `ci` only when the changed files match its automation contract |
+| `domain:code-quality` | Concrete scope labels plus `type:refactor` when applicable |
+| `domain:deps` | `dependencies` and/or `type:dependencies` |
+| `domain:web-fetch` | `tool:web` |
+| `tauri` | `desktop`; Tauri remains an implementation detail in paths and titles |
+
+The retained product labels are intentionally distinct. `cli` is the end-user command-line surface, while `channel:cli` is the interactive CLI chat channel. `web` is the browser dashboard and web-chat product, while `tool:web` is the agent's web-fetch/search tool group. `zerocode` is the ZeroCode terminal application, `hardware` covers the host integrations, support crates, and firmware tree, and `desktop` is the Tauri desktop product. Use the applicable tool or product label for native computer-use work outside `apps/tauri/**`; do not apply synchronized `desktop` manually to a PR whose paths do not match.
 
 `agent:prompt` is for provider-visible prompt, context, and response-guidance policy. Use it when the work is about system-prompt content, tool-call formatting guidance, prompt-cache-sensitive context, channel response guidance, or other model-visible instruction surfaces that cross the base `agent`, `channel`, `memory`, `provider`, or `runtime` labels. Apply it in addition to applicable base or scope labels; it does not replace them. Do not apply it to every `crates/zeroclaw-runtime/src/agent/**` change; use the base `agent` label for ordinary agent runtime changes.
 
@@ -201,7 +223,7 @@ Each channel gets a `channel:<name>` label in addition to the base `channel` lab
 | `channel:slack` | `slack.rs` |
 | `channel:telegram` | `telegram.rs` |
 | `channel:twitter` | `twitter.rs` |
-| `channel:wati` | `wati.rs` |
+| `channel:wechat` | `crates/zeroclaw-channels/src/wechat.rs` |
 | `channel:webhook` | `webhook.rs` |
 | `channel:wecom` | `wecom.rs`, `wecom_ws.rs` |
 | `channel:whatsapp` | `whatsapp.rs`, `whatsapp_storage.rs`, `whatsapp_web.rs` |
@@ -303,6 +325,17 @@ Defined in `.github/label-policy.json`. Based on the author's merged PR count qu
 | `principal contributor` | 20 |
 | `distinguished contributor` | 50 |
 
+## Priority labels
+
+Priority labels express maintainer scheduling urgency, not ownership or implementation status. Apply them manually and revisit them when the issue's impact or release context changes.
+
+| Label | Meaning |
+|---|---|
+| `priority:p0` | Immediate blocker requiring urgent maintainer attention; excluded from issue stale handling while the priority remains current |
+| `priority:p1` | High-priority work to schedule ahead of the normal queue |
+| `priority:p2` | Medium-priority work with a clear maintainer interest |
+| `priority:p3` | Lower-priority tracked work without an urgent scheduling commitment |
+
 ## Status labels
 
 Track lifecycle state of RFCs and tracked work items. Applied manually unless a maintained workflow says otherwise.
@@ -351,6 +384,16 @@ Applied manually: the auto-response automation that used to handle these was rem
 | `r:support` | Usage / help item better handled outside the bug backlog |
 | `needs-author-action` | Author response is needed before maintainers can continue the review or merge path. For PRs, apply this with request-changes reviews when the next step is on the author, and remove it when the author pushes a substantive update or provides requested information. This is not a stale warning by itself. |
 | `stale-candidate` | Dormant PR that is a candidate for closing. Follow the stale ramp in [Reviewer Playbook → PR backlog pruning](./reviewer-playbook.md#pr-backlog-pruning). Issue stale passes use `status:stale` instead. |
+
+## Workflow labels
+
+Applied manually to make cross-artifact coordination visible. These labels do not imply ownership, acceptance, or stale protection.
+
+| Label | Purpose |
+|---|---|
+| `follow-up` | Scope deliberately carved out from a parent issue or PR; link the parent so the relationship is visible |
+| `release-gate` | Finding or work item that must be reconciled for the named release gate |
+| `stacked` | PR depends on another PR; include an explicit `Depends on #...` reference and merge it after its base |
 
 ## Community pickup labels
 
