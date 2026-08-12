@@ -38,6 +38,13 @@ use serde::{Deserialize, Serialize};
 ///   has no runtime consumer — the context compressor was removed —
 ///   so it currently has no effect. One warning per non-default field (see
 ///   `collect_context_compression_ignored_warnings` in `schema.rs`).
+/// - `verifiable_intent_tool_withheld`: `verifiable_intent.enabled` is set, but
+///   the `vi_verify` tool is withheld from the model-visible registry until a
+///   credential chain verifier exists, so enabling the section does not enable
+///   credential verification. The runtime also traces this at config load, and
+///   that trace has no sink under `observability.log_persistence = "none"`;
+///   this warning is the channel that survives, since `zeroclaw doctor` and the
+///   config API read the structured list rather than the log.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ValidationWarning {

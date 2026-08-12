@@ -7707,7 +7707,12 @@ fn warn_verifiable_intent_withheld(config: &Config) {
     ::zeroclaw_log::record!(
         WARN,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            // Operator-facing posture notice, not runtime bookkeeping. An event
+            // with no category stores as `internal`, and the dashboard Logs view
+            // hides that category by default, so an uncategorised notice is
+            // absent from the history an operator actually reads.
+            .with_category(::zeroclaw_log::EventCategory::System),
         "verifiable_intent: vi_verify is not registered as a model-callable tool because no credential chain verifier exists yet (see #9328)"
     );
 }

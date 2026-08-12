@@ -5104,6 +5104,12 @@ impl Default for McpConfig {
 /// a credential chain verifier. Until one exists the `vi_verify` tool is
 /// withheld from the model-visible registry, so neither key below enables
 /// verification of a credential. The library paths are unaffected.
+///
+/// Enabling the section reports that gap two ways. The runtime traces it at
+/// each config application, which needs log persistence to be on to reach a
+/// sink. `zeroclaw doctor` and the config API also report it as the
+/// `verifiable_intent_tool_withheld` validation warning, which stays available
+/// when persistence is off.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "verifiable_intent"]
@@ -19159,6 +19165,40 @@ impl Config {
         }
     }
 
+    /// Report that opting into `[verifiable_intent]` does not currently enable
+    /// credential verification, because `vi_verify` is withheld from the
+    /// model-visible registry until a chain verifier exists.
+    ///
+    /// The runtime already traces this at config load. That trace reaches a
+    /// sink only when log persistence is on, so under
+    /// `observability.log_persistence = "none"` it is delivered nowhere. This
+    /// warning is the channel that survives: `zeroclaw doctor` prints the
+    /// structured list to stdout and the config API returns it in its
+    /// response, neither of which depends on the log writer.
+    ///
+    /// Same class as `memory_config_knob_inert` — a knob that is set, accepted,
+    /// and currently has no runtime consumer.
+    ///
+    /// The change that re-registers `vi_verify` must delete this check and the
+    /// runtime trace together, or an operator is told the capability is
+    /// unavailable while the model is calling it.
+    fn collect_verifiable_intent_warnings(
+        &self,
+        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
+    ) {
+        if !self.verifiable_intent.enabled {
+            return;
+        }
+        warnings.push(crate::validation_warnings::ValidationWarning::new(
+            "verifiable_intent_tool_withheld",
+            "verifiable_intent.enabled is set, but the vi_verify tool is withheld from the \
+             model-visible registry until a credential chain verifier exists. Enabling the \
+             section does not enable credential verification on commerce tool calls. The \
+             issuance and verification library paths are unaffected.",
+            "verifiable_intent.enabled",
+        ));
+    }
+
     /// Collect non-fatal validation warnings — config that loads and
     /// validates successfully (`validate()` returns `Ok(())`) but will fail
     /// at runtime because of a logical inconsistency the schema cannot
@@ -19208,6 +19248,7 @@ impl Config {
         // warning when the more specific cross-provider diagnostic already
         // covers the same path.
         self.collect_context_compression_ignored_warnings(&mut warnings);
+        self.collect_verifiable_intent_warnings(&mut warnings);
         warnings.extend(validate_memory_semantics(&self.memory));
         for (alias, wa) in &self.channels.whatsapp {
             warnings.extend(validate_whatsapp_semantics(alias, wa));
@@ -31801,6 +31842,78 @@ group_policy = "disabled"
             !warnings.iter().any(|w| w.path.contains("custom.vllm")),
             "custom honors wire_api and must not warn",
         );
+    }
+
+    /// The section is opt-in, so an operator who has not touched it is told
+    /// nothing.
+    #[test]
+    async fn verifiable_intent_disabled_does_not_warn() {
+        let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
+        assert!(!config.verifiable_intent.enabled);
+
+        assert!(
+            !config
+                .collect_warnings()
+                .iter()
+                .any(|w| w.code == "verifiable_intent_tool_withheld"),
+        );
+    }
+
+    /// Opting in produces the structured warning. This is the delivery path
+    /// that survives `observability.log_persistence = "none"`, since
+    /// `zeroclaw doctor` prints this list to stdout and the config API returns
+    /// it, neither of which goes through the log writer.
+    #[test]
+    async fn verifiable_intent_enabled_warns_that_the_tool_is_withheld() {
+        let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
+        config.verifiable_intent.enabled = true;
+
+        let warnings = config.collect_warnings();
+        let withheld: Vec<_> = warnings
+            .iter()
+            .filter(|w| w.code == "verifiable_intent_tool_withheld")
+            .collect();
+
+        assert_eq!(withheld.len(), 1, "exactly one notice, got {warnings:?}");
+        assert_eq!(withheld[0].path, "verifiable_intent.enabled");
+        assert!(
+            withheld[0].message.contains("vi_verify"),
+            "the message must name the withheld tool: {}",
+            withheld[0].message
+        );
+    }
+
+    /// The config surface does not consult the observability policy, which is
+    /// the property that makes it a second channel rather than a second copy
+    /// of the same one. Asserting it here pins the independence at the unit
+    /// level; the process-level proof lives in the component test.
+    ///
+    /// Every variant is covered rather than the three that motivated the
+    /// change, so adding a policy fails this test until someone decides what
+    /// the notice does under it.
+    #[test]
+    async fn verifiable_intent_warning_is_independent_of_log_persistence() {
+        for policy in [
+            LogPersistence::None,
+            LogPersistence::Rolling,
+            LogPersistence::Full,
+            LogPersistence::Rotating,
+        ] {
+            let mut config = Config::default();
+            suppress_semantic_memory_warning(&mut config);
+            config.verifiable_intent.enabled = true;
+            config.observability.log_persistence = policy;
+
+            assert!(
+                config
+                    .collect_warnings()
+                    .iter()
+                    .any(|w| w.code == "verifiable_intent_tool_withheld"),
+                "the notice must survive log_persistence = {policy:?}",
+            );
+        }
     }
 
     #[cfg(unix)]
