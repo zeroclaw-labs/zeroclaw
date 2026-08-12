@@ -20,7 +20,7 @@ Each `vN/` directory maps to one WIT package major version. Minor bumps (0.2,
 
 #### Breaking vs non-breaking changes
 
-**Breaking — requires a new `vN+1/` directory:**
+**Breaking for a frozen `vN/` directory — requires a new `vN+1/` directory:**
 
 - Removing or renaming any type, function, record field, enum case, or variant case
 - Adding a case to an existing enum or variant: these are closed types, so an
@@ -49,9 +49,9 @@ Each `vN/` directory maps to one WIT package major version. Minor bumps (0.2,
 
 All current content in `wit/v0/` is gated behind
 `@unstable(feature = plugins-wit-v0)`. It graduates when the first
-stable Component Model release ships. Until a version directory is frozen,
-`v0` is experimental: components must be rebuilt against the WIT shipped by
-the target host, including after additions to existing enums or variants.
+stable Component Model release ships. Until a version directory is frozen, it
+is experimental: components must be rebuilt against the WIT shipped by the
+target host, including after additions to existing enums or variants.
 
 #### Host compatibility window
 
