@@ -182,6 +182,26 @@ pub fn nat64_embedded_ipv4_under_any(
         .find_map(|p| nat64_embedded_ipv4_under_prefix(v6, p.prefix, p.len))
 }
 
+/// True when two declared network-specific NAT64 prefixes overlap — one is
+/// contained by the other, or they are identical. Overlapping declarations
+/// make embedded-IPv4 extraction order-dependent: a single IPv6 address inside
+/// both prefixes decodes to a *different* IPv4 under each length (the RFC 6052
+/// layout shifts the 32-bit IPv4 position as the prefix grows), so the SSRF
+/// gate would classify the same resolved address as public under one ordering
+/// and non-global/metadata under the other. Security decision must not depend
+/// on configuration order, so callers reject overlapping sets as invalid
+/// (fail closed) before dispatch.
+#[must_use]
+pub fn nat64_prefixes_overlap(a: &Nat64Prefix, b: &Nat64Prefix) -> bool {
+    if a.len == b.len {
+        return a.prefix == b.prefix;
+    }
+    // The shorter prefix (larger network) contains the longer one exactly when
+    // the longer's address lies inside the shorter's range.
+    let (shorter, longer) = if a.len < b.len { (a, b) } else { (b, a) };
+    is_under_nat64_prefix(longer.prefix, shorter)
+}
+
 /// True when an IPv6 address is not globally routable (loopback, ULA,
 /// link-local, documentation, multicast, an IPv4-mapped non-global v4, or an
 /// RFC 6052 NAT64/DNS64 form embedding a non-global v4). The NAT64 branch
@@ -500,6 +520,58 @@ mod tests {
         assert_eq!(
             nat64_embedded_ipv4_under_any("64:ff9b:1:7f00:0:100::".parse().unwrap(), &declared),
             Some(Ipv4Addr::new(127, 0, 0, 1)),
+        );
+    }
+
+    #[test]
+    fn nat64_prefixes_overlap_detects_containment_equality_and_disjoint_sets() {
+        let p32 = Nat64Prefix {
+            prefix: "2606:4700::".parse().unwrap(),
+            len: 32,
+        };
+        let p48 = Nat64Prefix {
+            prefix: "2606:4700:4700::".parse().unwrap(),
+            len: 48,
+        };
+        let disjoint = Nat64Prefix {
+            prefix: "2001:db8:64::".parse().unwrap(),
+            len: 96,
+        };
+        // /48 sits entirely inside /32: overlapping.
+        assert!(nat64_prefixes_overlap(&p32, &p48));
+        assert!(nat64_prefixes_overlap(&p48, &p32));
+        // Identical declarations overlap.
+        assert!(nat64_prefixes_overlap(&p48, &p48));
+        // Disjoint prefixes do not overlap.
+        assert!(!nat64_prefixes_overlap(&p32, &disjoint));
+        assert!(!nat64_prefixes_overlap(&disjoint, &p48));
+    }
+
+    #[test]
+    fn nat64_embedded_ipv4_under_any_is_order_dependent_for_overlapping_prefixes() {
+        // With overlapping declarations the SAME address decodes to different
+        // IPv4s under each prefix length, flipping the SSRF classification
+        // between public and non-global — the reason the gate rejects
+        // overlapping sets as an invalid configuration.
+        let addr: std::net::Ipv6Addr = "2606:4700:4700:a00:0:100::".parse().unwrap();
+        let p32 = [Nat64Prefix {
+            prefix: "2606:4700::".parse().unwrap(),
+            len: 32,
+        }];
+        let p48 = [Nat64Prefix {
+            prefix: "2606:4700:4700::".parse().unwrap(),
+            len: 48,
+        }];
+        // Under /32 the embedded IPv4 is public (71.0.10.0)...
+        assert_eq!(
+            nat64_embedded_ipv4_under_any(addr, &p32),
+            Some(Ipv4Addr::new(71, 0, 10, 0)),
+        );
+        // ...but under the overlapping /48 it is private (10.0.0.1). Declaration
+        // order therefore decides whether the gate blocks the same address.
+        assert_eq!(
+            nat64_embedded_ipv4_under_any(addr, &p48),
+            Some(Ipv4Addr::new(10, 0, 0, 1)),
         );
     }
 

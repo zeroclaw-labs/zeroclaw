@@ -59,6 +59,8 @@ tool-file-download-error-read-body = Error al leer el cuerpo de la respuesta: { 
 tool-file-download-error-write-body = Error al escribir los bytes descargados: { $err }
 tool-file-download-error-flush = No se pudo vaciar el archivo descargado: { $err }
 tool-file-download-error-move = No se pudo mover el archivo descargado a su lugar: { $err }
+tool-file-download-error-invalid-nat64-prefix = la configuración '{ $config_key }' de file_download contiene la entrada malformada '{ $prefix }': corríjala o elimínela y vuelva a intentarlo (un prefijo NAT64 específico de red debe ser un CIDR IPv6 con longitud 32, 40, 48, 56, 64 o 96)
+tool-file-download-error-overlapping-nat64-prefix = la configuración '{ $config_key }' de file_download contiene entradas superpuestas '{ $prefix_a }' y '{ $prefix_b }': corrija o elimine una y vuelva a intentarlo (los prefijos NAT64 superpuestos hacen que la clasificación IPv4 integrada dependa del orden de configuración)
 tool-file-download-success = Se descargaron { $written } bytes en { $dest_path } ({ $status })
 tool-file-read = Leer el contenido de un archivo con números de línea. Admite lectura parcial mediante offset y limit. Los archivos binarios e imágenes se rechazan (use la herramienta image_info para imágenes). Establezca encoding="base64" para devolver bytes en bruto codificados en base64 (para archivos binarios como .pdf/.xlsx/.docx); offset/limit se ignoran en ese modo.
 tool-file-write = Escribir contenido en un archivo del espacio de trabajo

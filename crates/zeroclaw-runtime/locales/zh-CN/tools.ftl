@@ -59,6 +59,8 @@ tool-file-download-error-read-body = 读取响应正文时失败：{ $err }
 tool-file-download-error-write-body = 写入已下载字节时失败：{ $err }
 tool-file-download-error-flush = 刷新已下载文件失败：{ $err }
 tool-file-download-error-move = 将已下载文件移动到位失败：{ $err }
+tool-file-download-error-invalid-nat64-prefix = file_download 配置 '{ $config_key }' 包含格式错误的条目 '{ $prefix }'：请修复或移除后重试（网络特定的 NAT64 前缀必须是长度为 32、40、48、56、64 或 96 的 IPv6 CIDR）
+tool-file-download-error-overlapping-nat64-prefix = file_download 配置 '{ $config_key }' 包含重叠的条目 '{ $prefix_a }' 和 '{ $prefix_b }'：请修复或移除其中一个后重试（重叠的 NAT64 前缀会使内嵌 IPv4 的分类依赖配置顺序）
 tool-file-download-success = 已下载 { $written } 字节到 { $dest_path }（{ $status }）
 tool-file-read = 读取带行号的文件内容。支持通过 offset 和 limit 进行部分读取。二进制文件和图像文件会被拒绝（图像请使用 image_info 工具）。设置 encoding="base64" 可以返回经 base64 编码的原始字节（适用于 .pdf/.xlsx/.docx 等二进制文件）；该模式下 offset/limit 被忽略。
 tool-file-write = 将内容写入工作区中的文件

@@ -59,6 +59,8 @@ tool-file-download-error-read-body = レスポンスボディの読み取り中�
 tool-file-download-error-write-body = ダウンロードしたバイトの書き込み中にエラーが発生しました: { $err }
 tool-file-download-error-flush = ダウンロードしたファイルのフラッシュに失敗しました: { $err }
 tool-file-download-error-move = ダウンロードしたファイルの移動に失敗しました: { $err }
+tool-file-download-error-invalid-nat64-prefix = file_download 設定 '{ $config_key }' に不正なエントリ '{ $prefix }' が含まれています: 修正または削除して再試行してください（ネットワーク固有の NAT64 プレフィックスは長さ 32、40、48、56、64、96 の IPv6 CIDR である必要があります）
+tool-file-download-error-overlapping-nat64-prefix = file_download 設定 '{ $config_key }' に重複するエントリ '{ $prefix_a }' と '{ $prefix_b }' が含まれています: どちらかを修正または削除して再試行してください（重複する NAT64 プレフィックスは、埋め込み IPv4 の分類が設定の順序に依存する原因になります）
 tool-file-download-success = { $written } バイトを { $dest_path } にダウンロードしました ({ $status })
 tool-file-read = 行番号付きのファイルコンテンツを読み込み。offsetとlimitによる部分読み込みをサポート。バイナリファイルと画像ファイルは拒否されます（画像の場合は image_info ツールを使用）。encoding="base64" を設定すると、生のバイトをbase64エンコードして返します（.pdf/.xlsx/.docx などのバイナリファイル用）。そのモードでは offset/limit は無視されます。
 tool-file-write = ワークスペース内のファイルにコンテンツを書き込み

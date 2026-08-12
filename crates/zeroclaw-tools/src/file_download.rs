@@ -604,14 +604,23 @@ static NORMALIZE_WARNING_EMITTED: OnceLock<()> = OnceLock::new();
 
 /// Per-dispatch normalization of the canonical `config.nat64_prefixes` Vec.
 /// Parses each IPv6 CIDR into a [`Nat64Prefix`] (RFC 6052 §2.2 lengths only).
-/// A malformed entry fails the whole dispatch with an actionable, field-specific
-/// error. It must NOT fall back to an empty list: an empty declaration set
-/// treats every network-specific prefix as undeclared ordinary address space
-/// (the schema contract at `config.nat64_prefixes`), which would remove the
-/// declared-prefix policy at the SSRF boundary — a fail-open. The empty
-/// allowlist posture of `normalize_allowed_private_hosts` is fail-closed
-/// there (empty = reject every private host), but it is the wrong fail-closed
-/// state for a *prefix declaration*.
+/// A malformed entry — or a set of overlapping entries — fails the whole
+/// dispatch with an actionable, field-specific error. It must NOT fall back to
+/// an empty list: an empty declaration set treats every network-specific
+/// prefix as undeclared ordinary address space (the schema contract at
+/// `config.nat64_prefixes`), which would remove the declared-prefix policy at
+/// the SSRF boundary — a fail-open. The empty allowlist posture of
+/// `normalize_allowed_private_hosts` is fail-closed there (empty = reject
+/// every private host), but it is the wrong fail-closed state for a *prefix
+/// declaration*.
+///
+/// Overlapping declarations are rejected because extraction is order-dependent
+/// otherwise: a single IPv6 inside both a `/32` and a `/48` decodes to a
+/// different IPv4 under each (the RFC 6052 layout shifts the embedded-IPv4
+/// position as the prefix length grows), so the SSRF gate would classify the
+/// same resolved address as public under one ordering and non-global/metadata
+/// under the other. A security decision must not depend on configuration
+/// order, so an overlapping set is an invalid configuration.
 fn normalize_nat64_prefixes(
     raw: &[String],
 ) -> Result<Vec<zeroclaw_infra::net_guard::Nat64Prefix>, String> {
@@ -624,6 +633,22 @@ fn normalize_nat64_prefixes(
                     "tool-file-download-error-invalid-nat64-prefix",
                     &[
                         ("prefix", entry),
+                        ("config_key", "file_download.nat64_prefixes"),
+                    ],
+                ));
+            }
+        }
+    }
+    for i in 0..parsed.len() {
+        for j in (i + 1)..parsed.len() {
+            if zeroclaw_infra::net_guard::nat64_prefixes_overlap(&parsed[i], &parsed[j]) {
+                let a = format!("{}/{}", parsed[i].prefix, parsed[i].len);
+                let b = format!("{}/{}", parsed[j].prefix, parsed[j].len);
+                return Err(tool_msg_with_args(
+                    "tool-file-download-error-overlapping-nat64-prefix",
+                    &[
+                        ("prefix_a", &a),
+                        ("prefix_b", &b),
                         ("config_key", "file_download.nat64_prefixes"),
                     ],
                 ));
@@ -2700,6 +2725,72 @@ mod tests {
         assert!(
             err.contains("nat64_prefixes") && err.contains("not-a-cidr"),
             "dispatch must reject the malformed nat64_prefixes entry with a field-specific error; got: {err}"
+        );
+    }
+
+    /// Fail-closed contract for overlapping `config.nat64_prefixes`: two
+    /// prefixes where one contains the other make embedded-IPv4 extraction
+    /// order-dependent (the same address decodes to a public IPv4 under a
+    /// shorter prefix and a private IPv4 under a longer one). The normalization
+    /// must reject the set as an invalid configuration in BOTH declaration
+    /// orders — the SSRF decision cannot depend on configuration order. It
+    /// must also NOT silently drop the overlapping entry (that would fall back
+    /// to declaring only the other prefix, changing the boundary the operator
+    /// asked for).
+    #[test]
+    fn normalize_nat64_prefixes_rejects_overlapping_declarations_in_both_orders() {
+        let forward = vec!["2606:4700::/32".into(), "2606:4700:4700::/48".into()];
+        let reverse = vec!["2606:4700:4700::/48".into(), "2606:4700::/32".into()];
+
+        for raw in [&forward, &reverse] {
+            let err = normalize_nat64_prefixes(raw).unwrap_err();
+            assert!(
+                err.contains("nat64_prefixes")
+                    && err.contains("2606:4700::/32")
+                    && err.contains("2606:4700:4700::/48"),
+                "overlapping declarations must fail closed with both prefixes named; got: {err}"
+            );
+        }
+    }
+
+    /// Overlapping declarations must also fail the real dispatch boundary
+    /// (not just the normalization helper), so a configured overlapping set
+    /// can never reach the SSRF policy with an order-dependent classification.
+    #[tokio::test]
+    async fn validate_endpoint_host_rejects_overlapping_nat64_prefixes_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = FileDownloadConfig {
+            url: Some("http://internal.example.com/x".into()),
+            nat64_prefixes: vec!["2606:4700::/32".into(), "2606:4700:4700::/48".into()],
+            ..FileDownloadConfig::default()
+        };
+        let snapshot_prefixes = config.nat64_prefixes.clone();
+        // The resolver answer is irrelevant: `normalize_nat64_prefixes` runs
+        // before DNS at the dispatch boundary and must fail closed on the
+        // overlapping declarations alone.
+        let endpoint_resolver: EndpointResolver = Arc::new(
+            move |_host: String,
+                  _port: u16|
+                  -> Pin<Box<dyn Future<Output = ResolveResult> + Send>> {
+                Box::pin(async move { Ok(Vec::new()) })
+            },
+        );
+        let tool = FileDownloadTool::new_with_endpoint_resolver(
+            test_security(tmp.path().to_path_buf(), AutonomyLevel::Full),
+            config,
+            true,
+            Vec::<String>::new,
+            move || snapshot_prefixes.clone(),
+            endpoint_resolver,
+        );
+        let err = tool
+            .validate_endpoint_host("http://internal.example.com/x")
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("overlap")
+                || (err.contains("2606:4700::/32") && err.contains("2606:4700:4700::/48")),
+            "dispatch must fail closed on overlapping nat64_prefixes; got: {err}"
         );
     }
 

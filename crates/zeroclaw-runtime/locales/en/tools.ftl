@@ -89,6 +89,7 @@ tool-file-download-error-invalid-url = file_download endpoint URL is invalid: { 
 tool-file-download-error-private-host = file_download endpoint host '{ $host }' is loopback / private / link-local. To allow this host, add it (or "*") to { $config_key } in config.toml
 tool-file-download-error-metadata-endpoint = file_download endpoint host '{ $host }' resolved to cloud metadata or credential-delivery address { $ip }, which cannot be enabled by file_download.allowed_private_hosts
 tool-file-download-error-invalid-nat64-prefix = file_download config '{ $config_key }' contains malformed entry '{ $prefix }': fix or remove it, then retry (a network-specific NAT64 prefix must be an IPv6 CIDR with length 32, 40, 48, 56, 64, or 96)
+tool-file-download-error-overlapping-nat64-prefix = file_download config '{ $config_key }' contains overlapping entries '{ $prefix_a }' and '{ $prefix_b }': fix or remove one, then retry (overlapping NAT64 prefixes make embedded-IPv4 classification depend on configuration order)
 tool-file-download-success = Downloaded { $written } bytes to { $dest_path } ({ $status })
 
 tool-file-read = Read file contents with line numbers. Supports partial reading via offset and limit. Binary and image files are rejected (use the image_info tool for images). Set encoding="base64" to return raw bytes base64-encoded (for binary files such as .pdf/.xlsx/.docx); offset/limit are ignored in that mode.

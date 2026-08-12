@@ -59,6 +59,8 @@ tool-file-download-error-read-body = Échec lors de la lecture du corps de la r�
 tool-file-download-error-write-body = Échec lors de l'écriture des octets téléchargés : { $err }
 tool-file-download-error-flush = Échec du vidage du fichier téléchargé : { $err }
 tool-file-download-error-move = Échec du déplacement du fichier téléchargé à sa place : { $err }
+tool-file-download-error-invalid-nat64-prefix = la configuration '{ $config_key }' de file_download contient l'entrée malformée '{ $prefix }' : corrigez-la ou supprimez-la, puis réessayez (un préfixe NAT64 spécifique au réseau doit être un CIDR IPv6 de longueur 32, 40, 48, 56, 64 ou 96)
+tool-file-download-error-overlapping-nat64-prefix = la configuration '{ $config_key }' de file_download contient les entrées qui se chevauchent '{ $prefix_a }' et '{ $prefix_b }' : corrigez ou supprimez l'une d'elles, puis réessayez (des préfixes NAT64 qui se chevauchent rendent la classification IPv4 intégrée dépendante de l'ordre de configuration)
 tool-file-download-success = { $written } octets téléchargés vers { $dest_path } ({ $status })
 tool-file-read = Lire le contenu du fichier avec les numéros de ligne. Prise en charge de la lecture partielle via offset et limite. Les fichiers binaires et images sont rejetés (utilisez l'outil image_info pour les images). Définissez encoding="base64" pour renvoyer les octets bruts encodés en base64 (pour les fichiers binaires tels que .pdf/.xlsx/.docx) ; offset/limit sont ignorés dans ce mode.
 tool-file-write = Écrire le contenu dans un fichier de l'espace de travail
