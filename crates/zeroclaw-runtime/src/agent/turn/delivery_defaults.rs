@@ -50,10 +50,26 @@ pub(crate) fn maybe_inject_originating_channel(
     }
 }
 
+/// Delivery resolves a `<type>.<alias>` composite key; the bare type is
+/// registered only when that type has exactly one configured instance
+/// (`configured_channel_map`). Default to the composite so a job created from
+/// one of several aliased instances announces back to the instance it came
+/// from, instead of failing to resolve.
+fn default_delivery_channel(channel_name: &str, channel_alias: Option<&str>) -> String {
+    match channel_alias
+        .map(str::trim)
+        .filter(|alias| !alias.is_empty())
+    {
+        Some(alias) => format!("{channel_name}.{alias}"),
+        None => channel_name.to_string(),
+    }
+}
+
 pub(crate) fn maybe_inject_channel_delivery_defaults(
     tool_name: &str,
     tool_args: &mut serde_json::Value,
     channel_name: &str,
+    channel_alias: Option<&str>,
     channel_reply_target: Option<&str>,
 ) {
     // Interactive tools first — independent of cron delivery defaults.
@@ -90,10 +106,12 @@ pub(crate) fn maybe_inject_channel_delivery_defaults(
         return;
     }
 
+    let delivery_channel = default_delivery_channel(channel_name, channel_alias);
+
     let default_delivery = || {
         serde_json::json!({
             "mode": "announce",
-            "channel": channel_name,
+            "channel": delivery_channel,
             "to": reply_target,
         })
     };
@@ -125,7 +143,7 @@ pub(crate) fn maybe_inject_channel_delivery_defaults(
             if needs_channel {
                 delivery.insert(
                     "channel".to_string(),
-                    serde_json::Value::String(channel_name.to_string()),
+                    serde_json::Value::String(delivery_channel.clone()),
                 );
             }
 
@@ -159,6 +177,7 @@ mod tests {
             "cron_add",
             &mut args,
             "discord",
+            None,
             Some("channel-42"),
         );
 
@@ -170,6 +189,92 @@ mod tests {
                 "to": "channel-42",
             })
         );
+    }
+
+    #[test]
+    fn absent_delivery_defaults_to_the_originating_composite_channel() {
+        // The failure this fixes: a job created from one of several aliased
+        // instances stored the bare type, which `deliver_announcement` cannot
+        // resolve, so the run completed and its output was dropped.
+        let mut args = serde_json::json!({
+            "job_type": "agent",
+            "prompt": "check the inbox",
+        });
+
+        maybe_inject_channel_delivery_defaults(
+            "cron_add",
+            &mut args,
+            "telegram",
+            Some("work"),
+            Some("chat-42"),
+        );
+
+        assert_eq!(
+            args["delivery"],
+            serde_json::json!({
+                "mode": "announce",
+                "channel": "telegram.work",
+                "to": "chat-42",
+            })
+        );
+    }
+
+    #[test]
+    fn omitted_channel_key_is_filled_with_the_composite_channel() {
+        // Observed shape: the model emits mode and to, and omits channel.
+        let mut args = serde_json::json!({
+            "job_type": "agent",
+            "delivery": { "mode": "announce", "to": "chat-42" },
+        });
+
+        maybe_inject_channel_delivery_defaults(
+            "cron_add",
+            &mut args,
+            "telegram",
+            Some("work"),
+            Some("chat-42"),
+        );
+
+        assert_eq!(args["delivery"]["channel"], "telegram.work");
+    }
+
+    #[test]
+    fn explicit_channel_is_never_overridden() {
+        let mut args = serde_json::json!({
+            "job_type": "agent",
+            "delivery": { "mode": "announce", "channel": "telegram.other", "to": "chat-42" },
+        });
+
+        maybe_inject_channel_delivery_defaults(
+            "cron_add",
+            &mut args,
+            "telegram",
+            Some("work"),
+            Some("chat-42"),
+        );
+
+        assert_eq!(args["delivery"]["channel"], "telegram.other");
+    }
+
+    #[test]
+    fn unaliased_channel_still_defaults_to_the_bare_type() {
+        // Turns with no channel instance behind them (CLI, daemon) keep the
+        // pre-existing bare value; the bare key is registered for a
+        // single-instance type.
+        let mut args = serde_json::json!({
+            "job_type": "agent",
+            "prompt": "check the inbox",
+        });
+
+        maybe_inject_channel_delivery_defaults(
+            "cron_add",
+            &mut args,
+            "telegram",
+            Some("   "),
+            Some("chat-42"),
+        );
+
+        assert_eq!(args["delivery"]["channel"], "telegram");
     }
 
     #[test]

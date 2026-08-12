@@ -3459,7 +3459,13 @@ mod tests {
             "schedule": { "kind": "every", "every_ms": 60000 }
         });
 
-        maybe_inject_channel_delivery_defaults("cron_add", &mut args, "dingtalk", Some("chat-42"));
+        maybe_inject_channel_delivery_defaults(
+            "cron_add",
+            &mut args,
+            "dingtalk",
+            None,
+            Some("chat-42"),
+        );
 
         assert_eq!(
             args["delivery"],
@@ -3479,7 +3485,13 @@ mod tests {
             "schedule": { "kind": "every", "every_ms": 60000 }
         });
 
-        maybe_inject_channel_delivery_defaults("cron_add", &mut args, "webhook", Some("thread-42"));
+        maybe_inject_channel_delivery_defaults(
+            "cron_add",
+            &mut args,
+            "webhook",
+            None,
+            Some("thread-42"),
+        );
 
         assert!(
             args.get("delivery").is_none(),
