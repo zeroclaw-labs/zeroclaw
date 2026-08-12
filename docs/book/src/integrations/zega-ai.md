@@ -1,20 +1,28 @@
 ---
 type: reference
 status: proposed
-last-reviewed: 2026-08-09
+last-reviewed: 2026-08-05
 relates-to:
   - FND-002
   - FND-003
   - crates/zeroclaw-gateway
 ---
 
-# ZEGA AI (External Integration & Bridge Specification)
+# ZEGA AI (External Prototype)
 
-[ZEGA AI](https://github.com/siabang35/zega.ai) is an autonomous Solana Pay merchant platform built to integrate with the [ZeroClaw](https://github.com/zeroclaw-labs/zeroclaw) agentic framework. ZEGA connects to the ZeroClaw gateway daemon via a standalone TypeScript bridge package (`@zega/zeroclaw-bridge`), providing typed gateway pairing, status checks, and offline resilience for web applications.
+[ZEGA AI](https://github.com/siabang35/zega.ai) is an external fintech
+platform that connects to a ZeroClaw v0.8.x gateway daemon through a
+TypeScript bridge package (`@zega/zeroclaw-bridge`). The bridge is an
+**external prototype** maintained in the ZEGA monorepo and is not part of
+ZeroClaw itself.
 
-> **Status:** Community Integration Reference. This specification documents the client-side bridge contract provided by `@zega/zeroclaw-bridge` to pair with a ZeroClaw daemon over HTTP.
+> **Status:** Prototype. The bridge has been smoke-tested against local
+> helper modules (SemVer parsing, error hierarchies, offline resilience).
+> No live daemon pairing or endpoint tests have been executed yet. The
+> information below describes the bridge's design intent, not verified
+> production compatibility.
 
-## Gateway Connectivity & Pairing
+## Pairing
 
 > **Gateway URL configuration note:** The bridge client defaults to
 > `http://127.0.0.1:4242`, whereas ZeroClaw's canonical `GatewayConfig`
@@ -29,16 +37,16 @@ relates-to:
 >
 > Connecting without setting the gateway port to match the active ZeroClaw
 > daemon will cause the bridge to report an offline/unreachable state before
-> pairing can occur. Remotely reachable gateways should use HTTPS or an
-> authenticated tunnel (such as WireGuard, Tailscale, or an SSH tunnel)
-> rather than plain HTTP to protect bearer credentials transmitted in the
-> `Authorization` header.
+> pairing can occur.
+>
+> Remotely reachable gateways should use HTTPS or an authenticated tunnel (such as WireGuard, Tailscale, or an SSH tunnel) rather than plain HTTP to protect bearer credentials transmitted in the `Authorization` header.
 
-The bridge implements the two pairing contracts exposed by the ZeroClaw gateway in strict order:
+The bridge implements the two pairing contracts exposed by the ZeroClaw
+gateway and tries them in order:
 
-### 1. Enhanced route: `POST /api/pair`
+### Enhanced route: `POST /api/pair`
 
-Accepts a JSON payload:
+Accepts a JSON body:
 
 ```json
 {
@@ -48,11 +56,13 @@ Accepts a JSON payload:
 }
 ```
 
-On success, the gateway returns `{ "paired": true, "token": "<bearer>" }`. The bridge stores the bearer token for subsequent authenticated requests.
+On success the gateway returns `{ "paired": true, "token": "<bearer>" }`.
+The bridge stores the token for subsequent authenticated requests.
 
-Upstream handler: `api_pairing::submit_pairing_enhanced` (`crates/zeroclaw-gateway/src/api_pairing.rs`).
+Upstream handler: `api_pairing::submit_pairing_enhanced`
+(`crates/zeroclaw-gateway/src/api_pairing.rs`).
 
-### 2. Legacy route: `POST /pair`
+### Legacy route: `POST /pair`
 
 Sends the pairing code in the `X-Pairing-Code` header:
 
@@ -62,28 +72,40 @@ Content-Type: application/json
 X-Pairing-Code: <6-digit code>
 ```
 
-The bridge falls back to this endpoint when the enhanced endpoint is unavailable or returns a non-rate-limit non-success status. If the enhanced endpoint returns a rate-limit failure (`RateLimitError`), the bridge re-throws the error immediately without attempting the legacy fallback.
+The bridge falls back to this route when the enhanced endpoint is
+unavailable or returns a non-rate-limit non-success status. If the
+enhanced endpoint returns a rate-limit failure (`RateLimitError`), the
+bridge re-throws the error immediately without attempting the legacy
+fallback.
 
-Upstream handler: `handle_pair` (`crates/zeroclaw-gateway/src/lib.rs`).
+Upstream handler: `handle_pair`
+(`crates/zeroclaw-gateway/src/lib.rs`).
 
-## Bridge Architecture
+## Bridge architecture
 
 | Component | Role |
 |---|---|
-| `ZeroClawGatewayClient` | HTTP client featuring `AbortController` timeouts (5 s default request/health timeout), exponential backoff, and graceful offline fallback states when the daemon is unreachable. |
-| `ZeroClawAuthManager` | Coordinates pairing credentials (enhanced → legacy fallback) and generates `Authorization: Bearer <token>` headers for authenticated daemon interactions. |
-| Version Matrix | Client-side version compatibility checker targeting numeric bounds `>=0.8.0 <0.9.0-alpha`. Strips pre-release suffixes prior to numeric component comparison (`major.minor.patch`). |
+| `ZeroClawGatewayClient` | HTTP client with a 5-second default request and health timeout, `AbortController` cancellation, and automatic retry with exponential back-off. Falls back to an offline error state when the daemon is unreachable. |
+| `ZeroClawAuthManager` | Manages the pairing flow (enhanced → legacy fallback) and generates `Authorization: Bearer <token>` headers for authenticated endpoints. |
+| Version matrix | Client-side version check targeting numeric bounds `>=0.8.0 <0.9.0` (target `v0.8.3`). The current client helper strips prerelease suffixes prior to comparison and evaluates numeric components (`major.minor.patch`). This range reflects design intent and has **not** been verified against a live daemon. |
 
-## Inspected Bridge Smoke Tests
+## What the smoke test covers
 
-The bridge package (`packages/zeroclaw-bridge/`) includes an offline smoke test suite (`pnpm --filter @zega/zeroclaw-bridge test:smoke`) with 18 assertions validating:
+The bridge ships a smoke test (`pnpm --filter @zega/zeroclaw-bridge test:smoke`)
+with 18 assertions that validate the following **offline / unit-level** behavior:
 
-- SemVer parsing/comparison and version-compatibility boundary checking.
+- SemVer parsing and comparison.
+- Version compatibility boundaries (compatible, too old, exceeds the maximum).
 - Auth-manager token storage, bearer-header construction, and offline `getState()` behavior.
-- Error constructor correctness for gateway error types.
+- Gateway error constructors and fields.
 
-> **Limitation:** The smoke suite does not start a ZeroClaw daemon, exchange a pairing code, or call a live gateway endpoint. Pairing fallback and rate-limit escalation branches (implemented in `src/auth.ts`) are not covered by the pinned smoke script.
+The smoke test does **not** start a ZeroClaw daemon, exchange a pairing
+code, or call any gateway endpoint over HTTP.
 
-## External Reference
+It does not exercise the enhanced-to-legacy pairing fallback or rate-limit escalation branches.
 
-For source code, package sources, and repository implementation details, visit the [ZEGA AI Repository](https://github.com/siabang35/zega.ai) or inspect the bridge package at reviewed commit [`f99104367a6b06815cf478120b247d042fa7b1a5`](https://github.com/siabang35/zega.ai/tree/f99104367a6b06815cf478120b247d042fa7b1a5/packages/zeroclaw-bridge).
+## External reference
+
+For source code and monorepo details, visit the
+[ZEGA AI repository](https://github.com/siabang35/zega.ai) or inspect the bridge package at reviewed commit
+[`f99104367a6b06815cf478120b247d042fa7b1a5`](https://github.com/siabang35/zega.ai/tree/f99104367a6b06815cf478120b247d042fa7b1a5/packages/zeroclaw-bridge).
