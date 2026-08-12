@@ -1698,6 +1698,20 @@ pub async fn handle_api_sessions_list(
     Json(serde_json::json!({ "sessions": sessions })).into_response()
 }
 
+/// Resolve a path `{id}` to the persisted session key.
+///
+/// `GET /api/sessions` advertises both a display `session_id` (`gw_` stripped
+/// for gateway sessions) and the full DB `session_key` for API operations.
+/// Accept either form so callers that reuse `session_key` do not get a doubled
+/// `gw_` prefix (`gw_gw_<id>`).
+fn resolve_gateway_session_key(id: &str) -> String {
+    if id.starts_with("gw_") || id.contains('_') {
+        id.to_string()
+    } else {
+        format!("gw_{id}")
+    }
+}
+
 /// GET /api/sessions/{id}/messages — load persisted gateway WebSocket chat transcript
 pub async fn handle_api_session_messages(
     State(state): State<AppState>,
@@ -1717,14 +1731,7 @@ pub async fn handle_api_session_messages(
         .into_response();
     };
 
-    // Accept either the full DB key (channel-driven sessions like
-    // `discord.clamps_…`) or the stripped form (legacy callers that pass
-    // just the UUID for gateway sessions).
-    let session_key = if id.starts_with("gw_") || id.contains('_') {
-        id.clone()
-    } else {
-        format!("gw_{id}")
-    };
+    let session_key = resolve_gateway_session_key(&id);
     let msgs = backend.load_with_timestamps(&session_key);
     let messages: Vec<serde_json::Value> = msgs
         .into_iter()
@@ -1772,7 +1779,7 @@ pub async fn handle_api_session_message_post(
             .into_response();
     };
 
-    let session_key = format!("gw_{id}");
+    let session_key = resolve_gateway_session_key(&id);
     if !backend
         .list_sessions()
         .iter()
@@ -1854,11 +1861,7 @@ pub async fn handle_api_session_delete(
             .into_response();
     };
 
-    let session_key = if id.starts_with("gw_") || id.contains('_') {
-        id.clone()
-    } else {
-        format!("gw_{id}")
-    };
+    let session_key = resolve_gateway_session_key(&id);
 
     let token = state
         .cancel_tokens
@@ -1918,7 +1921,7 @@ pub async fn handle_api_session_rename(
             .into_response();
     }
 
-    let session_key = format!("gw_{id}");
+    let session_key = resolve_gateway_session_key(&id);
 
     // Verify the session exists before renaming
     let sessions = backend.list_sessions();
@@ -1992,7 +1995,7 @@ pub async fn handle_api_session_state(
             .into_response();
     };
 
-    let session_key = format!("gw_{id}");
+    let session_key = resolve_gateway_session_key(&id);
     match backend.get_session_state(&session_key) {
         Ok(Some(ss)) => {
             let mut resp = serde_json::json!({
@@ -2031,7 +2034,7 @@ pub async fn handle_api_session_abort(
         return e.into_response();
     }
 
-    let session_key = format!("gw_{id}");
+    let session_key = resolve_gateway_session_key(&id);
 
     // Look up and cancel the token. Hold the lock only long enough to
     // clone the token — cancellation itself does not need the lock.
@@ -3410,6 +3413,145 @@ pub(crate) mod tests {
         let messages = backend.load("gw_operator-1");
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[1].content, "queued notification");
+    }
+
+    #[test]
+    fn resolve_gateway_session_key_accepts_full_key_and_display_id() {
+        assert_eq!(resolve_gateway_session_key("operator-1"), "gw_operator-1");
+        assert_eq!(
+            resolve_gateway_session_key("gw_operator-1"),
+            "gw_operator-1"
+        );
+        assert_eq!(
+            resolve_gateway_session_key("discord.clamps_room"),
+            "discord.clamps_room"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_abort_accepts_full_session_key_from_sessions_list() {
+        let state = test_state(zeroclaw_config::schema::Config::default());
+        let session_key = "gw_operator-1".to_string();
+        let token = tokio_util::sync::CancellationToken::new();
+        state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock")
+            .insert(session_key.clone(), token.clone());
+
+        // Same id GET /api/sessions advertises as session_key for abort.
+        let response = handle_api_session_abort(State(state), HeaderMap::new(), Path(session_key))
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(
+            json["status"], "aborted",
+            "full session_key must abort; doubled gw_ prefix yields no_active_response"
+        );
+        assert!(token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn session_abort_still_accepts_display_session_id() {
+        let state = test_state(zeroclaw_config::schema::Config::default());
+        let token = tokio_util::sync::CancellationToken::new();
+        state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock")
+            .insert("gw_operator-1".to_string(), token.clone());
+
+        let response = handle_api_session_abort(
+            State(state),
+            HeaderMap::new(),
+            Path("operator-1".to_string()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["status"], "aborted");
+        assert!(token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn session_message_post_accepts_full_session_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        backend
+            .append(
+                "gw_operator-1",
+                &zeroclaw_providers::ChatMessage::assistant("existing"),
+            )
+            .unwrap();
+        let state = test_state_with_session_backend(config, backend.clone());
+
+        let response = handle_api_session_message_post(
+            State(state),
+            HeaderMap::new(),
+            Path("gw_operator-1".to_string()),
+            Json(
+                serde_json::from_value::<SessionMessagePostBody>(serde_json::json!({
+                    "content": "via session_key"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["status"], "ok");
+        let messages = backend.load("gw_operator-1");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].content, "via session_key");
+    }
+
+    #[tokio::test]
+    async fn session_rename_accepts_full_session_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        backend
+            .append(
+                "gw_operator-1",
+                &zeroclaw_providers::ChatMessage::assistant("existing"),
+            )
+            .unwrap();
+        let state = test_state_with_session_backend(config, backend.clone());
+
+        let response = handle_api_session_rename(
+            State(state),
+            HeaderMap::new(),
+            Path("gw_operator-1".to_string()),
+            Json(serde_json::json!({ "name": "ops" })),
+        )
+        .await
+        .into_response();
+
+        // Master doubles the prefix (`gw_gw_operator-1`) and returns 404.
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["name"], "ops");
+        assert!(
+            backend.list_sessions().iter().any(|k| k == "gw_operator-1"),
+            "rename must target the real session key, not a doubled gw_ prefix"
+        );
     }
 
     #[tokio::test]
