@@ -292,11 +292,13 @@ pub fn default_tools_with_runtime(
 ) -> Vec<Box<dyn Tool>> {
     let persistent_writes = runtime.has_filesystem_access();
     vec![
+        // The shell tool owns its own dialect-aware command + forbidden-path
+        // validation (see `ShellTool::execute`), so it is not wrapped in the
+        // generic POSIX `PathGuardedTool` — matching `SkillShellTool`. Wrapping it
+        // would run a dialect-less path scan ahead of the tool and wrongly reject
+        // the Windows `\\.\nul` device on a native cmd.exe sink.
         Box::new(RateLimitedTool::new(
-            PathGuardedTool::new(
-                ShellTool::new(security.clone(), runtime).with_persistent_writes(persistent_writes),
-                security.clone(),
-            ),
+            ShellTool::new(security.clone(), runtime).with_persistent_writes(persistent_writes),
             security.clone(),
         )),
         Box::new(RateLimitedTool::new(
@@ -599,17 +601,14 @@ pub fn all_tools_with_runtime(
     // snapshot below.
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(RateLimitedTool::new(
-            PathGuardedTool::new(
-                ShellTool::new_with_sandbox(security.clone(), runtime.clone(), sandbox.clone())
-                    .with_timeout_secs(if security.shell_timeout_secs > 0 {
-                        security.shell_timeout_secs
-                    } else {
-                        root_config.shell_tool.timeout_secs
-                    })
-                    .with_tui_env(tui_env)
-                    .with_persistent_writes(persistent_writes),
-                security.clone(),
-            ),
+            ShellTool::new_with_sandbox(security.clone(), runtime.clone(), sandbox.clone())
+                .with_timeout_secs(if security.shell_timeout_secs > 0 {
+                    security.shell_timeout_secs
+                } else {
+                    root_config.shell_tool.timeout_secs
+                })
+                .with_tui_env(tui_env)
+                .with_persistent_writes(persistent_writes),
             security.clone(),
         )),
         Arc::new(RateLimitedTool::new(
