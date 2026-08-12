@@ -172,12 +172,11 @@ fn invalid_frame_context(value: &Value) -> (JsonRpcFrameErrorKind, Option<Value>
     let Some(obj) = value.as_object() else {
         return (JsonRpcFrameErrorKind::Ambiguous, None);
     };
-    let has_method = obj.contains_key(field::METHOD);
     let has_response_member = obj.contains_key(field::RESULT) || obj.contains_key(field::ERROR);
 
-    let kind = match (has_method, has_response_member) {
-        (true, false) => JsonRpcFrameErrorKind::Request,
-        (false, true) => JsonRpcFrameErrorKind::Response,
+    let kind = match (obj.get(field::METHOD), has_response_member) {
+        (Some(Value::String(_)), false) => JsonRpcFrameErrorKind::Request,
+        (None, true) => JsonRpcFrameErrorKind::Response,
         _ => JsonRpcFrameErrorKind::Ambiguous,
     };
     let request_id = (kind == JsonRpcFrameErrorKind::Request)
@@ -710,8 +709,8 @@ mod tests {
             (Value::Null, JsonRpcFrameErrorKind::Ambiguous, None),
             (
                 json!({"jsonrpc":"2.0","method":null,"id":7}),
-                JsonRpcFrameErrorKind::Request,
-                Some(json!(7)),
+                JsonRpcFrameErrorKind::Ambiguous,
+                None,
             ),
             (
                 json!({"jsonrpc":"2.0","method":"status","params":null}),
@@ -720,8 +719,13 @@ mod tests {
             ),
             (
                 json!({"jsonrpc":"2.0","method":null,"id":null}),
-                JsonRpcFrameErrorKind::Request,
-                Some(Value::Null),
+                JsonRpcFrameErrorKind::Ambiguous,
+                None,
+            ),
+            (
+                json!({"jsonrpc":"2.0","method":null,"id":7,"result":true}),
+                JsonRpcFrameErrorKind::Ambiguous,
+                None,
             ),
             (
                 json!({

@@ -1097,10 +1097,11 @@ impl RpcDispatcher {
         self.handle_session_messages(params).await
     }
 
-    /// Drive a full JSON-RPC request line through the dispatcher from an
-    /// external integration test, including notification emission on the
-    /// outbound channel. Mirrors the transport `process_line` path.
-    pub async fn process_line_for_test(&mut self, line: &str) {
+    /// Drive a full JSON-RPC request line through the dispatcher from a unit
+    /// test, including notification emission on the outbound channel. Mirrors
+    /// the transport `process_line` path.
+    #[cfg(test)]
+    async fn process_line_for_test(&mut self, line: &str) {
         self.process_line(line).await;
     }
 
@@ -10173,9 +10174,9 @@ mod tests {
 
     async fn assert_process_line_error(line: &str, code: i32, id: Value) {
         let (mut dispatcher, mut rx) = make_bidi_test_dispatcher();
-        dispatcher.process_line_for_test(line).await;
+        Box::pin(dispatcher.process_line_for_test(line)).await;
 
-        let response = rx.recv().await.expect("JSON-RPC error response");
+        let response = rx.try_recv().expect("JSON-RPC error response");
         let response: Value = serde_json::from_str(&response).expect("valid response JSON");
         assert_eq!(response["error"]["code"], json!(code), "line: {line}");
         assert_eq!(response["id"], id, "line: {line}");
@@ -10183,7 +10184,7 @@ mod tests {
 
     async fn assert_process_line_drops_invalid_response(line: &str) {
         let (mut dispatcher, mut rx) = make_bidi_test_dispatcher();
-        dispatcher.process_line_for_test(line).await;
+        Box::pin(dispatcher.process_line_for_test(line)).await;
 
         assert!(
             matches!(
@@ -10200,8 +10201,6 @@ mod tests {
 
         let invalid_requests = [
             (r#"{"jsonrpc":"1.0","method":"status","id":1}"#, json!(1)),
-            (r#"{"jsonrpc":"2.0","method":null,"id":6}"#, json!(6)),
-            (r#"{"jsonrpc":"2.0","method":null,"id":null}"#, Value::Null),
             (
                 r#"{"jsonrpc":"2.0","method":"status","params":true,"id":7}"#,
                 json!(7),
@@ -10224,6 +10223,8 @@ mod tests {
             "null",
             r#"{"jsonrpc":"2.0"}"#,
             r#"{"jsonrpc":"2.0","id":3}"#,
+            r#"{"jsonrpc":"2.0","method":null,"id":6}"#,
+            r#"{"jsonrpc":"2.0","method":null,"id":null}"#,
             r#"{"jsonrpc":"2.0","method":"status","id":9,"result":true}"#,
         ];
         for line in ambiguous {
@@ -10250,7 +10251,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_response_cannot_complete_opposite_direction_same_id_request() {
+    async fn malformed_frames_cannot_complete_opposite_direction_same_id_request() {
         let (mut dispatcher, mut daemon_writer_rx) = make_bidi_test_dispatcher();
         let daemon_rpc = dispatcher.rpc_for_test();
         let daemon_wait_rpc = Arc::clone(&daemon_rpc);
@@ -10288,7 +10289,7 @@ mod tests {
         let malformed = format!(
             r#"{{"jsonrpc":"2.0","id":"{shared_id}","result":null,"error":{{"code":-32600,"message":"bad"}}}}"#
         );
-        dispatcher.process_line_for_test(&malformed).await;
+        Box::pin(dispatcher.process_line_for_test(&malformed)).await;
 
         assert!(
             matches!(
@@ -10300,11 +10301,28 @@ mod tests {
         assert_eq!(daemon_rpc.pending_count(), 1);
         assert_eq!(client_rpc.pending_count(), 1);
 
+        let malformed_methods = [
+            format!(r#"{{"jsonrpc":"2.0","method":null,"id":"{shared_id}"}}"#),
+            format!(r#"{{"jsonrpc":"2.0","method":null,"id":"{shared_id}","result":true}}"#),
+        ];
+        for malformed_method in malformed_methods {
+            Box::pin(dispatcher.process_line_for_test(&malformed_method)).await;
+
+            let error_response: Value = serde_json::from_str(
+                &daemon_writer_rx
+                    .try_recv()
+                    .expect("invalid-request response"),
+            )
+            .expect("valid JSON-RPC response");
+            assert_eq!(error_response["id"], Value::Null);
+            assert_eq!(error_response["error"]["code"], json!(INVALID_REQUEST));
+            assert_eq!(daemon_rpc.pending_count(), 1);
+            assert_eq!(client_rpc.pending_count(), 1);
+        }
+
         let valid_daemon_response =
             format!(r#"{{"jsonrpc":"2.0","id":"{shared_id}","result":{{"answer":"blue"}}}}"#);
-        dispatcher
-            .process_line_for_test(&valid_daemon_response)
-            .await;
+        Box::pin(dispatcher.process_line_for_test(&valid_daemon_response)).await;
         let daemon_result = tokio::time::timeout(std::time::Duration::from_secs(1), daemon_waiter)
             .await
             .expect("daemon request remained resolvable")
