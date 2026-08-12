@@ -190,6 +190,25 @@ impl FileEditTool {
             });
         }
 
+        // An edit reads the target before rewriting it, so write admission
+        // alone is not sufficient: a path denied for READS must not have its
+        // contents surfaced through the edit path (no-match diagnostics quote
+        // file content). The registered `PathGuardedTool` wrapper does not
+        // cover this — its legacy check admits any absolute path already under
+        // the workspace before a workspace-relative `deny_read` entry is
+        // consulted — so the canonical read policy is applied here, at the
+        // boundary that actually performs the read.
+        if !self.security.is_resolved_path_readable(&resolved_target) {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!(
+                    "Path denied for reads by the current policy: {}",
+                    resolved_target.display()
+                )),
+            });
+        }
+
         if self.security.is_runtime_config_path(&resolved_target) {
             return Ok(ToolResult {
                 success: false,
@@ -1042,6 +1061,95 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(content, "[core]\nbare = false");
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// Production registration shape (`RateLimitedTool<PathGuardedTool<..>>`)
+    /// over a policy whose canonical `deny_read` names a workspace-relative
+    /// file. The wrapper's legacy path check admits an absolute path already
+    /// under the workspace, so only the tool's own canonical read check can
+    /// stop this.
+    fn deny_read_wrapped_tool(workspace: &std::path::Path, denied: &str) -> Box<dyn Tool> {
+        // The workspace MUST be the canonical form. With a symlinked temp root
+        // (`/var` -> `/private/var` on macOS) the canonicalized target would not
+        // compare as being under a non-canonical `workspace_dir`, the wrapper's
+        // absolute-path branch would reject it for a reason unrelated to
+        // `deny_read`, and this regression would pass vacuously.
+        let workspace = workspace.canonicalize().expect("workspace exists");
+        let mut profile = zeroclaw_config::schema::RiskProfileConfig::default();
+        profile.sandbox_policy.deny_read = Some(vec![denied.to_string()]);
+        let security = Arc::new(SecurityPolicy::from_risk_profile(&profile, &workspace));
+        Box::new(RateLimitedTool::new(
+            PathGuardedTool::new(FileEditTool::new(security.clone()), security.clone()),
+            security,
+        ))
+    }
+
+    #[tokio::test]
+    async fn file_edit_blocks_deny_read_target_via_absolute_workspace_path() {
+        // `secret.txt` is deliberately NOT a mandatory deny_write guardrail
+        // entry, so the write-side guardrail cannot be what fails this — the
+        // canonical read policy has to.
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_edit_deny_read_absolute");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let target = dir.join("secret.txt");
+        tokio::fs::write(&target, "TOKEN=old").await.unwrap();
+
+        let tool = deny_read_wrapped_tool(&dir, "secret.txt");
+        let absolute = tokio::fs::canonicalize(&target).await.unwrap();
+        let result = tool
+            .execute(json!({
+                "path": absolute.to_string_lossy(),
+                "old_string": "old",
+                "new_string": "new",
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "an absolute workspace path covered by deny_read must be refused, got {result:?}"
+        );
+        let content = tokio::fs::read_to_string(&target).await.unwrap();
+        assert_eq!(
+            content, "TOKEN=old",
+            "a denied edit must leave the file untouched"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_edit_still_edits_a_readable_sibling_under_the_same_policy() {
+        // Companion to the deny_read regression: the read gate must reject the
+        // denied target only, not every file under a policy that has any
+        // deny_read entry.
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_edit_deny_read_sibling");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("secret.txt"), "TOKEN=old")
+            .await
+            .unwrap();
+        tokio::fs::write(dir.join("notes.txt"), "hello old")
+            .await
+            .unwrap();
+
+        let tool = deny_read_wrapped_tool(&dir, "secret.txt");
+        let result = tool
+            .execute(json!({"path": "notes.txt", "old_string": "old", "new_string": "new"}))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "unrelated file must remain editable: {result:?}"
+        );
+        let content = tokio::fs::read_to_string(dir.join("notes.txt"))
+            .await
+            .unwrap();
+        assert_eq!(content, "hello new");
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }

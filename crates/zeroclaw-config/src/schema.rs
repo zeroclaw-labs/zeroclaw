@@ -12075,7 +12075,13 @@ pub struct RiskProfileConfig {
     /// OS-level sandbox filesystem and network policy. Canonical model.
     /// `forbidden_paths`, `allowed_roots`, and `workspace_only` are compatibility
     /// inputs translated into this struct by `SandboxPolicy::from_risk_profile`.
+    ///
+    /// `#[nested]` is required for the `Configurable` tree to descend into the
+    /// struct: without it the property tree exposes only the object root, so
+    /// `zeroclaw config get/set`, the config API, and environment overrides
+    /// cannot reach `deny_read`, `allow_write`, or any other leaf.
     #[serde(default)]
+    #[nested]
     pub sandbox_policy: SandboxPolicyConfig,
 }
 
@@ -32132,6 +32138,61 @@ group_policy = "disabled"
         assert_eq!(
             config.get_prop("transcription.max_audio_bytes").unwrap(),
             "<unset>"
+        );
+    }
+
+    #[test]
+    async fn sandbox_policy_leaves_are_exposed_in_the_property_tree() {
+        // `sandbox_policy` needs `#[nested]`, not just `#[serde(default)]`:
+        // without it the derive stops at the object root and every leaf is
+        // invisible to `zeroclaw config get/set`, the config API, and env
+        // overrides — TOML deserialization alone is not the public contract.
+        let mut config = Config::default();
+        config
+            .risk_profiles
+            .insert("default".to_string(), RiskProfileConfig::default());
+
+        let paths: Vec<String> = config.prop_fields().into_iter().map(|f| f.name).collect();
+        for leaf in [
+            "deny_read",
+            "allow_read",
+            "allow_write",
+            "deny_write",
+            "mandatory_deny_write_enabled",
+        ] {
+            let expected = format!("risk_profiles.default.sandbox_policy.{leaf}");
+            assert!(
+                paths.contains(&expected),
+                "sandbox_policy leaf `{leaf}` missing from the property tree: {paths:?}"
+            );
+        }
+    }
+
+    #[test]
+    async fn sandbox_policy_leaf_round_trips_through_get_and_set_prop() {
+        let mut config = Config::default();
+        config
+            .risk_profiles
+            .insert("default".to_string(), RiskProfileConfig::default());
+
+        let path = "risk_profiles.default.sandbox_policy.deny_read";
+        config.set_prop(path, "/etc/shadow,.env").unwrap();
+        assert_eq!(
+            config.risk_profiles["default"].sandbox_policy.deny_read,
+            Some(vec!["/etc/shadow".to_string(), ".env".to_string()]),
+        );
+        let shown = config.get_prop(path).unwrap();
+        assert!(
+            shown.contains("/etc/shadow") && shown.contains(".env"),
+            "get_prop must report the configured denials, got {shown}"
+        );
+
+        let bool_path = "risk_profiles.default.sandbox_policy.mandatory_deny_write_enabled";
+        config.set_prop(bool_path, "false").unwrap();
+        assert!(
+            !config.risk_profiles["default"]
+                .sandbox_policy
+                .mandatory_deny_write_enabled
         );
     }
 

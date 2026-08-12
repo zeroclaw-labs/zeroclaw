@@ -6,6 +6,25 @@ use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::autonomy::AutonomyLevel;
 use zeroclaw_config::policy::SecurityPolicy;
 
+/// Which side of the canonical policy a Git-affected path set is checked
+/// against. `GitOperationsTool` is registered without the `PathGuardedTool`
+/// wrapper, so these checks are the only enforcement of `deny_read` /
+/// `deny_write` over paths Git reads or mutates.
+#[derive(Clone, Copy)]
+enum GitAccess {
+    Read,
+    Write,
+}
+
+impl GitAccess {
+    fn noun(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+        }
+    }
+}
+
 /// Git operations tool for structured repository management.
 /// Provides safe, parsed git operations with JSON output.
 pub struct GitOperationsTool {
@@ -51,7 +70,20 @@ impl GitOperationsTool {
         Ok(result)
     }
 
-    /// Check if an operation requires write access
+    /// Check if an operation requires write access.
+    ///
+    /// `reset` and `revert` are listed for autonomy gating but are not
+    /// dispatched by `execute`, so they cannot reach a working tree today.
+    /// Every dispatched operation that reads file contents or mutates
+    /// working-tree paths carries a preflight over its enumerated affected set:
+    /// `add` (`preflight_add`), `diff` (inline), `checkout`
+    /// (`ensure_checkout_does_not_overwrite_denied_paths`), `stash`
+    /// (`preflight_stash`), and `worktree` add/remove
+    /// (`preflight_worktree_add` / `preflight_worktree_remove`). `commit`
+    /// records already-staged content and `log`/`branch`/`status` report
+    /// metadata only, so neither reaches file contents. Any operation added to
+    /// the dispatch table must gain the same treatment before it is wired up —
+    /// gating on autonomy alone does not enforce the canonical policy.
     fn requires_write_access(&self, operation: &str) -> bool {
         matches!(
             operation,
@@ -240,20 +272,245 @@ impl GitOperationsTool {
                 &["diff", "--name-only", "HEAD", branch_name, "--"],
                 working_dir,
             )
-            .await?;
+            .await
+            .map_err(|e| {
+                anyhow::Error::msg(format!(
+                    "Checkout blocked: cannot determine which files switching to \
+                     '{branch_name}' would overwrite: {e}"
+                ))
+            })?;
 
-        for relative in diff_output.lines().filter(|line| !line.is_empty()) {
+        self.ensure_git_paths_allowed(
+            &diff_output,
+            working_dir,
+            GitAccess::Write,
+            &format!("Checkout of '{branch_name}'"),
+        )
+    }
+
+    /// Apply the canonical policy to a Git-reported path set before Git runs.
+    ///
+    /// `path_list` is newline-separated repository-relative paths exactly as
+    /// `--name-only` output produces them. Every entry is resolved against
+    /// `working_dir` and checked in `mode`; the first denial aborts the whole
+    /// operation rather than letting Git act on the remainder, because a
+    /// partially applied Git command cannot be rolled back from here.
+    fn ensure_git_paths_allowed(
+        &self,
+        path_list: &str,
+        working_dir: &std::path::Path,
+        mode: GitAccess,
+        operation: &str,
+    ) -> anyhow::Result<()> {
+        for relative in path_list.lines().filter(|line| !line.is_empty()) {
             let candidate = working_dir.join(relative);
             let resolved = zeroclaw_config::policy::canonicalize_best_effort(&candidate);
-            if !self.security.is_resolved_path_allowed(&resolved) {
+            let allowed = match mode {
+                GitAccess::Read => self.security.is_resolved_path_readable(&resolved),
+                GitAccess::Write => self.security.is_resolved_path_allowed(&resolved),
+            };
+            if !allowed {
                 anyhow::bail!(
-                    "Checkout blocked: switching to '{branch_name}' would overwrite '{relative}', \
-                     which is denied by the current write policy"
+                    "{operation} blocked: '{relative}' is denied by the current {} policy",
+                    mode.noun()
                 );
             }
         }
 
         Ok(())
+    }
+
+    /// Enumerate the paths `git add` would stage and reject the operation when
+    /// any is denied for reads.
+    ///
+    /// Staging copies a file's bytes into the object store, so `add` is a read
+    /// of every path it touches even though it never mutates the working tree.
+    /// `--dry-run` is what Git itself would act on, so the pathspec is expanded
+    /// by Git rather than matched textually here. Fails closed on any line that
+    /// does not have the documented `add '<path>'` shape — an unparsed line
+    /// means the affected set cannot be proven safe.
+    async fn preflight_add(
+        &self,
+        pathspec: &[String],
+        working_dir: &std::path::Path,
+    ) -> anyhow::Result<()> {
+        let mut args: Vec<&str> = vec!["add", "--dry-run", "--"];
+        args.extend(pathspec.iter().map(String::as_str));
+
+        let dry_run = self
+            .run_git_command(&args, working_dir)
+            .await
+            .map_err(|e| {
+                anyhow::Error::msg(format!(
+                    "Add blocked: cannot determine which files it would stage: {e}"
+                ))
+            })?;
+
+        let mut affected = String::new();
+        for line in dry_run.lines().filter(|line| !line.is_empty()) {
+            let path = line
+                .strip_prefix("add '")
+                .or_else(|| line.strip_prefix("remove '"))
+                .and_then(|rest| rest.strip_suffix('\''))
+                .ok_or_else(|| {
+                    anyhow::Error::msg(format!(
+                        "Add blocked: cannot interpret the affected path in git output: {line}"
+                    ))
+                })?;
+            affected.push_str(path);
+            affected.push('\n');
+        }
+
+        self.ensure_git_paths_allowed(&affected, working_dir, GitAccess::Read, "Add")
+    }
+
+    /// Enumerate the files `git worktree add` would materialize and reject the
+    /// operation when any is denied for writes. The target root is already
+    /// checked by [`Self::ensure_worktree_add_target_allowed`]; this covers the
+    /// tree Git writes underneath it, which a root-only check cannot see.
+    async fn preflight_worktree_add(
+        &self,
+        target: &std::path::Path,
+        reference: &str,
+        working_dir: &std::path::Path,
+    ) -> anyhow::Result<()> {
+        let tree = self
+            .run_git_command(&["ls-tree", "-r", "--name-only", reference], working_dir)
+            .await
+            .map_err(|e| {
+                anyhow::Error::msg(format!(
+                    "Worktree add blocked: cannot determine which files '{reference}' would \
+                     materialize: {e}"
+                ))
+            })?;
+
+        self.ensure_git_paths_allowed(&tree, target, GitAccess::Write, "Worktree add")
+    }
+
+    /// Enumerate everything `git worktree remove` would delete and reject the
+    /// operation when any of it is denied for writes. Deletion is a write, and
+    /// the existing check only covers the worktree root — a denied path nested
+    /// inside would be removed unchecked. Walks the real directory rather than
+    /// asking Git, because removal takes the whole tree, not just tracked
+    /// files. Symlinks are recorded but never followed, so the walk cannot
+    /// escape the worktree. Fails closed if the tree cannot be enumerated.
+    async fn preflight_worktree_remove(&self, target: &std::path::Path) -> anyhow::Result<()> {
+        let mut affected = String::new();
+        let mut pending = vec![target.to_path_buf()];
+
+        while let Some(dir) = pending.pop() {
+            let mut entries = tokio::fs::read_dir(&dir).await.map_err(|e| {
+                anyhow::Error::msg(format!(
+                    "Worktree remove blocked: cannot enumerate '{}': {e}",
+                    dir.display()
+                ))
+            })?;
+            while let Some(entry) = entries.next_entry().await.map_err(|e| {
+                anyhow::Error::msg(format!(
+                    "Worktree remove blocked: cannot enumerate '{}': {e}",
+                    dir.display()
+                ))
+            })? {
+                let path = entry.path();
+                let meta = tokio::fs::symlink_metadata(&path).await.map_err(|e| {
+                    anyhow::Error::msg(format!(
+                        "Worktree remove blocked: cannot inspect '{}': {e}",
+                        path.display()
+                    ))
+                })?;
+                affected.push_str(&path.to_string_lossy());
+                affected.push('\n');
+                if meta.is_dir() {
+                    pending.push(path);
+                }
+            }
+        }
+
+        self.ensure_git_paths_allowed(&affected, target, GitAccess::Write, "Worktree remove")
+    }
+
+    /// Enumerate a stash action's mutation set and reject it when any affected
+    /// path is denied for writes.
+    async fn preflight_stash(
+        &self,
+        action: &str,
+        include_untracked: bool,
+        pathspec: &[String],
+        working_dir: &std::path::Path,
+    ) -> anyhow::Result<()> {
+        let affected = self
+            .stash_mutation_set(action, include_untracked, pathspec, working_dir)
+            .await?;
+        self.ensure_git_paths_allowed(
+            &affected,
+            working_dir,
+            GitAccess::Write,
+            &format!("Stash {action}"),
+        )
+    }
+
+    /// Enumerate the working-tree paths a `git stash` action would create,
+    /// replace, or delete. `push`/`save` revert tracked modifications (and,
+    /// with `include_untracked`, remove untracked files); `pop` writes the
+    /// stashed contents back. Both mutation sets come from Git itself so the
+    /// check covers exactly what Git is about to touch.
+    async fn stash_mutation_set(
+        &self,
+        action: &str,
+        include_untracked: bool,
+        pathspec: &[String],
+        working_dir: &std::path::Path,
+    ) -> anyhow::Result<String> {
+        let mut affected = String::new();
+
+        if action == "pop" {
+            // `stash show` defaults to the most recent entry — the same one
+            // `stash pop` restores.
+            let restored = self
+                .run_git_command(&["stash", "show", "--name-only"], working_dir)
+                .await
+                .map_err(|e| {
+                    anyhow::Error::msg(format!(
+                        "Stash pop blocked: cannot determine which files it would restore: {e}"
+                    ))
+                })?;
+            affected.push_str(&restored);
+            return Ok(affected);
+        }
+
+        let mut tracked_args: Vec<&str> = vec!["diff", "--name-only", "HEAD", "--"];
+        for p in pathspec {
+            tracked_args.push(p);
+        }
+        let tracked = self
+            .run_git_command(&tracked_args, working_dir)
+            .await
+            .map_err(|e| {
+                anyhow::Error::msg(format!(
+                    "Stash blocked: cannot determine which tracked files it would revert: {e}"
+                ))
+            })?;
+        affected.push_str(&tracked);
+
+        if include_untracked {
+            let mut untracked_args: Vec<&str> =
+                vec!["ls-files", "--others", "--exclude-standard", "--"];
+            for p in pathspec {
+                untracked_args.push(p);
+            }
+            let untracked = self
+                .run_git_command(&untracked_args, working_dir)
+                .await
+                .map_err(|e| {
+                    anyhow::Error::msg(format!(
+                        "Stash blocked: cannot determine which untracked files it would \
+                         remove: {e}"
+                    ))
+                })?;
+            affected.push_str(&untracked);
+        }
+
+        Ok(affected)
     }
 
     async fn git_status(
@@ -326,6 +583,42 @@ impl GitOperationsTool {
 
         // Validate files argument against injection patterns
         self.sanitize_git_args(files)?;
+
+        // A diff prints file contents, so the requested pathspec has to clear
+        // the canonical read policy before Git runs. The pathspec is expanded
+        // by Git itself (`--name-only` over the same arguments) rather than
+        // matched textually, so a glob or directory that selects a denied file
+        // is caught. Fails closed: if the affected read set cannot be
+        // enumerated, the diff is refused rather than run unchecked.
+        let mut enumerate_args = vec!["diff", "--name-only"];
+        if cached {
+            enumerate_args.push("--cached");
+        }
+        enumerate_args.push("--");
+        enumerate_args.push(files);
+
+        let affected = match self.run_git_command(&enumerate_args, working_dir).await {
+            Ok(list) => list,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(format!(
+                        "Diff blocked: cannot determine which files it would read: {e}"
+                    )),
+                });
+            }
+        };
+
+        if let Err(e) =
+            self.ensure_git_paths_allowed(&affected, working_dir, GitAccess::Read, "Diff")
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!("{e}")),
+            });
+        }
 
         let mut git_args = vec!["diff", "--unified=3"];
         if cached {
@@ -586,6 +879,14 @@ impl GitOperationsTool {
             anyhow::bail!("No paths to stage");
         }
 
+        if let Err(e) = self.preflight_add(&sanitized, working_dir).await {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!("{e}")),
+            });
+        }
+
         let mut git_args: Vec<&str> = vec!["add", "--"];
         git_args.extend(sanitized.iter().map(String::as_str));
 
@@ -695,6 +996,26 @@ impl GitOperationsTool {
                     .unwrap_or("")
                     .trim()
                     .to_string();
+                let pathspec: Vec<String> = paths_raw
+                    .split_whitespace()
+                    .map(ToString::to_string)
+                    .collect();
+
+                // `stash push` reverts tracked modifications in the working
+                // tree (and removes untracked files with `-u`), so its
+                // mutation set is checked against `deny_write` first — the
+                // same contract `checkout` enforces.
+                if let Err(e) = self
+                    .preflight_stash(action, include_untracked, &pathspec, working_dir)
+                    .await
+                {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(format!("{e}")),
+                    });
+                }
+
                 let mut cmd: Vec<String> =
                     vec!["stash".into(), "push".into(), "-m".into(), message];
                 if keep_index {
@@ -712,7 +1033,18 @@ impl GitOperationsTool {
                 let cmd_refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
                 self.run_git_command(&cmd_refs, working_dir).await
             }
-            "pop" => self.run_git_command(&["stash", "pop"], working_dir).await,
+            "pop" => {
+                // `pop` writes the stashed contents back over the working
+                // tree, so the restored path set is checked the same way.
+                if let Err(e) = self.preflight_stash(action, false, &[], working_dir).await {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(format!("{e}")),
+                    });
+                }
+                self.run_git_command(&["stash", "pop"], working_dir).await
+            }
             "list" => self.run_git_command(&["stash", "list"], working_dir).await,
             "drop" => {
                 let index_raw = args.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -850,6 +1182,24 @@ impl GitOperationsTool {
                     git_args.push(branch);
                 }
 
+                // Without a branch Git creates one from HEAD, so HEAD is the
+                // tree that gets materialized in that case.
+                let reference = if branch.is_empty() { "HEAD" } else { branch };
+                if let Err(e) = self
+                    .preflight_worktree_add(
+                        std::path::Path::new(worktree_path),
+                        reference,
+                        working_dir,
+                    )
+                    .await
+                {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(format!("{e}")),
+                    });
+                }
+
                 self.run_git_command(&git_args, working_dir).await?;
                 Ok(ToolResult {
                     success: true,
@@ -873,6 +1223,17 @@ impl GitOperationsTool {
                     );
                     anyhow::Error::msg("Worktree path must be valid UTF-8 for git execution")
                 })?;
+
+                if let Err(e) = self
+                    .preflight_worktree_remove(std::path::Path::new(worktree_path))
+                    .await
+                {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(format!("{e}")),
+                    });
+                }
 
                 self.run_git_command(&["worktree", "remove", worktree_path], working_dir)
                     .await?;
@@ -1924,5 +2285,422 @@ mod tests {
         );
         let content = std::fs::read_to_string(tmp.path().join("docs.txt")).unwrap();
         assert_eq!(content, "updated docs");
+    }
+
+    // ── Git tool policy boundary: deny_read on reads, deny_write on mutations ──
+
+    /// Build a tool whose policy denies reads of `denied` (a repo-relative
+    /// path). The workspace is canonicalized because the tool resolves Git's
+    /// reported paths through `canonicalize_best_effort`; comparing those
+    /// against a symlinked `/var` temp root would make the denial never match
+    /// and the regression pass vacuously.
+    fn deny_read_git_tool(root: &std::path::Path, denied: &str) -> GitOperationsTool {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: root.to_path_buf(),
+            forbidden_paths: vec![root.join(denied).display().to_string()],
+            ..SecurityPolicy::default()
+        });
+        GitOperationsTool::new(security, root.to_path_buf())
+    }
+
+    fn deny_write_git_tool(root: &std::path::Path, denied: &str) -> GitOperationsTool {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: root.to_path_buf(),
+            deny_write: vec![root.join(denied)],
+            ..SecurityPolicy::default()
+        });
+        GitOperationsTool::new(security, root.to_path_buf())
+    }
+
+    #[tokio::test]
+    async fn diff_rejects_pathspec_that_would_read_a_denied_file() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &[".env"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::write(root.join(".env"), "SECRET=leaked").unwrap();
+
+        let tool = deny_read_git_tool(&root, ".env");
+        let result = tool
+            .execute(json!({"operation": "diff", "files": ".env"}))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "diff of a deny_read target must be refused"
+        );
+        let rendered = format!("{result:?}");
+        assert!(
+            !rendered.contains("SECRET=leaked"),
+            "a refused diff must not surface the denied file's content: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_diff_rejects_a_denied_file() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &[".env"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::write(root.join(".env"), "SECRET=leaked").unwrap();
+        std::process::Command::new("git")
+            .args(["add", ".env"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let tool = deny_read_git_tool(&root, ".env");
+        let result = tool
+            .execute(json!({"operation": "diff", "files": ".env", "cached": true}))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "the cached diff path must apply the same read policy"
+        );
+        assert!(
+            !format!("{result:?}").contains("SECRET=leaked"),
+            "a refused cached diff must not surface denied content"
+        );
+    }
+
+    #[tokio::test]
+    async fn diff_fails_closed_when_a_multi_file_pathspec_includes_a_denied_file() {
+        // The default "." pathspec expands to several files. One denied entry
+        // must abort the whole diff rather than emitting the rest — Git prints
+        // all matched files in one pass, so partial filtering is not available.
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &[".env", "notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::write(root.join(".env"), "SECRET=leaked").unwrap();
+        std::fs::write(root.join("notes.txt"), "public change").unwrap();
+
+        let tool = deny_read_git_tool(&root, ".env");
+        let result = tool
+            .execute(json!({"operation": "diff", "files": "."}))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "a pathspec selecting a denied file must fail closed"
+        );
+        let rendered = format!("{result:?}");
+        assert!(
+            !rendered.contains("SECRET=leaked") && !rendered.contains("public change"),
+            "failing closed must emit neither the denied nor the permitted diff: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn diff_still_reports_a_permitted_file_under_the_same_policy() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &[".env", "notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::write(root.join("notes.txt"), "public change").unwrap();
+
+        let tool = deny_read_git_tool(&root, ".env");
+        let result = tool
+            .execute(json!({"operation": "diff", "files": "notes.txt"}))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "a permitted pathspec must still diff normally: {:?}",
+            result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn stash_push_rejected_when_it_would_revert_a_denied_file() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &[".env"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::write(root.join(".env"), "SECRET=modified").unwrap();
+
+        let tool = deny_write_git_tool(&root, ".env");
+        let result = tool
+            .execute(json!({"operation": "stash", "action": "push"}))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "stash push must be blocked when it would revert a deny_write path"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join(".env")).unwrap(),
+            "SECRET=modified",
+            "a blocked stash must leave the protected file untouched"
+        );
+        let stashes = std::process::Command::new("git")
+            .args(["stash", "list"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&stashes.stdout).trim().is_empty(),
+            "a blocked stash must not have created a stash entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn stash_pop_rejected_when_it_would_restore_over_a_denied_file() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &[".env"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+
+        // Create the stash entry directly through git so the tool's own
+        // push-side preflight is not what this test exercises.
+        std::fs::write(root.join(".env"), "SECRET=stashed").unwrap();
+        std::process::Command::new("git")
+            .args(["stash", "push", "-m", "fixture"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let tool = deny_write_git_tool(&root, ".env");
+        let result = tool
+            .execute(json!({"operation": "stash", "action": "pop"}))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "stash pop must be blocked when it would write a deny_write path"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join(".env")).unwrap(),
+            "initial",
+            "a blocked pop must not restore the stashed contents"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_rejected_when_it_would_stage_a_deny_read_file() {
+        // Staging hashes the file's bytes into the object store, so `add` is a
+        // read of every path it touches even though the working tree is
+        // untouched.
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::write(root.join(".env"), "SECRET=leaked").unwrap();
+
+        let tool = deny_read_git_tool(&root, ".env");
+        let result = tool
+            .execute(json!({"operation": "add", "paths": ".env"}))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "staging a deny_read target must be refused"
+        );
+        let staged = std::process::Command::new("git")
+            .args(["diff", "--cached", "--name-only"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&staged.stdout).trim().is_empty(),
+            "a refused add must not have staged anything"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_fails_closed_when_a_broad_pathspec_covers_a_denied_file() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::write(root.join(".env"), "SECRET=leaked").unwrap();
+        std::fs::write(root.join("notes.txt"), "public change").unwrap();
+
+        let tool = deny_read_git_tool(&root, ".env");
+        let result = tool
+            .execute(json!({"operation": "add", "paths": "."}))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "a pathspec expanding onto a denied file must fail closed"
+        );
+        let staged = std::process::Command::new("git")
+            .args(["diff", "--cached", "--name-only"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&staged.stdout).trim().is_empty(),
+            "failing closed must stage neither the denied nor the permitted file"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_still_stages_a_permitted_file_under_the_same_policy() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::write(root.join("notes.txt"), "public change").unwrap();
+
+        let tool = deny_read_git_tool(&root, ".env");
+        let result = tool
+            .execute(json!({"operation": "add", "paths": "notes.txt"}))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "permitted add must work: {:?}",
+            result.error
+        );
+        let staged = std::process::Command::new("git")
+            .args(["diff", "--cached", "--name-only"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&staged.stdout).trim(), "notes.txt");
+    }
+
+    #[tokio::test]
+    async fn worktree_remove_rejected_when_the_tree_holds_a_denied_file() {
+        // `worktree remove` deletes the whole tree. The root-only check cannot
+        // see a denied path nested inside it, and deletion is a write.
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        let wt = root.join("wt");
+
+        std::process::Command::new("git")
+            .args(["worktree", "add", wt.to_str().unwrap(), "-b", "side"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::fs::write(wt.join("protected.txt"), "keep me").unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: root.clone(),
+            deny_write: vec![wt.join("protected.txt")],
+            ..SecurityPolicy::default()
+        });
+        let tool = GitOperationsTool::new(security, root.clone());
+
+        let result = tool
+            .execute(json!({
+                "operation": "worktree",
+                "subcommand": "remove",
+                "worktree_path": wt.to_str().unwrap(),
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "removing a worktree containing a deny_write path must be refused"
+        );
+        assert!(
+            wt.join("protected.txt").exists(),
+            "a blocked worktree remove must not delete the protected file"
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_remove_succeeds_when_the_tree_holds_no_denied_path() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        let wt = root.join("wt");
+
+        std::process::Command::new("git")
+            .args(["worktree", "add", wt.to_str().unwrap(), "-b", "side"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: root.clone(),
+            deny_write: vec![root.join("untouched.txt")],
+            ..SecurityPolicy::default()
+        });
+        let tool = GitOperationsTool::new(security, root.clone());
+
+        let result = tool
+            .execute(json!({
+                "operation": "worktree",
+                "subcommand": "remove",
+                "worktree_path": wt.to_str().unwrap(),
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "removing a worktree with no denied paths must work: {:?}",
+            result.error
+        );
+        assert!(!wt.exists(), "the worktree should be gone");
+    }
+
+    #[tokio::test]
+    async fn worktree_add_rejected_when_the_checked_out_tree_holds_a_denied_path() {
+        // The target root passes the existing check; the denial is on a file
+        // the branch would materialize underneath it.
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        let wt = root.join("wt");
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: root.clone(),
+            deny_write: vec![wt.join("notes.txt")],
+            ..SecurityPolicy::default()
+        });
+        let tool = GitOperationsTool::new(security, root.clone());
+
+        let result = tool
+            .execute(json!({
+                "operation": "worktree",
+                "subcommand": "add",
+                "worktree_path": wt.to_str().unwrap(),
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "materializing a denied path through worktree add must be refused"
+        );
+        assert!(!wt.exists(), "a blocked worktree add must create nothing");
+    }
+
+    #[tokio::test]
+    async fn stash_push_succeeds_when_no_denied_path_is_affected() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &[".env", "notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::write(root.join("notes.txt"), "modified").unwrap();
+
+        let tool = deny_write_git_tool(&root, ".env");
+        let result = tool
+            .execute(json!({"operation": "stash", "action": "push", "paths": "notes.txt"}))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "stashing only permitted paths must still work: {:?}",
+            result.error
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("notes.txt")).unwrap(),
+            "initial",
+            "the permitted file should have been reverted by the stash"
+        );
     }
 }
