@@ -1640,6 +1640,7 @@ mod tests {
         });
 
         let (mut socket, _) = connect_async(format!(
+            // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- loopback-only test listener
             "ws://{address}/ws/chat?agent=web&session_id=idle-test"
         ))
         .await
