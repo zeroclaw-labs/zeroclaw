@@ -366,7 +366,15 @@ impl Tool for CronAddTool {
                 });
             }
             None => {
-                if args.get("prompt").is_some() {
+                // Infer agent only when prompt has non-blank content. A present
+                // but null/empty/whitespace `prompt` key must not forge Agent
+                // (and then fail "Missing 'prompt'") when a shell command is
+                // supplied — match the content check used below for agent jobs.
+                if args
+                    .get("prompt")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|prompt| !prompt.trim().is_empty())
+                {
                     JobType::Agent
                 } else {
                     JobType::Shell
@@ -1084,6 +1092,33 @@ mod tests {
                 .unwrap_or_default()
                 .contains("Missing 'prompt'")
         );
+    }
+
+    #[tokio::test]
+    async fn blank_or_null_prompt_without_job_type_infers_shell_when_command_present() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
+
+        for prompt in [json!(null), json!(""), json!("   ")] {
+            let result = tool
+                .execute(json!({
+                    "schedule": { "kind": "cron", "expr": "*/5 * * * *" },
+                    "command": "echo ok",
+                    "prompt": prompt,
+                }))
+                .await
+                .unwrap();
+            assert!(
+                result.success,
+                "prompt={prompt:?} should infer shell, got error={:?}",
+                result.error
+            );
+        }
+
+        let jobs = cron::list_jobs(&cfg).unwrap();
+        assert_eq!(jobs.len(), 3);
+        assert!(jobs.iter().all(|job| job.command == "echo ok"));
     }
 
     #[tokio::test]

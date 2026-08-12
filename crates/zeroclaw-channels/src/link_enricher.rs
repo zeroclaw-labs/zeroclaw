@@ -2,9 +2,10 @@
 //! and prepends summaries so the agent has link context without explicit tool calls.
 
 use regex::Regex;
-use std::net::IpAddr;
 use std::sync::LazyLock;
 use std::time::Duration;
+
+const MAX_REDIRECTS: usize = 5;
 
 /// Configuration for the link enricher pipeline stage.
 #[derive(Debug, Clone)]
@@ -47,71 +48,44 @@ pub fn extract_urls(text: &str, max: usize) -> Vec<String> {
 /// Returns `true` if the URL points to a private/local address that should be
 /// blocked for SSRF protection.
 pub fn is_ssrf_target(url: &str) -> bool {
-    let host = match extract_host(url) {
-        Some(h) => h,
-        None => return true, // unparseable URLs are rejected
-    };
+    reqwest::Url::parse(url).map_or(true, |url| is_blocked_url(&url))
+}
 
-    // Check hostname-based locals
-    if host == "localhost"
-        || host.ends_with(".localhost")
-        || host.ends_with(".local")
-        || host == "local"
-    {
+fn is_blocked_url(url: &reqwest::Url) -> bool {
+    if !matches!(url.scheme(), "http" | "https") {
         return true;
     }
 
-    // Check IP-based private ranges
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        return is_private_ip(ip);
-    }
-
-    false
-}
-
-/// Extract the host portion from a URL string.
-fn extract_host(url: &str) -> Option<String> {
-    let rest = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))?;
-    let authority = rest.split(['/', '?', '#']).next()?;
-    if authority.is_empty() {
-        return None;
-    }
-    // Strip port
-    let host = if authority.starts_with('[') {
-        // IPv6 in brackets — reject for simplicity
-        return None;
-    } else {
-        authority.split(':').next().unwrap_or(authority)
+    let Some(host) = url.host_str() else {
+        return true;
     };
-    Some(host.to_lowercase())
+    let canonical_host = host.trim_end_matches('.');
+    canonical_host.is_empty() || zeroclaw_infra::net_guard::is_private_or_local_host(canonical_host)
 }
 
-/// Check if an IP address falls within private/reserved ranges.
-fn is_private_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            v4.is_loopback()           // 127.0.0.0/8
-                || v4.is_private()     // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
-                || v4.is_link_local()  // 169.254.0.0/16
-                || v4.is_unspecified() // 0.0.0.0
-                || v4.is_broadcast()   // 255.255.255.255
-                || v4.is_multicast() // 224.0.0.0/4
+fn redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if is_blocked_url(attempt.url()) {
+            return attempt.error(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Link-enricher redirect target is not a public HTTP(S) URL",
+            ));
         }
-        IpAddr::V6(v6) => {
-            v6.is_loopback()       // ::1
-                || v6.is_unspecified() // ::
-                || v6.is_multicast()
-                // Check for IPv4-mapped IPv6 addresses
-                || v6.to_ipv4_mapped().is_some_and(|v4| {
-                    v4.is_loopback()
-                        || v4.is_private()
-                        || v4.is_link_local()
-                        || v4.is_unspecified()
-                })
-        }
-    }
+
+        reqwest::redirect::Policy::limited(MAX_REDIRECTS).redirect(attempt)
+    })
+}
+
+fn http_client_builder(timeout_secs: u64) -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(timeout_secs))
+        .connect_timeout(Duration::from_secs(5))
+        .redirect(redirect_policy())
+        .user_agent("ZeroClaw/0.1 (link-enricher)")
+}
+
+fn http_client(timeout_secs: u64) -> reqwest::Result<reqwest::Client> {
+    http_client_builder(timeout_secs).build()
 }
 
 /// Extract the `<title>` tag content from HTML.
@@ -160,15 +134,7 @@ struct LinkSummary {
 }
 
 /// Fetch a single URL and extract a summary. Returns `None` on any failure.
-async fn fetch_link_summary(url: &str, timeout_secs: u64) -> Option<LinkSummary> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(timeout_secs))
-        .connect_timeout(Duration::from_secs(5))
-        .redirect(reqwest::redirect::Policy::limited(5))
-        .user_agent("ZeroClaw/0.1 (link-enricher)")
-        .build()
-        .ok()?;
-
+async fn fetch_link_summary(client: &reqwest::Client, url: &str) -> Option<LinkSummary> {
     let response = client.get(url).send().await.ok()?;
     if !response.status().is_success() {
         return None;
@@ -221,9 +187,14 @@ pub async fn enrich_message(content: &str, config: &LinkEnricherConfig) -> Strin
         return content.to_string();
     }
 
+    let client = match http_client(config.timeout_secs) {
+        Ok(client) => client,
+        Err(_) => return content.to_string(),
+    };
+
     let mut enrichments = Vec::new();
     for url in safe_urls {
-        match fetch_link_summary(url, config.timeout_secs).await {
+        match fetch_link_summary(&client, url).await {
             Some(summary) => {
                 enrichments.push(format!("[Link: {} — {}]", summary.title, summary.snippet));
             }
@@ -302,6 +273,19 @@ mod tests {
     fn ssrf_blocks_localhost() {
         assert!(is_ssrf_target("http://localhost/admin"));
         assert!(is_ssrf_target("https://localhost:8080/api"));
+        for host in [
+            "localhost.",
+            "localhost..",
+            "foo.localhost...",
+            "local.",
+            "printer.local..",
+            "127.0.0.1..",
+        ] {
+            assert!(
+                is_ssrf_target(&format!("http://{host}/admin")),
+                "absolute local hostname {host} must be blocked"
+            );
+        }
     }
 
     #[test]
@@ -336,8 +320,9 @@ mod tests {
 
     #[test]
     fn ssrf_blocks_ipv6_loopback() {
-        // IPv6 in brackets is rejected by extract_host
         assert!(is_ssrf_target("http://[::1]/admin"));
+        assert!(is_ssrf_target("http://[fd00::1]/admin"));
+        assert!(is_ssrf_target("http://[fe80::1]/admin"));
     }
 
     #[test]
@@ -350,6 +335,171 @@ mod tests {
         assert!(!is_ssrf_target("https://example.com/page"));
         assert!(!is_ssrf_target("https://www.google.com"));
         assert!(!is_ssrf_target("http://93.184.216.34/resource"));
+        assert!(!is_ssrf_target("https://[2606:4700:4700::1111]/"));
+    }
+
+    #[test]
+    fn ssrf_rejects_malformed_or_hostless_urls() {
+        assert!(is_ssrf_target("not a url"));
+        assert!(is_ssrf_target("file:///etc/passwd"));
+        assert!(is_ssrf_target("http://"));
+        assert!(is_ssrf_target("http://.../"));
+    }
+
+    #[tokio::test]
+    async fn redirect_policy_rejects_public_to_private_hop() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let port = server.address().port();
+        Mock::given(method("GET"))
+            .and(path("/start"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", format!("http://127.0.0.1:{port}/private")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/private"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = http_client_builder(5)
+            .resolve("public.test", *server.address())
+            .build()
+            .unwrap();
+        let url = format!("http://public.test:{port}/start");
+        assert!(fetch_link_summary(&client, &url).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn redirect_policy_rejects_absolute_localhost_hop() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let port = server.address().port();
+        Mock::given(method("GET"))
+            .and(path("/start"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", format!("http://localhost..:{port}/private")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/private"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = http_client_builder(5)
+            .resolve("public.test", *server.address())
+            .resolve("localhost..", *server.address())
+            .build()
+            .unwrap();
+        let url = format!("http://public.test:{port}/start");
+        assert!(fetch_link_summary(&client, &url).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn redirect_policy_follows_public_hop() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let port = server.address().port();
+        Mock::given(method("GET"))
+            .and(path("/start"))
+            .respond_with(ResponseTemplate::new(302).insert_header("Location", "/final"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/final"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw("<title>Redirected</title><p>ok</p>", "text/html"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = http_client_builder(5)
+            .resolve("public.test.", *server.address())
+            .build()
+            .unwrap();
+        let summary = fetch_link_summary(&client, &format!("http://public.test.:{port}/start"))
+            .await
+            .expect("public redirect should succeed");
+        assert_eq!(summary.title, "redirected");
+    }
+
+    async fn mount_redirect_chain(server: &wiremock::MockServer, redirects: usize) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        for hop in 0..=redirects {
+            let response = if hop < redirects {
+                ResponseTemplate::new(302).insert_header("Location", format!("/hop/{}", hop + 1))
+            } else {
+                ResponseTemplate::new(200)
+            };
+            Mock::given(method("GET"))
+                .and(path(format!("/hop/{hop}")))
+                .respond_with(response)
+                .mount(server)
+                .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn redirect_policy_preserves_five_redirect_limit() {
+        use wiremock::MockServer;
+
+        let server = MockServer::start().await;
+        mount_redirect_chain(&server, MAX_REDIRECTS).await;
+        let client = http_client_builder(5)
+            .resolve("public.test", *server.address())
+            .build()
+            .unwrap();
+        let response = client
+            .get(format!(
+                "http://public.test:{}/hop/0",
+                server.address().port()
+            ))
+            .send()
+            .await
+            .expect("five redirects should remain allowed");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn redirect_policy_rejects_sixth_redirect() {
+        use wiremock::MockServer;
+
+        let server = MockServer::start().await;
+        mount_redirect_chain(&server, MAX_REDIRECTS + 1).await;
+        let client = http_client_builder(5)
+            .resolve("public.test", *server.address())
+            .build()
+            .unwrap();
+        let error = client
+            .get(format!(
+                "http://public.test:{}/hop/0",
+                server.address().port()
+            ))
+            .send()
+            .await
+            .expect_err("sixth redirect must fail");
+        assert!(error.is_redirect());
     }
 
     // ── Title extraction ────────────────────────────────────────────

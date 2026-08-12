@@ -92,6 +92,8 @@ pub enum ChannelKind {
     Twitter,
     VoiceCall,
     VoiceWake,
+    /// Retained after the WATI channel was removed so historical
+    /// attribution records that name it still deserialize.
     Wati,
     #[strum(serialize = "wecom")]
     WeCom,
@@ -106,12 +108,13 @@ pub enum ChannelKind {
 
 impl ChannelKind {
     /// Whether this channel can deliver inbound events that fan into an SOP.
-    /// `Cli` is a local interactive session, not a background event source, and
-    /// `Plugin` is a synthetic attribution bucket; both are excluded. Everything
-    /// else is a real inbound channel a SOP can trigger on.
+    /// `Cli` is a local interactive session, `Plugin` is a synthetic attribution
+    /// bucket, and `Wati` is retained only for historical attribution records;
+    /// none is a live background event source. Every other kind is a real inbound
+    /// channel a SOP can trigger on.
     #[must_use]
     pub fn inbound_capable(self) -> bool {
-        !matches!(self, Self::Cli | Self::Plugin)
+        !matches!(self, Self::Cli | Self::Plugin | Self::Wati)
     }
 
     /// Canonical snake_case wire string, single-sourced from `IntoStaticStr`.
@@ -446,6 +449,20 @@ mod tests {
     }
 
     #[test]
+    fn retired_wati_kind_still_deserializes_from_historical_attribution() {
+        #[derive(serde::Deserialize)]
+        struct StoredAttribution {
+            #[serde(default, with = "super::channel_kind_opt_serde")]
+            channel_type: Option<ChannelKind>,
+        }
+
+        let stored: StoredAttribution = serde_json::from_str(r#"{"channel_type":"wati"}"#)
+            .expect("historical WATI attribution must remain readable");
+        assert_eq!(stored.channel_type, Some(ChannelKind::Wati));
+        assert!(!ChannelKind::Wati.inbound_capable());
+    }
+
+    #[test]
     fn provider_kind_delegates_to_inner() {
         assert_eq!(
             ProviderKind::Model(ModelProviderKind::Anthropic).type_str(),
@@ -483,5 +500,40 @@ mod tests {
                 .is_none()
         );
         assert_eq!(Role::System.attribution_field(), Some("system_alias"));
+    }
+
+    #[test]
+    fn role_family_str_returns_stable_tags() {
+        assert_eq!(Role::Agent.family_str(), "agent");
+        assert_eq!(Role::Swarm.family_str(), "swarm");
+        assert_eq!(Role::Channel(ChannelKind::Discord).family_str(), "channel");
+        assert_eq!(Role::Tool(ToolKind::Shell).family_str(), "tool");
+        assert_eq!(Role::Cron(CronKind::Interval).family_str(), "cron");
+        assert_eq!(
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Anthropic)).family_str(),
+            "provider.model"
+        );
+        assert_eq!(
+            Role::Provider(ProviderKind::Tts(TtsProviderKind::ElevenLabs)).family_str(),
+            "provider.tts"
+        );
+        assert_eq!(
+            Role::Provider(ProviderKind::Transcription(
+                TranscriptionProviderKind::Whisper
+            ))
+            .family_str(),
+            "provider.transcription"
+        );
+        assert_eq!(
+            Role::Provider(ProviderKind::Tunnel(TunnelProviderKind::Ngrok)).family_str(),
+            "provider.tunnel"
+        );
+        assert_eq!(Role::Memory(MemoryKind::Sqlite).family_str(), "memory");
+        assert_eq!(Role::PeerGroup.family_str(), "peer_group");
+        assert_eq!(Role::Skill.family_str(), "skill");
+        assert_eq!(Role::Mcp.family_str(), "mcp");
+        assert_eq!(Role::Sop.family_str(), "sop");
+        assert_eq!(Role::Session.family_str(), "session");
+        assert_eq!(Role::System.family_str(), "system");
     }
 }
