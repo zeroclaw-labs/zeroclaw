@@ -1640,8 +1640,8 @@ mod tests {
         });
 
         let (mut socket, _) = connect_async(format!(
-            // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- loopback-only test listener
-            "ws://{address}/ws/chat?agent=web&session_id=idle-test"
+            // This URL connects only to the test's loopback listener.
+            "ws://{address}/ws/chat?agent=web&session_id=idle-test" // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
         ))
         .await
         .expect("chat WebSocket upgrade");
