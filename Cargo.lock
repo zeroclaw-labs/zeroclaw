@@ -13581,6 +13581,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeroclaw-log-attribution-macro-consumer"
+version = "0.8.4"
+dependencies = [
+ "zeroclaw-log",
+ "zeroclaw-log-attribution-macro-support",
+]
+
+[[package]]
+name = "zeroclaw-log-attribution-macro-support"
+version = "0.8.4"
+dependencies = [
+ "zeroclaw-api",
+]
+
+[[package]]
 name = "zeroclaw-macros"
 version = "0.8.4"
 dependencies = [

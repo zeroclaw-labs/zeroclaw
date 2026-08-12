@@ -428,10 +428,10 @@ use config::Config;
 
 // Re-export so binary modules can use crate::<CommandEnum> while keeping a single source of truth.
 pub use zeroclaw::{
-    AgentsCommands, ChannelCommands, ChannelsCommands, CronCommands, GatewayCommands,
-    HardwareCommands, IntegrationCommands, MigrateCommands, PeripheralCommands, ProvidersCommands,
-    ServiceCommands, ServiceLogStream, SkillBundleCommands, SkillCommands, SopCommands,
-    SopGraphFormat,
+    AgentsCommands, ChannelCommands, ChannelsCommands, CronCommands, CronDeliveryArgs,
+    GatewayCommands, HardwareCommands, IntegrationCommands, MigrateCommands, PeripheralCommands,
+    ProvidersCommands, ServiceCommands, ServiceLogStream, SkillBundleCommands, SkillCommands,
+    SopCommands, SopGraphFormat,
 };
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
