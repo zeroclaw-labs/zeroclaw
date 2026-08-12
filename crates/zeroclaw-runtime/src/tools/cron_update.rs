@@ -170,7 +170,7 @@ impl Tool for CronUpdateTool {
                                 "channel": {
                                     "type": "string",
                                     "enum": cron::CRON_DELIVERY_SCHEMA_CHANNELS,
-                                    "description": "Channel to deliver output to. Prefer '<type>.<alias>' (e.g. 'telegram.work'): a bare type resolves only while that type has exactly one configured instance. Unlike cron_add, this patch is not filled in from the current conversation."
+                                    "description": "Channel to deliver output to. Use '<type>.<alias>' (e.g. 'telegram.work'); a bare type resolves only while that type has one configured instance. Unlike cron_add, this patch is never filled in from the current conversation."
                                 },
                                 "to": {
                                     "type": "string",

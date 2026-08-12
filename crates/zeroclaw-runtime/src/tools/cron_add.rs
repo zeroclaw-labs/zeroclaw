@@ -256,7 +256,7 @@ impl Tool for CronAddTool {
                 },
                 "delivery": {
                     "type": "object",
-                    "description": "Optional delivery config to send job output to a channel after each run. When this job is created from a chat turn, an omitted channel and to are filled from that conversation, so 'announce' alone delivers back to where the request came from.",
+                    "description": "Optional delivery config to send job output to a channel after each run. When created from a chat turn, omitted fields default to announcing back to that conversation.",
                     "properties": {
                         "mode": {
                             "type": "string",
@@ -266,7 +266,7 @@ impl Tool for CronAddTool {
                         "channel": {
                             "type": "string",
                             "enum": cron::CRON_DELIVERY_SCHEMA_CHANNELS,
-                            "description": "Channel type to deliver output to. When the job is created from a chat turn, this resolves to that conversation's own channel instance. Pass an explicit '<type>.<alias>' only to deliver somewhere else."
+                            "description": "Channel type to deliver output to. From a chat turn this resolves to that conversation's own channel instance; pass '<type>.<alias>' to deliver elsewhere."
                         },
                         "to": {
                             "type": "string",
