@@ -72,7 +72,7 @@ impl FileDownloadTool {
     /// [`super::file_write::FileWriteTool::new_with_persistence`].
     ///
     /// `allowed_private_hosts` is resolved from the construction-time `config`
-    /// snapshot on each dispatch by [`normalize_allowed_private_hosts`]. The
+    /// snapshot on each dispatch by `normalize_allowed_private_hosts`. The
     /// channel daemon instead wires the live config handle via
     /// [`Self::new_with_persistence_and_resolver`].
     pub fn new_with_persistence(
@@ -94,7 +94,7 @@ impl FileDownloadTool {
 
     /// Construct with a resolver closure that reads `allowed_private_hosts`
     /// from the canonical config at use time. The resolver is called on each
-    /// dispatch and its result normalized via [`normalize_allowed_private_hosts`],
+    /// dispatch and its result normalized via `normalize_allowed_private_hosts`,
     /// so a live `config/set` that adds or removes an internal CDN entry takes
     /// effect on the next call instead of the construction-time snapshot.
     ///
@@ -596,7 +596,7 @@ fn normalize_allowed_private_hosts(allowed: &[String]) -> Vec<String> {
     }
 }
 
-/// Set by [`normalize_allowed_private_hosts`] the first time the
+/// Set by `normalize_allowed_private_hosts` the first time the
 /// configured allowlist fails to normalize, so the WARN fires at most
 /// once per process. Drops the per-dispatch noise that would otherwise
 /// flood logs for a permanently-misconfigured entry.
@@ -609,7 +609,7 @@ static NORMALIZE_WARNING_EMITTED: OnceLock<()> = OnceLock::new();
 /// treats every network-specific prefix as undeclared ordinary address space
 /// (the schema contract at `config.nat64_prefixes`), which would remove the
 /// declared-prefix policy at the SSRF boundary — a fail-open. The empty
-/// allowlist posture of [`normalize_allowed_private_hosts`] is fail-closed
+/// allowlist posture of `normalize_allowed_private_hosts` is fail-closed
 /// there (empty = reject every private host), but it is the wrong fail-closed
 /// state for a *prefix declaration*.
 fn normalize_nat64_prefixes(
