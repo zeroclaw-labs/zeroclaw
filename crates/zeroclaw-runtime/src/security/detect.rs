@@ -249,7 +249,7 @@ fn sandbox_backend_name(backend: &SandboxBackend) -> &'static str {
 /// yet forwarded to individual backends; sandbox selection is currently driven
 /// solely by `SandboxConfig` and `runtime_kind`. It IS consulted for one
 /// thing: deciding whether to warn that `deny_write`/`deny_read` are
-/// unenforced (see [`warn_if_denials_unenforced`]).
+/// unenforced (see `warn_if_denials_unenforced`).
 pub fn create_sandbox(
     sandbox: &SandboxConfig,
     policy: &SandboxPolicy,
