@@ -153,7 +153,7 @@ pub struct DelegateTool {
     root_config: Option<Arc<Config>>,
     /// Live config handle threaded from the parent registry so independent /
     /// background / parallel delegate target registries (built through
-    /// [`Self::independent_agentic_tools_for_target`]) observe `config/set`
+    /// `Self::independent_agentic_tools_for_target`) observe `config/set`
     /// reloads — e.g. a `file_download` SSRF allowlist revocation — instead of
     /// falling back to the construction-time `root_config` snapshot. Unset for
     /// legacy unit-test constructors.
@@ -426,7 +426,7 @@ impl DelegateTool {
     }
 
     /// Attach the live config handle so independent delegate target registries
-    /// (built through [`Self::independent_agentic_tools_for_target`]) read live
+    /// (built through `Self::independent_agentic_tools_for_target`) read live
     /// policy — such as the `file_download` SSRF allowlist — after `config/set`
     /// reloads instead of falling back to the construction-time `root_config`
     /// snapshot. `None` (legacy unit-test constructors) keeps the snapshot
