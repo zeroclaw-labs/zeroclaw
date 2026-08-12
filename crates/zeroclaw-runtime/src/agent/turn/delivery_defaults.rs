@@ -91,10 +91,8 @@ pub(crate) fn maybe_inject_channel_delivery_defaults(
         return;
     }
 
-    // Delivery resolves a `<type>.<alias>` composite key, and the bare type is
-    // registered only while that type has exactly one configured instance
-    // (`configured_channel_map`). Naming this turn's own instance is what keeps
-    // a job created from one of several aliased instances deliverable.
+    // Delivery resolves `<type>.<alias>`; the bare type is registered only
+    // while that type has one configured instance (`configured_channel_map`).
     let delivery_channel = match channel_alias
         .map(str::trim)
         .filter(|alias| !alias.is_empty())
@@ -131,11 +129,8 @@ pub(crate) fn maybe_inject_channel_delivery_defaults(
                 .entry("mode".to_string())
                 .or_insert_with(|| serde_json::Value::String("announce".to_string()));
 
-            // Empty means "unset", and a bare originating type is the same
-            // instance named ambiguously — the turn-context block recommends
-            // exactly that spelling, so a model that follows it lands here.
-            // Both resolve to this turn's instance. Any other value is a
-            // deliberate choice of a different destination and is left alone.
+            // Unset, or the bare type the turn-context block recommends: both
+            // name this turn's instance. Anything else is a chosen destination.
             let needs_resolved_channel = delivery
                 .get("channel")
                 .and_then(serde_json::Value::as_str)
@@ -196,9 +191,6 @@ mod tests {
 
     #[test]
     fn absent_delivery_defaults_to_the_originating_composite_channel() {
-        // The failure this fixes: a job created from one of several aliased
-        // instances stored the bare type, which `deliver_announcement` cannot
-        // resolve, so the run completed and its output was dropped.
         let mut args = serde_json::json!({
             "job_type": "agent",
             "prompt": "check the inbox",
@@ -243,8 +235,7 @@ mod tests {
 
     #[test]
     fn an_explicit_destination_is_never_overridden() {
-        // Including this turn's own instance already spelled out, which must
-        // not pick up a second alias suffix.
+        // Includes this turn's own instance, which must not gain a second suffix.
         for chosen in ["telegram.work", "telegram.other", "discord", "discord.ops"] {
             let mut args = serde_json::json!({
                 "job_type": "agent",
@@ -265,9 +256,7 @@ mod tests {
 
     #[test]
     fn bare_originating_type_is_upgraded_to_the_composite_channel() {
-        // The turn-context block recommends the bare type, so a model that
-        // follows it emits a value that only resolves when the type has one
-        // configured instance. It names this turn's instance either way.
+        // The turn-context block recommends this spelling to the model.
         for spelling in ["telegram", "TELEGRAM", "  telegram  "] {
             let mut args = serde_json::json!({
                 "job_type": "agent",
@@ -309,9 +298,7 @@ mod tests {
 
     #[test]
     fn unaliased_channel_still_defaults_to_the_bare_type() {
-        // Turns with no channel instance behind them (CLI, daemon) keep the
-        // pre-existing bare value; the bare key is registered for a
-        // single-instance type.
+        // CLI and daemon turns have no instance behind them.
         let mut args = serde_json::json!({
             "job_type": "agent",
             "prompt": "check the inbox",
