@@ -3,6 +3,7 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+use zeroclaw_api::runtime_traits::ShellDialect;
 
 // Re-export from zeroclaw-config.
 pub use crate::autonomy::AutonomyLevel;
@@ -999,7 +1000,7 @@ fn contains_unquoted_char(command: &str, target: char) -> bool {
 
 /// Returns true if `command` contains an unquoted `>` that is NOT a safe
 /// stderr form (`2>/dev/null`, `2>&1`).
-fn contains_unsafe_output_redirect(command: &str) -> bool {
+fn contains_unsafe_output_redirect_for_shell(command: &str, dialect: ShellDialect) -> bool {
     // Strip safe redirect-to-dev patterns (with word boundary enforcement),
     // then fd-merge patterns, then check for remaining `>`.
     use regex::Regex;
@@ -1015,9 +1016,37 @@ fn contains_unsafe_output_redirect(command: &str) -> bool {
     });
 
     let safe = re.replace_all(command, "$2").to_string();
+    // Windows null device: strip `>nul`, `1>nul`, `2>nul`, `2>NUL`, and the
+    // `\\.\nul` device form (case-insensitive) — the platform equivalent of the
+    // `/dev/null` forms stripped above. A trailing non-boundary char (e.g.
+    // `>nul.txt`, `>null`) is left intact so only the bare device matches.
+    //
+    // Gated on the effective shell: only Windows `cmd.exe` resolves `nul` to
+    // the discard-only null device. Under a POSIX shell (Unix native, Docker
+    // `sh -c`, cron `sh -c`) `nul` is an ordinary relative filename, so
+    // `echo x >nul` would create/truncate a workspace file — it must stay
+    // flagged as an unsafe file redirect.
+    let safe = if matches!(dialect, ShellDialect::WindowsCmd) {
+        static SAFE_NUL_OUTPUT_RE: OnceLock<Regex> = OnceLock::new();
+        let nul_re = SAFE_NUL_OUTPUT_RE.get_or_init(|| {
+            Regex::new(r"(?i)\d*>[ ]?(?:\\\\\.\\)?nul(\s|[;&|)]|$)")
+                .expect("SAFE_NUL_OUTPUT_RE regex must compile")
+        });
+        nul_re.replace_all(&safe, "$1").to_string()
+    } else {
+        safe
+    };
     // Also strip fd-merge redirects (2>&1, 1>&2, >&N, etc.)
     let safe = strip_fd_merge_redirects(&safe);
     contains_unquoted_char(&safe, '>')
+}
+
+/// POSIX-dialect convenience wrapper for tests — the conservative default that
+/// production reaches when it has no effective shell context. Production shell
+/// tools call the `_for_shell` form with the runtime's actual dialect.
+#[cfg(test)]
+fn contains_unsafe_output_redirect(command: &str) -> bool {
+    contains_unsafe_output_redirect_for_shell(command, ShellDialect::Posix)
 }
 
 /// Returns true if `command` contains an unquoted `<` that is NOT a heredoc (`<<`)
@@ -1193,8 +1222,18 @@ fn safe_device_redirect_names_pattern() -> String {
         .join("|")
 }
 
-fn is_safe_device_redirect_target(target: &str) -> bool {
-    SAFE_DEVICE_REDIRECT_TARGETS.contains(&strip_wrapping_quotes(target).trim())
+fn is_safe_device_redirect_target(target: &str, dialect: ShellDialect) -> bool {
+    let target = strip_wrapping_quotes(target).trim();
+    if SAFE_DEVICE_REDIRECT_TARGETS.contains(&target) {
+        return true;
+    }
+    // Windows null device: `nul`/`NUL` (case-insensitive) and the full `\\.\nul`
+    // device form. Only under a native Windows `cmd.exe` shell does `nul` always
+    // resolve to the discard-only null device. Under a POSIX shell (Unix native,
+    // Docker `sh -c`, cron `sh -c`) `nul` is an ordinary relative filename, so it
+    // must not be treated as a safe device.
+    matches!(dialect, ShellDialect::WindowsCmd)
+        && (target.eq_ignore_ascii_case("nul") || target.eq_ignore_ascii_case(r"\\.\nul"))
 }
 
 /// Extract the basename from a command path, handling both Unix (`/`) and
@@ -1418,12 +1457,30 @@ impl SecurityPolicy {
     }
 
     /// Validate full command execution policy (allowlist + risk gate).
+    ///
+    /// Uses the conservative POSIX shell dialect. Shell tools that know the
+    /// runtime's effective shell should call
+    /// [`validate_command_execution_for_shell`](Self::validate_command_execution_for_shell)
+    /// so the Windows `nul` null device is only accepted under `cmd.exe`.
     pub fn validate_command_execution(
         &self,
         command: &str,
         approved: bool,
     ) -> Result<CommandRiskLevel, String> {
-        if !self.is_command_allowed(command) {
+        self.validate_command_execution_for_shell(command, approved, ShellDialect::Posix)
+    }
+
+    /// Validate full command execution policy against a specific shell dialect.
+    /// The dialect decides platform-specific redirect safety (e.g. the Windows
+    /// `nul` null device is discard-only under `cmd.exe` but an ordinary file
+    /// under a POSIX shell).
+    pub fn validate_command_execution_for_shell(
+        &self,
+        command: &str,
+        approved: bool,
+        dialect: ShellDialect,
+    ) -> Result<CommandRiskLevel, String> {
+        if !self.is_command_allowed_for_shell(command, dialect) {
             return Err(format!("Command not allowed by security policy: {command}"));
         }
 
@@ -1499,6 +1556,13 @@ impl SecurityPolicy {
     // technique. If any gate rejects, the whole command is blocked.
 
     pub fn is_command_allowed(&self, command: &str) -> bool {
+        self.is_command_allowed_for_shell(command, ShellDialect::Posix)
+    }
+
+    /// Allowlist + shell-safety check against a specific shell dialect. The
+    /// dialect gates platform-specific redirect safety (the Windows `nul` null
+    /// device is only discard-safe under `cmd.exe`).
+    pub fn is_command_allowed_for_shell(&self, command: &str, dialect: ShellDialect) -> bool {
         if self.autonomy == AutonomyLevel::ReadOnly {
             return false;
         }
@@ -1524,7 +1588,7 @@ impl SecurityPolicy {
         //   - `2>/dev/null`, `>/dev/null`, `1>/dev/null` (output suppression)
         //   - `2>&1`, `1>&2` (fd merging)
         //   - `<<` heredocs, `<<<` here-strings (input literals)
-        if contains_unsafe_output_redirect(command) {
+        if contains_unsafe_output_redirect_for_shell(command, dialect) {
             return false;
         }
         if contains_unquoted_input_redirect(command) {
@@ -1662,7 +1726,18 @@ impl SecurityPolicy {
     /// [`SecurityPolicy::forbidden_workspace_path_argument`], which additionally
     /// follows in-workspace symlinks to block escapes.
     pub fn forbidden_path_argument(&self, command: &str) -> Option<String> {
-        self.forbidden_path_argument_impl(command, false)
+        self.forbidden_path_argument_impl(command, ShellDialect::Posix, false)
+    }
+
+    /// Scan `command` for forbidden path arguments against a specific shell
+    /// dialect. The dialect gates which redirect targets count as safe devices
+    /// (the Windows `nul` null device is only a safe device under `cmd.exe`).
+    pub fn forbidden_path_argument_for_shell(
+        &self,
+        command: &str,
+        dialect: ShellDialect,
+    ) -> Option<String> {
+        self.forbidden_path_argument_impl(command, dialect, false)
     }
 
     /// Like [`SecurityPolicy::forbidden_path_argument`] but for a command that
@@ -1689,12 +1764,24 @@ impl SecurityPolicy {
     /// boundary (the OS sandbox and the broader granular sandbox-policy work),
     /// not this preflight.
     pub fn forbidden_workspace_path_argument(&self, command: &str) -> Option<String> {
-        self.forbidden_path_argument_impl(command, true)
+        self.forbidden_path_argument_impl(command, ShellDialect::Posix, true)
+    }
+
+    /// Like [`SecurityPolicy::forbidden_workspace_path_argument`], but against
+    /// a specific shell dialect so platform-specific safe redirect devices are
+    /// classified by the shell that will execute the command.
+    pub fn forbidden_workspace_path_argument_for_shell(
+        &self,
+        command: &str,
+        dialect: ShellDialect,
+    ) -> Option<String> {
+        self.forbidden_path_argument_impl(command, dialect, true)
     }
 
     fn forbidden_path_argument_impl(
         &self,
         command: &str,
+        dialect: ShellDialect,
         resolve_workspace: bool,
     ) -> Option<String> {
         let forbidden_candidate = |raw: &str| {
@@ -1773,7 +1860,7 @@ impl SecurityPolicy {
             // Cover inline forms like `cat</etc/passwd`.
             match executable_redirect {
                 RedirectionArgument::Target { target, .. } => {
-                    if !is_safe_device_redirect_target(target)
+                    if !is_safe_device_redirect_target(target, dialect)
                         && let Some(blocked) = forbidden_candidate(target)
                     {
                         return Some(blocked);
@@ -1793,7 +1880,7 @@ impl SecurityPolicy {
 
                 if next_is_redirect_target {
                     next_is_redirect_target = false;
-                    if is_safe_device_redirect_target(candidate) {
+                    if is_safe_device_redirect_target(candidate, dialect) {
                         continue;
                     }
                     if let Some(blocked) = forbidden_candidate(candidate) {
@@ -1811,7 +1898,7 @@ impl SecurityPolicy {
                         if let Some(blocked) = forbidden_non_redirect_candidate(prefix) {
                             return Some(blocked);
                         }
-                        if is_safe_device_redirect_target(target) {
+                        if is_safe_device_redirect_target(target, dialect) {
                             continue;
                         }
                         if let Some(blocked) = forbidden_candidate(target) {
@@ -3809,6 +3896,72 @@ mod tests {
         assert!(p.is_command_allowed("ls 2> /dev/null"));
         assert!(p.is_command_allowed("find . 2>&1 > /dev/null"));
         assert!(p.is_command_allowed("cat</dev/null"));
+    }
+
+    #[test]
+    fn windows_nul_redirect_allowed_only_under_cmd_exe() {
+        // The Windows null device is a safe discard-only redirect target — but
+        // ONLY under a native Windows `cmd.exe` shell. Under a POSIX shell (Unix
+        // native, Docker `sh -c`, cron `sh -c`) `nul` is an ordinary relative
+        // filename, so `>nul` must stay blocked to prevent a workspace-file write.
+        use ShellDialect::{Posix, WindowsCmd};
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into(), "echo".into()],
+            ..SecurityPolicy::default()
+        };
+
+        for cmd in [
+            "git -C E:/repo ls-tree -r --name-only HEAD path 2>nul",
+            "echo x >nul",
+            "echo x 1>NUL",
+            "echo x 2>Nul",
+            "echo x > nul",     // target as a separate token
+            r"echo x >\\.\nul", // full device form
+        ] {
+            // cmd.exe: nul resolves to the discard-only null device.
+            assert!(
+                p.is_command_allowed_for_shell(cmd, WindowsCmd),
+                "cmd.exe must allow the nul null device: {cmd}"
+            );
+            // POSIX shell: the SAME command must be blocked (nul is a real file).
+            assert!(
+                !p.is_command_allowed_for_shell(cmd, Posix),
+                "POSIX shell must block a redirect to `nul` (an ordinary file): {cmd}"
+            );
+        }
+
+        // The default (dialect-less) entry point is POSIX/fail-closed, so a
+        // Docker or cron `sh -c` sink — which never reports WindowsCmd — blocks nul.
+        assert!(!p.is_command_allowed("echo x >nul"));
+
+        // The redirect gate itself: nul is stripped as safe only under cmd.exe.
+        assert!(!contains_unsafe_output_redirect_for_shell(
+            "git status 2>nul",
+            WindowsCmd
+        ));
+        assert!(contains_unsafe_output_redirect_for_shell(
+            "git status 2>nul",
+            Posix
+        ));
+        assert!(!contains_unsafe_output_redirect_for_shell(
+            r"echo x >\\.\nul",
+            WindowsCmd
+        ));
+        assert!(contains_unsafe_output_redirect_for_shell(
+            r"echo x >\\.\nul",
+            Posix
+        ));
+
+        // /dev/null stays safe under BOTH dialects; a real file and a non-bare
+        // `nul`-prefixed name stay blocked under both.
+        assert!(p.is_command_allowed_for_shell("git status 2>/dev/null", Posix));
+        assert!(p.is_command_allowed_for_shell("git status 2>/dev/null", WindowsCmd));
+        assert!(!p.is_command_allowed_for_shell("echo secret 2>out.txt", WindowsCmd));
+        assert!(!p.is_command_allowed_for_shell("echo secret >nul.txt", WindowsCmd));
+        assert!(contains_unsafe_output_redirect_for_shell(
+            "echo secret >nul.txt",
+            WindowsCmd
+        ));
     }
 
     #[test]

@@ -172,7 +172,7 @@ async-trait = "0.1"
 ring = { version = "0.17", optional = true }
 
 # LRU cache for bounded sender state
-lru = { version = "0.16", optional = true }
+lru = { version = "0.18.2", optional = true }
 
 # Memory / persistence (migration.rs, behind agent-runtime)
 rusqlite = { version = "0.37", features = ["bundled"], optional = true }
@@ -317,7 +317,7 @@ channels-full = [
     "channel-mattermost", "channel-irc", "channel-imessage",
     "channel-dingtalk", "channel-qq", "channel-bluesky", "channel-git",
     "channel-twitch", "channel-twitter", "channel-reddit", "channel-notion", "channel-mqtt", "channel-amqp",
-    "channel-linq", "channel-wati", "channel-nextcloud",
+    "channel-linq", "channel-nextcloud",
     "channel-mochat", "channel-wecom", "channel-wecom-ws", "channel-clawdtalk",
     "channel-whatsapp-cloud", "channel-voice-call",
 ]
@@ -357,7 +357,6 @@ channel-mqtt = ["zeroclaw-channels/channel-mqtt"]
 channel-filesystem = ["zeroclaw-channels/channel-filesystem"]
 channel-amqp = ["zeroclaw-channels/channel-amqp"]
 channel-linq = ["zeroclaw-channels/channel-linq", "zeroclaw-gateway?/channel-linq"]
-channel-wati = ["zeroclaw-channels/channel-wati", "zeroclaw-gateway?/channel-wati"]
 channel-nextcloud = ["zeroclaw-channels/channel-nextcloud", "zeroclaw-gateway?/channel-nextcloud"]
 channel-mochat = ["zeroclaw-channels/channel-mochat"]
 channel-wechat = ["zeroclaw-channels/channel-wechat", "zeroclaw-gateway?/channel-wechat"]

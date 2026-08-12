@@ -447,10 +447,6 @@ These are incoming webhook endpoints for specific messaging channels. They're se
 - `GET /whatsapp` — verification (echoes `hub.challenge`)
 - `POST /whatsapp` — incoming messages (signature verified via `X-Hub-Signature-256`)
 
-### WATI (WhatsApp Business)
-- `GET /wati` — verification (echoes `challenge`)
-- `POST /wati` — incoming messages
-
 ### Linq (iMessage/RCS/SMS)
 - `POST /linq` — incoming messages (signature verified via `X-Webhook-Signature` + `X-Webhook-Timestamp`)
 

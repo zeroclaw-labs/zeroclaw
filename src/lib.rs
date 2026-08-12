@@ -34,7 +34,7 @@
     clippy::unnecessary_wraps
 )]
 
-use clap::Subcommand;
+use clap::{Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "agent-runtime")]
@@ -213,8 +213,23 @@ Examples:
 }
 
 /// Service management subcommands
+#[derive(ValueEnum, Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ServiceLogStream {
+    Stdout,
+    Stderr,
+}
+
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ServiceCommands {
+    /// Internal launchd runner that owns bounded daemon output capture
+    #[command(hide = true)]
+    RunLaunchdDaemon,
+    /// Internal OpenRC logger that drains one daemon stream into bounded storage
+    #[command(hide = true)]
+    RunOpenrcLogWriter {
+        #[arg(value_enum)]
+        stream: ServiceLogStream,
+    },
     /// Install daemon service unit for auto-start and restart
     Install,
     /// Start daemon service
