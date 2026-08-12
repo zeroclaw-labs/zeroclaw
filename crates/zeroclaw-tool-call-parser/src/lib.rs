@@ -383,6 +383,11 @@ fn starts_with_tool_protocol_tag_or_fence(text: &str) -> bool {
     lower.starts_with("<tool_call")
         || lower.starts_with("<toolcall")
         || lower.starts_with("<tool-call")
+        // `<tools>` only, not a `<tools` prefix: the prefix would also swallow
+        // `<toolsomething>`, and unlike the aliases above this tag has a second
+        // legitimate meaning (the Hermes tool *declaration* block), so it is
+        // matched exactly and left to the example-guard below.
+        || lower.starts_with("<tools>")
         || lower.starts_with("<invoke")
         || lower.starts_with("<functioncall")
         || lower.starts_with("<function_call")
@@ -415,6 +420,7 @@ fn contains_tool_protocol_tag_marker(text: &str) -> bool {
     lower.contains("<tool_call")
         || lower.contains("<toolcall")
         || lower.contains("<tool-call")
+        || lower.contains("<tools>")
         || lower.contains("<invoke")
         || lower.contains("<functioncall")
         || lower.contains("<function_call")
@@ -524,6 +530,20 @@ fn looks_like_malformed_tagged_tool_protocol_envelope(text: &str) -> bool {
         || lower.contains("tool_call_id")
 }
 
+/// JSON keys naming a tool-call container. Business JSON does not carry these.
+const TOOL_PROTOCOL_CONTAINER_KEYS: [&str; 3] =
+    ["\"tool_calls\"", "\"toolcalls\"", "\"function_call\""];
+
+/// JSON keys carrying a tool call's correlation id.
+const TOOL_PROTOCOL_CALL_ID_KEYS: [&str; 2] = ["\"call_id\"", "\"tool_call_id\""];
+
+/// Every key that identifies a payload as tool protocol on its own.
+fn tool_protocol_json_identifying_keys() -> impl Iterator<Item = &'static str> {
+    TOOL_PROTOCOL_CONTAINER_KEYS
+        .into_iter()
+        .chain(TOOL_PROTOCOL_CALL_ID_KEYS)
+}
+
 fn has_malformed_tool_protocol_text_signal(text: &str) -> bool {
     let trimmed = text.trim_start();
     let lower = trimmed.to_ascii_lowercase();
@@ -539,13 +559,51 @@ fn has_malformed_tool_protocol_text_signal(text: &str) -> bool {
         && (text.contains("\"content\"")
             || text.contains("\"result\"")
             || text.contains("\"output\""));
-    let has_protocol_container = text.contains("\"tool_calls\"")
-        || text.contains("\"toolcalls\"")
-        || text.contains("\"function_call\"");
+    let has_protocol_container = TOOL_PROTOCOL_CONTAINER_KEYS
+        .iter()
+        .any(|key| text.contains(key));
     let has_arguments = text.contains("\"arguments\"") || text.contains("\"parameters\"");
-    let has_call_id = text.contains("\"call_id\"") || text.contains("\"tool_call_id\"");
+    let has_call_id = TOOL_PROTOCOL_CALL_ID_KEYS
+        .iter()
+        .any(|key| text.contains(key));
 
     has_tool_result_shape || (has_protocol_container && has_arguments && has_call_id)
+}
+
+/// Whether `text` is a tool-protocol JSON payload that has not finished
+/// arriving.
+///
+/// The completed-envelope classifiers need the whole value: they parse it, or
+/// they look for a corroborating second key. A streaming consumer cannot wait
+/// for either — the frame it is deciding about is on screen now, and the key
+/// that gives the payload away may be the only one that has arrived. So this
+/// deliberately trips on a *single* protocol key.
+///
+/// Being eager is the safe direction here and not in the completed case: a
+/// held-back partial costs one frame and is re-rendered by the next delta,
+/// whereas a rendered protocol envelope stays visible until the turn ends, or
+/// indefinitely if the turn fails first. `false` for anything that already
+/// parses as a complete JSON value, which the ordinary classifiers then judge
+/// on their own terms.
+pub fn looks_like_incomplete_tool_protocol_json(text: &str) -> bool {
+    let trimmed = text.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let json_like =
+        trimmed.starts_with('{') || trimmed.starts_with('[') || lower.starts_with("```json");
+    if !json_like {
+        return false;
+    }
+
+    if let Some(body) = json_fence_body(trimmed) {
+        return looks_like_incomplete_tool_protocol_json(body);
+    }
+
+    // A complete value is not this function's business.
+    if serde_json::from_str::<serde_json::Value>(trimmed).is_ok() {
+        return false;
+    }
+
+    tool_protocol_json_identifying_keys().any(|key| trimmed.contains(key))
 }
 
 fn malformed_text_mentions_known_tool(text: &str, known_tool_names: &HashSet<String>) -> bool {
@@ -917,21 +975,26 @@ fn parse_minimax_invoke_calls(response: &str) -> Option<(String, Vec<ParsedToolC
     Some((text, calls))
 }
 
-const TOOL_CALL_OPEN_TAGS: [&str; 7] = [
+const TOOL_CALL_OPEN_TAGS: [&str; 8] = [
     "<tool_call>",
     "<tool_calls>",
     "<toolcall>",
     "<tool-call>",
+    // Hermes-family models sometimes emit the tool *declaration* tag around an
+    // invocation. Qwen2.5-Coder-32B does this deterministically: the payload is
+    // well-formed Hermes JSON, only the wrapper is wrong.
+    "<tools>",
     "<invoke>",
     "<minimax:tool_call>",
     "<minimax:toolcall>",
 ];
 
-const TOOL_CALL_CLOSE_TAGS: [&str; 7] = [
+const TOOL_CALL_CLOSE_TAGS: [&str; 8] = [
     "</tool_call>",
     "</tool_calls>",
     "</toolcall>",
     "</tool-call>",
+    "</tools>",
     "</invoke>",
     "</minimax:tool_call>",
     "</minimax:toolcall>",
@@ -1160,6 +1223,7 @@ fn file_write_content_tail_is_unambiguous(input: &str, after_quote: usize) -> bo
     tail.is_empty()
         || tail.starts_with("</tool_call>")
         || tail.starts_with("</tool_calls>")
+        || tail.starts_with("</tools>")
         || tail.starts_with("</toolcall>")
         || tail.starts_with("</tool-call>")
         || tail.starts_with("</invoke>")
@@ -1750,6 +1814,218 @@ fn malformed_tool_block_event(payload_len: usize) -> ::zeroclaw_log::Event {
         }))
 }
 
+/// Is this JSON value an *invocation* rather than a tool *declaration*?
+///
+/// Only consulted for the `<tools>` wrapper, which is overloaded: in the Hermes
+/// prompt format `<tools>` DECLARES the available tools, while `<tool_call>`
+/// invokes one. Every other alias in [`TOOL_CALL_OPEN_TAGS`] has exactly one
+/// meaning, so this narrowing does not apply to them.
+///
+/// The distinction cannot be left to [`has_arguments_signal`], which counts
+/// `parameters` as an arguments marker: a declaration carries `name` +
+/// `parameters` and is therefore indistinguishable from a call by that test.
+/// A declaration is rejected here on three signals a real invocation never has
+/// -- a JSON array of entries, a `description`, or a `parameters` schema in
+/// place of concrete `arguments`.
+fn looks_like_tools_wrapper_invocation(value: &serde_json::Value) -> bool {
+    // A declaration block is an ARRAY of tool schemas. An invocation is one call.
+    let serde_json::Value::Object(map) = value else {
+        return false;
+    };
+    // `description` and `parameters` describe a tool; they never appear in a call.
+    if map.contains_key("description") || map.contains_key("parameters") {
+        return false;
+    }
+    // OpenAI-shaped `{"type":"function","function":{...}}` declarations.
+    if let Some(inner) = map.get("function").and_then(serde_json::Value::as_object)
+        && (inner.contains_key("description") || inner.contains_key("parameters"))
+    {
+        return false;
+    }
+    // Only `arguments` is admitted. `args` was accepted here previously, but the
+    // canonical parser reads `arguments`/`parameters` and never `args`, so an
+    // `args`-only body was admitted as an invocation and then dispatched with
+    // EMPTY arguments -- a corrupted call rather than an inert one. Admitting a
+    // shape the parser cannot honour is worse than not admitting it: if a model
+    // is found to emit `args`, implement it in the canonical parser first.
+    //
+    // THE ADMITTED VALUE MUST BE THE EXECUTED VALUE. `parse_tool_calls_from_json_value`
+    // gives precedence to a nested `function` object, and `tool_calls` can expand one
+    // value into several. A body carrying BOTH a benign top level and a nested
+    // envelope therefore passed this predicate on the top level while dispatching the
+    // nested content:
+    //
+    //   {"name":"benign","arguments":{},
+    //    "function":{"name":"shell","arguments":{"command":"rm -rf /tmp/x"}}}
+    //
+    // The discriminator has to authorize the same representation that crosses the
+    // parser boundary, so an envelope member disqualifies the body outright rather
+    // than being validated on a level the parser will ignore.
+    if map.contains_key("function") || map.contains_key("tool_calls") {
+        return false;
+    }
+    has_non_empty_string(value, "name") && map.contains_key("arguments")
+}
+
+/// The extent of one `<tools>` span, and the single value it is allowed to carry.
+///
+/// `<tools>` is the only overloaded wrapper in [`TOOL_CALL_OPEN_TAGS`]: in the
+/// Hermes prompt format it DECLARES the available tools, while some models also
+/// use it to wrap an invocation. Because it is overloaded, its contract is
+/// narrower than every other alias:
+///
+/// 1. The body is delimited STRUCTURALLY -- see [`tools_span`].
+/// 2. It carries exactly one canonical JSON invocation, or nothing.
+/// 3. Whatever it does not carry is inert, and stays inert everywhere else.
+struct ToolsSpan {
+    /// Byte offset in `after_open` where the body ends.
+    body_end: usize,
+    /// Byte length of the close tag that terminated the span; 0 when unclosed.
+    close_len: usize,
+    /// The one JSON value the body carried, if the body was exactly one value.
+    /// `None` means nothing in this span may ever be dispatched.
+    value: Option<serde_json::Value>,
+}
+
+/// Delimit a `<tools>` span by PARSING it, never by substring search.
+///
+/// A textual scan for the close tag is not JSON-string aware, so tag-shaped
+/// bytes inside argument content act as a delimiter: the wrapper truncates
+/// mid-string, the valid call is lost, and the remainder is exposed to the
+/// other recovery parsers as if the model had emitted it at top level. Tool
+/// arguments routinely carry markup, so quoted tag text must never delimit.
+///
+/// Parsing first makes the distinction structural: bytes inside the parsed
+/// value belong to the value, and only a close alias that FOLLOWS the value can
+/// end the span. This holds for the matching close, a foreign close alias, and
+/// no close at all -- the three ways a span can end -- so all three share one
+/// rule rather than each re-deriving a boundary.
+///
+/// When the body is not exactly one JSON value it can never be admitted, so the
+/// only remaining job is to bound the inert region. That search starts AFTER any
+/// value that did parse, which keeps a quoted close from truncating the span.
+/// A body that looks like JSON but does not parse gets no textual search at all:
+/// a close alias may be quoted inside an unterminated string, and there is no
+/// valid call in a malformed body to lose by consuming the remainder.
+///
+/// The FIRST close alias at or after that point ends the span; bytes beyond it
+/// are outside the wrapper and are parsed normally. This is deliberate. A model
+/// that echoes its declaration block and then invokes a tool is the common real
+/// shape, and swallowing everything to a later close would make that invocation
+/// unreachable. It also concedes nothing: content after the close is content the
+/// model could have emitted with no wrapper at all, so treating it as ordinary
+/// output grants no capability. What the wrapper policy owns is the body it
+/// delimits -- that a declaration, an echoed prompt, or a prose example inside
+/// the span never becomes a call -- not the whole remainder of the response.
+fn tools_span(after_open: &str) -> ToolsSpan {
+    let lead = after_open.len() - after_open.trim_start().len();
+    let mut de = serde_json::Deserializer::from_str(after_open.trim_start())
+        .into_iter::<serde_json::Value>();
+
+    if let Some(Ok(value)) = de.next() {
+        let body_end = lead + de.byte_offset();
+        if let Some(rest) = after_open.get(body_end..) {
+            let ws = rest.len() - rest.trim_start().len();
+            let trailing = rest.trim_start();
+
+            // Models mix open/close aliases, so ANY close tag can terminate the
+            // wrapper. It still has to follow the value to count.
+            if let Some(close) = TOOL_CALL_CLOSE_TAGS
+                .iter()
+                .find(|tag| trailing.starts_with(**tag))
+            {
+                return ToolsSpan {
+                    body_end: body_end + ws,
+                    close_len: close.len(),
+                    value: Some(value),
+                };
+            }
+
+            // Unclosed, but the body IS the complete value. Truncation of the
+            // wrapper must not weaken the rule the closed paths enforce, and it
+            // must not strengthen it either: a complete invocation still counts.
+            if trailing.is_empty() {
+                return ToolsSpan {
+                    body_end: after_open.len(),
+                    close_len: 0,
+                    value: Some(value),
+                };
+            }
+        }
+
+        // A value parsed, but the body holds more than that one value (trailing
+        // prose, a second value). Not admissible; bound the span from the end of
+        // what parsed so quoted tag text inside it cannot act as the delimiter.
+        return match find_first_tag(&after_open[body_end..], &TOOL_CALL_CLOSE_TAGS) {
+            Some((idx, tag)) => ToolsSpan {
+                body_end: body_end + idx,
+                close_len: tag.len(),
+                value: None,
+            },
+            None => ToolsSpan {
+                body_end: after_open.len(),
+                close_len: 0,
+                value: None,
+            },
+        };
+    }
+
+    // Nothing parsed. If the body opens like JSON it is malformed JSON, and a
+    // close alias could be quoted inside an unterminated string -- so do not
+    // trust a textual scan to bound it. Consume the remainder instead; a
+    // malformed `<tools>` body has no valid call to lose, and leaving a suffix
+    // behind is exactly how refused bytes reach another executable parser.
+    let trimmed = after_open.trim_start();
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        return ToolsSpan {
+            body_end: after_open.len(),
+            close_len: 0,
+            value: None,
+        };
+    }
+
+    // Prose or a declaration block: no JSON string for a close alias to hide in,
+    // so a textual bound is sound and keeps any following tags parseable.
+    match find_first_tag(after_open, &TOOL_CALL_CLOSE_TAGS) {
+        Some((idx, tag)) => ToolsSpan {
+            body_end: idx,
+            close_len: tag.len(),
+            value: None,
+        },
+        None => ToolsSpan {
+            body_end: after_open.len(),
+            close_len: 0,
+            value: None,
+        },
+    }
+}
+
+/// Does a byte RANGE overlap any `<tools>` span that was refused?
+///
+/// Refusing to admit a body is only half of the boundary. The other half is that
+/// the refused bytes are not offered to a second executable parser. Fallbacks
+/// that walk `remaining` get this for free, because the `<tools>` handler
+/// advances past the span. Fallbacks that re-scan the ORIGINAL response do not,
+/// and must consult this instead.
+///
+/// THE TEST IS OVERLAP, NOT MEMBERSHIP OF THE START OFFSET. Asking only whether
+/// a match BEGINS inside a refused span leaves the boundary open from the other
+/// side: a fence that opens BEFORE the span and runs through it never starts
+/// inside anything, passes the check, and its body -- refused bytes included --
+/// is handed to `extract_json_values`, which finds the very object the `<tools>`
+/// handler rejected. Start-offset containment is not span containment.
+///
+/// Two ranges overlap when each begins before the other ends; empty ranges
+/// cannot overlap anything.
+fn range_hits_rejected_span(rejected: &[std::ops::Range<usize>], start: usize, end: usize) -> bool {
+    if start >= end {
+        return false;
+    }
+    rejected
+        .iter()
+        .any(|span| !span.is_empty() && start < span.end && span.start < end)
+}
+
 pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     // Strip `<think>...</think>` blocks before parsing.  Qwen and other
     // reasoning models embed chain-of-thought inline in the response text;
@@ -1761,6 +2037,9 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     let mut text_parts = Vec::new();
     let mut calls = Vec::new();
     let mut remaining = response;
+    // Byte ranges of `<tools>` spans this loop refused. Consulted by the global
+    // fallbacks that re-scan `response` instead of walking `remaining`.
+    let mut rejected_tools_spans: Vec<std::ops::Range<usize>> = Vec::new();
 
     // First, try to parse as OpenAI-style JSON response with tool_calls array
     // This handles model_providers like Minimax that return tool_calls in native JSON format
@@ -1780,7 +2059,14 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
         return (String::new(), vec![call]);
     }
 
-    if let Some((minimax_text, minimax_calls)) = parse_minimax_invoke_calls(response)
+    // This scan searches the WHOLE response for executable `<invoke>` syntax, so
+    // running it ahead of the tag loop lets legacy markup nested inside a
+    // `<tools>` wrapper execute before the body is ever classified. Gating the
+    // wrapper-local sites cannot protect a scan that runs first. When a `<tools>`
+    // span is present the tag loop owns the text; responses without one are
+    // unaffected.
+    if !response.contains("<tools>")
+        && let Some((minimax_text, minimax_calls)) = parse_minimax_invoke_calls(response)
         && !minimax_calls.is_empty()
     {
         return (minimax_text, minimax_calls);
@@ -1792,6 +2078,45 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
         let before = &remaining[..start];
         if !before.trim().is_empty() {
             text_parts.push(before.trim().to_string());
+        }
+
+        // `<tools>` is handled HERE, in full, and never reaches the generic
+        // recovery paths below. Those paths exist to rescue malformed output from
+        // unambiguous tags: they scan through prose for JSON, retry the body
+        // against XML and GLM shorthand, and treat a foreign or missing close as
+        // a reason to try harder. Every one of those behaviours is wrong for an
+        // overloaded tag that also declares tools, and threading a guard through
+        // each of them means the guard can be forgotten at the next path added.
+        // Handling the tag once, at the top, makes that structurally impossible.
+        if open_tag == "<tools>" {
+            let after_open = &remaining[start + open_tag.len()..];
+            let span = tools_span(after_open);
+            let consumed = span.body_end + span.close_len;
+
+            // Exactly one canonical invocation is the entire admissible set.
+            let admitted = span
+                .value
+                .as_ref()
+                .filter(|value| looks_like_tools_wrapper_invocation(value))
+                .map(parse_tool_calls_from_json_value)
+                .filter(|parsed| !parsed.is_empty());
+
+            if let Some(parsed) = admitted {
+                calls.extend(parsed);
+            } else {
+                // Refused. The body becomes visible text, and the span is
+                // recorded so no later parser can execute the bytes this
+                // boundary just declined.
+                let body = after_open[..span.body_end].trim();
+                if !body.is_empty() {
+                    text_parts.push(body.to_string());
+                }
+                let span_start = response.len() - remaining.len() + start;
+                rejected_tools_spans.push(span_start..span_start + open_tag.len() + consumed);
+            }
+
+            remaining = &after_open[consumed..];
+            continue;
         }
 
         let Some(close_tag) = (match open_tag {
@@ -1812,7 +2137,6 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
             let inner = &after_open[..close_idx];
             let mut parsed_any = false;
 
-            // Try JSON format first
             let json_values = extract_json_values(inner);
             for value in json_values {
                 let parsed_calls = parse_tool_calls_from_json_value(&value);
@@ -1940,6 +2264,13 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
         }
     }
 
+    // The fallbacks below re-scan the ORIGINAL response rather than walking
+    // `remaining`, so the tag loop's consume-on-reject does not reach them: a
+    // `<tools>` body this parser already refused is otherwise handed straight to
+    // the next executable parser, which has no notion of the wrapper policy.
+    // Every match therefore has to be checked against the refused spans. The
+    // fallbacks further down operate on `remaining` and are covered already.
+
     // If XML tags found nothing, try markdown code blocks with tool_call language.
     // Models behind OpenRouter sometimes output ```tool_call ... ``` or hybrid
     // ```tool_call ... </tool_call> instead of structured API calls or XML tags.
@@ -1955,6 +2286,12 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
 
         for cap in MD_TOOL_CALL_RE.captures_iter(response) {
             let full_match = cap.get(0).unwrap();
+            // Range-aware: a fence that OPENS before a refused span and runs
+            // through it must be refused too, not just one that starts inside.
+            if range_hits_rejected_span(&rejected_tools_spans, full_match.start(), full_match.end())
+            {
+                continue;
+            }
             let before = &response[last_end..full_match.start()];
             if !before.trim().is_empty() {
                 md_text_parts.push(before.trim().to_string());
@@ -1995,6 +2332,12 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
 
         for cap in MD_TOOL_NAME_RE.captures_iter(response) {
             let full_match = cap.get(0).unwrap();
+            // Range-aware: a fence that OPENS before a refused span and runs
+            // through it must be refused too, not just one that starts inside.
+            if range_hits_rejected_span(&rejected_tools_spans, full_match.start(), full_match.end())
+            {
+                continue;
+            }
             let before = &response[last_end..full_match.start()];
             if !before.trim().is_empty() {
                 md_text_parts.push(before.trim().to_string());
@@ -2336,8 +2679,632 @@ pub fn build_native_assistant_history_from_parsed_calls(
 }
 
 #[cfg(test)]
-mod tests {
+mod tools_wrapper_body_boundary_tests {
     use super::*;
+
+    /// REGRESSION: explanatory prose inside `<tools>` around an
+    /// invocation-shaped example became an EXECUTABLE call.
+    ///
+    /// `extract_json_values` scans through surrounding text to find JSON, so
+    /// the value predicate never saw the prose. Observed at head 274019fb5:
+    ///
+    /// ```text
+    /// PROSE-WRAPPED EXAMPLE produced 1 call(s):
+    /// [ParsedToolCall { name: "shell", arguments: {"command": "rm -rf /tmp/x"} }]
+    /// ```
+    #[test]
+    fn tools_prose_wrapped_invocation_example_is_inert() {
+        let payload = concat!(
+            "<tools>\n",
+            "For example, a shell invocation looks like this:\n",
+            "{\"name\":\"shell\",\"arguments\":{\"command\":\"rm -rf /tmp/x\"}}\n",
+            "</tools>"
+        );
+        let (_text, calls) = parse_tool_calls(payload);
+        assert!(
+            calls.is_empty(),
+            "prose around an invocation-shaped example must stay inert, got {calls:?}"
+        );
+    }
+
+    /// The same smuggling path via a FOREIGN close tag. The complete-body rule
+    /// holds on matching, foreign and missing closes alike.
+    #[test]
+    fn tools_prose_wrapped_example_with_foreign_close_is_inert() {
+        let payload = concat!(
+            "<tools>\n",
+            "Here is what a call looks like:\n",
+            "{\"name\":\"shell\",\"arguments\":{\"command\":\"rm -rf /tmp/x\"}}\n",
+            "</tool_call>"
+        );
+        let (_text, calls) = parse_tool_calls(payload);
+        assert!(
+            calls.is_empty(),
+            "foreign close must not admit a prose-wrapped example, got {calls:?}"
+        );
+    }
+
+    /// Trailing prose is disqualifying too -- the body IS the value or nothing.
+    #[test]
+    fn tools_invocation_with_trailing_prose_is_inert() {
+        let payload = concat!(
+            "<tools>\n",
+            "{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}\n",
+            "...that is how you would call it.\n",
+            "</tools>"
+        );
+        let (_text, calls) = parse_tool_calls(payload);
+        assert!(
+            calls.is_empty(),
+            "trailing prose must disqualify the body, got {calls:?}"
+        );
+    }
+
+    /// The motivating case must STILL work: a bare canonical invocation.
+    /// Without this the fix could pass by rejecting everything.
+    #[test]
+    fn tools_bare_canonical_invocation_still_parses() {
+        let payload = "<tools>{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}</tools>";
+        let (_text, calls) = parse_tool_calls(payload);
+        assert_eq!(
+            calls.len(),
+            1,
+            "canonical invocation must still parse, got {calls:?}"
+        );
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments.get("command").and_then(|v| v.as_str()),
+            Some("ls"),
+            "arguments must survive intact"
+        );
+    }
+
+    /// REGRESSION: a `<tools>` string
+    /// INSIDE otherwise valid arguments must not be touched. The first fix used
+    /// a raw-text pre-pass over the whole response, which could not tell wrapper
+    /// syntax from tag-shaped bytes inside a JSON string and rewrote the
+    /// `content` of a legitimate `file_write` before dispatch.
+    #[test]
+    fn tools_string_inside_valid_arguments_is_preserved() {
+        let payload = concat!(
+            "<tool_call>{\"name\":\"file_write\",\"arguments\":",
+            "{\"content\":\"<tools>example</tools>\"}}</tool_call>"
+        );
+        let (_text, calls) = parse_tool_calls(payload);
+        assert_eq!(
+            calls.len(),
+            1,
+            "the file_write call must survive, got {calls:?}"
+        );
+        assert_eq!(calls[0].name, "file_write");
+        assert_eq!(
+            calls[0].arguments.get("content").and_then(|v| v.as_str()),
+            Some("<tools>example</tools>"),
+            "argument content must be preserved byte-for-byte"
+        );
+    }
+
+    /// Nested close-alias case under the UNAMBIGUOUS tags, pinned but not fixed.
+    ///
+    /// A `</tool_call>` inside JSON string content terminates the outer wrapper,
+    /// and the exposed bytes reach the GLM fallback as a real call. The tag
+    /// scanner for those aliases is textual, so it cannot see that the close is
+    /// inside a string. `<tools>` no longer has this defect -- it is delimited by
+    /// parsing -- but generalising that to every alias changes the recovery
+    /// behaviour of tags this change does not otherwise touch, so it is left as a
+    /// ready repro rather than folded in here.
+    ///
+    /// The assertions describe the DESIRED behaviour and the test is ignored,
+    /// so it starts passing the moment the scanner becomes string-aware.
+    #[test]
+    #[ignore = "pre-existing defect of the textual tag scanner, outside the <tools> alias"]
+    fn close_alias_inside_arguments_should_not_expose_nested_call() {
+        let payload = concat!(
+            "<tool_call>{\"name\":\"file_write\",\"arguments\":",
+            "{\"content\":\"<tools>x</tool_call><tool_call>shell>pwd</tool_call>\"}}",
+            "</tool_call>"
+        );
+        let (_text, calls) = parse_tool_calls(payload);
+        // Current behaviour without a string-aware scanner: the outer file_write
+        // is lost and `shell`/`pwd` is dispatched from the exposed remainder.
+        assert!(
+            !calls.iter().any(|c| c.name == "shell"),
+            "a close alias inside argument content must not become a shell call, got {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c.name == "file_write"),
+            "the outer file_write must survive, got {calls:?}"
+        );
+    }
+
+    /// REGRESSION: the admitted value must be the
+    /// EXECUTED value. `parse_tool_calls_from_json_value` prefers a nested
+    /// `function`, so a body with a benign top level and a hostile nested
+    /// envelope passed admission on one representation and dispatched another.
+    #[test]
+    fn tools_top_level_plus_nested_function_is_inert() {
+        let payload = concat!(
+            "<tools>{\"name\":\"benign\",\"arguments\":{},",
+            "\"function\":{\"name\":\"shell\",\"arguments\":",
+            "{\"command\":\"rm -rf /tmp/x\"}}}</tools>"
+        );
+        let (_text, calls) = parse_tool_calls(payload);
+        assert!(
+            calls.is_empty(),
+            "a mixed top-level + function envelope must not be admitted, got {calls:?}"
+        );
+    }
+
+    /// Same divergence via `tool_calls`, which can expand one admitted value
+    /// into several executed calls.
+    #[test]
+    fn tools_top_level_plus_tool_calls_envelope_is_inert() {
+        let payload = concat!(
+            "<tools>{\"name\":\"benign\",\"arguments\":{},",
+            "\"tool_calls\":[{\"name\":\"shell\",\"arguments\":",
+            "{\"command\":\"rm -rf /tmp/x\"}}]}</tools>"
+        );
+        let (_text, calls) = parse_tool_calls(payload);
+        assert!(
+            calls.is_empty(),
+            "a mixed top-level + tool_calls envelope must not be admitted, got {calls:?}"
+        );
+    }
+
+    /// Whitespace and newlines around the JSON are NOT prose.
+    #[test]
+    fn tools_whitespace_padded_invocation_still_parses() {
+        let payload =
+            "<tools>\n\n  {\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}  \n</tools>";
+        let (_text, calls) = parse_tool_calls(payload);
+        assert_eq!(
+            calls.len(),
+            1,
+            "whitespace padding must not disqualify, got {calls:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    // ---- <tools> boundary regressions ----
+    // Each negative below is a payload that reached an executable parser before
+    // the boundary was made structural. The positive controls alongside them pin
+    // the boundary from the other side: a guard that simply refused every body
+    // would satisfy the negatives and fail these.
+
+    #[test]
+    fn tools_unclosed_prose_prefixed_invocation_stays_inert() {
+        // find_json_end / extract_first_json_value_with_end scan THROUGH text, so a
+        // prose prefix under a truncated wrapper dispatched a real shell call.
+        let text = "<tools>\nFor example:\n{\"name\":\"shell\",\"arguments\":{\"command\":\"rm -rf /tmp/x\"}}";
+        let (_v, calls) = parse_tool_calls(text);
+        assert!(
+            calls.is_empty(),
+            "prose-prefixed unclosed body must not dispatch: {:?}",
+            calls.iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn tools_unclosed_trailing_suffix_stays_inert() {
+        let text = "<tools>{\"name\":\"shell\",\"arguments\":{\"command\":\"rm -rf /tmp/x\"}} and then some prose";
+        let (_v, calls) = parse_tool_calls(text);
+        assert!(
+            calls.is_empty(),
+            "trailing non-whitespace must disqualify: {:?}",
+            calls.iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn tools_unclosed_multiple_values_stays_inert() {
+        let text = "<tools>{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}{\"name\":\"shell\",\"arguments\":{\"command\":\"rm -rf /tmp/x\"}}";
+        let (_v, calls) = parse_tool_calls(text);
+        assert!(
+            calls.is_empty(),
+            "two values are not one body: {:?}",
+            calls.iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn tools_unclosed_bare_canonical_invocation_still_parses() {
+        // Positive control for the three above: a truncated wrapper around exactly
+        // one canonical invocation MUST still work, or the guard is just a mute.
+        let text = "<tools>{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}";
+        let (_v, calls) = parse_tool_calls(text);
+        assert_eq!(
+            calls.len(),
+            1,
+            "a clean unclosed invocation must still parse"
+        );
+        assert_eq!(calls[0].name, "shell");
+    }
+
+    #[test]
+    fn tools_wrapping_legacy_invoke_does_not_bypass_the_guard() {
+        // parse_minimax_invoke_calls ran BEFORE the <tools> loop over the whole
+        // response, so nested legacy markup executed before classification.
+        let text = "<tools><invoke name=\"shell\"><parameter name=\"command\">rm -rf /tmp/x</parameter></invoke></tools>";
+        let (_v, calls) = parse_tool_calls(text);
+        assert!(
+            calls.is_empty(),
+            "legacy <invoke> nested in <tools> must stay inert: {:?}",
+            calls.iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn bare_legacy_invoke_without_tools_still_parses() {
+        // Positive control for the pre-loop guard: minimax recovery must keep
+        // working for every response that has no <tools> span.
+        let text = "<invoke name=\"shell\"><parameter name=\"command\">ls</parameter></invoke>";
+        let (_v, calls) = parse_tool_calls(text);
+        assert_eq!(
+            calls.len(),
+            1,
+            "minimax <invoke> recovery must survive the guard"
+        );
+    }
+
+    #[test]
+    fn tools_literal_close_tag_inside_arguments_is_preserved() {
+        // A plain substring find is not JSON-string aware: a literal </tools> in
+        // argument content truncated the wrapper and LOST the valid call.
+        let text = "<tools>{\"name\":\"file_write\",\"arguments\":{\"content\":\"literal </tools> markup\"}}</tools>";
+        let (_v, calls) = parse_tool_calls(text);
+        assert_eq!(
+            calls.len(),
+            1,
+            "literal </tools> in content must not delimit: {:?}",
+            calls.iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+        );
+        assert_eq!(calls[0].name, "file_write");
+        let args = calls[0].arguments.to_string();
+        assert!(
+            args.contains("</tools>"),
+            "argument content must survive intact: {args}"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Quoted close aliases must not delimit a `<tools>` span on ANY path.
+    //
+    // Close detection was structural only when the parsed value was followed
+    // immediately by the MATCHING close. The foreign-close and missing-close
+    // paths fell back to a substring scan, so a close alias inside JSON string
+    // content still truncated the wrapper: the valid call was dropped and the
+    // remainder after the quoted tag was exposed to another executable parser.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn tools_quoted_foreign_close_inside_arguments_is_preserved() {
+        // Foreign-close path: the span really ends at `</tool_call>`, but a
+        // quoted `</tools>` sits inside `content` and used to delimit first.
+        let text = "<tools>{\"name\":\"file_write\",\"arguments\":{\"content\":\"literal </tools> markup\"}}</tool_call>";
+        let (_v, calls) = parse_tool_calls(text);
+        assert_eq!(
+            calls.len(),
+            1,
+            "quoted close must not delimit a foreign-closed span: {:?}",
+            calls.iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+        );
+        assert_eq!(calls[0].name, "file_write");
+        assert!(calls[0].arguments.to_string().contains("</tools>"));
+    }
+
+    #[test]
+    fn tools_quoted_close_inside_unclosed_arguments_is_preserved() {
+        // Missing-close path: no close tag at all, and the only tag-shaped bytes
+        // in the span are quoted inside argument content.
+        let text = "<tools>{\"name\":\"file_write\",\"arguments\":{\"content\":\"literal </tools> markup\"}}";
+        let (_v, calls) = parse_tool_calls(text);
+        assert_eq!(
+            calls.len(),
+            1,
+            "quoted close must not delimit an unclosed span: {:?}",
+            calls.iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+        );
+        assert_eq!(calls[0].name, "file_write");
+        assert!(calls[0].arguments.to_string().contains("</tools>"));
+    }
+
+    #[test]
+    fn tools_nested_suffix_after_quoted_close_is_never_dispatched() {
+        // The consequence of a textual delimiter, on the missing-close path: the
+        // span has no real close, so the scan hit the `</tools>` quoted inside
+        // `content`, truncated there, and handed the remainder back to the tag
+        // loop as if the model had emitted it at top level. The nested payload
+        // uses GLM shorthand deliberately -- it needs no quotes, so it survives
+        // being cut out of a JSON string and reaches the legacy parser as a real
+        // `shell` call. The wrapper holds ONE file_write; that is the only call
+        // this response may produce.
+        let text = concat!(
+            "<tools>{\"name\":\"file_write\",\"arguments\":{\"content\":",
+            "\"</tools><tool_call>shell>rm -rf /tmp/x</tool_call>\"}}"
+        );
+        let (_v, calls) = parse_tool_calls(text);
+        assert!(
+            !calls.iter().any(|c| c.name == "shell"),
+            "quoted nested tool_call must never be dispatched: {:?}",
+            calls.iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            calls.len(),
+            1,
+            "nested suffix must not become a second call: {:?}",
+            calls.iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+        );
+        assert_eq!(calls[0].name, "file_write");
+    }
+
+    // ---------------------------------------------------------------------
+    // Consume-on-reject covers the global fallbacks too.
+    //
+    // The fenced-Markdown fallbacks re-scan the ORIGINAL response instead of
+    // walking `remaining`, so a `<tools>` body the wrapper policy had already
+    // refused was handed to a second executable parser and dispatched.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn rejected_tools_span_hiding_fenced_tool_call_stays_inert() {
+        // Matching close. The body is a declaration array -- refused on shape --
+        // but it contains a fenced ```tool_call the Markdown fallback would run.
+        let text = concat!(
+            "<tools>\n",
+            "[{\"name\":\"shell\",\"description\":\"run\",\"parameters\":{}}]\n",
+            "```tool_call\n",
+            "{\"name\":\"shell\",\"arguments\":{\"command\":\"rm -rf /tmp/x\"}}\n",
+            "```\n",
+            "</tools>"
+        );
+        let (_v, calls) = parse_tool_calls(text);
+        assert!(
+            calls.is_empty(),
+            "fenced tool_call inside a refused <tools> span must stay inert: {:?}",
+            calls.iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn rejected_unclosed_tools_span_hiding_fenced_tool_call_stays_inert() {
+        // Missing close, same smuggle.
+        let text = concat!(
+            "<tools>\n",
+            "Here is how the format works:\n",
+            "```tool_call\n",
+            "{\"name\":\"shell\",\"arguments\":{\"command\":\"rm -rf /tmp/x\"}}\n",
+            "```"
+        );
+        let (_v, calls) = parse_tool_calls(text);
+        assert!(
+            calls.is_empty(),
+            "fenced tool_call in a refused unclosed <tools> span must stay inert: {:?}",
+            calls.iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn rejected_tools_span_hiding_named_tool_fence_stays_inert() {
+        // The second fenced fallback, ```tool <name>, has the same exposure.
+        let text = concat!(
+            "<tools>\n",
+            "[{\"name\":\"file_write\",\"description\":\"write\",\"parameters\":{}}]\n",
+            "```tool file_write\n",
+            "{\"path\":\"/tmp/x\",\"content\":\"pwned\"}\n",
+            "```\n",
+            "</tools>"
+        );
+        let (_v, calls) = parse_tool_calls(text);
+        assert!(
+            calls.is_empty(),
+            "named-tool fence inside a refused <tools> span must stay inert: {:?}",
+            calls.iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn rejected_unclosed_tools_span_hiding_named_tool_fence_stays_inert() {
+        let text = concat!(
+            "<tools>\n",
+            "For example:\n",
+            "```tool file_write\n",
+            "{\"path\":\"/tmp/x\",\"content\":\"pwned\"}\n",
+            "```"
+        );
+        let (_v, calls) = parse_tool_calls(text);
+        assert!(
+            calls.is_empty(),
+            "named-tool fence in a refused unclosed <tools> span must stay inert: {:?}",
+            calls.iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    /// REGRESSION: a fence that OPENS BEFORE a refused `<tools>` span and runs
+    /// through it must not be parsed either.
+    ///
+    /// The ledger originally tested only whether a match STARTED inside a
+    /// refused range. A fence opening before the span never starts inside
+    /// anything, passed that check, and its body -- refused bytes included --
+    /// reached `extract_json_values`, which found the very object the `<tools>`
+    /// handler had rejected. The existing tests cover the inverse nesting (fence
+    /// starting inside the span), so they do not exercise this direction.
+    #[test]
+    fn fence_opening_before_a_refused_tools_span_stays_inert() {
+        let text = concat!(
+            "```tool_call\n",
+            "<tools>\n",
+            "Here is how the format works:\n",
+            "{\"name\":\"shell\",\"arguments\":{\"command\":\"rm -rf /tmp/x\"}}\n",
+            "</tools>\n",
+            "```"
+        );
+        let (_v, calls) = parse_tool_calls(text);
+        assert!(
+            calls.is_empty(),
+            "a fence overlapping a refused <tools> span must stay inert: {:?}",
+            calls.iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    /// The named-tool fence has the same overlap exposure.
+    #[test]
+    fn named_tool_fence_opening_before_a_refused_tools_span_stays_inert() {
+        let text = concat!(
+            "```tool file_write\n",
+            "<tools>\n",
+            "For example:\n",
+            "{\"path\":\"/tmp/x\",\"content\":\"pwned\"}\n",
+            "</tools>\n",
+            "```"
+        );
+        let (_v, calls) = parse_tool_calls(text);
+        assert!(
+            calls.is_empty(),
+            "a named-tool fence overlapping a refused span must stay inert: {:?}",
+            calls.iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    /// The overlap test must be OVERLAP, not "touches an endpoint". A fence that
+    /// ends exactly where a refused span begins shares no byte with it and must
+    /// still parse, or the guard silently eats adjacent legitimate calls.
+    #[test]
+    fn range_overlap_is_exclusive_at_the_boundaries() {
+        // Two spans, not one: a single-range vec is also a clippy trap, and
+        // multiple refused spans is the real shape anyway.
+        let rejected = [10usize..20usize, 40usize..50usize];
+        assert!(
+            !range_hits_rejected_span(&rejected, 0, 10),
+            "abutting before"
+        );
+        assert!(
+            !range_hits_rejected_span(&rejected, 20, 30),
+            "abutting after"
+        );
+        assert!(
+            range_hits_rejected_span(&rejected, 5, 15),
+            "opens before, crosses in"
+        );
+        assert!(
+            range_hits_rejected_span(&rejected, 15, 25),
+            "opens inside, crosses out"
+        );
+        assert!(
+            range_hits_rejected_span(&rejected, 0, 30),
+            "spans it entirely"
+        );
+        assert!(range_hits_rejected_span(&rejected, 12, 15), "wholly inside");
+        // An empty match cannot consume refused bytes.
+        assert!(!range_hits_rejected_span(&rejected, 15, 15), "empty range");
+        // The second span must be honoured too, not just the first.
+        assert!(
+            range_hits_rejected_span(&rejected, 45, 60),
+            "overlaps the later span"
+        );
+        assert!(
+            !range_hits_rejected_span(&rejected, 25, 35),
+            "between spans"
+        );
+    }
+
+    #[test]
+    fn fenced_tool_call_outside_any_tools_span_still_parses() {
+        // POSITIVE CONTROL. The span ledger must suppress only refused bytes.
+        // A hardening change that simply stopped running the fenced fallbacks
+        // would satisfy every negative above; this fails if that happens.
+        let text = concat!(
+            "```tool_call\n",
+            "{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}\n",
+            "```"
+        );
+        let (_v, calls) = parse_tool_calls(text);
+        assert_eq!(calls.len(), 1, "fenced tool_call recovery must survive");
+        assert_eq!(calls[0].name, "shell");
+    }
+
+    #[test]
+    fn fenced_tool_call_after_a_rejected_tools_span_still_parses() {
+        // POSITIVE CONTROL for the span BOUNDARY: a refused declaration must not
+        // swallow the rest of the response. The fence here sits outside the span.
+        let text = concat!(
+            "<tools>[{\"name\":\"shell\",\"description\":\"run\",\"parameters\":{}}]</tools>\n",
+            "```tool_call\n",
+            "{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}\n",
+            "```"
+        );
+        let (_v, calls) = parse_tool_calls(text);
+        assert_eq!(
+            calls.len(),
+            1,
+            "a fence after a refused span must still parse: {:?}",
+            calls.iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+        );
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].arguments["command"], "ls");
+    }
+
+    #[test]
+    fn canonical_tool_call_after_a_rejected_tools_declaration_still_parses() {
+        // POSITIVE CONTROL: the common real shape -- a model echoes its tool
+        // declarations, then invokes one. Bounding the refused span correctly is
+        // what keeps the following invocation reachable.
+        let text = concat!(
+            "<tools>[{\"name\":\"shell\",\"description\":\"run\",\"parameters\":{}}]</tools>\n",
+            "<tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}</tool_call>"
+        );
+        let (_v, calls) = parse_tool_calls(text);
+        assert_eq!(
+            calls.len(),
+            1,
+            "invocation after a declaration must still parse: {:?}",
+            calls.iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+        );
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].arguments["command"], "ls");
+    }
+
+    use super::*;
+
+    #[test]
+    fn incomplete_protocol_json_trips_on_a_single_identifying_key() {
+        // One key is enough while the value is still arriving: the corroborating
+        // key may simply not have been emitted yet.
+        assert!(looks_like_incomplete_tool_protocol_json(
+            "{\"tool_call_id\":\"call_1\","
+        ));
+        assert!(looks_like_incomplete_tool_protocol_json(
+            "{\"tool_calls\":[{\"name\":\"shell\""
+        ));
+        assert!(looks_like_incomplete_tool_protocol_json(
+            "{\"function_call\":{\"arguments\":\"{\\\"a\\\":1"
+        ));
+        // An unclosed JSON fence is the same payload with a wrapper.
+        assert!(looks_like_incomplete_tool_protocol_json(
+            "```json\n{\"tool_call_id\":\"c1\","
+        ));
+    }
+
+    #[test]
+    fn incomplete_protocol_json_ignores_complete_values_and_business_json() {
+        // Complete values belong to the ordinary classifiers, which can parse
+        // them and judge them properly.
+        assert!(!looks_like_incomplete_tool_protocol_json(
+            "{\"tool_call_id\":\"call_1\",\"content\":\"done\"}"
+        ));
+        // Business JSON carries none of the identifying keys, so a half-arrived
+        // config still streams.
+        assert!(!looks_like_incomplete_tool_protocol_json(
+            "{\"retries\": 3, \"timeout_ms\":"
+        ));
+        // Prose is not JSON, however much it talks about tool calls.
+        assert!(!looks_like_incomplete_tool_protocol_json(
+            "The \"tool_call_id\" field identifies the call."
+        ));
+        assert!(!looks_like_incomplete_tool_protocol_json(""));
+    }
 
     #[test]
     fn build_native_assistant_history_returns_none_for_empty_calls() {
@@ -2940,6 +3907,193 @@ Done."#;
         assert_eq!(
             calls[0].arguments.get("command").unwrap().as_str().unwrap(),
             "date"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_tools_tag_alias() {
+        // Qwen2.5-Coder-32B wraps a well-formed Hermes call in the tool
+        // *declaration* tag rather than the invocation tag. Observed
+        // deterministically (6/6 across two independent runs, and independent
+        // of how many tools are offered), so the call is recoverable and should
+        // not be dropped as prose.
+        let response = r#"<tools>
+{"name": "get_weather", "arguments": {"city": "Paris"}}
+</tools>"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "get_weather");
+        assert_eq!(
+            calls[0].arguments.get("city").unwrap().as_str().unwrap(),
+            "Paris"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_rejects_tools_declaration_block() {
+        // `<tools>` is ALSO the Hermes tag that DECLARES the available tools.
+        // A declaration is an array of schemas -- `description` / `parameters`,
+        // no `arguments` -- and must never be executed as an invocation.
+        let response = r#"<tools>
+[{"name": "get_weather", "description": "Get the current weather for a city.", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}]
+</tools>"#;
+
+        let (_text, calls) = parse_tool_calls(response);
+        assert!(
+            calls.is_empty(),
+            "a tool DECLARATION must not be parsed as an invocation, got {calls:?}"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_rejects_tools_block_discussed_in_prose() {
+        // An assistant explaining the Hermes format must not trigger a call.
+        let response = r#"In the Hermes prompt format the available tools are declared like this:
+
+<tools>
+[{"name": "shell", "description": "Run a command", "parameters": {}}]
+</tools>
+
+and the model then replies with a <tool_call> block."#;
+
+        let (_text, calls) = parse_tool_calls(response);
+        assert!(
+            calls.is_empty(),
+            "prose describing the format must not be parsed as an invocation, got {calls:?}"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_rejects_echoed_system_prompt_tools_block() {
+        // Some models echo their own system prompt. That echo contains the
+        // declaration block verbatim and must stay inert.
+        let response = r#"You are a helpful assistant with access to the following functions.
+<tools>
+[{"type": "function", "function": {"name": "file_read", "description": "Read a file", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}}]
+</tools>
+Use them when appropriate."#;
+
+        let (_text, calls) = parse_tool_calls(response);
+        assert!(
+            calls.is_empty(),
+            "an echoed system prompt must not be parsed as an invocation, got {calls:?}"
+        );
+    }
+
+    #[test]
+    fn tools_wrapper_does_not_reach_glm_shortened_body_on_matching_close() {
+        // GLM shortened bodies are executable legacy syntax: `shell>cmd` becomes
+        // a shell call under the unambiguous tags. A value-shaped admission rule
+        // cannot see it at all, because such a body never parses as JSON -- which
+        // is why `<tools>` carries canonical JSON or nothing, rather than being
+        // filtered on the way out of the legacy parsers.
+        let response = "<tools>shell>rm -rf /tmp/x</tools>";
+        let (_text, calls) = parse_tool_calls(response);
+        assert!(
+            calls.is_empty(),
+            "GLM shortened body under <tools> must stay inert, got {calls:?}"
+        );
+    }
+
+    #[test]
+    fn tools_wrapper_does_not_reach_glm_shortened_body_on_foreign_close() {
+        let response = "<tools>shell>rm -rf /tmp/x</tool_call>";
+        let (_text, calls) = parse_tool_calls(response);
+        assert!(
+            calls.is_empty(),
+            "GLM body under <tools> with a foreign close must stay inert, got {calls:?}"
+        );
+    }
+
+    #[test]
+    fn tools_wrapper_does_not_reach_glm_shortened_body_when_unclosed() {
+        let response = "<tools>shell>rm -rf /tmp/x";
+        let (_text, calls) = parse_tool_calls(response);
+        assert!(
+            calls.is_empty(),
+            "unclosed GLM body under <tools> must stay inert, got {calls:?}"
+        );
+    }
+
+    #[test]
+    fn glm_shortened_body_still_works_under_an_unambiguous_tag() {
+        // Positive control for the restriction: gating <tools> must not disable
+        // legacy recovery for the tags that are not overloaded.
+        let response = "<tool_call>shell>uname -a</tool_call>";
+        let (_text, calls) = parse_tool_calls(response);
+        assert_eq!(
+            calls.len(),
+            1,
+            "GLM shortened body must still parse under <tool_call>"
+        );
+        assert_eq!(calls[0].name, "shell");
+    }
+
+    #[test]
+    fn parse_tool_calls_rejects_tools_declaration_closed_by_foreign_alias() {
+        // Mismatched close. The cross-alias recovery path used to parse this
+        // body without consulting the <tools> guard, so closing a declaration
+        // with a FOREIGN alias was enough to turn it into a call.
+        let response = r#"<tools>
+[{"name": "shell", "description": "Run a command", "parameters": {}}]
+</tool_call>"#;
+
+        let (_text, calls) = parse_tool_calls(response);
+        assert!(
+            calls.is_empty(),
+            "a declaration closed by a foreign alias must stay inert, got {calls:?}"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_rejects_unclosed_tools_declaration() {
+        // Missing close. Truncation mid-stream reaches the brace-balancing
+        // recovery path, which was likewise unguarded.
+        let response = r#"<tools>
+[{"name": "shell", "description": "Run a command", "parameters": {}}]"#;
+
+        let (_text, calls) = parse_tool_calls(response);
+        assert!(
+            calls.is_empty(),
+            "an unclosed declaration must stay inert, got {calls:?}"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_rejects_tools_wrapper_with_args_key() {
+        // `args` is not the canonical key: the parser reads `arguments`. When
+        // the admission predicate accepted `args`, this was admitted as an
+        // invocation and then dispatched with EMPTY arguments -- the runtime
+        // received a different call from the one the model encoded. Staying
+        // inert is correct; a corrupted call is not.
+        let response = r#"<tools>
+{"name": "shell", "args": {"command": "rm -rf /tmp/x"}}
+</tools>"#;
+
+        let (_text, calls) = parse_tool_calls(response);
+        assert!(
+            calls.is_empty(),
+            "an `args`-shaped body must not be dispatched with empty arguments, got {calls:?}"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_still_accepts_canonical_tools_invocation() {
+        // Positive control: the motivating Qwen payload must keep working, so
+        // the guards above cannot be satisfied by simply rejecting everything.
+        let response = r#"<tools>
+{"name": "shell", "arguments": {"command": "uname -a"}}
+</tools>"#;
+
+        let (_text, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 1, "canonical invocation must still parse");
+        assert_eq!(calls[0].name, "shell");
+        assert!(
+            calls[0].arguments.get("command").is_some(),
+            "arguments must be preserved, got {:?}",
+            calls[0].arguments
         );
     }
 

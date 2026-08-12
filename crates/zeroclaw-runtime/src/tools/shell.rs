@@ -283,7 +283,11 @@ impl Tool for ShellTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        match self.security.validate_command_execution(command, approved) {
+        match self.security.validate_command_execution_for_shell(
+            command,
+            approved,
+            self.runtime.shell_dialect(),
+        ) {
             Ok(_) => {}
             Err(reason) => {
                 return Ok(ToolResult {
@@ -292,6 +296,21 @@ impl Tool for ShellTool {
                     error: Some(reason),
                 });
             }
+        }
+
+        // Own the workspace-resolving forbidden-path scan here, dialect-aware,
+        // rather than relying on an outer generic path guard that defaults to
+        // POSIX. This keeps symlink-escape hardening while allowing cmd.exe's
+        // null device only on the native Windows execution path.
+        if let Some(path) = self
+            .security
+            .forbidden_workspace_path_argument_for_shell(command, self.runtime.shell_dialect())
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!("Path blocked by security policy: {path}")),
+            });
         }
 
         // Execute with timeout to prevent hanging commands.
@@ -584,7 +603,7 @@ mod tests {
     use crate::platform::{DockerRuntime, NativeRuntime, RuntimeAdapter};
     use crate::security::{AutonomyLevel, SecurityPolicy};
     use zeroclaw_config::schema::DockerRuntimeConfig;
-    use zeroclaw_tools::wrappers::{PathGuardedTool, RateLimitedTool};
+    use zeroclaw_tools::wrappers::RateLimitedTool;
 
     #[tokio::test]
     async fn get_session_id_returns_scoped_session_key() {
@@ -668,17 +687,12 @@ mod tests {
             .expect("medium-risk test command should have a base command")
     }
 
-    /// Returns the fully-wrapped shell tool as it is composed in production:
-    /// RateLimited(PathGuarded(ShellTool)).  Tests that verify path-blocking or
-    /// rate-limiting behaviour must use this helper so they exercise the wrappers.
-    fn wrapped_shell(security: Arc<SecurityPolicy>) -> RateLimitedTool<PathGuardedTool<ShellTool>> {
-        RateLimitedTool::new(
-            PathGuardedTool::new(
-                ShellTool::new(security.clone(), test_runtime()),
-                security.clone(),
-            ),
-            security,
-        )
+    /// The shell tool as assembled in production: `RateLimitedTool<ShellTool>`.
+    /// ShellTool owns its own dialect-aware command + forbidden-path validation,
+    /// so (like `SkillShellTool`) it is not wrapped in the generic POSIX
+    /// `PathGuardedTool`. Tests exercise this exact shape.
+    fn wrapped_shell(security: Arc<SecurityPolicy>) -> RateLimitedTool<ShellTool> {
+        RateLimitedTool::new(ShellTool::new(security.clone(), test_runtime()), security)
     }
 
     #[test]
@@ -739,6 +753,68 @@ mod tests {
         assert!(result.success);
         assert!(result.output.trim().contains("hello"));
         assert!(result.error.is_none());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn shell_executes_windows_nul_redirect_through_cmd_exe() {
+        // Native-Windows runtime boundary through the FULLY WRAPPED production
+        // shape (`RateLimitedTool<ShellTool>`). `test_runtime()` is
+        // `NativeRuntime`, which reports `WindowsCmd`, so ShellTool's own
+        // dialect-aware validation accepts a redirect to the `nul` null device
+        // and cmd.exe then resolves `nul` to the discard-only device. Because the
+        // shell tool now owns its forbidden-path scan (no outer POSIX
+        // `PathGuardedTool`), the `\\.\nul` device form is no longer rejected
+        // ahead of the tool. Proves the allow decision AND real execution.
+        let tool = wrapped_shell(test_security(AutonomyLevel::Supervised));
+
+        // Bare `2>nul`: stderr is discarded, stdout is preserved, command succeeds.
+        let result = tool
+            .execute(json!({"command": "echo zeroclaw_nul_stdout 2>nul"}))
+            .await
+            .expect("`2>nul` command should return a result");
+        assert!(
+            result.success,
+            "`2>nul` must be allowed and execute on Windows: {:?}",
+            result.error
+        );
+        assert!(result.output.trim().contains("zeroclaw_nul_stdout"));
+        assert!(result.error.is_none());
+
+        // Full `\\.\nul` device form redirecting stdout: nothing is written to a
+        // real workspace file, and the command still succeeds.
+        let result = tool
+            .execute(json!({"command": r"echo zeroclaw_dev >\\.\nul"}))
+            .await
+            .expect(r"`>\\.\nul` command should return a result");
+        assert!(
+            result.success,
+            r"`>\\.\nul` must be allowed and execute on Windows: {:?}",
+            result.error
+        );
+        assert!(result.error.is_none());
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn shell_rejects_nul_redirect_through_posix_production_shape() {
+        // The POSIX counterpart, through the same production shape. On a POSIX
+        // sink (Unix native, Docker `sh -c`, cron `sh -c`) `nul` is an ordinary
+        // relative filename, so a redirect to it — bare `nul` or the `\\.\nul`
+        // device form — must stay blocked as an unsafe file redirect. This is the
+        // boundary the fix protects: dropping the outer `PathGuardedTool` must not
+        // weaken POSIX rejection, because ShellTool's own dialect-aware scan runs.
+        let tool = wrapped_shell(test_security(AutonomyLevel::Supervised));
+        for cmd in ["echo zeroclaw x >nul", r"echo zeroclaw x >\\.\nul"] {
+            let result = tool
+                .execute(json!({ "command": cmd }))
+                .await
+                .expect("command should return a result");
+            assert!(
+                !result.success,
+                "POSIX must reject a redirect to `nul` as an unsafe file target: {cmd}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -856,8 +932,13 @@ mod tests {
     async fn shell_warns_on_ephemeral_workspace_failure_path() {
         let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime())
             .with_persistent_writes(false);
+        // Use a bare (non-path-looking) name so the command fails on a missing
+        // directory rather than being stopped by the shell tool's own forbidden-
+        // path guard. An absolute `/nonexistent...` would be rejected before it
+        // ever runs, and this test is about the ephemeral banner on a *runtime*
+        // failure, not about path gating.
         let result = tool
-            .execute(json!({"command": "ls /nonexistent_dir_xyz_4627"}))
+            .execute(json!({"command": "ls nonexistent_dir_xyz_4627"}))
             .await
             .expect("command should return a result");
         assert!(!result.success);
@@ -927,6 +1008,61 @@ mod tests {
                 .unwrap_or("")
                 .contains("Path blocked")
         );
+    }
+
+    /// End-to-end regression for the shell workspace-boundary bypass: driving
+    /// the REAL wrapped shell tool, a write through an in-workspace symlink
+    /// pointing outside must be refused before the command runs, and nothing may
+    /// be created at the target. This covers only the direct path-shaped
+    /// redirect form the static scan can see; dynamic forms (scripts,
+    /// expansion, races) are outside this layer.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_blocks_symlink_escape_end_to_end() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "zeroclaw_shell_e2e_symlink_escape_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let workspace = root.join("workspace");
+        let outside = root.join("outside");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        // `link` inside the workspace points at the outside directory.
+        symlink(&outside, workspace.join("link")).unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: workspace.clone(),
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        });
+        let tool = wrapped_shell(security);
+
+        let result = tool
+            .execute(json!({"command": "echo pwned > link/escape.txt", "approved": true}))
+            .await
+            .expect("shell tool must return a result");
+
+        assert!(!result.success, "the escaping write must be refused");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Path blocked"),
+            "expected a path-block error, got: {:?}",
+            result.error
+        );
+        assert!(
+            !outside.join("escape.txt").exists(),
+            "no file may be written outside the workspace through the symlink"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]

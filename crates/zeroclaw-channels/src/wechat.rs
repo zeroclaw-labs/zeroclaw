@@ -440,6 +440,33 @@ fn https_base_url(
     Ok(url)
 }
 
+/// Interpret an iLink `sendmessage` response body, returning a description
+/// of the failure when the API reported one.
+///
+/// The iLink API reports send failures as HTTP 200 with a non-zero
+/// `ret`/`errcode` in the JSON body — the same envelope the getUpdates
+/// sync loop parses. Checking only the HTTP status treats those failures
+/// (e.g. an expired or missing `context_token`) as success, so the message
+/// is silently dropped.
+///
+/// An empty or non-JSON 2xx body carries no envelope to inspect and is
+/// treated as success, preserving the pre-check behavior for those shapes.
+fn sendmessage_body_error(body: &str) -> Option<String> {
+    if body.trim().is_empty() {
+        return None;
+    }
+    let Ok(data) = serde_json::from_str::<serde_json::Value>(body) else {
+        return None;
+    };
+    let ret = data.get("ret").and_then(|v| v.as_i64()).unwrap_or(0);
+    let errcode = data.get("errcode").and_then(|v| v.as_i64()).unwrap_or(0);
+    if ret == 0 && errcode == 0 {
+        return None;
+    }
+    let errmsg = data.get("errmsg").and_then(|v| v.as_str()).unwrap_or("");
+    Some(format!("ret={ret}, errcode={errcode}, errmsg={errmsg:?}"))
+}
+
 /// WeChat iLink Bot channel — long-polls the iLink Bot API for updates.
 pub struct WeChatChannel {
     /// Bot token obtained via QR-code login; `None` until first login.
@@ -1928,6 +1955,16 @@ impl WeChatChannel {
             anyhow::bail!("sendMessage failed ({status}): {err}");
         }
 
+        // The API reports failures as HTTP 200 with a non-zero ret/errcode
+        // in the body; a status check alone silently drops the message.
+        let body = resp
+            .text()
+            .await
+            .context("failed to read sendMessage response body")?;
+        if let Some(err) = sendmessage_body_error(&body) {
+            anyhow::bail!("sendMessage failed ({err})");
+        }
+
         Ok(())
     }
 
@@ -2557,6 +2594,123 @@ impl Channel for WeChatChannel {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    fn test_wechat_channel_for_api(api_base_url: String, state_dir: &Path) -> WeChatChannel {
+        let mut channel = WeChatChannel::new(
+            "wechat_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            None,
+            None,
+            Some(state_dir.to_path_buf()),
+        )
+        .unwrap();
+        channel.api_base_url = api_base_url;
+        *channel.bot_token.write().unwrap() = Some("test-token".into());
+        channel
+    }
+
+    #[tokio::test]
+    async fn send_text_reports_2xx_error_envelope() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/sendmessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ret": -1,
+                "errcode": 301,
+                "errmsg": "context token expired"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let state = tempdir().unwrap();
+        let channel = test_wechat_channel_for_api(server.uri(), state.path());
+        let err = channel
+            .send_text("recipient", "hello", None)
+            .await
+            .expect_err("a 2xx iLink error envelope must fail the send");
+
+        let message = err.to_string();
+        assert!(message.contains("sendMessage failed"), "{message}");
+        assert!(message.contains("errcode=301"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn send_text_propagates_2xx_body_read_failure() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 64\r\nConnection: close\r\n\r\n{}")
+                .await
+                .unwrap();
+        });
+
+        let state = tempdir().unwrap();
+        let channel = test_wechat_channel_for_api(format!("http://{address}"), state.path());
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            channel.send_text("recipient", "hello", None),
+        )
+        .await
+        .expect("the local truncated-body request must complete")
+        .expect_err("a truncated 2xx response body must fail the send");
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("the local truncated-body server must complete")
+            .unwrap();
+
+        assert!(
+            err.to_string()
+                .contains("failed to read sendMessage response body"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn sendmessage_body_error_flags_nonzero_ret() {
+        let err = sendmessage_body_error(r#"{"ret":-1,"errmsg":"context token expired"}"#)
+            .expect("non-zero ret must be reported as an error");
+        assert!(err.contains("ret=-1"), "ret code missing from error: {err}");
+        assert!(
+            err.contains("context token expired"),
+            "errmsg missing from error: {err}"
+        );
+    }
+
+    #[test]
+    fn sendmessage_body_error_flags_nonzero_errcode() {
+        let err = sendmessage_body_error(r#"{"ret":0,"errcode":301,"errmsg":"session expired"}"#)
+            .expect("non-zero errcode must be reported as an error");
+        assert!(err.contains("errcode=301"), "errcode missing: {err}");
+    }
+
+    #[test]
+    fn sendmessage_body_error_accepts_success_envelope() {
+        assert_eq!(
+            sendmessage_body_error(r#"{"ret":0,"errcode":0,"errmsg":""}"#),
+            None
+        );
+        // Fields absent entirely also means success (defaults are 0).
+        assert_eq!(sendmessage_body_error(r#"{"msg_id":"abc"}"#), None);
+    }
+
+    #[test]
+    fn sendmessage_body_error_preserves_legacy_success_for_empty_or_non_json() {
+        // An empty 2xx body was success before this check existed; keep it so.
+        assert_eq!(sendmessage_body_error(""), None);
+        assert_eq!(sendmessage_body_error("   "), None);
+        // A non-JSON 2xx body has no envelope to inspect; do not invent failures.
+        assert_eq!(sendmessage_body_error("OK"), None);
+    }
 
     #[test]
     fn wechat_channel_name() {
