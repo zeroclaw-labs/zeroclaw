@@ -161,6 +161,12 @@ impl Sandbox for BubblewrapSandbox {
     fn description(&self) -> &str {
         "User namespace sandbox (requires bwrap)"
     }
+
+    fn coding_cli_unsupported_reason(&self) -> Option<&'static str> {
+        Some(
+            "bubblewrap sandbox does not bind the validated workspace or select the validated working directory inside the namespace",
+        )
+    }
 }
 
 #[cfg(test)]
@@ -258,6 +264,17 @@ mod tests {
         assert!(BubblewrapSandbox::support_from_help("--cap-drop", "").cap_drop);
         assert!(BubblewrapSandbox::support_from_help("", "--cap-drop").cap_drop);
         assert!(!BubblewrapSandbox::support_from_help("", "").cap_drop);
+    }
+
+    #[test]
+    fn bubblewrap_sandbox_rejects_coding_cli_execution() {
+        let sandbox = BubblewrapSandbox;
+        let reason = sandbox
+            .coding_cli_unsupported_reason()
+            .expect("bubblewrap sandbox must fail closed for coding CLIs");
+
+        assert!(reason.contains("workspace"));
+        assert!(reason.contains("working directory"));
     }
 
     #[test]

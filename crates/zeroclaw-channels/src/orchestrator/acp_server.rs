@@ -335,10 +335,6 @@ impl AcpServer {
             })?;
         zeroclaw_spawn::spawn!(writer_task(writer_rx));
 
-        let stdin = tokio::io::stdin();
-        let mut reader = BufReader::new(stdin);
-        let mut line = String::new();
-
         // Spawn session reaper
         let sessions = Arc::clone(&self.sessions);
         let timeout = Duration::from_secs(self.acp_config.session_timeout_secs);
@@ -391,27 +387,44 @@ impl AcpServer {
             }
         });
 
+        // Read newline-delimited JSON-RPC from the process's real stdin.
+        // Factored into `serve_reader` so tests can drive the exact same
+        // framing loop with an in-memory pipe instead of the stdin handle.
+        self.serve_reader(tokio::io::stdin()).await?;
+
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_category(::zeroclaw_log::EventCategory::Channel),
+            "ACP server: stdin closed, shutting down"
+        );
+
+        Ok(())
+    }
+
+    /// Read newline-delimited JSON-RPC requests from `reader`, dispatching each
+    /// non-empty line through the shared `process_line` path. This is the exact
+    /// framing loop the stdio front door uses: `run()` calls it with the
+    /// process's real stdin, and tests drive it with an in-memory pipe to prove
+    /// `session/new` end-to-end through the stdio surface.
+    async fn serve_reader<R>(self: &Arc<Self>, reader: R) -> Result<()>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
         loop {
             line.clear();
             let bytes_read = reader.read_line(&mut line).await?;
             if bytes_read == 0 {
-                ::zeroclaw_log::record!(
-                    DEBUG,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_category(::zeroclaw_log::EventCategory::Channel),
-                    "ACP server: stdin closed, shutting down"
-                );
                 break;
             }
-
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
             }
-
             self.process_line(trimmed).await;
         }
-
         Ok(())
     }
 
@@ -659,19 +672,6 @@ impl AcpServer {
 
     async fn handle_session_new(&self, params: &Value) -> RpcResult {
         let config = self.config_snapshot();
-        let requested_cwd = self.requested_session_cwd(params, &config);
-
-        let workspace_dir = std::fs::canonicalize(&requested_cwd)
-            .map_err(|e| RpcError {
-                code: INVALID_PARAMS,
-                message: format!(
-                    "cwd is not a usable directory ({}): {e}",
-                    requested_cwd.display()
-                ),
-                data: None,
-            })?
-            .to_string_lossy()
-            .into_owned();
 
         // Every ACP session is bound to an explicit agent alias.
         // Accept `agentAlias` (camelCase) or `agent_alias` / `agent`,
@@ -679,6 +679,9 @@ impl AcpServer {
         // `[acp].default_agent`. When all are absent and exactly one agent
         // is configured, auto-select it so single-agent setups work without
         // extra config.
+        // NOTE: agent_alias MUST be resolved before workspace_dir so the
+        // default fallback can use the per-agent workspace path instead of
+        // the daemon process CWD.
         let agent_alias = params
             .get("agentAlias")
             .or_else(|| params.get("agent_alias"))
@@ -705,6 +708,49 @@ impl AcpServer {
                 data: None,
             })?;
         Self::validate_dispatchable_agent_alias(&config, &agent_alias)?;
+
+        // Default workspace is the per-agent directory. An explicit
+        // `cwd`/`workspaceDir`/`workspace_dir` is the session's file-access
+        // boundary and is honored exactly as given — including a narrower
+        // subdirectory under the install root. The ONE exception is a cwd that
+        // resolves to the install root itself: clients such as Thunderbolt pass
+        // `.` as a placeholder, which canonicalizes to the daemon's working
+        // directory. Treating that lone placeholder as "no meaningful cwd" and
+        // falling back to the per-agent workspace keeps uploads and the tool
+        // sandbox out of the daemon root, without silently broadening any other
+        // explicit path.
+        //
+        // Canonicalize the install root too: the explicit cwd goes through
+        // `canonicalize`, so comparing it against a non-canonical install root
+        // silently never matches whenever the path is symlinked or carries a
+        // platform prefix (macOS `/var`->`/private/var`, Windows `\\?\`
+        // verbatim). Both sides must be canonical for the equality to hold.
+        //
+        // An explicitly-provided cwd that cannot be resolved is a client error,
+        // not a silent substitution: fail with INVALID_PARAMS. Only an absent
+        // cwd falls back to the per-agent workspace.
+        let install_root = std::fs::canonicalize(config.install_root_dir())
+            .unwrap_or_else(|_| config.install_root_dir());
+        let workspace_dir = match self.requested_session_cwd(params) {
+            Some(requested) => {
+                let canon = std::fs::canonicalize(&requested).map_err(|e| RpcError {
+                    code: INVALID_PARAMS,
+                    message: format!(
+                        "cwd is not a usable directory ({}): {e}",
+                        requested.display()
+                    ),
+                    data: None,
+                })?;
+                if canon == install_root {
+                    config.agent_workspace_dir(&agent_alias)
+                } else {
+                    canon
+                }
+            }
+            None => config.agent_workspace_dir(&agent_alias),
+        }
+        .to_string_lossy()
+        .into_owned();
 
         let session_id = Uuid::new_v4().to_string();
 
@@ -1375,14 +1421,13 @@ impl AcpServer {
         Ok(serde_json::json!({}))
     }
 
-    fn requested_session_cwd(&self, params: &Value, config: &Config) -> PathBuf {
+    fn requested_session_cwd(&self, params: &Value) -> Option<PathBuf> {
         params
             .get("cwd")
             .or_else(|| params.get("workspaceDir"))
             .or_else(|| params.get("workspace_dir"))
             .and_then(|v| v.as_str())
             .map(PathBuf::from)
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| config.data_dir.clone()))
     }
 
     async fn handle_session_prompt(&self, params: &Value, _request_id: &Value) -> RpcResult {
@@ -2737,30 +2782,187 @@ mod tests {
     }
 
     #[test]
-    fn session_new_defaults_to_launch_cwd_when_client_omits_cwd() {
+    fn session_new_omits_cwd_when_client_does_not_specify() {
         let config = Config {
             data_dir: PathBuf::from("/not/the/project"),
             ..Default::default()
         };
         let server = AcpServer::new(config, AcpServerConfig::default());
-        let expected = std::env::current_dir().unwrap();
-        let config = server.config_snapshot();
 
-        assert_eq!(
-            server.requested_session_cwd(&serde_json::json!({}), &config),
-            expected
-        );
+        assert_eq!(server.requested_session_cwd(&serde_json::json!({})), None);
     }
 
     #[test]
     fn session_new_respects_client_cwd_when_present() {
         let server = AcpServer::new(Config::default(), AcpServerConfig::default());
         let cwd = std::env::current_dir().unwrap();
-        let config = server.config_snapshot();
 
         assert_eq!(
-            server.requested_session_cwd(&serde_json::json!({"cwd": cwd}), &config),
-            cwd
+            server.requested_session_cwd(&serde_json::json!({"cwd": cwd})),
+            Some(cwd),
+        );
+    }
+
+    #[tokio::test]
+    async fn session_new_ignores_cwd_when_equal_to_install_root() {
+        // When a client passes cwd = '.' (resolved to the install root), the
+        // session must still use the per-agent workspace — not the daemon cwd.
+        let cwd = tempfile::tempdir().unwrap();
+        // A fully-wired config (valid `anthropic.default` provider + `test-agent`)
+        // so agent construction succeeds. A failing construction would emit the
+        // shared "ACP session/new failed" log line and race the attribution test
+        // that matches events by message text alone.
+        let mut config = make_test_config(cwd.path());
+        // Pin the install root to the temp dir (parent of config_path) so
+        // install_root_dir() resolves to a real, canonicalizable directory.
+        config.config_path = cwd.path().join("config.toml");
+        let server = AcpServer::new(config, AcpServerConfig::default());
+        let snapshot = server.config_snapshot();
+        let install_root = snapshot.install_root_dir();
+        let expected_workspace = snapshot.agent_workspace_dir("test-agent");
+
+        // Pass install_root as cwd — simulates what Thunderbolt does with cwd: '.'
+        let result = server
+            .handle_session_new(&serde_json::json!({
+                "cwd": install_root.to_string_lossy(),
+                "agentAlias": "test-agent",
+            }))
+            .await
+            .expect("session/new must succeed");
+
+        let session_workspace = result["workspaceDir"].as_str().unwrap();
+
+        // Positive contract: workspaceDir is exactly the per-agent workspace.
+        // Asserting the concrete value (not merely "!= install_root") is what
+        // makes this a real regression test — the per-agent workspace is a
+        // subdirectory of the install root, so an inequality check passes even
+        // when the guard is removed and cannot detect the regression.
+        assert_eq!(
+            session_workspace,
+            expected_workspace.to_string_lossy(),
+            "cwd equal to install_root must resolve to the per-agent workspace"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_new_pins_explicit_subdir_under_install_root() {
+        // A client that explicitly narrows the session to a subdirectory under
+        // the install root must have that exact directory honored as the
+        // file-access boundary. Only a cwd equal to the install root itself is
+        // treated as the '.' placeholder; anything narrower must NOT be widened
+        // back to the whole per-agent workspace.
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = make_test_config(cwd.path());
+        config.config_path = cwd.path().join("config.toml");
+        let server = AcpServer::new(config, AcpServerConfig::default());
+        let snapshot = server.config_snapshot();
+        let install_root = snapshot.install_root_dir();
+        let agent_workspace = snapshot.agent_workspace_dir("test-agent");
+
+        // A real, canonicalizable subdirectory under the install root that is
+        // NOT the per-agent workspace, so the two outcomes are distinguishable.
+        let explicit_subdir = install_root.join("project-subdir");
+        std::fs::create_dir_all(&explicit_subdir).unwrap();
+        let expected = std::fs::canonicalize(&explicit_subdir).unwrap();
+        assert_ne!(
+            expected,
+            std::fs::canonicalize(&agent_workspace).unwrap_or(agent_workspace),
+            "test setup: the explicit subdir must differ from the agent workspace"
+        );
+
+        let result = server
+            .handle_session_new(&serde_json::json!({
+                "cwd": explicit_subdir.to_string_lossy(),
+                "agentAlias": "test-agent",
+            }))
+            .await
+            .expect("session/new must succeed");
+
+        let session_workspace = result["workspaceDir"].as_str().unwrap();
+        assert_eq!(
+            session_workspace,
+            expected.to_string_lossy(),
+            "an explicit subdirectory under the install root must be honored \
+             exactly, not widened to the per-agent workspace"
+        );
+    }
+
+    /// Front-door proof for the CLI stdio surface. The tests above call
+    /// `handle_session_new` directly; this one drives the real stdio serve loop
+    /// (`serve_reader`, the exact framing loop `run()` uses for `zeroclaw acp`)
+    /// through an in-memory pipe, feeding newline-delimited JSON-RPC just as an
+    /// editor/IDE ACP client would over the process's stdin. An omitted-`cwd`
+    /// `session/new` must return the per-agent workspace — the behavior this PR
+    /// introduces — not the daemon process CWD.
+    #[tokio::test]
+    async fn stdio_front_door_omitted_cwd_uses_agent_workspace() {
+        use tokio::io::AsyncWriteExt;
+
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = make_test_config(cwd.path());
+        // Pin config_path so `agent_workspace_dir` resolves under a real,
+        // canonicalizable install root.
+        config.config_path = cwd.path().join("config.toml");
+        let expected_ws = config
+            .agent_workspace_dir("test-agent")
+            .to_string_lossy()
+            .into_owned();
+
+        // The server writes response frames to `writer_rx`; no store, so
+        // `session/new` skips persistence.
+        let (writer_tx, mut writer_rx) = mpsc::channel::<String>(64);
+        let server = Arc::new(AcpServer::new_with_writer(
+            config,
+            AcpServerConfig::default(),
+            writer_tx,
+        ));
+
+        // In-memory stdin: the server reads `server_stdin`; the test writes
+        // framed JSON-RPC to `client`.
+        let (mut client, server_stdin) = tokio::io::duplex(4096);
+        let reader = Arc::clone(&server);
+        let reader_task =
+            zeroclaw_spawn::spawn!(async move { reader.serve_reader(server_stdin).await });
+
+        client
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n")
+            .await
+            .unwrap();
+        client
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/new\",\
+                  \"params\":{\"agentAlias\":\"test-agent\"}}\n",
+            )
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+
+        let workspace_dir = tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(frame) = writer_rx.recv().await {
+                let value: Value = match serde_json::from_str(&frame) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if value.get("id").and_then(|i| i.as_i64()) == Some(2) {
+                    if let Some(err) = value.get("error") {
+                        panic!("session/new returned an error: {err}");
+                    }
+                    return value["result"]["workspaceDir"].as_str().map(String::from);
+                }
+            }
+            None
+        })
+        .await
+        .expect("session/new response should arrive before timeout");
+
+        drop(client); // EOF → serve_reader returns
+        let _ = reader_task.await;
+
+        assert_eq!(
+            workspace_dir.as_deref(),
+            Some(expected_ws.as_str()),
+            "omitted-cwd session/new over the real stdio serve loop must return \
+             the per-agent workspace, not the daemon CWD"
         );
     }
 

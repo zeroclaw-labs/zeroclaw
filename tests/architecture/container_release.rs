@@ -8,6 +8,12 @@ fn workflow(name: &str) -> String {
         .unwrap_or_else(|error| panic!("failed to read {name}: {error}"))
 }
 
+fn repository_file(name: &str) -> String {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    fs::read_to_string(root.join(name))
+        .unwrap_or_else(|error| panic!("failed to read {name}: {error}"))
+}
+
 fn top_level_job<'a>(workflow: &'a str, name: &str) -> &'a str {
     let marker = format!("\n  {name}:\n");
     let (_, rest) = workflow
@@ -145,6 +151,79 @@ fn scheduled_trivy_verifies_published_tag_before_scan() {
     assert!(
         !scheduled.contains("\n  upload-sarif:\n"),
         "each scan matrix leg must upload its own SARIF result independently"
+    );
+}
+
+#[test]
+fn root_compose_publishes_on_host_loopback_by_default() {
+    let compose = repository_file("docker-compose.yml");
+    let required_overrides =
+        "- ZEROCLAW_gateway__host=0.0.0.0\n      - ZEROCLAW_gateway__allow_public_bind=true";
+
+    assert!(
+        compose.contains(required_overrides),
+        "Compose must keep the non-loopback gateway host beside its public-bind acknowledgement"
+    );
+    // The in-container listener is 0.0.0.0, and `allow_public_bind` only
+    // silences a startup warning rather than refusing a public bind, so the
+    // `ports:` mapping is the only enforced host-side boundary. Default it to
+    // loopback: a persisted `require_pairing = false` config answers
+    // unauthenticated requests on /webhook, /api/config, and /api/browse.
+    assert!(
+        compose.contains("${HOST_PORT:-127.0.0.1:42617}:${ZEROCLAW_GATEWAY_PORT:-42617}"),
+        "Compose must publish the gateway port on host loopback by default"
+    );
+}
+
+#[test]
+fn compose_smoke_proves_override_precedence_through_the_published_port() {
+    let workflow = workflow("docker-image-pr.yml");
+    let smoke = repository_file("scripts/ci/smoke_docker_compose.sh");
+
+    for required in [
+        "- docker-compose.yml",
+        "- scripts/ci/smoke_docker_compose.sh",
+        "matrix: ${{ fromJSON(needs.changes.outputs.source_matrix) }}",
+        "\"gateway_smoke\":true",
+        "load: ${{ matrix.gateway_smoke || (matrix.dockerfile == 'Dockerfile.alpine' && matrix.platform == 'linux/amd64') }}",
+        "if: matrix.gateway_smoke",
+        "run: bash scripts/ci/smoke_docker_compose.sh",
+    ] {
+        assert!(
+            workflow.contains(required),
+            "Docker image PR workflow is missing Compose smoke invariant: {required}"
+        );
+    }
+
+    for required in [
+        "host = \"127.0.0.1\"",
+        "HOST_PORT=\"127.0.0.1:${requested_host_port}\"",
+        "port zeroclaw 42617",
+        "http://127.0.0.1:${published_port}/health",
+        ":/zeroclaw-data/.zeroclaw/config.toml:ro",
+    ] {
+        assert!(
+            smoke.contains(required),
+            "Compose smoke test is missing published-port invariant: {required}"
+        );
+    }
+
+    // The fixture must stay observably different from the image's baked
+    // config, and the probe must assert that difference. Otherwise a lost
+    // config bind lets the baked `[::]` listener answer the same /health and
+    // the smoke passes while proving nothing about override precedence.
+    assert!(
+        smoke.contains("require_pairing = true"),
+        "Compose smoke fixture must differ from the baked require_pairing=false config"
+    );
+    assert!(
+        smoke.contains(r#"grep -q '"require_pairing":[[:space:]]*true'"#),
+        "Compose smoke must assert the fixture's require_pairing in the health payload"
+    );
+    assert!(
+        smoke.contains(r#"published_address="${published%:*}""#)
+            && smoke.contains(r#"if [[ "$published_address" != "127.0.0.1" ]]"#),
+        "Compose smoke must assert the resolved publication address, not only the port"
     );
 }
 
