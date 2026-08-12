@@ -1024,6 +1024,16 @@ impl Agent {
         )
     }
 
+    /// The effective context-token budget this agent enforces before dispatch,
+    /// resolved from its own configuration snapshot (the lower of
+    /// `max_context_tokens` and an enabled `history_pruning.max_tokens`). External
+    /// surfaces (the Zerocode usage meter) source the displayed denominator from
+    /// here so it always matches what the live agent enforces — not the global
+    /// config, which may have been edited without refreshing this session.
+    pub fn effective_context_budget(&self) -> usize {
+        self.config.resolved.effective_context_budget()
+    }
+
     pub fn clear_history(&mut self) {
         self.history.clear();
         self.history_has_trim_breadcrumb = false;
@@ -4346,6 +4356,51 @@ mod tests {
 
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert!(response.contains("<tool_call>"));
+    }
+
+    #[test]
+    fn effective_context_budget_reads_agent_snapshot_not_live_global_config() {
+        // The agent enforces its budget from its own resolved snapshot, and the
+        // Zerocode usage meter now sources the displayed denominator from the
+        // same accessor. So a later runtime-profile / history_pruning edit to the
+        // GLOBAL config — which `config/set` does not refresh into an already
+        // live session — cannot make the meter diverge from enforcement.
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(
+                &zeroclaw_config::schema::MemoryConfig {
+                    backend: "none".into(),
+                    ..zeroclaw_config::schema::MemoryConfig::default()
+                },
+                std::path::Path::new("/tmp"),
+                None,
+            )
+            .expect("memory creation should succeed"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let agent_config = zeroclaw_config::schema::AliasedAgentConfig {
+            resolved: zeroclaw_config::schema::ResolvedRuntime {
+                max_context_tokens: 48_000,
+                ..zeroclaw_config::schema::ResolvedRuntime::default()
+            },
+            ..zeroclaw_config::schema::AliasedAgentConfig::default()
+        };
+        let agent = Agent::builder()
+            .model_provider(Box::new(MockModelProvider {
+                responses: Mutex::new(vec![]),
+            }))
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .config(agent_config)
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        // The value the meter emits is exactly the value enforcement uses — both
+        // read `config.resolved.effective_context_budget()` on this same agent —
+        // fixed at the session's snapshot (48_000), independent of any global edit.
+        assert_eq!(agent.effective_context_budget(), 48_000);
     }
 
     #[test]

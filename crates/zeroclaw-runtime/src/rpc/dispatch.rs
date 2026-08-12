@@ -1737,16 +1737,29 @@ impl RpcDispatcher {
                 .get_agent_alias(sid)
                 .await
                 .unwrap_or_default();
-            let (mp, m) = if let Some(agent) = self.ctx.sessions.get_agent(sid).await {
-                let (_, model_provider, model) = agent.lock().await.attribution_fields();
-                (model_provider, model)
+            let (mp, m, agent_budget) = if let Some(agent) = self.ctx.sessions.get_agent(sid).await
+            {
+                let guard = agent.lock().await;
+                let (_, model_provider, model) = guard.attribution_fields();
+                // Source the meter denominator from the live agent so it matches
+                // the budget that agent actually enforces. `config/set` only
+                // refreshes live sessions on provider/agent changes, so a
+                // runtime-profile or history_pruning edit would otherwise make the
+                // global-config denominator diverge from enforcement.
+                (
+                    model_provider,
+                    model,
+                    Some(guard.effective_context_budget() as u64),
+                )
             } else {
-                (String::new(), String::new())
+                (String::new(), String::new(), None)
             };
-            let max_ctx = {
+            let max_ctx = agent_budget.or_else(|| {
+                // No live agent for this session yet — fall back to the global
+                // config's effective budget for the alias.
                 let cfg = self.ctx.config.read();
                 Some(context_usage_max_tokens(&cfg, &alias))
-            };
+            });
             (alias, mp, m, max_ctx)
         };
 

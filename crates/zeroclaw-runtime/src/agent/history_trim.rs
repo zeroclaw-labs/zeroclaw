@@ -357,6 +357,58 @@ mod tests {
     fn asst(c: &str) -> ChatMessage {
         ChatMessage::assistant(c)
     }
+
+    #[test]
+    fn drop_oldest_turn_skips_leading_breadcrumb_and_removes_a_real_turn() {
+        let crumb = breadcrumb();
+
+        // With provenance carried from an earlier turn, the synthetic breadcrumb
+        // leading the history is skipped and the oldest REAL turn is removed.
+        let mut history = vec![
+            breadcrumb(),
+            user("old question"),
+            asst("old answer"),
+            user("new question"),
+            asst("new answer"),
+        ];
+        let dropped =
+            drop_oldest_turn(&mut history, true).expect("an actual old turn must be removed");
+        assert_eq!(
+            dropped, 2,
+            "the whole oldest real turn (user + assistant) is dropped"
+        );
+        assert_eq!(
+            history[0].content, crumb.content,
+            "the breadcrumb still leads"
+        );
+        assert!(
+            !history.iter().any(|m| m.content == "old question"),
+            "the oldest real turn is gone: {history:?}"
+        );
+        assert!(
+            history.iter().any(|m| m.content == "new question"),
+            "the recent turn is kept: {history:?}"
+        );
+
+        // Without provenance (the pre-fix seed of `false`) the breadcrumb is
+        // mistaken for the oldest turn: only it is removed — reinserted by the
+        // caller — so the real old turn survives and the request stays oversized.
+        let mut mis = vec![
+            breadcrumb(),
+            user("old question"),
+            asst("old answer"),
+            user("new question"),
+        ];
+        let dropped_wrong = drop_oldest_turn(&mut mis, false).expect("something is dropped");
+        assert_eq!(
+            dropped_wrong, 1,
+            "only the breadcrumb is removed when provenance is lost"
+        );
+        assert!(
+            mis.iter().any(|m| m.content == "old question"),
+            "the real old turn wrongly survives without provenance: {mis:?}"
+        );
+    }
     fn tool(c: &str) -> ChatMessage {
         ChatMessage::tool(c)
     }
