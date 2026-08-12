@@ -1087,4 +1087,113 @@ mod tests {
             "the lockout must come from the shared auth limiter, not PairingGuard: {body}"
         );
     }
+
+    /// Serve `submit_pairing_enhanced` on a real loopback listener with
+    /// `ConnectInfo<SocketAddr>` and return the bound address plus the server
+    /// task handle, so tests exercise the outer HTTP + proxy boundary rather
+    /// than calling the handler directly.
+    async fn serve_pairing(state: AppState) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let app = axum::Router::new()
+            .route("/api/pair", axum::routing::post(submit_pairing_enhanced))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = zeroclaw_spawn::spawn!(async move {
+            let _ = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await;
+        });
+        (addr, handle)
+    }
+
+    /// Send one wrong `POST /api/pair` over a fresh connection with the given
+    /// `X-Forwarded-For`, returning the HTTP status code. A raw request keeps
+    /// the test free of an HTTP-client dependency while still driving the real
+    /// service (ConnectInfo + header extraction).
+    async fn post_pair_status(addr: std::net::SocketAddr, forwarded_for: &str) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let body = r#"{"code":"wrong"}"#;
+        let request = format!(
+            "POST /api/pair HTTP/1.1\r\nHost: localhost\r\nX-Forwarded-For: {forwarded_for}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len(),
+        );
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let text = String::from_utf8_lossy(&response);
+        let status_line = text.lines().next().expect("HTTP status line");
+        status_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .expect("HTTP status code")
+    }
+
+    #[tokio::test]
+    async fn submit_pairing_enhanced_http_boundary_rotating_forwarded_header_cannot_evade_lockout()
+    {
+        // Default (untrusted) forwarded headers: a single direct peer rotating
+        // `X-Forwarded-For` on every request must not dodge the peer-keyed
+        // lockout. After five wrong attempts the sixth is locked out (429).
+        let mut state = test_state(Config::default());
+        state.pairing = Arc::new(PairingGuard::new(true, &[]));
+        state.rate_limiter = Arc::new(GatewayRateLimiter::new(100, 100, 100));
+        state.auth_limiter = Arc::new(AuthRateLimiter::new());
+        state.trust_forwarded_headers = false;
+
+        let (addr, server) = serve_pairing(state).await;
+
+        let mut statuses = Vec::new();
+        for i in 0..6 {
+            statuses.push(post_pair_status(addr, &format!("10.0.0.{i}")).await);
+        }
+        server.abort();
+
+        assert_eq!(
+            statuses,
+            vec![400, 400, 400, 400, 400, 429],
+            "rotating X-Forwarded-For from one direct peer must not evade the lockout"
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_pairing_enhanced_http_boundary_trusted_proxy_separates_clients() {
+        // Trusted-proxy mode: the forwarded client identity is honoured, so
+        // client A's five failures lock only A. Client B keeps a fresh bucket,
+        // and A's sixth request is the one that is locked out.
+        let mut state = test_state(Config::default());
+        state.pairing = Arc::new(PairingGuard::new(true, &[]));
+        state.rate_limiter = Arc::new(GatewayRateLimiter::new(100, 100, 100));
+        state.auth_limiter = Arc::new(AuthRateLimiter::new());
+        state.trust_forwarded_headers = true;
+
+        let (addr, server) = serve_pairing(state).await;
+
+        let client_a = "198.51.100.7";
+        let client_b = "198.51.100.8";
+
+        let mut a_statuses = Vec::new();
+        for _ in 0..5 {
+            a_statuses.push(post_pair_status(addr, client_a).await);
+        }
+        let b_status = post_pair_status(addr, client_b).await;
+        let a_sixth = post_pair_status(addr, client_a).await;
+        server.abort();
+
+        assert_eq!(
+            a_statuses,
+            vec![400, 400, 400, 400, 400],
+            "client A's five wrong attempts"
+        );
+        assert_eq!(
+            b_status, 400,
+            "client B has an independent bucket behind the trusted proxy"
+        );
+        assert_eq!(a_sixth, 429, "client A is locked out on its sixth attempt");
+    }
 }
