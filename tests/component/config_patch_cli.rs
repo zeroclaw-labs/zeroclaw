@@ -81,8 +81,6 @@ fn test_state(config: Config) -> AppState {
         nextcloud_talk: HashMap::new(),
         #[cfg(feature = "channel-nextcloud")]
         nextcloud_talk_webhook_secret: HashMap::new(),
-        #[cfg(feature = "channel-wati")]
-        wati: HashMap::new(),
         #[cfg(feature = "channel-email")]
         gmail_push: None,
         observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),

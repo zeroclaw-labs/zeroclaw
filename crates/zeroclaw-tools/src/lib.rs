@@ -20,6 +20,7 @@ pub mod cli_discovery;
 pub mod cloud_ops;
 pub mod cloud_patterns;
 pub mod codex_cli;
+pub mod coding_cli;
 pub mod composio;
 pub mod content_search;
 pub mod data_management;

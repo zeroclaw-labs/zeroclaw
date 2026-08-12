@@ -40,7 +40,7 @@ The full field reference, straight from the schema:
 
 {{#config-fields channels.git}}
 
-The `default` alias is the common first instance. Leave `repos` empty to poll every repository visible to the credential, or set it to an explicit repository list for lower rate usage. Set `listen_to_bots` only if comments from other bot accounts should be processed. An unknown `provider` value is a clear startup error rather than a silent fallback.
+The `default` alias is the common first instance. It is also what one-off sends resolve: `zeroclaw channel send --channel-id git` looks up the `default` alias specifically, so name the instance `default` unless every send will come from an agent bound to a differently-named alias. Leave `repos` empty to poll every repository visible to the credential, or set it to an explicit repository list for lower rate usage. Set `listen_to_bots` only if comments from other bot accounts should be processed. An unknown `provider` value is a clear startup error rather than a silent fallback.
 
 Credential setup differs per provider and each has its own encrypted secret; both walkthroughs cover it end to end:
 
