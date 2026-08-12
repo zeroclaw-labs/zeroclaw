@@ -29,11 +29,18 @@ use crate::acp_channel::AcpChannel;
 
 /// Tool name of the structured, replay-only cancellation event a client-cancel
 /// leaves in a persisted transcript. It is a sentinel — recognised structurally
-/// by this name (never by localized text) so `session/load` can exclude it from
-/// provider history and replay it as the live client-cancel update.
+/// (never by localized text) so `session/load` can exclude it from provider
+/// history and replay it as the live client-cancel update.
 const CANCELLATION_EVENT_TOOL_NAME: &str = "turn-cancelled";
-/// Stable tool-call id for the cancellation sentinel.
-const CANCELLATION_EVENT_TOOL_ID: &str = "turn-cancelled";
+/// Reserved tool-call id for the cancellation sentinel. Namespaced so it cannot
+/// collide with a real native/custom/MCP tool call: recognition keys off this id
+/// plus the full sentinel shape (see [`AcpServer::is_cancellation_event`]), so an
+/// ordinary tool call merely named `turn-cancelled` is never treated as a cancel.
+const CANCELLATION_EVENT_TOOL_ID: &str = "zeroclaw.acp.turn-cancelled.v1";
+/// Argument payload the cancellation sentinel always carries. Part of the
+/// discriminator so a real tool call with the reserved name but genuine
+/// arguments is not misclassified.
+const CANCELLATION_EVENT_TOOL_ARGS: &str = "{}";
 
 /// Terminal result of a `session/prompt` turn, returned by the per-session turn
 /// task after it has already persisted the outcome's transcript while holding
@@ -1460,6 +1467,8 @@ impl AcpServer {
             "ACP session closed"
         );
 
+        drop(session);
+        self.reclaim_session_gate(session_id);
         Ok(serde_json::json!({}))
     }
 
@@ -1533,6 +1542,33 @@ impl AcpServer {
         // prompt holds it (a concurrent prompt is already rejected above).
         let finalize_gate = self.session_gate(&session_id);
         let _finalize_guard = finalize_gate.lock().await;
+
+        // Revalidate the captured session generation now that we hold the gate.
+        // Admission (clone + `register_cancel_token`) happens before this gate is
+        // acquired, so between then and here a `session/close` or `session/stop`
+        // may have removed the live map entry and a `session/load`/`session/resume`
+        // may have installed a replacement agent seeded from durable history.
+        // Running the captured (now superseded) `Arc<Session>` would append this
+        // turn's output onto an obsolete generation after the replacement was
+        // seeded. If the map entry is gone or is no longer the Arc we captured,
+        // release the reservation and abort instead.
+        {
+            let sessions = self.sessions.lock().await;
+            let still_current = sessions
+                .get(&session_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &session_arc));
+            if !still_current {
+                drop(sessions);
+                self.remove_cancel_token(&session_id);
+                return Err(RpcError {
+                    code: SESSION_NOT_FOUND,
+                    message: format!(
+                        "Session {session_id} was closed or replaced before the prompt could run"
+                    ),
+                    data: None,
+                });
+            }
+        }
 
         let prompt = match Self::materialize_prompt(
             params,
@@ -1921,6 +1957,26 @@ impl AcpServer {
             .clone()
     }
 
+    /// Reclaim a session's finalization gate so `session_gates` does not grow for
+    /// the process lifetime as sessions are closed and re-loaded. The entry is
+    /// dropped only when the map is its sole owner (`strong_count == 1`): if a
+    /// prompt or restore still holds (or is parked on) the gate, it is left in
+    /// place and reclaimed by a later `session/close`/`session/stop`. Because a
+    /// concurrent `session_gate()` create-on-miss serialises on the same
+    /// `session_gates` lock, a still-referenced gate is never split into two
+    /// independent locks.
+    fn reclaim_session_gate(&self, session_id: &str) {
+        let mut gates = self
+            .session_gates
+            .lock()
+            .expect("session_gates lock poisoned — invariant: all guarded critical sections are short, infallible HashMap ops");
+        if let Some(gate) = gates.get(session_id)
+            && Arc::strong_count(gate) == 1
+        {
+            gates.remove(session_id);
+        }
+    }
+
     /// Assemble the persisted transcript for a failed turn: the messages the
     /// turn produced before the error (user prompt, completed tool activity,
     /// any partial assistant text) plus a trailing assistant failure marker so
@@ -1972,21 +2028,40 @@ impl AcpServer {
             tool_calls: vec![ToolCall {
                 id: CANCELLATION_EVENT_TOOL_ID.to_string(),
                 name: CANCELLATION_EVENT_TOOL_NAME.to_string(),
-                arguments: "{}".to_string(),
+                arguments: CANCELLATION_EVENT_TOOL_ARGS.to_string(),
                 extra_content: None,
             }],
             reasoning_content: None,
         }
     }
 
-    /// A restored message is the structured ACP cancellation event when it is an
-    /// `AssistantToolCalls` carrying exactly the sentinel `turn-cancelled` call.
+    /// A restored message is the structured ACP cancellation event only when it
+    /// matches the sentinel's *full* shape: an `AssistantToolCalls` with no text
+    /// or reasoning carrying exactly one tool call whose reserved id, name, empty
+    /// arguments and absent extra content all match [`Self::cancellation_event`].
+    ///
+    /// Matching on the reserved id (not the name alone) keeps a real native,
+    /// custom or MCP tool call that merely shares the `turn-cancelled` name from
+    /// being stripped out of provider history and replayed as a client cancel.
     fn is_cancellation_event(message: &ConversationMessage) -> bool {
-        matches!(
-            message,
-            ConversationMessage::AssistantToolCalls { tool_calls, .. }
-                if tool_calls.len() == 1 && tool_calls[0].name == CANCELLATION_EVENT_TOOL_NAME
-        )
+        let ConversationMessage::AssistantToolCalls {
+            text,
+            tool_calls,
+            reasoning_content,
+        } = message
+        else {
+            return false;
+        };
+        if text.is_some() || reasoning_content.is_some() {
+            return false;
+        }
+        let [call] = tool_calls.as_slice() else {
+            return false;
+        };
+        call.id == CANCELLATION_EVENT_TOOL_ID
+            && call.name == CANCELLATION_EVENT_TOOL_NAME
+            && call.arguments == CANCELLATION_EVENT_TOOL_ARGS
+            && call.extra_content.is_none()
     }
 
     /// Prepare a restored transcript (loaded from the store) for provider
@@ -2283,6 +2358,27 @@ impl AcpServer {
                 data: None,
             })?;
 
+        // Cancel any in-flight or queued turn before removing the map entry, so a
+        // prompt admitted but still parked behind the finalization gate is stopped
+        // rather than left to run after this `session/stop` returns (parity with
+        // `session/close`).
+        let token = self
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned — invariant: all guarded critical sections are short, infallible HashMap ops")
+            .get(session_id)
+            .cloned();
+        if let Some(token) = token {
+            token.cancel();
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Channel)
+                    .with_attrs(::serde_json::json!({"session_id": session_id})),
+                "ACP session/stop: cancelled active turn"
+            );
+        }
+
         let session_arc = {
             let mut sessions = self.sessions.lock().await;
             sessions.remove(session_id).ok_or_else(|| RpcError {
@@ -2314,6 +2410,8 @@ impl AcpServer {
                 })),
             "ACP session stopped"
         );
+        drop(session);
+        self.reclaim_session_gate(session_id);
         Ok(serde_json::json!({
             "sessionId": session_id,
             "stopped": true,
@@ -5894,6 +5992,177 @@ mod tests {
             other => panic!("expected preserved partial text, got {other:?}"),
         }
         assert!(AcpServer::is_cancellation_event(folded.last().unwrap()));
+    }
+
+    #[test]
+    fn is_cancellation_event_ignores_real_tool_call_sharing_the_sentinel_name() {
+        use zeroclaw_api::model_provider::{ConversationMessage, ToolCall};
+
+        // The genuine sentinel is still recognised.
+        assert!(
+            AcpServer::is_cancellation_event(&AcpServer::cancellation_event()),
+            "the structured cancellation event must be recognised"
+        );
+
+        // A real native/custom/MCP tool call that merely shares the reserved
+        // name — but carries a genuine call id and real arguments — must NOT be
+        // classified as a cancellation, so it is never stripped from provider
+        // history and replayed as a client cancel.
+        let real_call = ConversationMessage::AssistantToolCalls {
+            text: None,
+            tool_calls: vec![ToolCall {
+                id: "call_abc123".to_string(),
+                name: CANCELLATION_EVENT_TOOL_NAME.to_string(),
+                arguments: r#"{"target":"prod"}"#.to_string(),
+                extra_content: None,
+            }],
+            reasoning_content: None,
+        };
+        assert!(
+            !AcpServer::is_cancellation_event(&real_call),
+            "an ordinary tool call named turn-cancelled must remain a tool call"
+        );
+
+        // Even with the reserved id and empty args, accompanying assistant text
+        // means it is not the bare sentinel shape.
+        let with_text = ConversationMessage::AssistantToolCalls {
+            text: Some("here you go".to_string()),
+            tool_calls: vec![ToolCall {
+                id: CANCELLATION_EVENT_TOOL_ID.to_string(),
+                name: CANCELLATION_EVENT_TOOL_NAME.to_string(),
+                arguments: CANCELLATION_EVENT_TOOL_ARGS.to_string(),
+                extra_content: None,
+            }],
+            reasoning_content: None,
+        };
+        assert!(
+            !AcpServer::is_cancellation_event(&with_text),
+            "a tool call with surrounding assistant text is not the sentinel"
+        );
+
+        // The restore seed excludes the true sentinel but keeps the real
+        // same-named call, so it survives into provider history.
+        let seed: Vec<_> = [real_call, AcpServer::cancellation_event()]
+            .into_iter()
+            .filter(|message| !AcpServer::is_cancellation_event(message))
+            .collect();
+        assert_eq!(
+            seed.len(),
+            1,
+            "only the true sentinel is filtered from provider history"
+        );
+        assert!(
+            !AcpServer::is_cancellation_event(&seed[0]),
+            "the real same-named tool call survives into provider history"
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_aborts_when_session_replaced_before_acquiring_the_gate() {
+        use std::sync::Arc as StdArc;
+
+        let cwd = tempfile::tempdir().unwrap();
+        let store = StdArc::new(
+            zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap(),
+        );
+        let server = StdArc::new(AcpServer::new_with_store(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+            StdArc::clone(&store),
+        ));
+
+        let new_session = |alias: &str| {
+            let server = StdArc::clone(&server);
+            let cwd = cwd.path().to_string_lossy().to_string();
+            let alias = alias.to_string();
+            async move {
+                server
+                    .handle_session_new(&serde_json::json!({ "cwd": cwd, "agentAlias": alias }))
+                    .await
+                    .expect("session/new must succeed")["sessionId"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            }
+        };
+
+        let s1 = new_session("test-agent").await;
+        // A second session provides a genuinely different Arc to install as the replacement.
+        let s2 = new_session("test-agent").await;
+        let arc2 = server
+            .sessions
+            .lock()
+            .await
+            .get(&s2)
+            .cloned()
+            .expect("s2 must be active");
+
+        let before = store
+            .load_session(&s1)
+            .unwrap()
+            .expect("s1 record exists")
+            .messages
+            .len();
+
+        // Hold the finalization gate so the prompt parks right after admission
+        // (session clone + cancel-token registration) and before it can run.
+        let gate = server.session_gate(&s1);
+        let guard = gate.lock().await;
+
+        let prompt_server = StdArc::clone(&server);
+        let prompt_sid = s1.clone();
+        let prompt = zeroclaw_spawn::spawn!(async move {
+            prompt_server
+                .handle_session_prompt(
+                    &serde_json::json!({ "sessionId": prompt_sid, "prompt": "hi" }),
+                    &serde_json::json!(1),
+                )
+                .await
+        });
+
+        // Wait until the prompt has been admitted (token registered) and is now
+        // parked on the gate we hold.
+        loop {
+            let admitted = server
+                .cancel_tokens
+                .lock()
+                .expect("cancel_tokens lock")
+                .contains_key(&s1);
+            if admitted {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        // Simulate a `session/load` replacement: swap the live map entry for a
+        // different session generation while the prompt is parked on the gate.
+        server
+            .sessions
+            .lock()
+            .await
+            .insert(s1.clone(), StdArc::clone(&arc2));
+
+        // Release the gate; the parked prompt must revalidate its captured
+        // generation and abort rather than run on the superseded session.
+        drop(guard);
+
+        let result = prompt.await.expect("prompt task joins");
+        assert!(
+            result.is_err(),
+            "prompt must abort when its session was replaced under the gate"
+        );
+
+        // The superseded generation never ran, so no terminal transcript was appended.
+        let after = store
+            .load_session(&s1)
+            .unwrap()
+            .expect("s1 record exists")
+            .messages
+            .len();
+        assert_eq!(
+            after, before,
+            "an aborted prompt must not append onto the replaced session"
+        );
     }
 
     #[tokio::test]
