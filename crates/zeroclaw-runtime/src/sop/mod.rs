@@ -1190,12 +1190,10 @@ type = "manual"
         .expect("write SOP.toml");
     }
 
-    /// Regression for #9779.
-    ///
     /// `sops_dir` is an optional override; omitting it must resolve the
-    /// documented `<workspace>/sops` default. Before the fix every construction
-    /// site gated on the override being *set*, so a populated default directory
-    /// was visible to `sop list` yet the daemon never built an engine for it and
+    /// documented `<workspace>/sops` default. Every construction site used to
+    /// gate on the override being *set*, so a populated default directory was
+    /// visible to `sop list` yet the daemon never built an engine for it and
     /// SOPs silently never ran.
     #[test]
     fn sops_enabled_when_sops_dir_is_omitted_and_default_dir_exists() {
