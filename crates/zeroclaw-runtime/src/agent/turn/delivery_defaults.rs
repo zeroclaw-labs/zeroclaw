@@ -50,21 +50,6 @@ pub(crate) fn maybe_inject_originating_channel(
     }
 }
 
-/// Delivery resolves a `<type>.<alias>` composite key; the bare type is
-/// registered only when that type has exactly one configured instance
-/// (`configured_channel_map`). Default to the composite so a job created from
-/// one of several aliased instances announces back to the instance it came
-/// from, instead of failing to resolve.
-fn default_delivery_channel(channel_name: &str, channel_alias: Option<&str>) -> String {
-    match channel_alias
-        .map(str::trim)
-        .filter(|alias| !alias.is_empty())
-    {
-        Some(alias) => format!("{channel_name}.{alias}"),
-        None => channel_name.to_string(),
-    }
-}
-
 pub(crate) fn maybe_inject_channel_delivery_defaults(
     tool_name: &str,
     tool_args: &mut serde_json::Value,
@@ -106,7 +91,17 @@ pub(crate) fn maybe_inject_channel_delivery_defaults(
         return;
     }
 
-    let delivery_channel = default_delivery_channel(channel_name, channel_alias);
+    // Delivery resolves a `<type>.<alias>` composite key, and the bare type is
+    // registered only while that type has exactly one configured instance
+    // (`configured_channel_map`). Naming this turn's own instance is what keeps
+    // a job created from one of several aliased instances deliverable.
+    let delivery_channel = match channel_alias
+        .map(str::trim)
+        .filter(|alias| !alias.is_empty())
+    {
+        Some(alias) => format!("{channel_name}.{alias}"),
+        None => channel_name.to_string(),
+    };
 
     let default_delivery = || {
         serde_json::json!({
@@ -136,11 +131,19 @@ pub(crate) fn maybe_inject_channel_delivery_defaults(
                 .entry("mode".to_string())
                 .or_insert_with(|| serde_json::Value::String("announce".to_string()));
 
-            let needs_channel = delivery
+            // Empty means "unset", and a bare originating type is the same
+            // instance named ambiguously — the turn-context block recommends
+            // exactly that spelling, so a model that follows it lands here.
+            // Both resolve to this turn's instance. Any other value is a
+            // deliberate choice of a different destination and is left alone.
+            let needs_resolved_channel = delivery
                 .get("channel")
                 .and_then(serde_json::Value::as_str)
-                .is_none_or(|value| value.trim().is_empty());
-            if needs_channel {
+                .is_none_or(|value| {
+                    let value = value.trim();
+                    value.is_empty() || value.eq_ignore_ascii_case(channel_name)
+                });
+            if needs_resolved_channel {
                 delivery.insert(
                     "channel".to_string(),
                     serde_json::Value::String(delivery_channel.clone()),
@@ -239,10 +242,58 @@ mod tests {
     }
 
     #[test]
-    fn explicit_channel_is_never_overridden() {
+    fn an_explicit_destination_is_never_overridden() {
+        // Including this turn's own instance already spelled out, which must
+        // not pick up a second alias suffix.
+        for chosen in ["telegram.work", "telegram.other", "discord", "discord.ops"] {
+            let mut args = serde_json::json!({
+                "job_type": "agent",
+                "delivery": { "mode": "announce", "channel": chosen, "to": "chat-42" },
+            });
+
+            maybe_inject_channel_delivery_defaults(
+                "cron_add",
+                &mut args,
+                "telegram",
+                Some("work"),
+                Some("chat-42"),
+            );
+
+            assert_eq!(args["delivery"]["channel"], chosen, "chosen={chosen}");
+        }
+    }
+
+    #[test]
+    fn bare_originating_type_is_upgraded_to_the_composite_channel() {
+        // The turn-context block recommends the bare type, so a model that
+        // follows it emits a value that only resolves when the type has one
+        // configured instance. It names this turn's instance either way.
+        for spelling in ["telegram", "TELEGRAM", "  telegram  "] {
+            let mut args = serde_json::json!({
+                "job_type": "agent",
+                "delivery": { "mode": "announce", "channel": spelling, "to": "chat-42" },
+            });
+
+            maybe_inject_channel_delivery_defaults(
+                "cron_add",
+                &mut args,
+                "telegram",
+                Some("work"),
+                Some("chat-42"),
+            );
+
+            assert_eq!(
+                args["delivery"]["channel"], "telegram.work",
+                "spelling={spelling}"
+            );
+        }
+    }
+
+    #[test]
+    fn mode_none_still_suppresses_every_injection() {
         let mut args = serde_json::json!({
             "job_type": "agent",
-            "delivery": { "mode": "announce", "channel": "telegram.other", "to": "chat-42" },
+            "delivery": { "mode": "none" },
         });
 
         maybe_inject_channel_delivery_defaults(
@@ -253,7 +304,7 @@ mod tests {
             Some("chat-42"),
         );
 
-        assert_eq!(args["delivery"]["channel"], "telegram.other");
+        assert_eq!(args["delivery"], serde_json::json!({ "mode": "none" }));
     }
 
     #[test]
