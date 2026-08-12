@@ -2,19 +2,80 @@
 
 use crate::verifiable_intent::error::{ViError, ViErrorKind};
 use crate::verifiable_intent::types::{
-    CheckoutL3Mandate, Constraint, Entity, Fulfillment, LineItemEntry, MandateMode,
-    PaymentL3Mandate,
+    CheckoutL3Mandate, Constraint, CredentialChain, Entity, Fulfillment, KnownConstraint,
+    LineItemEntry, MandateMode, PaymentL3Mandate,
 };
 
 // ── Strictness mode ──────────────────────────────────────────────────
 
 /// Controls behavior when an unknown constraint type is encountered.
+///
+/// This applies only to mandates that are not open. An open mandate rejects an
+/// unrecognized constraint in either mode, so the setting cannot widen agent
+/// authority. See `check_single_constraint`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StrictnessMode {
-    /// Unknown constraint types cause a violation (fail-closed).
+    /// An unrecognized constraint type is a violation.
     Strict,
-    /// Unknown constraint types are skipped with a warning (fail-open).
+    /// An unrecognized constraint type is recorded as skipped and the
+    /// recognized constraints decide the outcome.
     Permissive,
+}
+
+// ── Verified values ──────────────────────────────────────────────────
+
+/// A credential chain whose signatures, bindings and headers have been
+/// verified.
+///
+/// The fields are private and there is no constructor, no `Default`, and no
+/// conversion from unverified data, so a value of this type cannot be produced
+/// by any current code path. The chain verifier that constructs it is a later
+/// stage of the work tracked upstream; until it lands, holding one of these is
+/// impossible rather than merely discouraged.
+pub struct VerifiedCredentialChain {
+    chain: CredentialChain,
+    mode: MandateMode,
+}
+
+impl VerifiedCredentialChain {
+    /// The verified chain layers.
+    pub fn chain(&self) -> &CredentialChain {
+        &self.chain
+    }
+
+    /// The execution mode established during verification.
+    pub fn mode(&self) -> MandateMode {
+        self.mode
+    }
+}
+
+/// A checkout and payment mandate pair, paired and verified together, with the
+/// fulfillment derived from the verified L3 layers.
+///
+/// Same construction rules as `VerifiedCredentialChain`. Constraint evaluation
+/// consumes a value of this type once the verifier exists, which is what stops
+/// a caller supplying both the constraints and the values checked against them.
+pub struct VerifiedMandatePair {
+    constraints: Vec<Constraint>,
+    fulfillment: Fulfillment,
+    mode: MandateMode,
+}
+
+impl VerifiedMandatePair {
+    /// Constraints taken from the verified L2 mandates.
+    pub fn constraints(&self) -> &[Constraint] {
+        &self.constraints
+    }
+
+    /// Fulfillment derived from the verified L3 mandates.
+    pub fn fulfillment(&self) -> &Fulfillment {
+        &self.fulfillment
+    }
+
+    /// The execution mode established during verification.
+    pub fn mode(&self) -> MandateMode {
+        self.mode
+    }
 }
 
 // ── Chain verification result ────────────────────────────────────────
@@ -53,6 +114,14 @@ pub struct ConstraintCheckResult {
     pub satisfied: bool,
     pub constraint_type: String,
     pub violations: Vec<ViError>,
+    /// Set when the constraint was not evaluated at all.
+    ///
+    /// A skipped result reports `satisfied: true` so that recognized
+    /// constraints decide the outcome, which is the behavior the reference
+    /// implementation records in its `skipped` list. The flag is what separates
+    /// "checked and passed" from "never checked", and a caller that treats the
+    /// two as the same is drawing a stronger conclusion than the data supports.
+    pub skipped: bool,
 }
 
 impl ConstraintCheckResult {
@@ -61,6 +130,7 @@ impl ConstraintCheckResult {
             satisfied: true,
             constraint_type: constraint_type.into(),
             violations: vec![],
+            skipped: false,
         }
     }
 
@@ -69,6 +139,17 @@ impl ConstraintCheckResult {
             satisfied: false,
             constraint_type: constraint_type.into(),
             violations: vec![err],
+            skipped: false,
+        }
+    }
+
+    /// A constraint that was left unevaluated under a permissive policy.
+    pub fn skipped(constraint_type: &str) -> Self {
+        Self {
+            satisfied: true,
+            constraint_type: constraint_type.into(),
+            violations: vec![],
+            skipped: true,
         }
     }
 }
@@ -164,37 +245,51 @@ pub fn infer_mode_from_vct(vct: &str) -> Result<MandateMode, ViError> {
 // ── Constraint validation ────────────────────────────────────────────
 
 /// Evaluate all constraints against fulfillment data.
+///
+/// `mode` decides how an unrecognized constraint is treated. `Autonomous` is
+/// the open-mandate case, where the agent acts on its own and an unevaluable
+/// constraint would leave its authority unbounded, so such a constraint is a
+/// violation whatever the strictness setting says.
 pub fn check_constraints(
     constraints: &[Constraint],
     fulfillment: &Fulfillment,
     strictness: StrictnessMode,
+    mode: MandateMode,
 ) -> Vec<ConstraintCheckResult> {
     constraints
         .iter()
-        .map(|c| check_single_constraint(c, fulfillment, strictness))
+        .map(|c| check_single_constraint(c, fulfillment, strictness, mode))
         .collect()
 }
 
 fn check_single_constraint(
     constraint: &Constraint,
     fulfillment: &Fulfillment,
-    _strictness: StrictnessMode,
+    strictness: StrictnessMode,
+    mode: MandateMode,
 ) -> ConstraintCheckResult {
-    match constraint {
-        Constraint::AllowedMerchant { allowed_merchants } => {
+    let known = match constraint {
+        Constraint::Known(known) => known,
+        Constraint::Unknown {
+            constraint_type, ..
+        } => return check_unknown_constraint(constraint_type, strictness, mode),
+    };
+
+    match known {
+        KnownConstraint::AllowedMerchant { allowed_merchants } => {
             check_allowed_merchant(allowed_merchants, fulfillment)
         }
-        Constraint::LineItems { items } => check_line_items(items, fulfillment),
-        Constraint::AllowedPayee { allowed_payees } => {
+        KnownConstraint::LineItems { items } => check_line_items(items, fulfillment),
+        KnownConstraint::AllowedPayee { allowed_payees } => {
             check_allowed_payee(allowed_payees, fulfillment)
         }
-        Constraint::PaymentAmount { currency, min, max } => {
+        KnownConstraint::PaymentAmount { currency, min, max } => {
             check_payment_amount(currency, *min, *max, fulfillment)
         }
-        Constraint::PaymentBudget { currency, max } => {
+        KnownConstraint::PaymentBudget { currency, max } => {
             check_payment_budget(currency, *max, fulfillment)
         }
-        Constraint::PaymentReference {
+        KnownConstraint::PaymentReference {
             conditional_transaction_id,
         } => {
             // Reference binding is verified structurally, not against fulfillment.
@@ -203,12 +298,38 @@ fn check_single_constraint(
                 &conditional_transaction_id[..8.min(conditional_transaction_id.len())]
             ))
         }
-        Constraint::PaymentRecurrence { .. } | Constraint::AgentRecurrence { .. } => {
+        KnownConstraint::PaymentRecurrence { .. } | KnownConstraint::AgentRecurrence { .. } => {
             // Recurrence constraints are informational for the payment network
             // to enforce statefulness. Pass-through at the agent level.
             ConstraintCheckResult::ok("recurrence")
         }
     }
+}
+
+/// Decide what an unrecognized constraint type means.
+///
+/// An open mandate rejects it in either strictness mode: the agent acts without
+/// a further confirmation step, and a constraint nothing can evaluate places no
+/// bound on what it may do. Outside that case the configured mode decides, and
+/// a permissive result is recorded as skipped rather than as a pass.
+fn check_unknown_constraint(
+    constraint_type: &str,
+    strictness: StrictnessMode,
+    mode: MandateMode,
+) -> ConstraintCheckResult {
+    let open_mandate = matches!(mode, MandateMode::Autonomous);
+    if open_mandate || matches!(strictness, StrictnessMode::Strict) {
+        let detail = if open_mandate {
+            format!("unknown constraint type in open mandate: {constraint_type}")
+        } else {
+            format!("unknown constraint type: {constraint_type}")
+        };
+        return ConstraintCheckResult::violation(
+            constraint_type,
+            ViError::new(ViErrorKind::UnknownConstraintType, detail),
+        );
+    }
+    ConstraintCheckResult::skipped(constraint_type)
 }
 
 // ── Individual constraint checkers ───────────────────────────────────
@@ -822,14 +943,14 @@ mod tests {
     #[test]
     fn check_constraints_multiple() {
         let constraints = vec![
-            Constraint::PaymentAmount {
+            Constraint::Known(KnownConstraint::PaymentAmount {
                 currency: "USD".into(),
                 min: Some(10000),
                 max: Some(40000),
-            },
-            Constraint::AllowedPayee {
+            }),
+            Constraint::Known(KnownConstraint::AllowedPayee {
                 allowed_payees: vec![merchant("Store", "https://store.example.com")],
-            },
+            }),
         ];
         let f = Fulfillment {
             amount: Some(25000),
@@ -837,9 +958,15 @@ mod tests {
             payee: Some(merchant("Store", "https://store.example.com")),
             ..Default::default()
         };
-        let results = check_constraints(&constraints, &f, StrictnessMode::Strict);
+        let results = check_constraints(
+            &constraints,
+            &f,
+            StrictnessMode::Strict,
+            MandateMode::Autonomous,
+        );
         assert_eq!(results.len(), 2);
         assert!(results.iter().all(|r| r.satisfied));
+        assert!(results.iter().all(|r| !r.skipped));
     }
 
     #[test]
@@ -852,22 +979,27 @@ mod tests {
             (" ", Some(" ".into())),
         ] {
             let constraints = vec![
-                Constraint::PaymentAmount {
+                Constraint::Known(KnownConstraint::PaymentAmount {
                     currency: expected.into(),
                     min: None,
                     max: Some(40000),
-                },
-                Constraint::PaymentBudget {
+                }),
+                Constraint::Known(KnownConstraint::PaymentBudget {
                     currency: expected.into(),
                     max: 50000,
-                },
+                }),
             ];
             let fulfillment = Fulfillment {
                 amount: Some(20000),
                 currency,
                 ..Default::default()
             };
-            let results = check_constraints(&constraints, &fulfillment, StrictnessMode::Strict);
+            let results = check_constraints(
+                &constraints,
+                &fulfillment,
+                StrictnessMode::Strict,
+                MandateMode::Autonomous,
+            );
 
             assert_eq!(results.len(), 2);
             assert_eq!(results[0].constraint_type, "payment.amount");
@@ -878,5 +1010,134 @@ mod tests {
                 assert_eq!(result.violations[0].kind, ViErrorKind::CurrencyMismatch);
             }
         }
+    }
+
+    fn unknown_constraint() -> Constraint {
+        serde_json::from_str(r#"{"type":"urn:example:experimental","scope":"wide"}"#).unwrap()
+    }
+
+    /// An open mandate rejects an unrecognized constraint whatever the
+    /// strictness setting says. The agent acts on its own in this mode, so a
+    /// constraint nothing can evaluate places no bound on what it may do.
+    #[test]
+    fn open_mandate_rejects_unknown_constraint_in_either_mode() {
+        for strictness in [StrictnessMode::Strict, StrictnessMode::Permissive] {
+            let results = check_constraints(
+                &[unknown_constraint()],
+                &Fulfillment::default(),
+                strictness,
+                MandateMode::Autonomous,
+            );
+
+            assert_eq!(results.len(), 1);
+            assert!(
+                !results[0].satisfied,
+                "an open mandate must reject an unknown constraint under {strictness:?}"
+            );
+            assert!(!results[0].skipped);
+            assert_eq!(
+                results[0].violations[0].kind,
+                ViErrorKind::UnknownConstraintType
+            );
+            assert_eq!(results[0].constraint_type, "urn:example:experimental");
+        }
+    }
+
+    /// Outside an open mandate the configured mode decides, which is the half
+    /// of the setting that had no effect while the representation was closed.
+    #[test]
+    fn strict_mode_rejects_unknown_constraint() {
+        let results = check_constraints(
+            &[unknown_constraint()],
+            &Fulfillment::default(),
+            StrictnessMode::Strict,
+            MandateMode::Immediate,
+        );
+
+        assert!(!results[0].satisfied);
+        assert!(!results[0].skipped);
+        assert_eq!(
+            results[0].violations[0].kind,
+            ViErrorKind::UnknownConstraintType
+        );
+    }
+
+    /// The permissive result is recorded as skipped rather than as a pass. A
+    /// caller that reads only `satisfied` would otherwise conclude the
+    /// constraint had been checked.
+    #[test]
+    fn permissive_mode_records_unknown_constraint_as_skipped() {
+        let results = check_constraints(
+            &[unknown_constraint()],
+            &Fulfillment::default(),
+            StrictnessMode::Permissive,
+            MandateMode::Immediate,
+        );
+
+        assert!(results[0].satisfied);
+        assert!(
+            results[0].skipped,
+            "a permissive result must record the skip"
+        );
+        assert!(results[0].violations.is_empty());
+        assert_eq!(results[0].constraint_type, "urn:example:experimental");
+    }
+
+    /// A recognized constraint is unaffected by either input, and its result is
+    /// never marked skipped.
+    #[test]
+    fn known_constraint_is_unaffected_by_strictness_and_mode() {
+        let constraints = vec![Constraint::Known(KnownConstraint::PaymentAmount {
+            currency: "USD".into(),
+            min: None,
+            max: Some(40000),
+        })];
+        let fulfillment = Fulfillment {
+            amount: Some(20000),
+            currency: Some("USD".into()),
+            ..Default::default()
+        };
+
+        for strictness in [StrictnessMode::Strict, StrictnessMode::Permissive] {
+            for mode in [MandateMode::Immediate, MandateMode::Autonomous] {
+                let results = check_constraints(&constraints, &fulfillment, strictness, mode);
+                assert!(results[0].satisfied, "{strictness:?} / {mode:?}");
+                assert!(!results[0].skipped, "{strictness:?} / {mode:?}");
+            }
+        }
+    }
+
+    /// A mixed list evaluates the recognized constraint and rejects the
+    /// unrecognized one rather than failing the whole list at parse time.
+    #[test]
+    fn unknown_constraint_does_not_prevent_evaluating_the_rest() {
+        let constraints: Vec<Constraint> = serde_json::from_str(
+            r#"[
+                {"type":"payment.amount","currency":"USD","max":40000},
+                {"type":"urn:example:experimental","scope":"wide"}
+            ]"#,
+        )
+        .unwrap();
+        let fulfillment = Fulfillment {
+            amount: Some(20000),
+            currency: Some("USD".into()),
+            ..Default::default()
+        };
+
+        let results = check_constraints(
+            &constraints,
+            &fulfillment,
+            StrictnessMode::Strict,
+            MandateMode::Autonomous,
+        );
+
+        assert_eq!(results.len(), 2);
+        assert!(results[0].satisfied);
+        assert_eq!(results[0].constraint_type, "payment.amount");
+        assert!(!results[1].satisfied);
+        assert_eq!(
+            results[1].violations[0].kind,
+            ViErrorKind::UnknownConstraintType
+        );
     }
 }

@@ -1,6 +1,6 @@
 //! Core data models for the Verifiable Intent credential chain.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 
 // ── JWK / Key material ───────────────────────────────────────────────
@@ -110,10 +110,10 @@ pub struct FulfillmentLineItem {
 
 // ── Constraints ──────────────────────────────────────────────────────
 
-/// Constraint types embedded in L2 Autonomous mandates.
+/// Constraint types this build recognizes and can evaluate.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type")]
-pub enum Constraint {
+pub enum KnownConstraint {
     /// Merchant allowlist for checkout mandates.
     #[serde(rename = "mandate.checkout.allowed_merchant")]
     AllowedMerchant { allowed_merchants: Vec<Entity> },
@@ -165,6 +165,94 @@ pub enum Constraint {
     /// Cross-reference between checkout and payment mandates.
     #[serde(rename = "payment.reference")]
     PaymentReference { conditional_transaction_id: String },
+}
+
+/// Every `type` tag `KnownConstraint` can deserialize.
+///
+/// This list decides what happens when a constraint carries a recognized tag
+/// but fails to deserialize. Such a value must surface the parse error. A tag
+/// missing here would instead let a malformed recognized constraint fall
+/// through to `Constraint::Unknown`, where a permissive policy skips it and the
+/// malformed input is silently ignored. `known_constraint_tags_are_complete`
+/// pins the list to the enum.
+const KNOWN_CONSTRAINT_TYPES: &[&str] = &[
+    "mandate.checkout.allowed_merchant",
+    "mandate.checkout.line_items",
+    "payment.allowed_payee",
+    "payment.amount",
+    "payment.budget",
+    "payment.recurrence",
+    "payment.agent_recurrence",
+    "payment.reference",
+];
+
+/// A constraint carried by an L2 open mandate.
+///
+/// The constraint model is extensible: implementations define their own types,
+/// and the registered set grows over time, so a verifier will meet tags newer
+/// than itself. An unrecognized constraint is kept verbatim rather than failing
+/// the whole evaluation at parse time, so that a strictness policy can decide
+/// what it means. The specification requires that every field of such a
+/// constraint survive parsing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Constraint {
+    /// A constraint type this build can evaluate.
+    Known(KnownConstraint),
+    /// A constraint type this build does not recognize, preserved in full.
+    Unknown {
+        constraint_type: String,
+        fields: serde_json::Map<String, serde_json::Value>,
+    },
+}
+
+impl Serialize for Constraint {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Constraint::Known(known) => known.serialize(serializer),
+            Constraint::Unknown {
+                constraint_type,
+                fields,
+            } => {
+                let mut object = serde_json::Map::with_capacity(fields.len() + 1);
+                object.insert(
+                    "type".to_owned(),
+                    serde_json::Value::String(constraint_type.clone()),
+                );
+                for (key, value) in fields {
+                    object.insert(key.clone(), value.clone());
+                }
+                object.serialize(serializer)
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Constraint {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+
+        let serde_json::Value::Object(mut object) = serde_json::Value::deserialize(deserializer)?
+        else {
+            return Err(D::Error::custom("constraint must be a JSON object"));
+        };
+        let Some(serde_json::Value::String(constraint_type)) = object.get("type").cloned() else {
+            return Err(D::Error::custom("constraint must carry a string `type`"));
+        };
+
+        match KnownConstraint::deserialize(serde_json::Value::Object(object.clone())) {
+            Ok(known) => Ok(Constraint::Known(known)),
+            Err(error) => {
+                if KNOWN_CONSTRAINT_TYPES.contains(&constraint_type.as_str()) {
+                    return Err(D::Error::custom(error));
+                }
+                object.remove("type");
+                Ok(Constraint::Unknown {
+                    constraint_type,
+                    fields: object,
+                })
+            }
+        }
+    }
 }
 
 // ── Mandate payloads ─────────────────────────────────────────────────
@@ -370,11 +458,11 @@ mod tests {
 
     #[test]
     fn constraint_serde_roundtrip() {
-        let c = Constraint::PaymentAmount {
+        let c = Constraint::Known(KnownConstraint::PaymentAmount {
             currency: "USD".into(),
             min: Some(10000),
             max: Some(40000),
-        };
+        });
         let json = serde_json::to_string(&c).unwrap();
         assert!(json.contains("payment.amount"));
         let back: Constraint = serde_json::from_str(&json).unwrap();
@@ -383,17 +471,84 @@ mod tests {
 
     #[test]
     fn constraint_merchant_serde_roundtrip() {
-        let c = Constraint::AllowedMerchant {
+        let c = Constraint::Known(KnownConstraint::AllowedMerchant {
             allowed_merchants: vec![Entity {
                 id: None,
                 name: "Test Store".into(),
                 website: "https://test.example.com".into(),
             }],
-        };
+        });
         let json = serde_json::to_string(&c).unwrap();
         assert!(json.contains("mandate.checkout.allowed_merchant"));
         let back: Constraint = serde_json::from_str(&json).unwrap();
         assert_eq!(c, back);
+    }
+
+    /// `KNOWN_CONSTRAINT_TYPES` decides whether a failed parse of a recognized
+    /// tag surfaces as an error or degrades into `Unknown`. Adding a variant
+    /// and forgetting the list would make that degradation silent, so pin one
+    /// against the other: every variant's serialized tag must appear in the
+    /// list, and the list must carry nothing the enum does not emit.
+    #[test]
+    fn known_constraint_tags_are_complete() {
+        let entity = || Entity {
+            id: None,
+            name: "n".into(),
+            website: "w".into(),
+        };
+        let every_variant = [
+            KnownConstraint::AllowedMerchant {
+                allowed_merchants: vec![entity()],
+            },
+            KnownConstraint::LineItems { items: vec![] },
+            KnownConstraint::AllowedPayee {
+                allowed_payees: vec![entity()],
+            },
+            KnownConstraint::PaymentAmount {
+                currency: "USD".into(),
+                min: None,
+                max: None,
+            },
+            KnownConstraint::PaymentBudget {
+                currency: "USD".into(),
+                max: 1,
+            },
+            KnownConstraint::PaymentRecurrence {
+                frequency: "MNTH".into(),
+                start_date: "2026-01-01".into(),
+                end_date: None,
+                number: None,
+            },
+            KnownConstraint::AgentRecurrence {
+                frequency: "MNTH".into(),
+                start_date: "2026-01-01".into(),
+                end_date: None,
+                max_occurrences: None,
+            },
+            KnownConstraint::PaymentReference {
+                conditional_transaction_id: "t".into(),
+            },
+        ];
+
+        let mut emitted: Vec<String> = every_variant
+            .iter()
+            .map(|variant| {
+                let value = serde_json::to_value(variant).unwrap();
+                value["type"].as_str().unwrap().to_owned()
+            })
+            .collect();
+        emitted.sort();
+
+        let mut declared: Vec<String> = KNOWN_CONSTRAINT_TYPES
+            .iter()
+            .map(|t| (*t).to_owned())
+            .collect();
+        declared.sort();
+
+        assert_eq!(
+            emitted, declared,
+            "KNOWN_CONSTRAINT_TYPES has drifted from the KnownConstraint variants"
+        );
     }
 
     #[test]
@@ -403,5 +558,95 @@ mod tests {
         assert_eq!(json, r#""autonomous""#);
         let back: MandateMode = serde_json::from_str(&json).unwrap();
         assert_eq!(m, back);
+    }
+
+    /// The constraint model is extensible and its registered set grows, so a
+    /// verifier will meet tags newer than itself. A representation that cannot
+    /// hold one has no way to apply a strictness policy to it.
+    #[test]
+    fn unknown_constraint_type_is_representable() {
+        let json = r#"{"type":"urn:example:loyalty-points","tier":"gold","points":42}"#;
+        let parsed: Constraint =
+            serde_json::from_str(json).expect("an unrecognized constraint type must parse");
+
+        let Constraint::Unknown {
+            constraint_type,
+            fields,
+        } = &parsed
+        else {
+            panic!("expected the unknown arm, got {parsed:?}");
+        };
+        assert_eq!(constraint_type, "urn:example:loyalty-points");
+        assert_eq!(fields.get("tier").and_then(|v| v.as_str()), Some("gold"));
+        assert_eq!(fields.get("points").and_then(|v| v.as_i64()), Some(42));
+    }
+
+    /// Preserving the payload is only worth anything if it survives a round
+    /// trip, which the specification requires.
+    #[test]
+    fn unknown_constraint_round_trips_with_every_field() {
+        let json = r#"{"type":"com.acme.shipping","nested":{"a":[1,2]},"flag":true}"#;
+        let parsed: Constraint = serde_json::from_str(json).unwrap();
+        let reserialized = serde_json::to_string(&parsed).unwrap();
+
+        let before: serde_json::Value = serde_json::from_str(json).unwrap();
+        let after: serde_json::Value = serde_json::from_str(&reserialized).unwrap();
+        assert_eq!(before, after);
+    }
+
+    /// An unrecognized type carrying nothing but `type` is still a constraint.
+    #[test]
+    fn bare_unknown_constraint_parses() {
+        let parsed: Constraint = serde_json::from_str(r#"{"type":"com.acme.bare"}"#).unwrap();
+        let Constraint::Unknown { fields, .. } = &parsed else {
+            panic!("expected the unknown arm, got {parsed:?}");
+        };
+        assert!(fields.is_empty());
+    }
+
+    /// The dangerous case, and the reason `KNOWN_CONSTRAINT_TYPES` exists. A
+    /// recognized tag that fails to deserialize must surface that error. If it
+    /// degraded into the unknown arm, a permissive policy would skip it and a
+    /// malformed recognized constraint would pass unreported.
+    #[test]
+    fn malformed_known_constraint_errors_rather_than_becoming_unknown() {
+        // `payment.amount` requires `currency`.
+        let err = serde_json::from_str::<Constraint>(r#"{"type":"payment.amount"}"#).unwrap_err();
+        assert!(
+            err.to_string().contains("currency"),
+            "expected a missing-field error, got: {err}"
+        );
+    }
+
+    /// A constraint has to be an object carrying a string `type`.
+    #[test]
+    fn malformed_constraint_shapes_are_rejected() {
+        assert!(serde_json::from_str::<Constraint>("[1,2]").is_err());
+        assert!(serde_json::from_str::<Constraint>(r#"{"currency":"USD"}"#).is_err());
+        assert!(serde_json::from_str::<Constraint>(r#"{"type":7}"#).is_err());
+    }
+
+    /// Recognized types are unaffected by the open representation.
+    #[test]
+    fn known_constraint_still_parses_into_its_variant() {
+        let json = r#"{"type":"payment.amount","currency":"USD","min":10000,"max":40000}"#;
+        let parsed: Constraint = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            parsed,
+            Constraint::Known(KnownConstraint::PaymentAmount { .. })
+        ));
+    }
+
+    /// The realistic shape: a vendor extension alongside registered types.
+    #[test]
+    fn mixed_constraint_list_parses_both_arms() {
+        let json = r#"[
+            {"type":"payment.amount","currency":"USD","max":40000},
+            {"type":"urn:example:experimental","scope":"wide"}
+        ]"#;
+        let parsed: Vec<Constraint> = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert!(matches!(parsed[0], Constraint::Known(_)));
+        assert!(matches!(parsed[1], Constraint::Unknown { .. }));
     }
 }
