@@ -47,9 +47,16 @@ const CANCELLATION_EVENT_TOOL_ARGS: &str = "{}";
 /// the session lock. The outer handler only needs to render the client-facing
 /// response, notifications, and logs from it — persistence is done.
 enum TerminalOutcome {
-    Success { response: String },
-    Cancelled,
-    Failed { error: String },
+    Success {
+        response: String,
+    },
+    Cancelled {
+        persist_error: Option<String>,
+    },
+    Failed {
+        error: String,
+        persist_error: Option<String>,
+    },
 }
 
 // ── Configuration ────────────────────────────────────────────────
@@ -1690,7 +1697,10 @@ impl AcpServer {
             // only after this — i.e. after terminal persistence has committed.
             match result {
                 Ok(success) => {
-                    Self::append_transcript(
+                    // Successful turns keep best-effort persistence: the client
+                    // already has the response, so a persist failure is logged
+                    // but not surfaced.
+                    let _ = Self::append_transcript(
                         persist_store,
                         persist_session_id,
                         success.new_messages,
@@ -1701,13 +1711,17 @@ impl AcpServer {
                     }
                 }
                 Err(failure) if was_cancelled => {
-                    Self::append_transcript(
+                    // The failed/cancelled durability contract is the whole point
+                    // of this change, so retain a persistence failure and surface
+                    // it to the caller instead of reporting a clean cancellation.
+                    let persist_error = Self::append_transcript(
                         persist_store,
                         persist_session_id,
                         Self::cancelled_turn_transcript(failure.new_messages),
                     )
-                    .await;
-                    TerminalOutcome::Cancelled
+                    .await
+                    .err();
+                    TerminalOutcome::Cancelled { persist_error }
                 }
                 Err(failure) => {
                     let error = failure.error.to_string();
@@ -1717,15 +1731,21 @@ impl AcpServer {
                     // invalid request doesn't accrete assistant-only failure
                     // markers into `session/load`. Only persist — with the
                     // marker — when the turn produced visible work.
-                    if !failure.new_messages.is_empty() {
+                    let persist_error = if failure.new_messages.is_empty() {
+                        None
+                    } else {
                         Self::append_transcript(
                             persist_store,
                             persist_session_id,
                             Self::failed_turn_transcript(failure.new_messages),
                         )
-                        .await;
+                        .await
+                        .err()
+                    };
+                    TerminalOutcome::Failed {
+                        error,
+                        persist_error,
                     }
-                    TerminalOutcome::Failed { error }
                 }
             }
         });
@@ -1830,7 +1850,7 @@ impl AcpServer {
         // notifications, and logs for each outcome.
         let result_text = match outcome {
             TerminalOutcome::Success { response } => response,
-            TerminalOutcome::Cancelled => {
+            TerminalOutcome::Cancelled { persist_error } => {
                 ::zeroclaw_log::record!(
                     INFO,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete).with_category(::zeroclaw_log::EventCategory::Channel)
@@ -1843,9 +1863,24 @@ impl AcpServer {
                 );
                 self.write_notification(&Self::turn_cancelled_notification(&session_id))
                     .await;
+                // The turn was cancelled live, but if its transcript could not be
+                // committed the durability contract was not met — surface that
+                // rather than reporting a clean cancellation.
+                if let Some(detail) = persist_error {
+                    return Err(RpcError {
+                        code: INTERNAL_ERROR,
+                        message: format!(
+                            "Turn cancelled, but its transcript could not be persisted and may be lost on reload: {detail}"
+                        ),
+                        data: None,
+                    });
+                }
                 return Ok(Self::cancelled_prompt_result(session_id, &accumulated_text));
             }
-            TerminalOutcome::Failed { error } => {
+            TerminalOutcome::Failed {
+                error,
+                persist_error,
+            } => {
                 ::zeroclaw_log::record!(
                     ERROR,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_category(::zeroclaw_log::EventCategory::Channel)
@@ -1855,9 +1890,15 @@ impl AcpServer {
                         })),
                     "ACP session/prompt turn failed"
                 );
+                let message = match persist_error {
+                    Some(detail) => format!(
+                        "Agent turn failed: {error} (its transcript also could not be persisted: {detail})"
+                    ),
+                    None => format!("Agent turn failed: {error}"),
+                };
                 return Err(RpcError {
                     code: INTERNAL_ERROR,
-                    message: format!("Agent turn failed: {error}"),
+                    message,
                     data: None,
                 });
             }
@@ -2175,16 +2216,21 @@ impl AcpServer {
     /// the live session continues in memory. Shared by the successful, failed,
     /// and cancelled turn paths so every terminal outcome preserves its
     /// user-visible transcript across `session/load`.
+    /// Persist a terminal turn transcript. Returns `Ok(())` when the rows were
+    /// committed (or there was nothing to persist), and `Err(detail)` when the
+    /// SQLite append or its blocking task failed, so callers enforcing the
+    /// failed/cancelled durability contract can surface the loss instead of
+    /// reporting a clean terminal result.
     async fn append_transcript(
         store: Option<Arc<AcpSessionStore>>,
         session_id: String,
         messages: Vec<ConversationMessage>,
-    ) {
+    ) -> Result<(), String> {
         let Some(store) = store else {
-            return;
+            return Ok(());
         };
         if messages.is_empty() {
-            return;
+            return Ok(());
         }
         let persisted =
             tokio::task::spawn_blocking(move || store.append_turn(&session_id, &messages)).await;
@@ -2193,17 +2239,21 @@ impl AcpServer {
             Ok(Err(e)) => Some(e.to_string()),
             Err(join) => Some(join.to_string()),
         };
-        if let Some(detail) = error {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_category(::zeroclaw_log::EventCategory::Channel)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({
-                        "error": detail,
-                    })),
-                "Failed to persist turn; session continues in memory"
-            );
+        match error {
+            None => Ok(()),
+            Some(detail) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Channel)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "error": detail,
+                        })),
+                    "Failed to persist turn; session continues in memory"
+                );
+                Err(detail)
+            }
         }
     }
 
@@ -5542,7 +5592,8 @@ mod tests {
             session_id.to_string(),
             AcpServer::failed_turn_transcript(failed_turn),
         )
-        .await;
+        .await
+        .expect("failed-turn transcript must persist to a healthy store");
 
         let data = store
             .load_session(session_id)
@@ -5859,6 +5910,35 @@ mod tests {
             "failed turn must end with the turn-failed marker: {:?}",
             data.messages
         );
+    }
+
+    #[tokio::test]
+    async fn append_transcript_surfaces_persistence_failure() {
+        use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
+
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+
+        // `append_turn` errors for a session with no record. `append_transcript`
+        // must propagate that as `Err` so a failed/cancelled turn can surface the
+        // lost transcript instead of reporting a clean terminal result.
+        let failed = AcpServer::append_transcript(
+            Some(Arc::clone(&store)),
+            "no-such-session".to_string(),
+            vec![ConversationMessage::Chat(ChatMessage::user("hi"))],
+        )
+        .await;
+        assert!(
+            failed.is_err(),
+            "a failed store append must surface as Err, not a silent success"
+        );
+
+        // Nothing to persist stays a best-effort `Ok` no-op.
+        let empty =
+            AcpServer::append_transcript(Some(store), "no-such-session".to_string(), Vec::new())
+                .await;
+        assert!(empty.is_ok(), "an empty transcript is a no-op success");
     }
 
     #[tokio::test]
