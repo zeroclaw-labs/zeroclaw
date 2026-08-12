@@ -159,6 +159,9 @@ zc-doctor-detail-title = 详情
 zc-doctor-no-selection = 未选择诊断
 zc-doctor-label-message = 消息
 zc-doctor-help-mouse = 鼠标：点击筛选/选择，滚轮滚动
+zc-doctor-error-daemon-timeout = Doctor 检查超时。守护进程可能繁忙、不可达或正在处理长时间运行的请求。请重试或检查守护进程连接。
+zc-doctor-partial-banner = ⚠ 部分结果——模型探测超时
+zc-doctor-partial-hint = 部分提供商目录无法访问。下方显示配置、工作区和守护进程的检查结果。按刷新键重试。
 zc-dashboard-tab-overview = 概览
 zc-dashboard-tab-sessions = 会话
 zc-dashboard-tab-agents = 代理
@@ -496,3 +499,5 @@ zc-config-footer-action-back-to-skills = 返回技能
 zc-config-footer-action-help = 帮助
 zc-config-footer-action-new-line = 换行
 zc-config-field-edit-hint = { $keys } → 按下以编辑
+
+zc-doctor-log-path = 日志：{ $path }

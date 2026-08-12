@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use std::io::Write;
 use std::path::Path;
-use zeroclaw_config::schema::Config;
+use zeroclaw_config::schema::{Config, UNCONFIGURED_CONTEXT_WINDOW_FALLBACK};
 
 const DAEMON_STALE_SECONDS: i64 = 30;
 const SCHEDULER_STALE_SECONDS: i64 = 120;
@@ -150,7 +150,7 @@ fn collapse_model_probes(probes: Vec<(String, ModelProbe)>) -> Vec<DiagResult> {
     out
 }
 
-async fn probe_models(config: &Config) -> Vec<DiagResult> {
+pub(crate) async fn probe_models(config: &Config) -> Vec<DiagResult> {
     let targets = doctor_model_targets(config, None);
     let mut probes = Vec::with_capacity(targets.len());
 
@@ -237,6 +237,48 @@ pub async fn run_structured(config: &Config) -> Vec<DiagResult> {
     results.extend(check_codex_auth_wiring(config).await);
     results.extend(probe_models(config).await);
     results
+}
+
+/// Run Doctor with a per-phase timeout for the network-dependent probe phase.
+///
+/// Returns partial results if `probe_models` exceeds `probe_timeout`, along
+/// with a `timed_out_phase` label so callers can surface the incomplete state
+/// to the user.  The synchronous `diagnose` and the Codex auth check always
+/// run to completion first, so the common config/workspace/daemon diagnostics
+/// are never lost to a slow provider catalog endpoint.
+pub async fn run_structured_with_timeout(
+    config: &Config,
+    probe_timeout: std::time::Duration,
+) -> (Vec<DiagResult>, Option<String>) {
+    run_structured_with_probe(config, probe_timeout, Box::pin(probe_models(config))).await
+}
+
+/// Same contract as [`run_structured_with_timeout`], with the probe phase
+/// injectable. Production callers pass `Box::pin(probe_models(config))`; tests
+/// pass a controlled future so both sides of the deadline are exercised
+/// deterministically instead of depending on a real network boundary.
+pub(crate) async fn run_structured_with_probe(
+    config: &Config,
+    probe_timeout: std::time::Duration,
+    probe: std::pin::Pin<Box<dyn std::future::Future<Output = Vec<DiagResult>> + Send + '_>>,
+) -> (Vec<DiagResult>, Option<String>) {
+    let mut results = diagnose(config);
+    results.extend(check_codex_auth_wiring(config).await);
+
+    let (probe_results, timed_out) = match tokio::time::timeout(probe_timeout, probe).await {
+        Ok(probes) => (probes, None),
+        Err(_) => {
+            let msg = crate::i18n::get_required_cli_string("cli-doctor-probe-timeout-message");
+            results.push(DiagResult {
+                severity: Severity::Warn,
+                category: "doctor".into(),
+                message: msg,
+            });
+            (vec![], Some("probe_models".into()))
+        }
+    };
+    results.extend(probe_results);
+    (results, timed_out)
 }
 
 /// Run diagnostics and print human-readable report to stdout.
@@ -331,7 +373,34 @@ fn classify_model_probe_error(err_message: &str) -> ModelProbeOutcome {
 
 fn doctor_model_targets(config: &Config, provider_override: Option<&str>) -> Vec<String> {
     if let Some(model_provider) = provider_override.map(str::trim).filter(|p| !p.is_empty()) {
-        return vec![model_provider.to_string()];
+        if model_provider.contains('.') {
+            return vec![model_provider.to_string()];
+        }
+
+        // A bare family name expands to every alias configured under it.
+        // Passing it through undotted reaches `create_model_provider_with_options`,
+        // which nulls `provider_api_url` and never looks the alias up — so the
+        // probe silently used the family's compiled-in default endpoint and
+        // reported a self-hosted gateway as unreachable at an address the
+        // operator never configured. Expanding here keeps the same invariant
+        // the orchestrator states for `/models`: a bare family must never
+        // construct a provider that ignores `[providers.models.<f>.<alias>]`.
+        let mut aliases: Vec<String> = config
+            .providers
+            .models
+            .aliases_of(model_provider)
+            .map(ToString::to_string)
+            .collect();
+        aliases.sort();
+        if aliases.is_empty() {
+            // Unknown or unconfigured family: hand the raw name downstream so
+            // the existing "no such provider" diagnostics still fire.
+            return vec![model_provider.to_string()];
+        }
+        return aliases
+            .into_iter()
+            .map(|alias| format!("{model_provider}.{alias}"))
+            .collect();
     }
 
     config
@@ -1093,6 +1162,42 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
                 items.push(DiagItem::ok(cat, format!("{label}: model: {model}")));
             } else {
                 items.push(DiagItem::warn(cat, format!("{label}: no model configured")));
+            }
+
+            // A missing value remains unknown until this profile is selected;
+            // zero is explicitly invalid because it leaves recovery with no
+            // usable model-context budget.
+            match entry.context_window {
+                Some(0) => items.push(DiagItem::error(
+                    cat,
+                    crate::i18n::get_required_cli_string_with_args(
+                        "cli-doctor-context-window-zero",
+                        &[("provider_ref", &label)],
+                    ),
+                )),
+                Some(context_window) => items.push(DiagItem::ok(
+                    cat,
+                    crate::i18n::get_required_cli_string_with_args(
+                        "cli-doctor-context-window-ok",
+                        &[
+                            ("provider_ref", &label),
+                            ("context_window", &context_window.to_string()),
+                        ],
+                    ),
+                )),
+                None => items.push(DiagItem::warn(
+                    cat,
+                    crate::i18n::get_required_cli_string_with_args(
+                        "cli-doctor-context-window-unset",
+                        &[
+                            ("provider_ref", &label),
+                            (
+                                "fallback",
+                                &UNCONFIGURED_CONTEXT_WINDOW_FALLBACK.to_string(),
+                            ),
+                        ],
+                    ),
+                )),
             }
 
             // Temperature range
@@ -1909,6 +2014,89 @@ mod tests {
     }
 
     #[test]
+    fn context_window_diagnostics_distinguish_unset_explicit_and_zero_profiles() {
+        let mut unset = Config::default();
+        let profile = unset
+            .providers
+            .models
+            .ensure("ollama", "local")
+            .expect("known model provider type");
+        profile.model = Some("qwen3".to_string());
+
+        let mut unset_items = Vec::new();
+        check_config_semantics(&unset, &mut unset_items);
+        let unset_message = crate::i18n::get_required_cli_string_with_args(
+            "cli-doctor-context-window-unset",
+            &[
+                ("provider_ref", "ollama.local"),
+                (
+                    "fallback",
+                    &UNCONFIGURED_CONTEXT_WINDOW_FALLBACK.to_string(),
+                ),
+            ],
+        );
+        let unset_item = unset_items
+            .iter()
+            .find(|item| item.message == unset_message)
+            .expect("unset profile must produce the localized warning");
+        assert_eq!(unset_item.severity, Severity::Warn);
+
+        let mut explicit = unset.clone();
+        explicit
+            .providers
+            .models
+            .ensure("ollama", "local")
+            .expect("known model provider type")
+            .context_window = Some(32_000);
+        let mut explicit_items = Vec::new();
+        check_config_semantics(&explicit, &mut explicit_items);
+        let explicit_message = crate::i18n::get_required_cli_string_with_args(
+            "cli-doctor-context-window-ok",
+            &[
+                ("provider_ref", "ollama.local"),
+                ("context_window", "32000"),
+            ],
+        );
+        let explicit_item = explicit_items
+            .iter()
+            .find(|item| item.message == explicit_message)
+            .expect("explicit profile must produce the localized OK result");
+        assert_eq!(explicit_item.severity, Severity::Ok);
+
+        let unset_warnings = unset_items
+            .iter()
+            .filter(|item| item.severity == Severity::Warn)
+            .count();
+        let explicit_warnings = explicit_items
+            .iter()
+            .filter(|item| item.severity == Severity::Warn)
+            .count();
+        assert_eq!(
+            unset_warnings,
+            explicit_warnings + 1,
+            "an unset context window must add exactly one doctor warning"
+        );
+
+        let mut zero = explicit;
+        zero.providers
+            .models
+            .ensure("ollama", "local")
+            .expect("known model provider type")
+            .context_window = Some(0);
+        let mut zero_items = Vec::new();
+        check_config_semantics(&zero, &mut zero_items);
+        let zero_message = crate::i18n::get_required_cli_string_with_args(
+            "cli-doctor-context-window-zero",
+            &[("provider_ref", "ollama.local")],
+        );
+        let zero_item = zero_items
+            .iter()
+            .find(|item| item.message == zero_message)
+            .expect("zero context window must produce the localized error");
+        assert_eq!(zero_item.severity, Severity::Error);
+    }
+
+    #[test]
     fn config_validation_warns_no_channels() {
         let config = Config::default();
         let mut items = Vec::new();
@@ -2102,8 +2290,6 @@ mod tests {
         let config = config_with_install_root(&tmp);
         let state_dir = tmp.path().join("state");
         std::fs::create_dir_all(&state_dir).unwrap();
-        // A directory where the cache file is expected produces a read
-        // error that is not `NotFound` — distinct from the missing-file case.
         let cache_path = state_dir.join(MODEL_CACHE_FILE);
         std::fs::create_dir_all(&cache_path).unwrap();
 
@@ -2124,11 +2310,6 @@ mod tests {
         let state_dir = tmp.path().join("state");
         std::fs::create_dir_all(&state_dir).unwrap();
 
-        // Plant a symlink at the *old* fixed temp-file name, pointing outside
-        // the cache directory. The old `cache_path.with_extension("json.tmp")`
-        // scheme would write through this predictable path and truncate the
-        // decoy; the new unique/exclusive tempfile-based path must never pick
-        // this name at all.
         let decoy = tmp.path().join("decoy.json");
         std::fs::write(&decoy, "untouched").unwrap();
         std::os::unix::fs::symlink(&decoy, state_dir.join("models_cache.json.tmp")).unwrap();
@@ -2166,9 +2347,6 @@ mod tests {
             .expect("known model_provider type")
             .uri = Some(server.uri());
 
-        // Make the cache destination unwritable: `state` exists as a plain
-        // file, so `create_dir_all` inside `persist_model_cache` fails even
-        // though the provider fetch itself succeeds.
         std::fs::write(tmp.path().join("state"), "not a directory").unwrap();
 
         let result = run_models(&config, Some("ollama.default"), false, false).await;
@@ -2177,6 +2355,210 @@ mod tests {
             result.is_err(),
             "a targeted refresh must fail the command when the fetched catalog cannot be persisted, \
              even though the network fetch itself succeeded"
+        );
+    }
+
+    /// Regression test: the probe-phase timeout path must preserve the
+    /// pre-probe diagnostics and set `timed_out_phase` when the probe exceeds
+    /// the deadline. The probe future is injected (`std::future::pending`), so
+    /// the timeout branch is forced deterministically — no dependency on a real
+    /// network endpoint that may or may not hang.
+    #[tokio::test]
+    async fn run_structured_with_timeout_preserves_prior_diagnostics() {
+        use std::time::Duration;
+
+        let config = Config::default();
+
+        // A never-completing probe forces the timeout branch on every run.
+        let (results, timed_out_phase) = run_structured_with_probe(
+            &config,
+            Duration::from_millis(100),
+            Box::pin(std::future::pending::<Vec<DiagResult>>()),
+        )
+        .await;
+
+        // Pre-probe diagnostics (config, workspace, daemon, environment, CLI tools)
+        // must survive the timeout.
+        assert!(
+            results.iter().any(|r| r.category == "config"),
+            "config diagnostics must survive probe timeout"
+        );
+        assert!(
+            results.iter().any(|r| r.category == "workspace"),
+            "workspace diagnostics must survive probe timeout"
+        );
+        assert!(
+            results.iter().any(|r| r.category == "daemon"),
+            "daemon diagnostics must survive probe timeout"
+        );
+
+        // The timeout warning must be present and resolve to the localized
+        // probe-timeout copy, independent of the ambient locale.
+        let expected_warning =
+            crate::i18n::get_required_cli_string("cli-doctor-probe-timeout-message");
+        assert!(
+            !expected_warning.contains("{cli-doctor-probe-timeout-message}"),
+            "probe-timeout key must resolve in the active locale"
+        );
+        let timeout_warning = results.iter().find(|r| r.message == expected_warning);
+        assert!(
+            timeout_warning.is_some(),
+            "probe timeout must append a timeout warning to results"
+        );
+        let timeout_warning = timeout_warning.expect("checked above");
+        assert_eq!(timeout_warning.category, "doctor");
+        assert_eq!(timeout_warning.severity, Severity::Warn);
+
+        // The warning must be appended exactly once, not duplicated by
+        // re-running the probe.
+        assert_eq!(
+            results
+                .iter()
+                .filter(|r| r.message == expected_warning)
+                .count(),
+            1,
+            "probe timeout must append exactly one timeout warning"
+        );
+
+        // timed_out_phase must identify the probe phase.
+        assert_eq!(
+            timed_out_phase,
+            Some("probe_models".to_string()),
+            "timed_out_phase must identify the probe phase"
+        );
+    }
+
+    /// Regression test: when the probe completes under the deadline,
+    /// `timed_out_phase` must be `None` and an actual probe result must be
+    /// retained in the output — not dropped or replaced by a timeout warning.
+    #[tokio::test]
+    async fn run_structured_with_timeout_under_deadline() {
+        use std::time::Duration;
+
+        let config = Config::default();
+
+        // A probe that completes immediately with a real result — this proves
+        // completed probe rows survive to the output, which the old
+        // no-providers-under-deadline case could not exercise.
+        let probe_result = DiagResult {
+            severity: Severity::Ok,
+            category: "probe.mock".into(),
+            message: "mock probe ok".into(),
+        };
+        let (results, timed_out_phase) = run_structured_with_probe(
+            &config,
+            Duration::from_secs(5),
+            Box::pin(async move { vec![probe_result] }),
+        )
+        .await;
+
+        // The probe result must survive to the output.
+        assert!(
+            results.iter().any(|r| r.message == "mock probe ok"),
+            "under-deadline probe results must be retained"
+        );
+
+        // No timeout warning should be present (compared via the same Fluent
+        // lookup the production path uses, so the check is locale-independent).
+        let expected_warning =
+            crate::i18n::get_required_cli_string("cli-doctor-probe-timeout-message");
+        assert!(
+            !results.iter().any(|r| r.message == expected_warning),
+            "under-deadline run must not append timeout warning"
+        );
+
+        // timed_out_phase must be None.
+        assert_eq!(
+            timed_out_phase, None,
+            "timed_out_phase must be None when probe completes under deadline"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bare_family_probes_the_configured_endpoint_not_the_compiled_default() {
+        // The regression: `--model-provider ollama` (bare) used to reach
+        // `create_model_provider_with_options`, which nulls the resolved API
+        // URL, so the probe hit the family's compiled-in default instead of
+        // the operator's `uri`. Self-hosted gateways were reported unreachable
+        // at an address nobody configured. The mock asserts on drop that the
+        // request actually arrived here.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v1/models"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "data": [{"id": "llama3", "object": "model"}]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = config_with_install_root(&tmp);
+        config
+            .providers
+            .models
+            .ensure("ollama", "homelab")
+            .expect("known model_provider type")
+            .uri = Some(format!("{}/v1", server.uri()));
+
+        run_models(&config, Some("ollama"), false, false)
+            .await
+            .expect("a bare family with one configured alias must probe that alias");
+    }
+
+    #[test]
+    fn a_bare_family_expands_to_every_configured_alias() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = config_with_install_root(&tmp);
+        for alias in ["homelab", "workstation"] {
+            config
+                .providers
+                .models
+                .ensure("ollama", alias)
+                .expect("known model_provider type")
+                .uri = Some("http://example.invalid".to_owned());
+        }
+
+        assert_eq!(
+            doctor_model_targets(&config, Some("ollama")),
+            vec!["ollama.homelab".to_owned(), "ollama.workstation".to_owned()],
+            "a bare family must fan out to its aliases rather than collapse to a config-less default"
+        );
+    }
+
+    #[test]
+    fn an_unconfigured_family_still_reaches_the_downstream_diagnostics() {
+        // Nothing configured under the family: keep handing the raw name down
+        // so the existing "no such provider" error text is what the user sees,
+        // rather than an empty target list that silently probes nothing.
+        let tmp = TempDir::new().unwrap();
+        let config = config_with_install_root(&tmp);
+        assert_eq!(
+            doctor_model_targets(&config, Some("ollama")),
+            vec!["ollama".to_owned()]
+        );
+        assert_eq!(
+            doctor_model_targets(&config, Some("nonsense")),
+            vec!["nonsense".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_dotted_ref_is_passed_through_untouched() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = config_with_install_root(&tmp);
+        config
+            .providers
+            .models
+            .ensure("ollama", "homelab")
+            .expect("known model_provider type")
+            .uri = Some("http://example.invalid".to_owned());
+
+        assert_eq!(
+            doctor_model_targets(&config, Some("ollama.homelab")),
+            vec!["ollama.homelab".to_owned()]
         );
     }
 

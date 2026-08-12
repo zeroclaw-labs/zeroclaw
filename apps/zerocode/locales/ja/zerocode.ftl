@@ -159,6 +159,9 @@ zc-doctor-detail-title = 詳細
 zc-doctor-no-selection = 診断が選択されていません
 zc-doctor-label-message = メッセージ
 zc-doctor-help-mouse = マウス: フィルター/選択をクリック、スクロールホイール
+zc-doctor-error-daemon-timeout = Doctor のチェックがタイムアウトしました。デーモンがビジー、到達不能、または長時間のリクエストを処理中である可能性があります。再試行するか、デーモンへの接続を確認してください。
+zc-doctor-partial-banner = ⚠ 部分的な結果: モデル調査がタイムアウトしました
+zc-doctor-partial-hint = 一部のプロバイダーカタログに到達できませんでした。設定、ワークスペース、デーモンのチェック結果は以下に表示されます。更新キーを押して再試行してください。
 zc-dashboard-tab-overview = 概要
 zc-dashboard-tab-sessions = セッション
 zc-dashboard-tab-agents = エージェント
@@ -496,3 +499,5 @@ zc-config-footer-action-back-to-skills = スキルに戻る
 zc-config-footer-action-help = ヘルプ
 zc-config-footer-action-new-line = 改行
 zc-config-field-edit-hint = { $keys } → 押して編集
+
+zc-doctor-log-path = log: { $path }

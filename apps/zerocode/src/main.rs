@@ -42,6 +42,7 @@ mod mouse;
 mod quickstart_pane;
 mod sop_pane;
 mod terminal_backend;
+mod text_navigation;
 mod theme;
 mod todo_tracker;
 mod turn_status;
@@ -260,6 +261,28 @@ fn confirm_insecure_tls(url: &str) -> anyhow::Result<InsecureTlsChoice> {
     confirm_insecure_tls_with(stdin.lock(), &mut stderr, url)
 }
 
+/// Apply the operator's [`InsecureTlsChoice`] for `url`: a no-op for
+/// `Once`, persisting the route acknowledgement for `Always`, or
+/// bailing out for `Abort`. Extracted from the inline match in `run()`
+/// so the choice -> side-effect mapping can be exercised directly in
+/// tests without a running daemon.
+fn apply_insecure_tls_choice(
+    choice: InsecureTlsChoice,
+    config_dir: &std::path::Path,
+    url: &str,
+) -> anyhow::Result<()> {
+    match choice {
+        InsecureTlsChoice::Once => {}
+        InsecureTlsChoice::Always => {
+            config::persist_wss_route_ack(config_dir, url)?;
+        }
+        InsecureTlsChoice::Abort => {
+            anyhow::bail!("aborted: insecure TLS connection not confirmed");
+        }
+    }
+    Ok(())
+}
+
 async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -374,15 +397,7 @@ async fn run() -> anyhow::Result<()> {
         }
         ConnectTarget::Wss { url, skip_verify } => {
             if *skip_verify && !loaded_config.connection.wss.tls.route_acked(url) {
-                match confirm_insecure_tls(url)? {
-                    InsecureTlsChoice::Once => {}
-                    InsecureTlsChoice::Always => {
-                        config::persist_wss_route_ack(&local_config_dir, url)?;
-                    }
-                    InsecureTlsChoice::Abort => {
-                        anyhow::bail!("aborted: insecure TLS connection not confirmed");
-                    }
-                }
+                apply_insecure_tls_choice(confirm_insecure_tls(url)?, &local_config_dir, url)?;
             }
             #[cfg(unix)]
             {
@@ -1232,10 +1247,10 @@ mod confirm_insecure_tls_tests {
     //!    — the empty / `n` / junk / uppercase-`N` / default branches all
     //!    return [`InsecureTlsChoice::Abort`].
     //! 2. "Decline/abort paths leave no persisted insecure-TLS choice"
-    //!    — the static-source test
-    //!    [`abort_arm_of_confirm_match_must_not_call_persist`] enforces
-    //!    the structural invariant that the `Abort` arm of the production
-    //!    match in `run()` does not invoke `persist_wss_route_ack`.
+    //!    — covered behaviorally by `apply_insecure_tls_choice_tests`,
+    //!    which executes the production choice -> side-effect seam
+    //!    (`crate::apply_insecure_tls_choice`) for `Once`, `Always`, and
+    //!    `Abort` and asserts persistence only happens for `Always`.
     //! 3. "Mode transition tests cover the quickstart/chat handoff" is
     //!    covered by the existing `connection_tests::flag_connect_*` /
     //!    `config_uri_*` / `skip_verify_*` tests; this issue does not
@@ -1341,84 +1356,94 @@ mod confirm_insecure_tls_tests {
              got: {stderr}"
         );
     }
+}
 
-    /// Static invariant, insecure-TLS acceptance criterion 2:
-    /// "Decline/abort paths leave no persisted insecure-TLS choice."
-    ///
-    /// `confirm_insecure_tls` is called from `run()` in a `match` that
-    /// decides whether to invoke `persist_wss_route_ack`. Persisting on
-    /// the `Abort` branch would silently store an insecure-TLS choice
-    /// the operator explicitly declined — a security-sensitive
-    /// regression that no other test in the suite catches.
-    ///
-    /// Rather than spawn the full CLI / daemon / config-dir stack to
-    /// exercise the abort path end-to-end, this test inspects the
-    /// production source of `main.rs` and asserts the `Abort` arm does
-    /// not contain the persist call. This is a structural guard: any
-    /// future move of `persist_wss_route_ack(...)` into the abort arm
-    /// trips this test loudly.
+#[cfg(test)]
+mod apply_insecure_tls_choice_tests {
+    //! Behavior-level tests for [`crate::apply_insecure_tls_choice`], the
+    //! test seam extracted from the `Once` / `Always` / `Abort` match
+    //! that used to live inline in `run()`. These tests execute the
+    //! production choice -> side-effect path directly (no source-text
+    //! inspection) against a temporary config directory:
+    //!
+    //! - `Once` must not persist a route acknowledgement.
+    //! - `Always` must persist the confirmed route, and only that route.
+    //! - `Abort` must return the exact production error and persist
+    //!   nothing.
+    //! - `Always` must not disturb unrelated, pre-existing config
+    //!   sections on disk.
+
+    use super::*;
+
+    const URL: &str = "wss://example.invalid:8443/";
+
     #[test]
-    fn abort_arm_of_confirm_match_must_not_call_persist() {
-        const MAIN_SRC: &str = include_str!("main.rs");
-        const MATCH_OPEN: &str = "match confirm_insecure_tls(url)? {";
-        const ABORT_ARM_LABEL: &str = "InsecureTlsChoice::Abort";
-        const PERSIST_CALL: &str = "persist_wss_route_ack(&local_config_dir, url)?";
-
-        let match_open_idx = MAIN_SRC
-            .find(MATCH_OPEN)
-            .unwrap_or_else(|| panic!("main.rs must contain a `{MATCH_OPEN}` block"));
-        // Locate the matching closing brace by scanning for the first
-        // `}\n` after the open that is preceded by another `}` at the
-        // same indentation depth. The match block in `run()` is
-        // followed by code at lower indentation, so we use a simple
-        // brace-pair scan: every `{` increments depth, every `}`
-        // decrements, and depth 0 is the close.
-        let after_open = match_open_idx + MATCH_OPEN.len();
-        let mut depth: usize = 1;
-        let mut idx = after_open;
-        let bytes = MAIN_SRC.as_bytes();
-        while idx < bytes.len() {
-            match bytes[idx] {
-                b'{' => depth += 1,
-                b'}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        break;
-                    }
-                }
-                _ => {}
-            }
-            idx += 1;
-        }
+    fn once_does_not_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        apply_insecure_tls_choice(InsecureTlsChoice::Once, dir.path(), URL)
+            .expect("Once must not error");
+        let cfg = config::ensure_and_load(dir.path()).unwrap();
         assert!(
-            depth == 0,
-            "match block in main.rs does not close cleanly (depth={depth} at idx={idx})"
+            !cfg.connection.wss.tls.route_acked(URL),
+            "Once must leave no route acknowledgement behind"
         );
-        let match_block = &MAIN_SRC[match_open_idx..=idx];
+    }
 
-        // Slice just the Abort arm: from `InsecureTlsChoice::Abort` to
-        // the next `=>` (the arm label terminator) or the end of the
-        // block.
-        let abort_label_idx = match_block.find(ABORT_ARM_LABEL).unwrap_or_else(|| {
-            panic!(
-                "main.rs match block must include `{ABORT_ARM_LABEL}` arm; \
-                 got block:\n{match_block}"
-            )
-        });
-        let arm_tail_start = match_block[abort_label_idx..]
-            .find("=>")
-            .map(|i| abort_label_idx + i + "=>".len())
-            .unwrap_or(match_block.len());
-        // The arm body extends to the end of the match block (we slice
-        // up to the closing brace which was at `idx`). Subtract 1 to
-        // exclude the `}` itself.
-        let abort_arm_body = &match_block[arm_tail_start..match_block.len() - 1];
+    #[test]
+    fn always_persists_exact_route() {
+        let dir = tempfile::tempdir().unwrap();
+        apply_insecure_tls_choice(InsecureTlsChoice::Always, dir.path(), URL)
+            .expect("Always must not error");
+        let cfg = config::ensure_and_load(dir.path()).unwrap();
         assert!(
-            !abort_arm_body.contains(PERSIST_CALL),
-            "Abort arm of `match confirm_insecure_tls(url)?` MUST NOT call \
-             `{PERSIST_CALL}` — persisting on Abort would silently store an \
-             insecure-TLS choice the operator declined. Found in arm body:\n\
-             {abort_arm_body}"
+            cfg.connection.wss.tls.route_acked(URL),
+            "Always must persist the confirmed route"
+        );
+        assert_eq!(
+            cfg.connection.wss.tls.skip_verify_routes,
+            vec![URL.to_string()],
+            "Always must store exactly the confirmed route, unmutated"
+        );
+    }
+
+    #[test]
+    fn abort_returns_error_and_persists_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = apply_insecure_tls_choice(InsecureTlsChoice::Abort, dir.path(), URL)
+            .expect_err("Abort must return an error");
+        assert!(
+            err.to_string()
+                .contains("aborted: insecure TLS connection not confirmed"),
+            "unexpected error message: {err}"
+        );
+        let cfg = config::ensure_and_load(dir.path()).unwrap();
+        assert!(
+            !cfg.connection.wss.tls.route_acked(URL),
+            "Abort must leave no route acknowledgement behind"
+        );
+    }
+
+    #[test]
+    fn always_preserves_unrelated_config() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            config::config_path(dir.path()),
+            "[theme]\nname = \"nord\"\n\n[future]\nkeep = true\n",
+        )
+        .unwrap();
+
+        apply_insecure_tls_choice(InsecureTlsChoice::Always, dir.path(), URL)
+            .expect("Always must not error");
+
+        let on_disk = std::fs::read_to_string(config::config_path(dir.path())).unwrap();
+        let doc: toml::Table = toml::from_str(&on_disk).unwrap();
+        assert_eq!(doc["theme"]["name"].as_str(), Some("nord"));
+        assert_eq!(doc["future"]["keep"].as_bool(), Some(true));
+
+        let cfg = config::ensure_and_load(dir.path()).unwrap();
+        assert!(
+            cfg.connection.wss.tls.route_acked(URL),
+            "Always must persist the confirmed route alongside unrelated sections"
         );
     }
 }

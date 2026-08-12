@@ -662,4 +662,120 @@ mod tests {
             "unclosed fullwidth DSML must not be recoverable"
         );
     }
+
+    /// REGRESSION: lookalike attribute names (`tool_name="shell"`,
+    /// `is_string="true"`) must not become a known executable call anywhere in
+    /// the parse-then-detect pipeline. Each vector is paired with the OTHER
+    /// canonical attribute so a pre-fix parser produced a call from the
+    /// lookalike alone.
+    #[test]
+    fn lookalike_dsml_attributes_parse_then_runtime_no_executable_call() {
+        let response = concat!(
+            "<｜DSML｜tool_calls>\n",
+            "<｜DSML｜invoke tool_name=\"shell\">\n",
+            "<｜DSML｜parameter name=\"command\" is_string=\"true\">ls</｜DSML｜parameter>\n",
+            "</｜DSML｜invoke>\n",
+            "</｜DSML｜tool_calls>"
+        );
+        let (_, calls) = zeroclaw_tool_call_parser::parse_tool_calls(response);
+        assert!(
+            calls.is_empty(),
+            "lookalike attributes must not become a known call"
+        );
+        let known: HashSet<String> = ["shell".to_string()].into_iter().collect();
+        assert!(
+            detect_tool_call_parse_issue_for_known_tools(response, &calls, &known).is_none(),
+            "the lookalike envelope is visible text, not an executable call or an issue"
+        );
+    }
+
+    /// REGRESSION: an unclosed ASCII envelope followed by a complete
+    /// same-family wrapper must not borrow the later close; the runtime
+    /// detector must fail closed instead of executing combined content.
+    #[test]
+    fn unclosed_ascii_dsml_then_valid_wrapper_parse_then_runtime_is_issue() {
+        let response = concat!(
+            "<|DSML|>\n",
+            "{\"name\":\"shell\",\"arguments\":{\"command\":\"rm -rf /tmp/x\"}}\n",
+            "<|DSML|>\n",
+            "{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}\n",
+            "</|DSML|>"
+        );
+        let (_, calls) = zeroclaw_tool_call_parser::parse_tool_calls(response);
+        assert!(
+            calls.is_empty(),
+            "borrowed close must not execute malformed combined content"
+        );
+        let known: HashSet<String> = ["shell".to_string()].into_iter().collect();
+        assert!(
+            detect_tool_call_parse_issue_for_known_tools(response, &calls, &known).is_some(),
+            "parse-then-detect must fail closed on the unclosed first envelope"
+        );
+    }
+
+    /// REGRESSION: the fullwidth wrapper has the same close-borrowing exposure.
+    #[test]
+    fn unclosed_fullwidth_dsml_then_valid_wrapper_parse_then_runtime_is_issue() {
+        let response = concat!(
+            "<｜DSML｜tool_calls>\n",
+            "<｜DSML｜invoke name=\"shell\">\n",
+            "<｜DSML｜parameter name=\"command\" string=\"true\">rm -rf /tmp/x</｜DSML｜parameter>\n",
+            "</｜DSML｜invoke>\n",
+            "<｜DSML｜tool_calls>\n",
+            "<｜DSML｜invoke name=\"shell\">\n",
+            "<｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter>\n",
+            "</｜DSML｜invoke>\n",
+            "</｜DSML｜tool_calls>"
+        );
+        let (_, calls) = zeroclaw_tool_call_parser::parse_tool_calls(response);
+        assert!(
+            calls.is_empty(),
+            "fullwidth wrapper must not borrow the later close"
+        );
+        let known: HashSet<String> = ["shell".to_string()].into_iter().collect();
+        assert!(
+            detect_tool_call_parse_issue_for_known_tools(response, &calls, &known).is_some(),
+            "parse-then-detect must fail closed on the unclosed first fullwidth wrapper"
+        );
+    }
+
+    /// REGRESSION: a DSML example inside a CommonMark blockquoted backtick
+    /// fence stays visible with no call and no issue, without depending on
+    /// prose keywords.
+    #[test]
+    fn blockquoted_backtick_fenced_dsml_example_parse_then_runtime_is_visible_text() {
+        let response = "> ```xml\n\
+            > <｜DSML｜tool_calls>\n\
+            > <｜DSML｜invoke name=\"shell\">\n\
+            > <｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter>\n\
+            > </｜DSML｜invoke>\n\
+            > </｜DSML｜tool_calls>\n\
+            > ```";
+        let (_, calls) = zeroclaw_tool_call_parser::parse_tool_calls(response);
+        assert!(calls.is_empty());
+        let known: HashSet<String> = ["shell".to_string()].into_iter().collect();
+        assert!(
+            detect_tool_call_parse_issue_for_known_tools(response, &calls, &known).is_none(),
+            "blockquoted DSML documentation must not be flagged or executed"
+        );
+    }
+
+    /// REGRESSION: the blockquoted tilde fence has the same exposure.
+    #[test]
+    fn blockquoted_tilde_fenced_dsml_example_parse_then_runtime_is_visible_text() {
+        let response = "> ~~~xml\n\
+            > <｜DSML｜tool_calls>\n\
+            > <｜DSML｜invoke name=\"shell\">\n\
+            > <｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter>\n\
+            > </｜DSML｜invoke>\n\
+            > </｜DSML｜tool_calls>\n\
+            > ~~~";
+        let (_, calls) = zeroclaw_tool_call_parser::parse_tool_calls(response);
+        assert!(calls.is_empty());
+        let known: HashSet<String> = ["shell".to_string()].into_iter().collect();
+        assert!(
+            detect_tool_call_parse_issue_for_known_tools(response, &calls, &known).is_none(),
+            "blockquoted tilde-fenced DSML documentation must not be flagged or executed"
+        );
+    }
 }

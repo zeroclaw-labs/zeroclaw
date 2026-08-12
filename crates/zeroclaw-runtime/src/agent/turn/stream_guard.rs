@@ -167,7 +167,8 @@ impl StreamTextGuard {
         if let Some(release) = self.evaluate_pending(true) {
             return Some(release);
         }
-        if self.suppressed_protocol || self.pending.is_empty() {
+        // evaluate_pending may have suppressed and cleared the buffer.
+        if self.pending.is_empty() {
             return None;
         }
         if looks_like_malformed_tool_protocol_envelope_for_known_tools(
@@ -176,7 +177,34 @@ impl StreamTextGuard {
         ) {
             return self.suppress_protocol(&self.narration_before_candidate());
         }
+        // The final fragment is classified on its own merits, not by whether an
+        // unrelated envelope was suppressed earlier in the turn. Pending text
+        // that still carries a protocol signal (a truncated envelope, a close
+        // marker fragment) must not leak; anything else -- including narration
+        // that merely ends in '<' -- is released. A turn-global
+        // `suppressed_protocol` check here would eat valid EOF text like
+        // `Compare 2 <` just because envelope A appeared earlier.
+        if self.pending_has_protocol_signal_at_finish(&self.pending) {
+            return None;
+        }
         Some(std::mem::take(&mut self.pending))
+    }
+
+    /// Protocol signals that still make the FINAL pending fragment unsafe to
+    /// forward at EOF. Deliberately narrower than [`Self::tail_has_protocol_signal`]:
+    /// fragments that merely START with a suspicious prefix or carry an
+    /// embedded partial marker (e.g. `plain <｜dsmldata`) are released, not
+    /// swallowed -- only complete-but-malformed envelopes and close-marker
+    /// fragments must fail closed.
+    fn pending_has_protocol_signal_at_finish(&self, pending: &str) -> bool {
+        contains_truncated_ascii_dsml_envelope(pending)
+            || contains_truncated_fullwidth_dsml_envelope(pending)
+            || contains_tool_protocol_tag_call(pending)
+            || contains_close_tag_marker(pending)
+            || looks_like_malformed_tool_protocol_envelope_for_known_tools(
+                pending,
+                &self.known_tool_names,
+            )
     }
 
     fn evaluate_pending(&mut self, finalizing: bool) -> Option<String> {
@@ -246,15 +274,34 @@ impl StreamTextGuard {
             scan = end;
         }
         let tail = &self.pending[scan..];
+        let mut carried: Option<String> = None;
         if !self.tail_has_protocol_signal(tail) {
-            let tail = tail.trim();
-            if !tail.is_empty() {
-                parts.push(tail.to_string());
+            if let Some(partial) = find_incomplete_protocol_candidate_start(tail) {
+                // The tail ends in an incomplete marker (e.g. a bare '<' that
+                // could open `<|DSML|>` / `<｜DSML｜...>` / `<＼DSML＼...>`).
+                // Carry it into the next push instead of forwarding it: the
+                // next delta may complete the marker, and envelope B must still
+                // be recognized and suppressed rather than leaking as text.
+                let before_partial = tail[..partial].trim();
+                if !before_partial.is_empty() {
+                    parts.push(before_partial.to_string());
+                }
+                carried = Some(tail[partial..].to_string());
+            } else {
+                let tail = tail.trim();
+                if !tail.is_empty() {
+                    parts.push(tail.to_string());
+                }
             }
         }
 
-        self.pending.clear();
-        self.pending_candidate_start = None;
+        if let Some(carried) = carried {
+            self.pending = carried;
+            self.pending_candidate_start = Some(0);
+        } else {
+            self.pending.clear();
+            self.pending_candidate_start = None;
+        }
         self.suppressed_protocol = true;
         self.suppress_forwarding = true;
         if parts.is_empty() {
@@ -1037,6 +1084,256 @@ mod tests {
         assert!(
             !guard.suppressed_protocol,
             "tilde-fenced documentation must not be suppressed"
+        );
+    }
+
+    /// REGRESSION: a DSML example inside a CommonMark blockquoted backtick
+    /// fence must stay visible in the STREAM, independent of prose keywords.
+    #[test]
+    fn streamed_blockquoted_backtick_fenced_dsml_example_stays_visible() {
+        let mut guard = shell_guard();
+
+        assert_eq!(
+            guard.push("> ```xml\n> <｜DSML｜tool_calls>\n> <｜DSML｜invoke name=\"shell\">\n"),
+            Some(
+                "> ```xml\n> <｜DSML｜tool_calls>\n> <｜DSML｜invoke name=\"shell\">\n".to_string()
+            ),
+            "blockquoted backtick-fenced documentation must remain visible"
+        );
+        assert_eq!(
+            guard.push("> <｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter>\n> </｜DSML｜invoke>\n> </｜DSML｜tool_calls>\n> ```\nEnd."),
+            Some("> <｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter>\n> </｜DSML｜invoke>\n> </｜DSML｜tool_calls>\n> ```\nEnd.".to_string())
+        );
+        assert_eq!(guard.finish(), None);
+        assert!(
+            !guard.suppressed_protocol,
+            "blockquoted backtick-fenced documentation must not be suppressed"
+        );
+    }
+
+    /// REGRESSION: the blockquoted tilde fence has the same streaming exposure.
+    #[test]
+    fn streamed_blockquoted_tilde_fenced_dsml_example_stays_visible() {
+        let mut guard = shell_guard();
+
+        assert_eq!(
+            guard.push("> ~~~xml\n> <｜DSML｜tool_calls>\n> <｜DSML｜invoke name=\"shell\">\n"),
+            Some(
+                "> ~~~xml\n> <｜DSML｜tool_calls>\n> <｜DSML｜invoke name=\"shell\">\n".to_string()
+            ),
+            "blockquoted tilde-fenced documentation must remain visible"
+        );
+        assert_eq!(
+            guard.push("> <｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter>\n> </｜DSML｜invoke>\n> </｜DSML｜tool_calls>\n> ~~~\nEnd."),
+            Some("> <｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter>\n> </｜DSML｜invoke>\n> </｜DSML｜tool_calls>\n> ~~~\nEnd.".to_string())
+        );
+        assert_eq!(guard.finish(), None);
+        assert!(
+            !guard.suppressed_protocol,
+            "blockquoted tilde-fenced documentation must not be suppressed"
+        );
+    }
+
+    /// REGRESSION: a blockquoted ```tool_call fence is an EXECUTABLE protocol
+    /// fence, not documentation: with a real call inside it must be suppressed,
+    /// proving the container-prefix fix does not white-list tool fences. Only
+    /// the bare blockquote marker before the fence is narration.
+    #[test]
+    fn streamed_blockquoted_tool_call_fence_with_call_is_suppressed() {
+        let mut guard = shell_guard();
+
+        assert_eq!(
+            guard.push(
+                "> ```tool_call\n> {\"name\":\"shell\",\"arguments\":{\"command\":\"pwd\"}}\n> ```"
+            ),
+            Some(">".to_string()),
+            "the blockquote marker before the fence is narration; the fence itself must be buffered"
+        );
+        assert_eq!(guard.finish(), None);
+        assert!(
+            guard.suppressed_protocol,
+            "a blockquoted tool_call fence without an example trailer is a protocol leak"
+        );
+    }
+
+    /// REGRESSION: the fullwidth marker has the same carry exposure as ASCII:
+    /// envelope A plus narration ending in '<' must carry the marker so a
+    /// following `｜DSML｜tool_calls>` delta is still recognized.
+    #[test]
+    fn suppressed_fullwidth_envelope_then_partial_marker_recognizes_next_envelope() {
+        let mut guard = shell_guard();
+
+        let delta_a = concat!(
+            "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"shell\">\n<｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+            " Mid <"
+        );
+        assert_eq!(
+            guard.push(delta_a),
+            Some("Mid".to_string()),
+            "narration before the trailing '<' is released; the '<' itself is carried"
+        );
+        assert_eq!(
+            guard.push("｜DSML｜tool_calls>\n"),
+            None,
+            "fullwidth envelope B continues from the carried '<' and must not be forwarded"
+        );
+        assert_eq!(
+            guard.push("<｜DSML｜invoke name=\"shell\">\n<｜DSML｜parameter name=\"command\" string=\"true\">pwd</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"),
+            None,
+            "fullwidth envelope B's body must not leak"
+        );
+        assert_eq!(guard.finish(), None);
+        assert!(
+            guard.suppressed_protocol,
+            "fullwidth envelope B opened across the carried marker must be suppressed"
+        );
+    }
+
+    /// REGRESSION: the carry path must preserve LONGER partial markers too.
+    /// After envelope A, ` Mid <|DS` carries `<|DS`; the next delta completes
+    /// `<|DSML|>` and envelope B is still recognized.
+    #[test]
+    fn suppressed_envelope_then_multi_char_partial_marker_recognizes_next_envelope() {
+        let mut guard = shell_guard();
+
+        let delta_a = concat!(
+            "<|DSML|>invoke name=\"shell\"><|DSML|>parameter name=\"command\" string=\"true\">ls</|DSML|>parameter></|DSML|>invoke></|DSML|>tool_calls>",
+            " Mid <|DS"
+        );
+        assert_eq!(
+            guard.push(delta_a),
+            Some("Mid".to_string()),
+            "narration before the partial marker is released; `<|DS` is carried"
+        );
+        assert_eq!(
+            guard.push("ML|>\n"),
+            None,
+            "envelope B continues from the carried `<|DS` and must not be forwarded"
+        );
+        assert_eq!(
+            guard.push("{\"name\":\"shell\",\"arguments\":{\"cmd\":\"pwd\"}}\n</|DSML|>"),
+            None
+        );
+        assert_eq!(guard.finish(), None);
+        assert!(
+            guard.suppressed_protocol,
+            "envelope B opened across the carried multi-char marker must be suppressed"
+        );
+    }
+
+    /// REGRESSION: a carried bare '<' that never grows into a marker at EOF is
+    /// classified on its own merits: it is not a protocol signal, so it is
+    /// released rather than swallowed by the earlier suppression.
+    #[test]
+    fn carried_bare_angle_bracket_is_released_at_eof() {
+        let mut guard = shell_guard();
+
+        assert_eq!(
+            guard.push(
+                "<|DSML|>invoke name=\"shell\"><|DSML|>parameter name=\"command\" string=\"true\">ls</|DSML|>parameter></|DSML|>invoke></|DSML|>tool_calls> Mid <"
+            ),
+            Some("Mid".to_string()),
+            "narration is released and the bare '<' is carried"
+        );
+        assert_eq!(
+            guard.finish(),
+            Some("<".to_string()),
+            "the carried bare '<' that never completed a marker is released at EOF"
+        );
+        assert!(guard.suppressed_protocol);
+    }
+
+    /// REGRESSION: the STREAM path must also fail closed on the close-borrow
+    /// shape. An unclosed ASCII envelope followed by a valid same-family
+    /// wrapper arrives as one guarded stream; it must be suppressed, not
+    /// executed from malformed combined content.
+    #[test]
+    fn streamed_borrow_shape_unclosed_ascii_envelope_is_suppressed() {
+        let mut guard = shell_guard();
+
+        assert_eq!(
+            guard.push("<|DSML|>\n"),
+            None,
+            "the unclosed first envelope must be buffered"
+        );
+        assert_eq!(
+            guard.push("{\"name\":\"shell\",\"arguments\":{\"command\":\"rm -rf /tmp/x\"}}\n"),
+            None
+        );
+        assert_eq!(
+            guard.push("<|DSML|>\n"),
+            None,
+            "a second opener before any close must not be treated as clean text"
+        );
+        assert_eq!(
+            guard.push("{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}\n</|DSML|>"),
+            None,
+            "the borrowed close must not resolve the malformed combined content"
+        );
+        assert_eq!(guard.finish(), None);
+        assert!(
+            guard.suppressed_protocol,
+            "the borrow shape must be suppressed end to end in the stream"
+        );
+    }
+
+    /// REGRESSION: after envelope A is suppressed, narration ending in a bare
+    /// '<' inside the SAME delta must carry that '<' as pending state, so the
+    /// next delta that completes `<|DSML|>` is still recognized as envelope B
+    /// instead of leaking its protocol text.
+    #[test]
+    fn suppressed_envelope_then_partial_marker_recognizes_next_envelope() {
+        let mut guard = shell_guard();
+
+        let delta_a = concat!(
+            "<|DSML|>invoke name=\"shell\"><|DSML|>parameter name=\"command\" string=\"true\">ls</|DSML|>parameter></|DSML|>invoke></|DSML|>tool_calls>",
+            " Mid <"
+        );
+        assert_eq!(
+            guard.push(delta_a),
+            Some("Mid".to_string()),
+            "narration before the trailing '<' is released; the '<' itself is carried"
+        );
+        assert_eq!(
+            guard.push("|DSML|>\n"),
+            None,
+            "envelope B continues from the carried '<' and must not be forwarded"
+        );
+        assert_eq!(
+            guard.push("{\"name\":\"shell\",\"arguments\":{\"cmd\":\"pwd\"}}\n</|DSML|>"),
+            None,
+            "envelope B's body must not leak"
+        );
+        assert_eq!(guard.finish(), None);
+        assert!(
+            guard.suppressed_protocol,
+            "envelope B opened across the carried marker must be suppressed"
+        );
+    }
+
+    /// REGRESSION: finish() must classify the final pending fragment on its own
+    /// merits. A valid EOF fragment like `Compare 2 <` must be released even
+    /// when an unrelated envelope was suppressed earlier in the turn.
+    #[test]
+    fn suppressed_envelope_then_valid_eof_fragment_is_released() {
+        let mut guard = shell_guard();
+
+        assert_eq!(
+            guard.push(
+                "<|DSML|>invoke name=\"shell\"><|DSML|>parameter name=\"command\" string=\"true\">ls</|DSML|>parameter></|DSML|>invoke></|DSML|>tool_calls>"
+            ),
+            None,
+            "standalone envelope must be suppressed"
+        );
+        assert_eq!(
+            guard.push("Compare 2 <"),
+            None,
+            "the trailing '<' is buffered as a possible marker start"
+        );
+        assert_eq!(
+            guard.finish(),
+            Some("Compare 2 <".to_string()),
+            "valid EOF text must not disappear because an envelope was suppressed earlier"
         );
     }
 }
