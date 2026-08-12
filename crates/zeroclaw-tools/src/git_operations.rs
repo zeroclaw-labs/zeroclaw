@@ -452,8 +452,9 @@ impl GitOperationsTool {
     /// Enumerate the working-tree paths a `git stash` action would create,
     /// replace, or delete. `push`/`save` revert tracked modifications (and,
     /// with `include_untracked`, remove untracked files); `pop` writes the
-    /// stashed contents back. Both mutation sets come from Git itself so the
-    /// check covers exactly what Git is about to touch.
+    /// stashed contents back, including any untracked files the entry was
+    /// created with (`git stash push -u`). Both mutation sets come from Git
+    /// itself so the check covers exactly what Git is about to touch.
     async fn stash_mutation_set(
         &self,
         action: &str,
@@ -465,9 +466,17 @@ impl GitOperationsTool {
 
         if action == "pop" {
             // `stash show` defaults to the most recent entry — the same one
-            // `stash pop` restores.
+            // `stash pop` restores. `--include-untracked` is required: without
+            // it Git lists only the tracked half of the entry, so files stored
+            // by `git stash push -u` would be restored over `deny_write`
+            // targets without ever entering the mutation set. Fails closed on
+            // any enumeration error, including Git versions that do not accept
+            // the flag.
             let restored = self
-                .run_git_command(&["stash", "show", "--name-only"], working_dir)
+                .run_git_command(
+                    &["stash", "show", "--name-only", "--include-untracked"],
+                    working_dir,
+                )
                 .await
                 .map_err(|e| {
                     anyhow::Error::msg(format!(
@@ -1035,8 +1044,10 @@ impl GitOperationsTool {
             }
             "pop" => {
                 // `pop` writes the stashed contents back over the working
-                // tree, so the restored path set is checked the same way.
-                if let Err(e) = self.preflight_stash(action, false, &[], working_dir).await {
+                // tree, so the restored path set is checked the same way. A
+                // pop always restores the entry's untracked half too, so the
+                // mutation set is enumerated with untracked entries included.
+                if let Err(e) = self.preflight_stash(action, true, &[], working_dir).await {
                     return Ok(ToolResult {
                         success: false,
                         output: ToolOutput::default(),
@@ -2480,6 +2491,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stash_pop_rejected_when_it_would_restore_a_denied_untracked_file() {
+        // `git stash show --name-only` reports only the tracked half of an
+        // entry, so an entry created with `-u` can carry a `deny_write` path
+        // that never appears in the mutation set unless untracked entries are
+        // enumerated explicitly.
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+
+        // `.env` is untracked here, so only `git stash push -u` captures it.
+        std::fs::write(root.join(".env"), "SECRET=stashed").unwrap();
+        std::process::Command::new("git")
+            .args(["stash", "push", "-u", "-m", "fixture"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(
+            !root.join(".env").exists(),
+            "fixture precondition: the untracked file must be in the stash, not the worktree"
+        );
+
+        let tool = deny_write_git_tool(&root, ".env");
+        let result = tool
+            .execute(json!({"operation": "stash", "action": "pop"}))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "stash pop must be blocked when the entry's untracked half writes a deny_write path"
+        );
+        assert!(
+            !root.join(".env").exists(),
+            "a blocked pop must not restore the untracked protected file"
+        );
+    }
+
+    #[tokio::test]
     async fn add_rejected_when_it_would_stage_a_deny_read_file() {
         // Staging hashes the file's bytes into the object store, so `add` is a
         // read of every path it touches even though the working tree is
@@ -2701,6 +2750,39 @@ mod tests {
             std::fs::read_to_string(root.join("notes.txt")).unwrap(),
             "initial",
             "the permitted file should have been reverted by the stash"
+        );
+    }
+
+    #[tokio::test]
+    async fn stash_pop_succeeds_when_untracked_entries_are_permitted() {
+        // The untracked half of the entry is enumerated, so a pop must still
+        // succeed when nothing in it is denied.
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &[".env"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+
+        std::fs::write(root.join("scratch.txt"), "untracked work").unwrap();
+        std::process::Command::new("git")
+            .args(["stash", "push", "-u", "-m", "fixture"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let tool = deny_write_git_tool(&root, ".env");
+        let result = tool
+            .execute(json!({"operation": "stash", "action": "pop"}))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "popping an entry with only permitted untracked paths must work: {:?}",
+            result.error
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("scratch.txt")).unwrap(),
+            "untracked work",
+            "the permitted untracked file should have been restored"
         );
     }
 }
