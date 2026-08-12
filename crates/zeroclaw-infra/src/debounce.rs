@@ -86,6 +86,21 @@ impl MessageDebouncer {
         self.debounce_inner(sender_key, message, window).await
     }
 
+    /// Cancel and remove an open accumulation bucket.
+    ///
+    /// Dropping the bucket's result sender wakes its receiver with an error,
+    /// so callers can retire any position reserved for the cancelled turn.
+    /// The next message for the same key always opens a fresh bucket.
+    pub async fn cancel(&self, sender_key: &str) -> bool {
+        let entry = self.entries.lock().await.remove(sender_key);
+        if let Some(entry) = entry {
+            entry.timer_handle.abort();
+            true
+        } else {
+            false
+        }
+    }
+
     async fn debounce_inner(
         &self,
         sender_key: &str,
@@ -244,6 +259,31 @@ mod tests {
 
         assert_eq!(rx_a.await.unwrap(), "hi alice");
         assert_eq!(rx_b.await.unwrap(), "hi bob");
+    }
+
+    #[tokio::test]
+    async fn cancel_makes_the_next_message_open_a_fresh_bucket() {
+        let debouncer = MessageDebouncer::new(Duration::from_millis(50));
+        let cancelled = match debouncer.debounce("user1", "before stop").await {
+            DebounceResult::Pending { rx, extended } => {
+                assert!(!extended);
+                rx
+            }
+            DebounceResult::Passthrough(_) => panic!("expected Pending"),
+        };
+
+        assert!(debouncer.cancel("user1").await);
+        assert!(cancelled.await.is_err());
+
+        let fresh = match debouncer.debounce("user1", "after stop").await {
+            DebounceResult::Pending { rx, extended } => {
+                assert!(!extended);
+                rx
+            }
+            DebounceResult::Passthrough(_) => panic!("expected Pending"),
+        };
+        assert_eq!(fresh.await.unwrap(), "after stop");
+        assert!(!debouncer.cancel("user1").await);
     }
 
     #[tokio::test]
