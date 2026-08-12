@@ -3,7 +3,8 @@
 use std::collections::HashSet;
 use zeroclaw_tool_call_parser::{
     ParsedToolCall, ToolProtocolEnvelopeKind, classify_tool_protocol_envelope,
-    contains_tool_protocol_tag_call, looks_like_malformed_tool_protocol_envelope,
+    contains_tool_protocol_tag_call, contains_truncated_ascii_dsml_envelope,
+    contains_truncated_fullwidth_dsml_envelope, looks_like_malformed_tool_protocol_envelope,
     looks_like_malformed_tool_protocol_envelope_for_known_tools, looks_like_tool_protocol_envelope,
     looks_like_tool_protocol_example, tool_protocol_envelope_mentions_known_tool,
 };
@@ -11,8 +12,27 @@ use zeroclaw_tool_call_parser::{
 pub(crate) fn longest_suffix_matching_prefix(text: &str, pattern: &str) -> usize {
     (1..pattern.len())
         .rev()
-        .find(|&len| text.ends_with(&pattern[..len]))
+        .find(|&len| pattern.is_char_boundary(len) && text.ends_with(&pattern[..len]))
         .unwrap_or(0)
+}
+
+fn ends_with_partial_marker(text: &str) -> Option<usize> {
+    let lower = text.to_ascii_lowercase();
+    let mut best: Option<usize> = None;
+    for marker in [
+        "<|dsml|",
+        "<|tool_call|",
+        "<｜dsml｜",
+        "<｜tool_call｜",
+        "<＼dsml＼",
+        "<＼tool_call＼",
+    ] {
+        let matched = longest_suffix_matching_prefix(&lower, marker);
+        if matched >= 1 {
+            best = Some(best.map_or(matched, |current| current.max(matched)));
+        }
+    }
+    best.map(|matched| text.len() - matched)
 }
 
 pub(crate) fn find_embedded_protocol_candidate_start(text: &str) -> Option<usize> {
@@ -25,6 +45,10 @@ pub(crate) fn find_embedded_protocol_candidate_start(text: &str) -> Option<usize
         "<tool-call",
         "<invoke",
         "<function",
+        "<|dsml",
+        "<|tool_call",
+        "<｜dsml",
+        "<＼dsml",
         "```tool",
         "```invoke",
         "```json",
@@ -53,6 +77,10 @@ pub(crate) fn find_incomplete_protocol_candidate_start(text: &str) -> Option<usi
         "<tool",
         "<invoke",
         "<function",
+        "<|dsml",
+        "<|tool_call",
+        "<｜dsml",
+        "<＼dsml",
         "```tool",
         "```invoke",
         "```json",
@@ -60,6 +88,10 @@ pub(crate) fn find_incomplete_protocol_candidate_start(text: &str) -> Option<usi
         if let Some(idx) = lower.rfind(pattern) {
             earliest = Some(earliest.map_or(idx, |current| current.min(idx)));
         }
+    }
+
+    if let Some(partial_start) = ends_with_partial_marker(text) {
+        earliest = Some(earliest.map_or(partial_start, |current| current.min(partial_start)));
     }
 
     for delimiter in ['{', '['] {
@@ -89,6 +121,10 @@ pub(crate) fn starts_suspicious_protocol_prefix(text: &str) -> bool {
         || lower.starts_with("<tool")
         || lower.starts_with("<invoke")
         || lower.starts_with("<function")
+        || lower.starts_with("<|dsml")
+        || lower.starts_with("<|tool_call")
+        || lower.starts_with("<｜dsml")
+        || lower.starts_with("<＼dsml")
         || lower.starts_with("```tool")
         || lower.starts_with("```invoke")
         || lower.starts_with("```json")
@@ -99,10 +135,336 @@ pub(crate) fn starts_suspicious_tag_or_fence_prefix(text: &str) -> bool {
     lower.starts_with("<tool")
         || lower.starts_with("<invoke")
         || lower.starts_with("<function")
+        || lower.starts_with("<|dsml")
+        || lower.starts_with("<|tool_call")
+        || lower.starts_with("<｜dsml")
+        || lower.starts_with("<＼dsml")
         || lower.starts_with("```tool")
         || lower.starts_with("```invoke")
         || lower.starts_with("```json")
         || lower.starts_with("[tool_call]")
+}
+
+pub(crate) fn contains_close_tag_marker(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "</tool_call",
+        "</toolcall",
+        "</tool-call",
+        "</invoke",
+        "</function",
+        "</|dsml|",
+        "</|tool_call|",
+        "</｜dsml｜",
+        "</｜dsml",
+        "</＼dsml＼",
+        "</＼dsml",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+/// Lowercase close-marker prefixes for tool-protocol envelopes. Shared by the
+/// envelope-boundary and continuation-fragment helpers below.
+const SUPPRESSED_CLOSE_MARKERS: [&str; 12] = [
+    "</|dsml|>",
+    "</｜dsml｜",
+    "</＼dsml＼",
+    "</|tool_call|>",
+    "</tool_call>",
+    "</tool_calls>",
+    "</toolcall>",
+    "</tool-call>",
+    "</invoke>",
+    "</function",
+    "</minimax:tool_call>",
+    "</minimax:toolcall>",
+];
+
+fn is_plain_tag_name(seg: &str) -> bool {
+    !seg.is_empty()
+        && seg
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | ':'))
+}
+
+fn first_json_value_end(input: &str) -> Option<usize> {
+    for (byte_idx, ch) in input.char_indices() {
+        if ch != '{' && ch != '[' {
+            continue;
+        }
+        let slice = &input[byte_idx..];
+        let mut stream = serde_json::Deserializer::from_str(slice).into_iter::<serde_json::Value>();
+        if let Some(Ok(_)) = stream.next() {
+            let consumed = stream.byte_offset();
+            if consumed > 0 {
+                return Some(byte_idx + consumed);
+            }
+        }
+    }
+    None
+}
+
+pub(crate) fn protocol_envelope_end(text: &str, start: usize) -> Option<usize> {
+    let rest = text.get(start..)?;
+    let lower = rest.to_ascii_lowercase();
+
+    if let Some(body) = rest.strip_prefix("```") {
+        if let Some(close) = body.find("```") {
+            return Some(start + 3 + close + 3);
+        }
+        return None;
+    }
+
+    let mut best: Option<usize> = None;
+    for marker in SUPPRESSED_CLOSE_MARKERS {
+        let Some(rel) = lower.rfind(marker) else {
+            continue;
+        };
+        let tail = &rest[rel + marker.len()..];
+        let end = match tail.find('>') {
+            Some(idx)
+                if tail[..idx].trim_start().is_empty()
+                    || is_plain_tag_name(tail[..idx].trim_start()) =>
+            {
+                rel + marker.len() + idx + 1
+            }
+            _ => rel + marker.len(),
+        };
+        best = Some(best.map_or(end, |current: usize| current.max(end)));
+    }
+    if let Some(end) = best {
+        return Some(start + end);
+    }
+
+    if rest.starts_with('{') || rest.starts_with('[') {
+        return first_json_value_end(rest).map(|end| start + end);
+    }
+    for open in ["<|dsml|>", "<｜dsml｜", "<＼dsml＼", "<|tool_call|>"] {
+        if !lower.starts_with(open) {
+            continue;
+        }
+        let mut body = &rest[open.len()..];
+        let mut body_offset = open.len();
+        if let Some(idx) = body.find('>')
+            && is_plain_tag_name(body[..idx].trim_start())
+        {
+            body = &body[idx + 1..];
+            body_offset += idx + 1;
+        }
+        if let Some(end) = first_json_value_end(body) {
+            return Some(start + body_offset + end);
+        }
+        break;
+    }
+
+    None
+}
+
+pub(crate) fn first_protocol_envelope_end(text: &str, start: usize) -> Option<usize> {
+    let rest = text.get(start..)?;
+    let lower = rest.to_ascii_lowercase();
+
+    if let Some(body) = rest.strip_prefix("```") {
+        if let Some(close) = body.find("```") {
+            return Some(start + 3 + close + 3);
+        }
+        return None;
+    }
+
+    if rest.starts_with('{') || rest.starts_with('[') {
+        return first_json_value_end(rest).map(|end| start + end);
+    }
+
+    for (open, close) in [
+        ("<|dsml|>", "</|dsml|>"),
+        ("<|tool_call|>", "</|tool_call|>"),
+        ("<｜dsml｜", "</｜dsml｜"),
+        ("<＼dsml＼", "</＼dsml＼"),
+    ] {
+        if !lower.starts_with(open) {
+            continue;
+        }
+        let mut body = &rest[open.len()..];
+        let mut body_offset = open.len();
+        if let Some(idx) = body.find('>')
+            && is_plain_tag_name(body[..idx].trim_start())
+        {
+            body = &body[idx + 1..];
+            body_offset += idx + 1;
+        }
+        let body_lower = body.to_ascii_lowercase();
+        let mut scan = 0usize;
+        while let Some(rel) = body_lower[scan..].find(close) {
+            let idx = scan + rel;
+            let tail = &body[idx + close.len()..];
+            let trimmed = tail.trim_start();
+            if let Some(after) = trimmed.strip_prefix("tool_calls") {
+                let end = if after.trim_start().starts_with('>') {
+                    idx + close.len()
+                        + (tail.len() - trimmed.len())
+                        + "tool_calls".len()
+                        + after.trim_start().find('>').unwrap()
+                        + 1
+                } else {
+                    idx + close.len()
+                };
+                return Some(start + body_offset + end);
+            }
+            if trimmed.starts_with("invoke")
+                || trimmed.starts_with("parameter")
+                || trimmed.starts_with("tool_call")
+            {
+                scan = idx + close.len();
+                continue;
+            }
+            return Some(start + body_offset + idx + close.len());
+        }
+        if let Some(end) = first_json_value_end(body) {
+            return Some(start + body_offset + end);
+        }
+        return None;
+    }
+
+    let open = lower
+        .split_whitespace()
+        .next()
+        .and_then(|tok| {
+            TOOL_PROTOCOL_OPEN_CLOSES
+                .iter()
+                .find(|(o, _)| tok.starts_with(o))
+        })
+        .map(|(_, c)| *c);
+    let Some(close) = open else {
+        return protocol_envelope_end(text, start);
+    };
+    let close_lower = close.to_ascii_lowercase();
+    if let Some(rel) = lower.find(&close_lower) {
+        let tail = &rest[rel + close.len()..];
+        let end = match tail.find('>') {
+            Some(idx)
+                if tail[..idx].trim_start().is_empty()
+                    || is_plain_tag_name(tail[..idx].trim_start()) =>
+            {
+                rel + close.len() + idx + 1
+            }
+            _ => rel + close.len(),
+        };
+        Some(start + end)
+    } else {
+        protocol_envelope_end(text, start)
+    }
+}
+
+const TOOL_PROTOCOL_OPEN_CLOSES: [(&str, &str); 8] = [
+    ("<tool_call>", "</tool_call>"),
+    ("<tool_calls>", "</tool_calls>"),
+    ("<toolcall>", "</toolcall>"),
+    ("<tool-call>", "</tool-call>"),
+    ("<invoke>", "</invoke>"),
+    ("<function_call>", "</function_call>"),
+    ("<functioncall>", "</functioncall>"),
+    ("<minimax:toolcall>", "</minimax:toolcall>"),
+];
+
+pub(crate) fn trailing_partial_close_fragment(chunk: &str) -> Option<&str> {
+    let rel = chunk.rfind("</")?;
+    let fragment = &chunk[rel..];
+    if fragment.contains('>') {
+        return None;
+    }
+    let lower = fragment.to_ascii_lowercase();
+    [
+        "</|dsml|",
+        "</|tool_call|",
+        "</tool_call",
+        "</tool_calls",
+        "</toolcall",
+        "</tool-call",
+        "</invoke",
+        "</function",
+        "</minimax:tool_call",
+        "</minimax:toolcall",
+        "</｜dsml｜",
+        "</＼dsml＼",
+        "</｜",
+        "</＼",
+        "</|",
+    ]
+    .iter()
+    .any(|prefix| lower.starts_with(prefix))
+    .then_some(fragment)
+}
+
+pub(crate) fn suppressed_continuation_trailing(chunk: &str) -> Option<&str> {
+    let lead = chunk.len() - chunk.trim_start().len();
+    let body = &chunk[lead..];
+    let lower = body.to_ascii_lowercase();
+
+    let mut first: Option<usize> = None;
+    for marker in SUPPRESSED_CLOSE_MARKERS {
+        if let Some(rel) = lower.find(marker)
+            && first.is_none_or(|current| rel < current)
+        {
+            first = Some(rel);
+        }
+    }
+    let Some(first_idx) = first else {
+        return close_run_trailing(chunk, lead, body);
+    };
+    if !body[..first_idx].trim().is_empty() {
+        return None;
+    }
+
+    let mut best: Option<usize> = None;
+    for marker in SUPPRESSED_CLOSE_MARKERS {
+        let Some(rel) = lower.rfind(marker) else {
+            continue;
+        };
+        let tail = &body[rel + marker.len()..];
+        let end = match tail.find('>') {
+            Some(idx)
+                if tail[..idx].trim_start().is_empty()
+                    || is_plain_tag_name(tail[..idx].trim_start()) =>
+            {
+                rel + marker.len() + idx + 1
+            }
+            _ => rel + marker.len(),
+        };
+        best = Some(best.map_or(end, |current: usize| current.max(end)));
+    }
+    if let Some(end) = best {
+        return trailing_after_fragment(chunk, lead + end);
+    }
+
+    close_run_trailing(chunk, lead, body)
+}
+
+fn close_run_trailing<'a>(chunk: &'a str, lead: usize, body: &str) -> Option<&'a str> {
+    let mut end = lead;
+    for ch in body.chars() {
+        if matches!(ch, '}' | ']' | '`') {
+            end += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if end > lead {
+        return trailing_after_fragment(chunk, end);
+    }
+    None
+}
+
+fn trailing_after_fragment(chunk: &str, end: usize) -> Option<&str> {
+    let trailing = chunk[end..].trim_start();
+    if trailing.is_empty() {
+        return None;
+    }
+    let lower = trailing.to_ascii_lowercase();
+    if starts_suspicious_protocol_prefix(trailing) || lower.starts_with("</") {
+        return None;
+    }
+    Some(trailing)
 }
 
 pub(crate) fn complete_non_protocol_json(text: &str, known_tool_names: &HashSet<String>) -> bool {
@@ -163,6 +525,8 @@ pub(crate) fn detect_tool_call_parse_issue_for_known_tools(
 
     if looks_like_malformed_tool_protocol_envelope_for_known_tools(trimmed, known_tool_names)
         || contains_tool_protocol_tag_call(trimmed)
+        || contains_truncated_ascii_dsml_envelope(trimmed)
+        || contains_truncated_fullwidth_dsml_envelope(trimmed)
     {
         return Some(message.into());
     }
@@ -192,4 +556,226 @@ pub(crate) fn json_fence_body(trimmed: &str) -> Option<&str> {
         return None;
     }
     Some(body_with_close[..close_start].trim())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn longest_suffix_matching_prefix_is_character_boundary_safe() {
+        // The fullwidth DSML token is multi-byte UTF-8; slicing must not panic.
+        assert_eq!(longest_suffix_matching_prefix("ab｜DS", "｜DSML｜"), 5);
+        assert_eq!(longest_suffix_matching_prefix("ab", "｜DSML｜"), 0);
+        assert_eq!(longest_suffix_matching_prefix("", "｜DSML｜"), 0);
+        assert_eq!(longest_suffix_matching_prefix("hello", "hello"), 0);
+        // The text ends in a full `｜` char, matching the 3-byte pattern prefix.
+        assert_eq!(longest_suffix_matching_prefix("ab｜", "｜DSML｜"), 3);
+    }
+
+    #[test]
+    fn detects_fullwidth_dsml_candidates() {
+        let embedded = r#"Here it is: <｜DSML｜tool_calls>"#;
+        assert_eq!(
+            find_embedded_protocol_candidate_start(embedded),
+            Some(embedded.find("<｜DSML｜tool_calls>").unwrap())
+        );
+        assert!(starts_suspicious_protocol_prefix(
+            "<｜dsml｜invoke name=\"shell\">"
+        ));
+        assert!(starts_suspicious_tag_or_fence_prefix(
+            "<｜dsml｜tool_calls>"
+        ));
+        assert!(find_incomplete_protocol_candidate_start("x<｜dsml").is_some());
+    }
+
+    #[test]
+    fn detects_fullwidth_reverse_solidus_dsml_candidates() {
+        let embedded = r#"Here it is: <＼DSML＼tool_calls>"#;
+        assert_eq!(
+            find_embedded_protocol_candidate_start(embedded),
+            Some(embedded.find("<＼DSML＼tool_calls>").unwrap())
+        );
+        assert!(starts_suspicious_protocol_prefix(
+            "<＼dsml＼invoke name=\"shell\">"
+        ));
+        assert!(starts_suspicious_tag_or_fence_prefix(
+            "<＼dsml＼tool_calls>"
+        ));
+        assert!(find_incomplete_protocol_candidate_start("x<＼dsml").is_some());
+    }
+
+    #[test]
+    fn detects_marker_split_across_chunk_boundary() {
+        assert!(find_incomplete_protocol_candidate_start("I will <|").is_some());
+        assert!(find_incomplete_protocol_candidate_start("I will <|D").is_some());
+        assert!(find_incomplete_protocol_candidate_start("I will <|DSM").is_some());
+        assert!(find_incomplete_protocol_candidate_start("I will <｜").is_some());
+        assert!(find_incomplete_protocol_candidate_start("I will <｜D").is_some());
+        assert!(find_incomplete_protocol_candidate_start("I will <｜DSM").is_some());
+        assert!(find_incomplete_protocol_candidate_start("x<|tool_").is_some());
+        assert!(find_incomplete_protocol_candidate_start("x<｜tool_").is_some());
+        assert!(
+            find_incomplete_protocol_candidate_start("just text <").is_some(),
+            "a bare trailing '<' must be retained so the next chunk's \
+             `|DSML|>` / `｜DSML｜...` / `＼DSML＼...` is still recognized"
+        );
+        assert!(
+            find_incomplete_protocol_candidate_start("wrote 5 < 10").is_none(),
+            "'<' inside plain text is not a protocol candidate"
+        );
+    }
+
+    #[test]
+    fn detects_reverse_solidus_marker_split_across_chunk_boundary() {
+        assert!(find_incomplete_protocol_candidate_start("I will <＼").is_some());
+        assert!(find_incomplete_protocol_candidate_start("I will <＼D").is_some());
+        assert!(find_incomplete_protocol_candidate_start("I will <＼DSM").is_some());
+    }
+
+    #[test]
+    fn unclosed_ascii_dsml_parse_then_runtime_detect_is_issue() {
+        let response = "<|DSML|>\n\
+            {\"name\":\"shell\",\"arguments\":{\"command\":\"id\"}}\n\
+            trailing text";
+        let (_, calls) = zeroclaw_tool_call_parser::parse_tool_calls(response);
+        assert!(calls.is_empty());
+        let known: HashSet<String> = ["shell".to_string()].into_iter().collect();
+        assert!(
+            detect_tool_call_parse_issue_for_known_tools(response, &calls, &known).is_some(),
+            "parse-then-detect must flag the unclosed ASCII DSML envelope"
+        );
+    }
+
+    #[test]
+    fn unclosed_fullwidth_dsml_parse_then_runtime_detect_is_issue() {
+        let response = "<｜DSML｜tool_calls>\n\
+            <｜DSML｜invoke name=\"shell\">\n\
+            <｜DSML｜parameter name=\"command\" string=\"true\">id</｜DSML｜parameter>\n\
+            </｜DSML｜invoke>\n";
+        let (_, calls) = zeroclaw_tool_call_parser::parse_tool_calls(response);
+        assert!(calls.is_empty());
+        let known: HashSet<String> = ["shell".to_string()].into_iter().collect();
+        assert!(
+            detect_tool_call_parse_issue_for_known_tools(response, &calls, &known).is_some()
+                || contains_truncated_fullwidth_dsml_envelope(response),
+            "unclosed fullwidth DSML must not be recoverable"
+        );
+    }
+
+    /// REGRESSION: lookalike attribute names (`tool_name="shell"`,
+    /// `is_string="true"`) must not become a known executable call anywhere in
+    /// the parse-then-detect pipeline. Each vector is paired with the OTHER
+    /// canonical attribute so a pre-fix parser produced a call from the
+    /// lookalike alone.
+    #[test]
+    fn lookalike_dsml_attributes_parse_then_runtime_no_executable_call() {
+        let response = concat!(
+            "<｜DSML｜tool_calls>\n",
+            "<｜DSML｜invoke tool_name=\"shell\">\n",
+            "<｜DSML｜parameter name=\"command\" is_string=\"true\">ls</｜DSML｜parameter>\n",
+            "</｜DSML｜invoke>\n",
+            "</｜DSML｜tool_calls>"
+        );
+        let (_, calls) = zeroclaw_tool_call_parser::parse_tool_calls(response);
+        assert!(
+            calls.is_empty(),
+            "lookalike attributes must not become a known call"
+        );
+        let known: HashSet<String> = ["shell".to_string()].into_iter().collect();
+        assert!(
+            detect_tool_call_parse_issue_for_known_tools(response, &calls, &known).is_none(),
+            "the lookalike envelope is visible text, not an executable call or an issue"
+        );
+    }
+
+    /// REGRESSION: an unclosed ASCII envelope followed by a complete
+    /// same-family wrapper must not borrow the later close; the runtime
+    /// detector must fail closed instead of executing combined content.
+    #[test]
+    fn unclosed_ascii_dsml_then_valid_wrapper_parse_then_runtime_is_issue() {
+        let response = concat!(
+            "<|DSML|>\n",
+            "{\"name\":\"shell\",\"arguments\":{\"command\":\"rm -rf /tmp/x\"}}\n",
+            "<|DSML|>\n",
+            "{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}\n",
+            "</|DSML|>"
+        );
+        let (_, calls) = zeroclaw_tool_call_parser::parse_tool_calls(response);
+        assert!(
+            calls.is_empty(),
+            "borrowed close must not execute malformed combined content"
+        );
+        let known: HashSet<String> = ["shell".to_string()].into_iter().collect();
+        assert!(
+            detect_tool_call_parse_issue_for_known_tools(response, &calls, &known).is_some(),
+            "parse-then-detect must fail closed on the unclosed first envelope"
+        );
+    }
+
+    /// REGRESSION: the fullwidth wrapper has the same close-borrowing exposure.
+    #[test]
+    fn unclosed_fullwidth_dsml_then_valid_wrapper_parse_then_runtime_is_issue() {
+        let response = concat!(
+            "<｜DSML｜tool_calls>\n",
+            "<｜DSML｜invoke name=\"shell\">\n",
+            "<｜DSML｜parameter name=\"command\" string=\"true\">rm -rf /tmp/x</｜DSML｜parameter>\n",
+            "</｜DSML｜invoke>\n",
+            "<｜DSML｜tool_calls>\n",
+            "<｜DSML｜invoke name=\"shell\">\n",
+            "<｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter>\n",
+            "</｜DSML｜invoke>\n",
+            "</｜DSML｜tool_calls>"
+        );
+        let (_, calls) = zeroclaw_tool_call_parser::parse_tool_calls(response);
+        assert!(
+            calls.is_empty(),
+            "fullwidth wrapper must not borrow the later close"
+        );
+        let known: HashSet<String> = ["shell".to_string()].into_iter().collect();
+        assert!(
+            detect_tool_call_parse_issue_for_known_tools(response, &calls, &known).is_some(),
+            "parse-then-detect must fail closed on the unclosed first fullwidth wrapper"
+        );
+    }
+
+    /// REGRESSION: a DSML example inside a CommonMark blockquoted backtick
+    /// fence stays visible with no call and no issue, without depending on
+    /// prose keywords.
+    #[test]
+    fn blockquoted_backtick_fenced_dsml_example_parse_then_runtime_is_visible_text() {
+        let response = "> ```xml\n\
+            > <｜DSML｜tool_calls>\n\
+            > <｜DSML｜invoke name=\"shell\">\n\
+            > <｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter>\n\
+            > </｜DSML｜invoke>\n\
+            > </｜DSML｜tool_calls>\n\
+            > ```";
+        let (_, calls) = zeroclaw_tool_call_parser::parse_tool_calls(response);
+        assert!(calls.is_empty());
+        let known: HashSet<String> = ["shell".to_string()].into_iter().collect();
+        assert!(
+            detect_tool_call_parse_issue_for_known_tools(response, &calls, &known).is_none(),
+            "blockquoted DSML documentation must not be flagged or executed"
+        );
+    }
+
+    /// REGRESSION: the blockquoted tilde fence has the same exposure.
+    #[test]
+    fn blockquoted_tilde_fenced_dsml_example_parse_then_runtime_is_visible_text() {
+        let response = "> ~~~xml\n\
+            > <｜DSML｜tool_calls>\n\
+            > <｜DSML｜invoke name=\"shell\">\n\
+            > <｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter>\n\
+            > </｜DSML｜invoke>\n\
+            > </｜DSML｜tool_calls>\n\
+            > ~~~";
+        let (_, calls) = zeroclaw_tool_call_parser::parse_tool_calls(response);
+        assert!(calls.is_empty());
+        let known: HashSet<String> = ["shell".to_string()].into_iter().collect();
+        assert!(
+            detect_tool_call_parse_issue_for_known_tools(response, &calls, &known).is_none(),
+            "blockquoted tilde-fenced DSML documentation must not be flagged or executed"
+        );
+    }
 }

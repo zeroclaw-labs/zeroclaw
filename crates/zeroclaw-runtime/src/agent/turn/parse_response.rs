@@ -311,8 +311,160 @@ pub(crate) async fn interpret_chat_response(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_native_assistant_history, unforwarded_narration};
-    use zeroclaw_providers::ToolCall;
+    use super::{build_native_assistant_history, interpret_chat_response, unforwarded_narration};
+    use crate::agent::turn::TurnCtx;
+    use crate::agent::turn::tool_specs::IterationToolSpecs;
+    use zeroclaw_api::agent::TurnEvent;
+    use zeroclaw_providers::{ChatResponse, ToolCall};
+
+    /// Drive the REAL `interpret_chat_response` (the function every agent turn
+    /// calls) with one scenario and return the pipeline decision.
+    async fn interpret_scenario(text: &str, known_tools: &[&str]) -> super::InterpretedResponse {
+        let provider = "testprov";
+        let model = "testmodel";
+        let (tx, _rx) = tokio::sync::mpsc::channel::<TurnEvent>(4);
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let dedup_exempt_tools: Vec<String> = Vec::new();
+        let ctx = TurnCtx {
+            parent_agent_alias: None,
+            observer: &crate::observability::NoopObserver,
+            provider_name: provider,
+            model,
+            temperature: None,
+            approval: None,
+            channel_name: "",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: Some(&tx),
+            hooks: None,
+            dedup_exempt_tools: &dedup_exempt_tools,
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            agent_alias: None,
+            turn_id: "dsml-blocker-acceptance",
+        };
+        let specs = IterationToolSpecs {
+            tool_specs: known_tools
+                .iter()
+                .map(|name| crate::tools::ToolSpec::new(*name, "run", serde_json::json!({})))
+                .collect(),
+            known_tool_names: known_tools
+                .iter()
+                .map(|name| (*name).to_string().to_ascii_lowercase())
+                .collect(),
+            use_native_tools: false,
+        };
+        let resp = ChatResponse {
+            text: Some(text.to_string()),
+            tool_calls: vec![],
+            usage: None,
+            reasoning_content: None,
+        };
+        let now = std::time::Instant::now();
+        interpret_chat_response(&ctx, resp, &[], &specs, false, now, 0, false).await
+    }
+
+    /// END-TO-END acceptance for the three reviewer blockers, through the real
+    /// parse-response pipeline (not the parser or detect functions in
+    /// isolation): the executed call set, the fail-closed flag, and the
+    /// visible text are all asserted exactly as an agent turn would see them.
+    #[tokio::test]
+    async fn reviewer_blocker_scenarios_reach_the_right_pipeline_decisions() {
+        // 1. Lookalike attribute names: visible text, NO call, NO fail-closed.
+        // Each vector is paired with the OTHER canonical attribute so a
+        // pre-fix parser produced a call from the lookalike alone.
+        let lookalike = concat!(
+            "<｜DSML｜tool_calls>\n",
+            "<｜DSML｜invoke tool_name=\"shell\">\n",
+            "<｜DSML｜parameter name=\"command\" is_string=\"true\">ls</｜DSML｜parameter>\n",
+            "</｜DSML｜invoke>\n",
+            "</｜DSML｜tool_calls>"
+        );
+        let r = interpret_scenario(lookalike, &["shell"]).await;
+        assert!(r.tool_calls.is_empty(), "lookalike attrs must not execute");
+        assert!(
+            !r.parse_issue_detected,
+            "lookalike envelope stays visible, not a fail-closed issue"
+        );
+        assert!(
+            r.assistant_history_content.contains("tool_name"),
+            "the lookalike envelope text stays in the assistant history"
+        );
+
+        // 2. Unclosed ASCII envelope + valid same-family wrapper: fail closed.
+        let borrow_ascii = concat!(
+            "<|DSML|>\n",
+            "{\"name\":\"shell\",\"arguments\":{\"command\":\"rm -rf /tmp/x\"}}\n",
+            "<|DSML|>\n",
+            "{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}\n",
+            "</|DSML|>"
+        );
+        let r = interpret_scenario(borrow_ascii, &["shell"]).await;
+        assert!(
+            r.tool_calls.is_empty(),
+            "borrowed close must not execute malformed combined content"
+        );
+        assert!(
+            r.parse_issue_detected,
+            "unclosed first ASCII envelope must fail closed end to end"
+        );
+
+        // 3. Unclosed fullwidth wrapper + valid same-family wrapper: fail closed.
+        let borrow_fullwidth = concat!(
+            "<｜DSML｜tool_calls>\n",
+            "<｜DSML｜invoke name=\"shell\">\n",
+            "<｜DSML｜parameter name=\"command\" string=\"true\">rm -rf /tmp/x</｜DSML｜parameter>\n",
+            "</｜DSML｜invoke>\n",
+            "<｜DSML｜tool_calls>\n",
+            "<｜DSML｜invoke name=\"shell\">\n",
+            "<｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter>\n",
+            "</｜DSML｜invoke>\n",
+            "</｜DSML｜tool_calls>"
+        );
+        let r = interpret_scenario(borrow_fullwidth, &["shell"]).await;
+        assert!(r.tool_calls.is_empty());
+        assert!(
+            r.parse_issue_detected,
+            "unclosed first fullwidth wrapper must fail closed end to end"
+        );
+
+        // 4. Blockquoted backtick-fenced DSML example: visible, no call, no flag.
+        let blockquote_backtick = "> ```xml\n\
+            > <｜DSML｜tool_calls>\n\
+            > <｜DSML｜invoke name=\"shell\">\n\
+            > <｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter>\n\
+            > </｜DSML｜invoke>\n\
+            > </｜DSML｜tool_calls>\n\
+            > ```";
+        let r = interpret_scenario(blockquote_backtick, &["shell"]).await;
+        assert!(r.tool_calls.is_empty(), "quoted example must not execute");
+        assert!(
+            !r.parse_issue_detected,
+            "blockquoted documentation is not a fail-closed issue"
+        );
+        assert!(
+            r.assistant_history_content.contains("｜DSML｜tool_calls"),
+            "blockquoted DSML stays visible in the assistant history"
+        );
+
+        // 5. Blockquoted tilde-fenced DSML example: visible, no call, no flag.
+        let blockquote_tilde = "> ~~~xml\n\
+            > <｜DSML｜tool_calls>\n\
+            > <｜DSML｜invoke name=\"shell\">\n\
+            > <｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter>\n\
+            > </｜DSML｜invoke>\n\
+            > </｜DSML｜tool_calls>\n\
+            > ~~~";
+        let r = interpret_scenario(blockquote_tilde, &["shell"]).await;
+        assert!(r.tool_calls.is_empty(), "quoted example must not execute");
+        assert!(!r.parse_issue_detected);
+        assert!(
+            r.assistant_history_content.contains("｜DSML｜tool_calls"),
+            "blockquoted tilde-fenced DSML stays visible"
+        );
+    }
 
     #[test]
     fn native_assistant_history_preserves_tool_call_extra_content() {
