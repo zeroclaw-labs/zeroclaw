@@ -196,9 +196,9 @@ cli-cron-long-about =
 
     示例：
     zeroclaw cron list
-    zeroclaw cron add '0 9 * * 1-5' 'Good morning' --tz America/New_York --agent
-    zeroclaw cron add '*/30 * * * *' 'Check system health' --agent
-    zeroclaw cron add '*/5 * * * *' 'echo ok'
+    zeroclaw cron add '0 9 * * 1-5' 'Good morning' --agent sentinel --prompt --tz America/New_York
+    zeroclaw cron add '*/30 * * * *' 'Check system health' --agent sentinel --prompt
+    zeroclaw cron add '*/5 * * * *' 'echo ok' --agent sentinel
     zeroclaw cron add-at 2025-01-15T14:00:00Z 'Send reminder' --agent
     zeroclaw cron add-every 60000 'Ping heartbeat'
     zeroclaw cron once 30m 'Run backup in 30 minutes' --agent
@@ -945,6 +945,13 @@ cli-doctor-ctxwin-saved = 已保存 {$updated} 项更新到 config.toml
 cli-doctor-ctxwin-dry-run = 试运行完成 — 未写入更改。去掉 --dry-run 以应用。
 cli-doctor-ctxwin-none = 无需更新。
 cli-doctor-ctxwin-write-failed = {$provider_ref}: 写入 context_window 失败: {$error}
+cli-doctor-context-window-ok = {$provider_ref}：上下文窗口：{$context_window} 个令牌
+cli-doctor-context-window-zero = {$provider_ref}：context_window 为 0（无效；请设置为模型的实际上下文上限）
+cli-doctor-context-window-unset = {$provider_ref}：未设置 context_window — 选择此配置时将使用 {$fallback} 个令牌的回退值；该值可能远低于模型的实际上限；请在此配置中设置 context_window
+
+# Doctor probe timeout warning — shown when model probing times out but prior
+# diagnostics (config, workspace, daemon) are preserved and returned.
+cli-doctor-probe-timeout-message = 模型探测超时。部分提供商目录可能无法访问。您可以重新运行 Doctor 来刷新。
 
 # ── Degraded config sections (doctor diagnose, #8835) ──
 cli-doctor-degraded-security = 安全关键配置节 `{$path}` 无效，已重置为默认值以便守护进程启动；当前运行的安全态势可能弱于预期。运行 `zeroclaw config migrate` 查看解析错误，然后修复该文件。

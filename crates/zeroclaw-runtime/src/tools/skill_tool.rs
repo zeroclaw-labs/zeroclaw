@@ -193,7 +193,11 @@ impl Tool for SkillShellTool {
 
         // Security validation — always requires explicit approval (approved=true)
         // since skill tools are user-defined and should be treated as medium-risk.
-        match self.security.validate_command_execution(&command, true) {
+        match self.security.validate_command_execution_for_shell(
+            &command,
+            true,
+            self.runtime.shell_dialect(),
+        ) {
             Ok(_) => {}
             Err(reason) => {
                 return Ok(ToolResult {
@@ -204,7 +208,10 @@ impl Tool for SkillShellTool {
             }
         }
 
-        if let Some(path) = self.security.forbidden_path_argument(&command) {
+        if let Some(path) = self
+            .security
+            .forbidden_workspace_path_argument_for_shell(&command, self.runtime.shell_dialect())
+        {
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
@@ -300,8 +307,11 @@ pub struct SkillBuiltinTool {
     tool_description: String,
     target_tool: Arc<dyn zeroclaw_api::tool::Tool>,
     locked_args: serde_json::Map<String, serde_json::Value>,
-    /// Target schema with the locked keys removed (precomputed at construction).
-    advertised_schema: serde_json::Value,
+    /// Target schema with the locked keys removed (precomputed at
+    /// construction). `Arc`-shared so per-iteration spec assembly hands out
+    /// reference counts instead of deep-cloning the (possibly MCP-derived,
+    /// tens-of-KB) tree — see the invariant on `Tool::spec`.
+    advertised_schema: Arc<serde_json::Value>,
 }
 
 impl SkillBuiltinTool {
@@ -315,7 +325,7 @@ impl SkillBuiltinTool {
             .into_iter()
             .map(|(k, v)| (k, serde_json::Value::String(v)))
             .collect();
-        let advertised_schema = narrow_schema(target_tool.parameters_schema(), &locked);
+        let advertised_schema = Arc::new(narrow_schema(target_tool.parameters_schema(), &locked));
         Self {
             tool_name: composed_tool_name(skill_name, &tool.name),
             tool_description: tool.description.clone(),
@@ -380,7 +390,20 @@ impl Tool for SkillBuiltinTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        self.advertised_schema.clone()
+        (*self.advertised_schema).clone()
+    }
+
+    // Hand out the stored schema by `Arc::clone` instead of the trait
+    // default's per-call deep clone — specs are rebuilt every agent-loop
+    // iteration and elevated skill tools can front MCP-derived schemas.
+    fn spec(&self) -> zeroclaw_api::tool::ToolSpec {
+        zeroclaw_api::tool::ToolSpec {
+            name: self.tool_name.clone(),
+            description: self.tool_description.clone(),
+            parameters: Arc::clone(&self.advertised_schema),
+            output: None,
+            param_domains: std::collections::BTreeMap::new(),
+        }
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -1039,6 +1062,28 @@ mod tests {
         assert!(
             !required.contains(&"action"),
             "locked key removed from required"
+        );
+    }
+
+    #[test]
+    fn skill_elevated_spec_shares_schema_across_calls() {
+        let target: Arc<dyn Tool> = Arc::new(EchoArgsTool {
+            name: "composio".into(),
+        });
+        let mut locked = HashMap::new();
+        locked.insert("action".to_string(), "execute".to_string());
+        let st = elevation_skill_tool("builtin", "composio", locked.clone());
+        let tool = SkillBuiltinTool::new("sk", &st, target, locked);
+
+        assert!(
+            Arc::ptr_eq(&tool.spec().parameters, &tool.spec().parameters),
+            "spec() must hand out the stored Arc, not deep-clone the \
+             advertised schema every agent-loop iteration"
+        );
+        assert_eq!(
+            *tool.spec().parameters,
+            tool.parameters_schema(),
+            "shared spec schema and legacy owned accessor must agree"
         );
     }
 

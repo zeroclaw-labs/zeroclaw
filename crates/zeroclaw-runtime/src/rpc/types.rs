@@ -71,6 +71,16 @@ fn default_protocol_version() -> u64 {
 }
 
 rpc_type! {
+    /// Command identity and accepted tokens advertised to an RPC client.
+    pub struct CommandDescriptor {
+        pub id: String,
+        pub name: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub aliases: Vec<String>,
+    }
+}
+
+rpc_type! {
     pub struct InitializeResult {
         pub protocol_version: u64,
         pub server_version: String,
@@ -85,6 +95,13 @@ rpc_type! {
         /// Supported RPC method names (e.g. "session/prompt", "memory/list").
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub capabilities: Vec<String>,
+        /// Shared command catalogue entries available on the TUI surface.
+        ///
+        /// Always serialized so a new daemon's authoritative empty catalogue
+        /// remains distinguishable from an older daemon that predates this
+        /// field.
+        #[serde(default)]
+        pub commands: Vec<CommandDescriptor>,
     }
 }
 
@@ -119,6 +136,11 @@ rpc_type! {
     pub struct DoctorRunResult {
         pub results: Vec<DiagResult>,
         pub summary: DoctorSummary,
+        /// Resolved active log persistence path, if available.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub log_path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub timed_out_phase: Option<String>,
     }
 }
 

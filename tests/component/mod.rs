@@ -1,8 +1,11 @@
+#[cfg(feature = "channel-acp-server")]
+mod acp_session_cwd_stdio;
 #[cfg(feature = "agent-runtime")]
 mod config_dir_locale_regression;
 mod config_patch_cli;
 mod config_persistence;
 mod config_schema;
+mod cron_help_examples;
 mod daemon_startup_feedback;
 mod dockerignore_test;
 mod gateway;

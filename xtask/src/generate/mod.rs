@@ -98,6 +98,11 @@ fn registry() -> Vec<Surface> {
             render: |root, cur| packaging::render_pkgbuild(root, cur),
         },
         Surface {
+            name: "aur-srcinfo",
+            file: "dist/aur/.SRCINFO",
+            render: |root, cur| packaging::render_srcinfo(root, cur),
+        },
+        Surface {
             name: "scoop",
             file: "dist/scoop/zeroclaw.json",
             render: |root, cur| packaging::render_scoop(root, cur),

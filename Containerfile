@@ -182,7 +182,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
     # Build combined libstdc++.a from libc++.a + libc++abi.a (stagex ships LLVM libc++, not GCC libstdc++)
     (mkdir -p /tmp/libwrap/cxx /tmp/libwrap/cxxabi && cd /tmp/libwrap/cxx && ar x /usr/lib/libc++.a && cd /tmp/libwrap/cxxabi && ar x /usr/lib/libc++abi.a && ar rcs /usr/lib/libstdc++.a /tmp/libwrap/cxx/*.o /tmp/libwrap/cxxabi/*.o && rm -rf /tmp/libwrap)
 
-    # Release build — zeroclawlabs (daemon)
+    # Release build — zeroclaw (daemon)
     # >>> generated:container-standard by `cargo generate installers` - do not edit <<<
     ZEROCLAW_FEATURES="acp-bridge,agent-runtime,channel-acp-server,channel-discord,channel-email,channel-filesystem,channel-lark,channel-matrix,channel-telegram,channel-webhook,gateway,observability-prometheus,schema-export,whatsapp-web"
 # >>> end generated:container-standard <<<
@@ -193,7 +193,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
         --target "$TARGET" \
         --no-default-features \
         --features "${ZEROCLAW_FEATURES}" \
-        -p zeroclawlabs
+        -p zeroclaw
 
     # Release build — zerocode (TUI config manager)
     CARGO_TARGET_DIR=/target \
@@ -268,9 +268,9 @@ RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
     # Build combined libstdc++.a from libc++.a + libc++abi.a (stagex ships LLVM libc++, not GCC libstdc++)
     (mkdir -p /tmp/libwrap/cxx /tmp/libwrap/cxxabi && cd /tmp/libwrap/cxx && ar x /usr/lib/libc++.a && cd /tmp/libwrap/cxxabi && ar x /usr/lib/libc++abi.a && ar rcs /usr/lib/libstdc++.a /tmp/libwrap/cxx/*.o /tmp/libwrap/cxxabi/*.o && rm -rf /tmp/libwrap)
 
-    # Release build — zeroclawlabs (all channels)
+    # Release build — zeroclaw (all channels)
     # >>> generated:container-fat by `cargo generate installers` - do not edit <<<
-    ZEROCLAW_FEATURES="acp-bridge,agent-runtime,browser-native,channel-acp-server,channel-amqp,channel-bluesky,channel-clawdtalk,channel-dingtalk,channel-discord,channel-email,channel-feishu,channel-filesystem,channel-git,channel-imessage,channel-irc,channel-lark,channel-line,channel-linq,channel-matrix,channel-mattermost,channel-mochat,channel-mqtt,channel-nextcloud,channel-nostr,channel-notion,channel-qq,channel-reddit,channel-signal,channel-slack,channel-telegram,channel-twitch,channel-twitter,channel-voice-call,channel-wati,channel-webhook,channel-wechat,channel-wecom,channel-wecom-ws,channel-whatsapp-cloud,dev-sim,gateway,hardware,memory-postgres,observability-otel,observability-prometheus,peripheral-rpi,plugins-wasm,plugins-wasm-cranelift,plugins-wasm-pulley,plugins-wasm-runtime-only,probe,provider-gitea,provider-github,sandbox-bubblewrap,sandbox-landlock,schema-export,webauthn,whatsapp-web"
+    ZEROCLAW_FEATURES="acp-bridge,agent-runtime,browser-native,channel-acp-server,channel-amqp,channel-bluesky,channel-clawdtalk,channel-dingtalk,channel-discord,channel-email,channel-feishu,channel-filesystem,channel-git,channel-imessage,channel-irc,channel-lark,channel-line,channel-linq,channel-matrix,channel-mattermost,channel-mochat,channel-mqtt,channel-nextcloud,channel-nostr,channel-notion,channel-qq,channel-reddit,channel-signal,channel-slack,channel-telegram,channel-twitch,channel-twitter,channel-voice-call,channel-webhook,channel-wechat,channel-wecom,channel-wecom-ws,channel-whatsapp-cloud,dev-sim,gateway,hardware,memory-postgres,observability-otel,observability-prometheus,peripheral-rpi,plugins-wasm,plugins-wasm-cranelift,plugins-wasm-pulley,plugins-wasm-runtime-only,probe,provider-gitea,provider-github,sandbox-bubblewrap,sandbox-landlock,schema-export,webauthn,whatsapp-web"
 # >>> end generated:container-fat <<<
     CARGO_TARGET_DIR=/target \
     cargo build \
@@ -279,7 +279,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
         --target "$TARGET" \
         --no-default-features \
         --features "${ZEROCLAW_FEATURES}" \
-        -p zeroclawlabs
+        -p zeroclaw
 
     # Release build — zerocode (TUI config manager)
     CARGO_TARGET_DIR=/target \
