@@ -103,6 +103,13 @@ pub struct ToolLoop<'a> {
     /// [`ResolvedAgentExecution`]. Everything below is per-message turn state.
     pub exec: ResolvedAgentExecution<'a>,
     pub history: &'a mut Vec<ChatMessage>,
+    /// Persisted trim-breadcrumb provenance for this agent's live history. A
+    /// later turn seeds `has_leading_breadcrumb` from this so it treats a
+    /// synthetic breadcrumb already leading the history as such — not as the
+    /// oldest real turn — and the loop writes provenance back through this handle
+    /// when it inserts one. `None` on paths with no persisted agent flag (tests
+    /// and nested/one-shot sub-turns); those behave as "no leading breadcrumb".
+    pub history_has_trim_breadcrumb: Option<&'a mut bool>,
     pub channel_name: &'a str,
     pub channel_reply_target: Option<&'a str>,
     pub cancellation_token: Option<CancellationToken>,
@@ -141,15 +148,18 @@ pub struct ToolLoop<'a> {
     pub sop_reassembly: Option<SopStepReassembly<'a>>,
 }
 
+/// Trim `history` to the provider-reported token budget, returning whether this
+/// call inserted a synthetic trim breadcrumb — so the caller can carry that
+/// provenance into `has_leading_breadcrumb` and the agent's persisted flag.
 async fn enforce_reported_budget(
     history: &mut Vec<ChatMessage>,
     reported_input_tokens: usize,
     context_token_budget: usize,
     event_tx: Option<&tokio::sync::mpsc::Sender<TurnEvent>>,
     observer: &dyn crate::observability::Observer,
-) {
+) -> bool {
     if context_token_budget == 0 || reported_input_tokens <= context_token_budget {
-        return;
+        return false;
     }
     let taken = std::mem::take(history);
     let result = crate::agent::history_trim::trim_to_reported_budget(
@@ -159,7 +169,8 @@ async fn enforce_reported_budget(
     );
     if result.trimmed {
         let mut trimmed = result.history;
-        crate::agent::history_trim::insert_breadcrumb_deduped(&mut trimmed);
+        let inserted_breadcrumb =
+            crate::agent::history_trim::insert_breadcrumb_deduped(&mut trimmed);
         *history = trimmed;
         if let Some(tx) = event_tx {
             let _ = tx
@@ -180,8 +191,10 @@ async fn enforce_reported_budget(
                 turn_id: None,
             },
         );
+        inserted_breadcrumb
     } else {
         *history = result.history;
+        false
     }
 }
 
@@ -293,6 +306,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
     let ToolLoop {
         exec,
         history: raw_history,
+        history_has_trim_breadcrumb: mut persisted_breadcrumb,
         channel_name,
         channel_reply_target,
         cancellation_token,
@@ -476,7 +490,13 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
     // text — to skip it, so a user-authored breadcrumb-equivalent message is
     // never mistaken for the synthetic one. Persists across iterations because
     // the breadcrumb stays in history once inserted.
-    let mut has_leading_breadcrumb = false;
+    //
+    // Seed from the agent's persisted flag so a breadcrumb inserted on an earlier
+    // turn (already leading this turn's restored history) is recognised at
+    // iteration zero instead of being miscounted as the oldest real turn, trimmed,
+    // and reinserted with no progress. Any change made below is written back
+    // through `persisted_breadcrumb` so the next turn seeds correctly.
+    let mut has_leading_breadcrumb = persisted_breadcrumb.as_deref().copied().unwrap_or(false);
 
     for iteration in 0..max_iterations {
         for steering_message in drain_steering_messages(&mut steering) {
@@ -559,6 +579,9 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 // inserting because a real user message already matched the
                 // breadcrumb text must not mark that message as synthetic.
                 has_leading_breadcrumb |= inserted_breadcrumb;
+                if let Some(flag) = persisted_breadcrumb.as_deref_mut() {
+                    *flag = has_leading_breadcrumb;
+                }
                 {
                     let __zc_trim_span = ::zeroclaw_log::info_span!(
                         target: "zeroclaw_log_internal_scope",
@@ -747,6 +770,9 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     // mark that message as synthetic.
                     has_leading_breadcrumb |=
                         crate::agent::history_trim::insert_breadcrumb_deduped(turn_state.history);
+                    if let Some(flag) = persisted_breadcrumb.as_deref_mut() {
+                        *flag = has_leading_breadcrumb;
+                    }
                     if let Some(tx) = event_tx.as_ref() {
                         let _ = tx
                             .send(TurnEvent::HistoryTrimmed {
@@ -1064,7 +1090,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             let msg = ChatMessage::assistant(response_text.clone());
             turn_state.push_dual(msg);
             if let Some(reported) = reported_input_tokens {
-                enforce_reported_budget(
+                let inserted = enforce_reported_budget(
                     turn_state.history,
                     reported as usize,
                     context_token_budget,
@@ -1072,6 +1098,12 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     observer,
                 )
                 .await;
+                if inserted {
+                    has_leading_breadcrumb = true;
+                    if let Some(flag) = persisted_breadcrumb.as_deref_mut() {
+                        *flag = true;
+                    }
+                }
             }
             return Ok(accumulated_display_text);
         }
@@ -1334,7 +1366,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         }
 
         if let Some(reported) = reported_input_tokens {
-            enforce_reported_budget(
+            let inserted = enforce_reported_budget(
                 turn_state.history,
                 reported as usize,
                 context_token_budget,
@@ -1342,6 +1374,12 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 observer,
             )
             .await;
+            if inserted {
+                has_leading_breadcrumb = true;
+                if let Some(flag) = persisted_breadcrumb.as_deref_mut() {
+                    *flag = true;
+                }
+            }
         }
     }
 
@@ -2024,6 +2062,7 @@ async fn drive_live_sop_actions(
                             let step_result = crate::sop::executor::scope_step_call_sink(
                                 step_call_sink.clone(),
                                 Box::pin(run_tool_call_loop(ToolLoop {
+                                    history_has_trim_breadcrumb: None,
                                     exec: ResolvedAgentExecution::resolve(
                                         ResolvedModelAccess {
                                             model_provider: eff_model_provider,

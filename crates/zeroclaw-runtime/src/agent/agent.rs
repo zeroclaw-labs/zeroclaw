@@ -2384,6 +2384,7 @@ impl Agent {
                 crate::agent::tool_receipts::scope_receipts(
                     receipt_scope.clone(),
                     crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
+                        history_has_trim_breadcrumb: Some(&mut self.history_has_trim_breadcrumb),
                         exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
                             crate::agent::loop_::ResolvedModelAccess {
                                 model_provider: self.model_provider.as_ref(),
@@ -2786,6 +2787,7 @@ impl Agent {
                 crate::agent::tool_receipts::scope_receipts(
                     receipt_scope.clone(),
                     crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
+                        history_has_trim_breadcrumb: Some(&mut self.history_has_trim_breadcrumb),
                         exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
                             crate::agent::loop_::ResolvedModelAccess {
                                 model_provider: self.model_provider.as_ref(),

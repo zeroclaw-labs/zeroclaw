@@ -2627,6 +2627,7 @@ impl DelegateTool {
         let result = tokio::time::timeout(
             Duration::from_secs(agentic_timeout_secs),
             run_tool_call_loop(ToolLoop {
+                history_has_trim_breadcrumb: None,
                 sop_reassembly: None,
                 exec: ResolvedAgentExecution::resolve(
                     ResolvedModelAccess {

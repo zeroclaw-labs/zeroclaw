@@ -872,6 +872,7 @@ async fn agent_turn_with_sop_reassembly(
         Some(turn_id.clone()),
     );
     let result = run_tool_call_loop(ToolLoop {
+        history_has_trim_breadcrumb: None,
         sop_reassembly,
         exec: ResolvedAgentExecution::resolve(
             ResolvedModelAccess {
@@ -1878,6 +1879,7 @@ pub async fn run(
                         TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                             cost_tracking_context.clone(),
                             run_tool_call_loop(ToolLoop {
+                                history_has_trim_breadcrumb: None,
                                 exec: ResolvedAgentExecution::resolve(
                                     ResolvedModelAccess {
                                         model_provider: model_provider.as_ref(),
@@ -2423,6 +2425,7 @@ pub async fn run(
                             TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                                 cost_tracking_context.clone(),
                                 run_tool_call_loop(ToolLoop {
+                                    history_has_trim_breadcrumb: None,
                                     exec: ResolvedAgentExecution::resolve(
                                         ResolvedModelAccess {
                                             model_provider: model_provider.as_ref(),
@@ -4845,6 +4848,7 @@ mod tests {
         let observer = NoopObserver;
 
         let _ = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -5185,6 +5189,7 @@ mod tests {
         let observer = NoopObserver;
 
         let err = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -5262,6 +5267,7 @@ mod tests {
         };
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -5346,6 +5352,7 @@ mod tests {
         let turn_id = uuid::Uuid::new_v4().to_string();
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -5435,6 +5442,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -5509,6 +5517,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -5586,6 +5595,7 @@ mod tests {
         };
 
         let err = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -5664,6 +5674,7 @@ mod tests {
         // Even though vision_model_provider points to a nonexistent model_provider, this
         // should succeed because there are no image markers to trigger routing.
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -5729,6 +5740,7 @@ mod tests {
             let turn_id = uuid::Uuid::new_v4().to_string();
 
             run_tool_call_loop(ToolLoop {
+                history_has_trim_breadcrumb: None,
                 parent_agent_alias: None,
                 sop_reassembly: None,
                 exec: ResolvedAgentExecution {
@@ -5915,6 +5927,7 @@ mod tests {
             let turn_id = uuid::Uuid::new_v4().to_string();
 
             run_tool_call_loop(ToolLoop {
+                history_has_trim_breadcrumb: None,
                 parent_agent_alias: None,
                 sop_reassembly: None,
                 exec: ResolvedAgentExecution {
@@ -6040,6 +6053,7 @@ mod tests {
         };
 
         let err = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -6117,6 +6131,7 @@ mod tests {
         };
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -6193,6 +6208,7 @@ mod tests {
         };
 
         let err = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -6355,6 +6371,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -6496,6 +6513,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -6657,6 +6675,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -6775,6 +6794,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -6948,6 +6968,7 @@ mod tests {
             tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(64);
 
         let _ = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -7057,6 +7078,7 @@ mod tests {
         let turn_id = uuid::Uuid::new_v4().to_string();
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -7150,6 +7172,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -7235,6 +7258,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -7328,6 +7352,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -7424,6 +7449,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -7525,6 +7551,7 @@ mod tests {
         );
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -7619,6 +7646,7 @@ mod tests {
         let observer = NoopObserver;
 
         let _ = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -7739,6 +7767,7 @@ mod tests {
         };
 
         let err = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -7837,6 +7866,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -7940,6 +7970,7 @@ mod tests {
         let dedup_exempt = vec!["shell".to_string()];
 
         let err = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -8033,6 +8064,7 @@ mod tests {
         let exempt = vec!["count_tool".to_string()];
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -8130,6 +8162,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -8229,6 +8262,7 @@ mod tests {
         let exempt = vec!["count_tool".to_string()];
 
         let _result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -8314,6 +8348,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -8403,6 +8438,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -8487,6 +8523,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -8569,6 +8606,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -8654,6 +8692,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -8736,6 +8775,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -8817,6 +8857,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -8890,6 +8931,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -8964,6 +9006,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -9038,6 +9081,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -9114,6 +9158,7 @@ This is an example, not an invocation."#;
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -9195,6 +9240,7 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -9288,6 +9334,7 @@ This is an example, not an invocation."#;
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -9364,6 +9411,7 @@ Done."#;
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -9443,6 +9491,7 @@ Done."#;
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -9520,6 +9569,7 @@ Done."#;
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -9598,6 +9648,7 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -9733,6 +9784,7 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -9819,6 +9871,7 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -9909,6 +9962,7 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -10022,6 +10076,7 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -10141,6 +10196,7 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(32);
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -10233,6 +10289,7 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(64);
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -10336,6 +10393,7 @@ This is an example, not an invocation."#;
 
         let turn_id = uuid::Uuid::new_v4().to_string();
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -11219,6 +11277,7 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(64);
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -11324,6 +11383,7 @@ This is an example, not an invocation."#;
         let turn_id = uuid::Uuid::new_v4().to_string();
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -11428,6 +11488,7 @@ This is an example, not an invocation."#;
         let turn_id = uuid::Uuid::new_v4().to_string();
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -11532,6 +11593,7 @@ This is an example, not an invocation."#;
         let turn_id = uuid::Uuid::new_v4().to_string();
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -11691,6 +11753,7 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(32);
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -14099,6 +14162,7 @@ Let me check the result."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(64);
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -14278,6 +14342,7 @@ Let me check the result."#;
             .scope(
                 Some(ctx),
                 run_tool_call_loop(ToolLoop {
+                    history_has_trim_breadcrumb: None,
                     parent_agent_alias: None,
                     sop_reassembly: None,
                     exec: ResolvedAgentExecution {
@@ -14398,6 +14463,7 @@ Let me check the result."#;
             .scope(
                 Some(ctx),
                 run_tool_call_loop(ToolLoop {
+                    history_has_trim_breadcrumb: None,
                     parent_agent_alias: None,
                     sop_reassembly: None,
                     exec: ResolvedAgentExecution {
@@ -14478,6 +14544,7 @@ Let me check the result."#;
         ];
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -14594,6 +14661,7 @@ Let me check the result."#;
             .scope(
                 Some(ctx),
                 run_tool_call_loop(ToolLoop {
+                    history_has_trim_breadcrumb: None,
                     parent_agent_alias: None,
                     sop_reassembly: None,
                     exec: ResolvedAgentExecution {
@@ -14676,6 +14744,7 @@ Let me check the result."#;
         let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -14765,6 +14834,7 @@ Let me check the result."#;
         ];
 
         let _ = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -15982,6 +16052,7 @@ Let me check the result."#;
         let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
