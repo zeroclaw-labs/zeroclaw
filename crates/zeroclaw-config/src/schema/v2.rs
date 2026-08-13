@@ -976,36 +976,27 @@ fn fold_providers_globals_into_models(
     // unowned: the fold claims no producer and instead marks the target
     // `ambiguous`, so a bare vision reference cannot be redirected to a
     // credential with no stated owner.
-    let (target_type, target_alias, colon_url, normalized_extras, source_key, ambiguous) =
+    let (target_type, target_alias, colon_url, normalized_extras, mut source_key, ambiguous) =
         match g_default_provider.as_ref().and_then(toml::Value::as_str) {
             Some(s) => {
                 let (raw_type, url) = split_colon_url_provider(s);
                 let (canonical, alias, extras) = normalize_provider_type(&raw_type, "default");
-                // The explicit selector is an equivalent overlay of an existing
-                // slot only when the slot's EFFECTIVE source identity matches:
-                // the materialized alias must hold the variant extras the
-                // selector implies (endpoint/auth_mode/uri) and, for colon-URL
-                // forms, the same URL as its `uri`. Checking only that the slot
-                // exists is not enough: a `qwen-intl` default_provider over a
-                // `qwen`-materialized `qwen.default` differs by endpoint, and
-                // two distinct `custom:https://...` selectors differ by URL.
-                // Comparing against the materialized values (rather than
-                // re-normalizing the raw producer key) also lets an operator
-                // override — e.g. `[providers.models.qwen] endpoint = "intl"`
-                // or a bare `custom` whose configured `uri` is already B — count
-                // as equivalent even when the raw producer spelling differs. In
-                // the non-equivalent cases the selector names a different
-                // source, so it must register as a distinct producer (making the
-                // slot ambiguous and leaving the bare vision reference
-                // fail-closed) rather than be suppressed and let the rewrite
-                // consume a credential against the wrong endpoint.
-                let equivalent_existing = effective_source_identity_matches(
-                    aliased_models,
-                    &canonical,
-                    &alias,
-                    &extras,
-                    url.as_deref(),
-                );
+                // The explicit selector is registered as a NEW producer of the
+                // target slot unless the fold's final alias state matches the
+                // selector's effective identity. Equivalence is deliberately NOT
+                // decided here (pre-fold): the fold below may itself supply the
+                // `uri` (and other normalized extras) that makes the materialized
+                // alias exactly match a selector whose URL the pre-fold alias
+                // lacked — e.g. a bare `[providers.models.custom]` whose missing
+                // URI is filled by a matching `custom:https://...` default
+                // provider. Deciding equivalence before the fold would register
+                // the selector as a second producer, make the slot ambiguous, and
+                // strand the vision reference on the configless path despite the
+                // fold producing the exact credential-bearing alias. Conversely,
+                // a selector that names a genuinely different source (a distinct
+                // URL, or a variant the existing alias does not hold after the
+                // fold) still registers as a distinct producer so the rewrite
+                // stays fail-closed. The post-fold re-check below resolves this.
                 // Preserve the full colon-bearing selector as the producer
                 // identity when it carries a URL. Recording only the stripped
                 // prefix here would collapse `custom:https://B` to `custom` and
@@ -1013,7 +1004,7 @@ fn fold_providers_globals_into_models(
                 // non-equivalent URL selector would fail to make the slot
                 // ambiguous and the bare reference could rewrite against the
                 // wrong URI.
-                let source_key = (!equivalent_existing).then(|| s.to_string());
+                let source_key = Some(s.to_string());
                 (canonical, alias, url, extras, source_key, false)
             }
             None => match aliased_models.keys().len() {
@@ -1135,6 +1126,31 @@ fn fold_providers_globals_into_models(
             ),
             "[providers] globals folded onto model_providers.."
         );
+    }
+    // Decide explicit-`default_provider` equivalence against the COMPLETED alias
+    // state, not the pre-fold one. The fold may have just supplied the `uri` (and
+    // other normalized extras) that makes the materialized alias exactly match
+    // the selector — a bare `[providers.models.custom]` whose missing URI is
+    // filled by a matching `custom:https://...` default provider, or a `qwen`
+    // entry whose endpoint override the fold left in place. When the final alias
+    // matches the selector, the selector completed an existing slot rather than
+    // naming a second source, so it must not be registered as an extra producer
+    // (that would make the slot ambiguous and strand the vision reference on the
+    // configless path). A selector the completed alias still does not match — a
+    // distinct URL, or a variant the fold could not apply — stays a separate
+    // producer so the rewrite fails closed.
+    if let Some(selector) = g_default_provider.as_ref().and_then(toml::Value::as_str) {
+        let (raw_type, url) = split_colon_url_provider(selector);
+        let (canonical, alias, extras) = normalize_provider_type(&raw_type, "default");
+        if effective_source_identity_matches(
+            aliased_models,
+            &canonical,
+            &alias,
+            &extras,
+            url.as_deref(),
+        ) {
+            source_key = None;
+        }
     }
     if ambiguous {
         // A no-op overlay across multiple families — the globals were fully
