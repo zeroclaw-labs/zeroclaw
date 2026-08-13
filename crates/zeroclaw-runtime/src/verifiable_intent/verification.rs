@@ -2,8 +2,8 @@
 
 use crate::verifiable_intent::error::{ViError, ViErrorKind};
 use crate::verifiable_intent::types::{
-    CheckoutL3Mandate, Constraint, CredentialChain, Entity, Fulfillment, KnownConstraint,
-    LineItemEntry, MandateMode, PaymentL3Mandate,
+    CheckoutL3Mandate, Constraint, CredentialChain, DisclosableEntry, Entity, Fulfillment,
+    KnownConstraint, LineItemEntry, MandateMode, PaymentL3Mandate,
 };
 
 // ── Strictness mode ──────────────────────────────────────────────────
@@ -335,7 +335,7 @@ fn check_unknown_constraint(
 // ── Individual constraint checkers ───────────────────────────────────
 
 fn check_allowed_merchant(
-    allowed_merchants: &[Entity],
+    allowed_merchants: &[DisclosableEntry<Entity>],
     fulfillment: &Fulfillment,
 ) -> ConstraintCheckResult {
     let ct = "mandate.checkout.allowed_merchant";
@@ -361,7 +361,27 @@ fn check_allowed_merchant(
             ),
         );
     };
-    if allowed_merchants.iter().any(|m| m.matches(merchant)) {
+
+    // An entry withheld from this presentation cannot take part in the
+    // decision, so only disclosed entries are candidates. The reference skips
+    // the constraint when every entry is withheld; failing closed is the
+    // conservative reading, and the policy belongs to the constraint-checker
+    // stage that owns unresolved-entry behavior.
+    let disclosed: Vec<&Entity> = allowed_merchants
+        .iter()
+        .filter_map(DisclosableEntry::disclosed)
+        .collect();
+    if disclosed.is_empty() {
+        return ConstraintCheckResult::violation(
+            ct,
+            ViError::new(
+                ViErrorKind::MerchantNotAllowed,
+                "merchant allowlist discloses no entries, so no merchant can be matched",
+            ),
+        );
+    }
+
+    if disclosed.iter().any(|allowed| allowed.matches(merchant)) {
         ConstraintCheckResult::ok(ct)
     } else {
         ConstraintCheckResult::violation(
@@ -375,7 +395,7 @@ fn check_allowed_merchant(
 }
 
 fn check_allowed_payee(
-    allowed_payees: &[Entity],
+    allowed_payees: &[DisclosableEntry<Entity>],
     fulfillment: &Fulfillment,
 ) -> ConstraintCheckResult {
     let ct = "payment.allowed_payee";
@@ -399,7 +419,23 @@ fn check_allowed_payee(
             ),
         );
     };
-    if allowed_payees.iter().any(|p| p.matches(payee)) {
+
+    // As in `check_allowed_merchant`: withheld entries are not candidates.
+    let disclosed: Vec<&Entity> = allowed_payees
+        .iter()
+        .filter_map(DisclosableEntry::disclosed)
+        .collect();
+    if disclosed.is_empty() {
+        return ConstraintCheckResult::violation(
+            ct,
+            ViError::new(
+                ViErrorKind::PayeeNotAllowed,
+                "payee allowlist discloses no entries, so no payee can be matched",
+            ),
+        );
+    }
+
+    if disclosed.iter().any(|allowed| allowed.matches(payee)) {
         ConstraintCheckResult::ok(ct)
     } else {
         ConstraintCheckResult::violation(
@@ -513,7 +549,7 @@ fn verify_fulfillment_currency(expected: &str, actual: Option<&str>) -> Result<(
 }
 
 fn check_line_items(
-    constraint_items: &[LineItemEntry],
+    constraint_items: &[DisclosableEntry<LineItemEntry>],
     fulfillment: &Fulfillment,
 ) -> ConstraintCheckResult {
     let ct = "mandate.checkout.line_items";
@@ -545,11 +581,25 @@ fn check_line_items(
         );
     }
 
-    // Total quantity check
-    let total_allowed: u128 = constraint_items
+    // A withheld entry states neither a quantity nor an acceptable-item list,
+    // so it cannot widen what the cart is allowed to contain. Counting only
+    // disclosed entries understates the allowance, which is the safe direction.
+    let disclosed: Vec<&LineItemEntry> = constraint_items
         .iter()
-        .map(|item| u128::from(item.quantity))
-        .sum();
+        .filter_map(DisclosableEntry::disclosed)
+        .collect();
+    if disclosed.is_empty() {
+        return ConstraintCheckResult::violation(
+            ct,
+            ViError::new(
+                ViErrorKind::LineItemViolation,
+                "line_items constraint discloses no entries, so no cart can be checked against it",
+            ),
+        );
+    }
+
+    // Total quantity check
+    let total_allowed: u128 = disclosed.iter().map(|item| u128::from(item.quantity)).sum();
     let total_actual: u128 = fulfillment_items
         .iter()
         .map(|item| u128::from(item.quantity))
@@ -567,7 +617,7 @@ fn check_line_items(
     // Per-item validation: each fulfillment item must be in at least one
     // constraint entry's acceptable_items (unless acceptable_items is empty = wildcard).
     for fi in fulfillment_items {
-        let allowed_by_any = constraint_items.iter().any(|entry| {
+        let allowed_by_any = disclosed.iter().any(|entry| {
             if entry.acceptable_items.is_empty() {
                 return true; // wildcard
             }
@@ -600,6 +650,16 @@ mod tests {
             name: name.into(),
             website: website.into(),
         }
+    }
+
+    /// An allowlist entry the presentation actually disclosed.
+    fn disclosed<T>(value: T) -> DisclosableEntry<T> {
+        DisclosableEntry::Disclosed(value)
+    }
+
+    /// An entry withheld from the presentation, carrying only its hash.
+    fn withheld<T>(hash: &str) -> DisclosableEntry<T> {
+        DisclosableEntry::Reference { hash: hash.into() }
     }
 
     #[test]
@@ -651,8 +711,8 @@ mod tests {
     #[test]
     fn merchant_in_allowlist_passes() {
         let allowed = vec![
-            merchant("Store A", "https://store-a.example.com"),
-            merchant("Store B", "https://store-b.example.com"),
+            disclosed(merchant("Store A", "https://store-a.example.com")),
+            disclosed(merchant("Store B", "https://store-b.example.com")),
         ];
         let f = Fulfillment {
             merchant: Some(merchant("Store A", "https://store-a.example.com")),
@@ -664,7 +724,10 @@ mod tests {
 
     #[test]
     fn merchant_not_in_allowlist_fails() {
-        let allowed = vec![merchant("Store A", "https://store-a.example.com")];
+        let allowed = vec![disclosed(merchant(
+            "Store A",
+            "https://store-a.example.com",
+        ))];
         let f = Fulfillment {
             merchant: Some(merchant("Store C", "https://store-c.example.com")),
             ..Default::default()
@@ -676,7 +739,10 @@ mod tests {
 
     #[test]
     fn payee_in_allowlist_passes() {
-        let allowed = vec![merchant("Payee A", "https://payee-a.example.com")];
+        let allowed = vec![disclosed(merchant(
+            "Payee A",
+            "https://payee-a.example.com",
+        ))];
         let f = Fulfillment {
             payee: Some(merchant("Payee A", "https://payee-a.example.com")),
             ..Default::default()
@@ -687,7 +753,10 @@ mod tests {
 
     #[test]
     fn payee_not_in_allowlist_fails() {
-        let allowed = vec![merchant("Payee A", "https://payee-a.example.com")];
+        let allowed = vec![disclosed(merchant(
+            "Payee A",
+            "https://payee-a.example.com",
+        ))];
         let f = Fulfillment {
             payee: Some(merchant("Payee B", "https://payee-b.example.com")),
             ..Default::default()
@@ -702,7 +771,10 @@ mod tests {
     /// clear the constraint it is being checked against.
     #[test]
     fn missing_merchant_does_not_satisfy_allowed_merchant() {
-        let allowed = vec![merchant("Store A", "https://store-a.example.com")];
+        let allowed = vec![disclosed(merchant(
+            "Store A",
+            "https://store-a.example.com",
+        ))];
         let f = Fulfillment::default();
         let result = check_allowed_merchant(&allowed, &f);
         assert!(
@@ -715,7 +787,10 @@ mod tests {
     /// The same for the payee allowlist.
     #[test]
     fn missing_payee_does_not_satisfy_allowed_payee() {
-        let allowed = vec![merchant("Payee A", "https://payee-a.example.com")];
+        let allowed = vec![disclosed(merchant(
+            "Payee A",
+            "https://payee-a.example.com",
+        ))];
         let f = Fulfillment::default();
         let result = check_allowed_payee(&allowed, &f);
         assert!(
@@ -725,16 +800,100 @@ mod tests {
         assert_eq!(result.violations[0].kind, ViErrorKind::PayeeNotAllowed);
     }
 
+    /// An allowlist whose entries were all withheld from the presentation says
+    /// nothing about who is permitted, so nothing can satisfy it. The reference
+    /// skips the constraint here; failing closed is the conservative reading,
+    /// and the policy belongs to the checker-parity stage.
+    #[test]
+    fn an_allowlist_of_withheld_entries_matches_nothing() {
+        let allowed: Vec<DisclosableEntry<Entity>> = vec![withheld("hash-a"), withheld("hash-b")];
+        let f = Fulfillment {
+            merchant: Some(merchant("Store A", "https://store-a.example.com")),
+            ..Default::default()
+        };
+
+        let result = check_allowed_merchant(&allowed, &f);
+        assert!(
+            !result.satisfied,
+            "an entry whose contents are unknown must not authorize a merchant"
+        );
+        assert_eq!(result.violations[0].kind, ViErrorKind::MerchantNotAllowed);
+    }
+
+    /// The common Autonomous case: the agent discloses the one merchant it is
+    /// transacting with and withholds the rest. The disclosed entry still
+    /// decides the outcome.
+    #[test]
+    fn a_disclosed_entry_matches_beside_withheld_ones() {
+        let allowed = vec![
+            withheld("hash-a"),
+            disclosed(merchant("Store B", "https://store-b.example.com")),
+            withheld("hash-c"),
+        ];
+        let f = Fulfillment {
+            merchant: Some(merchant("Store B", "https://store-b.example.com")),
+            ..Default::default()
+        };
+        assert!(check_allowed_merchant(&allowed, &f).satisfied);
+
+        let other = Fulfillment {
+            merchant: Some(merchant("Store Z", "https://store-z.example.com")),
+            ..Default::default()
+        };
+        assert!(
+            !check_allowed_merchant(&allowed, &other).satisfied,
+            "a withheld entry must not vouch for a merchant it never named"
+        );
+    }
+
+    /// A withheld line item states no quantity, so it cannot raise the cap.
+    /// Counting only disclosed entries understates the allowance, which is the
+    /// direction that fails closed.
+    #[test]
+    fn a_withheld_line_item_does_not_widen_the_allowance() {
+        let constraint_items = vec![
+            disclosed(LineItemEntry {
+                id: "line-1".into(),
+                acceptable_items: vec![],
+                quantity: 1,
+            }),
+            withheld("hash-of-a-second-line-item"),
+        ];
+
+        let within = Fulfillment {
+            line_items: Some(vec![FulfillmentLineItem {
+                item_id: "SKU001".into(),
+                quantity: 1,
+            }]),
+            ..Default::default()
+        };
+        assert!(check_line_items(&constraint_items, &within).satisfied);
+
+        let over = Fulfillment {
+            line_items: Some(vec![FulfillmentLineItem {
+                item_id: "SKU001".into(),
+                quantity: 2,
+            }]),
+            ..Default::default()
+        };
+        let result = check_line_items(&constraint_items, &over);
+        assert!(
+            !result.satisfied,
+            "the withheld entry must not contribute quantity it never stated"
+        );
+        assert_eq!(result.violations[0].kind, ViErrorKind::LineItemViolation);
+    }
+
     #[test]
     fn line_items_valid() {
-        let constraint_items = vec![LineItemEntry {
+        let constraint_items = vec![disclosed(LineItemEntry {
             id: "line-1".into(),
             acceptable_items: vec![AcceptableItem {
                 id: "SKU001".into(),
                 title: "Test Product".into(),
             }],
             quantity: 2,
-        }];
+        })];
         let f = Fulfillment {
             line_items: Some(vec![FulfillmentLineItem {
                 item_id: "SKU001".into(),
@@ -748,14 +907,14 @@ mod tests {
 
     #[test]
     fn line_items_unknown_sku_fails() {
-        let constraint_items = vec![LineItemEntry {
+        let constraint_items = vec![disclosed(LineItemEntry {
             id: "line-1".into(),
             acceptable_items: vec![AcceptableItem {
                 id: "SKU001".into(),
                 title: "Test Product".into(),
             }],
             quantity: 2,
-        }];
+        })];
         let f = Fulfillment {
             line_items: Some(vec![FulfillmentLineItem {
                 item_id: "SKU999".into(),
@@ -770,14 +929,14 @@ mod tests {
 
     #[test]
     fn line_items_quantity_exceeded() {
-        let constraint_items = vec![LineItemEntry {
+        let constraint_items = vec![disclosed(LineItemEntry {
             id: "line-1".into(),
             acceptable_items: vec![AcceptableItem {
                 id: "SKU001".into(),
                 title: "Test Product".into(),
             }],
             quantity: 1,
-        }];
+        })];
         let f = Fulfillment {
             line_items: Some(vec![FulfillmentLineItem {
                 item_id: "SKU001".into(),
@@ -792,16 +951,16 @@ mod tests {
     #[test]
     fn allowed_line_item_quantity_total_does_not_wrap() {
         let constraint_items = vec![
-            LineItemEntry {
+            disclosed(LineItemEntry {
                 id: "line-1".into(),
                 acceptable_items: vec![],
                 quantity: u32::MAX,
-            },
-            LineItemEntry {
+            }),
+            disclosed(LineItemEntry {
                 id: "line-2".into(),
                 acceptable_items: vec![],
                 quantity: 1,
-            },
+            }),
         ];
         let f = Fulfillment {
             line_items: Some(vec![FulfillmentLineItem {
@@ -816,11 +975,11 @@ mod tests {
 
     #[test]
     fn fulfillment_line_item_quantity_total_does_not_wrap() {
-        let constraint_items = vec![LineItemEntry {
+        let constraint_items = vec![disclosed(LineItemEntry {
             id: "line-1".into(),
             acceptable_items: vec![],
             quantity: u32::MAX,
-        }];
+        })];
         let f = Fulfillment {
             line_items: Some(vec![
                 FulfillmentLineItem {
@@ -949,7 +1108,7 @@ mod tests {
                 max: Some(40000),
             }),
             Constraint::Known(KnownConstraint::AllowedPayee {
-                allowed_payees: vec![merchant("Store", "https://store.example.com")],
+                allowed_payees: vec![disclosed(merchant("Store", "https://store.example.com"))],
             }),
         ];
         let f = Fulfillment {

@@ -108,6 +108,78 @@ pub struct FulfillmentLineItem {
     pub quantity: u32,
 }
 
+// ── Selectively disclosable constraint entries ───────────────────────
+
+/// An entry inside an `allowed` or `line_items` constraint.
+///
+/// In Autonomous mode the specification makes these entries individually
+/// disclosable: each is its own SD-JWT disclosure, referenced from the
+/// constraint object by hash. An agent presents only the entries a given
+/// verifier needs, so the remainder arrive as `{"...": "<hash>"}`.
+///
+/// Both forms have to survive parsing. A reference is not an error, and it is
+/// not a value either — it is an entry this presentation deliberately withheld,
+/// and a verifier that cannot tell the two apart cannot reason about either.
+/// Nothing here resolves a reference; resolution needs the presentation's
+/// disclosure set, which lives above this layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DisclosableEntry<T> {
+    /// The entry's value, disclosed in this presentation.
+    Disclosed(T),
+    /// An entry withheld from this presentation, kept as its disclosure hash.
+    Reference { hash: String },
+}
+
+impl<T> DisclosableEntry<T> {
+    /// The entry's value, or `None` when it was withheld.
+    ///
+    /// Callers that evaluate a constraint use this: an undisclosed entry cannot
+    /// take part in a decision, because its contents are unknown.
+    pub fn disclosed(&self) -> Option<&T> {
+        match self {
+            Self::Disclosed(value) => Some(value),
+            Self::Reference { .. } => None,
+        }
+    }
+}
+
+impl<T: Serialize> Serialize for DisclosableEntry<T> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Disclosed(value) => value.serialize(serializer),
+            Self::Reference { hash } => {
+                let mut object = serde_json::Map::with_capacity(1);
+                object.insert("...".to_owned(), serde_json::Value::String(hash.clone()));
+                object.serialize(serializer)
+            }
+        }
+    }
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for DisclosableEntry<T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+
+        let value = serde_json::Value::deserialize(deserializer)?;
+
+        // A reference is an object whose *only* member is `...` carrying a
+        // string. The reference implementation tests membership instead, which
+        // reads `{"...": h, "id": "m-1"}` as a reference and silently discards
+        // the `id`. Requiring exclusivity turns that malformed entry into a
+        // parse failure rather than quiet data loss.
+        if let serde_json::Value::Object(object) = &value
+            && object.len() == 1
+            && let Some(serde_json::Value::String(hash)) = object.get("...")
+        {
+            return Ok(Self::Reference { hash: hash.clone() });
+        }
+
+        T::deserialize(value)
+            .map(Self::Disclosed)
+            .map_err(D::Error::custom)
+    }
+}
+
 // ── Constraints ──────────────────────────────────────────────────────
 
 /// Constraint types this build recognizes and can evaluate.
@@ -116,15 +188,21 @@ pub struct FulfillmentLineItem {
 pub enum KnownConstraint {
     /// Merchant allowlist for checkout mandates.
     #[serde(rename = "mandate.checkout.allowed_merchant")]
-    AllowedMerchant { allowed_merchants: Vec<Entity> },
+    AllowedMerchant {
+        allowed_merchants: Vec<DisclosableEntry<Entity>>,
+    },
 
     /// Product selection constraints for checkout mandates.
     #[serde(rename = "mandate.checkout.line_items")]
-    LineItems { items: Vec<LineItemEntry> },
+    LineItems {
+        items: Vec<DisclosableEntry<LineItemEntry>>,
+    },
 
     /// Payee allowlist for payment mandates.
     #[serde(rename = "payment.allowed_payee")]
-    AllowedPayee { allowed_payees: Vec<Entity> },
+    AllowedPayee {
+        allowed_payees: Vec<DisclosableEntry<Entity>>,
+    },
 
     /// Per-transaction amount range.
     #[serde(rename = "payment.amount")]
@@ -472,16 +550,79 @@ mod tests {
     #[test]
     fn constraint_merchant_serde_roundtrip() {
         let c = Constraint::Known(KnownConstraint::AllowedMerchant {
-            allowed_merchants: vec![Entity {
+            allowed_merchants: vec![DisclosableEntry::Disclosed(Entity {
                 id: None,
                 name: "Test Store".into(),
                 website: "https://test.example.com".into(),
-            }],
+            })],
         });
         let json = serde_json::to_string(&c).unwrap();
         assert!(json.contains("mandate.checkout.allowed_merchant"));
         let back: Constraint = serde_json::from_str(&json).unwrap();
         assert_eq!(c, back);
+    }
+
+    /// An Autonomous presentation discloses only the entries a given verifier
+    /// needs, so a constraint routinely carries a mix of values and hashes.
+    /// Both have to survive parsing, and a round trip must not turn one into
+    /// the other.
+    #[test]
+    fn constraint_entries_keep_disclosed_and_withheld_forms() {
+        let json = r#"{
+            "type": "mandate.checkout.allowed_merchant",
+            "allowed_merchants": [
+                {"id": "m-1", "name": "Audioshop", "website": "https://audioshop.example"},
+                {"...": "hrPPJ7L3t5KDOjA04PIL08z0_6UyW8finU53nPf-sCU"}
+            ]
+        }"#;
+
+        let parsed: Constraint = serde_json::from_str(json).expect("mixed entries must parse");
+        let Constraint::Known(KnownConstraint::AllowedMerchant { allowed_merchants }) = &parsed
+        else {
+            panic!("expected a merchant allowlist, got {parsed:?}");
+        };
+
+        assert_eq!(allowed_merchants.len(), 2);
+        assert_eq!(
+            allowed_merchants[0].disclosed().map(|e| e.name.as_str()),
+            Some("Audioshop"),
+        );
+        assert_eq!(
+            allowed_merchants[1],
+            DisclosableEntry::Reference {
+                hash: "hrPPJ7L3t5KDOjA04PIL08z0_6UyW8finU53nPf-sCU".to_owned(),
+            },
+        );
+        assert!(allowed_merchants[1].disclosed().is_none());
+
+        let round_tripped: Constraint =
+            serde_json::from_str(&serde_json::to_string(&parsed).unwrap()).unwrap();
+        assert_eq!(parsed, round_tripped);
+    }
+
+    /// An entry is a reference only when `...` is its sole member. The
+    /// reference implementation tests membership, which would read a hybrid
+    /// object as a reference and silently drop its other fields; refusing it
+    /// turns malformed input into a parse error instead of quiet data loss.
+    #[test]
+    fn a_reference_entry_must_carry_nothing_but_the_hash() {
+        let hybrid = r#"{
+            "type": "mandate.checkout.allowed_merchant",
+            "allowed_merchants": [{"...": "abc", "id": "m-1"}]
+        }"#;
+        assert!(
+            serde_json::from_str::<Constraint>(hybrid).is_err(),
+            "an object mixing a reference with entry fields must not parse"
+        );
+
+        let non_string_hash = r#"{
+            "type": "mandate.checkout.allowed_merchant",
+            "allowed_merchants": [{"...": 7}]
+        }"#;
+        assert!(
+            serde_json::from_str::<Constraint>(non_string_hash).is_err(),
+            "a reference hash must be a string"
+        );
     }
 
     /// `KNOWN_CONSTRAINT_TYPES` decides whether a failed parse of a recognized
@@ -498,11 +639,11 @@ mod tests {
         };
         let every_variant = [
             KnownConstraint::AllowedMerchant {
-                allowed_merchants: vec![entity()],
+                allowed_merchants: vec![DisclosableEntry::Disclosed(entity())],
             },
             KnownConstraint::LineItems { items: vec![] },
             KnownConstraint::AllowedPayee {
-                allowed_payees: vec![entity()],
+                allowed_payees: vec![DisclosableEntry::Disclosed(entity())],
             },
             KnownConstraint::PaymentAmount {
                 currency: "USD".into(),

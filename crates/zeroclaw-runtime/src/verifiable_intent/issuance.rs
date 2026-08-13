@@ -278,8 +278,8 @@ mod tests {
     use super::*;
     use crate::verifiable_intent::crypto::{generate_ec_p256, load_key_pair};
     use crate::verifiable_intent::types::{
-        Cnf, Constraint, Entity, FulfillmentLineItem, KnownConstraint, PaymentAmount,
-        PaymentInstrument,
+        Cnf, Constraint, DisclosableEntry, Entity, FulfillmentLineItem, KnownConstraint,
+        PaymentAmount, PaymentInstrument,
     };
 
     fn test_issuer_l1() -> String {
@@ -349,11 +349,11 @@ mod tests {
             vct: "mandate.checkout.open".into(),
             cnf: cnf.clone(),
             constraints: vec![Constraint::Known(KnownConstraint::AllowedMerchant {
-                allowed_merchants: vec![Entity {
+                allowed_merchants: vec![DisclosableEntry::Disclosed(Entity {
                     id: None,
                     name: "Test Store".into(),
                     website: "https://store.example.com".into(),
-                }],
+                })],
             })],
             prompt_summary: Some("Buy a test product".into()),
         };
