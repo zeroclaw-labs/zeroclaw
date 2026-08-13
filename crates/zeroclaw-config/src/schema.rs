@@ -9081,7 +9081,9 @@ pub struct FileDownloadConfig {
     /// these prefixes for an IPv4-only hostname; the SSRF gate extracts the
     /// embedded IPv4 (RFC 6052 §2.2) and classifies it exactly like the
     /// built-in well-known `64:ff9b::/96` prefix — a private / loopback /
-    /// link-local / metadata target is rejected unless the host is allowlisted.
+    /// link-local target is rejected unless the host is allowlisted, and a
+    /// metadata / credential embedding is rejected even for an allowlisted host
+    /// (matching the `allowed_private_hosts` carve-out).
     /// The well-known prefix is recognized automatically and never needs to be
     /// declared here. A network-specific prefix is chosen by the operator and
     /// cannot be detected from an address alone (RFC 8215 §5 forbids assuming
