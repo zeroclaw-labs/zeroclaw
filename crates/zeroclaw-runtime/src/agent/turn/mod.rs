@@ -236,6 +236,7 @@ pub struct ToolLoop<'a> {
     pub sop_reassembly: Option<SopStepReassembly<'a>>,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn enforce_reported_budget(
     history: &mut Vec<ChatMessage>,
     reported_input_tokens: usize,
