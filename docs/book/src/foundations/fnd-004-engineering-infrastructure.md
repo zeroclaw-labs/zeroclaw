@@ -1,9 +1,9 @@
 # FND-004: Engineering Infrastructure: CI/CD Pipeline and Release Automation
 
-> Supporting v0.7.0 → v1.0.0 · Type: Architecture · Rev. 1
+> Supporting v0.7.0 → v1.0.0 · Type: Architecture · Rev. 7
 >
-> **Canonical reference** · Ratified by the team · Rev. 1
-> Discussion thread and full revision history: [#5579](https://github.com/zeroclaw-labs/zeroclaw/issues/5579)
+> **Canonical reference** · Ratified by the team · Rev. 7
+> Original RFC discussion: [#5579](https://github.com/zeroclaw-labs/zeroclaw/issues/5579)
 
 ---
 
@@ -31,6 +31,12 @@
 | Rev | Date | Summary |
 |---|---|---|
 | 1 | 2026-04-09 | Initial draft |
+| 2 | 2026-06-04 | Replaced format-and-lint serial gating with format-only gating followed by parallel required Rust jobs ([#7111](https://github.com/zeroclaw-labs/zeroclaw/pull/7111)) |
+| 3 | 2026-06-10 | Required trusted `master` runs to seed caches consumed by pull requests ([#7355](https://github.com/zeroclaw-labs/zeroclaw/pull/7355)) |
+| 4 | 2026-06-21 | Changed the plugin build and release target from `wasm32-wasip1` to `wasm32-wasip2` ([#8061](https://github.com/zeroclaw-labs/zeroclaw/pull/8061)) |
+| 5 | 2026-06-30 | Removed the desktop artifact and its release-pipeline obligations ([#8544](https://github.com/zeroclaw-labs/zeroclaw/pull/8544)) |
+| 6 | 2026-07-04 | Restored the desktop artifact and its release-pipeline obligations ([#8565](https://github.com/zeroclaw-labs/zeroclaw/pull/8565)) |
+| 7 | 2026-08-07 | Replaced `actions/attest-build-provenance` guidance with direct `actions/attest` artifact attestation ([#9717](https://github.com/zeroclaw-labs/zeroclaw/pull/9717)) |
 
 ---
 
@@ -165,7 +171,7 @@ PR changes: crates/zeroclaw-tool-call-parser/src/lib.rs
 Affected crates:
   zeroclaw-tool-call-parser     ← directly changed
   zeroclaw-misc                 ← depends on it
-  zeroclawlabs (root)           ← depends on it
+  zeroclaw (root)               ← depends on it
 
 Not affected:
   zeroclaw-channels             ← no dependency path
@@ -333,7 +339,7 @@ For ZeroClaw's current scale and team size, **SLSA Level 2** is the appropriate 
 
 SLSA Level 2 provenance means each release artifact ships with a cryptographically signed attestation that records: what source commit produced it, which workflow produced it, and that the workflow ran on the expected platform. Users and package managers can verify this attestation. It closes the gap between "we say this binary came from this source" and "this binary provably came from this source."
 
-GitHub Actions supports SLSA Level 2 provenance generation natively through the `actions/attest-build-provenance` action. The cost to add it is one step per build job.
+GitHub Actions supports SLSA Level 2 provenance generation natively through the `actions/attest` action. The cost to add it is one step per build job.
 
 ### 6.2 Conventional Commits (Already Implied, Formalise It)
 
@@ -482,7 +488,7 @@ Implement the directed release graph from §5.2: `build-kernel-standard`, `build
 
 ##### D3: Add SLSA Level 2 provenance
 
-Add `actions/attest-build-provenance` to each build job. Provenance attestations are attached to GitHub Release assets. Document verification instructions in `SECURITY.md`.
+Add `actions/attest` to each build job. Provenance attestations are attached to GitHub Release assets. Document verification instructions in `SECURITY.md`.
 
 ##### D4: Retire redundant release workflows
 

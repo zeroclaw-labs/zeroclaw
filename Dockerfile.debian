@@ -113,9 +113,9 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
     --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=zeroclaw-target,target=/app/target,sharing=locked \
     if [ -n "$ZEROCLAW_CARGO_FLAGS" ]; then \
-      cargo build --release --locked -p zeroclawlabs -p zerocode $ZEROCLAW_CARGO_FLAGS; \
+      cargo build --release --locked -p zeroclaw -p zerocode $ZEROCLAW_CARGO_FLAGS; \
     else \
-      cargo build --release --locked -p zeroclawlabs -p zerocode; \
+      cargo build --release --locked -p zeroclaw -p zerocode; \
     fi
 RUN rm -rf src benches crates xtask tools/fill-translations
 
@@ -137,10 +137,9 @@ RUN touch src/main.rs src/lib.rs apps/zerocode/src/main.rs
 RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=zeroclaw-target,target=/app/target,sharing=locked \
-    rm -rf target/release/.fingerprint/zeroclawlabs-* \
-           target/release/deps/zeroclawlabs-* \
-           target/release/incremental/zeroclawlabs-* \
-           target/release/.fingerprint/zeroclaw-* \
+    rm -rf target/release/.fingerprint/zeroclaw-* \
+           target/release/deps/zeroclaw-* \
+           target/release/incremental/zeroclaw-* \
            target/release/deps/zeroclaw_* \
            target/release/incremental/zeroclaw_* \
            target/release/.fingerprint/xtask-* \
@@ -151,9 +150,9 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
            target/release/deps/zerocode-* \
            target/release/incremental/zerocode-* && \
     if [ -n "$ZEROCLAW_CARGO_FLAGS" ]; then \
-      cargo build --release --locked -p zeroclawlabs -p zerocode $ZEROCLAW_CARGO_FLAGS; \
+      cargo build --release --locked -p zeroclaw -p zerocode $ZEROCLAW_CARGO_FLAGS; \
     else \
-      cargo build --release --locked -p zeroclawlabs -p zerocode; \
+      cargo build --release --locked -p zeroclaw -p zerocode; \
     fi && \
     cp target/release/zeroclaw /app/zeroclaw && \
     cp target/release/zerocode /app/zerocode && \
