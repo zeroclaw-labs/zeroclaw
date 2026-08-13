@@ -24,6 +24,23 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
 
+# ── Runner selection: closed Blacksmith toggle (compile-heavy jobs) ─────────
+# The seven Rust-compiling jobs below (lint, build, check, check-plugin-backends,
+# check-32bit, bench, test) and the Linux `build` matrix entry pick their runner
+# from a single boolean Actions variable, mapped here to two pinned choices only:
+#   • CI_USE_BLACKSMITH == 'true'        → blacksmith-8vcpu-ubuntu-2404 (pinned in-workflow)
+#   • any other value / unset (default)  → GitHub-hosted ubuntu-latest (today's behavior)
+# The label is hard-coded in this reviewed workflow, so a mutable repo variable can only
+# flip between these two vetted runners — it can never redirect a required check to an
+# arbitrary runner without a `.github/**` review. An unexpected value fails safe to
+# ubuntu-latest. Only the boolean toggle is operator-controlled.
+#
+# PRECONDITION before setting CI_USE_BLACKSMITH=true: an org admin must DISABLE Blacksmith
+# triggerer SSH (Blacksmith → Settings → Features → SSH Access) so a green required check
+# attests only the reviewed commit, and that control must be attested in review. Requires
+# the Blacksmith GitHub App installed on the org; never set the toggle while the App is
+# uninstalled or these jobs queue with no runner (~24h) instead of failing fast.
+
 jobs:
   # ── Fast serial gate: fail formatting errors before burning compute ───────
 
@@ -81,6 +98,9 @@ jobs:
       - name: Test translation release submodule handling
         run: scripts/release/refresh-translations.test.sh
 
+      - name: Test monthly outdated result classification
+        run: bash scripts/ci/monthly_outdated_result.test.sh
+
       - name: Guard release attestation contract
         run: python3 scripts/ci/release_attestation_contract_test.py
 
@@ -89,7 +109,9 @@ jobs:
   lint:
     name: Lint
     needs: [fmt]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
+    # Measured green run on b86b1737: rustdoc step 2m22s, total Lint 10m40s
+    # (under the prior 15m ceiling). Keep 15 unless a cold-cache run proves more.
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -99,7 +121,7 @@ jobs:
         with:
           toolchain: 1.96.1
           components: clippy
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         id: rust-cache
         with:
           cache-on-failure: true
@@ -115,6 +137,7 @@ jobs:
           cargo_log="${RUNNER_TEMP}/cargo-clippy.log"
           SECONDS=0
           cargo clippy \
+            --locked \
             --workspace \
             --exclude zeroclaw-desktop \
             --all-targets \
@@ -147,6 +170,10 @@ jobs:
           exit "$cargo_status"
         env:
           RUST_CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
+      - name: Rustdoc warnings gate
+        # Exclude zeroclaw-desktop: same surface as xtask build_api / docs-deploy.
+        # Desktop pulls glib-sys on Linux; the lint runner does not install GTK libs.
+        run: cargo doc --no-deps --workspace --exclude zeroclaw-desktop
       - name: Config-write isolation guard
         run: cargo test --test architecture tests_that_persist_config_isolate_the_path
       - name: Fluent coverage guard (no bare user-facing strings)
@@ -210,7 +237,7 @@ jobs:
           toolchain: 1.96.1
           components: clippy
           targets: x86_64-pc-windows-msvc
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         id: rust-cache
         with:
           cache-on-failure: true
@@ -271,7 +298,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
             target: x86_64-unknown-linux-gnu
             cmd: build
             label: Build
@@ -289,7 +316,7 @@ jobs:
         with:
           toolchain: 1.96.1
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         id: rust-cache
         with:
           cache-on-failure: true
@@ -341,7 +368,7 @@ jobs:
   check:
     name: Check (${{ matrix.name }})
     needs: [fmt]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 20
     env:
       RUSTFLAGS: ${{ matrix.rustflags }}
@@ -357,12 +384,21 @@ jobs:
             args: --workspace --exclude zeroclaw-desktop --no-default-features
             sys_deps: ""
             rustflags: -D warnings
+          # Lint already denies warnings with --all-targets, but only at
+          # --features ci-all. Feature-gated call sites are live there, so a
+          # helper whose gate is wider than its callers reads as used and the
+          # drift lands green. This row compiles the test targets on the
+          # default surface, where that mismatch is visible.
+          - name: default features, all targets
+            args: --workspace --exclude zeroclaw-desktop --all-targets
+            sys_deps: ""
+            rustflags: -D warnings
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: 1.96.1
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         id: rust-cache
         with:
           cache-on-failure: true
@@ -378,7 +414,7 @@ jobs:
   check-plugin-backends:
     name: Check (${{ matrix.name }})
     needs: [fmt]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -411,7 +447,7 @@ jobs:
       - name: Install channel plugin fixture target
         if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
         run: rustup target add wasm32-wasip2
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: steps.changed.outputs.run == 'true'
         with:
           cache-on-failure: true
@@ -450,7 +486,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
@@ -470,7 +506,7 @@ jobs:
   check-32bit:
     name: Check (32-bit)
     needs: [fmt]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -478,7 +514,7 @@ jobs:
         with:
           toolchain: 1.96.1
           targets: i686-unknown-linux-gnu
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         id: rust-cache
         with:
           cache-on-failure: true
@@ -493,14 +529,14 @@ jobs:
   bench:
     name: Benchmarks Compile
     needs: [fmt]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: 1.96.1
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         id: rust-cache
         with:
           cache-on-failure: true
@@ -547,7 +583,7 @@ jobs:
   test:
     name: Test
     needs: [fmt]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -555,7 +591,7 @@ jobs:
         with:
           toolchain: 1.96.1
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         id: rust-cache
         with:
           cache-on-failure: true
@@ -628,7 +664,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: 1.96.1
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         id: rust-cache
         with:
           shared-key: test
@@ -655,7 +691,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: 1.96.1
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         id: rust-cache
         with:
           cache-on-failure: true
@@ -684,7 +720,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: 1.96.1
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         id: rust-cache
         with:
           cache-on-failure: true
@@ -693,6 +729,8 @@ jobs:
         run: |
           curl -LsSf https://github.com/EmbarkStudios/cargo-deny/releases/download/0.19.9/cargo-deny-0.19.9-x86_64-unknown-linux-musl.tar.gz \
             | tar zxf - -C ~/.cargo/bin --strip-components=1
+      - name: Validate scoped lru advisory exception
+        run: python3 scripts/ci/lru_advisory_scope_test.py
       - name: Check licenses, sources, and advisories
         run: cargo deny check
       - name: Lockfile integrity
@@ -837,7 +875,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: 1.96.1
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         id: rust-cache
         with:
           cache-on-failure: true

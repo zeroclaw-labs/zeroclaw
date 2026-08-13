@@ -10,9 +10,9 @@ Fires on every PR targeting `master` and on trusted pushes to `master`.
 Composite job with multiple matrix legs:
 
 - **fmt**: `cargo fmt --all -- --check`
-- **lint**: `cargo clippy --workspace --exclude zeroclaw-desktop --all-targets --features ci-all -- -D warnings`, plus two architecture guards (`cargo test --test architecture`): config-write isolation and Fluent coverage (no bare user-facing strings)
+- **lint**: `cargo clippy --workspace --exclude zeroclaw-desktop --all-targets --features ci-all -- -D warnings`, then `cargo doc --no-deps --workspace --exclude zeroclaw-desktop` (rustdoc warnings are fatal via `.cargo/config.toml` `build.rustdocflags`; desktop is excluded to match `xtask build_api` / docs-deploy and avoid GTK/`glib-sys` on the lint runner), plus architecture guards (`cargo test --test architecture`): config-write isolation and Fluent coverage (no bare user-facing strings), and the comment hygiene gate
 - **build**: matrix: `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-pc-windows-msvc`
-- **check**: all features plus a workspace-wide, warnings-fatal no-default-features pass (excluding `zeroclaw-desktop`)
+- **check**: three warnings-fatal passes over the workspace (excluding `zeroclaw-desktop`): all features; no default features; and default features with `--all-targets`, which is the only leg that compiles test targets on the default feature surface
 - **check-32bit**: `i686-unknown-linux-gnu` with no default features
 - **bench**: benchmarks compile check
 - **test**: the standalone firmware protocol host gate from `scripts/ci/firmware_protocol_gate.sh` and `cargo nextest run --locked --workspace --exclude zeroclaw-desktop` on Linux
@@ -31,7 +31,7 @@ Fresh required CI is normally the shared evidence for the Cargo surfaces it actu
 - a release target is outside the PR matrix and only covered by release/manual workflows;
 - stale, cancelled, skipped, or unavailable CI is not fresh evidence.
 
-When a definition or import is feature-gated, compare its `cfg` predicate with every consumer. Validate both the enabled configuration and each relevant disabled configuration: an enabled-feature pass proves the consumer still works, while the workspace-wide no-default-features check catches warning-producing mismatches such as unused private definitions or imports. Targeted feature combinations remain necessary when neither required CI configuration exercises the changed predicate.
+When a definition or import is feature-gated, compare its `cfg` predicate with every consumer. Validate both the enabled configuration and each relevant disabled configuration: an enabled-feature pass proves the consumer still works, while the workspace-wide no-default-features check catches warning-producing mismatches such as unused private definitions or imports. That pass runs `cargo check` without `--all-targets`, so it never compiles test targets: a helper gated on plain `test` whose only callers sit behind a feature is caught by the default-features/all-targets leg instead. Targeted feature combinations remain necessary when neither required CI configuration exercises the changed predicate.
 
 ### Daily Advisory Scan (`daily-audit.yml`)
 
@@ -262,7 +262,7 @@ All third-party refs are pinned to a full commit SHA with a trailing version com
 | `actions/setup-node` (`v7.0.0`) | `ci-sbom.yml`, `ci.yml`, `cross-platform-build-manual.yml`, `daily-npm-audit.yml`, `release-stable-manual.yml` | Node toolchain for npm SBOM generation, web tests/audit, and web/desktop builds |
 | `actions/upload-artifact` (`v7.0.1`) | `release-stable-manual.yml`, `cross-platform-build-manual.yml`, `docker-publish.yml`, `trivy-scheduled.yml` | Upload build artifacts and Trivy SARIF handoff artifacts |
 | `actions/download-artifact` (`v8.0.1`) | `release-stable-manual.yml`, `cross-platform-build-manual.yml`, `docker-publish.yml` | Download build artifacts and Trivy SARIF handoff artifacts |
-| `actions/attest` (`v4.2.1`) | `release-stable-manual.yml` | Generate GitHub-hosted Build Level 2 provenance for release assets |
+| `actions/attest` (`v4.2.2`) | `release-stable-manual.yml` | Generate GitHub-hosted Build Level 2 provenance for release assets |
 | `actions/labeler` (`v6.1.0`) | `pr-path-labeler.yml` | Apply path/scope labels from `.github/labeler.yml` |
 | `dtolnay/rust-toolchain` (`stable`) | `ci.yml`, `release-stable-manual.yml`, `cross-platform-build-manual.yml`, `cross-platform-clippy.yml`, `daily-audit.yml`, `docs-deploy.yml` | Install Rust toolchain |
 | `Swatinem/rust-cache` (`v2.9.1`) | `ci.yml`, `release-stable-manual.yml`, `cross-platform-build-manual.yml`, `cross-platform-clippy.yml`, `docs-deploy.yml` | Cargo build/dependency caching |

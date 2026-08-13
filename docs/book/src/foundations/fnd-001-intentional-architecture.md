@@ -1,9 +1,9 @@
 # FND-001: Intentional Architecture: ZeroClaw Microkernel Transition
 
-> Starting v0.7.0 · Type: Architecture · Rev. 4
+> Starting v0.7.0 · Type: Architecture · Rev. 8
 >
-> **Canonical reference** · Ratified by the team · Rev. 4
-> Discussion thread and full revision history: [#5574](https://github.com/zeroclaw-labs/zeroclaw/issues/5574)
+> **Canonical reference** · Ratified by the team · Rev. 8
+> Original RFC discussion and draft history: [#5574](https://github.com/zeroclaw-labs/zeroclaw/issues/5574)
 
 ---
 
@@ -37,6 +37,16 @@
 | 3 | 2026-04-10 | Terminology correction per implementation feedback from PR #5559: "kernel" → "runtime" for the agent orchestration layer throughout; "kernel" now refers specifically to the irreducible foundation (`--no-default-features` build); §4.1 updated to describe the explicit two-layer architecture (foundation + runtime); §4.2–§4.3 dependency diagram and component map updated to show `zeroclaw-runtime`; Phase 2 renamed from "The Kernel" to "The Runtime"; binary size targets reframed as aspirational north stars with measured progress tracking rather than hard gates; §7 updated with actual Phase 1 measurement (6.6 MB foundation build) and explicit note that architectural decomposition enables optimization but optimization is a dedicated second pass |
 | 4 | 2026-06-02 | Updated §5.2 to target `wasm32-wasip2` to enable WIT files. Updated Phase 2 §D2 to replace Extism with wasmtime to enable ARM32 targets and WIT files |
 | 5 | 2026-06-29 | Amended §4.4.2 to replace the single always-on `plugins-wasm` row with the three-flag execution-backend taxonomy (`plugins-wasm` host plus `plugins-wasm-cranelift` / `plugins-wasm-pulley` backends), completing the RFC #6943 deconfliction |
+| 6 | 2026-06-30 | Removed the desktop installer from the release-artifact matrix, target architecture, roadmap, and success criteria ([#8544](https://github.com/zeroclaw-labs/zeroclaw/pull/8544)) |
+| 7 | 2026-07-04 | Restored the desktop installer and its release, architecture, roadmap, and success-criteria obligations ([#8565](https://github.com/zeroclaw-labs/zeroclaw/pull/8565)) |
+| 8 | 2026-07-20 | Made root `AGENTS.md` the compact project contract, routed maintained detail through the architecture map and coding-agent guidelines, and prevented crate policy from weakening project safety, privacy, or authorization requirements ([#9050](https://github.com/zeroclaw-labs/zeroclaw/pull/9050)) |
+
+Revision numbers in this canonical document follow the ratified repository
+history. The linked RFC issue also labels a configuration-discipline edit as
+draft Rev. 4, but that text was not included when this foundation document was
+ratified in [#5911](https://github.com/zeroclaw-labs/zeroclaw/pull/5911).
+Current configuration authority and environment-override behavior are documented
+in [Config lifecycle](../architecture/config-lifecycle.md) and [Environment Variables](../reference/env-vars.md).
 
 ---
 

@@ -65,8 +65,6 @@ pub use crate::twitter::TwitterChannel;
 pub use crate::voice_call::VoiceCallChannel;
 #[cfg(feature = "voice-wake")]
 pub use crate::voice_wake::VoiceWakeChannel;
-#[cfg(feature = "channel-wati")]
-pub use crate::wati::WatiChannel;
 #[cfg(feature = "channel-webhook")]
 pub use crate::webhook::WebhookChannel;
 #[cfg(feature = "channel-wechat")]
@@ -7942,7 +7940,7 @@ impl std::fmt::Display for UnknownChannelId {
             f,
             "Unknown channel '{channel_id}'. Supported: telegram, discord, slack, mattermost, \
             signal, matrix, whatsapp, qq, lark, feishu, dingtalk, wecom, wecom_ws, nextcloud_talk, \
-            wati, linq, email, gmail_push, git, irc, twitter, mochat, imessage, line, voice-call"
+            linq, email, gmail_push, git, irc, twitter, mochat, imessage, line, voice-call"
         )
     }
 }
@@ -8449,32 +8447,6 @@ fn build_channel_by_id(
         #[cfg(not(feature = "channel-nextcloud"))]
         "nextcloud_talk" | "nextcloud-talk" => {
             anyhow::bail!("Nextcloud Talk channel requires the `channel-nextcloud` feature");
-        }
-        #[cfg(feature = "channel-wati")]
-        "wati" => {
-            let wati_cfg = config
-                .channels
-                .wati
-                .get("default")
-                .context("WATI channel is not configured")?;
-            let alias = "default".to_string();
-            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
-                let cfg_arc = config_arc.clone();
-                let alias = alias.clone();
-                Arc::new(move || cfg_arc.read().channel_external_peers("wati", &alias))
-            };
-            Ok(Arc::new(WatiChannel::new_with_proxy(
-                wati_cfg.api_token.clone(),
-                wati_cfg.api_url.clone(),
-                wati_cfg.tenant_id.clone(),
-                alias,
-                peer_resolver,
-                wati_cfg.proxy_url.clone(),
-            )))
-        }
-        #[cfg(not(feature = "channel-wati"))]
-        "wati" => {
-            anyhow::bail!("WATI channel requires the `channel-wati` feature");
         }
         #[cfg(feature = "channel-linq")]
         "linq" => {
@@ -9725,46 +9697,6 @@ fn collect_configured_channels(
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
             "Linq channel is configured but this build was compiled without \
              `channel-linq`; skipping Linq."
-        );
-    }
-
-    #[cfg(feature = "channel-wati")]
-    for (alias, wati_cfg) in &config.channels.wati {
-        if !active_channel_aliases.contains(&format!("wati.{alias}")) {
-            continue;
-        }
-        if !wati_cfg.enabled {
-            continue;
-        }
-        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
-            let cfg_arc = config_arc.clone();
-            let alias = alias.clone();
-            Arc::new(move || cfg_arc.read().channel_external_peers("wati", &alias))
-        };
-        let wati_channel = WatiChannel::new_with_proxy(
-            wati_cfg.api_token.clone(),
-            wati_cfg.api_url.clone(),
-            wati_cfg.tenant_id.clone(),
-            alias.clone(),
-            peer_resolver,
-            wati_cfg.proxy_url.clone(),
-        )
-        .with_transcription(config.transcription.clone());
-        channels.push(ConfiguredChannel {
-            display_name: "WATI",
-            alias: Some(alias.clone()),
-            channel: Arc::new(wati_channel),
-        });
-    }
-
-    #[cfg(not(feature = "channel-wati"))]
-    if !config.channels.wati.is_empty() {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-            "WATI channel is configured but this build was compiled without \
-             `channel-wati`; skipping WATI."
         );
     }
 
@@ -17241,9 +17173,6 @@ BTC is currently around $65,000 based on latest tool output."#
         fn name(&self) -> &str {
             "fingerprint-test-runtime"
         }
-        fn has_shell_access(&self) -> bool {
-            true
-        }
         fn has_filesystem_access(&self) -> bool {
             true
         }
@@ -17252,6 +17181,9 @@ BTC is currently around $65,000 based on latest tool output."#
         }
         fn supports_long_running(&self) -> bool {
             false
+        }
+        fn shell_dialect(&self) -> platform::ShellDialect {
+            platform::ShellDialect::Posix
         }
         fn build_shell_command(
             &self,
@@ -22146,7 +22078,7 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
-    fn prompt_skills_preserve_instructions_without_compact_loader() {
+    fn prompt_helpers_default_mode_preserves_instructions_with_compact_loader() {
         let ws = make_workspace();
         let skills = vec![zeroclaw_runtime::skills::Skill {
             name: "code-review".into(),
@@ -22171,7 +22103,24 @@ BTC is currently around $65,000 based on latest tool output."#
             location: None,
         }];
 
-        let prompt = build_system_prompt(ws.path(), "model", &[], &skills, None, None);
+        let prompt = build_system_prompt(
+            ws.path(),
+            "model",
+            &[("read_skill", "Load skill instructions by name")],
+            &skills,
+            None,
+            None,
+        );
+        let prompt_with_tool_calls =
+            zeroclaw_runtime::agent::system_prompt::build_system_prompt_with_tool_calls(
+                ws.path(),
+                "model",
+                &[("read_skill", "Load skill instructions by name")],
+                &skills,
+                None,
+                None,
+                true,
+            );
 
         assert!(prompt.contains("<available_skills>"), "missing skills XML");
         assert!(prompt.contains("<name>code-review</name>"));
@@ -22186,6 +22135,12 @@ BTC is currently around $65,000 based on latest tool output."#
         // Registered tools (shell kind) appear under <callable_tools> with prefixed names
         assert!(prompt.contains("<callable_tools"));
         assert!(prompt.contains("<name>code-review__lint</name>"));
+        assert!(prompt_with_tool_calls.contains("<instructions>"));
+        assert!(
+            prompt_with_tool_calls.contains(
+                "<instruction>Always run cargo test before final response.</instruction>"
+            )
+        );
     }
 
     #[test]
@@ -24200,6 +24155,8 @@ BTC is currently around $65,000 based on latest tool output."#
             ..Default::default()
         };
         config.skills.open_skills_enabled = false;
+        config.skills.prompt_injection_mode =
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Compact;
 
         let initial_skills =
             zeroclaw_runtime::skills::load_skills_with_config(workspace.path(), &config);
