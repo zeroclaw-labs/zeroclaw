@@ -2354,16 +2354,20 @@ impl Channel for WeChatChannel {
 
             consecutive_failures = 0;
 
-            // Update cursor
-            if let Some(new_cursor) = data
+            // Capture the response cursor but defer committing it (both the
+            // local `cursor` and `self.cursor`/disk) until every message in
+            // this batch has been successfully enqueued below. Persisting any
+            // earlier would let a crash between cursor persistence and enqueue
+            // completion permanently lose the batch: on restart, `listen()`
+            // would reload the already-advanced cursor and never re-poll those
+            // messages. `set_context_token` also calls `save_sync_data()`
+            // mid-batch; because the in-memory cursor is not advanced yet,
+            // those writes serialize the old cursor.
+            let next_cursor = data
                 .get("get_updates_buf")
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
-            {
-                cursor = new_cursor.to_string();
-                *self.cursor.lock() = cursor.clone();
-                self.save_sync_data();
-            }
+                .map(|s| s.to_string());
 
             if let Some(next_timeout) = data
                 .get("longpolling_timeout_ms")
@@ -2453,8 +2457,22 @@ impl Channel for WeChatChannel {
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
                         "channel receiver dropped, stopping"
                     );
+                    // Do NOT commit `next_cursor` here: the batch is only
+                    // partially (or not at all) enqueued, so the old cursor
+                    // must stay on disk. On supervised restart `listen()`
+                    // reloads it and re-polls this batch.
                     return Ok(());
                 }
+            }
+
+            // Commit the cursor only now that the whole batch has been
+            // enqueued (or there was nothing to enqueue). There is no inbound
+            // dedup, so redelivery after a restart is possible (at-least-once);
+            // that trade is intentional and preferable to silent message loss.
+            if let Some(new_cursor) = next_cursor {
+                cursor = new_cursor;
+                *self.cursor.lock() = cursor.clone();
+                self.save_sync_data();
             }
         }
     }
@@ -3422,6 +3440,252 @@ mod tests {
         assert_eq!(
             ch2.get_context_token("acct:user1"),
             Some("new_token".to_string())
+        );
+    }
+
+    fn getupdates_batch(cursor: &str, msgs: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "ret": 0,
+            "errcode": 0,
+            "get_updates_buf": cursor,
+            "msgs": msgs,
+        })
+    }
+
+    /// Regression for lost inbound batches: if the first `tx.send` in a batch
+    /// fails (receiver gone), `listen()` must return without committing the
+    /// cursor the response carried. Otherwise a crash between cursor
+    /// persistence and enqueue completion permanently skips the un-enqueued
+    /// messages on restart.
+    #[tokio::test]
+    async fn listen_does_not_commit_cursor_when_first_enqueue_fails() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().to_path_buf();
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/getupdates"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(getupdates_batch(
+                "cursor_after_batch",
+                serde_json::json!([
+                    {
+                        "from_user_id": "user_a",
+                        "message_id": 1,
+                        "create_time_ms": 1_700_000_000_000u64,
+                        "item_list": [{"type": 1, "text_item": {"text": "hello"}}]
+                    },
+                    {
+                        "from_user_id": "user_b",
+                        "message_id": 2,
+                        "create_time_ms": 1_700_000_001_000u64,
+                        "item_list": [{"type": 1, "text_item": {"text": "world"}}]
+                    }
+                ]),
+            )))
+            .mount(&mock_server)
+            .await;
+
+        let ch = test_wechat_channel_for_api(mock_server.uri(), &state_dir);
+        *ch.cursor.lock() = "original_cursor".to_string();
+        ch.save_sync_data();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+
+        let result = tokio::time::timeout(Duration::from_secs(5), ch.listen(tx))
+            .await
+            .expect("listen() should return promptly once the receiver is gone");
+        assert!(result.is_ok());
+
+        let probe = WeChatChannel::new(
+            "test",
+            Arc::new(|| vec!["*".to_string()]),
+            None,
+            None,
+            Some(state_dir),
+        )
+        .unwrap();
+        assert_eq!(
+            *probe.cursor.lock(),
+            "original_cursor",
+            "cursor must not advance when the batch was never enqueued"
+        );
+    }
+
+    /// Happy path for the deferred cursor commit: once a batch is fully
+    /// enqueued, its cursor commits. A second batch whose enqueue fails
+    /// (receiver dropped mid-flight) must not move the cursor further.
+    #[tokio::test]
+    async fn listen_commits_cursor_only_after_batch_fully_enqueued() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().to_path_buf();
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/getupdates"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(getupdates_batch(
+                "cursor_batch_1",
+                serde_json::json!([
+                    {
+                        "from_user_id": "user_a",
+                        "message_id": 1,
+                        "create_time_ms": 1_700_000_000_000u64,
+                        "item_list": [{"type": 1, "text_item": {"text": "hello"}}]
+                    },
+                    {
+                        "from_user_id": "user_b",
+                        "message_id": 2,
+                        "create_time_ms": 1_700_000_001_000u64,
+                        "item_list": [{"type": 1, "text_item": {"text": "world"}}]
+                    }
+                ]),
+            )))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/getupdates"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(getupdates_batch(
+                "cursor_batch_2",
+                serde_json::json!([
+                    {
+                        "from_user_id": "user_c",
+                        "message_id": 3,
+                        "create_time_ms": 1_700_000_002_000u64,
+                        "item_list": [{"type": 1, "text_item": {"text": "third"}}]
+                    }
+                ]),
+            )))
+            .mount(&mock_server)
+            .await;
+
+        let ch = test_wechat_channel_for_api(mock_server.uri(), &state_dir);
+        *ch.cursor.lock() = "original_cursor".to_string();
+        ch.save_sync_data();
+        let ch = Arc::new(ch);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let listen_ch = ch.clone();
+        let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx).await });
+
+        let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out waiting for first message")
+            .expect("channel closed before first message");
+        assert_eq!(first.sender, "user_a");
+
+        let second = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out waiting for second message")
+            .expect("channel closed before second message");
+        assert_eq!(second.sender, "user_b");
+
+        drop(rx);
+
+        let result = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("listen() task timed out")
+            .expect("listen() task panicked");
+        assert!(result.is_ok());
+
+        let probe = WeChatChannel::new(
+            "test",
+            Arc::new(|| vec!["*".to_string()]),
+            None,
+            None,
+            Some(state_dir),
+        )
+        .unwrap();
+        assert_eq!(
+            *probe.cursor.lock(),
+            "cursor_batch_1",
+            "cursor should advance to batch 1's cursor, not batch 2's"
+        );
+    }
+
+    /// `set_context_token` (called mid-batch) itself calls `save_sync_data()`.
+    /// Because cursor commitment is deferred until the whole batch is
+    /// enqueued, that mid-batch save must persist the OLD cursor while still
+    /// recording the new context token.
+    #[tokio::test]
+    async fn listen_mid_batch_context_token_save_keeps_old_cursor() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().to_path_buf();
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/getupdates"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(getupdates_batch(
+                "cursor_after_batch",
+                serde_json::json!([
+                    {
+                        "from_user_id": "user_a",
+                        "message_id": 1,
+                        "create_time_ms": 1_700_000_000_000u64,
+                        "context_token": "ctx_abc123",
+                        "item_list": [{"type": 1, "text_item": {"text": "hello"}}]
+                    },
+                    {
+                        "from_user_id": "user_b",
+                        "message_id": 2,
+                        "create_time_ms": 1_700_000_001_000u64,
+                        "item_list": [{"type": 1, "text_item": {"text": "world"}}]
+                    }
+                ]),
+            )))
+            .mount(&mock_server)
+            .await;
+
+        let ch = test_wechat_channel_for_api(mock_server.uri(), &state_dir);
+        *ch.cursor.lock() = "original_cursor".to_string();
+        ch.save_sync_data();
+        let ch = Arc::new(ch);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let listen_ch = ch.clone();
+        let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx).await });
+
+        let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out waiting for first message")
+            .expect("channel closed before first message");
+        assert_eq!(first.sender, "user_a");
+
+        drop(rx);
+
+        let result = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("listen() task timed out")
+            .expect("listen() task panicked");
+        assert!(result.is_ok());
+
+        let probe = WeChatChannel::new(
+            "test",
+            Arc::new(|| vec!["*".to_string()]),
+            None,
+            None,
+            Some(state_dir),
+        )
+        .unwrap();
+        assert_eq!(
+            probe.get_context_token("user_a"),
+            Some("ctx_abc123".to_string()),
+            "mid-batch set_context_token must still persist the new token"
+        );
+        assert_eq!(
+            *probe.cursor.lock(),
+            "original_cursor",
+            "mid-batch save must not have leaked the uncommitted new cursor"
         );
     }
 }
