@@ -13,9 +13,9 @@ use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, stream};
 use std::process::Stdio;
 use std::sync::Arc;
-use tokio::process::Command;
 use tokio::time::{self, Duration};
 use tokio_util::sync::CancellationToken;
+use zeroclaw_api::runtime_traits::RuntimeAdapter;
 use zeroclaw_config::schema::Config;
 use zeroclaw_config::schema::{CronJobDecl, CronScheduleDecl, CronShellOutputFormat};
 use zeroclaw_log::Instrument;
@@ -201,8 +201,30 @@ pub async fn run_manual_job(
     context: CronDeliveryContext,
     event_tx: &EventBroadcast,
 ) -> ManualCronRunResult {
+    run_manual_job_inner(config, job, context, event_tx, None, false).await
+}
+
+pub(crate) async fn run_manual_job_with_runtime(
+    config: &Config,
+    job: &CronJob,
+    context: CronDeliveryContext,
+    event_tx: &EventBroadcast,
+    runtime: &dyn RuntimeAdapter,
+    approved: bool,
+) -> ManualCronRunResult {
+    run_manual_job_inner(config, job, context, event_tx, Some(runtime), approved).await
+}
+
+async fn run_manual_job_inner(
+    config: &Config,
+    job: &CronJob,
+    context: CronDeliveryContext,
+    event_tx: &EventBroadcast,
+    runtime: Option<&dyn RuntimeAdapter>,
+    approved: bool,
+) -> ManualCronRunResult {
     let started_at = Utc::now();
-    let (success, output) = execute_job_now(config, job).await;
+    let (success, output) = execute_job_now_with_runtime(config, job, runtime, approved).await;
     let finished_at = Utc::now();
     let duration_ms = (finished_at - started_at).num_milliseconds();
     let outcome = deliver_and_classify_run_result(config, job, success, output, context).await;
@@ -499,6 +521,15 @@ async fn skip_missed_jobs_on_startup(config: &Config) {
 }
 
 pub async fn execute_job_now(config: &Config, job: &CronJob) -> (bool, String) {
+    execute_job_now_with_runtime(config, job, None, false).await
+}
+
+async fn execute_job_now_with_runtime(
+    config: &Config,
+    job: &CronJob,
+    runtime: Option<&dyn RuntimeAdapter>,
+    approved: bool,
+) -> (bool, String) {
     // Reject orphaned declarative jobs: a declarative row whose canonical
     // config declaration has been removed must not execute through any
     // path (automatic polling or manual trigger).
@@ -529,9 +560,16 @@ pub async fn execute_job_now(config: &Config, job: &CronJob) -> (bool, String) {
         Err(e) => return (false, format!("agent {agent_alias} risk profile: {e}")),
     };
     let span = zeroclaw_log::attribution_span!(job);
-    Box::pin(execute_job_with_retry(config, &security, &agent_alias, job))
-        .instrument(span)
-        .await
+    Box::pin(execute_job_with_retry(
+        config,
+        &security,
+        &agent_alias,
+        job,
+        runtime,
+        approved,
+    ))
+    .instrument(span)
+    .await
 }
 
 fn cron_agent_run_security_policy(base: &SecurityPolicy, job: &CronJob) -> SecurityPolicy {
@@ -561,14 +599,34 @@ async fn execute_job_with_retry(
     security: &SecurityPolicy,
     agent_alias: &str,
     job: &CronJob,
+    runtime: Option<&dyn RuntimeAdapter>,
+    approved: bool,
 ) -> (bool, String) {
+    let owned_runtime = if matches!(job.job_type, JobType::Shell) && runtime.is_none() {
+        match crate::platform::create_runtime(&config.runtime) {
+            Ok(runtime) => Some(runtime),
+            Err(error) => return (false, format!("shell setup error: {error}")),
+        }
+    } else {
+        None
+    };
+    let runtime = runtime.or(owned_runtime.as_deref());
+
     let mut last_output = String::new();
     let retries = config.reliability.scheduler_retries;
     let mut backoff_ms = config.reliability.provider_backoff_ms.max(200);
 
     for attempt in 0..=retries {
         let (success, output) = match job.job_type {
-            JobType::Shell => run_job_command(config, security, job).await,
+            JobType::Shell => {
+                let Some(runtime) = runtime else {
+                    return (
+                        false,
+                        "shell setup error: runtime missing for shell cron job".to_string(),
+                    );
+                };
+                run_job_command_with_runtime(config, runtime, security, job, approved).await
+            }
             JobType::Agent => Box::pin(run_agent_job(config, security, agent_alias, job)).await,
         };
         last_output = output;
@@ -696,9 +754,16 @@ async fn execute_and_persist_job(
 
     let started_at = Utc::now();
     let span = zeroclaw_log::attribution_span!(job);
-    let (success, output) = Box::pin(execute_job_with_retry(config, security, agent_alias, job))
-        .instrument(span)
-        .await;
+    let (success, output) = Box::pin(execute_job_with_retry(
+        config,
+        security,
+        agent_alias,
+        job,
+        None,
+        false,
+    ))
+    .instrument(span)
+    .await;
     let finished_at = Utc::now();
     let success = Box::pin(persist_job_result(
         config,
@@ -1088,24 +1153,30 @@ pub async fn deliver_announcement(
     }
 }
 
-async fn run_job_command(
+async fn run_job_command_with_runtime(
     config: &Config,
+    runtime: &dyn RuntimeAdapter,
     security: &SecurityPolicy,
     job: &CronJob,
+    approved: bool,
 ) -> (bool, String) {
-    run_job_command_with_timeout(
+    run_job_command_with_runtime_and_timeout(
         config,
+        runtime,
         security,
         job,
+        approved,
         Duration::from_secs(SHELL_JOB_TIMEOUT_SECS),
     )
     .await
 }
 
-async fn run_job_command_with_timeout(
+async fn run_job_command_with_runtime_and_timeout(
     config: &Config,
+    runtime: &dyn RuntimeAdapter,
     security: &SecurityPolicy,
     job: &CronJob,
+    approved: bool,
     timeout: Duration,
 ) -> (bool, String) {
     if !security.can_act() {
@@ -1126,9 +1197,8 @@ async fn run_job_command_with_timeout(
     // Jobs created via the validated helpers were already checked at creation
     // time, but we re-validate at execution time to catch policy changes and
     // manually-edited job stores.
-    let approved = false; // scheduler runs are never pre-approved
     if let Err(error) =
-        crate::cron::validate_shell_command_with_security(security, &job.command, approved)
+        crate::cron::validate_shell_command_with_security(runtime, security, &job.command, approved)
     {
         return (false, error.to_string());
     }
@@ -1156,12 +1226,19 @@ async fn run_job_command_with_timeout(
     // override an imperative job's stored format.
     let output_format = &job.shell_output_format;
 
-    let child = match build_cron_shell_command(&job.command, &config.data_dir) {
-        Ok(mut cmd) => match cmd.spawn() {
-            Ok(child) => child,
-            Err(e) => return (false, format!("spawn error: {e}")),
-        },
-        Err(e) => return (false, format!("shell setup error: {e}")),
+    let mut command = match runtime.build_shell_command(&job.command, &config.data_dir) {
+        Ok(command) => command,
+        Err(error) => return (false, format!("shell setup error: {error}")),
+    };
+
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => return (false, format!("spawn error: {error}")),
     };
 
     match time::timeout(timeout, child.wait_with_output()).await {
@@ -1193,20 +1270,39 @@ async fn run_job_command_with_timeout(
     }
 }
 
-fn build_cron_shell_command(
-    command: &str,
-    workspace_dir: &std::path::Path,
-) -> anyhow::Result<Command> {
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c")
-        .arg(command)
-        .current_dir(workspace_dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+#[cfg(test)]
+async fn run_job_command(
+    config: &Config,
+    security: &SecurityPolicy,
+    job: &CronJob,
+) -> (bool, String) {
+    let runtime = match crate::platform::create_runtime(&config.runtime) {
+        Ok(runtime) => runtime,
+        Err(error) => return (false, format!("shell setup error: {error}")),
+    };
+    run_job_command_with_runtime(config, runtime.as_ref(), security, job, false).await
+}
 
-    Ok(cmd)
+#[cfg(all(test, not(target_os = "windows")))]
+async fn run_job_command_with_timeout(
+    config: &Config,
+    security: &SecurityPolicy,
+    job: &CronJob,
+    timeout: Duration,
+) -> (bool, String) {
+    let runtime = match crate::platform::create_runtime(&config.runtime) {
+        Ok(runtime) => runtime,
+        Err(error) => return (false, format!("shell setup error: {error}")),
+    };
+    run_job_command_with_runtime_and_timeout(
+        config,
+        runtime.as_ref(),
+        security,
+        job,
+        false,
+        timeout,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -1216,9 +1312,18 @@ mod tests {
     use crate::security::SecurityPolicy;
     use chrono::{Duration as ChronoDuration, Utc};
     use tempfile::TempDir;
-    use zeroclaw_config::schema::Config;
+    use zeroclaw_config::schema::{Config, RuntimeKind};
 
     const TEST_AGENT: &str = "test-agent";
+
+    fn build_configured_shell_command(
+        config: &Config,
+        command: &str,
+        workspace_dir: &std::path::Path,
+    ) -> anyhow::Result<tokio::process::Command> {
+        let runtime = crate::platform::create_runtime(&config.runtime)?;
+        runtime.build_shell_command(command, workspace_dir)
+    }
 
     #[test]
     fn is_no_reply_sentinel_matches_bare_form_case_insensitively() {
@@ -1337,6 +1442,105 @@ mod tests {
             last_status: None,
             last_output: None,
         }
+    }
+
+    struct PowerShellProbeRuntime {
+        build_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl PowerShellProbeRuntime {
+        fn new() -> Self {
+            Self {
+                build_calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl RuntimeAdapter for PowerShellProbeRuntime {
+        fn name(&self) -> &str {
+            "powershell-probe"
+        }
+
+        fn has_filesystem_access(&self) -> bool {
+            true
+        }
+
+        fn storage_path(&self) -> std::path::PathBuf {
+            std::env::temp_dir()
+        }
+
+        fn supports_long_running(&self) -> bool {
+            true
+        }
+
+        fn shell_dialect(&self) -> zeroclaw_api::runtime_traits::ShellDialect {
+            zeroclaw_api::runtime_traits::ShellDialect::PowerShell
+        }
+
+        fn build_shell_command(
+            &self,
+            _command: &str,
+            workspace_dir: &std::path::Path,
+        ) -> anyhow::Result<tokio::process::Command> {
+            self.build_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+            #[cfg(target_os = "windows")]
+            let mut command = {
+                let mut command = tokio::process::Command::new("cmd");
+                command.args(["/C", "echo", "same-runtime"]);
+                command
+            };
+
+            #[cfg(not(target_os = "windows"))]
+            let mut command = {
+                let mut command = tokio::process::Command::new("printf");
+                command.arg("same-runtime");
+                command
+            };
+
+            command.current_dir(workspace_dir);
+            Ok(command)
+        }
+    }
+
+    #[tokio::test]
+    async fn cron_shell_validation_and_execution_share_runtime_adapter() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let security = SecurityPolicy {
+            autonomy: zeroclaw_config::policy::AutonomyLevel::Full,
+            workspace_dir: config.data_dir.clone(),
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        };
+        let runtime = PowerShellProbeRuntime::new();
+
+        let safe_job = test_job("Write-Output \"quoted safe value\" | Select-Object -First 1");
+        let (success, output) =
+            run_job_command_with_runtime(&config, &runtime, &security, &safe_job, false).await;
+        assert!(success, "{output}");
+        assert!(output.contains("same-runtime"), "{output}");
+        assert_eq!(
+            runtime
+                .build_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+
+        let dangerous_job = test_job("ac blocked.txt value");
+        let (success, output) =
+            run_job_command_with_runtime(&config, &runtime, &security, &dangerous_job, true).await;
+        assert!(!success);
+        assert!(output.contains("high-risk"), "{output}");
+        assert_eq!(
+            runtime
+                .build_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "policy rejection must happen before the runtime builds a command"
+        );
     }
 
     fn unique_component(prefix: &str) -> String {
@@ -1702,6 +1906,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_job_command_blocks_windows_relative_path_for_powershell() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config
+            .risk_profiles
+            .entry(TEST_AGENT.into())
+            .or_default()
+            .allowed_commands = vec!["cat".into()];
+        let job = test_job("cat ..\\secret.txt");
+        let security = test_security(&config);
+        let runtime = crate::platform::NativeRuntime::with_shell("pwsh".into());
+
+        let (success, output) =
+            run_job_command_with_runtime(&config, &runtime, &security, &job, false).await;
+
+        assert!(!success);
+        assert!(output.contains("blocked by security policy"));
+        assert!(output.contains("forbidden path argument"));
+        assert!(output.contains("..\\secret.txt"));
+    }
+
+    #[tokio::test]
+    async fn run_job_command_blocks_powershell_stop_parsing_native_mutation() {
+        // Cron shares the same dialect-aware validator as the shell tool. On a
+        // PowerShell runtime, `git --% push` would strip `--%` and hand `push`
+        // to native Git while policy only sees `--%`; the bounded grammar must
+        // reject it so scheduled jobs cannot launder mutations through it.
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config
+            .risk_profiles
+            .entry(TEST_AGENT.into())
+            .or_default()
+            .allowed_commands = vec!["git".into()];
+        let job = test_job("git --% push origin main");
+        let security = test_security(&config);
+        let runtime = crate::platform::NativeRuntime::with_shell("pwsh".into());
+
+        let (success, output) =
+            run_job_command_with_runtime(&config, &runtime, &security, &job, false).await;
+
+        assert!(!success);
+        assert!(
+            output.contains("blocked by security policy"),
+            "output: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_job_command_blocks_powershell_mixed_quoted_provider_path() {
+        // A scheduled job must not launder an `Env:` provider read past policy
+        // by splitting the provider prefix with a quote: `cat E'nv:'PATH` binds
+        // as `Env:PATH` on PowerShell. The bounded grammar rejects the mixed
+        // quoted/unquoted token through the same validator cron uses.
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config
+            .risk_profiles
+            .entry(TEST_AGENT.into())
+            .or_default()
+            .allowed_commands = vec!["cat".into()];
+        let job = test_job("cat E'nv:'PATH");
+        let security = test_security(&config);
+        let runtime = crate::platform::NativeRuntime::with_shell("pwsh".into());
+
+        let (success, output) =
+            run_job_command_with_runtime(&config, &runtime, &security, &job, false).await;
+
+        assert!(!success);
+        assert!(
+            output.contains("blocked by security policy"),
+            "output: {output}"
+        );
+    }
+
+    #[tokio::test]
     async fn run_job_command_blocks_forbidden_option_assignment_path_argument() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp).await;
@@ -1853,6 +2133,8 @@ mod tests {
             &security,
             "test-agent",
             &job,
+            None,
+            false,
         ))
         .await;
         assert!(success);
@@ -1875,6 +2157,8 @@ mod tests {
             &security,
             "test-agent",
             &job,
+            None,
+            false,
         ))
         .await;
         assert!(!success);
@@ -2210,7 +2494,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
         let at = Utc::now() + ChronoDuration::minutes(10);
-        let job = cron::add_once_at(&config, "test-agent", at, "echo one-shot-shell").unwrap();
+        let job =
+            cron::add_once_at(&config, "test-agent", at, "echo one-shot-shell", None).unwrap();
         assert!(job.delete_after_run);
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
@@ -2242,7 +2527,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
         let at = Utc::now() + ChronoDuration::minutes(10);
-        let job = cron::add_once_at(&config, "test-agent", at, "echo one-shot-shell").unwrap();
+        let job =
+            cron::add_once_at(&config, "test-agent", at, "echo one-shot-shell", None).unwrap();
         assert!(job.delete_after_run);
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
@@ -2258,7 +2544,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
         let at = Utc::now() + ChronoDuration::minutes(10);
-        let job = cron::add_once_at(&config, "test-agent", at, "echo one-shot-shell").unwrap();
+        let job =
+            cron::add_once_at(&config, "test-agent", at, "echo one-shot-shell", None).unwrap();
         assert!(job.delete_after_run);
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
@@ -2538,9 +2825,11 @@ mod tests {
     }
 
     #[test]
-    fn build_cron_shell_command_uses_sh_non_login() {
+    #[cfg(not(target_os = "windows"))]
+    fn build_cron_shell_command_uses_configured_runtime() {
+        let config = Config::default();
         let workspace = std::env::temp_dir();
-        let cmd = build_cron_shell_command("echo cron-test", &workspace).unwrap();
+        let cmd = build_configured_shell_command(&config, "echo cron-test", &workspace).unwrap();
         let debug = format!("{cmd:?}");
         assert!(debug.contains("echo cron-test"));
         assert!(debug.contains("\"sh\""), "should use sh: {debug}");
@@ -2553,13 +2842,106 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
     async fn build_cron_shell_command_executes_successfully() {
+        let config = Config::default();
         let workspace = std::env::temp_dir();
-        let mut cmd = build_cron_shell_command("echo cron-ok", &workspace).unwrap();
+        let mut cmd = build_configured_shell_command(&config, "echo cron-ok", &workspace).unwrap();
         let output = cmd.output().await.unwrap();
         assert!(output.status.success());
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(stdout.contains("cron-ok"));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn build_cron_shell_command_executes_with_custom_native_shell() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let shim = tmp.path().join("cron-shell-shim");
+        std::fs::write(
+            &shim,
+            "#!/bin/sh\nprintf 'CUSTOM_SHELL\\n'\nprintf 'arg:%s\\n' \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut config = Config::default();
+        config.runtime.shell = Some(shim.to_string_lossy().into_owned());
+        let mut cmd =
+            build_configured_shell_command(&config, "echo cron-custom", tmp.path()).unwrap();
+        let output = cmd.output().await.unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        assert!(output.status.success());
+        assert!(stdout.contains("CUSTOM_SHELL"), "{stdout}");
+        assert!(stdout.contains("arg:-c"), "{stdout}");
+        assert!(stdout.contains("arg:echo cron-custom"), "{stdout}");
+    }
+
+    #[test]
+    fn build_cron_shell_command_preserves_docker_runtime_boundary() {
+        let mut config = Config::default();
+        config.runtime.kind = RuntimeKind::Docker;
+        config.runtime.docker.image = "alpine:3.20".into();
+        config.runtime.docker.network = "none".into();
+        config.runtime.docker.mount_workspace = false;
+
+        let cmd =
+            build_configured_shell_command(&config, "echo cron-docker", &std::env::temp_dir())
+                .unwrap();
+        let debug = format!("{cmd:?}");
+
+        assert!(debug.contains("\"docker\""), "{debug}");
+        assert!(debug.contains("\"run\""), "{debug}");
+        assert!(debug.contains("\"--network\""), "{debug}");
+        assert!(debug.contains("\"none\""), "{debug}");
+        assert!(debug.contains("\"alpine:3.20\""), "{debug}");
+        assert!(
+            debug.contains("\"sh\" \"-c\" \"echo cron-docker\""),
+            "{debug}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn build_cron_shell_command_uses_configured_powershell() {
+        let mut config = Config::default();
+        config.runtime.shell = Some("powershell".into());
+        let workspace = std::env::temp_dir();
+        let cmd =
+            build_configured_shell_command(&config, "Write-Output cron-ok", &workspace).unwrap();
+        let debug = format!("{cmd:?}");
+        assert!(debug.contains("powershell"));
+        assert!(debug.contains("-Command"));
+        assert!(!debug.contains("cmd.exe"));
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn cron_powershell_policy_accepts_read_only_and_rejects_expressions() {
+        let mut config = Config::default();
+        config.runtime.shell = Some("powershell".into());
+        let security = SecurityPolicy::default();
+        let runtime = crate::platform::create_runtime(&config.runtime).unwrap();
+
+        crate::cron::validate_shell_command_with_security(
+            runtime.as_ref(),
+            &security,
+            "Write-Output $PSHOME",
+            false,
+        )
+        .expect("documented read-only PowerShell command should pass");
+        assert!(
+            crate::cron::validate_shell_command_with_security(
+                runtime.as_ref(),
+                &security,
+                "echo ([System.IO.File]::Delete('important.txt'))",
+                false,
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]

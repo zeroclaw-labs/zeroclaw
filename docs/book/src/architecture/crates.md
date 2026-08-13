@@ -54,7 +54,7 @@ Structure:
 - `anthropic.rs`, `openai.rs`, `ollama.rs`, …: one file per native provider
 - `compatible.rs`: a single OpenAI-compatible implementation reused by 20+ providers (Groq, Mistral, xAI, Venice, etc.)
 - `router.rs`: hint-based per-call model route selection
-- `reliable.rs`: same-provider retry / backoff / API-key rotation wrapper
+- `reliable.rs`: retry / backoff / cooldown and ordered model-provider fallback wrapper
 - `streaming.rs`: SSE parsing, token estimation, tool-call deltas
 
 ### `zeroclaw-channels`

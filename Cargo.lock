@@ -390,7 +390,7 @@ version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "435a87a52755b8f27fcf321ac4f04b2802e337c8c4872923137471ec39c37532"
 dependencies = [
- "event-listener 5.4.1",
+ "event-listener 5.4.2",
  "event-listener-strategy",
  "futures-core",
  "pin-project-lite",
@@ -546,7 +546,7 @@ version = "3.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "290f7f2596bd5b78a9fec8088ccd89180d7f9f55b94b0576823bbbdc72ee8311"
 dependencies = [
- "event-listener 5.4.1",
+ "event-listener 5.4.2",
  "event-listener-strategy",
  "pin-project-lite",
 ]
@@ -570,7 +570,7 @@ dependencies = [
  "async-task",
  "blocking",
  "cfg-if",
- "event-listener 5.4.1",
+ "event-listener 5.4.2",
  "futures-lite 2.6.1",
  "rustix 1.1.4",
 ]
@@ -3071,11 +3071,10 @@ checksum = "0206175f82b8d6bf6652ff7d71a1e27fd2e4efde587fd368662814d6ec1d9ce0"
 
 [[package]]
 name = "event-listener"
-version = "5.4.1"
+version = "5.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e13b66accf52311f30a0db42147dadea9850cb48cd070028831ae5f5d4b856ab"
+checksum = "5a23add41df1562121a9393cb065eab5146a1242410f23a644851e90cfd669d2"
 dependencies = [
- "concurrent-queue",
  "parking",
  "pin-project-lite",
 ]
@@ -3086,7 +3085,7 @@ version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8be9f3dfaaffdae2972880079a491a1a8bb7cbed0b8dd7a347f668b4150a3b93"
 dependencies = [
- "event-listener 5.4.1",
+ "event-listener 5.4.2",
  "pin-project-lite",
 ]
 
@@ -5528,7 +5527,7 @@ dependencies = [
  "bytes",
  "bytesize",
  "cfg-if",
- "event-listener 5.4.1",
+ "event-listener 5.4.2",
  "eyeball",
  "eyeball-im",
  "futures-core",
@@ -11199,7 +11198,7 @@ dependencies = [
  "bytes",
  "chrono",
  "ctr 0.10.1",
- "event-listener 5.4.1",
+ "event-listener 5.4.2",
  "flate2",
  "futures",
  "hex",
@@ -12105,7 +12104,7 @@ dependencies = [
  "bytes",
  "chrono",
  "env_logger",
- "event-listener 5.4.1",
+ "event-listener 5.4.2",
  "futures",
  "hex",
  "itoa",
@@ -13116,7 +13115,7 @@ dependencies = [
  "async-trait",
  "blocking",
  "enumflags2",
- "event-listener 5.4.1",
+ "event-listener 5.4.2",
  "futures-core",
  "futures-lite 2.6.1",
  "hex",
@@ -13305,6 +13304,7 @@ dependencies = [
  "jsonwebtoken",
  "lapin",
  "lettre",
+ "libc",
  "lru 0.18.2",
  "mail-parser",
  "matrix-sdk",
@@ -13577,6 +13577,21 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "zeroclaw-api",
+]
+
+[[package]]
+name = "zeroclaw-log-attribution-macro-consumer"
+version = "0.8.4"
+dependencies = [
+ "zeroclaw-log",
+ "zeroclaw-log-attribution-macro-support",
+]
+
+[[package]]
+name = "zeroclaw-log-attribution-macro-support"
+version = "0.8.4"
+dependencies = [
  "zeroclaw-api",
 ]
 

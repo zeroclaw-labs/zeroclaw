@@ -1,4 +1,4 @@
-use crate::helpers::domain_guard;
+use crate::helpers::{domain_guard, response_body};
 use async_trait::async_trait;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use serde_json::json;
@@ -373,21 +373,13 @@ impl HttpRequestTool {
         Ok(request.send().await?)
     }
 
-    fn truncate_response(&self, text: &str) -> String {
-        // 0 means unlimited — no truncation.
-        if self.max_response_size == 0 {
-            return text.to_string();
+    async fn read_response_text(&self, response: reqwest::Response) -> anyhow::Result<String> {
+        let limit = (self.max_response_size != 0).then_some(self.max_response_size);
+        let (mut text, overflowed) = response_body::read_text(response, limit).await?;
+        if overflowed {
+            text.push_str("\n\n... [Response truncated due to size limit] ...");
         }
-        if text.len() > self.max_response_size {
-            let mut truncated = text
-                .chars()
-                .take(self.max_response_size)
-                .collect::<String>();
-            truncated.push_str("\n\n... [Response truncated due to size limit] ...");
-            truncated
-        } else {
-            text.to_string()
-        }
+        Ok(text)
     }
 }
 
@@ -591,8 +583,8 @@ impl Tool for HttpRequestTool {
                     .join(", ");
 
                 // Get response body with size limit
-                let response_text = match response.text().await {
-                    Ok(text) => self.truncate_response(&text),
+                let response_text = match self.read_response_text(response).await {
+                    Ok(text) => text,
                     Err(e) => format!("[Failed to read response body: {e}]"),
                 };
 
@@ -725,8 +717,86 @@ mod tests {
     use zeroclaw_config::autonomy::AutonomyLevel;
     use zeroclaw_config::policy::SecurityPolicy;
 
+    async fn chunked_response(chunks: &[&[u8]]) -> reqwest::Response {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let owned_chunks = chunks
+            .iter()
+            .map(|chunk| chunk.to_vec())
+            .collect::<Vec<_>>();
+
+        zeroclaw_spawn::spawn!(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let mut buffer = [0_u8; 1024];
+                let read = stream.read(&mut buffer).await.unwrap();
+                assert!(read > 0, "client closed before completing request headers");
+                request.extend_from_slice(&buffer[..read]);
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            for chunk in owned_chunks {
+                stream
+                    .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+                    .await
+                    .unwrap();
+                stream.write_all(&chunk).await.unwrap();
+                stream.write_all(b"\r\n").await.unwrap();
+            }
+            stream.write_all(b"0\r\n\r\n").await.unwrap();
+        });
+
+        reqwest::get(format!("http://{addr}")).await.unwrap()
+    }
+
     fn test_tool(allowed_domains: Vec<&str>) -> HttpRequestTool {
         test_tool_with_private(allowed_domains, false)
+    }
+
+    #[tokio::test]
+    async fn response_limit_truncates_a_chunked_body_during_streaming() {
+        let tool = HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["example.com".into()],
+            8,
+            30,
+            false,
+            Vec::new(),
+        )
+        .unwrap();
+        let response = chunked_response(&[b"hello", b" world", b" ignored"]).await;
+
+        let text = tool.read_response_text(response).await.unwrap();
+
+        assert!(text.starts_with("hello wo"));
+        assert!(text.contains("[Response truncated due to size limit]"));
+        assert!(!text.contains("ignored"));
+    }
+
+    #[tokio::test]
+    async fn zero_response_limit_preserves_a_complete_chunked_body() {
+        let tool = HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["example.com".into()],
+            0,
+            30,
+            false,
+            Vec::new(),
+        )
+        .unwrap();
+        let response = chunked_response(&[b"hello", b" world"]).await;
+
+        assert_eq!(
+            tool.read_response_text(response).await.unwrap(),
+            "hello world"
+        );
     }
 
     fn test_tool_with_private(
@@ -1234,62 +1304,6 @@ api_token = "Bearer from-secret"
             .unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap().contains("read-only"));
-    }
-
-    #[test]
-    fn truncate_response_within_limit() {
-        let tool = test_tool(vec!["example.com"]);
-        let text = "hello world";
-        assert_eq!(tool.truncate_response(text), "hello world");
-    }
-
-    #[test]
-    fn truncate_response_over_limit() {
-        let tool = HttpRequestTool::new(
-            Arc::new(SecurityPolicy::default()),
-            vec!["example.com".into()],
-            10,
-            30,
-            false,
-            Vec::new(),
-        )
-        .unwrap();
-        let text = "hello world this is long";
-        let truncated = tool.truncate_response(text);
-        assert!(truncated.len() <= 10 + 60); // limit + message
-        assert!(truncated.contains("[Response truncated"));
-    }
-
-    #[test]
-    fn truncate_response_zero_means_unlimited() {
-        let tool = HttpRequestTool::new(
-            Arc::new(SecurityPolicy::default()),
-            vec!["example.com".into()],
-            0, // max_response_size = 0 means no limit
-            30,
-            false,
-            Vec::new(),
-        )
-        .unwrap();
-        let text = "a".repeat(10_000_000);
-        assert_eq!(tool.truncate_response(&text), text);
-    }
-
-    #[test]
-    fn truncate_response_nonzero_still_truncates() {
-        let tool = HttpRequestTool::new(
-            Arc::new(SecurityPolicy::default()),
-            vec!["example.com".into()],
-            5,
-            30,
-            false,
-            Vec::new(),
-        )
-        .unwrap();
-        let text = "hello world";
-        let truncated = tool.truncate_response(text);
-        assert!(truncated.starts_with("hello"));
-        assert!(truncated.contains("[Response truncated"));
     }
 
     #[test]
