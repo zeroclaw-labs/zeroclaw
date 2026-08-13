@@ -236,9 +236,9 @@ cli-cron-long-about =
       zeroclaw cron add '0 9 * * 1-5' 'Good morning' --agent sentinel --prompt --tz America/New_York
       zeroclaw cron add '*/30 * * * *' 'Check system health' --agent sentinel --prompt
       zeroclaw cron add '*/5 * * * *' 'echo ok' --agent sentinel
-      zeroclaw cron add-at 2025-01-15T14:00:00Z 'Send reminder' --agent
-      zeroclaw cron add-every 60000 'Ping heartbeat'
-      zeroclaw cron once 30m 'Run backup in 30 minutes' --agent
+      zeroclaw cron add-at 2099-01-15T14:00:00Z 'Send reminder' --agent sentinel --prompt
+      zeroclaw cron add-every 60000 'Ping heartbeat' --agent sentinel --prompt
+      zeroclaw cron once 30m 'Run backup in 30 minutes' --agent sentinel --prompt
       zeroclaw cron pause TASK_ID
       zeroclaw cron update TASK_ID --expression '0 8 * * *' --tz Europe/London
 
@@ -559,7 +559,7 @@ cli-cron-added-oneshot = ✅ Added one-shot cron job {$id}
 cli-cron-added-interval-agent = ✅ Added interval agent cron job {$id}
 cli-cron-added-interval = ✅ Added interval cron job {$id}
 cli-cron-updated = ✅ Updated cron job {$id}
-cli-cron-update-no-field = At least one of --expression, --tz, --command, --name, --allowed-tool, or --uses-memory must be provided
+cli-cron-update-no-field = At least one of --expression, --tz, --command, --name, --allowed-tool, --uses-memory, or a delivery flag (--channel, --to, --thread, --best-effort, --no-best-effort) must be provided
 cli-cron-removed = ✅ Removed cron job {$id}
 cli-cron-paused = ⏸️  Paused cron job {$id}
 cli-cron-resumed = ▶️  Resumed cron job {$id}
@@ -575,6 +575,8 @@ cli-cron-cmd3 = {"  "}Cmd      : {$v}
 cli-cron-at = {"  "}At    : {$v}
 cli-cron-at2 = {"  "}At  : {$v}
 cli-cron-every = {"  "}Every(ms): {$v}
+cli-cron-delivery = {"  "}Delivery: {$v}
+cli-cron-delivery-disabled = disabled (output is not sent anywhere)
 
 # ── main / status / quickstart / pairing / desktop ──
 cli-no-command = No command provided.

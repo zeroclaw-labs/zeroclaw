@@ -2470,16 +2470,22 @@ struct GatewayChatDispatchCapture {
 static GATEWAY_CHAT_DISPATCH_CAPTURES: std::sync::Mutex<Vec<GatewayChatDispatchCapture>> =
     std::sync::Mutex::new(Vec::new());
 
-#[cfg(test)]
+// The four items below serialize and read the capture buffer, and only the
+// Linq webhook alias tests do either. Their gate has to name that feature as
+// well as `test`, or they are compiled and unused whenever it is off, which
+// `-D warnings` promotes to an error. The buffer itself, and the recording
+// function that fills it, stay on the plain `test` gate because the chat
+// dispatch path writes to them unconditionally.
+#[cfg(all(test, feature = "channel-linq"))]
 static GATEWAY_CHAT_DISPATCH_CAPTURE_TEST_LOCK: tokio::sync::Mutex<()> =
     tokio::sync::Mutex::const_new(());
 
-#[cfg(test)]
+#[cfg(all(test, feature = "channel-linq"))]
 async fn lock_gateway_chat_dispatch_capture_for_test() -> tokio::sync::MutexGuard<'static, ()> {
     GATEWAY_CHAT_DISPATCH_CAPTURE_TEST_LOCK.lock().await
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "channel-linq"))]
 fn clear_gateway_chat_dispatch_captures_for_test() {
     GATEWAY_CHAT_DISPATCH_CAPTURES
         .lock()
@@ -2487,7 +2493,7 @@ fn clear_gateway_chat_dispatch_captures_for_test() {
         .clear();
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "channel-linq"))]
 fn gateway_chat_dispatch_captures_for_test() -> Vec<GatewayChatDispatchCapture> {
     GATEWAY_CHAT_DISPATCH_CAPTURES
         .lock()
