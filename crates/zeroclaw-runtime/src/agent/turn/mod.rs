@@ -1740,28 +1740,27 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             // projection also carries the next iteration's native-tool signal so
             // the prompt-anchor swap (and the schema estimate) match the request
             // the NEXT iteration will actually dispatch.
-            let (next_schema_tokens, next_use_native_tools) =
-                match build_iteration_tool_specs(
-                    model_provider,
-                    tools_registry,
-                    excluded_tools,
-                    activated_tools,
-                ) {
-                    Ok(mut next_specs) => {
-                        next_specs.refresh_native_tool_mode(next_active_provider);
-                        (
-                            if next_specs.use_native_tools {
-                                crate::agent::history::estimate_tool_schema_tokens(
-                                    &next_specs.tool_specs,
-                                )
-                            } else {
-                                0
-                            },
-                            next_specs.use_native_tools,
-                        )
-                    }
-                    Err(_) => (tool_schema_tokens, use_native_tools),
-                };
+            let (next_schema_tokens, next_use_native_tools) = match build_iteration_tool_specs(
+                model_provider,
+                tools_registry,
+                excluded_tools,
+                activated_tools,
+            ) {
+                Ok(mut next_specs) => {
+                    next_specs.refresh_native_tool_mode(next_active_provider);
+                    (
+                        if next_specs.use_native_tools {
+                            crate::agent::history::estimate_tool_schema_tokens(
+                                &next_specs.tool_specs,
+                            )
+                        } else {
+                            0
+                        },
+                        next_specs.use_native_tools,
+                    )
+                }
+                Err(_) => (tool_schema_tokens, use_native_tools),
+            };
             enforce_reported_budget(
                 turn_state.history,
                 reported as usize,
@@ -3414,33 +3413,33 @@ mod reported_budget_tests {
             .recv()
             .await
             .expect("the untrimmable floor must emit a HistoryTrimmed event");
-        let (dropped_messages, kept_turns, tokens_before, tokens_after, token_budget) =
-            match event {
-                TurnEvent::HistoryTrimmed {
-                    dropped_messages,
-                    kept_turns,
-                    tokens_before,
-                    tokens_after,
-                    token_budget,
-                    ..
-                } => (
-                    dropped_messages,
-                    kept_turns,
-                    tokens_before,
-                    tokens_after,
-                    token_budget,
-                ),
-                other => panic!("expected HistoryTrimmed, got {other:?}"),
-            };
+        let (dropped_messages, kept_turns, tokens_before, tokens_after, token_budget) = match event
+        {
+            TurnEvent::HistoryTrimmed {
+                dropped_messages,
+                kept_turns,
+                tokens_before,
+                tokens_after,
+                token_budget,
+                ..
+            } => (
+                dropped_messages,
+                kept_turns,
+                tokens_before,
+                tokens_after,
+                token_budget,
+            ),
+            other => panic!("expected HistoryTrimmed, got {other:?}"),
+        };
         assert_eq!(
             dropped_messages, 0,
             "at the newest-turn floor nothing can be dropped"
         );
         assert_eq!(kept_turns, 1, "only the protected newest turn remains");
-        let tokens_after = tokens_after
-            .expect("the floor event must carry the projected post-trim token count");
-        let tokens_before = tokens_before
-            .expect("the floor event must carry the projected pre-trim token count");
+        let tokens_after =
+            tokens_after.expect("the floor event must carry the projected post-trim token count");
+        let tokens_before =
+            tokens_before.expect("the floor event must carry the projected pre-trim token count");
         assert!(
             tokens_after > budget as u64,
             "the projected request must still exceed the budget at the floor \
