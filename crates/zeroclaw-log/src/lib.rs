@@ -22,6 +22,7 @@ pub mod __private {
     pub use ::serde_json;
     pub use ::tracing;
     pub use ::uuid;
+    pub use ::zeroclaw_api;
 }
 
 pub use broadcast::{

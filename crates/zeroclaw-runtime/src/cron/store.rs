@@ -490,6 +490,23 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
         job.enabled = enabled;
     }
     if let Some(delivery) = patch.delivery {
+        // A declarative job's delivery is owned by `[cron.<id>].delivery` in
+        // config.toml. Writing it here would appear to succeed and then be
+        // silently reverted by `sync_declarative_jobs` on the next daemon
+        // start, which rewrites every declarative column from the config.
+        // Reject at this boundary rather than persist a value the next sync
+        // discards, matching how `shell_output_format` is handled below.
+        //
+        // Ownership is checked before shape: a declarative job rejects any
+        // delivery patch, so reporting a missing recipient first would imply
+        // that correcting it would let the write through.
+        if job.source == "declarative" {
+            anyhow::bail!(
+                "Cron job '{job_id}': delivery is owned by [cron.{job_id}].delivery in \
+                 config.toml for a declarative job, not the database. Edit the config \
+                 and restart the daemon."
+            );
+        }
         // Match add_*_job: announce delivery must include channel + to.
         validate_delivery_config(Some(&delivery))?;
         job.delivery = delivery;
@@ -3649,6 +3666,75 @@ schedule = { kind = "every", every_ms = 300000 }
         assert!(
             err.to_string().contains("config.toml"),
             "the core update_job boundary must reject a config-owned mutation, not silently ignore it: {err}"
+        );
+    }
+
+    /// Regression: a declarative job's delivery is owned by
+    /// `[cron.<id>].delivery`. Persisting a CLI patch here would look like it
+    /// worked and then be silently reverted by `sync_declarative_jobs` on the
+    /// next daemon start, which rewrites every declarative column from config.
+    /// The second half of this test proves that revert, so the guard is
+    /// justified by the behaviour rather than by assertion.
+    #[test]
+    fn update_job_rejects_delivery_for_declarative_job() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        seed_claiming_agent(&mut config, &["decl-job"]);
+
+        let decl = zeroclaw_config::schema::CronJobDecl {
+            name: Some("decl-job".to_string()),
+            job_type: "shell".to_string(),
+            schedule: zeroclaw_config::schema::CronScheduleDecl::Cron {
+                expr: "0 2 * * *".to_string(),
+                tz: None,
+            },
+            command: Some("echo ok".to_string()),
+            prompt: None,
+            enabled: true,
+            model: None,
+            allowed_tools: None,
+            uses_memory: true,
+            session_target: None,
+            delivery: None,
+            shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Wrapped,
+        };
+        let decls = decls_map(vec![("decl-job".to_string(), decl.clone())]);
+        config.cron.insert("decl-job".to_string(), decl);
+        sync_declarative_jobs(&config, &decls).unwrap();
+
+        let err = update_job(
+            &config,
+            "decl-job",
+            CronJobPatch {
+                delivery: Some(DeliveryConfig {
+                    mode: "announce".to_string(),
+                    channel: Some("telegram".to_string()),
+                    to: Some("111".to_string()),
+                    thread_id: None,
+                    best_effort: true,
+                }),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("config.toml"),
+            "the rejection must point at the canonical source: {msg}"
+        );
+        assert!(
+            msg.contains("[cron.decl-job].delivery"),
+            "the rejection must name the exact config key to edit: {msg}"
+        );
+
+        // The stored job is untouched, and a sync would have reverted it anyway.
+        let after = get_job(&config, "decl-job").unwrap();
+        assert_eq!(after.delivery.mode, "none");
+        sync_declarative_jobs(&config, &decls).unwrap();
+        assert_eq!(
+            get_job(&config, "decl-job").unwrap().delivery.mode,
+            "none",
+            "sync rewrites declarative delivery from config, which is why the patch is rejected"
         );
     }
 
