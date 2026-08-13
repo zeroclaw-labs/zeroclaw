@@ -23,7 +23,7 @@ pub(crate) struct ProviderCallOutcome {
 
 pub(crate) async fn announce_llm_request(
     ctx: &TurnCtx<'_>,
-    history: &[ChatMessage],
+    request_messages: &[ChatMessage],
     active_model_provider: &dyn ModelProvider,
     active_model_provider_name: &str,
     active_model: &str,
@@ -43,7 +43,7 @@ pub(crate) async fn announce_llm_request(
     ctx.observer.record_event(&ObserverEvent::LlmRequest {
         model_provider: active_model_provider_name.to_string(),
         model: active_model.to_string(),
-        messages_count: history.len(),
+        messages_count: request_messages.len(),
         channel: Some(ctx.channel_name.to_string()),
         agent_alias: ctx.agent_alias.map(|s| s.to_string()),
         parent_agent_alias: ctx.parent_agent_alias.map(|s| s.to_string()),
@@ -53,7 +53,7 @@ pub(crate) async fn announce_llm_request(
         let _provider_guard = ::zeroclaw_log::attribution_span!(active_model_provider).entered();
         let mut attrs = ::serde_json::json!({
             "iteration": iteration + 1,
-            "messages_count": history.len(),
+            "messages_count": request_messages.len(),
             "model": active_model,
             "trace_id": ctx.turn_id,
         });
@@ -64,7 +64,7 @@ pub(crate) async fn announce_llm_request(
             && policy.captures_payload()
             && let ::serde_json::Value::Object(map) = &mut attrs
         {
-            let rendered: Vec<::serde_json::Value> = history
+            let rendered: Vec<::serde_json::Value> = request_messages
                 .iter()
                 .map(|m| {
                     ::serde_json::json!({"role": m.role.as_str(), "content": m.content.as_str()})
@@ -101,7 +101,7 @@ pub(crate) async fn announce_llm_request(
 
     // Fire void hook before LLM call
     if let Some(hooks) = ctx.hooks {
-        hooks.fire_llm_input(history, ctx.model).await;
+        hooks.fire_llm_input(request_messages, active_model).await;
     }
 
     llm_started_at

@@ -13,6 +13,64 @@ struct StartupReadiness {
     socket_ready: bool,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+enum SocketStartupState {
+    #[default]
+    Pending,
+    Ready,
+    Fatal(String),
+}
+
+#[derive(Clone)]
+struct SocketStartupTracker {
+    state_tx: tokio::sync::watch::Sender<SocketStartupState>,
+}
+
+impl SocketStartupTracker {
+    fn new() -> (Self, tokio::sync::watch::Receiver<SocketStartupState>) {
+        let (state_tx, state_rx) = tokio::sync::watch::channel(SocketStartupState::Pending);
+        (Self { state_tx }, state_rx)
+    }
+
+    fn reporter(&self, inner: Option<SocketReadinessReporter>) -> Option<SocketReadinessReporter> {
+        let state_tx = self.state_tx.clone();
+        Some(SocketReadinessReporter::new(move || {
+            state_tx.send_if_modified(|state| {
+                if matches!(state, SocketStartupState::Pending) {
+                    *state = SocketStartupState::Ready;
+                    true
+                } else {
+                    false
+                }
+            });
+            if let Some(inner) = &inner {
+                inner.report_ready();
+            }
+        }))
+    }
+
+    fn record_error(&self, error: &anyhow::Error) {
+        if !is_addr_in_use(error) {
+            return;
+        }
+
+        self.state_tx.send_if_modified(|state| {
+            if matches!(state, SocketStartupState::Pending) {
+                *state = SocketStartupState::Fatal(format!("{error:#}"));
+                true
+            } else {
+                false
+            }
+        });
+    }
+}
+
+fn is_addr_in_use(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|error| error.kind() == std::io::ErrorKind::AddrInUse)
+}
+
 #[derive(Clone)]
 pub struct GatewayReadinessReporter(std::sync::Arc<dyn Fn(std::net::SocketAddr) + Send + Sync>);
 
@@ -471,6 +529,7 @@ pub async fn run(
     } else {
         (None, None)
     };
+    let (socket_startup_tracker, socket_startup_rx) = SocketStartupTracker::new();
     let mut gateway_required = false;
     let mut socket_required = false;
 
@@ -721,6 +780,7 @@ pub async fn run(
         let socket_cancel = channels_cancel.clone();
         let count = socket_client_count.clone();
         let socket_readiness_tx = startup_readiness_tx.clone();
+        let startup_tracker = socket_startup_tracker.clone();
         handles.push(spawn_component_supervisor(
             "socket",
             initial_backoff,
@@ -733,9 +793,15 @@ pub async fn run(
                 let count = count.clone();
                 let (readiness_attempt, readiness_reporter) =
                     StartupReadinessAttempt::socket(socket_readiness_tx.clone());
+                let readiness_reporter = startup_tracker.reporter(readiness_reporter);
+                let startup_tracker = startup_tracker.clone();
                 async move {
                     let _readiness_attempt = readiness_attempt;
-                    start(ctx, cancel, count, readiness_reporter).await
+                    let result = start(ctx, cancel, count, readiness_reporter).await;
+                    if let Err(error) = &result {
+                        startup_tracker.record_error(error);
+                    }
+                    result
                 }
             },
         ));
@@ -839,39 +905,61 @@ pub async fn run(
         );
     }
 
-    record_daemon_started(&config, &host, port);
+    // Wait for shutdown (SIGINT/SIGTERM/Ctrl+C), reload (in-process channel),
+    // or an unrecoverable initial socket ownership conflict.
+    let exit = wait_for_exit_signal(reload_rx, ephemeral, socket_client_count);
+    tokio::pin!(exit);
 
-    // Wait for shutdown (SIGINT/SIGTERM/Ctrl+C) or reload (in-process channel).
-    let exit = if startup_feedback_enabled {
-        let exit = wait_for_exit_signal(reload_rx, ephemeral, socket_client_count);
-        tokio::pin!(exit);
-        let readiness =
-            await_startup_readiness(startup_readiness_rx, gateway_required, socket_required);
-        tokio::pin!(readiness);
-
+    let startup_result = if socket_required {
+        let socket_startup = await_socket_startup(socket_startup_rx);
+        tokio::pin!(socket_startup);
         tokio::select! {
             biased;
-            exit = &mut exit => exit?,
-            readiness = &mut readiness => {
-                if let Some(readiness) = readiness
-                    && stderr_is_interactive_foreground()
-                {
-                    let mut stderr = std::io::stderr().lock();
-                    let _ = echo_daemon_ready_to_terminal(&config, readiness, &mut stderr);
-                }
-                exit.await?
-            }
+            exit = &mut exit => exit.map(Some),
+            startup = &mut socket_startup => startup.map(|()| None),
         }
     } else {
-        wait_for_exit_signal(reload_rx, ephemeral, socket_client_count).await?
+        Ok(None)
     };
-    crate::health::mark_component_error(
-        "daemon",
-        match exit {
-            DaemonExit::Shutdown => "shutdown requested",
-            DaemonExit::Reload => "reload requested",
-        },
-    );
+
+    let exit_result = match startup_result {
+        Err(error) => Err(error),
+        Ok(Some(exit)) => Ok(exit),
+        Ok(None) if startup_feedback_enabled => {
+            record_daemon_started(&config, &host, port);
+            let readiness =
+                await_startup_readiness(startup_readiness_rx, gateway_required, socket_required);
+            tokio::pin!(readiness);
+
+            tokio::select! {
+                biased;
+                exit = &mut exit => exit,
+                readiness = &mut readiness => {
+                    if let Some(readiness) = readiness
+                        && stderr_is_interactive_foreground()
+                    {
+                        let mut stderr = std::io::stderr().lock();
+                        let _ = echo_daemon_ready_to_terminal(&config, readiness, &mut stderr);
+                    }
+                    exit.await
+                }
+            }
+        }
+        Ok(None) => {
+            record_daemon_started(&config, &host, port);
+            exit.await
+        }
+    };
+    match &exit_result {
+        Ok(exit) => crate::health::mark_component_error(
+            "daemon",
+            match exit {
+                DaemonExit::Shutdown => "shutdown requested",
+                DaemonExit::Reload => "reload requested",
+            },
+        ),
+        Err(error) => crate::health::mark_component_error("daemon", format!("{error:#}")),
+    }
 
     channels_cancel.cancel();
 
@@ -903,7 +991,7 @@ pub async fn run(
         libc::malloc_trim(0);
     }
 
-    Ok(exit)
+    exit_result
 }
 
 pub fn state_file_path(config: &Config) -> PathBuf {
@@ -946,6 +1034,23 @@ async fn await_startup_readiness(
             .ok()
             .map(|state| *state),
         None => Some(StartupReadiness::default()),
+    }
+}
+
+async fn await_socket_startup(
+    mut state_rx: tokio::sync::watch::Receiver<SocketStartupState>,
+) -> Result<()> {
+    match state_rx
+        .wait_for(|state| !matches!(state, SocketStartupState::Pending))
+        .await
+        .map(|state| state.clone())
+    {
+        Ok(SocketStartupState::Ready) => Ok(()),
+        Ok(SocketStartupState::Fatal(message)) => {
+            Err(std::io::Error::new(std::io::ErrorKind::AddrInUse, message).into())
+        }
+        Ok(SocketStartupState::Pending) => unreachable!("wait_for excludes pending state"),
+        Err(_) => Ok(()),
     }
 }
 
@@ -3412,6 +3517,106 @@ mod tests {
         assert!(has_gateway_shutdown_tx);
         assert!(has_reload_tx);
         assert!(has_tui_registry);
+    }
+
+    #[tokio::test]
+    async fn initial_socket_addr_in_use_fails_daemon_startup() {
+        use std::io;
+        use tokio::time::{Duration, timeout};
+
+        for startup_feedback_enabled in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let config = test_config(&tmp);
+
+            let mut registry = DaemonRegistry::new();
+            registry.register_socket(Box::new(move |_ctx, _cancel, _client_count, _readiness| {
+                Box::pin(async move {
+                    Err(io::Error::new(
+                        io::ErrorKind::AddrInUse,
+                        "local IPC endpoint lifecycle is already owned",
+                    )
+                    .into())
+                })
+            }));
+
+            let error = timeout(
+                Duration::from_secs(2),
+                run(
+                    config,
+                    "127.0.0.1".to_string(),
+                    0,
+                    registry,
+                    false,
+                    startup_feedback_enabled,
+                ),
+            )
+            .await
+            .expect("initial socket ownership conflict should fail daemon startup promptly")
+            .expect_err("daemon startup should fail on an initially owned socket");
+
+            assert!(
+                error
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(|error| error.kind() == io::ErrorKind::AddrInUse),
+                "daemon should return the startup socket ownership error with startup_feedback_enabled={startup_feedback_enabled}, got: {error:#}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn socket_addr_in_use_after_readiness_stays_supervised() {
+        use std::io;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::time::{Duration, timeout};
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.reliability.channel_initial_backoff_secs = 1;
+        config.reliability.channel_max_backoff_secs = 1;
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_socket = attempts.clone();
+
+        let mut registry = DaemonRegistry::new();
+        registry.register_socket(Box::new(move |_ctx, _cancel, client_count, readiness| {
+            let attempts = attempts_for_socket.clone();
+            Box::pin(async move {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                if let Some(readiness) = readiness {
+                    readiness.report_ready();
+                }
+                if attempt == 1 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AddrInUse,
+                        "socket failed after it was already serving",
+                    )
+                    .into());
+                }
+
+                client_count.store(1, Ordering::SeqCst);
+                let client_count_for_drop = client_count.clone();
+                zeroclaw_spawn::spawn!(async move {
+                    tokio::time::sleep(Duration::from_millis(1500)).await;
+                    client_count_for_drop.store(0, Ordering::SeqCst);
+                });
+                std::future::pending::<Result<()>>().await
+            })
+        }));
+
+        let exit = timeout(
+            Duration::from_secs(8),
+            run(config, "127.0.0.1".to_string(), 0, registry, true, true),
+        )
+        .await
+        .expect("daemon should remain supervised after a post-readiness socket error")
+        .expect("daemon run should succeed after supervised socket restart");
+
+        assert_eq!(exit, DaemonExit::Shutdown);
+        assert!(
+            attempts.load(Ordering::SeqCst) >= 2,
+            "socket supervisor should retry after a post-readiness AddrInUse"
+        );
     }
 
     #[tokio::test]
