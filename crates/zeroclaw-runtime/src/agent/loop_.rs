@@ -16439,6 +16439,211 @@ Let me check the result."#;
     }
 
     #[tokio::test]
+    async fn reported_budget_calibrates_against_the_post_hook_request_population() {
+        // Regression for the request-seam contract: `reported_population_estimated`
+        // must be snapshotted from the POST-hook `provider_request_messages` (the
+        // request actually passed to the provider), not the pre-hook
+        // `prepared_messages`. A `before_llm_call` hook that grows the request
+        // changes the population the provider reports `input_tokens` for; if the
+        // calibration denominator came from the smaller pre-hook population, the
+        // ratio (and therefore the emitted calibrated `tokens_after`) would be
+        // inflated. The provider below reports `input_tokens` proportional to the
+        // messages it actually received, so the emitted accounting must be tied to
+        // that post-hook population.
+        use crate::hooks::{HookHandler, HookResult, HookRunner};
+
+        struct GrowingRequestHook;
+
+        #[async_trait]
+        impl HookHandler for GrowingRequestHook {
+            fn name(&self) -> &str {
+                "grow-request"
+            }
+
+            async fn before_llm_call(
+                &self,
+                messages: &mut Vec<ChatMessage>,
+                _model: &mut String,
+            ) -> HookResult<()> {
+                messages.push(ChatMessage::assistant("z".repeat(3000)));
+                HookResult::Continue(())
+            }
+        }
+
+        struct PostHookReportingProvider {
+            received: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+        }
+
+        #[async_trait]
+        impl ModelProvider for PostHookReportingProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                anyhow::bail!("chat_with_system should not be used in this test");
+            }
+
+            async fn chat(
+                &self,
+                request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<ChatResponse> {
+                let post_hook_estimate = estimate_history_tokens(&request.messages);
+                self.received
+                    .lock()
+                    .expect("received lock should be valid")
+                    .push(request.messages.to_vec());
+                Ok(ChatResponse {
+                    text: Some("done".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: Some(zeroclaw_providers::traits::TokenUsage {
+                        input_tokens: Some(post_hook_estimate as u64 * 4),
+                        output_tokens: Some(10),
+                        cached_input_tokens: None,
+                    }),
+                    reasoning_content: None,
+                })
+            }
+        }
+        impl ::zeroclaw_api::attribution::Attributable for PostHookReportingProvider {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Provider(
+                    ::zeroclaw_api::attribution::ProviderKind::Model(
+                        ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "PostHookReportingProvider"
+            }
+        }
+
+        let mut hooks = HookRunner::new();
+        hooks.register(Box::new(GrowingRequestHook));
+
+        let provider = PostHookReportingProvider {
+            received: Arc::new(Mutex::new(Vec::new())),
+        };
+        let received = Arc::clone(&provider.received);
+        let observer = NoopObserver;
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("first request"),
+            ChatMessage::assistant("first answer"),
+            ChatMessage::user("second request"),
+            ChatMessage::assistant("second answer"),
+        ];
+        // The preflight iteration-0 trim runs against `context_token_budget`, so
+        // the budget must sit ABOVE the durable history's own estimate (else the
+        // preflight trims history to the newest-turn floor before the reported
+        // count is ever seen and the seam under test never fires). The hook grows
+        // the request far above both, and the provider reports input_tokens
+        // proportional to that post-hook population, so enforcement triggers on
+        // the reported count.
+        let retained_estimate = estimate_history_tokens(&history);
+        let budget = retained_estimate + 20;
+        let (event_tx, mut event_rx) =
+            tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(64);
+        let turn_id = uuid::Uuid::new_v4().to_string();
+
+        run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &[],
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 2,
+                hooks: Some(&hooks),
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_token_budget: budget,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: Some(event_tx),
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: None,
+            turn_id: &turn_id,
+        })
+        .await
+        .expect("tool loop should succeed");
+
+        // The hook grew the request, so the provider must have seen a materially
+        // larger population than the durable history alone.
+        let post_hook_estimate = received
+            .lock()
+            .expect("received lock should be valid")
+            .first()
+            .map(|messages| estimate_history_tokens(messages))
+            .expect("the provider must have received at least one request");
+        assert!(
+            post_hook_estimate > estimate_history_tokens(&history),
+            "the hook must have grown the request population for this regression \
+             (post-hook {post_hook_estimate} vs retained {})",
+            estimate_history_tokens(&history)
+        );
+
+        // The reported-budget trim must be tied to the post-hook population: the
+        // provider reported `4 * post_hook_estimate`, and the runtime's
+        // calibration denominator is the same post-hook population, so the emitted
+        // `tokens_after` is `estimate_history_tokens(retained) * 4`. If the
+        // denominator were the smaller pre-hook population, the ratio would be
+        // inflated and `tokens_after` would not match.
+        let mut trimmed_event = None;
+        while let Ok(event) = event_rx.try_recv() {
+            if let zeroclaw_api::agent::TurnEvent::HistoryTrimmed { .. } = event {
+                trimmed_event = Some(event);
+            }
+        }
+        let trimmed = trimmed_event
+            .expect("the reported-budget enforcement must emit a HistoryTrimmed event");
+        let tokens_after = match trimmed {
+            zeroclaw_api::agent::TurnEvent::HistoryTrimmed { tokens_after, .. } => {
+                tokens_after.expect("reported-budget trim must carry token accounting")
+            }
+            other => panic!("expected HistoryTrimmed, got {other:?}"),
+        };
+        let expected = (estimate_history_tokens(&history) as f64 * 4.0).round() as u64;
+        assert_eq!(
+            tokens_after, expected,
+            "tokens_after must be calibrated against the post-hook request population \
+             (expected estimate(retained) * 4 = {expected})"
+        );
+    }
+
+    #[tokio::test]
     async fn agent_turn_propagates_resolved_agent_alias_to_observer_events() {
         // Regression guard: process_message resolves agent_alias but
         // agent_turn hardcoded `agent_alias: None` in the ToolLoop it built,

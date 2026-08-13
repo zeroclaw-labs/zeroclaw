@@ -263,6 +263,12 @@ async fn enforce_reported_budget(
     multimodal_config: &zeroclaw_config::schema::MultimodalConfig,
     degrade_strip_images: bool,
     mut image_cache: Option<&mut zeroclaw_providers::multimodal::LocalImageCache>,
+    // The native-tool signal the NEXT iteration resolves to. The real iteration
+    // applies `refresh_prompt_anchor` with this signal before preparing its
+    // request, so the projection must apply the same anchor swap before it
+    // estimates the retained population; otherwise the projected count can
+    // differ slightly from the dispatched prompt near tight budget boundaries.
+    next_use_native_tools: bool,
 ) {
     if context_token_budget == 0 {
         return;
@@ -281,6 +287,11 @@ async fn enforce_reported_budget(
     let mut trimmed = result.history;
     let mut trimmed_any = result.trimmed;
     let ratio = reported_input_tokens as f64 / pre_trim_estimated.max(1) as f64;
+    // Align the projected population with the request the NEXT iteration will
+    // dispatch: swap the task-framing anchor to that iteration's native-tool
+    // signal before any prepare/estimate below, exactly as the real iteration
+    // does before building its request.
+    refresh_prompt_anchor(&mut trimmed, next_use_native_tools);
     // Re-trim against the provider-facing population. The initial raw-based
     // selection can no-op (or under-trim) when image markers make the raw
     // estimate look small: a short `[IMAGE:...]` marker in raw history becomes a
@@ -303,6 +314,13 @@ async fn enforce_reported_budget(
     // would otherwise report.
     let mut tokens_after: usize;
     let mut projected_before = result.tokens_before;
+    // Whether the projection loop reached the newest-turn/schema floor while the
+    // projected next request was still over the budget. `drop_oldest_whole_turn`
+    // returns zero only when no droppable whole turn remains, so reaching it with
+    // nothing trimmed means the request cannot be brought under the budget without
+    // dropping the newest turn — an outcome that must be surfaced, not silently
+    // kept as if the trim succeeded.
+    let mut hit_floor = false;
     loop {
         let provider_facing = match prepare_messages_for_iteration(
             &trimmed,
@@ -329,6 +347,7 @@ async fn enforce_reported_budget(
         }
         let dropped = crate::agent::history_trim::drop_oldest_whole_turn(&mut trimmed);
         if dropped == 0 {
+            hit_floor = true;
             break;
         }
         trimmed_any = true;
@@ -421,6 +440,44 @@ async fn enforce_reported_budget(
                 tokens_before: Some(tokens_before as u64),
                 tokens_after: Some(result.tokens_after as u64),
                 tokens_before_source: Some(tokens_before_source),
+                tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
+            },
+        );
+    } else if hit_floor {
+        // The projected next request is over the budget but history already sits
+        // at the newest-turn/schema floor: `drop_oldest_whole_turn` returned zero,
+        // so no whole turn could be removed. Nothing was dropped, so no breadcrumb
+        // is injected and no trim claim is made; instead the floor is surfaced
+        // explicitly with the honest accounting so clients and operators see that
+        // the request cannot be brought under the configured budget.
+        let floor_turns = crate::agent::history_trim::count_turns(&trimmed);
+        *history = trimmed;
+        if let Some(tx) = event_tx {
+            let _ = tx
+                .send(TurnEvent::HistoryTrimmed {
+                    dropped_messages: 0,
+                    kept_turns: floor_turns,
+                    reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
+                    token_budget: Some(context_token_budget as u64),
+                    tokens_before: Some(projected_before as u64),
+                    tokens_after: Some(tokens_after as u64),
+                    tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
+                    tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
+                })
+                .await;
+        }
+        observer.record_event(
+            &zeroclaw_api::observability_traits::ObserverEvent::HistoryTrimmed {
+                dropped_messages: 0,
+                kept_turns: floor_turns,
+                reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
+                channel: None,
+                agent_alias: None,
+                turn_id: None,
+                token_budget: Some(context_token_budget as u64),
+                tokens_before: Some(projected_before as u64),
+                tokens_after: Some(tokens_after as u64),
+                tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
                 tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
             },
         );
@@ -1374,6 +1431,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     multimodal_config,
                     degrade_strip_images,
                     image_cache.as_deref_mut(),
+                    use_native_tools,
                 )
                 .await;
             }
@@ -1677,23 +1735,32 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             // iteration. The post-tool trim must reserve that next
             // provider-facing schema population, or a materially large newly
             // activated schema can push the next request over the budget even
-            // though this iteration's reported-budget check passed.
-            let next_schema_tokens = match build_iteration_tool_specs(
-                model_provider,
-                tools_registry,
-                excluded_tools,
-                activated_tools,
-            ) {
-                Ok(mut next_specs) => {
-                    next_specs.refresh_native_tool_mode(next_active_provider);
-                    if next_specs.use_native_tools {
-                        crate::agent::history::estimate_tool_schema_tokens(&next_specs.tool_specs)
-                    } else {
-                        0
+            // though this iteration's reported-budget check passed. The
+            // projection also carries the next iteration's native-tool signal so
+            // the prompt-anchor swap (and the schema estimate) match the request
+            // the NEXT iteration will actually dispatch.
+            let (next_schema_tokens, next_use_native_tools) =
+                match build_iteration_tool_specs(
+                    model_provider,
+                    tools_registry,
+                    excluded_tools,
+                    activated_tools,
+                ) {
+                    Ok(mut next_specs) => {
+                        next_specs.refresh_native_tool_mode(next_active_provider);
+                        (
+                            if next_specs.use_native_tools {
+                                crate::agent::history::estimate_tool_schema_tokens(
+                                    &next_specs.tool_specs,
+                                )
+                            } else {
+                                0
+                            },
+                            next_specs.use_native_tools,
+                        )
                     }
-                }
-                Err(_) => tool_schema_tokens,
-            };
+                    Err(_) => (tool_schema_tokens, use_native_tools),
+                };
             enforce_reported_budget(
                 turn_state.history,
                 reported as usize,
@@ -1705,6 +1772,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 multimodal_config,
                 next_degrade_strip_images,
                 image_cache.as_deref_mut(),
+                next_use_native_tools,
             )
             .await;
         }
@@ -2788,6 +2856,7 @@ mod reported_budget_tests {
             &zeroclaw_config::schema::MultimodalConfig::default(),
             false,
             None,
+            false,
         )
         .await;
         assert!(
@@ -2821,6 +2890,7 @@ mod reported_budget_tests {
             &zeroclaw_config::schema::MultimodalConfig::default(),
             false,
             None,
+            false,
         )
         .await;
         let after: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
@@ -2859,6 +2929,7 @@ mod reported_budget_tests {
             &zeroclaw_config::schema::MultimodalConfig::default(),
             false,
             None,
+            false,
         )
         .await;
         let after: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
@@ -2883,6 +2954,7 @@ mod reported_budget_tests {
             &zeroclaw_config::schema::MultimodalConfig::default(),
             false,
             None,
+            false,
         )
         .await;
 
@@ -2943,6 +3015,7 @@ mod reported_budget_tests {
             &zeroclaw_config::schema::MultimodalConfig::default(),
             false,
             None,
+            false,
         )
         .await;
 
@@ -3028,6 +3101,7 @@ mod reported_budget_tests {
             &config,
             false,
             Some(&mut image_cache),
+            false,
         )
         .await;
 
@@ -3113,6 +3187,7 @@ mod reported_budget_tests {
             &zeroclaw_config::schema::MultimodalConfig::default(),
             false,
             None,
+            false,
         )
         .await;
 
@@ -3184,6 +3259,7 @@ mod reported_budget_tests {
             &zeroclaw_config::schema::MultimodalConfig::default(),
             false,
             None,
+            false,
         )
         .await;
 
@@ -3247,6 +3323,7 @@ mod reported_budget_tests {
             &zeroclaw_config::schema::MultimodalConfig::default(),
             false,
             None,
+            false,
         )
         .await;
         assert!(
@@ -3269,6 +3346,118 @@ mod reported_budget_tests {
             "a pre-existing crumb must not be counted as a newly dropped message \
              (dropped {dropped_messages}, taken {taken_len}, retained {})",
             history.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn enforce_surfaces_the_untrimmable_newest_turn_floor() {
+        // History already sits at the newest-turn/schema floor: only the protected
+        // newest whole turn remains (plus system). The projected next request is
+        // over the budget because of a materially large deferred schema
+        // population, and `drop_oldest_whole_turn` returns zero (no droppable
+        // whole turn exists), so the trim cannot satisfy the budget. The floor
+        // must be surfaced explicitly with the honest accounting — the projected
+        // request still exceeds the budget with nothing dropped — rather than
+        // silently persisting an over-budget request as if the trim succeeded.
+        let big = "x".repeat(2000);
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user(format!("turn1 {big}")),
+            ChatMessage::assistant("a1".to_string()),
+        ];
+        let estimated = crate::agent::history::estimate_history_tokens(&history);
+        let reported = estimated; // within budget for the prior request
+        let budget = reported * 2;
+        // A materially large native tool schema that the next request reserves.
+        let spec = crate::tools::ToolSpec::new(
+            "large_deferred_mcp_tool",
+            "a deferred MCP tool with a very large parameter schema",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "payload": {
+                        "type": "string",
+                        "description": "big".repeat(2000),
+                    }
+                }
+            }),
+        );
+        let next_schema_tokens = crate::agent::history::estimate_tool_schema_tokens(&[spec]);
+        assert!(
+            estimated + next_schema_tokens > budget,
+            "the schema population must push the projected next request over the budget \
+             for this regression (estimated {estimated} + schema {next_schema_tokens} > \
+             budget {budget})"
+        );
+
+        let taken: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        enforce_reported_budget(
+            &mut history,
+            reported,
+            estimated,
+            next_schema_tokens,
+            budget,
+            Some(&tx),
+            &NoopObserver,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            false,
+            None,
+            false,
+        )
+        .await;
+
+        // The floor is an explicit outcome, not a silent no-op: an event must be
+        // emitted even though no whole turn could be dropped.
+        let event = rx
+            .recv()
+            .await
+            .expect("the untrimmable floor must emit a HistoryTrimmed event");
+        let (dropped_messages, kept_turns, tokens_before, tokens_after, token_budget) =
+            match event {
+                TurnEvent::HistoryTrimmed {
+                    dropped_messages,
+                    kept_turns,
+                    tokens_before,
+                    tokens_after,
+                    token_budget,
+                    ..
+                } => (
+                    dropped_messages,
+                    kept_turns,
+                    tokens_before,
+                    tokens_after,
+                    token_budget,
+                ),
+                other => panic!("expected HistoryTrimmed, got {other:?}"),
+            };
+        assert_eq!(
+            dropped_messages, 0,
+            "at the newest-turn floor nothing can be dropped"
+        );
+        assert_eq!(kept_turns, 1, "only the protected newest turn remains");
+        let tokens_after = tokens_after
+            .expect("the floor event must carry the projected post-trim token count");
+        let tokens_before = tokens_before
+            .expect("the floor event must carry the projected pre-trim token count");
+        assert!(
+            tokens_after > budget as u64,
+            "the projected request must still exceed the budget at the floor \
+             (tokens_after {tokens_after}, budget {budget})"
+        );
+        assert_eq!(
+            tokens_before, tokens_after,
+            "with nothing dropped the projected pre-trim and post-trim counts coincide"
+        );
+        assert_eq!(
+            token_budget,
+            Some(budget as u64),
+            "the configured budget must still be reported so the floor is anchored"
+        );
+        let after: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
+        assert_eq!(
+            after, taken,
+            "the untrimmable floor must not mutate the retained history"
         );
     }
 }
