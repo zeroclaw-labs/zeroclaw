@@ -90,17 +90,32 @@ pub struct Nat64Prefix {
     pub len: u8,
 }
 
+/// Zero the host bits of `addr` below `len`, keeping the top `len` network
+/// bits. A [`Nat64Prefix`] is kept in this canonical form so equivalent CIDRs
+/// (`2606:4700:4700::/48` and `2606:4700:4700::1/48`, which describe the same
+/// translation range) compare equal — otherwise the overlap rule for
+/// equal-length declarations could be bypassed with non-canonical host bits.
+#[must_use]
+fn mask_to_prefix_bits(addr: std::net::Ipv6Addr, len: u8) -> std::net::Ipv6Addr {
+    let bits = u128::from(addr) & (u128::MAX << (128 - u32::from(len)));
+    std::net::Ipv6Addr::from(bits)
+}
+
 /// Parse an IPv6 CIDR (`"2001:db8:64::/96"`) into a [`Nat64Prefix`]. Accepts
 /// only the RFC 6052 §2.2 prefix lengths (32, 40, 48, 56, 64, 96); a non-IPv6
 /// address or any other length returns `None` so callers can fail closed on a
-/// malformed entry.
+/// malformed entry. The parsed address is canonicalized to its top-`len` bits,
+/// so a declared `2606:4700:4700::1/48` is stored as `2606:4700:4700::/48`.
 #[must_use]
 pub fn parse_nat64_prefix(cidr: &str) -> Option<Nat64Prefix> {
     let (addr, len) = cidr.split_once('/')?;
     let len: u8 = len.parse().ok()?;
     let prefix = addr.parse::<std::net::Ipv6Addr>().ok()?;
     match len {
-        32 | 40 | 48 | 56 | 64 | 96 => Some(Nat64Prefix { prefix, len }),
+        32 | 40 | 48 | 56 | 64 | 96 => Some(Nat64Prefix {
+            prefix: mask_to_prefix_bits(prefix, len),
+            len,
+        }),
         _ => None,
     }
 }
@@ -194,7 +209,12 @@ pub fn nat64_embedded_ipv4_under_any(
 #[must_use]
 pub fn nat64_prefixes_overlap(a: &Nat64Prefix, b: &Nat64Prefix) -> bool {
     if a.len == b.len {
-        return a.prefix == b.prefix;
+        // Equal-length declarations overlap when their top-`len` network bits
+        // match — compare the masked identity, not the raw `Ipv6Addr`, so an
+        // equivalent alias with nonzero host bits (`2606:4700:4700::1/48` vs
+        // `2606:4700:4700::/48`) is still rejected even if it was constructed
+        // directly rather than via [`parse_nat64_prefix`].
+        return is_under_nat64_prefix(b.prefix, a);
     }
     // The shorter prefix (larger network) contains the longer one exactly when
     // the longer's address lies inside the shorter's range.
@@ -349,23 +369,23 @@ mod tests {
 
     #[test]
     fn parse_nat64_prefix_accepts_rfc6052_lengths_only() {
-        for (cidr, expected) in [
-            ("2001:db8:64::/32", 32u8),
-            ("2001:db8:64::/40", 40),
-            ("2001:db8:64::/48", 48),
-            ("2001:db8:64::/56", 56),
-            ("2001:db8:64::/64", 64),
-            ("64:ff9b:1::/96", 96),
+        // The declared address is canonicalized to its top-`len` bits: for
+        // `2001:db8:64::` the /32 and /40 forms mask away the nonzero `0064`
+        // host group, while /48+ keep it. The canonical identity is what the
+        // overlap rule and the extraction path compare against.
+        for (cidr, expected_len, expected_prefix) in [
+            ("2001:db8:64::/32", 32u8, "2001:db8::"),
+            ("2001:db8:64::/40", 40, "2001:db8::"),
+            ("2001:db8:64::/48", 48, "2001:db8:64::"),
+            ("2001:db8:64::/56", 56, "2001:db8:64::"),
+            ("2001:db8:64::/64", 64, "2001:db8:64::"),
+            ("64:ff9b:1::/96", 96, "64:ff9b:1::"),
         ] {
             let p = parse_nat64_prefix(cidr).unwrap();
-            assert_eq!(p.len, expected, "{cidr}");
+            assert_eq!(p.len, expected_len, "{cidr}");
             assert_eq!(
                 p.prefix,
-                cidr.split('/')
-                    .next()
-                    .unwrap()
-                    .parse::<std::net::Ipv6Addr>()
-                    .unwrap(),
+                expected_prefix.parse::<std::net::Ipv6Addr>().unwrap(),
                 "{cidr}"
             );
         }
@@ -545,6 +565,47 @@ mod tests {
         // Disjoint prefixes do not overlap.
         assert!(!nat64_prefixes_overlap(&p32, &disjoint));
         assert!(!nat64_prefixes_overlap(&disjoint, &p48));
+    }
+
+    #[test]
+    fn nat64_prefixes_overlap_rejects_equivalent_cidr_aliases() {
+        // `2606:4700:4700::1/48` and `2606:4700:4700::/48` describe the SAME
+        // translation range (only the top 48 bits matter), so the equal-length
+        // branch must treat them as overlapping in BOTH declaration orders —
+        // a non-canonical alias must not bypass the overlap rule.
+        let canonical = Nat64Prefix {
+            prefix: "2606:4700:4700::".parse().unwrap(),
+            len: 48,
+        };
+        let alias = Nat64Prefix {
+            prefix: "2606:4700:4700::1".parse().unwrap(),
+            len: 48,
+        };
+        assert!(nat64_prefixes_overlap(&canonical, &alias));
+        assert!(nat64_prefixes_overlap(&alias, &canonical));
+        // A genuinely different /48 with a nonzero host bit is NOT the same
+        // range and must not be reported as overlapping.
+        let different = Nat64Prefix {
+            prefix: "2606:4700:4701::2".parse().unwrap(),
+            len: 48,
+        };
+        assert!(!nat64_prefixes_overlap(&canonical, &different));
+        assert!(!nat64_prefixes_overlap(&different, &canonical));
+    }
+
+    #[test]
+    fn parse_nat64_prefix_canonicalizes_host_bits() {
+        // Parsing must mask host bits below the prefix length so equivalent
+        // aliases normalize to one identity (`2606:4700:4700::/48`).
+        let p = parse_nat64_prefix("2606:4700:4700::1/48").unwrap();
+        assert_eq!(
+            p,
+            Nat64Prefix {
+                prefix: "2606:4700:4700::".parse().unwrap(),
+                len: 48,
+            }
+        );
+        assert_eq!(p, parse_nat64_prefix("2606:4700:4700::/48").unwrap());
     }
 
     #[test]

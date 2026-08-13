@@ -2794,6 +2794,52 @@ mod tests {
         );
     }
 
+    /// Equivalent same-length aliases (`2606:4700:4700::/48` vs
+    /// `2606:4700:4700::1/48`) describe the same translation range, so the
+    /// equal-length overlap rule must reject them at the real dispatch boundary
+    /// in BOTH declaration orders — a non-canonical host bit must not make an
+    /// overlapping declaration look disjoint. The parse-time canonicalization
+    /// masks the host bits, so the error message names the canonical
+    /// `2606:4700:4700::/48` form either way.
+    #[tokio::test]
+    async fn validate_endpoint_host_rejects_equivalent_nat64_prefix_aliases() {
+        let tmp = tempfile::tempdir().unwrap();
+        for raw in [
+            vec!["2606:4700:4700::/48".into(), "2606:4700:4700::1/48".into()],
+            vec!["2606:4700:4700::1/48".into(), "2606:4700:4700::/48".into()],
+        ] {
+            let config = FileDownloadConfig {
+                url: Some("http://internal.example.com/x".into()),
+                nat64_prefixes: raw,
+                ..FileDownloadConfig::default()
+            };
+            let snapshot_prefixes = config.nat64_prefixes.clone();
+            let endpoint_resolver: EndpointResolver = Arc::new(
+                move |_host: String,
+                      _port: u16|
+                      -> Pin<Box<dyn Future<Output = ResolveResult> + Send>> {
+                    Box::pin(async move { Ok(Vec::new()) })
+                },
+            );
+            let tool = FileDownloadTool::new_with_endpoint_resolver(
+                test_security(tmp.path().to_path_buf(), AutonomyLevel::Full),
+                config,
+                true,
+                Vec::<String>::new,
+                move || snapshot_prefixes.clone(),
+                endpoint_resolver,
+            );
+            let err = tool
+                .validate_endpoint_host("http://internal.example.com/x")
+                .await
+                .unwrap_err();
+            assert!(
+                err.contains("overlap") || err.contains("2606:4700:4700::/48"),
+                "dispatch must fail closed on equivalent same-length nat64_prefix aliases; got: {err}"
+            );
+        }
+    }
+
     /// Operator-visibility contract for the SSRF audit events: every blocked
     /// endpoint emits a WARN rejection, an allowlisted host whose resolved
     /// addresses actually use the private carve-out emits an INFO admission,
