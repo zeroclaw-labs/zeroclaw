@@ -1,5 +1,7 @@
 //! SD-JWT / KB-SD-JWT cryptographic primitives.
 
+use std::collections::{HashMap, HashSet};
+
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ring::rand::SystemRandom;
@@ -65,18 +67,34 @@ pub fn jws_sign(
     Ok(format!("{signing_input}.{sig_b64}"))
 }
 
-/// Verify an ES256 JWS compact-serialization string against a public key.
-pub fn jws_verify(compact: &str, public_key_bytes: &[u8]) -> Result<(), ViError> {
-    let parts: Vec<&str> = compact.splitn(3, '.').collect();
-    if parts.len() != 3 {
+/// Split a JWS compact serialization into its header, payload and signature.
+///
+/// The pinned reference refuses anything that is not exactly three
+/// dot-separated segments (`signing.py::_jwt_decode_parts`). Validating once
+/// here keeps every entry point equally strict; the previous per-function
+/// `splitn(3, '.')` accepted a fourth segment by folding it into the signature.
+fn jws_parts(compact: &str) -> Result<[&str; 3], ViError> {
+    let mut segments = compact.split('.');
+    let (Some(header), Some(payload), Some(signature), None) = (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) else {
         return Err(ViError::new(
             ViErrorKind::InvalidHeader,
-            "JWS must have 3 dot-separated parts",
+            "JWS must have exactly 3 dot-separated parts",
         ));
-    }
+    };
+    Ok([header, payload, signature])
+}
 
-    let signing_input = format!("{}.{}", parts[0], parts[1]);
-    let sig_bytes = b64u_decode(parts[2])?;
+/// Verify an ES256 JWS compact-serialization string against a public key.
+pub fn jws_verify(compact: &str, public_key_bytes: &[u8]) -> Result<(), ViError> {
+    let [header, payload, signature] = jws_parts(compact)?;
+
+    let signing_input = format!("{header}.{payload}");
+    let sig_bytes = b64u_decode(signature)?;
 
     let peer_public_key =
         signature::UnparsedPublicKey::new(&signature::ECDSA_P256_SHA256_FIXED, public_key_bytes);
@@ -93,25 +111,16 @@ pub fn jws_verify(compact: &str, public_key_bytes: &[u8]) -> Result<(), ViError>
 
 /// Decode the payload segment of a JWS compact string (the middle part).
 pub fn jws_decode_payload(compact: &str) -> Result<serde_json::Value, ViError> {
-    let parts: Vec<&str> = compact.splitn(3, '.').collect();
-    if parts.len() < 2 {
-        return Err(ViError::new(
-            ViErrorKind::InvalidPayload,
-            "JWS must have at least 2 dot-separated parts",
-        ));
-    }
-    let bytes = b64u_decode(parts[1])?;
+    let [_, payload, _] = jws_parts(compact)?;
+    let bytes = b64u_decode(payload)?;
     serde_json::from_slice(&bytes)
         .map_err(|e| ViError::new(ViErrorKind::InvalidPayload, format!("payload JSON: {e}")))
 }
 
 /// Decode the header segment of a JWS compact string (the first part).
 pub fn jws_decode_header(compact: &str) -> Result<serde_json::Value, ViError> {
-    let part = compact
-        .split('.')
-        .next()
-        .ok_or_else(|| ViError::new(ViErrorKind::InvalidHeader, "empty JWS"))?;
-    let bytes = b64u_decode(part)?;
+    let [header, _, _] = jws_parts(compact)?;
+    let bytes = b64u_decode(header)?;
     serde_json::from_slice(&bytes)
         .map_err(|e| ViError::new(ViErrorKind::InvalidHeader, format!("header JSON: {e}")))
 }
@@ -183,19 +192,77 @@ pub fn jwk_to_public_bytes(jwk: &Jwk) -> Result<Vec<u8>, ViError> {
 
 // ── SD-JWT disclosure helpers ────────────────────────────────────────
 
-/// Create a single SD-JWT disclosure: `[salt, claim_name, claim_value]`.
-/// Returns `(disclosure_b64, disclosure_hash)`.
-pub fn create_disclosure(
-    claim_name: &str,
-    claim_value: &serde_json::Value,
-) -> Result<(String, String), ViError> {
+/// The decoded contents of an SD-JWT disclosure.
+///
+/// Only two shapes exist, and both resolve to their array's final element —
+/// which is what makes the spec's §9.1 `delegate_payload` references work
+/// uniformly across them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Disclosure {
+    /// `[salt, claim_name, claim_value]` — discloses an object property.
+    ObjectProperty {
+        salt: String,
+        claim_name: String,
+        claim_value: serde_json::Value,
+    },
+    /// `[salt, claim_value]` — discloses an array element.
+    ArrayElement {
+        salt: String,
+        claim_value: serde_json::Value,
+    },
+}
+
+impl Disclosure {
+    /// The salt that makes the disclosure unguessable.
+    pub fn salt(&self) -> &str {
+        match self {
+            Self::ObjectProperty { salt, .. } | Self::ArrayElement { salt, .. } => salt,
+        }
+    }
+
+    /// The disclosed property name, absent for array-element disclosures.
+    pub fn claim_name(&self) -> Option<&str> {
+        match self {
+            Self::ObjectProperty { claim_name, .. } => Some(claim_name),
+            Self::ArrayElement { .. } => None,
+        }
+    }
+
+    /// The disclosed value — the array's last element in either shape.
+    pub fn claim_value(&self) -> &serde_json::Value {
+        match self {
+            Self::ObjectProperty { claim_value, .. } | Self::ArrayElement { claim_value, .. } => {
+                claim_value
+            }
+        }
+    }
+}
+
+/// Generate the 16-byte salt the spec requires, base64url-encoded.
+fn generate_salt() -> Result<String, ViError> {
     let rng = SystemRandom::new();
     let mut salt_bytes = [0u8; 16];
     ring::rand::SecureRandom::fill(&rng, &mut salt_bytes)
         .map_err(|e| ViError::new(ViErrorKind::IssuanceInputInvalid, format!("rng: {e}")))?;
-    let salt = b64u_encode(&salt_bytes);
+    Ok(b64u_encode(&salt_bytes))
+}
 
-    let disclosure_json = serde_json::json!([salt, claim_name, claim_value]);
+/// Create a disclosure with a caller-supplied salt.
+///
+/// `claim_name` selects the shape: `Some` produces the object-property form,
+/// `None` the array-element form. Supplying the salt is what makes output
+/// comparable against the reference implementation's pinned test vectors.
+///
+/// Returns `(disclosure_b64, disclosure_hash)`.
+pub fn create_disclosure_with_salt(
+    claim_name: Option<&str>,
+    claim_value: &serde_json::Value,
+    salt: &str,
+) -> Result<(String, String), ViError> {
+    let disclosure_json = match claim_name {
+        Some(name) => serde_json::json!([salt, name, claim_value]),
+        None => serde_json::json!([salt, claim_value]),
+    };
     let disclosure_str = serde_json::to_string(&disclosure_json).map_err(|e| {
         ViError::new(
             ViErrorKind::IssuanceInputInvalid,
@@ -205,6 +272,90 @@ pub fn create_disclosure(
     let disclosure_b64 = b64u_encode(disclosure_str.as_bytes());
     let hash = sd_hash(&disclosure_b64);
     Ok((disclosure_b64, hash))
+}
+
+/// Create a single SD-JWT disclosure: `[salt, claim_name, claim_value]`.
+/// Returns `(disclosure_b64, disclosure_hash)`.
+pub fn create_disclosure(
+    claim_name: &str,
+    claim_value: &serde_json::Value,
+) -> Result<(String, String), ViError> {
+    create_disclosure_with_salt(Some(claim_name), claim_value, &generate_salt()?)
+}
+
+/// Create an array-element disclosure: `[salt, claim_value]`.
+///
+/// Used for entries that are individually disclosable rather than named
+/// properties — `delegate_payload` members and, per §9.2, the entries inside
+/// `allowed` and `line_items` constraints.
+pub fn create_array_element_disclosure(
+    claim_value: &serde_json::Value,
+) -> Result<(String, String), ViError> {
+    create_disclosure_with_salt(None, claim_value, &generate_salt()?)
+}
+
+/// Decode a disclosure into its typed form.
+///
+/// Stricter than the reference, which returns whatever JSON the disclosure
+/// happens to hold: anything that is not a 2- or 3-element array with a string
+/// salt is refused here rather than reaching a caller obliged to re-check it.
+pub fn decode_disclosure(disclosure_b64: &str) -> Result<Disclosure, ViError> {
+    let bytes = b64u_decode(disclosure_b64)?;
+    let decoded: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
+        ViError::new(
+            ViErrorKind::InvalidDisclosure,
+            format!("disclosure JSON: {e}"),
+        )
+    })?;
+
+    let serde_json::Value::Array(elements) = decoded else {
+        return Err(ViError::new(
+            ViErrorKind::InvalidDisclosure,
+            "disclosure must be a JSON array",
+        ));
+    };
+
+    let mut elements = elements.into_iter();
+    let (Some(salt), Some(second)) = (elements.next(), elements.next()) else {
+        return Err(ViError::new(
+            ViErrorKind::InvalidDisclosure,
+            "disclosure must have 2 or 3 elements",
+        ));
+    };
+    let third = elements.next();
+    if elements.next().is_some() {
+        return Err(ViError::new(
+            ViErrorKind::InvalidDisclosure,
+            "disclosure must have 2 or 3 elements",
+        ));
+    }
+
+    let serde_json::Value::String(salt) = salt else {
+        return Err(ViError::new(
+            ViErrorKind::InvalidDisclosure,
+            "disclosure salt must be a string",
+        ));
+    };
+
+    match third {
+        Some(claim_value) => {
+            let serde_json::Value::String(claim_name) = second else {
+                return Err(ViError::new(
+                    ViErrorKind::InvalidDisclosure,
+                    "object-property disclosure name must be a string",
+                ));
+            };
+            Ok(Disclosure::ObjectProperty {
+                salt,
+                claim_name,
+                claim_value,
+            })
+        }
+        None => Ok(Disclosure::ArrayElement {
+            salt,
+            claim_value: second,
+        }),
+    }
 }
 
 /// Serialize an SD-JWT: `issuer_jwt~disclosure1~disclosure2~...~kb_jwt`
@@ -238,6 +389,197 @@ pub fn parse_sd_jwt(serialized: &str) -> Result<(&str, Vec<&str>, Option<&str>),
     let disclosures = parts[1..parts.len() - 1].to_vec();
 
     Ok((issuer_jwt, disclosures, kb_jwt))
+}
+
+// ── Parsed SD-JWT ────────────────────────────────────────────────────
+
+/// A parsed SD-JWT presentation.
+///
+/// Keeps the exact strings it was parsed from alongside the decoded values.
+/// Spec §6.1 binds each layer to "the serialized form as received", so
+/// re-encoding from the decoded header and payload would not reproduce the
+/// bytes a binding covers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SdJwt {
+    issuer_jwt: String,
+    header: serde_json::Value,
+    payload: serde_json::Value,
+    signature: Vec<u8>,
+    disclosures: Vec<String>,
+    disclosure_values: Vec<Disclosure>,
+    key_binding_jwt: Option<String>,
+}
+
+impl SdJwt {
+    /// Parse a serialized SD-JWT, decoding the JWT segments and every disclosure.
+    pub fn parse(serialized: &str) -> Result<Self, ViError> {
+        let (issuer_jwt, disclosures, key_binding_jwt) = parse_sd_jwt(serialized)?;
+        let [_, _, signature_b64] = jws_parts(issuer_jwt)?;
+
+        let disclosure_values = disclosures
+            .iter()
+            .map(|disclosure| decode_disclosure(disclosure))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Self {
+            issuer_jwt: issuer_jwt.to_string(),
+            header: jws_decode_header(issuer_jwt)?,
+            payload: jws_decode_payload(issuer_jwt)?,
+            signature: b64u_decode(signature_b64)?,
+            disclosures: disclosures.into_iter().map(str::to_string).collect(),
+            disclosure_values,
+            key_binding_jwt: key_binding_jwt.map(str::to_string),
+        })
+    }
+
+    /// The issuer-signed JWT, exactly as received.
+    pub fn issuer_jwt(&self) -> &str {
+        &self.issuer_jwt
+    }
+
+    /// The decoded JWT header.
+    pub fn header(&self) -> &serde_json::Value {
+        &self.header
+    }
+
+    /// The decoded JWT payload, before any disclosure is resolved into it.
+    pub fn payload(&self) -> &serde_json::Value {
+        &self.payload
+    }
+
+    /// The raw ES256 signature bytes.
+    pub fn signature(&self) -> &[u8] {
+        &self.signature
+    }
+
+    /// The presented disclosures, in the order they were received.
+    pub fn disclosures(&self) -> &[String] {
+        &self.disclosures
+    }
+
+    /// The decoded disclosures, positionally matching [`Self::disclosures`].
+    pub fn disclosure_values(&self) -> &[Disclosure] {
+        &self.disclosure_values
+    }
+
+    /// The key-binding JWT, when the presentation carried one.
+    pub fn key_binding_jwt(&self) -> Option<&str> {
+        self.key_binding_jwt.as_deref()
+    }
+
+    /// Re-serialize exactly what was parsed, key-binding JWT included.
+    pub fn serialize(&self) -> String {
+        serialize_sd_jwt(
+            &self.issuer_jwt,
+            &self.disclosures,
+            self.key_binding_jwt.as_deref(),
+        )
+    }
+
+    /// The presentation a hash binding covers: every disclosure, a trailing
+    /// `~`, and no key-binding JWT.
+    ///
+    /// §6.1 computes `sd_hash` over the SD-JWT excluding the KB-JWT, so this
+    /// is a named operation rather than a convention a caller has to remember.
+    pub fn presentation(&self) -> String {
+        serialize_sd_jwt(&self.issuer_jwt, &self.disclosures, None)
+    }
+
+    /// The presentation containing only the disclosures at `indices`.
+    ///
+    /// §5.4 and §6.1.2: an L3 binds to the L2 subset forwarded to its own
+    /// recipient, not to everything the agent holds.
+    pub fn selective_presentation(&self, indices: &[usize]) -> Result<String, ViError> {
+        let mut selected = Vec::with_capacity(indices.len());
+        for &index in indices {
+            let disclosure = self.disclosures.get(index).ok_or_else(|| {
+                ViError::new(
+                    ViErrorKind::InvalidDisclosure,
+                    format!("disclosure index {index} is out of range"),
+                )
+            })?;
+            selected.push(disclosure.clone());
+        }
+        Ok(serialize_sd_jwt(&self.issuer_jwt, &selected, None))
+    }
+
+    /// Resolve the presented disclosures into the payload's claim set.
+    ///
+    /// Two separate rules, matching the reference:
+    ///
+    /// - Object-property disclosures resolve only when their hash appears in
+    ///   `_sd`. An array-element disclosure listed there resolves to nothing,
+    ///   because it has no name to bind to.
+    /// - `delegate_payload` references resolve against every presented
+    ///   disclosure, ungated by `_sd`. A reference whose disclosure is absent
+    ///   stays a `{"...": "<hash>"}` object so the caller can tell resolved
+    ///   from unresolved.
+    ///
+    /// Nested references inside constraint objects are deliberately left
+    /// alone; the reference does not recurse into them either.
+    pub fn resolve_disclosures(
+        &self,
+    ) -> Result<serde_json::Map<String, serde_json::Value>, ViError> {
+        let serde_json::Value::Object(mut claims) = self.payload.clone() else {
+            return Err(ViError::new(
+                ViErrorKind::InvalidPayload,
+                "SD-JWT payload must be a JSON object",
+            ));
+        };
+
+        let sd_hashes: HashSet<String> = match claims.get("_sd") {
+            Some(serde_json::Value::Array(entries)) => entries
+                .iter()
+                .filter_map(|entry| entry.as_str().map(str::to_string))
+                .collect(),
+            _ => HashSet::new(),
+        };
+
+        for (encoded, decoded) in self.disclosures.iter().zip(&self.disclosure_values) {
+            if let Disclosure::ObjectProperty {
+                claim_name,
+                claim_value,
+                ..
+            } = decoded
+                && sd_hashes.contains(&sd_hash(encoded))
+            {
+                claims.insert(claim_name.clone(), claim_value.clone());
+            }
+        }
+
+        let Some(serde_json::Value::Array(entries)) = claims.get("delegate_payload") else {
+            return Ok(claims);
+        };
+        if entries.is_empty() {
+            return Ok(claims);
+        }
+
+        let by_hash: HashMap<String, &serde_json::Value> = self
+            .disclosures
+            .iter()
+            .zip(&self.disclosure_values)
+            .map(|(encoded, decoded)| (sd_hash(encoded), decoded.claim_value()))
+            .collect();
+
+        let resolved: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|entry| {
+                entry
+                    .as_object()
+                    .and_then(|object| object.get("..."))
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|reference| by_hash.get(reference).copied())
+                    .cloned()
+                    .unwrap_or_else(|| entry.clone())
+            })
+            .collect();
+        claims.insert(
+            "delegate_payload".to_string(),
+            serde_json::Value::Array(resolved),
+        );
+
+        Ok(claims)
+    }
 }
 
 #[cfg(test)]
@@ -347,5 +689,264 @@ mod tests {
         let compact = format!("{header}.{payload}.fake-sig");
         let decoded = jws_decode_payload(&compact).unwrap();
         assert_eq!(decoded["sub"], "test");
+    }
+
+    // ── Conformance against the pinned reference implementation ──────
+    //
+    // Expected values come from agent-intent/verifiable-intent at
+    // 356c29635f1c44df7de02edb58699ca9f29bece6, captured by
+    // scripts/dev/generate-vi-reference-vectors.py. A ZeroClaw round trip
+    // cannot show that both sides preserved the same local deviation, so
+    // these assert against output ZeroClaw did not produce.
+
+    /// The one vector whose claim value contains non-ASCII text.
+    const NON_ASCII_CASE: &str = "object_nested";
+
+    fn vectors() -> serde_json::Value {
+        serde_json::from_str(include_str!(
+            "../../tests/fixtures/vi-reference-vectors.json"
+        ))
+        .expect("reference vectors must be valid JSON")
+    }
+
+    fn reference_public_key() -> Vec<u8> {
+        let vectors = vectors();
+        let jwk = &vectors["sd_jwt"]["public_jwk"];
+        let field = |name: &str| jwk[name].as_str().expect("jwk field").to_string();
+        jwk_to_public_bytes(&Jwk {
+            kty: field("kty"),
+            crv: field("crv"),
+            x: field("x"),
+            y: field("y"),
+            d: None,
+        })
+        .expect("reference JWK must convert")
+    }
+
+    #[test]
+    fn disclosure_encoding_matches_the_reference() {
+        let vectors = vectors();
+        let mut checked = 0;
+        for case in vectors["disclosures"].as_array().expect("disclosures") {
+            let name = case["case"].as_str().expect("case name");
+            if name == NON_ASCII_CASE {
+                continue;
+            }
+            let (disclosure, hash) = create_disclosure_with_salt(
+                case["claim_name"].as_str(),
+                &case["claim_value"],
+                case["salt"].as_str().expect("salt"),
+            )
+            .expect("disclosure must encode");
+
+            assert_eq!(
+                disclosure,
+                case["disclosure"].as_str().expect("expected"),
+                "disclosure bytes for {name}"
+            );
+            assert_eq!(
+                hash,
+                case["hash"].as_str().expect("expected hash"),
+                "disclosure hash for {name}"
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 5, "every ASCII vector must be exercised");
+    }
+
+    /// Python's `json.dumps` escapes non-ASCII to `\uXXXX` by default;
+    /// `serde_json` emits UTF-8 directly. The values are equal, the bytes are
+    /// not, so the disclosure hashes differ. RFC 8259 permits both and the
+    /// spec does not choose between them, so this pins the divergence for a
+    /// maintainer decision rather than silently resolving it either way.
+    #[test]
+    fn non_ascii_disclosure_encoding_diverges_from_the_reference() {
+        let vectors = vectors();
+        let case = vectors["disclosures"]
+            .as_array()
+            .expect("disclosures")
+            .iter()
+            .find(|case| case["case"] == NON_ASCII_CASE)
+            .expect("the non-ASCII vector must exist");
+
+        let (disclosure, hash) = create_disclosure_with_salt(
+            case["claim_name"].as_str(),
+            &case["claim_value"],
+            case["salt"].as_str().expect("salt"),
+        )
+        .expect("disclosure must encode");
+
+        let reference_disclosure = case["disclosure"].as_str().expect("expected");
+        assert_ne!(disclosure, reference_disclosure);
+        assert_ne!(hash, case["hash"].as_str().expect("expected hash"));
+
+        // The divergence is serialization only: both decode to the same value.
+        assert_eq!(
+            decode_disclosure(&disclosure).expect("ours").claim_value(),
+            decode_disclosure(reference_disclosure)
+                .expect("reference")
+                .claim_value(),
+        );
+    }
+
+    #[test]
+    fn decode_disclosure_reads_both_reference_shapes() {
+        let vectors = vectors();
+        for case in vectors["disclosures"].as_array().expect("disclosures") {
+            let name = case["case"].as_str().expect("case name");
+            let decoded = decode_disclosure(case["disclosure"].as_str().expect("disclosure"))
+                .expect("reference disclosure must decode");
+
+            assert_eq!(
+                decoded.salt(),
+                case["salt"].as_str().expect("salt"),
+                "salt for {name}"
+            );
+            assert_eq!(
+                decoded.claim_name(),
+                case["claim_name"].as_str(),
+                "name for {name}"
+            );
+            assert_eq!(
+                decoded.claim_value(),
+                &case["claim_value"],
+                "value for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_disclosure_rejects_malformed_input() {
+        let cases = [
+            ("not an array", &br#"{"salt":"x"}"#[..]),
+            ("one element", &br#"["salt"]"#[..]),
+            ("four elements", &br#"["salt","name","value","extra"]"#[..]),
+            ("non-string salt", &br#"[1,"name","value"]"#[..]),
+            ("non-string claim name", &br#"["salt",2,"value"]"#[..]),
+        ];
+        for (label, raw) in cases {
+            let encoded = b64u_encode(raw);
+            assert!(decode_disclosure(&encoded).is_err(), "must reject: {label}");
+        }
+    }
+
+    #[test]
+    fn resolve_disclosures_matches_the_reference() {
+        let vectors = vectors();
+        let parsed = SdJwt::parse(
+            vectors["sd_jwt"]["serialized"]
+                .as_str()
+                .expect("serialized"),
+        )
+        .expect("reference SD-JWT must parse");
+
+        let resolved = parsed
+            .resolve_disclosures()
+            .expect("resolution must succeed");
+        let expected = vectors["sd_jwt"]["resolved_claims"]
+            .as_object()
+            .expect("resolved_claims");
+
+        assert_eq!(&resolved, expected);
+    }
+
+    #[test]
+    fn selective_presentation_matches_the_reference() {
+        let vectors = vectors();
+        let selective = &vectors["selective_presentation"];
+        let base = selective["base_jwt"].as_str().expect("base_jwt");
+        let subset: Vec<String> = selective["subset_disclosures"]
+            .as_array()
+            .expect("subset")
+            .iter()
+            .map(|entry| entry.as_str().expect("disclosure").to_string())
+            .collect();
+
+        let presentation = serialize_sd_jwt(base, &subset, None);
+        assert_eq!(
+            presentation,
+            selective["presentation"].as_str().expect("presentation")
+        );
+        assert_eq!(
+            sd_hash(&presentation),
+            selective["binding_hash"].as_str().expect("binding_hash"),
+        );
+
+        // The same subset selected through the parsed type, by index.
+        let parsed = SdJwt::parse(
+            vectors["sd_jwt"]["serialized"]
+                .as_str()
+                .expect("serialized"),
+        )
+        .expect("parse");
+        let by_index = parsed.selective_presentation(&[0, 2]).expect("select");
+        assert_eq!(
+            by_index.strip_prefix(parsed.issuer_jwt()),
+            presentation.strip_prefix(base),
+        );
+    }
+
+    #[test]
+    fn selective_presentation_rejects_an_out_of_range_index() {
+        let vectors = vectors();
+        let parsed = SdJwt::parse(
+            vectors["sd_jwt"]["serialized"]
+                .as_str()
+                .expect("serialized"),
+        )
+        .expect("parse");
+        assert!(parsed.selective_presentation(&[0, 99]).is_err());
+    }
+
+    #[test]
+    fn verifies_a_signature_the_reference_produced() {
+        let vectors = vectors();
+        let parsed = SdJwt::parse(
+            vectors["sd_jwt"]["serialized"]
+                .as_str()
+                .expect("serialized"),
+        )
+        .expect("parse");
+        let public_key = reference_public_key();
+
+        jws_verify(parsed.issuer_jwt(), &public_key)
+            .expect("must verify a signature produced by the reference");
+
+        // Control: the same key must reject a mutated header.
+        let tampered = parsed.issuer_jwt().replacen("eyJ", "eyK", 1);
+        assert!(jws_verify(&tampered, &public_key).is_err());
+    }
+
+    #[test]
+    fn parse_retains_the_key_binding_jwt_without_binding_over_it() {
+        let vectors = vectors();
+        let serialized = vectors["sd_jwt"]["serialized"]
+            .as_str()
+            .expect("serialized");
+        let with_kb = format!("{serialized}kb.jwt.here");
+
+        let parsed = SdJwt::parse(&with_kb).expect("parse");
+        assert_eq!(parsed.key_binding_jwt(), Some("kb.jwt.here"));
+        assert_eq!(parsed.disclosures().len(), 4);
+        assert_eq!(parsed.serialize(), with_kb);
+        // §6.1: what a binding hashes excludes the KB-JWT and keeps the `~`.
+        assert_eq!(parsed.presentation(), serialized);
+    }
+
+    #[test]
+    fn jws_helpers_require_exactly_three_segments() {
+        let header = b64u_encode(b"{\"alg\":\"ES256\"}");
+        let payload = b64u_encode(b"{\"sub\":\"test\"}");
+        let two = format!("{header}.{payload}");
+        let four = format!("{header}.{payload}.sig.extra");
+
+        for malformed in [&two, &four] {
+            assert!(jws_decode_header(malformed).is_err(), "header: {malformed}");
+            assert!(
+                jws_decode_payload(malformed).is_err(),
+                "payload: {malformed}"
+            );
+            assert!(jws_verify(malformed, &[]).is_err(), "verify: {malformed}");
+        }
     }
 }
