@@ -16492,7 +16492,7 @@ Let me check the result."#;
                 _model: &str,
                 _temperature: Option<f64>,
             ) -> anyhow::Result<ChatResponse> {
-                let post_hook_estimate = estimate_history_tokens(&request.messages);
+                let post_hook_estimate = estimate_history_tokens(request.messages);
                 self.received
                     .lock()
                     .expect("received lock should be valid")
