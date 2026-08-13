@@ -7712,7 +7712,16 @@ fn warn_verifiable_intent_withheld(config: &Config) {
             // with no category stores as `internal`, and the dashboard Logs view
             // hides that category by default, so an uncategorised notice is
             // absent from the history an operator actually reads.
-            .with_category(::zeroclaw_log::EventCategory::System),
+            .with_category(::zeroclaw_log::EventCategory::System)
+            // The config surface reports this same fact as a structured
+            // warning. Carrying its code and path here is what lets an operator
+            // correlate the two rather than read them as separate problems;
+            // `with_attrs` persists them to the trace and serves them from the
+            // logs API, which the ephemeral variant would not.
+            .with_attrs(::serde_json::json!({
+                "code": ::zeroclaw_config::validation_warnings::VERIFIABLE_INTENT_TOOL_WITHHELD,
+                "path": "verifiable_intent.enabled",
+            })),
         "verifiable_intent: vi_verify is not registered as a model-callable tool because no credential chain verifier exists yet (see #9328)"
     );
 }

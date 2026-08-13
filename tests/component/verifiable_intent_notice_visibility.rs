@@ -14,10 +14,31 @@
 use std::path::Path;
 use std::process::Command;
 
-/// Every supported value of `observability.log_persistence`. Covering all of
-/// them rather than the three that motivated the change means adding a policy
-/// fails here until someone decides what the notice does under it.
-const POLICIES: [&str; 4] = ["none", "rolling", "full", "rotating"];
+use zeroclaw_config::schema::LogPersistence;
+
+/// Every supported value of `observability.log_persistence`, walked through a
+/// `match` rather than typed out.
+///
+/// Two properties, and the previous `const POLICIES: [&str; 4]` had neither.
+/// Adding a variant makes the `match` non-exhaustive, so the compiler forces
+/// the new policy into the chain and therefore into this list. And the wire
+/// strings come from `as_wire()`, so they cannot drift from the enum's serde
+/// spelling. A string array kept compiling unchanged while covering one policy
+/// less.
+fn policies() -> Vec<&'static str> {
+    let mut all = Vec::new();
+    let mut next = Some(LogPersistence::None);
+    while let Some(policy) = next {
+        all.push(policy.as_wire());
+        next = match policy {
+            LogPersistence::None => Some(LogPersistence::Rolling),
+            LogPersistence::Rolling => Some(LogPersistence::Full),
+            LogPersistence::Full => Some(LogPersistence::Rotating),
+            LogPersistence::Rotating => None,
+        };
+    }
+    all
+}
 
 fn write_config(dir: &Path, vi_enabled: bool, log_persistence: &str) {
     std::fs::write(
@@ -57,7 +78,7 @@ fn doctor_stdout(dir: &Path) -> String {
 
 #[test]
 fn withheld_notice_reaches_the_operator_under_every_log_persistence_policy() {
-    for policy in POLICIES {
+    for policy in policies() {
         let dir = tempfile::TempDir::new().expect("temp config dir");
         write_config(dir.path(), true, policy);
 
@@ -85,7 +106,7 @@ fn withheld_notice_reaches_the_operator_under_every_log_persistence_policy() {
 /// filter behaviour; this pins the category the notice is actually written
 /// with, which is the half that lives in this repository's own call site.
 #[test]
-fn traced_notice_is_categorised_system_so_the_dashboard_shows_it() {
+fn traced_notice_is_categorised_and_carries_its_warning_code() {
     let dir = tempfile::TempDir::new().expect("temp config dir");
     write_config(dir.path(), true, "rolling");
 
@@ -109,6 +130,20 @@ fn traced_notice_is_categorised_system_so_the_dashboard_shows_it() {
         notice["event"]["category"].as_str(),
         Some("system"),
         "an uncategorised notice stores as `internal`, which the Logs view hides by default"
+    );
+
+    // The config surface reports this same fact as a structured warning. The
+    // two carry different prose on purpose, so the code is the only thing that
+    // identifies them as one fact rather than two lookalike notices.
+    assert_eq!(
+        notice["attributes"]["code"].as_str(),
+        Some("verifiable_intent_tool_withheld"),
+        "the traced copy must carry the config warning's code so the two correlate"
+    );
+    assert_eq!(
+        notice["attributes"]["path"].as_str(),
+        Some("verifiable_intent.enabled"),
+        "and the config key an operator would edit"
     );
 }
 
@@ -153,7 +188,7 @@ fn trace_is_the_channel_that_disappears_and_doctor_is_the_one_that_does_not() {
 /// the notice unconditionally would pass every assertion there.
 #[test]
 fn withheld_notice_is_absent_when_the_section_is_not_enabled() {
-    for policy in POLICIES {
+    for policy in policies() {
         let dir = tempfile::TempDir::new().expect("temp config dir");
         write_config(dir.path(), false, policy);
 

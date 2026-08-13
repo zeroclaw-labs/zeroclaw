@@ -19190,7 +19190,7 @@ impl Config {
             return;
         }
         warnings.push(crate::validation_warnings::ValidationWarning::new(
-            "verifiable_intent_tool_withheld",
+            crate::validation_warnings::VERIFIABLE_INTENT_TOOL_WITHHELD,
             "verifiable_intent.enabled is set, but the vi_verify tool is withheld from the \
              model-visible registry until a credential chain verifier exists. Enabling the \
              section does not enable credential verification on commerce tool calls. The \
@@ -31885,22 +31885,39 @@ group_policy = "disabled"
         );
     }
 
+    /// Every `LogPersistence` variant, walked through a `match` rather than
+    /// listed.
+    ///
+    /// The walk is the mechanism. Adding a variant makes the `match`
+    /// non-exhaustive, and the only way to satisfy the compiler is to give the
+    /// new variant a place in the chain, which necessarily puts it in the
+    /// returned list. An array literal cannot do that: it keeps compiling
+    /// unchanged and silently covers one policy less.
+    fn every_log_persistence() -> Vec<LogPersistence> {
+        let mut all = Vec::new();
+        let mut next = Some(LogPersistence::None);
+        while let Some(policy) = next {
+            all.push(policy);
+            next = match policy {
+                LogPersistence::None => Some(LogPersistence::Rolling),
+                LogPersistence::Rolling => Some(LogPersistence::Full),
+                LogPersistence::Full => Some(LogPersistence::Rotating),
+                LogPersistence::Rotating => None,
+            };
+        }
+        all
+    }
+
     /// The config surface does not consult the observability policy, which is
     /// the property that makes it a second channel rather than a second copy
     /// of the same one. Asserting it here pins the independence at the unit
     /// level; the process-level proof lives in the component test.
     ///
     /// Every variant is covered rather than the three that motivated the
-    /// change, so adding a policy fails this test until someone decides what
-    /// the notice does under it.
+    /// change. See [`every_log_persistence`] for what makes "every" hold.
     #[test]
     async fn verifiable_intent_warning_is_independent_of_log_persistence() {
-        for policy in [
-            LogPersistence::None,
-            LogPersistence::Rolling,
-            LogPersistence::Full,
-            LogPersistence::Rotating,
-        ] {
+        for policy in every_log_persistence() {
             let mut config = Config::default();
             suppress_semantic_memory_warning(&mut config);
             config.verifiable_intent.enabled = true;

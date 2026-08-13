@@ -5,6 +5,20 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Stable code for the withheld `vi_verify` capability notice.
+///
+/// Named here because two channels report this one fact and an operator has to
+/// be able to tell that they are the same fact: `Config::collect_warnings()`
+/// raises the structured warning, and the runtime traces it at each config
+/// application (`warn_verifiable_intent_withheld` in `src/main.rs`).
+///
+/// The prose deliberately differs per surface — the [`ValidationWarning`]
+/// message is the stable English contract for API consumers, `zeroclaw doctor`
+/// renders a localized line through Fluent, and the trace carries an operator
+/// log sentence. The code is what ties them together, which is why it is shared
+/// and the wording is not.
+pub const VERIFIABLE_INTENT_TOOL_WITHHELD: &str = "verifiable_intent_tool_withheld";
+
 /// One non-fatal validation issue surfaced after a successful save.
 ///
 /// Stable codes (extend as new warnings are added):
