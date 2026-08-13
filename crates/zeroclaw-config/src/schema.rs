@@ -4808,6 +4808,10 @@ fn default_google_stt_language_code() -> String {
     "en-US".into()
 }
 
+fn default_langfuse_base_url() -> String {
+    "https://cloud.langfuse.com".to_string()
+}
+
 /// Voice transcription configuration with multi-provider support.
 ///
 /// The top-level `api_url`, `model`, and `api_key` fields remain for backward
@@ -11299,6 +11303,8 @@ pub enum ObservabilityBackend {
     Prometheus,
     #[serde(alias = "opentelemetry", alias = "otlp")]
     Otel,
+    #[serde(alias = "langfuse")]
+    Langfuse,
 }
 
 impl ObservabilityBackend {
@@ -11310,6 +11316,7 @@ impl ObservabilityBackend {
             Self::Verbose => "verbose",
             Self::Prometheus => "prometheus",
             Self::Otel => "otel",
+            Self::Langfuse => "langfuse",
         }
     }
 }
@@ -11524,6 +11531,24 @@ pub struct ObservabilityConfig {
     /// secret reads). Empty by default.
     #[serde(default)]
     pub log_tool_io_denylist: Vec<String>,
+    /// Langfuse public key (username for HTTP Basic auth).
+    #[serde(default)]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub langfuse_public_key: Option<String>,
+    /// Langfuse secret key (password for HTTP Basic auth).
+    #[serde(default)]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub langfuse_secret_key: Option<String>,
+    /// Langfuse base URL. Defaults to `"https://cloud.langfuse.com"`.
+    #[serde(default = "default_langfuse_base_url")]
+    pub langfuse_base_url: String,
+    /// Whether to include LLM/tool I/O in exported traces. Defaults to `false`.
+    #[serde(default)]
+    pub langfuse_include_io: bool,
 
     /// LLM request payload capture: "off" | "redacted" | "full".
     /// - `off` (default): only `messages_count` lands on the `llm_request`
@@ -11590,6 +11615,10 @@ impl Default for ObservabilityConfig {
             log_tool_io: default_log_tool_io(),
             log_tool_io_truncate_bytes: default_log_tool_io_truncate_bytes(),
             log_tool_io_denylist: Vec::new(),
+            langfuse_public_key: None,
+            langfuse_secret_key: None,
+            langfuse_base_url: default_langfuse_base_url(),
+            langfuse_include_io: false,
             log_llm_request_payload: default_log_llm_request_payload(),
             otel_genai_content: OtelContentPolicy::Off,
             otel_genai_content_max_chars: default_otel_genai_content_max_chars(),

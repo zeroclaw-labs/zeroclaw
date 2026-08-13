@@ -42,12 +42,14 @@ use std::time::SystemTime;
 pub struct LangfuseObserver {
     tracer_provider: SdkTracerProvider,
     tracer: opentelemetry_sdk::trace::Tracer,
-    /// Root span for the current agent session.  Created by `AgentStart` and
-    /// ended by `AgentEnd`.
-    current_root: ParkingMutex<Option<opentelemetry_sdk::trace::Span>>,
-    /// Pending tool arguments, keyed by tool name.  Written by `ToolCallStart`,
-    /// consumed by `ToolCall`.
-    pending_tool_args: ParkingMutex<HashMap<String, String>>,
+    /// Root spans keyed by `turn_id`.  Concurrent turns (and events lacking a
+    /// `turn_id`) each get their own root so a second `AgentStart` cannot
+    /// overwrite the first and `AgentEnd` closes the matching trace.
+    active_roots: ParkingMutex<HashMap<String, opentelemetry_sdk::trace::Span>>,
+    /// Pending tool arguments keyed by `(turn_id, tool_call_id)`.  Written by
+    /// `ToolCallStart`, consumed by `ToolCall`, so simultaneous calls to the
+    /// same tool do not overwrite each other's arguments.
+    pending_tool_args: ParkingMutex<HashMap<(String, String), String>>,
     /// Whether to include LLM input/output content in generation spans.
     include_io: bool,
 }
@@ -97,14 +99,14 @@ impl LangfuseObserver {
         Ok(Self {
             tracer_provider,
             tracer,
-            current_root: ParkingMutex::new(None),
+            active_roots: ParkingMutex::new(HashMap::new()),
             pending_tool_args: ParkingMutex::new(HashMap::new()),
             include_io,
         })
     }
 
     fn context_with_root_parent(root: &opentelemetry_sdk::trace::Span) -> Context {
-        // The live root span stays parked in `current_root` until `AgentEnd`, so
+        // The live root span stays parked in `active_roots` until `AgentEnd`, so
         // we cannot move it into `Context::with_span`. We only need its
         // `SpanContext` to preserve trace/parent IDs for completed child spans.
         //
@@ -144,6 +146,7 @@ impl Observer for LangfuseObserver {
             ObserverEvent::AgentStart {
                 model_provider,
                 model,
+                turn_id,
                 ..
             } => {
                 let mut root = self.tracer.build(
@@ -157,7 +160,9 @@ impl Observer for LangfuseObserver {
                         ]),
                 );
                 root.set_status(Status::Ok);
-                *self.current_root.lock() = Some(root);
+                self.active_roots
+                    .lock()
+                    .insert(turn_id.clone().unwrap_or_default(), root);
             }
 
             // ── LLM call (generation) ───────────────────────────────
@@ -169,10 +174,12 @@ impl Observer for LangfuseObserver {
                 error_message,
                 input_tokens,
                 output_tokens,
+                turn_id,
                 ..
             } => {
-                let root_guard = self.current_root.lock();
-                let Some(ref root) = *root_guard else {
+                let key = turn_id.clone().unwrap_or_default();
+                let root_guard = self.active_roots.lock();
+                let Some(ref root) = root_guard.get(&key) else {
                     return;
                 };
 
@@ -225,21 +232,32 @@ impl Observer for LangfuseObserver {
 
             // ── Tool call (span) ────────────────────────────────────
             ObserverEvent::ToolCallStart {
-                tool, arguments, ..
+                tool,
+                tool_call_id,
+                arguments,
+                turn_id,
+                ..
             } => {
+                let key = (
+                    turn_id.clone().unwrap_or_default(),
+                    tool_call_id.clone().unwrap_or_else(|| tool.clone()),
+                );
                 let mut pending = self.pending_tool_args.lock();
-                pending.insert(tool.clone(), arguments.clone().unwrap_or_default());
+                pending.insert(key, arguments.clone().unwrap_or_default());
             }
             ObserverEvent::ToolCall {
                 tool,
+                tool_call_id,
                 duration,
                 success,
                 arguments,
                 result,
+                turn_id,
                 ..
             } => {
-                let root_guard = self.current_root.lock();
-                let Some(ref root) = *root_guard else {
+                let turn_key = turn_id.clone().unwrap_or_default();
+                let root_guard = self.active_roots.lock();
+                let Some(ref root) = root_guard.get(&turn_key) else {
                     return;
                 };
 
@@ -251,10 +269,14 @@ impl Observer for LangfuseObserver {
                 // Prefer the arguments carried on the matching `ToolCallStart`;
                 // fall back to whatever the agent loop forwarded on `ToolCall`
                 // (some tool paths skip the start event).
+                let call_key = (
+                    turn_key.clone(),
+                    tool_call_id.clone().unwrap_or_else(|| tool.clone()),
+                );
                 let args = self
                     .pending_tool_args
                     .lock()
-                    .remove(tool.as_str())
+                    .remove(&call_key)
                     .or_else(|| arguments.clone())
                     .unwrap_or_default();
 
@@ -262,12 +284,15 @@ impl Observer for LangfuseObserver {
                     KeyValue::new("langfuse.observation.type", "span"),
                     KeyValue::new("langfuse.observation.metadata.tool", tool.clone()),
                     KeyValue::new("langfuse.observation.metadata.success", *success),
-                    KeyValue::new("langfuse.observation.input", args),
                     KeyValue::new("tool.name", tool.clone()),
                     KeyValue::new("duration_s", secs),
                 ];
-                if let Some(output) = result {
-                    attrs.push(KeyValue::new("langfuse.observation.output", output.clone()));
+                // Gate I/O export on the privacy boundary.
+                if self.include_io {
+                    attrs.push(KeyValue::new("langfuse.observation.input", args));
+                    if let Some(output) = result {
+                        attrs.push(KeyValue::new("langfuse.observation.output", output.clone()));
+                    }
                 }
 
                 let cx = Self::context_with_root_parent(root);
@@ -291,11 +316,15 @@ impl Observer for LangfuseObserver {
                 duration,
                 tokens_used,
                 cost_usd,
+                turn_id,
                 ..
             } => {
-                let Some(mut root) = self.current_root.lock().take() else {
+                let key = turn_id.clone().unwrap_or_default();
+                let Some(mut root) = self.active_roots.lock().remove(&key) else {
                     return;
                 };
+                // Clear any pending arguments for this turn.
+                self.pending_tool_args.lock().retain(|(t, _), _| t != &key);
 
                 // Attach aggregate trace metadata before ending.
                 let secs = duration.as_secs_f64();
@@ -363,18 +392,12 @@ impl Observer for LangfuseObserver {
 
 impl Drop for LangfuseObserver {
     fn drop(&mut self) {
-        // End any dangling root span so the trace is not left open.
-        if let Some(mut root) = self.current_root.lock().take() {
+        // End any dangling root spans so traces are not left open.  No network
+        // I/O here: the batch exporter flushes in the background, and explicit
+        // flushing happens at short-lived invocation boundaries and graceful
+        // shutdown (see `flush()`), not during normal turn teardown.
+        for (_, mut root) in self.active_roots.lock().drain() {
             root.end();
-        }
-        if let Err(e) = self.tracer_provider.force_flush() {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"error": e.to_string()})),
-                "Langfuse OTLP flush on drop failed"
-            );
         }
     }
 }
@@ -388,6 +411,7 @@ fn base64_encode(input: &str) -> String {
 mod tests {
     use super::*;
     use std::time::Duration;
+    use zeroclaw_api::observability_traits::TurnTokenUsage;
 
     /// Helper: construct an observer pointed at an unreachable endpoint.
     /// All recording must still succeed (export failures are best-effort).
@@ -472,7 +496,10 @@ mod tests {
             model_provider: "openai".into(),
             model: "gpt-4o".into(),
             duration: Duration::from_secs(5),
-            tokens_used: Some(700),
+            tokens_used: Some(TurnTokenUsage {
+                input_tokens: 300,
+                output_tokens: 400,
+            }),
             cost_usd: Some(0.03),
             channel: None,
             agent_alias: None,
@@ -565,7 +592,10 @@ mod tests {
             model_provider: "anthropic".into(),
             model: "claude-3".into(),
             duration: Duration::ZERO,
-            tokens_used: Some(0),
+            tokens_used: Some(TurnTokenUsage {
+                input_tokens: 0,
+                output_tokens: 0,
+            }),
             cost_usd: Some(0.0),
             channel: None,
             agent_alias: None,
@@ -636,7 +666,10 @@ mod tests {
             model_provider: "openrouter".into(),
             model: "sonnet".into(),
             duration: Duration::from_secs(10),
-            tokens_used: Some(4500),
+            tokens_used: Some(TurnTokenUsage {
+                input_tokens: 2000,
+                output_tokens: 2500,
+            }),
             cost_usd: Some(0.15),
             channel: None,
             agent_alias: None,

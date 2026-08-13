@@ -422,6 +422,72 @@ fn create_primary_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
                 Box::new(NoopObserver)
             }
         }
+        ObservabilityBackend::Langfuse => {
+            #[cfg(feature = "observability-langfuse")]
+            {
+                let public_key = match config.langfuse_public_key.as_deref() {
+                    Some(k) if !k.is_empty() => k,
+                    _ => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                            "Langfuse backend requested but langfuse_public_key is not set; falling back to noop."
+                        );
+                        return Box::new(NoopObserver);
+                    }
+                };
+                let secret_key = match config.langfuse_secret_key.as_deref() {
+                    Some(k) if !k.is_empty() => k,
+                    _ => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                            "Langfuse backend requested but langfuse_secret_key is not set; falling back to noop."
+                        );
+                        return Box::new(NoopObserver);
+                    }
+                };
+                match LangfuseObserver::new(
+                    public_key,
+                    secret_key,
+                    &config.langfuse_base_url,
+                    config.langfuse_include_io,
+                ) {
+                    Ok(obs) => Box::new(obs),
+                    Err(e) => {
+                        ::zeroclaw_log::record!(
+                            ERROR,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            "Failed to create Langfuse observer; falling back to noop."
+                        );
+                        Box::new(NoopObserver)
+                    }
+                }
+            }
+            #[cfg(not(feature = "observability-langfuse"))]
+            {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    "Langfuse backend requested but observability-langfuse not compiled; falling back to noop."
+                );
+                Box::new(NoopObserver)
+            }
+        }
         ObservabilityBackend::None => Box::new(NoopObserver),
     }
 }
