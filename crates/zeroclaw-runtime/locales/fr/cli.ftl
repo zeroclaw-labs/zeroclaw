@@ -200,9 +200,9 @@ cli-cron-long-about =
     zeroclaw cron add '0 9 * * 1-5' 'Bonjour' --agent sentinel --prompt --tz America/New_York
     zeroclaw cron add '*/30 * * * *' 'Vérifier la santé du système' --agent sentinel --prompt
     zeroclaw cron add '*/5 * * * *' 'echo ok' --agent sentinel
-    zeroclaw cron add-at 2025-01-15T14:00:00Z 'Envoyer un rappel' --agent
-    zeroclaw cron add-every 60000 'Ping de santé'
-    zeroclaw cron once 30m 'Lancer une sauvegarde dans 30 minutes' --agent
+    zeroclaw cron add-at 2099-01-15T14:00:00Z 'Envoyer un rappel' --agent sentinel --prompt
+    zeroclaw cron add-every 60000 'Ping de santé' --agent sentinel --prompt
+    zeroclaw cron once 30m 'Lancer une sauvegarde dans 30 minutes' --agent sentinel --prompt
     zeroclaw cron pause IDENTIFIANT_TACHE
     zeroclaw cron update IDENTIFIANT_TACHE --expression '0 8 * * *' --tz Europe/London
 cli-channel-long-about =

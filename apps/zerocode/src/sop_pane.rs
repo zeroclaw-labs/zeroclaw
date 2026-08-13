@@ -10,9 +10,14 @@ use ratatui::{
 
 use crate::client::{
     FlowRole, GraphLayout, GraphNode, GraphPin, GraphWire, NodeKind, NodeRunState, PinClass,
-    PlannedToolCall, RpcClient, SopDraft, SopGraphView, SopStep, SopStepKind, StepFailure,
-    SwitchRule,
+    PlannedToolCall, RpcClient, SopDraft, SopGraphView, SopRunStatusView, SopRunSummaryView,
+    SopStep, SopStepKind, StepFailure, SwitchRule,
 };
+
+/// Minimum spacing between `sops/runs` polls. Run state moves faster than
+/// the dashboard's aggregate counters, so the SOP pane polls harder (2s vs
+/// the dashboard's 5s) while still coalescing the 200ms event-loop ticks.
+const RUNS_POLL_INTERVAL_SECS: u64 = 2;
 
 pub(crate) struct SopPane {
     rpc: Arc<RpcClient>,
@@ -40,6 +45,18 @@ pub(crate) struct SopPane {
     pan_y: u16,
     canvas_rect: Rect,
     pan_drag: Option<(u16, u16, u16, u16)>,
+    /// Aggregated live status per SOP name, refreshed by [`SopPane::tick`]
+    /// and rendered as the leading icon on each list row.
+    run_status: std::collections::HashMap<String, SopRunStatusView>,
+    last_runs_poll: Option<std::time::Instant>,
+    /// The receiver is the single source of truth for whether a refresh is in
+    /// flight. Keeping the RPC off the event loop prevents a degraded daemon
+    /// from freezing input and rendering for the client timeout window.
+    runs_poll_rx:
+        Option<tokio::sync::mpsc::UnboundedReceiver<Result<Vec<SopRunSummaryView>, String>>>,
+    /// Poll freshness is independent from action errors. A failed refresh
+    /// retains the last successful map and marks it stale until recovery.
+    runs_poll_stale: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -488,6 +505,10 @@ impl SopPane {
             pan_y: 0,
             canvas_rect: Rect::new(0, 0, 0, 0),
             pan_drag: None,
+            run_status: std::collections::HashMap::new(),
+            last_runs_poll: None,
+            runs_poll_rx: None,
+            runs_poll_stale: false,
         }
     }
 
@@ -496,6 +517,64 @@ impl SopPane {
             .selected()
             .and_then(|i| self.names.get(i))
             .map(String::as_str)
+    }
+
+    /// Called on every event-loop tick while the SOP pane is focused. A single
+    /// unfiltered request covers every row, and the request runs outside the
+    /// event loop so a slow daemon cannot block terminal input or rendering.
+    pub(crate) fn tick(&mut self) {
+        self.drain_runs_poll();
+        if self.runs_poll_rx.is_some() {
+            return;
+        }
+        let should_poll = self
+            .last_runs_poll
+            .map(|t| t.elapsed().as_secs() >= RUNS_POLL_INTERVAL_SECS)
+            .unwrap_or(true);
+        if !should_poll {
+            return;
+        }
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.runs_poll_rx = Some(rx);
+        let rpc = Arc::clone(&self.rpc);
+        tokio::spawn(async move {
+            let result = rpc.sops_runs(None).await.map_err(|error| error.to_string());
+            let _ = tx.send(result);
+        });
+    }
+
+    fn drain_runs_poll(&mut self) {
+        let Some(rx) = self.runs_poll_rx.as_mut() else {
+            return;
+        };
+        let result = match rx.try_recv() {
+            Ok(result) => result,
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => return,
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                Err("run-status poll ended without a response".to_string())
+            }
+        };
+
+        self.runs_poll_rx = None;
+        // The throttle window starts after the response, so a five-second
+        // timeout cannot cause an immediate retry on the next event-loop tick.
+        self.last_runs_poll = Some(std::time::Instant::now());
+        let Ok(runs) = result else {
+            self.runs_poll_stale = true;
+            return;
+        };
+
+        let mut by_sop: std::collections::HashMap<String, Vec<SopRunSummaryView>> =
+            std::collections::HashMap::new();
+        for run in runs {
+            by_sop.entry(run.sop_name.clone()).or_default().push(run);
+        }
+        self.run_status = by_sop
+            .into_iter()
+            .filter_map(|(name, runs)| aggregate_sop_status(&runs).map(|s| (name, s)))
+            .collect();
+        self.runs_poll_stale = false;
     }
 
     pub(crate) async fn refresh(&mut self) {
@@ -1390,7 +1469,17 @@ impl SopPane {
         let items: Vec<ListItem> = self
             .names
             .iter()
-            .map(|n| ListItem::new(Line::from(n.clone())))
+            .map(|n| {
+                let line = match self.run_status.get(n) {
+                    Some(status) => Line::from(vec![
+                        Span::raw(status_icon(*status)),
+                        Span::raw(" "),
+                        Span::raw(n.clone()),
+                    ]),
+                    None => Line::from(n.clone()),
+                };
+                ListItem::new(line)
+            })
             .collect();
         let list = List::new(items)
             .block(Block::default().borders(Borders::ALL).title("SOPs"))
@@ -1402,7 +1491,8 @@ impl SopPane {
         let visual = self.layer == RenderLayer::Visual;
         let title = self.right_title();
 
-        if visual && self.error.is_none() {
+        let visible_error = self.visible_error();
+        if visual && visible_error.is_none() {
             self.render_canvas(f, cols[1], &title);
             return;
         }
@@ -1410,8 +1500,8 @@ impl SopPane {
         self.handle_rects.clear();
         self.wire_rects.clear();
 
-        let body = if let Some(err) = &self.error {
-            err.clone()
+        let body = if let Some(err) = visible_error {
+            err
         } else if editing {
             self.editor_lines().join("\n")
         } else {
@@ -1421,6 +1511,18 @@ impl SopPane {
             .block(Block::default().borders(Borders::ALL).title(title))
             .wrap(Wrap { trim: false });
         f.render_widget(para, cols[1]);
+    }
+
+    fn visible_error(&self) -> Option<String> {
+        let stale = self
+            .runs_poll_stale
+            .then(|| crate::i18n::t("zc-sop-runs-stale"));
+        match (&self.error, stale) {
+            (Some(action), Some(poll)) => Some(format!("{action}\n{poll}")),
+            (Some(action), None) => Some(action.clone()),
+            (None, Some(poll)) => Some(poll),
+            (None, None) => None,
+        }
     }
 
     fn right_title(&self) -> String {
@@ -2152,6 +2254,70 @@ fn render_editor_card(
     );
 }
 
+/// Collapse one SOP's run rows into the single status its list row shows.
+///
+/// Live runs always win over history: while anything is active the row
+/// reflects the engine, not the archive. Within the active set the rule is
+/// "loudest first" — a run parked on an operator decision outranks one that
+/// is merely executing, because the former is the only one that needs the
+/// user. `Unknown` (a status from a newer daemon) is deliberately ranked
+/// below every status we understand: it must never mask a real
+/// needs-input signal, but it still surfaces when it is all we have.
+///
+/// With no active runs the row falls back to the most recently started
+/// record. `started_at` is RFC3339, so a lexicographic max is a chronological
+/// max.
+fn aggregate_sop_status(runs: &[SopRunSummaryView]) -> Option<SopRunStatusView> {
+    /// Higher wins. A terminal status on a run the engine still lists as
+    /// active is a race between the run finishing and this poll, so it sits
+    /// at the floor — below `Unknown`, which at least might be a live state
+    /// this build does not know yet. Everything stays eligible, so a lone
+    /// active run always yields something.
+    fn liveness_rank(status: SopRunStatusView) -> u8 {
+        if status.needs_input() {
+            4
+        } else if status == SopRunStatusView::Running {
+            3
+        } else if status == SopRunStatusView::Pending {
+            2
+        } else if status.is_terminal() {
+            0
+        } else {
+            1
+        }
+    }
+
+    let best_active = runs
+        .iter()
+        .filter(|r| r.active)
+        .max_by(|a, b| {
+            liveness_rank(a.status)
+                .cmp(&liveness_rank(b.status))
+                .then_with(|| a.started_at.cmp(&b.started_at))
+        })
+        .map(|r| r.status);
+    if best_active.is_some() {
+        return best_active;
+    }
+
+    runs.iter()
+        .max_by(|a, b| a.started_at.cmp(&b.started_at))
+        .map(|r| r.status)
+}
+
+/// Row icon for an aggregated status. The palette is the accepted SOP status
+/// language: yellow in flight, blue awaiting a person, green completed, red
+/// failed or cancelled, and neutral white for an unknown future state.
+fn status_icon(status: SopRunStatusView) -> &'static str {
+    match status {
+        SopRunStatusView::Pending | SopRunStatusView::Running => "🟡",
+        SopRunStatusView::WaitingApproval | SopRunStatusView::PausedCheckpoint => "🔵",
+        SopRunStatusView::Completed => "🟢",
+        SopRunStatusView::Failed | SopRunStatusView::Cancelled => "🔴",
+        SopRunStatusView::Unknown => "⚪",
+    }
+}
+
 fn render_node_card(
     f: &mut Frame,
     area: Rect,
@@ -2331,5 +2497,427 @@ mod tests {
             "with no backend `sources` (old/failed response) the picker \
              reconstructs from bound + channel so it still works"
         );
+    }
+}
+
+#[cfg(test)]
+mod status_agg_tests {
+    use super::{RUNS_POLL_INTERVAL_SECS, SopPane, aggregate_sop_status, status_icon};
+    use crate::client::{RpcClient, SopRunStatusView, SopRunSummaryView};
+    use crate::jsonrpc::{JsonRpcError, RpcOutbound};
+    use serde_json::json;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use tokio::sync::mpsc;
+
+    fn run(status: SopRunStatusView, active: bool, started_at: &str) -> SopRunSummaryView {
+        SopRunSummaryView {
+            run_id: format!("run-{started_at}"),
+            sop_name: "deploy".to_string(),
+            status,
+            started_at: started_at.to_string(),
+            active,
+            ..SopRunSummaryView::default()
+        }
+    }
+
+    fn polling_pane() -> (SopPane, Arc<RpcOutbound>, mpsc::Receiver<String>) {
+        let (tx, rx) = mpsc::channel(8);
+        let outbound = Arc::new(RpcOutbound::new(tx));
+        let rpc = Arc::new(RpcClient::with_rpc(Arc::clone(&outbound)));
+        (SopPane::new(rpc), outbound, rx)
+    }
+
+    async fn receive_poll(rx: &mut mpsc::Receiver<String>) -> String {
+        let raw = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("SOP status poll should not block the event loop")
+            .expect("RPC writer should remain connected");
+        let request: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(request["method"], "sops/runs");
+        request["id"].as_str().unwrap().to_string()
+    }
+
+    async fn drain_poll(pane: &mut SopPane) {
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+            pane.tick();
+            if pane.runs_poll_rx.is_none() {
+                return;
+            }
+        }
+        panic!("completed SOP status poll was not drained");
+    }
+
+    fn make_poll_due(pane: &mut SopPane) {
+        pane.last_runs_poll =
+            Some(Instant::now() - Duration::from_secs(RUNS_POLL_INTERVAL_SECS.saturating_add(1)));
+    }
+
+    fn runs_response(status: &str) -> serde_json::Value {
+        json!({
+            "runs": [{
+                "run_id": "run-1",
+                "sop_name": "deploy",
+                "status": status,
+                "started_at": "2026-08-02T10:00:00Z",
+                "active": status == "running"
+            }]
+        })
+    }
+
+    #[tokio::test]
+    async fn poll_health_retains_stale_icons_without_clobbering_action_errors() {
+        let (mut pane, outbound, mut write_rx) = polling_pane();
+
+        let started = Instant::now();
+        pane.tick();
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "starting a poll must not wait for its RPC response"
+        );
+        let request_id = receive_poll(&mut write_rx).await;
+        pane.tick();
+        assert!(
+            write_rx.try_recv().is_err(),
+            "an in-flight poll must be the authority that suppresses duplicates"
+        );
+        outbound.dispatch_response(&request_id, Some(runs_response("running")), None);
+        drain_poll(&mut pane).await;
+
+        assert_eq!(
+            pane.run_status.get("deploy"),
+            Some(&SopRunStatusView::Running)
+        );
+        assert!(!pane.runs_poll_stale);
+        assert!(pane.last_runs_poll.is_some());
+
+        pane.error = Some("save failed".to_string());
+        make_poll_due(&mut pane);
+        pane.tick();
+        let request_id = receive_poll(&mut write_rx).await;
+        outbound.dispatch_response(
+            &request_id,
+            None,
+            Some(JsonRpcError {
+                code: -32000,
+                message: "daemon unavailable".to_string(),
+                data: None,
+            }),
+        );
+        drain_poll(&mut pane).await;
+
+        assert_eq!(
+            pane.run_status.get("deploy"),
+            Some(&SopRunStatusView::Running),
+            "a failed refresh must retain the last successful icons"
+        );
+        assert!(pane.runs_poll_stale);
+        assert_eq!(pane.error.as_deref(), Some("save failed"));
+        let stale_message = crate::i18n::t("zc-sop-runs-stale");
+        let first_visible_error = pane.visible_error().unwrap();
+        assert!(first_visible_error.contains("save failed"));
+        assert!(first_visible_error.contains(&stale_message));
+
+        pane.names = vec!["deploy".to_string()];
+        let backend = ratatui::backend::TestBackend::new(80, 10);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| pane.render(frame, frame.area()))
+            .expect("render stale SOP status");
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("🟡"));
+        assert!(rendered.contains("deploy"));
+        assert!(rendered.contains("save failed"));
+        assert!(rendered.contains(&stale_message));
+
+        pane.tick();
+        assert!(
+            write_rx.try_recv().is_err(),
+            "a failed response must still begin a fresh throttle window"
+        );
+        make_poll_due(&mut pane);
+        pane.tick();
+        let request_id = receive_poll(&mut write_rx).await;
+        outbound.dispatch_response(
+            &request_id,
+            None,
+            Some(JsonRpcError {
+                code: -32000,
+                message: "daemon unavailable".to_string(),
+                data: None,
+            }),
+        );
+        drain_poll(&mut pane).await;
+        assert_eq!(
+            pane.visible_error().as_deref(),
+            Some(first_visible_error.as_str()),
+            "repeated failures must leave the visible indication stable"
+        );
+
+        make_poll_due(&mut pane);
+        pane.tick();
+        let request_id = receive_poll(&mut write_rx).await;
+        outbound.dispatch_response(&request_id, Some(runs_response("completed")), None);
+        drain_poll(&mut pane).await;
+
+        assert_eq!(
+            pane.run_status.get("deploy"),
+            Some(&SopRunStatusView::Completed)
+        );
+        assert!(!pane.runs_poll_stale, "recovery must clear stale health");
+        assert_eq!(
+            pane.visible_error().as_deref(),
+            Some("save failed"),
+            "poll recovery must not clear an independently owned action error"
+        );
+    }
+
+    /// The 🟡 responsiveness warning: a slow or hung daemon must not make the
+    /// pane feel frozen. The poll runs off the event loop, so many `tick()`
+    /// calls with a response that never arrives must all return promptly, must
+    /// not queue a second request, and must leave rendering working.
+    #[tokio::test]
+    async fn repeated_slow_polls_never_block_input_or_rendering() {
+        let (mut pane, outbound, mut write_rx) = polling_pane();
+        pane.names = vec!["deploy".to_string()];
+
+        pane.tick();
+        let request_id = receive_poll(&mut write_rx).await;
+
+        // The response deliberately never arrives: simulate a hung transport.
+        let backend = ratatui::backend::TestBackend::new(80, 10);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        for _ in 0..200 {
+            let started = Instant::now();
+            make_poll_due(&mut pane);
+            pane.tick();
+            assert!(
+                started.elapsed() < Duration::from_millis(50),
+                "a tick with a poll still in flight must return immediately"
+            );
+            assert!(
+                write_rx.try_recv().is_err(),
+                "a pending poll must suppress new requests, not queue a backlog"
+            );
+            terminal
+                .draw(|frame| pane.render(frame, frame.area()))
+                .expect("rendering must keep working while a poll is hung");
+        }
+
+        // Once the slow response finally lands it is still applied normally.
+        outbound.dispatch_response(&request_id, Some(runs_response("running")), None);
+        drain_poll(&mut pane).await;
+        assert_eq!(
+            pane.run_status.get("deploy"),
+            Some(&SopRunStatusView::Running)
+        );
+    }
+
+    #[test]
+    fn no_runs_yields_no_status() {
+        assert_eq!(
+            aggregate_sop_status(&[]),
+            None,
+            "a SOP that never ran must render as a bare name, not an icon"
+        );
+    }
+
+    #[test]
+    fn single_active_running_wins() {
+        let runs = [run(SopRunStatusView::Running, true, "2026-08-02T10:00:00Z")];
+        assert_eq!(aggregate_sop_status(&runs), Some(SopRunStatusView::Running));
+    }
+
+    #[test]
+    fn active_waiting_approval_beats_active_running() {
+        let runs = [
+            run(SopRunStatusView::Running, true, "2026-08-02T12:00:00Z"),
+            run(
+                SopRunStatusView::WaitingApproval,
+                true,
+                "2026-08-02T09:00:00Z",
+            ),
+        ];
+        assert_eq!(
+            aggregate_sop_status(&runs),
+            Some(SopRunStatusView::WaitingApproval),
+            "needs-input outranks execution even when it started earlier — \
+             the row exists to tell the user someone is blocked on them"
+        );
+    }
+
+    #[test]
+    fn active_paused_checkpoint_also_outranks_running() {
+        let runs = [
+            run(SopRunStatusView::Running, true, "2026-08-02T12:00:00Z"),
+            run(
+                SopRunStatusView::PausedCheckpoint,
+                true,
+                "2026-08-02T11:00:00Z",
+            ),
+        ];
+        assert_eq!(
+            aggregate_sop_status(&runs),
+            Some(SopRunStatusView::PausedCheckpoint)
+        );
+    }
+
+    #[test]
+    fn active_running_beats_active_pending() {
+        let runs = [
+            run(SopRunStatusView::Pending, true, "2026-08-02T13:00:00Z"),
+            run(SopRunStatusView::Running, true, "2026-08-02T08:00:00Z"),
+        ];
+        assert_eq!(
+            aggregate_sop_status(&runs),
+            Some(SopRunStatusView::Running),
+            "the most-alive active run drives the row"
+        );
+    }
+
+    #[test]
+    fn active_run_beats_newer_terminal_run() {
+        let runs = [
+            run(SopRunStatusView::Completed, false, "2026-08-02T23:00:00Z"),
+            run(SopRunStatusView::Failed, false, "2026-08-02T22:00:00Z"),
+            run(SopRunStatusView::Pending, true, "2026-08-02T01:00:00Z"),
+        ];
+        assert_eq!(
+            aggregate_sop_status(&runs),
+            Some(SopRunStatusView::Pending),
+            "history never masks a live run, however recent the history is"
+        );
+    }
+
+    #[test]
+    fn terminal_only_picks_greatest_started_at() {
+        let runs = [
+            run(SopRunStatusView::Completed, false, "2026-08-01T10:00:00Z"),
+            run(SopRunStatusView::Failed, false, "2026-08-02T10:00:00Z"),
+            run(SopRunStatusView::Cancelled, false, "2026-07-30T10:00:00Z"),
+        ];
+        assert_eq!(
+            aggregate_sop_status(&runs),
+            Some(SopRunStatusView::Failed),
+            "with nothing live the row shows the latest outcome"
+        );
+    }
+
+    #[test]
+    fn lone_active_unknown_still_surfaces() {
+        let runs = [run(SopRunStatusView::Unknown, true, "2026-08-02T10:00:00Z")];
+        assert_eq!(
+            aggregate_sop_status(&runs),
+            Some(SopRunStatusView::Unknown),
+            "an unrecognized status is not a reason to render nothing"
+        );
+    }
+
+    #[test]
+    fn active_unknown_loses_to_running_and_needs_input() {
+        let with_running = [
+            run(SopRunStatusView::Unknown, true, "2026-08-02T14:00:00Z"),
+            run(SopRunStatusView::Running, true, "2026-08-02T02:00:00Z"),
+        ];
+        assert_eq!(
+            aggregate_sop_status(&with_running),
+            Some(SopRunStatusView::Running)
+        );
+
+        let with_waiting = [
+            run(SopRunStatusView::Unknown, true, "2026-08-02T14:00:00Z"),
+            run(
+                SopRunStatusView::WaitingApproval,
+                true,
+                "2026-08-02T02:00:00Z",
+            ),
+        ];
+        assert_eq!(
+            aggregate_sop_status(&with_waiting),
+            Some(SopRunStatusView::WaitingApproval),
+            "Unknown must never mask a run that is blocked on the user"
+        );
+    }
+
+    #[test]
+    fn active_terminal_row_loses_to_every_live_status() {
+        // A run the engine still lists as active but whose status already
+        // reads terminal is a poll racing the run's own completion; it must
+        // not outrank a genuinely live sibling.
+        let runs = [
+            run(SopRunStatusView::Completed, true, "2026-08-02T20:00:00Z"),
+            run(SopRunStatusView::Unknown, true, "2026-08-02T01:00:00Z"),
+        ];
+        assert_eq!(aggregate_sop_status(&runs), Some(SopRunStatusView::Unknown));
+    }
+
+    #[test]
+    fn unknown_is_neither_needs_input_nor_terminal() {
+        assert!(!SopRunStatusView::Unknown.needs_input());
+        assert!(!SopRunStatusView::Unknown.is_terminal());
+        // An inactive Unknown is still the latest record, so it wins the
+        // history fallback rather than being skipped.
+        let runs = [
+            run(SopRunStatusView::Completed, false, "2026-08-01T10:00:00Z"),
+            run(SopRunStatusView::Unknown, false, "2026-08-02T10:00:00Z"),
+        ];
+        assert_eq!(aggregate_sop_status(&runs), Some(SopRunStatusView::Unknown));
+    }
+
+    #[test]
+    fn icon_mapping_covers_every_status() {
+        assert_eq!(status_icon(SopRunStatusView::Pending), "🟡");
+        assert_eq!(status_icon(SopRunStatusView::Running), "🟡");
+        assert_eq!(status_icon(SopRunStatusView::WaitingApproval), "🔵");
+        assert_eq!(status_icon(SopRunStatusView::PausedCheckpoint), "🔵");
+        assert_eq!(status_icon(SopRunStatusView::Failed), "🔴");
+        assert_eq!(status_icon(SopRunStatusView::Completed), "🟢");
+        assert_eq!(status_icon(SopRunStatusView::Cancelled), "🔴");
+        assert_eq!(status_icon(SopRunStatusView::Unknown), "⚪");
+    }
+
+    /// The specific regression the review named: under the previous palette a
+    /// cancelled run rendered the same glyph as a clean completion, so an
+    /// operator could not tell an aborted run from a successful one. These
+    /// two must never collapse to the same glyph again.
+    #[test]
+    fn cancelled_is_visually_distinct_from_completed() {
+        assert_ne!(
+            status_icon(SopRunStatusView::Cancelled),
+            status_icon(SopRunStatusView::Completed),
+            "a cancelled run must not look like a clean completion"
+        );
+    }
+
+    /// An unrecognised status from a newer daemon must still occupy a cell.
+    /// An empty glyph would shift the row text and break the mouse hit-test
+    /// alignment that `list_row_rects` depends on.
+    #[test]
+    fn every_status_icon_is_non_empty_and_single_width() {
+        for status in [
+            SopRunStatusView::Pending,
+            SopRunStatusView::Running,
+            SopRunStatusView::WaitingApproval,
+            SopRunStatusView::PausedCheckpoint,
+            SopRunStatusView::Completed,
+            SopRunStatusView::Failed,
+            SopRunStatusView::Cancelled,
+            SopRunStatusView::Unknown,
+        ] {
+            let icon = status_icon(status);
+            assert!(!icon.is_empty(), "{status:?} must render a visible glyph");
+            assert_eq!(
+                icon.chars().count(),
+                1,
+                "{status:?} must be one glyph so every row keeps the same width"
+            );
+        }
     }
 }

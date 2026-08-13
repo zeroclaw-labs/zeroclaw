@@ -1,8 +1,8 @@
 # FND-003: Team Organization, Project Governance, and Contribution Pipeline
 
-> Starting v0.7.0 · Type: Governance · Rev. 7
+> Starting v0.7.0 · Type: Governance · Rev. 14
 >
-> **Canonical reference** · Ratified by the team · Rev. 7
+> **Canonical reference** · Ratified by the team · Rev. 14
 > Original governance discussion: [#5577](https://github.com/zeroclaw-labs/zeroclaw/issues/5577)
 > Follow-up work-lane and label-governance policy: [#6808](https://github.com/zeroclaw-labs/zeroclaw/issues/6808)
 
@@ -20,12 +20,18 @@
 |---|---|---|
 | 1 | 2026-04-09 | Initial draft |
 | 2 | 2026-04-09 | Added §6.4 Architectural Compliance: Human Review, AI Support; added Discussion Question on AI automation of architecture reviews |
-| 3 | 2026-05-24 | Added #6808 operational-label-policy pointers; current label behavior lives in maintainer docs |
-| 4 | 2026-05-24 | Added #6808 community-pickup and issue-risk/PR-risk operational pointers |
-| 5 | 2026-05-25 | Promoted #6808 feature-facing work-lane and label-governance policy into FND-003; clarified durable source boundaries, Discussions stewardship, Discord-to-GitHub handoff, and where operational gate questions live |
-| 6 | 2026-07-12 | Revised issue stale timing and qualifying-activity policy; made the maintainer label guide the sole operational source (#8989) |
-| 7 | 2026-07-18 | Replaced the universal ADR requirement with an explicit durable-disposition rule for accepted RFCs; reserved ADRs for significant architecture decisions |
-| 8 | 2026-07-25 | Retired the `CONTRIBUTORS.md` membership record and the `zeroclaw-core`/`zeroclaw-contributors` team names, none of which were ever created; §5.3 now names the `core-contributors` GitHub team, CODEOWNERS, and the Communication maintainer table as the real records |
+| 3 | 2026-05-24 | Added #6808 operational-label-policy pointers; current label behavior lives in maintainer docs ([#6899](https://github.com/zeroclaw-labs/zeroclaw/pull/6899)) |
+| 4 | 2026-05-24 | Added #6808 community-pickup and issue-risk/PR-risk operational pointers ([#6903](https://github.com/zeroclaw-labs/zeroclaw/pull/6903)) |
+| 5 | 2026-05-25 | Promoted #6808 feature-facing work-lane and label-governance policy into FND-003; clarified durable source boundaries, Discussions stewardship, Discord-to-GitHub handoff, and where operational gate questions live ([#6919](https://github.com/zeroclaw-labs/zeroclaw/pull/6919)) |
+| 6 | 2026-05-27 | Made board-level `Won't Do` a durable closure decision and delegated current terminal-label and replacement-process rules to maintainer sources ([#6929](https://github.com/zeroclaw-labs/zeroclaw/pull/6929)) |
+| 7 | 2026-06-07 | Expanded project-board planning ownership to an active owner or steward path and required stale-exemption reason plus active movement ownership ([#7011](https://github.com/zeroclaw-labs/zeroclaw/pull/7011)) |
+| 8 | 2026-06-14 | Replaced owner-or-steward requirements with contributor-visible routing evidence for project-board and stale-exemption policy ([#7571](https://github.com/zeroclaw-labs/zeroclaw/pull/7571)) |
+| 9 | 2026-06-16 | Made `.github/ISSUE_TEMPLATE/` the operational intake source, defined the current intake lanes, and kept judgment-only labels maintainer-applied ([#7652](https://github.com/zeroclaw-labs/zeroclaw/pull/7652)) |
+| 10 | 2026-06-23 | Standardized size-label spelling and changed PR-size labeling from required automation to a future optional mechanism aligned with maintainer policy ([#8111](https://github.com/zeroclaw-labs/zeroclaw/pull/8111)) |
+| 11 | 2026-07-05 | Changed the RFC lifecycle to issue-first governance and linked the foundational RFCs to their canonical FNDs ([#8694](https://github.com/zeroclaw-labs/zeroclaw/pull/8694)) |
+| 12 | 2026-07-12 | Revised issue stale timing and qualifying-activity policy; made the maintainer label guide the sole operational source ([#8989](https://github.com/zeroclaw-labs/zeroclaw/pull/8989)) |
+| 13 | 2026-07-18 | Replaced the universal ADR requirement with an explicit durable-disposition rule for accepted RFCs; reserved ADRs for significant architecture decisions ([#9136](https://github.com/zeroclaw-labs/zeroclaw/pull/9136)) |
+| 14 | 2026-07-25 | Retired the `CONTRIBUTORS.md` membership record and the `zeroclaw-core`/`zeroclaw-contributors` team names, none of which were ever created; §5.3 now names the `core-contributors` GitHub team, CODEOWNERS, and the Communication maintainer table as the real records ([#9388](https://github.com/zeroclaw-labs/zeroclaw/pull/9388)) |
 
 ---
 

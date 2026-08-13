@@ -644,10 +644,11 @@ pub fn all_tools_with_runtime(
             PathGuardedTool::new(ContentSearchTool::new(security.clone()), security.clone()),
             security.clone(),
         )),
-        Arc::new(CronAddTool::new(
+        Arc::new(CronAddTool::new_with_runtime(
             config.clone(),
             security.clone(),
             agent_alias,
+            runtime.clone(),
         )),
         Arc::new(CronListTool::new(config.clone())),
         Arc::new(CronRemoveTool::new(
@@ -655,22 +656,28 @@ pub fn all_tools_with_runtime(
             security.clone(),
             agent_alias,
         )),
-        Arc::new(CronUpdateTool::new(
+        Arc::new(CronUpdateTool::new_with_runtime(
             config.clone(),
             security.clone(),
             agent_alias,
+            runtime.clone(),
         )),
-        Arc::new(CronRunTool::new(config.clone(), security.clone())),
+        Arc::new(CronRunTool::new_with_runtime(
+            config.clone(),
+            security.clone(),
+            runtime.clone(),
+        )),
         Arc::new(CronRunsTool::new(config.clone())),
         Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())),
         Arc::new(MemoryRecallTool::new(memory.clone())),
         Arc::new(MemoryForgetTool::new(memory.clone(), security.clone())),
         Arc::new(MemoryExportTool::new(memory.clone())),
         Arc::new(MemoryPurgeTool::new(memory.clone(), security.clone())),
-        Arc::new(ScheduleTool::new(
+        Arc::new(ScheduleTool::new_with_runtime(
             security.clone(),
             root_config.clone(),
             agent_alias,
+            runtime.clone(),
         )),
         Arc::new(
             SpawnSubagentTool::new(Arc::new(root_config.clone()), agent_alias, security.clone())
@@ -1927,9 +1934,6 @@ mod tests {
         fn name(&self) -> &str {
             "capturing-test"
         }
-        fn has_shell_access(&self) -> bool {
-            true
-        }
         fn has_filesystem_access(&self) -> bool {
             self.filesystem_access
         }
@@ -1938,6 +1942,9 @@ mod tests {
         }
         fn supports_long_running(&self) -> bool {
             false
+        }
+        fn shell_dialect(&self) -> crate::platform::ShellDialect {
+            crate::platform::ShellDialect::Posix
         }
         fn build_shell_command(
             &self,
@@ -2561,9 +2568,6 @@ mod tests {
         fn name(&self) -> &str {
             "ephemeral-test"
         }
-        fn has_shell_access(&self) -> bool {
-            true
-        }
         fn has_filesystem_access(&self) -> bool {
             false
         }
@@ -2572,6 +2576,9 @@ mod tests {
         }
         fn supports_long_running(&self) -> bool {
             false
+        }
+        fn shell_dialect(&self) -> crate::platform::ShellDialect {
+            self.0.shell_dialect()
         }
         fn build_shell_command(
             &self,

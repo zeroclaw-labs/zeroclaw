@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::json;
 use std::sync::Arc;
+use zeroclaw_api::runtime_traits::RuntimeAdapter;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::Config;
 
@@ -12,21 +13,37 @@ use zeroclaw_config::schema::Config;
 pub struct ScheduleTool {
     security: Arc<SecurityPolicy>,
     config: Config,
+    runtime: Arc<dyn RuntimeAdapter>,
     /// Owning agent — risk profile gate for shell command validation.
     agent_alias: String,
 }
 
 impl ScheduleTool {
+    pub fn new_with_runtime(
+        security: Arc<SecurityPolicy>,
+        config: Config,
+        agent_alias: impl Into<String>,
+        runtime: Arc<dyn RuntimeAdapter>,
+    ) -> Self {
+        Self {
+            security,
+            config,
+            runtime,
+            agent_alias: agent_alias.into(),
+        }
+    }
+
+    #[cfg(test)]
     pub fn new(
         security: Arc<SecurityPolicy>,
         config: Config,
         agent_alias: impl Into<String>,
     ) -> Self {
-        Self {
-            security,
-            config,
-            agent_alias: agent_alias.into(),
-        }
+        let runtime = Arc::from(
+            crate::platform::create_runtime(&config.runtime)
+                .expect("test config must construct its runtime"),
+        );
+        Self::new_with_runtime(security, config, agent_alias, runtime)
     }
 }
 
@@ -389,8 +406,10 @@ impl ScheduleTool {
         // All job creation routes through validated cron helpers, which enforce
         // the full security policy (allowlist + risk gate) before persistence.
         if let Some(value) = expression {
-            let job = match cron::add_shell_job_with_approval(
+            let job = match cron::add_shell_job_with_runtime(
                 &self.config,
+                self.runtime.as_ref(),
+                &self.security,
                 &self.agent_alias,
                 None,
                 cron::Schedule::Cron {
@@ -425,8 +444,10 @@ impl ScheduleTool {
         }
 
         if let Some(value) = delay {
-            let job = match cron::add_once_validated(
+            let job = match cron::add_once_validated_with_runtime(
                 &self.config,
+                self.runtime.as_ref(),
+                &self.security,
                 &self.agent_alias,
                 value,
                 command,
@@ -480,8 +501,10 @@ impl ScheduleTool {
             })?
             .with_timezone(&Utc);
 
-        let job = match cron::add_once_at_validated(
+        let job = match cron::add_once_at_validated_with_runtime(
             &self.config,
+            self.runtime.as_ref(),
+            &self.security,
             &self.agent_alias,
             run_at_parsed,
             command,
@@ -916,6 +939,46 @@ mod tests {
                 .unwrap_or_default()
                 .contains("not allowed")
         );
+    }
+
+    #[tokio::test]
+    async fn create_uses_injected_runtime_dialect() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        let risk_profile = config.risk_profiles.entry(TEST_AGENT.into()).or_default();
+        risk_profile.level = AutonomyLevel::Full;
+        risk_profile.allowed_commands = vec!["*".into()];
+        seed_test_agent_provider_and_agent(&mut config);
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let security = Arc::new(SecurityPolicy::for_agent(&config, TEST_AGENT).unwrap());
+        let runtime: Arc<dyn RuntimeAdapter> =
+            Arc::new(crate::platform::NativeRuntime::with_shell("pwsh".into()));
+        let tool = ScheduleTool::new_with_runtime(security, config, TEST_AGENT, runtime);
+
+        let result = tool
+            .execute(json!({
+                "action": "create",
+                "expression": "*/5 * * * *",
+                "command": "ac blocked.txt value",
+                "approved": true
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("high-risk")),
+            "{:?}",
+            result.error
+        );
+        assert!(cron::list_jobs(&tool.config).unwrap().is_empty());
     }
 
     #[tokio::test]
