@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use zeroclaw_config::schema::Config;
 use zeroclaw_eval::baseline::{self, Baseline, CaseComparison, SuiteKind};
+use zeroclaw_eval::calibration::{JudgeRunRecord, append_judge_records, calibration_stem};
 use zeroclaw_eval::{CaseReport, LlmTrace, Mode, RunDeps, SuiteReport};
 use zeroclaw_runtime::agent::agent::build_session_model_provider;
 use zeroclaw_runtime::i18n::{get_required_cli_string, get_required_cli_string_with_args};
@@ -22,15 +23,25 @@ pub struct FinalizeOpts {
     pub suite_kind: Option<SuiteKind>,
 }
 
+/// One completed suite plus the calibratable judge results collected while it ran.
+pub struct EvalRun {
+    report: SuiteReport,
+    judge_records: Vec<JudgeRunRecord>,
+}
+
 /// Handle the post-run flow (dumps, baselines, comparison, printing) and return
 /// the process exit code. Kept together so `main` only wires flags.
 pub async fn finalize(
     config: &Config,
     mode: Mode,
     suite_path: &Path,
-    report: SuiteReport,
+    run: EvalRun,
     opts: FinalizeOpts,
 ) -> Result<i32> {
+    let EvalRun {
+        report,
+        judge_records,
+    } = run;
     let kind = SuiteKind::resolve(suite_path, opts.suite_kind);
     print_report(&report, opts.format);
 
@@ -47,6 +58,20 @@ pub async fn finalize(
                 &[("dir", AUTO_DUMP_DIR)],
             )
         );
+    }
+    if let Some(dir) = opts.dump_records.as_deref() {
+        let (count, path) = write_judge_dump(dir, &judge_records)?;
+        let count = count.to_string();
+        let path = path.display().to_string();
+        let message = get_required_cli_string_with_args(
+            "cli-eval-calibrate-records-appended",
+            &[("count", count.as_str()), ("path", path.as_str())],
+        );
+        if opts.format == OutputFormat::Json {
+            eprintln!("{message}");
+        } else {
+            println!("{message}");
+        }
     }
 
     // --write-baseline: persist the run and exit with its normal code.
@@ -227,21 +252,6 @@ fn build_run_deps(config: &Config, mode: Mode) -> Result<RunDeps> {
     Ok(deps)
 }
 
-/// Sanitize a judge ref into a calibration filename stem: `/`, `.`, and `:` all
-/// become `_` so the model-inclusive `judge_ref` is a safe single-segment name.
-fn calibration_stem(judge_ref: &str) -> String {
-    judge_ref
-        .chars()
-        .map(|c| {
-            if c == '/' || c == '.' || c == ':' {
-                '_'
-            } else {
-                c
-            }
-        })
-        .collect()
-}
-
 /// The provider- and model-level fallbacks configured for a judge alias.
 ///
 /// A calibration authorizes exactly one `<type>.<alias>:<model>` identity. When
@@ -313,15 +323,27 @@ fn build_judge_deps(config: &Config) -> Result<Option<zeroclaw_eval::grader::Jud
         model,
         judge_ref,
         gates: decision.gates(),
+        records_sink: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
     }))
 }
 
 /// Run a suite of eval cases and return the aggregated report. The failed-case
 /// auto-dump directory is cleared at run start.
-pub async fn run(config: &Config, suite: PathBuf, mode: Mode) -> Result<SuiteReport> {
+pub async fn run(config: &Config, suite: PathBuf, mode: Mode) -> Result<EvalRun> {
     let _ = std::fs::remove_dir_all(AUTO_DUMP_DIR);
     let deps = build_run_deps(config, mode)?;
-    Box::pin(zeroclaw_eval::run_suite(&suite, &deps)).await
+    let report = Box::pin(zeroclaw_eval::run_suite(&suite, &deps)).await?;
+    let judge_records = deps.judge.as_ref().map_or_else(Vec::new, |judge| {
+        let mut records = match judge.records_sink.lock() {
+            Ok(records) => records,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        std::mem::take(&mut *records)
+    });
+    Ok(EvalRun {
+        report,
+        judge_records,
+    })
 }
 
 /// Choose a collision-free path `dir/<stem>.json`, appending `_N` when a file
@@ -363,6 +385,14 @@ fn write_case_dump(dir: &Path, case: &CaseReport) -> Result<()> {
         serde_json::to_string_pretty(&dump)?,
     )?;
     Ok(())
+}
+
+/// Append this suite's calibratable judge results to the explicit dump directory.
+fn write_judge_dump(dir: &Path, records: &[JudgeRunRecord]) -> Result<(usize, PathBuf)> {
+    let path = dir.join("judge-runs.jsonl");
+    let count = append_judge_records(&path, records)
+        .map_err(|error| super::eval_calibrate::localized_jsonl_error(&path, &error))?;
+    Ok((count, path))
 }
 
 /// Write case dumps: `explicit_dir` (from `--dump-records`) receives every case;
@@ -450,6 +480,21 @@ mod tests {
         }
     }
 
+    fn judge_record(case_id: &str, score: f64) -> JudgeRunRecord {
+        JudgeRunRecord::new(zeroclaw_eval::calibration::JudgeRunRecordInput {
+            judge_ref: "judge.provider:model".to_string(),
+            case_id: case_id.to_string(),
+            case_hash: format!("hash-{case_id}"),
+            rubric_name: "helpfulness".to_string(),
+            rubric_text: "Be helpful".to_string(),
+            threshold: 0.7,
+            task_turns: vec!["Help me".to_string()],
+            final_response: "Done".to_string(),
+            score,
+            reason: format!("reason-{case_id}"),
+        })
+    }
+
     #[test]
     fn calibration_stem_keys_on_model_inclusive_judge_ref() {
         // The stem is derived from judge_ref (provider:model), not the bare
@@ -465,16 +510,111 @@ mod tests {
         );
     }
 
-    #[test]
-    fn dump_records_writes_all_cases() {
-        let report = SuiteReport {
-            cases: vec![case_report("pass", true), case_report("fail", false)],
-        };
+    #[tokio::test]
+    async fn finalize_accumulates_structured_judge_runs_across_two_runs() {
         let explicit = tempfile::tempdir().unwrap();
-        let auto = tempfile::tempdir().unwrap();
-        write_dumps(&report, Some(explicit.path()), auto.path()).unwrap();
-        assert!(explicit.path().join("pass.json").exists());
-        assert!(explicit.path().join("fail.json").exists());
+        let first = judge_record("first", 0.8);
+        let second = judge_record("second", 0.4);
+        for (case_id, judge_records) in [
+            ("first", vec![first.clone()]),
+            ("second", vec![second.clone()]),
+        ] {
+            let code = finalize(
+                &Config::default(),
+                Mode::Replay,
+                Path::new("evals/regression"),
+                EvalRun {
+                    report: SuiteReport {
+                        cases: vec![case_report(case_id, true)],
+                    },
+                    judge_records,
+                },
+                FinalizeOpts {
+                    format: OutputFormat::Json,
+                    dump_records: Some(explicit.path().to_path_buf()),
+                    baseline: None,
+                    write_baseline: None,
+                    suite_kind: Some(SuiteKind::Regression),
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(code, 0);
+        }
+
+        let judge_runs = explicit.path().join("judge-runs.jsonl");
+        let records = zeroclaw_eval::calibration::load_judge_records(&judge_runs).unwrap();
+        assert_eq!(records, vec![first, second]);
+    }
+
+    #[test]
+    fn production_gate_resolution_covers_every_calibration_state() {
+        fn calibration_json(schema: &str, judge_ref: &str, labeled_records: usize) -> String {
+            serde_json::json!({
+                "schema": schema,
+                "judge_ref": judge_ref,
+                "labeled_records": labeled_records,
+                "agreement": 0.9,
+                "labeler": "tester",
+                "date": "2026-07-21",
+            })
+            .to_string()
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("calibration.json");
+        let decide = |enabled| {
+            zeroclaw_eval::calibration::decide_gate(enabled, &path, "provider:model", &[], &[])
+        };
+        assert!(!decide(false).gates());
+        assert!(decide(true).refusal().is_some());
+
+        std::fs::write(&path, "not json").unwrap();
+        assert!(decide(true).refusal().is_some());
+
+        std::fs::write(
+            &path,
+            calibration_json(
+                "zeroclaw-eval/calibration/v0",
+                "provider:model",
+                zeroclaw_eval::calibration::MIN_CALIBRATION_RECORDS,
+            ),
+        )
+        .unwrap();
+        assert!(decide(true).refusal().is_some());
+
+        std::fs::write(
+            &path,
+            calibration_json(
+                zeroclaw_eval::calibration::CALIBRATION_SCHEMA,
+                "other:model",
+                zeroclaw_eval::calibration::MIN_CALIBRATION_RECORDS,
+            ),
+        )
+        .unwrap();
+        assert!(decide(true).refusal().is_some());
+
+        std::fs::write(
+            &path,
+            calibration_json(
+                zeroclaw_eval::calibration::CALIBRATION_SCHEMA,
+                "provider:model",
+                zeroclaw_eval::calibration::MIN_CALIBRATION_RECORDS - 1,
+            ),
+        )
+        .unwrap();
+        assert!(decide(true).refusal().is_some());
+
+        std::fs::write(
+            &path,
+            calibration_json(
+                zeroclaw_eval::calibration::CALIBRATION_SCHEMA,
+                "provider:model",
+                zeroclaw_eval::calibration::MIN_CALIBRATION_RECORDS,
+            ),
+        )
+        .unwrap();
+        assert!(decide(true).gates());
     }
 
     #[test]

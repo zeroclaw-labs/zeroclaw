@@ -2,12 +2,12 @@
 
 Agent evaluation harness for ZeroClaw.
 
-**Phase 0 — deterministic replay.** Runs the *real* agent loop against scripted
+**Phase 0: deterministic replay.** Runs the *real* agent loop against scripted
 LLM responses (an `LlmTrace` fixture) and grades the outcome against declarative
 expectations. Because the model output is fixed, a replay eval is free, fast, and
 fully deterministic: it proves the agent *machinery* (tool parsing, dispatch,
 multi-turn looping) behaves correctly given a known model output. It does **not**
-measure model quality — that is the live mode added in a later phase.
+measure model quality; that is the live mode added in a later phase.
 
 ## CLI
 
@@ -59,11 +59,13 @@ sandboxed tool registry for live evals is a later phase.
 
 ## Library shape
 
-- `case` — the `LlmTrace` fixture format + suite loading.
-- `replay::TraceLlmProvider` — a `ModelProvider` that replays trace steps in FIFO order.
-- `tools` — deterministic built-in tools the replay agent can dispatch.
-- `observer::RecordingObserver` — captures tool-call outcomes and token usage.
-- `grader` — non-panicking `GradeResult` checks (the `Grader` trait is the
+- `case`: the `LlmTrace` fixture format + suite loading.
+- `replay::TraceLlmProvider`: a `ModelProvider` that replays trace steps in FIFO order.
+- `tools`: deterministic built-in tools the replay agent can dispatch.
+- `observer::RecordingObserver`: captures tool-call outcomes and token usage.
+- `grader`: non-panicking `GradeResult` checks (the `Grader` trait is the
   extension point for side-effect/budget/LLM-judge graders in later phases).
-- `runner` — builds an isolated agent per case, drives it, grades it.
-- `report` — pass/fail aggregation, table + JSON rendering.
+- `calibration`: structured judge-run and human-label schemas, JSONL helpers,
+  agreement statistics, and strict calibration-file validation.
+- `runner`: builds an isolated agent per case, drives it, grades it.
+- `report`: pass/fail aggregation, table + JSON rendering.

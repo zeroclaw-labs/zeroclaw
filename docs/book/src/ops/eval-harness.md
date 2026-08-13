@@ -83,8 +83,7 @@ records each case's verdict and comparability key from a prior run:
 - `--baseline <file>` compares the current run against it, per case id.
 
 Comparison is keyed by the comparability tuple `(case_hash, mode, provider_ref,
-tool_surface, judge_ref)`: the judge identity joins the key, so swapping judges
-makes cases unverifiable rather than silently compared:
+tool_surface)`:
 
 - A changed key reports `changed - refresh baseline` (Unverifiable) and is never
   compared or gated.
@@ -119,46 +118,65 @@ verdict, malformed output, or a transport error is reported as
 `UNKNOWN (diagnostic)` and never fails a build.
 
 **Judge grades are diagnostic by default:** they are stripped from the pass/fail
-gate unless `[eval].judge_gate` is true AND a calibration artifact at
-`evals/calibration/<judge_ref>.json` **loads and validates**, where `judge_ref`
-is the model-inclusive `<type>.<alias>:<model>` with `/`, `.`, and `:` replaced
-by `_` (so calibration is model-specific, matching the comparability key).
+gate unless `[eval].judge_gate` is true and the model-specific calibration file
+at `evals/calibration/<judge_ref>.json` is accepted. Here, `judge_ref` is the
+model-inclusive `<type>.<alias>:<model>` with `/`, `.`, and `:` replaced by `_`,
+matching the comparability key. The consumer parses the file and requires the
+`zeroclaw-eval/calibration/v1` schema with no extra fields, an exact `judge_ref`
+match, at least 50 labeled records, and finite agreement in `0.0..=1.0` at or
+above `0.80`. The gate is also refused when the judge alias has provider or model
+fallbacks, because a calibration authorizes exactly one served identity. A
+missing or rejected file produces a concrete warning and keeps judge grades
+diagnostic; merely placing a file at the expected path no longer enables gating.
 
-Validation is strict; the gate is never armed by the mere presence of a path.
-The artifact must parse as a `zeroclaw-eval/calibration/v1` record with no extra
-fields, declare a `judge_ref` exactly equal to the served judge identity, cover
-at least 50 labeled records, and report a finite `agreement` in `0.0..=1.0` that
-is at least `0.80`. An empty file, a directory at the path, malformed JSON, an
-unrelated JSON document, a stale `judge_ref`, 49 labels, or an agreement below
-the floor all keep judge grades diagnostic.
+A judge reply must be exactly
+`{"score": <0.0-1.0>, "unknown": <bool>, "reason": "<text>"}`. Missing,
+mistyped, extra, non-finite, or out-of-range fields make the reply
+`UNKNOWN (diagnostic)`; scores are never clamped into the accepted range.
 
-The gate is also refused when the judge alias has provider (`fallback`) or model
-(`fallback_models`) failover configured: a calibration authorizes exactly one
-identity, and a successful fallback call can be served by a different
-provider/model than the one calibrated. Remove the fallbacks to gate on a judge.
-
-Every refusal prints a warning naming the specific reason, so a degraded gate is
-never silent.
-
-A judge reply must be the contracted object exactly:
-`{"score": <0.0-1.0>, "unknown": <bool>, "reason": "<text>"}`. A missing,
-mistyped, extra, non-finite, or out-of-range field makes the reply
-`UNKNOWN (diagnostic)`; out-of-range scores are **not** clamped, so
-`{"score":999}` never becomes a perfect `1.0`. Judge token usage is never added to the case's own token totals (the
-judge runs outside the agent), and the judge reference joins the baseline
-comparability key, so swapping judges makes cases unverifiable rather than
-silently compared.
+Judge token usage is never added to the case's own token totals (the judge runs
+outside the agent), and the judge reference joins the baseline comparability
+key, so swapping judges makes cases unverifiable rather than silently compared.
 
 Authoring rules: one dimension per rubric entry, and every judge case must also
-declare at least one deterministic check (response, tool, workspace, or budget)
-so it is not judge-only. Both rules are **enforced at suite load**: a judge-only
-case (which would pass vacuously whenever the judge is absent or diagnostic) and
-a `threshold` outside a finite `0.0..=1.0` both fail the load with the offending
-case named. Calibration protocol: dump at least 50 records with `--dump-records`,
-have a human label them, compute the judge's agreement with the human labels, and
-commit a calibration file `{"schema":"zeroclaw-eval/calibration/v1","judge_ref":
-"...","labeled_records":N,"agreement":0.0-1.0,"labeler":"...","date":"YYYY-MM-DD"}`
-with N at least 50 before enabling `judge_gate`.
+declare at least one deterministic check (response, workspace, tool, or budget)
+so it is not judge-only. Both rules are enforced when the suite loads.
+
+### Calibration workflow
+
+Build a calibration set with the CLI tooling:
+
+```bash
+# Run as many suites as needed to accumulate at least 50 judge runs.
+zeroclaw eval run --dump-records target/eval-calibration
+
+# Label every unique judge run. Use --judge-ref when a dump contains several.
+zeroclaw eval calibrate label \
+  --records target/eval-calibration \
+  --labeler "Reviewer name"
+
+# Summarize agreement and emit the validated calibration artifact.
+zeroclaw eval calibrate finalize \
+  --labels evals/calibration/labels/<judge_ref>.jsonl
+```
+
+`--dump-records` appends one entry per successful, parseable judge call to
+`judge-runs.jsonl`; repeated suite runs therefore accumulate toward the 50-label
+minimum. The label command deduplicates records by stable id and resumes an
+append-only labels file, so interrupted sessions are safe to restart.
+
+Labeling is blind: before each pass/fail answer, the terminal shows the task,
+rubric, and response but withholds the judge's score, verdict, and reason. This
+prevents the judge's own conclusion from anchoring the human assessment. The
+judge result is revealed only after the human answers. Press `t` to toggle the
+task transcript, `p` or `f` to label, `u` to leave the record pending, or `q` to
+quit.
+
+Finalization refuses fewer than 50 labels, prints agreement, per-rubric results,
+and Cohen's kappa, and writes only the compact calibration artifact. Agreement
+below 0.85 warns but still emits by default; pass `--min-agreement` to make a
+chosen floor mandatory. Commit the emitted `evals/calibration/<judge_ref>.json`
+file, then set `[eval].judge_gate = true`.
 
 ## Exit-code contract
 
@@ -188,6 +206,9 @@ Records can be dumped as JSON:
 
 - `--dump-records <dir>` writes `<dir>/<case_id>.json` (record plus grades) for
   every case.
+- When judge grading is configured, the same option appends calibratable judge
+  calls to `<dir>/judge-runs.jsonl`. Repeated runs accumulate; readers deduplicate
+  stable record ids.
 - On every run, any failed or errored case is auto-dumped to
   `target/eval-last-run/<case_id>.json` (cleared at the start of each run). When
   any exist, the table footer prints `failed-case records: target/eval-last-run/`.
