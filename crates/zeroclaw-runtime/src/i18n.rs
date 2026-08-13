@@ -599,6 +599,42 @@ mod tests {
     }
 
     #[test]
+    fn channel_approval_group_visibility_warning_is_translated_in_every_locale() {
+        // This warning is what tells an operator why a stranger's reply to a
+        // group approval token will bounce, so a catalogue that omits it ships
+        // the raw `{key}` sentinel into a chat. Assert every shipped catalogue
+        // carries it, and that the four localized ones are actually translated
+        // rather than copied from `en` — a copy would pass a mere
+        // "the key resolves" check while leaving the string un-localized.
+        const KEY: &str = "channel-approval-group-visibility-warning";
+
+        let english = format_ftl_message(include_str!("../locales/en/cli.ftl"), "en", KEY, &[])
+            .unwrap_or_else(|| panic!("{KEY} should format in en"));
+        assert!(
+            !english.trim().is_empty(),
+            "{KEY} must not be empty in en; got {english:?}"
+        );
+
+        for (source, locale) in [
+            (include_str!("../locales/es/cli.ftl"), "es"),
+            (include_str!("../locales/fr/cli.ftl"), "fr"),
+            (include_str!("../locales/ja/cli.ftl"), "ja"),
+            (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+        ] {
+            let value = format_ftl_message(source, locale, KEY, &[])
+                .unwrap_or_else(|| panic!("{KEY} should format in {locale}"));
+            assert!(
+                !value.trim().is_empty(),
+                "{KEY} must not be empty in {locale}; got {value:?}"
+            );
+            assert_ne!(
+                value, english,
+                "{KEY} in {locale} is the English string verbatim, so that catalogue was never translated"
+            );
+        }
+    }
+
+    #[test]
     fn daemon_startup_cli_strings_format_in_all_locales() {
         let url = "http://127.0.0.1:42617";
         let path = "/tmp/zeroclaw-test/daemon.sock";

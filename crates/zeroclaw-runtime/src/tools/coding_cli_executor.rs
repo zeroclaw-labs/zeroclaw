@@ -167,10 +167,6 @@ mod tests {
             "fake-runtime"
         }
 
-        fn has_shell_access(&self) -> bool {
-            true
-        }
-
         fn has_filesystem_access(&self) -> bool {
             true
         }
@@ -181,6 +177,10 @@ mod tests {
 
         fn supports_long_running(&self) -> bool {
             true
+        }
+
+        fn shell_dialect(&self) -> zeroclaw_api::runtime_traits::ShellDialect {
+            zeroclaw_api::runtime_traits::ShellDialect::Posix
         }
 
         fn build_shell_command(
@@ -308,10 +308,6 @@ mod tests {
             "env-forwarding-runtime"
         }
 
-        fn has_shell_access(&self) -> bool {
-            true
-        }
-
         fn has_filesystem_access(&self) -> bool {
             true
         }
@@ -322,6 +318,10 @@ mod tests {
 
         fn supports_long_running(&self) -> bool {
             true
+        }
+
+        fn shell_dialect(&self) -> zeroclaw_api::runtime_traits::ShellDialect {
+            zeroclaw_api::runtime_traits::ShellDialect::Posix
         }
 
         fn build_shell_command(

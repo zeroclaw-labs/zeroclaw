@@ -756,11 +756,11 @@ Examples:
 Add a one-shot task that fires at a specific RFC3339 timestamp with explicit Z or offset.
 
 The timestamp must include an explicit Z or numeric offset \
-(e.g. 2025-01-15T14:00:00Z or 2025-01-15T09:00:00-05:00).
+(e.g. 2099-01-15T14:00:00Z or 2099-01-15T09:00:00-05:00).
 
 Examples:
-  zeroclaw cron add-at --agent morning-shift 2025-01-15T14:00:00Z 'Send reminder'
-  zeroclaw cron add-at --agent morning-shift --prompt 2025-12-31T23:59:00Z 'Happy New Year!'")]
+  zeroclaw cron add-at --agent morning-shift --prompt 2099-01-15T14:00:00Z 'Send reminder'
+  zeroclaw cron add-at --agent morning-shift --prompt 2099-12-31T23:59:00Z 'Happy New Year!'")]
     AddAt {
         /// One-shot RFC3339 timestamp with explicit Z or offset
         at: String,
@@ -791,8 +791,8 @@ Add a task that repeats at a fixed interval.
 Interval is specified in milliseconds. For example, 60000 = 1 minute.
 
 Examples:
-  zeroclaw cron add-every --agent triage 60000 'Ping heartbeat'
-  zeroclaw cron add-every --agent triage 3600000 'Hourly report'")]
+  zeroclaw cron add-every --agent triage --prompt 60000 'Ping heartbeat'
+  zeroclaw cron add-every --agent triage --prompt 3600000 'Hourly report'")]
     AddEvery {
         /// Interval in milliseconds
         every_ms: u64,
@@ -824,7 +824,7 @@ Accepts human-readable durations: s (seconds), m (minutes), \
 h (hours), d (days).
 
 Examples:
-  zeroclaw cron once --agent ops-bot 30m 'Run backup in 30 minutes'
+  zeroclaw cron once --agent ops-bot --prompt 30m 'Run backup in 30 minutes'
   zeroclaw cron once --agent researcher --prompt 2h 'Follow up on deployment'")]
     Once {
         /// Delay duration

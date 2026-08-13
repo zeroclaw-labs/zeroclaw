@@ -1888,7 +1888,7 @@ pub async fn run(
                                     ResolvedIo {
                                         tools_registry: &tools_registry,
                                         observer: observer.as_ref(),
-                                        silent: false,
+                                        silent: !interactive,
                                         approval: approval_manager.as_ref(),
                                         multimodal_config: &config.multimodal,
                                         config: Some(&config),
@@ -15600,6 +15600,164 @@ Let me check the result."#;
             "direct agent turns must honor runtime_profiles.*.max_tool_iterations \
              instead of the skipped AliasedAgentConfig::resolved default"
         );
+    }
+
+    #[test]
+    fn single_shot_run_routes_narration_by_interactive_mode() {
+        fn run_helper(interactive: bool) -> std::process::Output {
+            let current_exe = std::env::current_exe().expect("current test binary path");
+            std::process::Command::new(current_exe)
+                .args([
+                    "single_shot_narration_boundary_helper_8760",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env(
+                    "ZEROCLAW_TEST_SINGLE_SHOT_INTERACTIVE",
+                    if interactive { "1" } else { "0" },
+                )
+                .output()
+                .expect("helper test process should run")
+        }
+
+        let non_interactive = run_helper(false);
+        let non_interactive_stderr = String::from_utf8_lossy(&non_interactive.stderr);
+        assert!(
+            non_interactive.status.success(),
+            "non-interactive helper failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+            non_interactive.status.code(),
+            String::from_utf8_lossy(&non_interactive.stdout),
+            non_interactive_stderr
+        );
+        assert!(
+            !non_interactive_stderr.contains("single-shot narration sentinel"),
+            "non-interactive narration leaked to stderr:\n{non_interactive_stderr}"
+        );
+
+        let interactive = run_helper(true);
+        let interactive_stderr = String::from_utf8_lossy(&interactive.stderr);
+        assert!(
+            interactive.status.success(),
+            "interactive helper failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+            interactive.status.code(),
+            String::from_utf8_lossy(&interactive.stdout),
+            interactive_stderr
+        );
+        assert!(
+            interactive_stderr.contains("single-shot narration sentinel"),
+            "interactive narration was not routed to stderr:\n{interactive_stderr}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "subprocess helper for single-shot stderr boundary regression"]
+    async fn single_shot_narration_boundary_helper_8760() {
+        use axum::{Json, Router, routing::post};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use tempfile::TempDir;
+        use tokio::net::TcpListener;
+        use zeroclaw_config::schema::{AliasedAgentConfig, RiskProfileConfig};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(_body): Json<serde_json::Value>| {
+                let call = calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    Json(if call == 0 {
+                        serde_json::json!({
+                            "choices": [{
+                                "message": {
+                                    "content": "single-shot narration sentinel",
+                                    "tool_calls": [{
+                                        "id": "call-1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "missing_test_tool",
+                                            "arguments": "{}"
+                                        }
+                                    }]
+                                }
+                            }]
+                        })
+                    } else {
+                        serde_json::json!({
+                            "choices": [{"message": {"content": "final answer"}}]
+                        })
+                    })
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test provider");
+        let mock_addr = listener.local_addr().expect("test provider address");
+        let server_handle = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test provider serves");
+        });
+
+        let tmp = TempDir::new().expect("temp dir");
+        let workspace_dir = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).expect("workspace directory");
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: workspace_dir,
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        let provider = config
+            .providers
+            .models
+            .ensure("custom", "default")
+            .expect("custom provider slot");
+        provider.api_key = Some("test-key".to_string());
+        provider.model = Some("test-model".to_string());
+        provider.uri = Some(format!("http://{mock_addr}"));
+        config.memory.backend = "none".to_string();
+        config.memory.auto_save = false;
+        config.risk_profiles.insert(
+            "test-profile".to_string(),
+            RiskProfileConfig {
+                level: crate::security::AutonomyLevel::Full,
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "test-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "custom.default".into(),
+                risk_profile: "test-profile".into(),
+                ..Default::default()
+            },
+        );
+
+        let interactive = std::env::var("ZEROCLAW_TEST_SINGLE_SHOT_INTERACTIVE")
+            .expect("interactive mode env")
+            == "1";
+        let response = super::run(
+            config,
+            "test-agent",
+            Some("run a tool".to_string()),
+            None,
+            None,
+            None,
+            Vec::new(),
+            interactive,
+            Some(tmp.path().join("session.json")),
+            None,
+            TurnOrigin::SubTurn,
+            super::AgentRunOverrides::default(),
+        )
+        .await
+        .expect("single-shot run should finish");
+        assert_eq!(response, "final answer");
+
+        server_handle.abort();
     }
 
     #[tokio::test]
