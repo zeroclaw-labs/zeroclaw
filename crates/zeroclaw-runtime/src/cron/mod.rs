@@ -176,11 +176,12 @@ pub fn add_once_validated(
     agent_alias: &str,
     delay: &str,
     command: &str,
+    delivery: Option<DeliveryConfig>,
     approved: bool,
 ) -> Result<CronJob> {
     let duration = parse_delay(delay)?;
     let at = chrono::Utc::now() + duration;
-    add_once_at_validated(config, agent_alias, at, command, approved)
+    add_once_at_validated(config, agent_alias, at, command, delivery, approved)
 }
 
 /// Create a one-shot validated shell job at an absolute timestamp.
@@ -189,10 +190,19 @@ pub fn add_once_at_validated(
     agent_alias: &str,
     at: chrono::DateTime<chrono::Utc>,
     command: &str,
+    delivery: Option<DeliveryConfig>,
     approved: bool,
 ) -> Result<CronJob> {
     let schedule = Schedule::At { at };
-    add_shell_job_with_approval(config, agent_alias, None, schedule, command, None, approved)
+    add_shell_job_with_approval(
+        config,
+        agent_alias,
+        None,
+        schedule,
+        command,
+        delivery,
+        approved,
+    )
 }
 
 // Convenience wrappers for CLI paths (default approved=false).
@@ -230,8 +240,14 @@ pub fn add_job(
 }
 
 #[allow(clippy::needless_pass_by_value)]
-pub fn add_once(config: &Config, agent_alias: &str, delay: &str, command: &str) -> Result<CronJob> {
-    add_once_validated(config, agent_alias, delay, command, false)
+pub fn add_once(
+    config: &Config,
+    agent_alias: &str,
+    delay: &str,
+    command: &str,
+    delivery: Option<DeliveryConfig>,
+) -> Result<CronJob> {
+    add_once_validated(config, agent_alias, delay, command, delivery, false)
 }
 
 pub fn add_once_at(
@@ -239,8 +255,9 @@ pub fn add_once_at(
     agent_alias: &str,
     at: chrono::DateTime<chrono::Utc>,
     command: &str,
+    delivery: Option<DeliveryConfig>,
 ) -> Result<CronJob> {
-    add_once_at_validated(config, agent_alias, at, command, false)
+    add_once_at_validated(config, agent_alias, at, command, delivery, false)
 }
 
 pub fn pause_job(config: &Config, id: &str) -> Result<CronJob> {

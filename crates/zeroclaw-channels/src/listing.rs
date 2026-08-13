@@ -69,11 +69,6 @@ const CHANNEL_COMPILE_SPECS: &[ChannelCompileSpec] = &[
         compiled: cfg!(feature = "channel-linq"),
     },
     ChannelCompileSpec {
-        schema_name: Some("WATI"),
-        type_keys: &["wati"],
-        compiled: cfg!(feature = "channel-wati"),
-    },
-    ChannelCompileSpec {
         schema_name: Some("NextCloud Talk"),
         type_keys: &["nextcloud", "nextcloud-talk", "nextcloud_talk"],
         compiled: cfg!(feature = "channel-nextcloud"),

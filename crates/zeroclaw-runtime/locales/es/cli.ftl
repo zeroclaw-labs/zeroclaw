@@ -200,9 +200,9 @@ cli-cron-long-about =
     zeroclaw cron add '0 9 * * 1-5' 'Good morning' --agent sentinel --prompt --tz America/New_York
     zeroclaw cron add '*/30 * * * *' 'Check system health' --agent sentinel --prompt
     zeroclaw cron add '*/5 * * * *' 'echo ok' --agent sentinel
-    zeroclaw cron add-at 2025-01-15T14:00:00Z 'Send reminder' --agent
-    zeroclaw cron add-every 60000 'Ping heartbeat'
-    zeroclaw cron once 30m 'Run backup in 30 minutes' --agent
+    zeroclaw cron add-at 2099-01-15T14:00:00Z 'Send reminder' --agent sentinel --prompt
+    zeroclaw cron add-every 60000 'Ping heartbeat' --agent sentinel --prompt
+    zeroclaw cron once 30m 'Run backup in 30 minutes' --agent sentinel --prompt
     zeroclaw cron pause TASK_ID
     zeroclaw cron update TASK_ID --expression '0 8 * * *' --tz Europe/London
 cli-channel-long-about =
@@ -479,7 +479,7 @@ cli-cron-added-oneshot = ✅ Tarea cron de una sola vez agregada {$id}
 cli-cron-added-interval-agent = ✅ Tarea cron de agente por intervalo agregada {$id}
 cli-cron-added-interval = ✅ Tarea cron de intervalo agregada {$id}
 cli-cron-updated = ✅ Tarea cron actualizada {$id}
-cli-cron-update-no-field = Se debe proporcionar al menos uno de --expression, --tz, --command, --name, --allowed-tool, o --uses-memory
+cli-cron-update-no-field = Se debe proporcionar al menos uno de --expression, --tz, --command, --name, --allowed-tool, --uses-memory, o una opción de entrega (--channel, --to, --thread, --best-effort, --no-best-effort)
 cli-cron-removed = ✅ Tarea cron eliminada {$id}
 cli-cron-paused = ⏸️  Tarea cron pausada {$id}
 cli-cron-resumed = ▶️  Tarea cron reanudada {$id}
@@ -495,6 +495,8 @@ cli-cron-cmd3 = {"  "}Cmd      : {$v}
 cli-cron-at = {"  "}En    : {$v}
 cli-cron-at2 = {"  "}En  : {$v}
 cli-cron-every = {"  "}Cada(ms): {$v}
+cli-cron-delivery = {"  "}Entrega: {$v}
+cli-cron-delivery-disabled = desactivada (la salida no se envía a ninguna parte)
 cli-no-command = No se proporcionó ningún comando.
 cli-press-enter = Presiona Enter para salir...
 cli-quickstart-title = Quickstart — crea un agente funcional de principio a fin.

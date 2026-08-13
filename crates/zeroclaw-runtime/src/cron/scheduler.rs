@@ -2210,7 +2210,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
         let at = Utc::now() + ChronoDuration::minutes(10);
-        let job = cron::add_once_at(&config, "test-agent", at, "echo one-shot-shell").unwrap();
+        let job =
+            cron::add_once_at(&config, "test-agent", at, "echo one-shot-shell", None).unwrap();
         assert!(job.delete_after_run);
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
@@ -2242,7 +2243,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
         let at = Utc::now() + ChronoDuration::minutes(10);
-        let job = cron::add_once_at(&config, "test-agent", at, "echo one-shot-shell").unwrap();
+        let job =
+            cron::add_once_at(&config, "test-agent", at, "echo one-shot-shell", None).unwrap();
         assert!(job.delete_after_run);
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
@@ -2258,7 +2260,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
         let at = Utc::now() + ChronoDuration::minutes(10);
-        let job = cron::add_once_at(&config, "test-agent", at, "echo one-shot-shell").unwrap();
+        let job =
+            cron::add_once_at(&config, "test-agent", at, "echo one-shot-shell", None).unwrap();
         assert!(job.delete_after_run);
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
