@@ -1,0 +1,104 @@
+name: AUR Freshness Check
+
+# Verifies that the AUR package actually reflects the current stable release.
+#
+# The publish job is fire-and-forget: if it fails, nothing re-checks, so the
+# AUR silently falls behind. That happened with v0.8.4: an aur.archlinux.org
+# maintenance window overlapped the release, the single unretried clone failed,
+# and the package sat three weeks behind with no signal. pub-aur.yml now retries
+# to survive a short outage, but a retry budget cannot cover every failure, so
+# this check is the backstop that turns a silent miss into a visible one.
+
+on:
+  schedule:
+    - cron: "41 7 * * 1"
+  workflow_dispatch:
+  workflow_call:
+
+concurrency:
+  group: aur-freshness-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Compare AUR Version To Release
+    runs-on: ubuntu-latest
+    env:
+      AUR_PACKAGE: zeroclawlabs
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Compare published AUR version against the current release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq '.tagName')"
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::latest release is not a stable vX.Y.Z tag: ${tag}"
+            exit 1
+          fi
+          release_version="${tag#v}"
+          git fetch --force --no-tags --depth=1 origin "refs/tags/${tag}:refs/tags/${tag}"
+
+          # An unreachable AUR is an upstream availability problem, not package
+          # staleness. Warn and pass rather than paging the team about someone
+          # else's maintenance window; the next scheduled run re-checks.
+          if ! rpc="$(curl -fsS --retry 3 --retry-delay 5 \
+            "https://aur.archlinux.org/rpc/v5/info?arg%5B%5D=${AUR_PACKAGE}")"; then
+            echo "::warning::Could not reach the AUR RPC; skipping the freshness comparison."
+            exit 0
+          fi
+
+          if [[ "$(jq -r '.resultcount' <<<"$rpc")" != "1" ]]; then
+            echo "::error::AUR RPC did not return exactly one result for ${AUR_PACKAGE}."
+            exit 1
+          fi
+
+          aur_full="$(jq -er '.results[0].Version' <<<"$rpc")"
+          # AUR versions are epoch:pkgver-pkgrel; only pkgver tracks the release.
+          aur_epoch_pkgver="${aur_full%%-*}"
+          aur_version="${aur_epoch_pkgver#*:}"
+          aur_epoch=0
+          if [[ "$aur_epoch_pkgver" == *:* ]]; then
+            aur_epoch="${aur_epoch_pkgver%%:*}"
+          fi
+          source_epoch="$(git show "${tag}:dist/aur/.SRCINFO" | awk -F '[[:space:]]*=[[:space:]]*' '$1 ~ /^[[:space:]]*epoch[[:space:]]*$/ { print $2 }')"
+          source_epoch="${source_epoch:-0}"
+          if [[ ! "$aur_epoch" =~ ^[0-9]+$ || ! "$source_epoch" =~ ^[0-9]+$ ]]; then
+            echo "::error::AUR or checked-in source metadata has an invalid or duplicate epoch."
+            exit 1
+          fi
+
+          if [[ "$aur_epoch" != "$source_epoch" || "$aur_version" != "$release_version" ]]; then
+            if [[ "$aur_epoch" != "$source_epoch" ]]; then
+              echo "::error::AUR epoch ${aur_epoch} does not match release ${tag} source epoch ${source_epoch}."
+            else
+              echo "::error::AUR ${AUR_PACKAGE} is at ${aur_full} but the current release is ${tag}."
+            fi
+            if (( 10#$aur_epoch > 10#$source_epoch )); then
+              echo "::error::AUR epoch ${aur_epoch} exceeds immutable release ${tag} source epoch ${source_epoch}. Preserve the published epoch in source and cut a new release tag; this check remains red until that tag is published. Do not use allow_downgrade across epochs."
+            elif (( 10#$aur_epoch < 10#$source_epoch )); then
+              echo "::error::Source epoch ${source_epoch} exceeds AUR epoch ${aur_epoch}; re-dispatch Pub AUR Package at ${tag} (dry_run: true first) so a normal publish advances the AUR package."
+            elif [[ "$aur_version" =~ ^[0-9]+(\.[0-9]+)*$ ]] && \
+              [[ "$(printf '%s\n' "$release_version" "$aur_version" | sort -V | tail -n 1)" == "$aur_version" ]]; then
+              echo "::error::AUR is newer than the release. For an intentional same-epoch rollback, dry-run Pub AUR Package at ${tag}, then manually dispatch it with allow_downgrade: true."
+            else
+              echo "::error::Re-dispatch Pub AUR Package at ${tag} (dry_run: true first) to resync."
+            fi
+            {
+              echo "### AUR is stale"
+              echo "- package: \`${AUR_PACKAGE}\`"
+              echo "- published: \`${aur_full}\`"
+              echo "- expected epoch/version: \`${source_epoch}:${release_version}\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          echo "AUR ${AUR_PACKAGE} is current at ${aur_full} (release ${tag})."
+          echo "AUR \`${AUR_PACKAGE}\` is current at \`${aur_full}\`." >> "$GITHUB_STEP_SUMMARY"

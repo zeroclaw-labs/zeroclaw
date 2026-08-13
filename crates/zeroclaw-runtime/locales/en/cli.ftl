@@ -236,9 +236,9 @@ cli-cron-long-about =
       zeroclaw cron add '0 9 * * 1-5' 'Good morning' --agent sentinel --prompt --tz America/New_York
       zeroclaw cron add '*/30 * * * *' 'Check system health' --agent sentinel --prompt
       zeroclaw cron add '*/5 * * * *' 'echo ok' --agent sentinel
-      zeroclaw cron add-at 2025-01-15T14:00:00Z 'Send reminder' --agent
-      zeroclaw cron add-every 60000 'Ping heartbeat'
-      zeroclaw cron once 30m 'Run backup in 30 minutes' --agent
+      zeroclaw cron add-at 2099-01-15T14:00:00Z 'Send reminder' --agent sentinel --prompt
+      zeroclaw cron add-every 60000 'Ping heartbeat' --agent sentinel --prompt
+      zeroclaw cron once 30m 'Run backup in 30 minutes' --agent sentinel --prompt
       zeroclaw cron pause TASK_ID
       zeroclaw cron update TASK_ID --expression '0 8 * * *' --tz Europe/London
 
@@ -371,7 +371,7 @@ cli-desktop-long-about =
 
 # Channel-side reply emitted when chat dispatch refuses because the
 # gateway has no model configured. Used by the gateway crate channel
-# webhook handlers (WhatsApp, Linq, WATI, Nextcloud Talk).
+# webhook handlers (WhatsApp, Linq, Nextcloud Talk).
 channel-needs-quickstart-reply = This agent isn't fully set up yet. The operator needs to run Quickstart before I can reply.
 
 channel-whatsapp-web-feature-missing-warning =   ⚠ WhatsApp Web is configured but the 'whatsapp-web' feature is not compiled in.
@@ -559,7 +559,7 @@ cli-cron-added-oneshot = ✅ Added one-shot cron job {$id}
 cli-cron-added-interval-agent = ✅ Added interval agent cron job {$id}
 cli-cron-added-interval = ✅ Added interval cron job {$id}
 cli-cron-updated = ✅ Updated cron job {$id}
-cli-cron-update-no-field = At least one of --expression, --tz, --command, --name, --allowed-tool, or --uses-memory must be provided
+cli-cron-update-no-field = At least one of --expression, --tz, --command, --name, --allowed-tool, --uses-memory, or a delivery flag (--channel, --to, --thread, --best-effort, --no-best-effort) must be provided
 cli-cron-removed = ✅ Removed cron job {$id}
 cli-cron-paused = ⏸️  Paused cron job {$id}
 cli-cron-resumed = ▶️  Resumed cron job {$id}
@@ -575,6 +575,8 @@ cli-cron-cmd3 = {"  "}Cmd      : {$v}
 cli-cron-at = {"  "}At    : {$v}
 cli-cron-at2 = {"  "}At  : {$v}
 cli-cron-every = {"  "}Every(ms): {$v}
+cli-cron-delivery = {"  "}Delivery: {$v}
+cli-cron-delivery-disabled = disabled (output is not sent anywhere)
 
 # ── main / status / quickstart / pairing / desktop ──
 cli-no-command = No command provided.
@@ -806,6 +808,7 @@ cli-plugin-config-entry-seeded = Seeded [[plugins.entries]] for '{$name}'. Set p
 cli-plugin-config-entry-seed-skipped = warning: skipped seeding the config entry for '{$name}': the [plugins] section on disk is malformed. Repair it, add a [[plugins.entries]] block with `name = "{$name}"`, then set values with `zeroclaw config set plugins.entries.{$name}.config.<key>`.
 cli-plugin-config-entry-seed-unaddressable = warning: skipped seeding the config entry for '{$name}': plugin names containing '.' cannot be addressed by dotted config paths (`config set` splits on '.'). Add a [[plugins.entries]] block with `name = "{$name}"` to the config file by hand.
 cli-config-section-degraded = warning: config section `{$section}` in {$path} is malformed and was reset to defaults for this run. Values in that section are NOT in effect. Run `zeroclaw config migrate` to see the parse error, then repair the file.
+cli-config-section-retired-wati = warning: retired WATI channel config section `{$section}` is ignored because WATI support was removed. Migrate to `[channels.whatsapp.<alias>]` using the Cloud API or WhatsApp Web, then revoke the unused WATI API token.
 cli-plugin-removed = Plugin '{$name}' removed.
 cli-plugin-not-found = Plugin '{$name}' not found.
 cli-plugin-legacy-detected = Note: plugins in a legacy location ({$path}) are not loaded by the agent — run `zeroclaw plugin migrate` to move them into {$target}.
@@ -1091,10 +1094,13 @@ cli-doctor-ctxwin-none = No updates needed.
 cli-doctor-ctxwin-write-failed = {$provider_ref}: failed to write context_window: {$error}
 cli-doctor-cache-write-failed = Failed to persist model cache: {$error}
 
+# Doctor probe timeout warning — shown when model probing times out but prior
+# diagnostics (config, workspace, daemon) are preserved and returned.
+cli-doctor-probe-timeout-message = Model probing timed out. Some provider catalogs may be unreachable. You can retry Doctor to refresh.
+
 # ── Degraded config sections (doctor diagnose, #8835) ──
 cli-doctor-degraded-security = SECURITY-CRITICAL config section `{$path}` is invalid and was reset to its default so the daemon can boot; the running posture may be WEAKER than intended. Run `zeroclaw config migrate` to see the parse error, then repair the file.
 cli-doctor-degraded-section = config section `{$path}` is malformed and was reset to defaults; values in that section are NOT in effect. Run `zeroclaw config migrate` to see the parse error, then repair the file.
-cli-doctor-skills-prompt-injection-mode-full-deprecated = Skill prompt injection mode "full" is deprecated. Explicit full mode remains supported during the deprecation window, but compact is now the default; migrate before Schema V4 removes full mode.
 sop-approval-deferred-at-capacity = Approval could not resume run {$run_id}: execution slots are full. The gate remains waiting; retry after a slot frees.
 sop-approval-policy-unavailable = Approval failed because the parked SOP step is unavailable: {$reason}. The run remains waiting.
 sop-rpc-decision-invalid-state = Run {$run_id} cannot be resolved in its current state.

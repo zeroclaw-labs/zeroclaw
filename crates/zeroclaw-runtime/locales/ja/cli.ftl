@@ -200,9 +200,9 @@ cli-cron-long-about =
     zeroclaw cron add '0 9 * * 1-5' 'Good morning' --agent sentinel --prompt --tz America/New_York
     zeroclaw cron add '*/30 * * * *' 'Check system health' --agent sentinel --prompt
     zeroclaw cron add '*/5 * * * *' 'echo ok' --agent sentinel
-    zeroclaw cron add-at 2025-01-15T14:00:00Z 'Send reminder' --agent
-    zeroclaw cron add-every 60000 'Ping heartbeat'
-    zeroclaw cron once 30m 'Run backup in 30 minutes' --agent
+    zeroclaw cron add-at 2099-01-15T14:00:00Z 'Send reminder' --agent sentinel --prompt
+    zeroclaw cron add-every 60000 'Ping heartbeat' --agent sentinel --prompt
+    zeroclaw cron once 30m 'Run backup in 30 minutes' --agent sentinel --prompt
     zeroclaw cron pause TASK_ID
     zeroclaw cron update TASK_ID --expression '0 8 * * *' --tz Europe/London
 cli-channel-long-about =
@@ -479,7 +479,7 @@ cli-cron-added-oneshot = ✅ ワンショットcronジョブ {$id} を追加し�
 cli-cron-added-interval-agent = ✅ インターバルエージェントcronジョブ {$id} を追加しました
 cli-cron-added-interval = ✅ インターバルcronジョブ {$id} を追加しました
 cli-cron-updated = ✅ cronジョブ {$id} を更新しました
-cli-cron-update-no-field = --expression、--tz、--command、--name、--allowed-tool、--uses-memory のうち少なくとも1つを指定する必要があります
+cli-cron-update-no-field = --expression、--tz、--command、--name、--allowed-tool、--uses-memory、または配信オプション（--channel、--to、--thread、--best-effort、--no-best-effort）のうち少なくとも1つを指定する必要があります
 cli-cron-removed = ✅ cronジョブ {$id} を削除しました
 cli-cron-paused = ⏸️  cronジョブ {$id} を一時停止しました
 cli-cron-resumed = ▶️  cronジョブ {$id} を再開しました
@@ -495,6 +495,8 @@ cli-cron-cmd3 = {"  "}Cmd      : {$v}
 cli-cron-at = {"  "}At    : {$v}
 cli-cron-at2 = {"  "}At  : {$v}
 cli-cron-every = {"  "}Every(ms): {$v}
+cli-cron-delivery = {"  "}配信: {$v}
+cli-cron-delivery-disabled = 無効（出力はどこにも送信されません）
 cli-no-command = コマンドが指定されていません。
 cli-press-enter = 終了するにはEnterキーを押してください...
 cli-quickstart-title = クイックスタート — 1つの動作するエージェントをエンドツーエンドで作成します。
@@ -950,10 +952,13 @@ cli-doctor-context-window-ok = {$provider_ref}: コンテキストウィンド�
 cli-doctor-context-window-zero = {$provider_ref}: context_window が 0 です（無効。モデルの実際のコンテキスト上限を設定してください）
 cli-doctor-context-window-unset = {$provider_ref}: context_window が未設定です — 選択時には {$fallback} トークンのフォールバックを使用します。モデルの実際の上限を大きく下回る可能性があるため、このプロファイルに context_window を設定してください
 
+# Doctor probe timeout warning — shown when model probing times out but prior
+# diagnostics (config, workspace, daemon) are preserved and returned.
+cli-doctor-probe-timeout-message = モデル調査がタイムアウトしました。一部のプロバイダーカタログに到達できない可能性があります。Doctor を再実行して更新できます。
+
 # ── Degraded config sections (doctor diagnose, #8835) ──
 cli-doctor-degraded-security = セキュリティ上重要な設定セクション `{$path}` が無効なため、デーモンを起動できるようデフォルト値にリセットされました。実行中のセキュリティ設定は意図したものより弱くなっている可能性があります。`zeroclaw config migrate` を実行してパースエラーを確認し、ファイルを修復してください。
 cli-doctor-degraded-section = 設定セクション `{$path}` は不正な形式のためデフォルト値にリセットされました。このセクションの値は反映されていません。`zeroclaw config migrate` を実行してパースエラーを確認し、ファイルを修復してください。
-cli-doctor-skills-prompt-injection-mode-full-deprecated = スキルプロンプト注入モード "full" は非推奨です。明示的な full モードは移行期間中もサポートされますが、現在のデフォルトは compact です。Schema V4 で full モードが削除される前に移行してください。
 sop-approval-deferred-at-capacity = 実行スロットが満杯のため、実行 {$run_id} を再開できませんでした。承認は待機状態のままです。スロットが空いてから再試行してください。
 sop-approval-policy-unavailable = 待機中の SOP ステップを利用できないため、承認に失敗しました: {$reason}。実行は待機状態のままです。
 sop-rpc-decision-invalid-state = 実行 {$run_id} は現在の状態では解決できません。

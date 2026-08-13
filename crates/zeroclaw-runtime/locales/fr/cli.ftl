@@ -200,9 +200,9 @@ cli-cron-long-about =
     zeroclaw cron add '0 9 * * 1-5' 'Bonjour' --agent sentinel --prompt --tz America/New_York
     zeroclaw cron add '*/30 * * * *' 'Vérifier la santé du système' --agent sentinel --prompt
     zeroclaw cron add '*/5 * * * *' 'echo ok' --agent sentinel
-    zeroclaw cron add-at 2025-01-15T14:00:00Z 'Envoyer un rappel' --agent
-    zeroclaw cron add-every 60000 'Ping de santé'
-    zeroclaw cron once 30m 'Lancer une sauvegarde dans 30 minutes' --agent
+    zeroclaw cron add-at 2099-01-15T14:00:00Z 'Envoyer un rappel' --agent sentinel --prompt
+    zeroclaw cron add-every 60000 'Ping de santé' --agent sentinel --prompt
+    zeroclaw cron once 30m 'Lancer une sauvegarde dans 30 minutes' --agent sentinel --prompt
     zeroclaw cron pause IDENTIFIANT_TACHE
     zeroclaw cron update IDENTIFIANT_TACHE --expression '0 8 * * *' --tz Europe/London
 cli-channel-long-about =
@@ -482,7 +482,7 @@ cli-cron-added-oneshot = ✅ Tâche cron à exécution unique {$id} ajoutée
 cli-cron-added-interval-agent = ✅ Tâche cron d'agent par intervalle {$id} ajoutée
 cli-cron-added-interval = ✅ Tâche cron par intervalle {$id} ajoutée
 cli-cron-updated = ✅ Tâche cron {$id} mise à jour
-cli-cron-update-no-field = Au moins un des paramètres --expression, --tz, --command, --name, --allowed-tool ou --uses-memory doit être fourni
+cli-cron-update-no-field = Au moins un des paramètres --expression, --tz, --command, --name, --allowed-tool, --uses-memory ou une option de livraison (--channel, --to, --thread, --best-effort, --no-best-effort) doit être fourni
 cli-cron-removed = ✅ Tâche cron {$id} supprimée
 cli-cron-paused = ⏸️  Tâche cron {$id} en pause
 cli-cron-resumed = ▶️  Tâche cron {$id} reprise
@@ -498,6 +498,8 @@ cli-cron-cmd3 = {"  "}Cmd      : {$v}
 cli-cron-at = {"  "}À     : {$v}
 cli-cron-at2 = {"  "}À   : {$v}
 cli-cron-every = {"  "}Toutes(ms): {$v}
+cli-cron-delivery = {"  "}Livraison : {$v}
+cli-cron-delivery-disabled = désactivée (la sortie n'est envoyée nulle part)
 cli-no-command = Aucune commande fournie.
 cli-press-enter = Appuyez sur Entrée pour quitter...
 cli-quickstart-title = Quickstart — créez un agent fonctionnel de bout en bout.
@@ -953,10 +955,13 @@ cli-doctor-context-window-ok = {$provider_ref} : fenêtre de contexte : {$contex
 cli-doctor-context-window-zero = {$provider_ref} : context_window vaut 0 (invalide ; définissez la limite de contexte réelle du modèle)
 cli-doctor-context-window-unset = {$provider_ref} : aucun context_window défini — utilisera la valeur de repli de {$fallback} jetons lorsqu'il sera sélectionné ; probablement bien inférieure à la limite réelle de ce modèle ; définissez context_window sur ce profil
 
+# Doctor probe timeout warning — shown when model probing times out but prior
+# diagnostics (config, workspace, daemon) are preserved and returned.
+cli-doctor-probe-timeout-message = La vérification des modèles a expiré. Certains catalogues de fournisseurs peuvent être inaccessibles. Vous pouvez réexécuter Doctor pour actualiser.
+
 # ── Degraded config sections (doctor diagnose, #8835) ──
 cli-doctor-degraded-security = La section de configuration CRITIQUE POUR LA SÉCURITÉ `{$path}` est invalide et a été réinitialisée à sa valeur par défaut pour permettre au daemon de démarrer ; la posture en cours d'exécution peut être PLUS FAIBLE que prévu. Exécutez `zeroclaw config migrate` pour voir l'erreur d'analyse, puis réparez le fichier.
 cli-doctor-degraded-section = La section de configuration `{$path}` est malformée et a été réinitialisée aux valeurs par défaut ; les valeurs de cette section ne sont PAS en vigueur. Exécutez `zeroclaw config migrate` pour voir l'erreur d'analyse, puis réparez le fichier.
-cli-doctor-skills-prompt-injection-mode-full-deprecated = Le mode d'injection des instructions de compétences "full" est obsolète. Le mode full explicite reste pris en charge pendant la période de dépréciation, mais compact est désormais la valeur par défaut ; effectuez la migration avant que Schema V4 ne supprime le mode full.
 sop-approval-deferred-at-capacity = Impossible de reprendre l’exécution {$run_id} : tous les créneaux d’exécution sont occupés. L’approbation reste en attente ; réessayez lorsqu’un créneau se libère.
 sop-approval-policy-unavailable = L’approbation a échoué car l’étape SOP en attente est indisponible : {$reason}. L’exécution reste en attente.
 sop-rpc-decision-invalid-state = L’exécution {$run_id} ne peut pas être résolue dans son état actuel.

@@ -8,6 +8,7 @@ use super::types::*;
 const RPC_RELOAD_REPLY_FLUSH_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
 const RPC_RELOAD_GATEWAY_SHUTDOWN_DELAY: std::time::Duration =
     std::time::Duration::from_millis(200);
+const PROBE_MODEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 use crate::agent::agent::TurnEvent;
 use crate::sop::SopGraphExt;
 use serde::Serialize;
@@ -19,9 +20,9 @@ use zeroclaw_config::schema::Config;
 
 use zeroclaw_api::jsonrpc::error_codes::*;
 use zeroclaw_api::jsonrpc::{
-    JSONRPC_VERSION, JsonRpcError, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
-    RpcOutbound, SopDecideRequest, SopRunOverlayRequest, SopRunRequest, SopRunResponse,
-    SopRunsRequest, SopSaveRequest, SopSelectRequest,
+    JSONRPC_VERSION, JsonRpcError, JsonRpcFrame, JsonRpcFrameErrorKind, JsonRpcNotification,
+    JsonRpcResponse, RpcOutbound, SopDecideRequest, SopRunOverlayRequest, SopRunRequest,
+    SopRunResponse, SopRunsRequest, SopSaveRequest, SopSelectRequest,
 };
 use zeroclaw_api::model_provider::ChatMessage;
 use zeroclaw_api::runtime_status::RuntimeConfigKind;
@@ -512,6 +513,11 @@ impl RpcDispatcher {
         self.tui_id = tui_id;
     }
 
+    #[cfg(test)]
+    pub fn rpc_for_test(&self) -> Arc<RpcOutbound> {
+        Arc::clone(&self.rpc)
+    }
+
     /// Construct a pre-authenticated dispatcher sharing the same context and
     /// RPC outbound as `self`. Used to run long-lived methods (e.g.
     /// `session/prompt`) in a spawned task so the read loop remains live.
@@ -647,8 +653,8 @@ impl RpcDispatcher {
     }
 
     async fn process_line(&mut self, line: &str) {
-        let req: JsonRpcRequest = match serde_json::from_str(line) {
-            Ok(r) => r,
+        let value: Value = match serde_json::from_str(line) {
+            Ok(value) => value,
             Err(e) => {
                 self.send_error(Value::Null, PARSE_ERROR, &format!("Parse error: {e}"))
                     .await;
@@ -656,15 +662,67 @@ impl RpcDispatcher {
             }
         };
 
-        // Bidirectional RPC: responses to our outbound requests.
-        if req.method.is_empty() {
-            if let Some(id) = req.id.as_ref().and_then(Value::as_str) {
-                self.rpc.dispatch_response(id, Some(req.params), None);
+        let frame = match JsonRpcFrame::from_value(value) {
+            Ok(frame) => frame,
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(serde_json::json!({ "line_len": line.len() })),
+                    "Rejected invalid JSON-RPC frame"
+                );
+                match e.kind() {
+                    JsonRpcFrameErrorKind::Request => {
+                        let id = e.request_id().cloned().unwrap_or(Value::Null);
+                        self.send_error(id, INVALID_REQUEST, &format!("Invalid request: {e}"))
+                            .await;
+                    }
+                    JsonRpcFrameErrorKind::Response => {}
+                    JsonRpcFrameErrorKind::Ambiguous => {
+                        self.send_error(
+                            Value::Null,
+                            INVALID_REQUEST,
+                            &format!("Invalid request: {e}"),
+                        )
+                        .await;
+                    }
+                }
+                return;
             }
-            return;
-        }
+        };
 
-        let id = req.id.clone().unwrap_or(Value::Null);
+        let req = match frame {
+            JsonRpcFrame::Request(req) => req,
+            JsonRpcFrame::Response { id, result } => {
+                if let Some(id_key) = response_id_key(&id) {
+                    if !self.rpc.dispatch_validated_response(&id_key, result) {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_category(::zeroclaw_log::EventCategory::Agent)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                            "Dropped JSON-RPC response with an unknown ID"
+                        );
+                    }
+                } else {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_category(::zeroclaw_log::EventCategory::Agent)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        "Dropped JSON-RPC response with an uncorrelatable null ID"
+                    );
+                }
+                return;
+            }
+        };
+
+        let req_id = req.id.clone().unwrap_or(Value::Null);
         let is_notification = req.id.is_none();
 
         let method = match Method::from_wire(&req.method) {
@@ -672,7 +730,7 @@ impl RpcDispatcher {
             None => {
                 if !is_notification {
                     self.send_error(
-                        id,
+                        req_id,
                         METHOD_NOT_FOUND,
                         &format!("Unknown method: {}", req.method),
                     )
@@ -684,7 +742,7 @@ impl RpcDispatcher {
 
         if !self.authenticated && method != Method::Initialize {
             if !is_notification {
-                self.send_error(id, AUTH_REQUIRED, "First call must be 'initialize'")
+                self.send_error(req_id, AUTH_REQUIRED, "First call must be 'initialize'")
                     .await;
             }
             return;
@@ -707,7 +765,7 @@ impl RpcDispatcher {
                 // The response (empty {} or error) is kept only so legacy
                 // request-form callers don't park forever.
                 let handle = self.spawn_handle();
-                let id_clone = id;
+                let id_clone = req_id.clone();
                 let params_clone = req.params.clone();
                 let is_notif = is_notification;
                 zeroclaw_spawn::spawn!(async move {
@@ -839,8 +897,8 @@ impl RpcDispatcher {
         }
 
         match result {
-            Ok(v) => self.send_result(id, v).await,
-            Err(e) => self.send_error(id, e.code, &e.message).await,
+            Ok(v) => self.send_result(req_id, v).await,
+            Err(e) => self.send_error(req_id, e.code, &e.message).await,
         }
     }
 
@@ -977,9 +1035,36 @@ impl RpcDispatcher {
 
     async fn handle_doctor_run(&self) -> RpcResult {
         let config = self.ctx.config.read().clone();
-        let results = crate::doctor::run_structured(&config).await;
+        self.run_doctor(Box::pin(crate::doctor::probe_models(&config)))
+            .await
+    }
+
+    /// Serialize a Doctor run into the `doctor/run` response. The probe future
+    /// is injectable so tests can force both sides of the timeout deadline
+    /// deterministically; the production path passes `Box::pin(probe_models)`.
+    async fn run_doctor(
+        &self,
+        probe: std::pin::Pin<
+            Box<dyn std::future::Future<Output = Vec<crate::doctor::DiagResult>> + Send + '_>,
+        >,
+    ) -> RpcResult {
+        let config = self.ctx.config.read().clone();
+        let (results, timed_out_phase) =
+            crate::doctor::run_structured_with_probe(&config, PROBE_MODEL_TIMEOUT, probe).await;
         let summary = doctor_summary(&results);
-        to_result(DoctorRunResult { results, summary })
+        // Read enabled + path from the one canonical active-writer accessor.
+        // The runtime `ctx.config.observability.log_persistence` snapshot is
+        // updated immediately by `config/set` while `zeroclaw-log` installs its
+        // writer state only at startup or daemon reload — gating on the config
+        // here would advertise a stale path (or omit a live one) during the
+        // config/reload window the Doctor diagnostics issue calls out.
+        let log_path = zeroclaw_log::active_log_path().map(|p| p.to_string_lossy().to_string());
+        to_result(DoctorRunResult {
+            results,
+            summary,
+            log_path,
+            timed_out_phase,
+        })
     }
 
     // ── TUI handlers ─────────────────────────────────────────────
@@ -1012,10 +1097,11 @@ impl RpcDispatcher {
         self.handle_session_messages(params).await
     }
 
-    /// Drive a full JSON-RPC request line through the dispatcher from an
-    /// external integration test, including notification emission on the
-    /// outbound channel. Mirrors the transport `process_line` path.
-    pub async fn process_line_for_test(&mut self, line: &str) {
+    /// Drive a full JSON-RPC request line through the dispatcher from a unit
+    /// test, including notification emission on the outbound channel. Mirrors
+    /// the transport `process_line` path.
+    #[cfg(test)]
+    async fn process_line_for_test(&mut self, line: &str) {
         self.process_line(line).await;
     }
 
@@ -4590,6 +4676,15 @@ impl RpcDispatcher {
     }
 }
 
+fn response_id_key(id: &Value) -> Option<String> {
+    match id {
+        Value::String(id) => Some(id.clone()),
+        Value::Number(id) => Some(id.to_string()),
+        Value::Null => None,
+        _ => unreachable!("validated JSON-RPC ID"),
+    }
+}
+
 // ── Helpers ──────────────────────────────────────────────────────
 
 fn parse_params<T: DeserializeOwned>(params: &Value) -> Result<T, JsonRpcError> {
@@ -7113,6 +7208,224 @@ mod tests {
         assert!(sessions.get_agent("scoped-a").await.is_none());
         assert!(sessions.get_agent("scoped-b").await.is_none());
         assert!(sessions.get_agent("scoped-c").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn doctor_run_omits_log_path_when_persistence_is_disabled() {
+        // Serialize against the other tests that mutate the process-global
+        // writer state (the two transition tests below) and install an
+        // explicit disabled writer so the assertion cannot observe a writer
+        // another parallel test installed.
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        zeroclaw_log::init_from_config(
+            &zeroclaw_log::LogConfig {
+                log_persistence: "none".into(),
+                log_persistence_path: "state/runtime-trace.jsonl".into(),
+                ..Default::default()
+            },
+            tmp.path(),
+        );
+        let mut config = make_acp_test_config(&tmp);
+        // Doctor must not advertise any path regardless of the config snapshot.
+        config.observability.log_persistence = zeroclaw_config::schema::LogPersistence::None;
+        let (dispatcher, _sessions) = make_acp_test_dispatcher(config);
+
+        let result = dispatcher
+            .handle_doctor_run()
+            .await
+            .expect("doctor/run must succeed");
+        let obj = result.as_object().expect("result must be an object");
+        assert!(
+            obj.get("log_path").map(|v| v.is_null()).unwrap_or(true),
+            "log_path must be null when no writer is active; got: {:?}",
+            obj.get("log_path")
+        );
+    }
+
+    /// Config/reload window, scenario A: the daemon started with an
+    /// ACTIVE writer (rolling), then `config/set` flipped
+    /// `observability.log_persistence` to `none` WITHOUT a daemon reload.
+    /// The writer still persists, so Doctor must still advertise the path —
+    /// gating on the `ctx.config` snapshot would hide a live log.
+    #[tokio::test]
+    async fn doctor_reports_active_writer_path_after_config_set_to_none_without_reload() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        zeroclaw_log::init_from_config(
+            &zeroclaw_log::LogConfig {
+                log_persistence: "rolling".into(),
+                log_persistence_path: "state/runtime-trace.jsonl".into(),
+                ..Default::default()
+            },
+            tmp.path(),
+        );
+
+        let mut config = make_acp_test_config(&tmp);
+        config.observability.log_persistence = zeroclaw_config::schema::LogPersistence::None;
+        let (dispatcher, _sessions) = make_acp_test_dispatcher(config);
+
+        let result = dispatcher
+            .handle_doctor_run()
+            .await
+            .expect("doctor/run must succeed");
+        let obj = result.as_object().expect("result must be an object");
+        let log_path = obj.get("log_path").and_then(|v| v.as_str());
+        assert!(
+            matches!(log_path, Some(p) if p.ends_with("runtime-trace.jsonl")),
+            "an active writer must be advertised even when the config snapshot says none; got: {:?}",
+            obj.get("log_path")
+        );
+
+        // Restore a disabled writer so later tests start from a clean state.
+        zeroclaw_log::init_from_config(
+            &zeroclaw_log::LogConfig {
+                log_persistence: "none".into(),
+                log_persistence_path: "state/runtime-trace.jsonl".into(),
+                ..Default::default()
+            },
+            tmp.path(),
+        );
+    }
+
+    /// Config/reload window, scenario B: the daemon started with
+    /// persistence DISABLED, then `config/set` flipped it to `rolling`
+    /// WITHOUT a daemon reload. No writer is installed, so Doctor must NOT
+    /// advertise the disabled writer's stale resolved path.
+    #[tokio::test]
+    async fn doctor_omits_log_path_after_config_set_to_rolling_without_reload_when_writer_disabled()
+    {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        zeroclaw_log::init_from_config(
+            &zeroclaw_log::LogConfig {
+                log_persistence: "none".into(),
+                log_persistence_path: "state/runtime-trace.jsonl".into(),
+                ..Default::default()
+            },
+            tmp.path(),
+        );
+
+        let mut config = make_acp_test_config(&tmp);
+        config.observability.log_persistence = zeroclaw_config::schema::LogPersistence::Rolling;
+        let (dispatcher, _sessions) = make_acp_test_dispatcher(config);
+
+        let result = dispatcher
+            .handle_doctor_run()
+            .await
+            .expect("doctor/run must succeed");
+        let obj = result.as_object().expect("result must be an object");
+        assert!(
+            obj.get("log_path").map(|v| v.is_null()).unwrap_or(true),
+            "log_path must stay null when no writer is installed, even if the config says rolling; got: {:?}",
+            obj.get("log_path")
+        );
+    }
+
+    /// RPC-boundary coverage for the probe-timeout branch: a controlled
+    /// never-completing probe must yield a `doctor/run` response whose
+    /// serialized JSON carries `timed_out_phase`, preserves the earlier
+    /// diagnostics, and appends the localized timeout warning exactly once.
+    #[tokio::test]
+    async fn doctor_run_timeout_serializes_partial_result() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (dispatcher, _sessions) = make_acp_test_dispatcher(config);
+
+        // Force the timeout branch deterministically — no reliance on a real
+        // network endpoint hanging or not.
+        let result = dispatcher
+            .run_doctor(Box::pin(std::future::pending::<
+                Vec<crate::doctor::DiagResult>,
+            >()))
+            .await
+            .expect("doctor/run must succeed");
+        let obj = result.as_object().expect("result must be an object");
+
+        assert_eq!(
+            obj.get("timed_out_phase").and_then(|v| v.as_str()),
+            Some("probe_models"),
+            "serialized response must carry timed_out_phase='probe_models'"
+        );
+
+        // Earlier diagnostics survive in the serialized results.
+        let results = obj
+            .get("results")
+            .and_then(|v| v.as_array())
+            .expect("results must be an array");
+        assert!(
+            results
+                .iter()
+                .any(|r| r.get("category").and_then(|c| c.as_str()) == Some("config")),
+            "serialized results must retain config diagnostics after timeout"
+        );
+        assert!(
+            results
+                .iter()
+                .any(|r| r.get("category").and_then(|c| c.as_str()) == Some("workspace")),
+            "serialized results must retain workspace diagnostics after timeout"
+        );
+
+        // The timeout warning is appended exactly once in the serialized output.
+        let warning = crate::i18n::get_required_cli_string("cli-doctor-probe-timeout-message");
+        let warns = results
+            .iter()
+            .filter(|r| r.get("message").and_then(|m| m.as_str()) == Some(warning.as_str()))
+            .count();
+        assert_eq!(
+            warns, 1,
+            "serialized results must append the timeout warning exactly once"
+        );
+    }
+
+    /// RPC-boundary coverage for the under-deadline branch: a probe that
+    /// completes immediately with a real result must have that result retained
+    /// in the serialized `doctor/run` response, with `timed_out_phase` absent.
+    #[tokio::test]
+    async fn doctor_run_under_deadline_retains_probe_results() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (dispatcher, _sessions) = make_acp_test_dispatcher(config);
+
+        let probe_result = crate::doctor::DiagResult {
+            severity: crate::doctor::Severity::Ok,
+            category: "probe.mock".into(),
+            message: "mock probe ok".into(),
+        };
+        let result = dispatcher
+            .run_doctor(Box::pin(async move { vec![probe_result] }))
+            .await
+            .expect("doctor/run must succeed");
+        let obj = result.as_object().expect("result must be an object");
+
+        // timed_out_phase is None → skipped on the wire.
+        assert!(
+            obj.get("timed_out_phase")
+                .map(|v| v.is_null())
+                .unwrap_or(true),
+            "under-deadline response must not carry timed_out_phase"
+        );
+
+        // The completed probe result survives in the serialized output.
+        let results = obj
+            .get("results")
+            .and_then(|v| v.as_array())
+            .expect("results must be an array");
+        assert!(
+            results
+                .iter()
+                .any(|r| r.get("message").and_then(|m| m.as_str()) == Some("mock probe ok")),
+            "serialized results must retain the completed probe result"
+        );
+
+        // No timeout warning leaks into the under-deadline response.
+        let warning = crate::i18n::get_required_cli_string("cli-doctor-probe-timeout-message");
+        assert!(
+            !results
+                .iter()
+                .any(|r| r.get("message").and_then(|m| m.as_str()) == Some(warning.as_str())),
+            "under-deadline response must not contain the timeout warning"
+        );
     }
 
     #[tokio::test]
@@ -9787,6 +10100,270 @@ mod tests {
             1,
             "session_end must fire when a real session is closed"
         );
+    }
+
+    fn make_bidi_test_dispatcher() -> (RpcDispatcher, tokio::sync::mpsc::Receiver<String>) {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal(zeroclaw_config::schema::Config::default(), sessions);
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-bidi:pid=1".into());
+        dispatcher.authenticated = true;
+        (dispatcher, rx)
+    }
+
+    #[tokio::test]
+    async fn process_line_routes_success_response_to_pending_caller() {
+        let (mut dispatcher, mut rx) = make_bidi_test_dispatcher();
+        let rpc = dispatcher.rpc_for_test();
+
+        let waiter =
+            zeroclaw_spawn::spawn!(async move { rpc.request("ask_user", json!({"q": "?"})).await });
+
+        let _sent = rx.recv().await.expect("outbound request sent");
+        let expected_id = format!("{}0", zeroclaw_api::jsonrpc::OUTBOUND_ID_PREFIX);
+        let frame =
+            format!(r#"{{"jsonrpc":"2.0","id":"{expected_id}","result":{{"answer":"blue"}}}}"#);
+        dispatcher.process_line_for_test(&frame).await;
+
+        let out = waiter.await.expect("waiter task join").expect("rpc result");
+        assert_eq!(out, json!({"answer": "blue"}));
+    }
+
+    #[tokio::test]
+    async fn process_line_routes_error_response_to_pending_caller() {
+        let (mut dispatcher, mut rx) = make_bidi_test_dispatcher();
+        let rpc = dispatcher.rpc_for_test();
+
+        let waiter = zeroclaw_spawn::spawn!(async move { rpc.request("poll", json!({})).await });
+
+        let _sent = rx.recv().await.expect("outbound request sent");
+        let expected_id = format!("{}0", zeroclaw_api::jsonrpc::OUTBOUND_ID_PREFIX);
+        let frame = format!(
+            r#"{{"jsonrpc":"2.0","id":"{expected_id}","error":{{"code":-32601,"message":"nope"}}}}"#
+        );
+        dispatcher.process_line_for_test(&frame).await;
+
+        let err = waiter
+            .await
+            .expect("waiter task join")
+            .expect_err("rpc error");
+        assert_eq!(err.code, -32601);
+        assert_eq!(err.message, "nope");
+    }
+
+    #[tokio::test]
+    async fn process_line_routes_explicit_null_result_response() {
+        let (mut dispatcher, mut rx) = make_bidi_test_dispatcher();
+        let rpc = dispatcher.rpc_for_test();
+
+        let waiter =
+            zeroclaw_spawn::spawn!(
+                async move { rpc.request("ask_user", json!({"q": "skip"})).await }
+            );
+
+        let _sent = rx.recv().await.expect("outbound request sent");
+        let expected_id = format!("{}0", zeroclaw_api::jsonrpc::OUTBOUND_ID_PREFIX);
+        let frame = format!(r#"{{"jsonrpc":"2.0","id":"{expected_id}","result":null}}"#);
+        dispatcher.process_line_for_test(&frame).await;
+
+        let out = waiter.await.expect("waiter task join").expect("rpc result");
+        assert_eq!(out, Value::Null);
+    }
+
+    async fn assert_process_line_error(line: &str, code: i32, id: Value) {
+        let (mut dispatcher, mut rx) = make_bidi_test_dispatcher();
+        Box::pin(dispatcher.process_line_for_test(line)).await;
+
+        let response = rx.try_recv().expect("JSON-RPC error response");
+        let response: Value = serde_json::from_str(&response).expect("valid response JSON");
+        assert_eq!(response["error"]["code"], json!(code), "line: {line}");
+        assert_eq!(response["id"], id, "line: {line}");
+    }
+
+    async fn assert_process_line_drops_invalid_response(line: &str) {
+        let (mut dispatcher, mut rx) = make_bidi_test_dispatcher();
+        Box::pin(dispatcher.process_line_for_test(line)).await;
+
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "an invalid response must not produce another response: {line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_line_distinguishes_syntax_and_envelope_errors() {
+        assert_process_line_error("{", PARSE_ERROR, Value::Null).await;
+
+        let invalid_requests = [
+            (r#"{"jsonrpc":"1.0","method":"status","id":1}"#, json!(1)),
+            (
+                r#"{"jsonrpc":"2.0","method":"status","params":true,"id":7}"#,
+                json!(7),
+            ),
+            (
+                r#"{"jsonrpc":"2.0","method":"status","params":null,"id":8}"#,
+                json!(8),
+            ),
+            (
+                r#"{"jsonrpc":"2.0","method":"status","params":null}"#,
+                Value::Null,
+            ),
+        ];
+
+        for (line, id) in invalid_requests {
+            assert_process_line_error(line, INVALID_REQUEST, id).await;
+        }
+
+        let ambiguous = [
+            "null",
+            r#"{"jsonrpc":"2.0"}"#,
+            r#"{"jsonrpc":"2.0","id":3}"#,
+            r#"{"jsonrpc":"2.0","method":null,"id":6}"#,
+            r#"{"jsonrpc":"2.0","method":null,"id":null}"#,
+            r#"{"jsonrpc":"2.0","method":"status","id":9,"result":true}"#,
+        ];
+        for line in ambiguous {
+            assert_process_line_error(line, INVALID_REQUEST, Value::Null).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn process_line_drops_malformed_response_frames_without_reply() {
+        let invalid_responses = [
+            r#"{"id":"zc-out-0","result":true}"#,
+            r#"{"jsonrpc":"1.0","id":"zc-out-0","result":true}"#,
+            r#"{"jsonrpc":"2.0","result":true}"#,
+            r#"{"jsonrpc":"2.0","id":2,"result":true,"error":{"code":-1,"message":"bad"}}"#,
+            r#"{"jsonrpc":"2.0","id":null,"result":true,"error":{"code":-1,"message":"bad"}}"#,
+            r#"{"jsonrpc":"2.0","id":4,"error":{"code":"bad","message":"bad"}}"#,
+            r#"{"jsonrpc":"2.0","id":{"nested":5},"result":true}"#,
+            r#"{"jsonrpc":"2.0","id":10,"result":true,"params":{}}"#,
+        ];
+
+        for line in invalid_responses {
+            assert_process_line_drops_invalid_response(line).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_frames_cannot_complete_opposite_direction_same_id_request() {
+        let (mut dispatcher, mut daemon_writer_rx) = make_bidi_test_dispatcher();
+        let daemon_rpc = dispatcher.rpc_for_test();
+        let daemon_wait_rpc = Arc::clone(&daemon_rpc);
+        let daemon_waiter = zeroclaw_spawn::spawn!(async move {
+            daemon_wait_rpc.request("ask_user", json!({"q": "?"})).await
+        });
+
+        let daemon_request: Value = serde_json::from_str(
+            &daemon_writer_rx
+                .recv()
+                .await
+                .expect("daemon outbound request"),
+        )
+        .expect("valid daemon request");
+
+        let (client_writer_tx, mut client_writer_rx) = tokio::sync::mpsc::channel(4);
+        let client_rpc = Arc::new(RpcOutbound::new(client_writer_tx));
+        let client_wait_rpc = Arc::clone(&client_rpc);
+        let client_waiter =
+            zeroclaw_spawn::spawn!(
+                async move { client_wait_rpc.request("status", Value::Null).await }
+            );
+        let client_request: Value = serde_json::from_str(
+            &client_writer_rx
+                .recv()
+                .await
+                .expect("client outbound request"),
+        )
+        .expect("valid client request");
+
+        let shared_id = format!("{}0", zeroclaw_api::jsonrpc::OUTBOUND_ID_PREFIX);
+        assert_eq!(daemon_request["id"], json!(&shared_id));
+        assert_eq!(client_request["id"], json!(&shared_id));
+
+        let malformed = format!(
+            r#"{{"jsonrpc":"2.0","id":"{shared_id}","result":null,"error":{{"code":-32600,"message":"bad"}}}}"#
+        );
+        Box::pin(dispatcher.process_line_for_test(&malformed)).await;
+
+        assert!(
+            matches!(
+                daemon_writer_rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "malformed response must not generate a same-ID reply"
+        );
+        assert_eq!(daemon_rpc.pending_count(), 1);
+        assert_eq!(client_rpc.pending_count(), 1);
+
+        let malformed_methods = [
+            format!(r#"{{"jsonrpc":"2.0","method":null,"id":"{shared_id}"}}"#),
+            format!(r#"{{"jsonrpc":"2.0","method":null,"id":"{shared_id}","result":true}}"#),
+        ];
+        for malformed_method in malformed_methods {
+            Box::pin(dispatcher.process_line_for_test(&malformed_method)).await;
+
+            let error_response: Value = serde_json::from_str(
+                &daemon_writer_rx
+                    .try_recv()
+                    .expect("invalid-request response"),
+            )
+            .expect("valid JSON-RPC response");
+            assert_eq!(error_response["id"], Value::Null);
+            assert_eq!(error_response["error"]["code"], json!(INVALID_REQUEST));
+            assert_eq!(daemon_rpc.pending_count(), 1);
+            assert_eq!(client_rpc.pending_count(), 1);
+        }
+
+        let valid_daemon_response =
+            format!(r#"{{"jsonrpc":"2.0","id":"{shared_id}","result":{{"answer":"blue"}}}}"#);
+        Box::pin(dispatcher.process_line_for_test(&valid_daemon_response)).await;
+        let daemon_result = tokio::time::timeout(std::time::Duration::from_secs(1), daemon_waiter)
+            .await
+            .expect("daemon request remained resolvable")
+            .expect("daemon waiter task")
+            .expect("daemon result");
+        assert_eq!(daemon_result, json!({"answer": "blue"}));
+        assert_eq!(client_rpc.pending_count(), 1);
+
+        assert!(client_rpc.dispatch_validated_response(&shared_id, Ok(json!({"status": "ready"}))));
+        let client_result = tokio::time::timeout(std::time::Duration::from_secs(1), client_waiter)
+            .await
+            .expect("client request remained resolvable")
+            .expect("client waiter task")
+            .expect("client result");
+        assert_eq!(client_result, json!({"status": "ready"}));
+    }
+
+    #[tokio::test]
+    async fn process_line_drops_unknown_valid_response_without_reply() {
+        let (mut dispatcher, mut rx) = make_bidi_test_dispatcher();
+        dispatcher
+            .process_line_for_test(r#"{"jsonrpc":"2.0","id":"unknown","result":true}"#)
+            .await;
+
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "a valid response with an unknown ID must not start a response loop"
+        );
+    }
+
+    #[test]
+    fn response_id_key_accepts_string_and_numeric_ids() {
+        assert_eq!(
+            response_id_key(&json!("zc-out-1")).as_deref(),
+            Some("zc-out-1")
+        );
+        assert_eq!(response_id_key(&json!(42)).as_deref(), Some("42"));
+        assert_eq!(response_id_key(&Value::Null), None);
     }
 
     // ── config_write_lock races ─────────────────────────────────

@@ -221,12 +221,6 @@
           - "src/channels/twitter.rs"
           - "crates/zeroclaw-channels/src/twitter.rs"
 
-"channel:wati":
-  - changed-files:
-      - any-glob-to-any-file:
-          - "src/channels/wati.rs"
-          - "crates/zeroclaw-channels/src/wati.rs"
-
 "channel:wechat":
   - changed-files:
       - any-glob-to-any-file:

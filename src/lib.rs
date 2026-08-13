@@ -34,7 +34,7 @@
     clippy::unnecessary_wraps
 )]
 
-use clap::Subcommand;
+use clap::{Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "agent-runtime")]
@@ -213,8 +213,23 @@ Examples:
 }
 
 /// Service management subcommands
+#[derive(ValueEnum, Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ServiceLogStream {
+    Stdout,
+    Stderr,
+}
+
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ServiceCommands {
+    /// Internal launchd runner that owns bounded daemon output capture
+    #[command(hide = true)]
+    RunLaunchdDaemon,
+    /// Internal OpenRC logger that drains one daemon stream into bounded storage
+    #[command(hide = true)]
+    RunOpenrcLogWriter {
+        #[arg(value_enum)]
+        stream: ServiceLogStream,
+    },
     /// Install daemon service unit for auto-start and restart
     Install,
     /// Start daemon service
@@ -598,6 +613,98 @@ pub enum MigrateCommands {
     },
 }
 
+/// Reject a `--to` value that is shaped like a flag.
+///
+/// `--to` opts into `allow_hyphen_values` so hyphen-led recipients parse, which
+/// otherwise lets a forgotten value consume the next flag: `--to --thread t-1`
+/// would take `--thread` as the recipient and then fail on the positional
+/// argument. Rejecting a `--` prefix keeps that mistake legible while leaving
+/// every real recipient shape (`-100…`, `-100…:42`) accepted.
+///
+/// The rejection is unconditional. A value parser runs on the parsed value
+/// whichever syntax supplied it, so `--to=--thread` is rejected identically and
+/// the message must not offer that as a workaround. No supported channel has a
+/// recipient beginning with `--`.
+fn parse_delivery_recipient(raw: &str) -> Result<String, String> {
+    if raw.starts_with("--") {
+        return Err(format!(
+            "`{raw}` looks like a flag, not a recipient; \
+             recipient values beginning with `--` are not supported"
+        ));
+    }
+    Ok(raw.to_string())
+}
+
+/// Shared delivery flags for the cron creation and update subcommands.
+///
+/// Flattened into `add`, `add-at`, `add-every`, `once`, and `update` so a job's
+/// output can be routed to a channel. When none of these are set the job keeps
+/// delivery mode `"none"` (output is computed but not announced anywhere).
+///
+/// On `update` these are a patch: only the fields given are changed, and the
+/// rest are carried over from the job's stored delivery config.
+#[derive(clap::Args, Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CronDeliveryArgs {
+    /// Announce job output to this channel (e.g. telegram, discord, slack).
+    #[arg(long = "channel")]
+    pub delivery_channel: Option<String>,
+    /// Target chat/recipient id for the channel (e.g. a Telegram chat id).
+    ///
+    /// `allow_hyphen_values` is required because supported recipients start with
+    /// a hyphen: Telegram group and channel ids are negative (`-100…`), and a
+    /// forum topic target is `chat:thread` (`-100…:42`), which is hyphen-led but
+    /// not a number. Without it clap treats the value as a flag and exits before
+    /// any delivery validation runs, leaving only the undocumented `--to=<value>`
+    /// form working.
+    ///
+    /// `allow_negative_numbers` is not enough: it accepts `-100…` but still
+    /// rejects the `chat:thread` form. The broader setting alone would let a
+    /// forgotten value swallow the following flag, so `parse_delivery_recipient`
+    /// rejects `--`-prefixed values and names the offending token.
+    #[arg(long = "to", allow_hyphen_values = true, value_parser = parse_delivery_recipient)]
+    pub delivery_to: Option<String>,
+    /// Optional thread/conversation id, for channels that route on it (webhook).
+    #[arg(long = "thread")]
+    pub delivery_thread: Option<String>,
+    /// Fail the job if delivery fails (default: delivery errors are non-fatal).
+    #[arg(long = "no-best-effort", conflicts_with = "best_effort")]
+    pub no_best_effort: bool,
+    /// Keep the job succeeding when delivery fails. Restores the default after
+    /// a previous `--no-best-effort`.
+    #[arg(long = "best-effort")]
+    pub best_effort: bool,
+}
+
+impl CronDeliveryArgs {
+    /// The requested best-effort setting, or `None` when neither flag is given.
+    ///
+    /// The two flags are mutually exclusive at the clap layer, so at most one
+    /// is ever set.
+    #[must_use]
+    pub fn best_effort_override(&self) -> Option<bool> {
+        if self.no_best_effort {
+            Some(false)
+        } else if self.best_effort {
+            Some(true)
+        } else {
+            None
+        }
+    }
+
+    /// Whether the user supplied any delivery flag.
+    ///
+    /// This drives the `update` no-field guard and decides whether the stored
+    /// job has to be loaded for a merge, so it must count the boolean flags
+    /// too: `--no-best-effort` on its own is a real request, not an absence.
+    #[must_use]
+    pub fn any_set(&self) -> bool {
+        self.delivery_channel.is_some()
+            || self.delivery_to.is_some()
+            || self.delivery_thread.is_some()
+            || self.best_effort_override().is_some()
+    }
+}
+
 /// Cron subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CronCommands {
@@ -636,6 +743,10 @@ Examples:
         /// Set to false for stateless digest/report jobs that should not accumulate or consume memory.
         #[arg(long)]
         uses_memory: Option<bool>,
+        /// Delivery of the job's output to a channel (see `--channel` / `--to`).
+        #[command(flatten)]
+        #[serde(default)]
+        delivery: CronDeliveryArgs,
         /// Command (shell) or prompt (when --prompt) to run
         command: String,
     },
@@ -645,11 +756,11 @@ Examples:
 Add a one-shot task that fires at a specific RFC3339 timestamp with explicit Z or offset.
 
 The timestamp must include an explicit Z or numeric offset \
-(e.g. 2025-01-15T14:00:00Z or 2025-01-15T09:00:00-05:00).
+(e.g. 2099-01-15T14:00:00Z or 2099-01-15T09:00:00-05:00).
 
 Examples:
-  zeroclaw cron add-at --agent morning-shift 2025-01-15T14:00:00Z 'Send reminder'
-  zeroclaw cron add-at --agent morning-shift --prompt 2025-12-31T23:59:00Z 'Happy New Year!'")]
+  zeroclaw cron add-at --agent morning-shift --prompt 2099-01-15T14:00:00Z 'Send reminder'
+  zeroclaw cron add-at --agent morning-shift --prompt 2099-12-31T23:59:00Z 'Happy New Year!'")]
     AddAt {
         /// One-shot RFC3339 timestamp with explicit Z or offset
         at: String,
@@ -665,6 +776,10 @@ Examples:
         /// If false, disable memory recall for this agent cron job (default: true).
         #[arg(long)]
         uses_memory: Option<bool>,
+        /// Delivery of the job's output to a channel (see `--channel` / `--to`).
+        #[command(flatten)]
+        #[serde(default)]
+        delivery: CronDeliveryArgs,
         /// Command (shell) or prompt (when --prompt) to run
         command: String,
     },
@@ -676,8 +791,8 @@ Add a task that repeats at a fixed interval.
 Interval is specified in milliseconds. For example, 60000 = 1 minute.
 
 Examples:
-  zeroclaw cron add-every --agent triage 60000 'Ping heartbeat'
-  zeroclaw cron add-every --agent triage 3600000 'Hourly report'")]
+  zeroclaw cron add-every --agent triage --prompt 60000 'Ping heartbeat'
+  zeroclaw cron add-every --agent triage --prompt 3600000 'Hourly report'")]
     AddEvery {
         /// Interval in milliseconds
         every_ms: u64,
@@ -693,6 +808,10 @@ Examples:
         /// If false, disable memory recall for this agent cron job (default: true).
         #[arg(long)]
         uses_memory: Option<bool>,
+        /// Delivery of the job's output to a channel (see `--channel` / `--to`).
+        #[command(flatten)]
+        #[serde(default)]
+        delivery: CronDeliveryArgs,
         /// Command (shell) or prompt (when --prompt) to run
         command: String,
     },
@@ -705,7 +824,7 @@ Accepts human-readable durations: s (seconds), m (minutes), \
 h (hours), d (days).
 
 Examples:
-  zeroclaw cron once --agent ops-bot 30m 'Run backup in 30 minutes'
+  zeroclaw cron once --agent ops-bot --prompt 30m 'Run backup in 30 minutes'
   zeroclaw cron once --agent researcher --prompt 2h 'Follow up on deployment'")]
     Once {
         /// Delay duration
@@ -722,6 +841,10 @@ Examples:
         /// If false, disable memory recall for this agent cron job (default: true).
         #[arg(long)]
         uses_memory: Option<bool>,
+        /// Delivery of the job's output to a channel (see `--channel` / `--to`).
+        #[command(flatten)]
+        #[serde(default)]
+        delivery: CronDeliveryArgs,
         /// Command (shell) or prompt (when --prompt) to run
         command: String,
     },
@@ -766,6 +889,10 @@ Examples:
         /// If false, disable memory recall for this agent cron job (default: true).
         #[arg(long)]
         uses_memory: Option<bool>,
+        /// Delivery of the job's output to a channel (see `--channel` / `--to`).
+        #[command(flatten)]
+        #[serde(default)]
+        delivery: CronDeliveryArgs,
     },
     /// Pause a scheduled task
     Pause {
