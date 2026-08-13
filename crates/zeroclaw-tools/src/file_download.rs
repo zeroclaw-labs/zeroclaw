@@ -172,6 +172,14 @@ impl FileDownloadTool {
         raw_url: &str,
     ) -> Result<(String, Vec<std::net::SocketAddr>), String> {
         let (transport_host, policy_host, port) = parse_endpoint_url(raw_url)?;
+        // Normalize the operator-declared policy views BEFORE any DNS I/O. A
+        // malformed or overlapping `nat64_prefixes` set (and any malformed
+        // `allowed_private_hosts` entry) must fail closed at the dispatch
+        // boundary: the endpoint-resolution side effect must not run while the
+        // local policy configuration is already invalid, because a lookup
+        // leaks the configured hostname into the resolver/search-list.
+        let allowed = normalize_allowed_private_hosts(&(self.allowed_private_hosts_resolver)());
+        let declared_prefixes = normalize_nat64_prefixes(&(self.nat64_prefixes_resolver)())?;
         // Resolve the exact transport hostname, which may carry a terminal DNS
         // dot. A trailing dot marks an absolute name, so resolving it forces an
         // explicitly absolute lookup: resolver search-list behavior cannot
@@ -179,8 +187,6 @@ impl FileDownloadTool {
         // is guaranteed to belong to the exact hostname reqwest connects to.
         // `policy_host` is retained only for allowlist comparison + diagnostics.
         let resolved_addrs = (self.endpoint_resolver)(transport_host.to_string(), port).await?;
-        let allowed = normalize_allowed_private_hosts(&(self.allowed_private_hosts_resolver)());
-        let declared_prefixes = normalize_nat64_prefixes(&(self.nat64_prefixes_resolver)())?;
         ssrf_check_endpoint(&policy_host, &resolved_addrs, &allowed, &declared_prefixes)?;
         // Return transport_host for resolve_to_addrs binding — this preserves
         // the exact hostname spelling (including trailing dot) that reqwest
@@ -2683,9 +2689,13 @@ mod tests {
     /// network-specific prefix as undeclared ordinary address space, which would
     /// remove the declared-prefix SSRF policy (a fail-open). Reverting
     /// `normalize_nat64_prefixes` to a `filter_map` empty fallback fails this
-    /// test: the mixed valid/malformed configuration would then let the
-    /// synthesized private target (10.0.0.1 under `64:ff9b:1::/48`) pass as
-    /// ordinary public IPv6.
+    /// test: the mixed valid/malformed configuration would then surface a
+    /// resolver/SSRF error instead of the field-specific configuration error.
+    ///
+    /// The policy normalization must also run BEFORE any resolver I/O, so the
+    /// injected counting resolver is asserted untouched: invalid configuration
+    /// must never reach `tokio::net::lookup_host`, which would leak the
+    /// configured hostname into the resolver/search-list.
     #[tokio::test]
     async fn validate_endpoint_host_rejects_malformed_nat64_prefixes_config() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2694,29 +2704,11 @@ mod tests {
             nat64_prefixes: vec!["64:ff9b:1::/48".into(), "not-a-cidr".into()],
             ..FileDownloadConfig::default()
         };
-        let snapshot_prefixes = config.nat64_prefixes.clone();
-        // The injected resolver answers with a DNS64-synthesized address under
-        // the VALID declared 64:ff9b:1::/48 prefix embedding 10.0.0.1 — so a
-        // filter_map fallback would classify it as ordinary public IPv6.
-        let endpoint_resolver: EndpointResolver = Arc::new(
-            move |_host: String,
-                  port: u16|
-                  -> Pin<Box<dyn Future<Output = ResolveResult> + Send>> {
-                Box::pin(async move {
-                    Ok(vec![std::net::SocketAddr::new(
-                        "64:ff9b:1:a00:0:100::".parse().unwrap(),
-                        port,
-                    )])
-                })
-            },
-        );
-        let tool = FileDownloadTool::new_with_endpoint_resolver(
+        let resolver_calls = Arc::new(AtomicUsize::new(0));
+        let tool = tool_with_counting_resolver(
             test_security(tmp.path().to_path_buf(), AutonomyLevel::Full),
             config,
-            true,
-            Vec::<String>::new,
-            move || snapshot_prefixes.clone(),
-            endpoint_resolver,
+            Arc::clone(&resolver_calls),
         );
         let err = tool
             .validate_endpoint_host("http://internal.example.com/x")
@@ -2725,6 +2717,11 @@ mod tests {
         assert!(
             err.contains("nat64_prefixes") && err.contains("not-a-cidr"),
             "dispatch must reject the malformed nat64_prefixes entry with a field-specific error; got: {err}"
+        );
+        assert_eq!(
+            resolver_calls.load(Ordering::SeqCst),
+            0,
+            "a malformed nat64_prefixes config must fail closed before any resolver I/O"
         );
     }
 
@@ -2756,6 +2753,8 @@ mod tests {
     /// Overlapping declarations must also fail the real dispatch boundary
     /// (not just the normalization helper), so a configured overlapping set
     /// can never reach the SSRF policy with an order-dependent classification.
+    /// The counting resolver is asserted untouched: overlapping configuration
+    /// must fail closed before any DNS I/O.
     #[tokio::test]
     async fn validate_endpoint_host_rejects_overlapping_nat64_prefixes_config() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2764,24 +2763,11 @@ mod tests {
             nat64_prefixes: vec!["2606:4700::/32".into(), "2606:4700:4700::/48".into()],
             ..FileDownloadConfig::default()
         };
-        let snapshot_prefixes = config.nat64_prefixes.clone();
-        // The resolver answer is irrelevant: `normalize_nat64_prefixes` runs
-        // before DNS at the dispatch boundary and must fail closed on the
-        // overlapping declarations alone.
-        let endpoint_resolver: EndpointResolver = Arc::new(
-            move |_host: String,
-                  _port: u16|
-                  -> Pin<Box<dyn Future<Output = ResolveResult> + Send>> {
-                Box::pin(async move { Ok(Vec::new()) })
-            },
-        );
-        let tool = FileDownloadTool::new_with_endpoint_resolver(
+        let resolver_calls = Arc::new(AtomicUsize::new(0));
+        let tool = tool_with_counting_resolver(
             test_security(tmp.path().to_path_buf(), AutonomyLevel::Full),
             config,
-            true,
-            Vec::<String>::new,
-            move || snapshot_prefixes.clone(),
-            endpoint_resolver,
+            Arc::clone(&resolver_calls),
         );
         let err = tool
             .validate_endpoint_host("http://internal.example.com/x")
@@ -2791,6 +2777,11 @@ mod tests {
             err.contains("overlap")
                 || (err.contains("2606:4700::/32") && err.contains("2606:4700:4700::/48")),
             "dispatch must fail closed on overlapping nat64_prefixes; got: {err}"
+        );
+        assert_eq!(
+            resolver_calls.load(Ordering::SeqCst),
+            0,
+            "overlapping nat64_prefixes must fail closed before any resolver I/O"
         );
     }
 
@@ -2813,21 +2804,11 @@ mod tests {
                 nat64_prefixes: raw,
                 ..FileDownloadConfig::default()
             };
-            let snapshot_prefixes = config.nat64_prefixes.clone();
-            let endpoint_resolver: EndpointResolver = Arc::new(
-                move |_host: String,
-                      _port: u16|
-                      -> Pin<Box<dyn Future<Output = ResolveResult> + Send>> {
-                    Box::pin(async move { Ok(Vec::new()) })
-                },
-            );
-            let tool = FileDownloadTool::new_with_endpoint_resolver(
+            let resolver_calls = Arc::new(AtomicUsize::new(0));
+            let tool = tool_with_counting_resolver(
                 test_security(tmp.path().to_path_buf(), AutonomyLevel::Full),
                 config,
-                true,
-                Vec::<String>::new,
-                move || snapshot_prefixes.clone(),
-                endpoint_resolver,
+                Arc::clone(&resolver_calls),
             );
             let err = tool
                 .validate_endpoint_host("http://internal.example.com/x")
@@ -2836,6 +2817,11 @@ mod tests {
             assert!(
                 err.contains("overlap") || err.contains("2606:4700:4700::/48"),
                 "dispatch must fail closed on equivalent same-length nat64_prefix aliases; got: {err}"
+            );
+            assert_eq!(
+                resolver_calls.load(Ordering::SeqCst),
+                0,
+                "equivalent same-length aliases must fail closed before any resolver I/O"
             );
         }
     }
