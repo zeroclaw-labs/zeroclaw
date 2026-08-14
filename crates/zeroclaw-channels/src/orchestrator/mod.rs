@@ -2871,6 +2871,26 @@ fn build_scope_override_summary(
     )
 }
 
+fn is_bare_model_picker_command(content: &str) -> bool {
+    let mut parts = content.split_whitespace();
+    let Some(command) = parts.next() else {
+        return false;
+    };
+    if parts.next().is_some() {
+        return false;
+    }
+    let mut command_parts = command.split('@');
+    let base = command_parts.next().unwrap_or_default();
+    let bot_name = command_parts.next();
+    command_parts.next().is_none()
+        && base.eq_ignore_ascii_case("/model")
+        && bot_name.is_none_or(|name| !name.is_empty())
+}
+
+fn scrub_native_model_picker_error(error: &anyhow::Error) -> String {
+    zeroclaw_runtime::security::scrub(&error.to_string())
+}
+
 async fn handle_runtime_command_if_needed(
     ctx: &ChannelRuntimeContext,
     msg: &zeroclaw_api::channel::ChannelMessage,
@@ -2887,6 +2907,48 @@ async fn handle_runtime_command_if_needed(
     let sender_key = conversation_history_key(msg);
     let defaults_snapshot = runtime_defaults_snapshot(ctx);
     let mut current = get_route_selection(ctx, msg, &sender_key, &defaults_snapshot);
+
+    if command == ChannelRuntimeCommand::ShowModel && is_bare_model_picker_command(&msg.content) {
+        let request = zeroclaw_api::channel::ChannelModelPickerRequest {
+            requesting_user: msg.sender.clone(),
+            requesting_user_id: msg.platform_sender_id.clone().unwrap_or_default(),
+            reply_target: msg.reply_target.clone(),
+            thread_ts: msg.thread_ts.clone(),
+            channel_alias: msg
+                .channel_alias
+                .clone()
+                .unwrap_or_else(|| msg.channel.clone()),
+            owner_agent_alias: ctx.agent_alias.as_str().to_string(),
+            current_model_provider: current.model_provider.clone(),
+            current_model: current.model.clone(),
+            model_routes: ctx
+                .model_routes
+                .iter()
+                .map(|route| zeroclaw_api::channel::ChannelModelPickerRoute {
+                    hint: route.hint.clone(),
+                    model_provider: route.model_provider.clone(),
+                    model: route.model.clone(),
+                })
+                .collect(),
+        };
+        match channel.present_model_picker(&request).await {
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(err) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "channel": msg.channel.as_str(),
+                            "channel_alias": request.channel_alias.as_str(),
+                            "error": scrub_native_model_picker_error(&err),
+                        })),
+                    "Native model picker failed; falling back to text response"
+                );
+            }
+        }
+    }
 
     let response = match command {
         ChannelRuntimeCommand::ShowProviders => build_providers_help_response(&current),
@@ -12560,6 +12622,54 @@ temperature = 0.3
     /// Identity is checked via `Arc::ptr_eq`, not by inspecting fields.
     struct NamedMockChannel {
         name: &'static str,
+    }
+
+    #[derive(Default)]
+    struct ModelPickerRecordingChannel {
+        requests: tokio::sync::Mutex<Vec<zeroclaw_api::channel::ChannelModelPickerRequest>>,
+        sent_messages: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ModelPickerRecordingChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Telegram,
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "main"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for ModelPickerRecordingChannel {
+        fn name(&self) -> &str {
+            "telegram"
+        }
+
+        async fn send(&self, message: &zeroclaw_api::channel::SendMessage) -> anyhow::Result<()> {
+            self.sent_messages
+                .lock()
+                .await
+                .push(message.content.clone());
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn present_model_picker(
+            &self,
+            request: &zeroclaw_api::channel::ChannelModelPickerRequest,
+        ) -> anyhow::Result<bool> {
+            self.requests.lock().await.push(request.clone());
+            Ok(true)
+        }
     }
 
     impl ::zeroclaw_api::attribution::Attributable for NamedMockChannel {
@@ -23100,6 +23210,26 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(parse_runtime_command("telegram", "/clear all"), None);
     }
 
+    #[test]
+    fn native_model_picker_is_limited_to_the_bare_model_command() {
+        assert!(is_bare_model_picker_command("/model"));
+        assert!(is_bare_model_picker_command(" /MODEL@zeroclaw_bot "));
+        assert!(!is_bare_model_picker_command("/model fast"));
+        assert!(!is_bare_model_picker_command("/model --help"));
+        assert!(!is_bare_model_picker_command("/models"));
+    }
+
+    #[test]
+    fn native_model_picker_errors_are_scrubbed_before_logging() {
+        let error = anyhow::Error::msg(
+            "request failed for https://api.telegram.org/bot123456:ABC-def_GHI/sendMessage",
+        );
+        let scrubbed = scrub_native_model_picker_error(&error);
+
+        assert!(scrubbed.contains("[REDACTED_BOT_TOKEN]"));
+        assert!(!scrubbed.contains("123456:ABC-def_GHI"));
+    }
+
     // Build a ChannelRuntimeContext with a Config that has peer_groups
     // populated for the agent-scope authorization tests below. Mirrors
     // `channel_runtime_context_for_defaults_test` but lets the caller
@@ -23470,6 +23600,107 @@ BTC is currently around $65,000 based on latest tool output."#
             content: "/model --agent gpt-4o".into(),
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn bare_model_picker_command_uses_current_session_route() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut ctx = channel_runtime_context_for_defaults_test(
+            tmp.path(),
+            "agentX",
+            "openrouter.default",
+            "config-model",
+        );
+        ctx.model_routes = Arc::new(vec![zeroclaw_config::schema::ModelRouteConfig {
+            hint: "fast".into(),
+            model_provider: "anthropic.work".into(),
+            model: "claude-sonnet-4-5".into(),
+            api_key: None,
+        }]);
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            id: "message-7".into(),
+            sender: "test_user".into(),
+            platform_sender_id: Some("123".into()),
+            reply_target: "chat-42".into(),
+            channel: "telegram".into(),
+            channel_alias: Some("main".into()),
+            thread_ts: Some("thread-9".into()),
+            content: "/model".into(),
+            ..Default::default()
+        };
+        let sender_key = conversation_history_key(&msg);
+        ctx.route_overrides.lock().unwrap().insert(
+            sender_key,
+            ChannelRouteSelection {
+                model_provider: "anthropic.work".into(),
+                model: "claude-sonnet-4-5".into(),
+                api_key: None,
+            },
+        );
+        let channel_impl = Arc::new(ModelPickerRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let handled = handle_runtime_command_if_needed(&ctx, &msg, Some(&channel)).await;
+
+        assert!(handled);
+        assert!(channel_impl.sent_messages.lock().await.is_empty());
+        let requests = channel_impl.requests.lock().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].requesting_user, "test_user");
+        assert_eq!(requests[0].requesting_user_id, "123");
+        assert_eq!(requests[0].reply_target, "chat-42");
+        assert_eq!(requests[0].thread_ts.as_deref(), Some("thread-9"));
+        assert_eq!(requests[0].channel_alias, "main");
+        assert_eq!(requests[0].owner_agent_alias, "agentX");
+        assert_eq!(requests[0].current_model_provider, "anthropic.work");
+        assert_eq!(requests[0].current_model, "claude-sonnet-4-5");
+        assert_eq!(requests[0].model_routes.len(), 1);
+        assert_eq!(requests[0].model_routes[0].hint, "fast");
+        assert_eq!(requests[0].model_routes[0].model_provider, "anthropic.work");
+        assert_eq!(requests[0].model_routes[0].model, "claude-sonnet-4-5");
+    }
+
+    #[tokio::test]
+    async fn model_picker_selection_command_keeps_existing_session_semantics() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut ctx = channel_runtime_context_for_defaults_test(
+            tmp.path(),
+            "agentX",
+            "openrouter.default",
+            "config-model",
+        );
+        ctx.model_routes = Arc::new(vec![zeroclaw_config::schema::ModelRouteConfig {
+            hint: "fast".into(),
+            model_provider: "anthropic.work".into(),
+            model: "claude-sonnet-4-5".into(),
+            api_key: None,
+        }]);
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            id: "message-8".into(),
+            sender: "test_user".into(),
+            reply_target: "chat-42".into(),
+            channel: "telegram".into(),
+            channel_alias: Some("main".into()),
+            content: "/model fast".into(),
+            ..Default::default()
+        };
+        let channel_impl = Arc::new(ModelPickerRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let handled = handle_runtime_command_if_needed(&ctx, &msg, Some(&channel)).await;
+
+        assert!(handled);
+        assert!(channel_impl.requests.lock().await.is_empty());
+        assert_eq!(channel_impl.sent_messages.lock().await.len(), 1);
+        let route = ctx
+            .route_overrides
+            .lock()
+            .unwrap()
+            .get(&conversation_history_key(&msg))
+            .cloned()
+            .expect("selection remains a per-sender session override");
+        assert_eq!(route.model_provider, "anthropic.work");
+        assert_eq!(route.model, "claude-sonnet-4-5");
     }
 
     #[tokio::test]
@@ -25499,6 +25730,7 @@ BTC is currently around $65,000 based on latest tool output."#
             zeroclaw_api::channel::ChannelMessage {
                 id: "msg-image-1".to_string(),
                 sender: "alice".to_string(),
+                platform_sender_id: None,
                 reply_target: "chat-image".to_string(),
                 content: "please inspect this".to_string(),
                 channel: "test-channel".into(),
@@ -27346,6 +27578,7 @@ This is an example JSON object for profile settings."#;
             zeroclaw_api::channel::ChannelMessage {
                 id: "msg-image-route".to_string(),
                 sender: "alice".to_string(),
+                platform_sender_id: None,
                 reply_target: "chat-image-route".to_string(),
                 content: "please inspect this".to_string(),
                 channel: "test-channel".into(),

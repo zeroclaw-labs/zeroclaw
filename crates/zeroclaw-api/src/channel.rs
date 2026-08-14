@@ -331,6 +331,10 @@ pub enum ChannelConversationScope {
 pub struct ChannelMessage {
     pub id: String,
     pub sender: String,
+    /// Immutable sender identifier assigned by the channel platform, when
+    /// available. Display names and usernames remain in `sender` so existing
+    /// session semantics are unchanged.
+    pub platform_sender_id: Option<String>,
     pub reply_target: String,
     pub content: String,
     pub channel: String,
@@ -610,6 +614,36 @@ pub struct ForgeApiResponse {
     pub body: serde_json::Value,
 }
 
+/// Runtime-owned state needed by a channel to present its native model picker.
+///
+/// The picker is presentation only: a selected option must re-enter the
+/// channel runtime through the existing `/model <ref>` command path so model
+/// resolution and session scoping keep a single owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelModelPickerRequest {
+    pub requesting_user: String,
+    pub requesting_user_id: String,
+    pub reply_target: String,
+    pub thread_ts: Option<String>,
+    pub channel_alias: String,
+    pub owner_agent_alias: String,
+    pub current_model_provider: String,
+    pub current_model: String,
+    /// Restart-scoped route snapshot used by the channel runtime to resolve
+    /// `/model <ref>`. Native pickers must not offer routes outside this set.
+    pub model_routes: Vec<ChannelModelPickerRoute>,
+}
+
+/// Provider/model route identity exposed to a channel-native model picker.
+///
+/// API keys stay runtime-owned and are deliberately excluded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelModelPickerRoute {
+    pub hint: String,
+    pub model_provider: String,
+    pub model: String,
+}
+
 /// Core channel trait — implement for any messaging platform.
 ///
 /// Every `Channel` is `Attributable`: the orchestrator's spawn site opens
@@ -629,6 +663,18 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
     /// Check if channel is healthy
     async fn health_check(&self) -> bool {
         true
+    }
+
+    /// Present a channel-native model picker for a bare `/model` command.
+    ///
+    /// Returns `true` when the channel handled the request. The default keeps
+    /// the existing text response for every channel that does not implement a
+    /// native picker.
+    async fn present_model_picker(
+        &self,
+        _request: &ChannelModelPickerRequest,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
     }
 
     /// Send a discrete-choice prompt with options.
