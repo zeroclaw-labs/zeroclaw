@@ -543,8 +543,11 @@ struct InboundTurn {
 /// A receive-order position reserved before post-hook routing is known.
 ///
 /// Hooks may run concurrently, but their final lane admissions are committed
-/// in this order. A slow earlier hook therefore cannot be overtaken when two
-/// source conversations converge onto one post-hook history key.
+/// in receive order within each source conversation, and hook-rerouted
+/// admissions are additionally committed against the global resolution
+/// frontier, so a slow earlier hook cannot be overtaken when two source
+/// conversations converge onto one post-hook history key. A conversation
+/// never waits on another conversation's debounce window or hook.
 enum InboundSlot {
     Ready(InboundTurn),
     Debounced {
@@ -553,39 +556,143 @@ enum InboundSlot {
     },
 }
 
-/// Orders final lane admission without serializing hook execution.
+/// Orders final lane admission without serializing hook execution and
+/// without a process-wide head-of-line barrier.
+///
+/// Two scopes compose the ordering contract:
+///
+/// - Every turn holds a slot in the admission chain of its **source
+///   conversation** (its pre-hook history key). A turn commits only after
+///   its chain predecessors committed or dropped, so debounce windows and
+///   slow hooks cannot reorder one conversation's turns, while a delayed
+///   turn in one conversation never delays admission in another.
+/// - A turn whose hook rewrote its route additionally waits for the
+///   **global resolution frontier**: every earlier-received turn, in any
+///   conversation, has committed or dropped. Rerouting is what lets two
+///   source conversations converge onto one history, so only rerouted
+///   turns pay for cross-conversation ordering; ordinary traffic never
+///   blocks behind an unrelated conversation.
+///
+/// One ordering is deliberately not promised: a turn a hook folds into a
+/// destination may land behind a later-received turn that already lives in
+/// that destination natively, because the resident turn commits without
+/// waiting for unresolved reroutes elsewhere. Closing that window would
+/// require every ordinary message to wait for every unresolved hook, which
+/// is exactly the global barrier this registry exists to avoid.
 struct IngressOrderRegistry {
-    next_sequence: AtomicU64,
     state: Mutex<IngressOrderState>,
     changed: tokio::sync::Notify,
 }
 
 struct IngressOrderState {
+    /// Next global receive sequence to hand out.
+    next_sequence: u64,
+    /// Global resolution frontier: every turn received before this sequence
+    /// committed or dropped. Only hook-rerouted admissions wait on it.
     next_commit: u64,
     completed_out_of_order: BTreeSet<u64>,
+    /// Per-source-conversation admission chains. An entry exists only while
+    /// its conversation has turns between receipt and admission.
+    chains: HashMap<String, IngressChainState>,
+}
+
+struct IngressChainState {
+    next_sequence: u64,
+    next_commit: u64,
+    completed_out_of_order: BTreeSet<u64>,
+}
+
+/// Advance a commit frontier past `sequence`, holding out-of-order
+/// completions until the gap before them closes.
+fn advance_commit_frontier(
+    next_commit: &mut u64,
+    completed_out_of_order: &mut BTreeSet<u64>,
+    sequence: u64,
+) {
+    if sequence < *next_commit {
+        return;
+    }
+    if sequence == *next_commit {
+        *next_commit += 1;
+        while {
+            let next = *next_commit;
+            completed_out_of_order.remove(&next)
+        } {
+            *next_commit += 1;
+        }
+    } else {
+        completed_out_of_order.insert(sequence);
+    }
 }
 
 impl IngressOrderRegistry {
     fn new() -> Arc<Self> {
         Arc::new(Self {
-            next_sequence: AtomicU64::new(1),
             state: Mutex::new(IngressOrderState {
+                next_sequence: 1,
                 next_commit: 1,
                 completed_out_of_order: BTreeSet::new(),
+                chains: HashMap::new(),
             }),
             changed: tokio::sync::Notify::new(),
         })
     }
 
-    fn register(self: &Arc<Self>) -> IngressOrderRegistration {
+    fn register(self: &Arc<Self>, source_key: &str) -> IngressOrderRegistration {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let sequence = state.next_sequence;
+        state.next_sequence += 1;
+        let chain = state
+            .chains
+            .entry(source_key.to_string())
+            .or_insert_with(|| IngressChainState {
+                next_sequence: 1,
+                next_commit: 1,
+                completed_out_of_order: BTreeSet::new(),
+            });
+        let chain_sequence = chain.next_sequence;
+        chain.next_sequence += 1;
+        drop(state);
         IngressOrderRegistration {
             registry: Arc::clone(self),
-            sequence: self.next_sequence.fetch_add(1, Ordering::Relaxed),
+            source_key: source_key.to_string(),
+            sequence,
+            chain_sequence,
             completed: false,
         }
     }
 
-    async fn wait_turn(&self, sequence: u64) {
+    /// Wait until every earlier turn of the same source conversation has
+    /// committed or dropped.
+    async fn wait_conversation_turn(&self, source_key: &str, chain_sequence: u64) {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+
+            let ready = self
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .chains
+                .get(source_key)
+                // A chain entry is retained until all of its slots commit,
+                // so it cannot be missing while this slot is live; if the
+                // invariant ever breaks, degrade to ordering loss, not to a
+                // hang.
+                .is_none_or(|chain| chain.next_commit == chain_sequence);
+            if ready {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    /// Wait until every earlier-received turn, in any conversation, has
+    /// committed or dropped. Only hook-rerouted admissions wait here; the
+    /// frontier subsumes the caller's own chain, whose predecessors were
+    /// received earlier by construction.
+    async fn wait_global_turn(&self, sequence: u64) {
         loop {
             let changed = self.changed.notified();
             tokio::pin!(changed);
@@ -604,21 +711,24 @@ impl IngressOrderRegistry {
         }
     }
 
-    fn complete(&self, sequence: u64) {
+    fn complete(&self, source_key: &str, sequence: u64, chain_sequence: u64) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if sequence < state.next_commit {
-            return;
-        }
-        if sequence == state.next_commit {
-            state.next_commit += 1;
-            while {
-                let next = state.next_commit;
-                state.completed_out_of_order.remove(&next)
-            } {
-                state.next_commit += 1;
+        let mut completed_out_of_order = std::mem::take(&mut state.completed_out_of_order);
+        advance_commit_frontier(
+            &mut state.next_commit,
+            &mut completed_out_of_order,
+            sequence,
+        );
+        state.completed_out_of_order = completed_out_of_order;
+        if let Some(chain) = state.chains.get_mut(source_key) {
+            advance_commit_frontier(
+                &mut chain.next_commit,
+                &mut chain.completed_out_of_order,
+                chain_sequence,
+            );
+            if chain.next_commit == chain.next_sequence {
+                state.chains.remove(source_key);
             }
-        } else {
-            state.completed_out_of_order.insert(sequence);
         }
         drop(state);
         self.changed.notify_waiters();
@@ -629,17 +739,34 @@ impl IngressOrderRegistry {
 /// early drop marks the position skipped so later routed turns cannot hang.
 struct IngressOrderRegistration {
     registry: Arc<IngressOrderRegistry>,
+    /// The pre-hook history key whose admission chain this turn reserved.
+    source_key: String,
     sequence: u64,
+    chain_sequence: u64,
     completed: bool,
 }
 
 impl IngressOrderRegistration {
-    async fn wait_turn(&self) {
-        self.registry.wait_turn(self.sequence).await;
+    fn source_key(&self) -> &str {
+        &self.source_key
+    }
+
+    /// Wait for this turn's admission slot: its source-conversation chain,
+    /// widened to the global resolution frontier when the hook rerouted the
+    /// turn into a different conversation.
+    async fn wait_admission(&self, rerouted: bool) {
+        if rerouted {
+            self.registry.wait_global_turn(self.sequence).await;
+        } else {
+            self.registry
+                .wait_conversation_turn(&self.source_key, self.chain_sequence)
+                .await;
+        }
     }
 
     fn finish(mut self) {
-        self.registry.complete(self.sequence);
+        self.registry
+            .complete(&self.source_key, self.sequence, self.chain_sequence);
         self.completed = true;
     }
 }
@@ -647,7 +774,8 @@ impl IngressOrderRegistration {
 impl Drop for IngressOrderRegistration {
     fn drop(&mut self) {
         if !self.completed {
-            self.registry.complete(self.sequence);
+            self.registry
+                .complete(&self.source_key, self.sequence, self.chain_sequence);
             self.completed = true;
         }
     }
@@ -740,6 +868,11 @@ const CONVERSATION_LANE_BACKLOG_LIMIT: usize = 32;
 /// Maximum ordinary turns retained anywhere behind the dispatcher, including
 /// unresolved hooks, debounce buckets, running turns, and every lane queue.
 const GLOBAL_PENDING_TURN_LIMIT: usize = 100;
+
+/// Busy notifications are best-effort overload telemetry, not work that must
+/// be queued.  Keeping one send in flight bounds detached work when a sender
+/// keeps posting after the aggregate admission budget is exhausted.
+const MAX_CONCURRENT_BUSY_NOTICES: usize = 1;
 
 impl ConversationLaneRegistry {
     fn new(semaphore: Arc<tokio::sync::Semaphore>) -> Arc<Self> {
@@ -929,6 +1062,8 @@ fn send_conversation_busy(
     ctx: &Arc<ChannelRuntimeContext>,
     msg: &zeroclaw_api::channel::ChannelMessage,
     reason: &'static str,
+    busy_notice_budget: &Arc<tokio::sync::Semaphore>,
+    busy_notice_tasks: &Arc<IngressTaskTracker>,
 ) {
     ::zeroclaw_log::record!(
         WARN,
@@ -944,22 +1079,36 @@ fn send_conversation_busy(
     if msg.passive_context {
         return;
     }
+    // Do not enqueue a notification behind an earlier slow send.  The
+    // overload condition is already recorded above, and one in-flight notice
+    // is enough to tell a human that this runtime is saturated.
+    let Ok(notice_permit) = Arc::clone(busy_notice_budget).try_acquire_owned() else {
+        return;
+    };
     if let Some(channel) = find_channel_for_message(&ctx.channels_by_name, msg).cloned() {
         let reply =
             zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-conversation-busy");
         let reply_target = msg.reply_target.clone();
         let thread_ts = msg.thread_ts.clone();
+        let tracked_task = busy_notice_tasks.track();
         zeroclaw_spawn::spawn!(async move {
+            let _notice_permit = notice_permit;
             let _ = channel
                 .send(&SendMessage::new(reply, &reply_target).in_thread(thread_ts))
                 .await;
+            drop(tracked_task);
         });
     }
 }
 
 /// Resolve debounce content and the modifying inbound hook concurrently, then
 /// commit final lane admission in transport receive order.
-async fn route_inbound_slot(lanes: Arc<ConversationLaneRegistry>, slot: InboundSlot) {
+async fn route_inbound_slot(
+    lanes: Arc<ConversationLaneRegistry>,
+    busy_notice_budget: Arc<tokio::sync::Semaphore>,
+    busy_notice_tasks: Arc<IngressTaskTracker>,
+    slot: InboundSlot,
+) {
     let InboundTurn { mut turn, order } = match slot {
         InboundSlot::Ready(turn) => turn,
         InboundSlot::Debounced { mut turn, content } => match content.await {
@@ -985,9 +1134,10 @@ async fn route_inbound_slot(lanes: Arc<ConversationLaneRegistry>, slot: InboundS
     };
     turn.msg = hooked;
 
+    let routed_key = conversation_history_key(&turn.msg);
     // Hooks run concurrently, but final route admission is an ordered commit.
     // Waiting here holds neither an execution permit nor a conversation lane.
-    order.wait_turn().await;
+    order.wait_admission(routed_key != order.source_key()).await;
     if turn
         .registration
         .as_ref()
@@ -996,9 +1146,14 @@ async fn route_inbound_slot(lanes: Arc<ConversationLaneRegistry>, slot: InboundS
         return;
     }
 
-    let routed_key = conversation_history_key(&turn.msg);
     if let Err(refused) = lanes.enqueue(&routed_key, turn) {
-        send_conversation_busy(&refused.ctx, &refused.msg, "conversation_backlog");
+        send_conversation_busy(
+            &refused.ctx,
+            &refused.msg,
+            "conversation_backlog",
+            &busy_notice_budget,
+            &busy_notice_tasks,
+        );
     }
     order.finish();
 }
@@ -1006,10 +1161,17 @@ async fn route_inbound_slot(lanes: Arc<ConversationLaneRegistry>, slot: InboundS
 fn spawn_inbound_routing(
     lanes: Arc<ConversationLaneRegistry>,
     tracker: &Arc<IngressTaskTracker>,
+    busy_notice_budget: Arc<tokio::sync::Semaphore>,
+    busy_notice_tasks: Arc<IngressTaskTracker>,
     slot: InboundSlot,
 ) {
     let tracked_task = tracker.track();
-    let worker = zeroclaw_spawn::spawn!(route_inbound_slot(lanes, slot));
+    let worker = zeroclaw_spawn::spawn!(route_inbound_slot(
+        lanes,
+        busy_notice_budget,
+        busy_notice_tasks,
+        slot
+    ));
     zeroclaw_spawn::spawn!(async move {
         log_worker_join_result(worker.await);
         drop(tracked_task);
@@ -8121,6 +8283,8 @@ async fn run_message_dispatch_loop(
 ) {
     let semaphore = Arc::new(tokio::sync::Semaphore::new(max_in_flight_messages));
     let pending_budget = Arc::new(tokio::sync::Semaphore::new(GLOBAL_PENDING_TURN_LIMIT));
+    let busy_notice_budget = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_BUSY_NOTICES));
+    let busy_notice_tasks = IngressTaskTracker::new();
     let in_flight_by_sender = Arc::new(Mutex::new(
         HashMap::<String, Vec<InFlightSenderTaskState>>::new(),
     ));
@@ -8248,7 +8412,13 @@ async fn run_message_dispatch_loop(
         let pending_work = match Arc::clone(&pending_budget).try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
-                send_conversation_busy(&ctx, &msg, "global_pending_work");
+                send_conversation_busy(
+                    &ctx,
+                    &msg,
+                    "global_pending_work",
+                    &busy_notice_budget,
+                    &busy_notice_tasks,
+                );
                 continue;
             }
         };
@@ -8315,6 +8485,7 @@ async fn run_message_dispatch_loop(
                     let registration =
                         register_inbound_turn(&ctx, &msg, &in_flight_by_sender, &task_sequence)
                             .await;
+                    let source_key = conversation_history_key(&msg);
                     let inbound = InboundTurn {
                         turn: Box::new(PendingTurn {
                             ctx: Arc::clone(&ctx),
@@ -8322,11 +8493,13 @@ async fn run_message_dispatch_loop(
                             registration,
                             pending_work,
                         }),
-                        order: ingress_order.register(),
+                        order: ingress_order.register(&source_key),
                     };
                     spawn_inbound_routing(
                         Arc::clone(&lanes),
                         &ingress_tasks,
+                        Arc::clone(&busy_notice_budget),
+                        Arc::clone(&busy_notice_tasks),
                         InboundSlot::Debounced {
                             turn: inbound,
                             content,
@@ -8348,9 +8521,12 @@ async fn run_message_dispatch_loop(
         // so the loop remains free to receive `/stop` and interruptions.
         let registration =
             register_inbound_turn(&ctx, &msg, &in_flight_by_sender, &task_sequence).await;
+        let source_key = conversation_history_key(&msg);
         spawn_inbound_routing(
             Arc::clone(&lanes),
             &ingress_tasks,
+            Arc::clone(&busy_notice_budget),
+            Arc::clone(&busy_notice_tasks),
             InboundSlot::Ready(InboundTurn {
                 turn: Box::new(PendingTurn {
                     ctx: Arc::clone(&ctx),
@@ -8358,13 +8534,14 @@ async fn run_message_dispatch_loop(
                     registration,
                     pending_work,
                 }),
-                order: ingress_order.register(),
+                order: ingress_order.register(&source_key),
             }),
         );
     }
 
     ingress_tasks.wait_drained().await;
     lanes.wait_drained().await;
+    busy_notice_tasks.wait_drained().await;
 }
 
 fn normalize_telegram_identity(value: &str) -> String {
@@ -15384,6 +15561,13 @@ api_key = "anthropic-key"
     }
 
     #[derive(Default)]
+    struct SlowBusyChannel {
+        sent_messages: tokio::sync::Mutex<Vec<String>>,
+        busy_in_flight: AtomicUsize,
+        max_busy_in_flight: AtomicUsize,
+    }
+
+    #[derive(Default)]
     struct SlackRecordingChannel {
         sent_messages: tokio::sync::Mutex<Vec<String>>,
     }
@@ -15404,6 +15588,17 @@ api_key = "anthropic-key"
         }
     }
 
+    impl ::zeroclaw_api::attribution::Attributable for SlowBusyChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+        fn alias(&self) -> &str {
+            "slow-busy-test"
+        }
+    }
+
     #[async_trait::async_trait]
     impl Channel for TelegramRecordingChannel {
         fn name(&self) -> &str {
@@ -15411,6 +15606,45 @@ api_key = "anthropic-key"
         }
 
         async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            self.sent_messages
+                .lock()
+                .await
+                .push(format!("{}:{}", message.recipient, message.content));
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for SlowBusyChannel {
+        fn name(&self) -> &str {
+            "telegram"
+        }
+
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            let busy = zeroclaw_runtime::i18n::get_required_cli_string(
+                "channel-runtime-conversation-busy",
+            );
+            if message.content == busy {
+                let current = self.busy_in_flight.fetch_add(1, Ordering::AcqRel) + 1;
+                self.max_busy_in_flight.fetch_max(current, Ordering::AcqRel);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                self.busy_in_flight.fetch_sub(1, Ordering::AcqRel);
+            }
             self.sent_messages
                 .lock()
                 .await
@@ -24332,21 +24566,13 @@ BTC is currently around $65,000 based on latest tool output."#
         // closed, so the conversation retains at most limit + 1 accepted
         // turns and everything past that must have been refused.
         assert!(
-            refused >= 2,
-            "the flood must overflow the backlog limit and be refused: \
-             {refused} refused of {} sent: {sent:?}",
-            sent.len()
-        );
-        assert!(
             completed <= CONVERSATION_LANE_BACKLOG_LIMIT + 1,
             "a conversation must never retain more than its bounded backlog: \
              {completed} completed"
         );
-        assert_eq!(
-            refused + completed,
-            flood,
-            "every flooded message must either complete or be refused with \
-             a notice: {sent:?}"
+        assert!(
+            refused <= flood - completed,
+            "busy notices may be coalesced, but cannot exceed rejected work: {sent:?}"
         );
         assert!(
             completed >= CONVERSATION_LANE_BACKLOG_LIMIT,
@@ -24415,8 +24641,8 @@ BTC is currently around $65,000 based on latest tool output."#
             .filter(|message| message.contains("message_id=m"))
             .count();
         assert!(
-            refused >= flood - GLOBAL_PENDING_TURN_LIMIT,
-            "work beyond the global pending limit must be refused: {sent:?}"
+            refused <= flood - GLOBAL_PENDING_TURN_LIMIT,
+            "busy notices may be coalesced, but cannot exceed rejected work: {sent:?}"
         );
         assert!(
             completed <= GLOBAL_PENDING_TURN_LIMIT,
@@ -24425,6 +24651,62 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             sent.iter().any(|message| message.ends_with(&stop_sent)),
             "/stop must bypass a saturated ordinary-work budget: {sent:?}"
+        );
+    }
+
+    /// Refusing a flood must not turn into an unbounded detached outbound
+    /// flood when the channel's send operation is slow.  A regular response
+    /// remains independently deliverable while the single busy notice waits.
+    #[tokio::test]
+    async fn busy_notices_are_coalesced_while_send_is_slow() {
+        let channel_impl = Arc::new(SlowBusyChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(SlowModelProvider {
+                delay: Duration::from_millis(1),
+            }),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        let budget = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_BUSY_NOTICES));
+        let busy_tasks = IngressTaskTracker::new();
+        let msg = shared_topic_message("alice", "m1", "flooded");
+
+        for _ in 0..64 {
+            send_conversation_busy(&ctx, &msg, "test_flood", &budget, &busy_tasks);
+        }
+        tokio::task::yield_now().await;
+
+        // Normal replies do not use the busy-notice budget and therefore do
+        // not wait for its slow send to finish.
+        channel_impl
+            .send(&SendMessage::new("normal response", &msg.reply_target))
+            .await
+            .unwrap();
+        busy_tasks.wait_drained().await;
+
+        let busy =
+            zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-conversation-busy");
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(
+            sent.iter()
+                .filter(|message| message.ends_with(&busy))
+                .count(),
+            1,
+            "a busy flood must collapse to one in-flight send: {sent:?}"
+        );
+        assert!(
+            sent.iter()
+                .any(|message| message.ends_with("normal response")),
+            "normal outbound responses must recover independently: {sent:?}"
+        );
+        assert_eq!(
+            channel_impl.max_busy_in_flight.load(Ordering::Acquire),
+            1,
+            "there may never be more than one slow busy send in flight"
         );
     }
 
@@ -24782,6 +25064,25 @@ BTC is currently around $65,000 based on latest tool output."#
         }
     }
 
+    struct SlowOnlyHook;
+
+    #[async_trait::async_trait]
+    impl zeroclaw_runtime::hooks::HookHandler for SlowOnlyHook {
+        fn name(&self) -> &str {
+            "slow-only"
+        }
+
+        async fn on_message_received(
+            &self,
+            message: ChannelMessage,
+        ) -> zeroclaw_runtime::hooks::HookResult<ChannelMessage> {
+            if message.content.contains("slow hook") {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            zeroclaw_runtime::hooks::HookResult::Continue(message)
+        }
+    }
+
     /// Two distinct pre-hook routes converge onto one history while the
     /// earlier message's hook finishes last. Final lane admission must still
     /// follow transport receive order.
@@ -24846,6 +25147,54 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             turns[2].content.contains("fast hook second"),
             "the later receive must remain second: {turns:?}"
+        );
+    }
+
+    /// A stalled hook in one source conversation must not hold ordinary
+    /// traffic in another conversation at the ingress ordering frontier.
+    #[tokio::test]
+    async fn slow_hook_in_one_conversation_does_not_block_another() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut hooks = zeroclaw_runtime::hooks::HookRunner::new();
+        hooks.register(Box::new(SlowOnlyHook));
+        let ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(SlowModelProvider {
+                delay: Duration::from_millis(10),
+            }),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            Some(Arc::new(hooks)),
+        );
+
+        let mut slow = shared_topic_message("alice", "m1", "slow hook first");
+        slow.reply_target = "-1001111:11".into();
+        slow.thread_ts = Some("11".into());
+        let mut independent = shared_topic_message("bob", "m2", "ordinary other room");
+        independent.reply_target = "-1002222:22".into();
+        independent.thread_ts = Some("22".into());
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<ChannelMessage>(8);
+        let send_task = zeroclaw_spawn::spawn!(async move {
+            tx.send(slow).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            tx.send(independent).await.unwrap();
+        });
+
+        run_message_dispatch_loop(rx, AgentRouter::single(ctx), 4).await;
+        send_task.await.unwrap();
+
+        let sent = channel_impl.sent_messages.lock().await;
+        let position = |marker: &str| {
+            sent.iter()
+                .position(|message| message.contains(marker))
+                .unwrap_or_else(|| panic!("no reply for {marker}: {sent:?}"))
+        };
+        assert!(
+            position("message_id=m2") < position("message_id=m1"),
+            "the unrelated turn must not wait for the slow hook: {sent:?}"
         );
     }
 
@@ -25102,8 +25451,8 @@ BTC is currently around $65,000 based on latest tool output."#
             .filter(|message| message.ends_with(&busy))
             .collect();
         assert!(
-            busy_messages.len() >= 2,
-            "overflow at the post-hook destination must be visible: {sent:?}"
+            !busy_messages.is_empty(),
+            "overflow at the post-hook destination must remain visible after coalescing: {sent:?}"
         );
         assert!(
             busy_messages
