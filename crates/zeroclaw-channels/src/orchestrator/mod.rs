@@ -8210,14 +8210,14 @@ fn concurrent_persist_lock_serialization() {
 
     let ctx = Arc::new(ChannelRuntimeContext {
         channels_by_name: Arc::new(HashMap::new()),
-        model_provider: Arc::new(tests::DummyModelProvider),
+        model_provider: Arc::new(test_fixtures::DummyModelProvider),
         model_provider_ref: Arc::new("test".into()),
         agent_alias: Arc::new("test".into()),
         agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
-        memory: Arc::new(tests::NoopMemory),
+        memory: Arc::new(test_fixtures::NoopMemory),
         memory_strategy: Arc::new(
             zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
-                Arc::new(tests::NoopMemory),
+                Arc::new(test_fixtures::NoopMemory),
                 zeroclaw_config::schema::MemoryConfig::default(),
                 std::path::PathBuf::new(),
             ),
@@ -8341,4 +8341,7 @@ mod debounce_resolution_tests;
 #[cfg(test)]
 mod omitted_feature_tests;
 #[cfg(test)]
+mod test_fixtures;
+// Heavy suite gated so lib-test iteration does not pay 17.8k lines; CI channels leg enables it.
+#[cfg(all(test, feature = "heavy-tests"))]
 mod tests;

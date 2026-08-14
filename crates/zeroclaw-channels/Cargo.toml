@@ -276,6 +276,9 @@ channel-voice-call = []
 channel-acp-server = []
 channel-matrix = ["dep:matrix-sdk", "dep:mime_guess"]
 voice-wake = ["dep:cpal"]
+# Heavy orchestrator behavioral suite (17.8k lines). Gated so lib-test
+# iteration does not compile it; CI channels leg enables this feature.
+heavy-tests = []
 
 [dev-dependencies]
 axum = { version = "0.8", default-features = false, features = [

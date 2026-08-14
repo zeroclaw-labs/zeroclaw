@@ -550,8 +550,12 @@ jobs:
             echo "::error::No packages defined for test leg '$LEG' in dev/ci/test-partition.json"
             exit 1
           fi
-          echo "==> leg $LEG: cargo nextest run --locked $PKGS"
-          cargo nextest run --locked $PKGS
+          FEATURE_ARGS=""
+          if [ "$LEG" = "channels" ]; then
+            FEATURE_ARGS="--features zeroclaw-channels/heavy-tests"
+          fi
+          echo "==> leg $LEG: cargo nextest run --locked $PKGS $FEATURE_ARGS"
+          cargo nextest run --locked $PKGS $FEATURE_ARGS
       # The parallelism regression gate covers zeroclaw-runtime and
       # zeroclaw-channels; the channels leg already builds both crates, so it
       # runs there once instead of once per leg.
