@@ -874,6 +874,12 @@ const GLOBAL_PENDING_TURN_LIMIT: usize = 100;
 /// keeps posting after the aggregate admission budget is exhausted.
 const MAX_CONCURRENT_BUSY_NOTICES: usize = 1;
 
+/// `/stop` acknowledgements are user feedback, so several may be in flight
+/// at once, but they share the same hazard as busy notices: the command
+/// bypasses every admission budget, and a flood of it against a slow channel
+/// must not accumulate detached reply tasks without bound.
+const MAX_CONCURRENT_STOP_REPLIES: usize = 8;
+
 impl ConversationLaneRegistry {
     fn new(semaphore: Arc<tokio::sync::Semaphore>) -> Arc<Self> {
         Arc::new(Self {
@@ -8284,7 +8290,10 @@ async fn run_message_dispatch_loop(
     let semaphore = Arc::new(tokio::sync::Semaphore::new(max_in_flight_messages));
     let pending_budget = Arc::new(tokio::sync::Semaphore::new(GLOBAL_PENDING_TURN_LIMIT));
     let busy_notice_budget = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_BUSY_NOTICES));
-    let busy_notice_tasks = IngressTaskTracker::new();
+    let stop_reply_budget = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_STOP_REPLIES));
+    // Tracks every budgeted notice send (busy notices and `/stop` replies)
+    // so shutdown drains them instead of leaking detached sends.
+    let notice_tasks = IngressTaskTracker::new();
     let in_flight_by_sender = Arc::new(Mutex::new(
         HashMap::<String, Vec<InFlightSenderTaskState>>::new(),
     ));
@@ -8390,10 +8399,35 @@ async fn run_message_dispatch_loop(
             };
             let channel = find_channel_for_message(&ctx.channels_by_name, &msg).cloned();
             if let Some(channel) = channel {
-                let send_msg = stop_reply_message(&msg, reply);
-                zeroclaw_spawn::spawn!(async move {
-                    let _ = channel.send(&send_msg).await;
-                });
+                // `/stop` bypasses every admission budget so cancellation
+                // stays reachable, but its acknowledgement must not: a
+                // sender flooding `/stop` against a slow channel would
+                // otherwise accumulate detached reply tasks without bound.
+                // The cancellation above already ran; only the reply is
+                // skipped when the budget is exhausted.
+                match Arc::clone(&stop_reply_budget).try_acquire_owned() {
+                    Ok(reply_permit) => {
+                        let send_msg = stop_reply_message(&msg, reply);
+                        let tracked_task = notice_tasks.track();
+                        zeroclaw_spawn::spawn!(async move {
+                            let _reply_permit = reply_permit;
+                            let _ = channel.send(&send_msg).await;
+                            drop(tracked_task);
+                        });
+                    }
+                    Err(_) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"sender": msg.sender})),
+                            "stop executed without acknowledgement: reply budget exhausted"
+                        );
+                    }
+                }
             } else {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -8417,7 +8451,7 @@ async fn run_message_dispatch_loop(
                     &msg,
                     "global_pending_work",
                     &busy_notice_budget,
-                    &busy_notice_tasks,
+                    &notice_tasks,
                 );
                 continue;
             }
@@ -8499,7 +8533,7 @@ async fn run_message_dispatch_loop(
                         Arc::clone(&lanes),
                         &ingress_tasks,
                         Arc::clone(&busy_notice_budget),
-                        Arc::clone(&busy_notice_tasks),
+                        Arc::clone(&notice_tasks),
                         InboundSlot::Debounced {
                             turn: inbound,
                             content,
@@ -8526,7 +8560,7 @@ async fn run_message_dispatch_loop(
             Arc::clone(&lanes),
             &ingress_tasks,
             Arc::clone(&busy_notice_budget),
-            Arc::clone(&busy_notice_tasks),
+            Arc::clone(&notice_tasks),
             InboundSlot::Ready(InboundTurn {
                 turn: Box::new(PendingTurn {
                     ctx: Arc::clone(&ctx),
@@ -8541,7 +8575,7 @@ async fn run_message_dispatch_loop(
 
     ingress_tasks.wait_drained().await;
     lanes.wait_drained().await;
-    busy_notice_tasks.wait_drained().await;
+    notice_tasks.wait_drained().await;
 }
 
 fn normalize_telegram_identity(value: &str) -> String {
@@ -15639,10 +15673,17 @@ api_key = "anthropic-key"
             let busy = zeroclaw_runtime::i18n::get_required_cli_string(
                 "channel-runtime-conversation-busy",
             );
-            if message.content == busy {
+            let stop_sent =
+                zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-stop-sent");
+            let stop_no_task =
+                zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-stop-no-task");
+            if message.content == busy
+                || message.content == stop_sent
+                || message.content == stop_no_task
+            {
                 let current = self.busy_in_flight.fetch_add(1, Ordering::AcqRel) + 1;
                 self.max_busy_in_flight.fetch_max(current, Ordering::AcqRel);
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
                 self.busy_in_flight.fetch_sub(1, Ordering::AcqRel);
             }
             self.sent_messages
@@ -24571,6 +24612,10 @@ BTC is currently around $65,000 based on latest tool output."#
              {completed} completed"
         );
         assert!(
+            refused >= 1,
+            "the overflow must be visible through at least one notice: {sent:?}"
+        );
+        assert!(
             refused <= flood - completed,
             "busy notices may be coalesced, but cannot exceed rejected work: {sent:?}"
         );
@@ -24641,6 +24686,10 @@ BTC is currently around $65,000 based on latest tool output."#
             .filter(|message| message.contains("message_id=m"))
             .count();
         assert!(
+            refused >= 1,
+            "saturation must be visible through at least one notice: {sent:?}"
+        );
+        assert!(
             refused <= flood - GLOBAL_PENDING_TURN_LIMIT,
             "busy notices may be coalesced, but cannot exceed rejected work: {sent:?}"
         );
@@ -24707,6 +24756,60 @@ BTC is currently around $65,000 based on latest tool output."#
             channel_impl.max_busy_in_flight.load(Ordering::Acquire),
             1,
             "there may never be more than one slow busy send in flight"
+        );
+    }
+
+    /// `/stop` bypasses the admission budgets so cancellation stays
+    /// reachable, which makes its acknowledgement the part that must be
+    /// bounded: a stop flood against a slow channel may not accumulate an
+    /// unbounded number of detached reply tasks. The stop itself still
+    /// executes for every message; only excess acknowledgements are dropped.
+    #[tokio::test]
+    async fn stop_flood_keeps_reply_tasks_bounded() {
+        let channel_impl = Arc::new(SlowBusyChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(SlowModelProvider {
+                delay: Duration::from_millis(1),
+            }),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<ChannelMessage>(8);
+        let send_task = zeroclaw_spawn::spawn!(async move {
+            for i in 0..(MAX_CONCURRENT_STOP_REPLIES * 4) {
+                tx.send(shared_topic_message("alice", &format!("s{i}"), "/stop"))
+                    .await
+                    .unwrap();
+            }
+        });
+
+        run_message_dispatch_loop(rx, AgentRouter::single(ctx), 4).await;
+        send_task.await.unwrap();
+
+        let stop_no_task =
+            zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-stop-no-task");
+        let sent = channel_impl.sent_messages.lock().await;
+        let acknowledged = sent
+            .iter()
+            .filter(|message| message.ends_with(&stop_no_task))
+            .count();
+        assert!(
+            acknowledged >= 1,
+            "a stop flood must still be acknowledged at least once: {sent:?}"
+        );
+        assert!(
+            channel_impl.max_busy_in_flight.load(Ordering::Acquire) <= MAX_CONCURRENT_STOP_REPLIES,
+            "stop replies in flight must respect their budget"
+        );
+        assert!(
+            acknowledged <= MAX_CONCURRENT_STOP_REPLIES,
+            "acknowledgements beyond the in-flight budget must be dropped, \
+             not queued: {acknowledged}"
         );
     }
 
@@ -25195,6 +25298,90 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             position("message_id=m2") < position("message_id=m1"),
             "the unrelated turn must not wait for the slow hook: {sent:?}"
+        );
+    }
+
+    /// An open debounce bucket reserves its admission slot when its first
+    /// message arrives, long before its timer resolves. That reservation
+    /// must not hold ordinary traffic in another conversation at the
+    /// ingress ordering frontier while the window keeps extending.
+    #[tokio::test]
+    async fn open_debounce_bucket_does_not_block_another_conversation() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let prompt_config = zeroclaw_config::schema::Config {
+            channels: zeroclaw_config::schema::ChannelsConfig {
+                debounce_ms: 1500,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(SlowModelProvider {
+                delay: Duration::from_millis(10),
+            }),
+            prompt_config,
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        let mut opener = shared_topic_message("alice", "a1", "first part");
+        opener.reply_target = "-1001111:11".into();
+        opener.thread_ts = Some("11".into());
+        let mut extension = shared_topic_message("alice", "a2", "second part");
+        extension.reply_target = "-1001111:11".into();
+        extension.thread_ts = Some("11".into());
+        let mut extension_two = shared_topic_message("alice", "a3", "third part");
+        extension_two.reply_target = "-1001111:11".into();
+        extension_two.thread_ts = Some("11".into());
+        let mut independent = shared_topic_message("bob", "b1", "other room");
+        independent.reply_target = "-1002222:22".into();
+        independent.thread_ts = Some("22".into());
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<ChannelMessage>(8);
+        let probe = Arc::clone(&channel_impl);
+        let answered_while_bucket_open = Arc::new(AtomicBool::new(false));
+        let answered_probe = Arc::clone(&answered_while_bucket_open);
+        let send_task = zeroclaw_spawn::spawn!(async move {
+            let started = tokio::time::Instant::now();
+            tx.send(opener).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            tx.send(independent).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            // Alice's follow-ups re-arm her bucket: it cannot fire before
+            // ~2.8s, while Bob's own window fires at ~1.6s. His turn must
+            // complete well inside that gap.
+            tx.send(extension).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(900)).await;
+            tx.send(extension_two).await.unwrap();
+            for _ in 0..200 {
+                let bob_replied = probe
+                    .sent_messages
+                    .lock()
+                    .await
+                    .iter()
+                    .any(|message| message.contains("message_id=b1"));
+                if bob_replied {
+                    answered_probe.store(
+                        started.elapsed() < Duration::from_millis(2500),
+                        Ordering::SeqCst,
+                    );
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(15)).await;
+            }
+        });
+
+        run_message_dispatch_loop(rx, AgentRouter::single(ctx), 4).await;
+        send_task.await.unwrap();
+
+        assert!(
+            answered_while_bucket_open.load(Ordering::SeqCst),
+            "the unrelated conversation must answer while the other room's \
+             debounce bucket is still open: {:?}",
+            channel_impl.sent_messages.lock().await
         );
     }
 
