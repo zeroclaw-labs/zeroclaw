@@ -1,6 +1,34 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
+/// Shell language understood by a runtime's command builder.
+///
+/// This is part of the execution boundary: security policy must validate the
+/// same language that [`RuntimeAdapter::build_shell_command`] will interpret.
+///
+/// The command-risk policy needs this to apply platform-specific safety rules —
+/// notably the null device: a POSIX shell treats `nul` as an ordinary relative
+/// filename (so `echo x >nul` would create/truncate a workspace file), while
+/// Windows `cmd.exe` resolves it to the discard-only null device. A redirect to
+/// `nul` is therefore only safe under [`ShellDialect::WindowsCmd`].
+///
+/// The dialect follows the *effective execution sink*, not merely the host OS.
+/// Docker always runs through `sh -c` and stays [`ShellDialect::Posix`] even on
+/// a Windows host. Native cron execution follows the configured runtime dialect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ShellDialect {
+    /// POSIX `sh`/`bash` semantics — Unix native execution and Docker `sh -c`.
+    /// The conservative default.
+    #[default]
+    Posix,
+    /// Windows `cmd.exe` semantics — native execution on a Windows host.
+    WindowsCmd,
+    /// Windows PowerShell or PowerShell 7+.
+    PowerShell,
+    /// The runtime does not expose shell execution.
+    None,
+}
+
 /// Runtime adapter that abstracts platform differences for the agent.
 ///
 /// Implement this trait to port the agent to a new execution environment.
@@ -21,9 +49,12 @@ pub trait RuntimeAdapter: Send + Sync {
 
     /// Report whether this runtime supports shell command execution.
     ///
-    /// When `false`, the agent disables shell-based tools. Serverless and
-    /// edge runtimes typically return `false`.
-    fn has_shell_access(&self) -> bool;
+    /// Shell capability is derived from [`Self::shell_dialect`] so adapters
+    /// cannot report a shell while omitting the language that policy must
+    /// validate (or report a language while disabling shell tools).
+    fn has_shell_access(&self) -> bool {
+        self.shell_dialect() != ShellDialect::None
+    }
 
     /// Report whether this runtime supports filesystem read/write.
     ///
@@ -52,6 +83,18 @@ pub trait RuntimeAdapter: Send + Sync {
     fn memory_budget(&self) -> u64 {
         0
     }
+
+    /// Return the shell language accepted by [`Self::build_shell_command`].
+    ///
+    /// This is the source of truth for both shell capability and command
+    /// policy. Adapters without shell access must return [`ShellDialect::None`].
+    ///
+    /// An adapter must report the dialect it *actually* runs under, because the
+    /// command-risk policy consults this to decide platform-specific safety
+    /// (e.g. accepting a redirect to the `nul` null device). Docker executes
+    /// via `sh -c` and therefore stays POSIX even on Windows; native cron jobs
+    /// follow the configured runtime dialect.
+    fn shell_dialect(&self) -> ShellDialect;
 
     /// Build a shell command process configured for this runtime.
     ///
@@ -98,10 +141,6 @@ mod tests {
             "dummy-runtime"
         }
 
-        fn has_shell_access(&self) -> bool {
-            true
-        }
-
         fn has_filesystem_access(&self) -> bool {
             true
         }
@@ -112,6 +151,17 @@ mod tests {
 
         fn supports_long_running(&self) -> bool {
             true
+        }
+
+        fn shell_dialect(&self) -> ShellDialect {
+            #[cfg(windows)]
+            {
+                ShellDialect::WindowsCmd
+            }
+            #[cfg(not(windows))]
+            {
+                ShellDialect::Posix
+            }
         }
 
         fn build_shell_command(
@@ -143,6 +193,15 @@ mod tests {
     }
 
     #[test]
+    fn default_shell_dialect_is_posix() {
+        // Any adapter that does not override `shell_dialect` uses the
+        // conservative POSIX default. Concrete adapters report their actual
+        // execution sink, including the configured native shell dialect.
+        let runtime = DummyRuntime;
+        assert_eq!(runtime.shell_dialect(), ShellDialect::Posix);
+    }
+
+    #[test]
     fn runtime_reports_capabilities() {
         let runtime = DummyRuntime;
 
@@ -150,6 +209,10 @@ mod tests {
         assert!(runtime.has_shell_access());
         assert!(runtime.has_filesystem_access());
         assert!(runtime.supports_long_running());
+        #[cfg(windows)]
+        assert_eq!(runtime.shell_dialect(), ShellDialect::WindowsCmd);
+        #[cfg(not(windows))]
+        assert_eq!(runtime.shell_dialect(), ShellDialect::Posix);
         assert_eq!(runtime.storage_path(), PathBuf::from("/tmp/dummy-runtime"));
     }
 

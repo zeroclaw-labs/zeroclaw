@@ -1004,6 +1004,21 @@ impl ReliableModelProvider {
 
 #[async_trait]
 impl ModelProvider for ReliableModelProvider {
+    fn has_stable_request_identity(&self, model: &str) -> bool {
+        if self.model_providers.len() != 1
+            || self
+                .model_fallbacks
+                .get(model)
+                .is_some_and(|fallbacks| !fallbacks.is_empty())
+        {
+            return false;
+        }
+
+        self.model_providers
+            .first()
+            .is_some_and(|entry| entry.provider().has_stable_request_identity(model))
+    }
+
     async fn warmup(&self) -> anyhow::Result<()> {
         for entry in &self.model_providers {
             let provider_name = entry.display_name.as_str();
@@ -2190,6 +2205,10 @@ mod tests {
 
     #[async_trait]
     impl ModelProvider for MockModelProvider {
+        fn has_stable_request_identity(&self, _model: &str) -> bool {
+            true
+        }
+
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -2360,6 +2379,106 @@ mod tests {
         assert_eq!(result, "from fallback");
         assert_eq!(primary_calls.load(Ordering::SeqCst), 2);
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn request_identity_is_unstable_when_provider_failover_is_possible() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(MockModelProvider {
+                        calls: calls.clone(),
+                        fail_until_attempt: 0,
+                        response: "primary",
+                        error: "unused",
+                    }),
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(MockModelProvider {
+                        calls,
+                        fail_until_attempt: 0,
+                        response: "fallback",
+                        error: "unused",
+                    }),
+                ),
+            ],
+            0,
+            1,
+        );
+
+        assert!(!model_provider.has_stable_request_identity("model"));
+    }
+
+    #[test]
+    fn request_identity_is_unstable_when_model_fallback_is_configured() {
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".into(),
+                Box::new(MockModelProvider {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    fail_until_attempt: 0,
+                    response: "primary",
+                    error: "unused",
+                }),
+            )],
+            0,
+            1,
+        )
+        .with_model_fallbacks(HashMap::from([(
+            "model".to_string(),
+            vec!["fallback-model".to_string()],
+        )]));
+
+        assert!(!model_provider.has_stable_request_identity("model"));
+    }
+
+    #[test]
+    fn single_provider_request_identity_remains_stable() {
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".into(),
+                Box::new(MockModelProvider {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    fail_until_attempt: 0,
+                    response: "primary",
+                    error: "unused",
+                }),
+            )],
+            0,
+            1,
+        );
+
+        assert!(model_provider.has_stable_request_identity("model"));
+    }
+
+    #[test]
+    fn pinned_request_identity_is_stable_only_without_a_model_remap() {
+        let model_provider = ReliableModelProvider::new_with_entries(
+            "test",
+            vec![ReliableModelProviderEntry::new_pinned(
+                "primary",
+                "primary.default",
+                "primary.default",
+                "pinned-model",
+                Box::new(MockModelProvider {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    fail_until_attempt: 0,
+                    response: "primary",
+                    error: "unused",
+                }),
+            )],
+            0,
+            1,
+        );
+
+        assert!(model_provider.has_stable_request_identity("pinned-model"));
+        assert!(!model_provider.has_stable_request_identity("requested-model"));
     }
 
     /// A `fallback_models` downgrade uses model-PINNED entries on one

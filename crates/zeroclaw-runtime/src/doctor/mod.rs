@@ -1380,23 +1380,8 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     for warning in config.collect_warnings() {
         items.push(DiagItem::warn(
             cat,
-            format!(
-                "{} (at {})",
-                localized_validation_warning_message(&warning),
-                warning.path
-            ),
+            format!("{} (at {})", warning.message, warning.path),
         ));
-    }
-}
-
-fn localized_validation_warning_message(
-    warning: &zeroclaw_config::validation_warnings::ValidationWarning,
-) -> String {
-    match warning.code.as_str() {
-        "skills_prompt_injection_mode_full_deprecated" => crate::i18n::get_required_cli_string(
-            "cli-doctor-skills-prompt-injection-mode-full-deprecated",
-        ),
-        _ => warning.message.clone(),
     }
 }
 
@@ -2941,25 +2926,6 @@ mod tests {
                 "expected per-agent SOUL.md diagnostic for {alias}; got {messages:?}"
             );
         }
-    }
-
-    #[test]
-    fn skills_prompt_deprecation_warning_uses_fluent() {
-        let warning = zeroclaw_config::validation_warnings::ValidationWarning::new(
-            "skills_prompt_injection_mode_full_deprecated",
-            "unlocalized fallback",
-            "skills.prompt_injection_mode",
-        );
-
-        let expected = crate::i18n::get_required_cli_string(
-            "cli-doctor-skills-prompt-injection-mode-full-deprecated",
-        );
-        assert_eq!(localized_validation_warning_message(&warning), expected);
-        assert_ne!(expected, "unlocalized fallback");
-        assert_ne!(
-            expected,
-            "{cli-doctor-skills-prompt-injection-mode-full-deprecated}"
-        );
     }
 
     #[test]
