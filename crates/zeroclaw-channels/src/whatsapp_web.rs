@@ -1669,6 +1669,7 @@ impl WhatsAppWebChannel {
                 channel: "whatsapp".to_string(),
                 channel_alias: Some(alias.to_string()),
                 sender: sender.to_string(),
+                platform_sender_id: None,
                 // Reply to the originating chat JID (DM or group), passed
                 // through unchanged (library handles LID addressing internally).
                 reply_target,

@@ -1171,12 +1171,6 @@ impl TelegramChannel {
         })
     }
 
-    #[cfg(test)]
-    async fn insert_pending_model_picker(&self, token: String, state: PendingModelPicker) {
-        self.insert_pending_model_picker_batch(vec![(token, state)])
-            .await;
-    }
-
     async fn insert_pending_model_picker_batch(&self, entries: Vec<(String, PendingModelPicker)>) {
         let mut pending = self.pending_model_pickers.lock().await;
         Self::reserve_pending_model_picker_capacity(&mut pending, entries.len());
@@ -7258,13 +7252,13 @@ mod tests {
 
         let expired_token = uuid::Uuid::new_v4().to_string();
         channel
-            .insert_pending_model_picker(
+            .insert_pending_model_picker_batch(vec![(
                 expired_token.clone(),
                 PendingModelPicker {
                     expires_at: Instant::now() - Duration::from_secs(1),
                     ..base.clone()
                 },
-            )
+            )])
             .await;
         assert!(
             !channel
@@ -7287,13 +7281,13 @@ mod tests {
 
         let owner_token = uuid::Uuid::new_v4().to_string();
         channel
-            .insert_pending_model_picker(
+            .insert_pending_model_picker_batch(vec![(
                 owner_token.clone(),
                 PendingModelPicker {
                     owner_agent_alias: "different_agent".into(),
                     ..base
                 },
-            )
+            )])
             .await;
         assert!(
             !channel
@@ -7323,7 +7317,7 @@ mod tests {
             let token = uuid::Uuid::new_v4().to_string();
             newest_token.clone_from(&token);
             channel
-                .insert_pending_model_picker(
+                .insert_pending_model_picker_batch(vec![(
                     token,
                     PendingModelPicker {
                         created_at: Instant::now(),
@@ -7342,7 +7336,7 @@ mod tests {
                         runtime_routes: runtime_routes.clone(),
                         action: ModelPickerAction::Cancel,
                     },
-                )
+                )])
                 .await;
         }
 
@@ -7375,7 +7369,7 @@ mod tests {
         .with_api_base(server.uri());
         let token = uuid::Uuid::new_v4().to_string();
         channel
-            .insert_pending_model_picker(
+            .insert_pending_model_picker_batch(vec![(
                 token.clone(),
                 PendingModelPicker {
                     created_at: Instant::now(),
@@ -7398,7 +7392,7 @@ mod tests {
                         model: "gpt-fast".into(),
                     }),
                 },
-            )
+            )])
             .await;
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         tx.try_send(ChannelMessage::default()).unwrap();
@@ -7470,7 +7464,7 @@ mod tests {
             action: ModelPickerAction::Cancel,
         };
         channel
-            .insert_pending_model_picker(
+            .insert_pending_model_picker_batch(vec![(
                 open_token.clone(),
                 PendingModelPicker {
                     action: ModelPickerAction::OpenCategory {
@@ -7479,10 +7473,10 @@ mod tests {
                     },
                     ..base.clone()
                 },
-            )
+            )])
             .await;
         channel
-            .insert_pending_model_picker(cancel_token.clone(), base)
+            .insert_pending_model_picker_batch(vec![(cancel_token.clone(), base)])
             .await;
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
 
@@ -7551,7 +7545,7 @@ mod tests {
         .with_api_base(server.uri());
         let token = uuid::Uuid::new_v4().to_string();
         channel
-            .insert_pending_model_picker(
+            .insert_pending_model_picker_batch(vec![(
                 token.clone(),
                 PendingModelPicker {
                     created_at: Instant::now(),
@@ -7574,7 +7568,7 @@ mod tests {
                         model: "gpt-fast".into(),
                     }),
                 },
-            )
+            )])
             .await;
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
 
