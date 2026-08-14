@@ -203,6 +203,7 @@ impl Tool for SendMessageToPeerTool {
             zeroclaw_spawn::spawn!(async move {
                 let turn = crate::agent::loop_::process_message(
                     cfg,
+                    None,
                     &recipient_alias,
                     &body,
                     None,

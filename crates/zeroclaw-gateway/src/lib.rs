@@ -2579,6 +2579,7 @@ pub(crate) async fn run_gateway_chat_with_tools(
                 cost_tracking_context,
                 zeroclaw_runtime::agent::process_message(
                     config,
+                    Some(state.config.clone()),
                     &agent_alias,
                     message,
                     session_id,
