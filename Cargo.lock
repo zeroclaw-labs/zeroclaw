@@ -13304,6 +13304,7 @@ dependencies = [
  "jsonwebtoken",
  "lapin",
  "lettre",
+ "libc",
  "lru 0.18.2",
  "mail-parser",
  "matrix-sdk",

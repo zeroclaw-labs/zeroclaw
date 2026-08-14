@@ -826,6 +826,7 @@ mod tests {
             include_str!("matrix.rs"),
             include_str!("signal.rs"),
             include_str!("whatsapp.rs"),
+            include_str!("whatsapp_web.rs"),
             include_str!("acp_channel.rs"),
             include_str!("util.rs"),
         ];

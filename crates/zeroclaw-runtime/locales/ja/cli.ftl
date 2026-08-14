@@ -959,7 +959,6 @@ cli-doctor-probe-timeout-message = モデル調査がタイムアウトしまし
 # ── Degraded config sections (doctor diagnose, #8835) ──
 cli-doctor-degraded-security = セキュリティ上重要な設定セクション `{$path}` が無効なため、デーモンを起動できるようデフォルト値にリセットされました。実行中のセキュリティ設定は意図したものより弱くなっている可能性があります。`zeroclaw config migrate` を実行してパースエラーを確認し、ファイルを修復してください。
 cli-doctor-degraded-section = 設定セクション `{$path}` は不正な形式のためデフォルト値にリセットされました。このセクションの値は反映されていません。`zeroclaw config migrate` を実行してパースエラーを確認し、ファイルを修復してください。
-cli-doctor-skills-prompt-injection-mode-full-deprecated = スキルプロンプト注入モード "full" は非推奨です。明示的な full モードは移行期間中もサポートされますが、現在のデフォルトは compact です。Schema V4 で full モードが削除される前に移行してください。
 sop-approval-deferred-at-capacity = 実行スロットが満杯のため、実行 {$run_id} を再開できませんでした。承認は待機状態のままです。スロットが空いてから再試行してください。
 sop-approval-policy-unavailable = 待機中の SOP ステップを利用できないため、承認に失敗しました: {$reason}。実行は待機状態のままです。
 sop-rpc-decision-invalid-state = 実行 {$run_id} は現在の状態では解決できません。
@@ -985,6 +984,8 @@ channel-approval-btn-always = 常に
 channel-approval-tap-instruction = 下のボタンをタップしてください：
 channel-approval-reply-instruction-yesno = 返信：「{ $yes_command }」、「{ $no_command }」、または「{ $always_command }」
 channel-approval-reply-instruction-approve-deny = 「{ $approve_command }」/「{ $deny_command }」/「{ $always_command }」と返信してください。
+channel-approval-group-visibility-warning =
+    これはグループチャットのため、ここにいる全員がこのコードと上に表示されたツールの引数を見ることができます。このチャンネルの承認されたピアのみが応答できます。
 channel-telegram-approval-ack-approved = 承認しました
 channel-telegram-approval-ack-always-approved = 常に承認しました
 channel-telegram-approval-ack-denied = 拒否しました

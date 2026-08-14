@@ -44,7 +44,7 @@ RUN apk add --no-cache build-base perl pkgconfig zig \
 
 COPY Cargo.toml Cargo.lock ./
 COPY --parents crates/*/Cargo.toml ./
-COPY --parents crates/zeroclaw-plugins/tests/fixtures/channel-fixture/Cargo.toml ./
+COPY --parents crates/*/tests/fixtures/*/Cargo.toml ./
 COPY --parents crates/zeroclaw-macros/src/ ./
 COPY apps/tauri/Cargo.toml apps/tauri/Cargo.toml
 COPY apps/zerocode/Cargo.toml apps/zerocode/Cargo.toml
@@ -66,8 +66,11 @@ RUN mkdir -p src src/bin benches apps/tauri/src apps/zerocode/src tools/fill-tra
     && echo "fn main() {}" > xtask/src/bin/web.rs \
     && mkdir -p crates/zeroclaw-hardware/examples \
     && echo "fn main() {}" > crates/zeroclaw-hardware/examples/esp32_sim.rs \
-    && mkdir -p crates/zeroclaw-plugins/tests/fixtures/channel-fixture/src \
-    && echo "" > crates/zeroclaw-plugins/tests/fixtures/channel-fixture/src/lib.rs \
+    && for d in crates/*/tests/fixtures/*/; do \
+        [ -f "${d}Cargo.toml" ] || continue; \
+        mkdir -p "${d}src"; \
+        printf '' > "${d}src/lib.rs"; \
+    done \
     && for d in crates/*/; do \
         [ "$d" = "crates/zeroclaw-macros/" ] && continue; \
         mkdir -p "${d}src"; \

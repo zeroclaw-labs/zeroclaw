@@ -431,7 +431,7 @@ plugins-wasm-pulley       = ["plugins-wasm", "zeroclaw-plugins/plugins-wasm-pull
 ci-all = [
     "agent-runtime",
     "channels-full",
-    "channel-nostr", "channel-matrix", "whatsapp-web",
+    "channel-nostr", "channel-matrix", "whatsapp-web", "channel-wechat",
     "observability-prometheus", "observability-otel",
     "hardware", "peripheral-rpi",
     "sandbox-landlock", "sandbox-bubblewrap",

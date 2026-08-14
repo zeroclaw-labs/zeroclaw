@@ -3023,7 +3023,7 @@ fn overview_status_lines(
             };
             lines.push(Line::from(vec![
                 Span::styled(
-                    format!("{:<11}", crate::i18n::t("zc-dashboard-label-memory")),
+                    format!("{:<11}", crate::i18n::t("zc-dashboard-label-daemon-memory")),
                     theme::dim_style(),
                 ),
                 Span::styled(val, theme::body_style()),
@@ -3044,7 +3044,7 @@ fn overview_status_lines(
             };
             lines.push(Line::from(vec![
                 Span::styled(
-                    format!("{:<11}", crate::i18n::t("zc-dashboard-label-cpu")),
+                    format!("{:<11}", crate::i18n::t("zc-dashboard-label-daemon-cpu")),
                     theme::dim_style(),
                 ),
                 Span::styled(val, theme::body_style()),
@@ -3067,7 +3067,7 @@ fn overview_status_lines(
             };
             lines.push(Line::from(vec![
                 Span::styled(
-                    format!("{:<11}", crate::i18n::t("zc-dashboard-label-cpu")),
+                    format!("{:<11}", crate::i18n::t("zc-dashboard-label-daemon-cpu")),
                     theme::dim_style(),
                 ),
                 Span::styled(val, theme::dim_style()),
@@ -3076,7 +3076,7 @@ fn overview_status_lines(
     } else {
         lines.push(Line::from(vec![
             Span::styled(
-                format!("{:<11}", crate::i18n::t("zc-dashboard-label-cpu")),
+                format!("{:<11}", crate::i18n::t("zc-dashboard-label-daemon-cpu")),
                 theme::dim_style(),
             ),
             Span::styled(crate::i18n::t("zc-dashboard-loading"), theme::dim_style()),
@@ -3357,6 +3357,10 @@ mod tests {
             None,
         ));
 
+        let daemon_memory = crate::i18n::t("zc-dashboard-label-daemon-memory");
+        let daemon_cpu = crate::i18n::t("zc-dashboard-label-daemon-cpu");
+        assert!(text.contains(&daemon_memory), "daemon memory label: {text}");
+        assert!(text.contains(&daemon_cpu), "daemon CPU label: {text}");
         assert!(text.contains("1.0M / 4.0M (25.0%)"), "memory: {text}");
         assert!(
             text.contains(&crate::i18n::t_args(

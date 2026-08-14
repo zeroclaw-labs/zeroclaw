@@ -609,6 +609,15 @@ jobs:
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+      # `channel-wechat` is outside `default-channels` and `channels-full`, so
+      # the workspace run above compiles neither the module nor its unit tests.
+      # Adding it to `ci-all` gives Lint and Check compile coverage; this step
+      # is what actually executes the tests.
+      - name: Run WeChat channel lib unit tests
+        run: "cargo nextest run --locked -p zeroclaw-channels --features channel-wechat --lib wechat::"
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
   parallel-runtime-test-changes:
     name: Detect parallel runtime test changes

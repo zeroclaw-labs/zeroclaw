@@ -1941,7 +1941,7 @@ pub async fn run_gateway(
         // ── WebSocket node discovery ──
         .route("/ws/nodes", get(nodes::handle_ws_nodes))
         // ── Static assets (web dashboard) ──
-        .route("/_app/{*path}", get(static_files::handle_static))
+        .merge(static_file_routes())
         // ── SPA fallback: non-API GET requests serve index.html ──
         .fallback(get(static_files::handle_spa_fallback))
         .with_state(state.clone())
@@ -2121,6 +2121,12 @@ pub async fn run_gateway(
 
     drop(broadcast_hook_guard);
     Ok(())
+}
+
+fn static_file_routes() -> Router<AppState> {
+    Router::new()
+        .route("/_app/", get(static_files::handle_static))
+        .route("/_app/{*path}", get(static_files::handle_static))
 }
 
 fn format_paircode_recovery_command(_host: &str, port: u16) -> String {
@@ -4074,11 +4080,13 @@ async fn handle_pair_code(State(state): State<AppState>) -> impl IntoResponse {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use axum::http::{HeaderValue, Uri};
+    use axum::body::Body;
+    use axum::http::{HeaderValue, Request, Uri};
     use axum::response::IntoResponse;
     use http_body_util::BodyExt;
     use parking_lot::{Mutex, RwLock};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tower::ServiceExt;
     #[cfg(feature = "channel-whatsapp-cloud")]
     use zeroclaw_api::channel::ChannelMessage;
     use zeroclaw_memory::{Memory, MemoryCategory, MemoryEntry};
@@ -4428,6 +4436,23 @@ mod tests {
         static_files::handle_spa_fallback(State(state), Uri::from_static(path)).await
     }
 
+    async fn static_route_response(
+        path: &'static str,
+        prefix: Option<&str>,
+        state: AppState,
+    ) -> axum::response::Response {
+        let routes = static_file_routes();
+        let app = match prefix {
+            Some(prefix) => Router::new().nest(prefix, routes),
+            None => routes,
+        }
+        .with_state(state);
+
+        app.oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
     /// Pair a device into both the pairing guard and the device registry,
     /// returning the plaintext token so the test can assert it is revoked.
     async fn pair_device(state: &AppState, device_id: &str) -> String {
@@ -4673,6 +4698,56 @@ mod tests {
     fn app_state_is_clone() {
         fn assert_clone<T: Clone>() {}
         assert_clone::<AppState>();
+    }
+
+    #[tokio::test]
+    async fn static_routes_reject_malformed_paths_before_spa_fallback() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut prefixed_state = spa_fallback_state(&tmp);
+        prefixed_state.path_prefix = "/gw".to_string();
+
+        for (path, prefix, state) in [
+            ("/_app/", None, spa_fallback_state(&tmp)),
+            ("/_app//index.html", None, spa_fallback_state(&tmp)),
+            ("/_app/assets/./app.js", None, spa_fallback_state(&tmp)),
+            ("/_app/assets/../secret", None, spa_fallback_state(&tmp)),
+            ("/_app/assets/app.js/", None, spa_fallback_state(&tmp)),
+            ("/gw/_app/", Some("/gw"), prefixed_state),
+        ] {
+            let response = static_route_response(path, prefix, state).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "route path should be rejected: {path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn static_routes_serve_valid_assets_with_and_without_prefix() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dist_dir = tmp.path().join("web").join("dist");
+        let assets = dist_dir.join("assets");
+        std::fs::create_dir_all(&assets).unwrap();
+        std::fs::write(assets.join("route-test.js"), b"route-ok").unwrap();
+
+        let mut state = spa_fallback_state(&tmp);
+        let unprefixed =
+            static_route_response("/_app/assets/route-test.js", None, state.clone()).await;
+        assert_eq!(unprefixed.status(), StatusCode::OK);
+        assert_eq!(
+            unprefixed.into_body().collect().await.unwrap().to_bytes(),
+            &b"route-ok"[..]
+        );
+
+        state.path_prefix = "/gw".to_string();
+        let prefixed =
+            static_route_response("/gw/_app/assets/route-test.js", Some("/gw"), state).await;
+        assert_eq!(prefixed.status(), StatusCode::OK);
+        assert_eq!(
+            prefixed.into_body().collect().await.unwrap().to_bytes(),
+            &b"route-ok"[..]
+        );
     }
 
     #[tokio::test]
