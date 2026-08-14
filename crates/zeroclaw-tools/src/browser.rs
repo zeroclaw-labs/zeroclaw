@@ -3491,8 +3491,13 @@ mod tests {
     /// backend receives the action. If the validator call is removed, this
     /// fails (the backends would otherwise succeed or error without the
     /// specific allowlist rejection).
+    ///
+    /// Linux-only: the fixture needs a directory whose name carries a raw
+    /// non-UTF-8 byte, and macOS (APFS) rejects such pathnames at
+    /// `create_dir_all` time with `EILSEQ`, so the fixture cannot be built
+    /// there.
     #[tokio::test]
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     async fn execute_action_rejects_non_utf8_canonical_target_before_backend_dispatch() {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
@@ -3551,8 +3556,12 @@ mod tests {
     /// ComputerUse shares the same canonical target validator, so a non-UTF-8
     /// canonical destination is rejected locally — before the sidecar round
     /// trip — and is never forwarded.
+    ///
+    /// Linux-only for the same reason as
+    /// `execute_action_rejects_non_utf8_canonical_target_before_backend_dispatch`:
+    /// macOS rejects the raw-byte pathname fixture with `EILSEQ`.
     #[tokio::test]
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     async fn computer_use_rejects_non_utf8_canonical_target_before_sidecar() {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
