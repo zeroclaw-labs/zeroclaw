@@ -2523,6 +2523,22 @@ fn record_gateway_chat_dispatch_for_test(
         });
 }
 
+/// The live config handle the gateway chat route hands to `process_message`.
+///
+/// `AppState.config` is the live `Arc<RwLock<Config>>` the HTTP config handlers
+/// mutate (per the config_write_lock invariant), so forwarding a clone of it —
+/// not a construction snapshot — lets a `config/set` revocation of
+/// `file_download.allowed_private_hosts` reach the runtime's tool-registry
+/// build at dispatch time.
+///
+/// This is a standalone function (rather than an inline `Some(state.config.
+/// clone())`) because `run_gateway_chat_with_tools` swaps in a mock provider
+/// branch under `#[cfg(test)]` that bypasses `process_message` entirely; the
+/// forwarding decision itself must remain testable at the caller boundary.
+fn gateway_live_config_for_chat(state: &AppState) -> Option<Arc<parking_lot::RwLock<Config>>> {
+    Some(state.config.clone())
+}
+
 pub(crate) async fn run_gateway_chat_with_tools(
     state: &AppState,
     message: &str,
@@ -2579,7 +2595,7 @@ pub(crate) async fn run_gateway_chat_with_tools(
                 cost_tracking_context,
                 zeroclaw_runtime::agent::process_message(
                     config,
-                    Some(state.config.clone()),
+                    gateway_live_config_for_chat(state),
                     &agent_alias,
                     message,
                     session_id,
@@ -4428,6 +4444,27 @@ mod tests {
         let mut state = admin_paircode_state(tmp, false, false);
         state.web_dist_dir = Some(dist_dir);
         state
+    }
+
+    #[test]
+    fn gateway_chat_live_config_returns_the_appstate_handle() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, false, false);
+
+        // The gateway chat route must hand `process_message` the live
+        // `AppState.config` handle (not a construction snapshot) so a
+        // `config/set` revocation of `file_download.allowed_private_hosts`
+        // reaches the registry build at dispatch time.
+        let live = gateway_live_config_for_chat(&state);
+        assert!(
+            live.is_some(),
+            "gateway chat must forward a live config handle"
+        );
+        assert!(
+            Arc::ptr_eq(&live.unwrap(), &state.config),
+            "gateway chat live handle must be the AppState.config Arc itself, \
+             so mutations to the live config are observed"
+        );
     }
 
     async fn spa_fallback_response(

@@ -216,6 +216,15 @@ impl Tool for SpawnSubagentTool {
                 .await;
         }
 
+        // A subagent runs on the construction-time config snapshot: it
+        // deliberately does not receive a live config handle, so a mid-flight
+        // `config/set` revocation of e.g. `file_download.allowed_private_hosts`
+        // is not re-observed on this already-spawned turn. The live-revocation
+        // guarantee covers the gateway/daemon parent and independent delegate
+        // registries (which rebuild through `all_tools_with_runtime` with a
+        // threaded handle); subagent turns are a documented exception. Threading
+        // the handle through `agent::run` is tracked separately so this security
+        // PR stays scoped to its own threat model.
         let run_result = Box::pin(scope!(
             agent_alias: parent_alias,
             session_key: run_id,

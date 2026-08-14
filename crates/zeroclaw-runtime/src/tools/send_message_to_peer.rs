@@ -201,6 +201,16 @@ impl Tool for SendMessageToPeerTool {
                 .as_ref()
                 .map(|_| Arc::new(Mutex::new(TurnUsage::default())));
             zeroclaw_spawn::spawn!(async move {
+                // A detached peer turn runs on the construction-time config
+                // snapshot: it deliberately does not receive a live config
+                // handle, so a mid-flight `config/set` revocation of e.g.
+                // `file_download.allowed_private_hosts` is not re-observed on
+                // this already-spawned turn. The live-revocation guarantee
+                // covers the gateway/daemon parent and independent delegate
+                // registries (which rebuild through `all_tools_with_runtime`
+                // with a threaded handle); detached peer turns are a documented
+                // exception. Threading the handle here is tracked separately so
+                // this security PR stays scoped to its own threat model.
                 let turn = crate::agent::loop_::process_message(
                     cfg,
                     None,
