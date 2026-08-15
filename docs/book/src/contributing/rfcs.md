@@ -4,7 +4,7 @@ Substantial changes to ZeroClaw's architecture, user-facing surface, or core pol
 
 Governance, RFC ratification rules, and voting thresholds are defined in RFC #5577.
 
-## When to file an RFC vs. just a PR
+## When to file an RFC, an issue, or a PR
 
 | Change | RFC first? |
 |---|---|
@@ -12,14 +12,20 @@ Governance, RFC ratification rules, and voting thresholds are defined in RFC #55
 | New provider implementation | No: open a PR |
 | New tool | No: open a PR |
 | Bug fix | No: open a PR |
-| New config key | Depends: if it fits within existing schema shape, PR. If it introduces a new subsystem or paradigm, RFC |
+| New config key | No: open a PR. RFC only if the key introduces a new subsystem or changes a core policy |
 | Changing an established default | Yes: RFC |
 | Schema migration that breaks existing configs | Yes: RFC |
 | Cross-cutting refactor affecting multiple crates | Yes: RFC |
 | New subsystem (e.g. a new security layer, a new protocol) | Yes: RFC |
 | Changes to governance, release process, or contribution model | Yes: RFC |
 
-Rule of thumb: if you'd want a second opinion before writing the code, it's an RFC. If it's obvious what to build, it's a PR.
+Which one you file depends on how much you already know:
+
+- You know **what** to build and **how** to build it: open a PR.
+- You know **what** to build but not **how**: open an issue and settle the approach there.
+- You are proposing a substantial change to architecture, the user-facing surface, or a core policy: file an RFC.
+
+Needing a second opinion is not by itself a reason to file an RFC. Most proposals that need review need it on the approach, which an issue or a draft PR carries faster than a discussion period and a ballot.
 
 ## Filing an RFC
 

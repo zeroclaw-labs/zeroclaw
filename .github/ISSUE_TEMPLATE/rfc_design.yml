@@ -7,9 +7,31 @@ body:
   - type: markdown
     attributes:
       value: |
-        Use this for significant changes to architecture, public interfaces, defaults, governance,
-        release process, contribution model, or project direction.
-        Smaller feature requests should use the feature template. Security vulnerabilities must be reported privately.
+        An RFC is for decisions the project must make **before** anyone can implement.
+        It is not a heavier feature request, and filing one for work that does not need a
+        project-level decision adds review latency without adding review.
+
+        Ordinary features, configuration fields and defaults, schema or data migrations, and
+        bounded refactors go straight to an issue and a PR. Use the **Feature Request**
+        template instead. Security vulnerabilities must be reported privately; see `SECURITY.md`.
+
+  - type: dropdown
+    id: trigger
+    attributes:
+      label: Which project-level trigger applies?
+      description: >
+        Pick the trigger this proposal actually meets. If none of them fit, this is ordinary
+        work. Close this form and use the Feature Request template. Maintainers may close an
+        RFC as an ordinary issue when it does not meet a trigger; the underlying work stays
+        valid and continues on the redirected issue or PR.
+      options:
+        - A new security layer, or a material change to the security model
+        - A governance, contribution-process, or project-authority change
+        - A cross-cutting refactor that changes ownership or contracts across established boundaries
+        - A new subsystem, or another project-wide capability boundary
+        - None of these: I will use the Feature Request template instead
+    validations:
+      required: true
 
   - type: textarea
     id: problem
@@ -45,9 +67,12 @@ body:
     id: alternatives
     attributes:
       label: Alternatives considered
-      description: What other paths did you consider, including doing nothing?
+      description: >
+        What other paths did you consider, including doing nothing? If the only real
+        alternative is "do not build it", the proposal is probably an ordinary feature
+        rather than a decision the project has to settle first.
     validations:
-      required: false
+      required: true
 
   - type: textarea
     id: non_goals
