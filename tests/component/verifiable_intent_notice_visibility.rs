@@ -19,12 +19,14 @@ use zeroclaw_config::schema::LogPersistence;
 /// Every supported value of `observability.log_persistence`, walked through a
 /// `match` rather than typed out.
 ///
-/// Two properties, and the previous `const POLICIES: [&str; 4]` had neither.
-/// Adding a variant makes the `match` non-exhaustive, so the compiler forces
-/// the new policy into the chain and therefore into this list. And the wire
-/// strings come from `as_wire()`, so they cannot drift from the enum's serde
-/// spelling. A string array kept compiling unchanged while covering one policy
-/// less.
+/// Two properties the previous `const POLICIES: [&str; 4]` did not have.
+/// Adding a variant makes the `match` non-exhaustive, so a new policy cannot be
+/// left out here without a compile error, and the wire strings come from
+/// `as_wire()`, so they cannot drift from the enum's serde spelling. A string
+/// array kept compiling unchanged while covering one policy less.
+///
+/// What this does not do is put the new variant in the walk on its own. An arm
+/// returning `None` compiles and leaves the policy out of the list.
 fn policies() -> Vec<&'static str> {
     let mut all = Vec::new();
     let mut next = Some(LogPersistence::None);

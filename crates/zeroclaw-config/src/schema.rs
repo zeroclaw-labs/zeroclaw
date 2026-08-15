@@ -31967,11 +31967,13 @@ group_policy = "disabled"
     /// Every `LogPersistence` variant, walked through a `match` rather than
     /// listed.
     ///
-    /// The walk is the mechanism. Adding a variant makes the `match`
-    /// non-exhaustive, and the only way to satisfy the compiler is to give the
-    /// new variant a place in the chain, which necessarily puts it in the
-    /// returned list. An array literal cannot do that: it keeps compiling
-    /// unchanged and silently covers one policy less.
+    /// Adding a variant makes the `match` non-exhaustive, so a new policy forces
+    /// a decision here instead of being covered silently. An array literal keeps
+    /// compiling unchanged and covers one policy less.
+    ///
+    /// The compile error is the whole of the guarantee. An arm returning `None`
+    /// satisfies it while leaving the variant out of the returned list, so this
+    /// forces the update to be considered rather than making it correct.
     fn every_log_persistence() -> Vec<LogPersistence> {
         let mut all = Vec::new();
         let mut next = Some(LogPersistence::None);
@@ -31992,8 +31994,8 @@ group_policy = "disabled"
     /// of the same one. Asserting it here pins the independence at the unit
     /// level; the process-level proof lives in the component test.
     ///
-    /// Every variant is covered rather than the three that motivated the
-    /// change. See [`every_log_persistence`] for what makes "every" hold.
+    /// Every current variant is covered rather than the three that motivated the
+    /// change. See [`every_log_persistence`] for the extent of that.
     #[test]
     async fn verifiable_intent_warning_is_independent_of_log_persistence() {
         for policy in every_log_persistence() {
