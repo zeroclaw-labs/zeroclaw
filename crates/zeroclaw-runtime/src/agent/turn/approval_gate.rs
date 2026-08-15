@@ -23,6 +23,7 @@ pub(crate) async fn gate_tool_approval(
     tool_name: &str,
     tool_args: &serde_json::Value,
     iteration: usize,
+    position: zeroclaw_api::channel::ApprovalPosition,
 ) -> ApprovalGateOutcome {
     let mut approval_requirement = ctx
         .approval
@@ -46,6 +47,7 @@ pub(crate) async fn gate_tool_approval(
                     tool_name: request.tool_name.clone(),
                     arguments_summary: crate::approval::summarize_args(&request.arguments),
                     raw_arguments: Some(request.arguments.clone()),
+                    position: Some(position),
                 };
                 let recipient = ctx.channel_reply_target.unwrap_or_default();
                 match ch.request_approval_attributed(recipient, &ch_request).await {

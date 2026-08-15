@@ -3119,6 +3119,7 @@ impl Channel for WhatsAppWebChannel {
             &token,
             &request.tool_name,
             &request.arguments_summary,
+            request.position_counter(),
         );
         if binding.is_group {
             // Say so in the prompt. The token is now readable by everyone in

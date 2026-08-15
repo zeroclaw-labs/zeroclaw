@@ -982,6 +982,7 @@ channel-approval-btn-approve = 承認
 channel-approval-btn-deny = 拒否
 channel-approval-btn-always = 常に
 channel-approval-tap-instruction = 下のボタンをタップしてください：
+channel-approval-position = ツール呼び出し { $total } 件中 { $index } 件目
 channel-approval-reply-instruction-yesno = 返信：「{ $yes_command }」、「{ $no_command }」、または「{ $always_command }」
 channel-approval-reply-instruction-approve-deny = 「{ $approve_command }」/「{ $deny_command }」/「{ $always_command }」と返信してください。
 channel-approval-group-visibility-warning =

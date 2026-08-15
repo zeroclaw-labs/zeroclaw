@@ -6008,6 +6008,7 @@ impl Channel for SlackChannel {
                     &token,
                     &request.tool_name,
                     &request.arguments_summary,
+                    request.position_counter(),
                 ),
                 recipient,
             ))

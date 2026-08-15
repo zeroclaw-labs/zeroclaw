@@ -981,6 +981,7 @@ channel-approval-btn-approve = 批准
 channel-approval-btn-deny = 拒绝
 channel-approval-btn-always = 始终
 channel-approval-tap-instruction = 点击下方按钮：
+channel-approval-position = 第 { $index } 个工具调用，共 { $total } 个
 channel-approval-reply-instruction-yesno = 回复：“{ $yes_command }”、“{ $no_command }” 或 “{ $always_command }”
 channel-approval-reply-instruction-approve-deny = 回复 `{ $approve_command }` / `{ $deny_command }` / `{ $always_command }`。
 channel-approval-group-visibility-warning =

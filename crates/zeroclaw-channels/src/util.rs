@@ -414,7 +414,9 @@ pub(crate) fn build_yesno_approval_prompt(
     token: &str,
     tool_name: &str,
     arguments_summary: &str,
+    position: Option<(u32, u32)>,
 ) -> String {
+    let position_line = approval_position_line(position);
     let heading = zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-heading-shout");
     let tool_label = zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-tool-label");
     let args_label = zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-args-label");
@@ -430,8 +432,43 @@ pub(crate) fn build_yesno_approval_prompt(
         ],
     );
     format!(
-        "{heading} [{token}]\n{tool_label}: {tool_name}\n{args_label}: {arguments_summary}\n\n{reply}"
+        "{heading} [{token}]\n{position_line}{tool_label}: {tool_name}\n{args_label}: {arguments_summary}\n\n{reply}"
     )
+}
+
+/// Localized `Tool call 2 of 3` line for an approval prompt, already
+/// newline-terminated, or empty when there is no counter to show.
+///
+/// Kept here so every adapter renders the same wording from the same
+/// catalogue key and the phrasing cannot drift per channel.
+#[cfg(any(
+    feature = "channel-discord",
+    feature = "channel-signal",
+    feature = "channel-slack",
+    feature = "channel-whatsapp-cloud",
+    feature = "whatsapp-web",
+    feature = "channel-matrix",
+    feature = "channel-telegram",
+    feature = "channel-lark",
+    test
+))]
+pub(crate) fn approval_position_line(position: Option<(u32, u32)>) -> String {
+    match position {
+        // `1 of 1` tells the operator nothing they did not already know. The
+        // rule lives here so no adapter has to remember it.
+        Some((_, total)) if total <= 1 => String::new(),
+        Some((index, total)) => {
+            let text = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                "channel-approval-position",
+                &[
+                    ("index", index.to_string().as_str()),
+                    ("total", total.to_string().as_str()),
+                ],
+            );
+            format!("{text}\n")
+        }
+        None => String::new(),
+    }
 }
 
 /// Localized text-reply approval prompt using approve/deny/always reply
@@ -442,7 +479,9 @@ pub(crate) fn build_approve_deny_approval_prompt(
     token: &str,
     tool_name: &str,
     arguments_summary: &str,
+    position: Option<(u32, u32)>,
 ) -> String {
+    let position_line = approval_position_line(position);
     let heading = zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-heading-shout");
     let tool_label = zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-tool-label");
     let args_label = zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-args-label");
@@ -458,7 +497,7 @@ pub(crate) fn build_approve_deny_approval_prompt(
         ],
     );
     format!(
-        "{heading} [{token}]\n{tool_label}: {tool_name}\n{args_label}: {arguments_summary}\n\n{reply}"
+        "{heading} [{token}]\n{position_line}{tool_label}: {tool_name}\n{args_label}: {arguments_summary}\n\n{reply}"
     )
 }
 
@@ -766,7 +805,7 @@ mod tests {
         // by Discord's plaintext fallback, Signal, WhatsApp, and Slack's
         // polling-mode fallback.
         let token = "ab12cd";
-        let prompt = super::build_yesno_approval_prompt(token, "shell", "ls -la");
+        let prompt = super::build_yesno_approval_prompt(token, "shell", "ls -la", None);
         assert!(
             prompt.contains(token),
             "prompt should echo the token verbatim; got {prompt:?}"
@@ -794,12 +833,78 @@ mod tests {
     }
 
     #[test]
+    fn approval_prompt_shows_batch_position_when_batch_has_several_calls() {
+        // Back-to-back cards from one message are indistinguishable before the
+        // operator taps, so a multi-call batch must say which call it is.
+        let prompt = super::build_yesno_approval_prompt("ab12cd", "shell", "ls -la", Some((2, 3)));
+        assert!(
+            prompt.contains('2') && prompt.contains('3'),
+            "prompt should carry the batch counter; got {prompt:?}"
+        );
+        // The counter belongs above the tool line so it is read first.
+        let counter_at = prompt
+            .find('2')
+            .expect("counter should be present in the prompt");
+        let tool_at = prompt
+            .find("shell")
+            .expect("tool name should be present in the prompt");
+        assert!(
+            counter_at < tool_at,
+            "counter should precede the tool line; got {prompt:?}"
+        );
+    }
+
+    #[test]
+    fn approval_prompt_omits_position_for_a_single_call_batch() {
+        // `1 of 1` tells the operator nothing, and every adapter would
+        // otherwise have to special-case it.
+        let with_single = super::build_yesno_approval_prompt("ab12cd", "shell", "x", Some((1, 1)));
+        let without = super::build_yesno_approval_prompt("ab12cd", "shell", "x", None);
+        assert_eq!(
+            with_single, without,
+            "a one-call batch should render exactly as an unpositioned prompt"
+        );
+    }
+
+    #[test]
+    fn position_counter_reports_raw_batch_position_not_approval_count() {
+        use zeroclaw_api::channel::{ApprovalPosition, ChannelApprovalRequest};
+
+        // The batch is three calls and only the second needs approval. The
+        // card must read "2 of 3" — the model-issued position — rather than
+        // "1 of 1", which would be the approval-required count. Computing the
+        // latter would require the approval set before the first card renders.
+        let request = ChannelApprovalRequest {
+            tool_name: "stake_tx_build".to_string(),
+            arguments_summary: "action: deactivate".to_string(),
+            raw_arguments: None,
+            position: Some(ApprovalPosition { index: 2, total: 3 }),
+        };
+
+        assert_eq!(request.position_counter(), Some((2, 3)));
+    }
+
+    #[test]
+    fn position_counter_is_absent_without_a_position() {
+        use zeroclaw_api::channel::ChannelApprovalRequest;
+
+        let request = ChannelApprovalRequest {
+            tool_name: "shell".to_string(),
+            arguments_summary: "ls -la".to_string(),
+            raw_arguments: None,
+            position: None,
+        };
+
+        assert_eq!(request.position_counter(), None);
+    }
+
+    #[test]
     fn approve_deny_approval_prompt_matches_matrix_own_parser_keywords() {
         // Same desync guard as above, for Matrix's `approve`/`deny`/`always`
         // reply shape (Matrix uses its own parser, not
         // `parse_approval_reply`, but the keyword contract is identical).
         let token = "AB12CD34";
-        let prompt = super::build_approve_deny_approval_prompt(token, "shell", "ls -la");
+        let prompt = super::build_approve_deny_approval_prompt(token, "shell", "ls -la", None);
         assert!(prompt.contains(token));
         for word in ["approve", "deny", "always"] {
             let reply = format!("{token} {word}");
@@ -869,6 +974,8 @@ mod tests {
                     ("approve_command", "TKN approve"),
                     ("deny_command", "TKN deny"),
                     ("always_command", "TKN always"),
+                    ("index", "1"),
+                    ("total", "2"),
                 ],
             );
             assert_ne!(

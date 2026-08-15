@@ -20748,6 +20748,7 @@ BTC is currently around $65,000 based on latest tool output."#
                             tool_name: "shell".to_string(),
                             arguments_summary: "command".to_string(),
                             raw_arguments: None,
+                            position: None,
                         },
                     )
                     .await
