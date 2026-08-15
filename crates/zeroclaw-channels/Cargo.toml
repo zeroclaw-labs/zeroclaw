@@ -130,8 +130,14 @@ rand = "0.10"
 webpki-roots = "1.0.6"
 tokio-socks = "0.5"
 
-# WhatsApp Web (optional). Pinned to oxidezap/whatsapp-rust @ b5daf75
-# until upstream ships 0.6.1 to crates.io.
+# WhatsApp Web (optional). Pinned to oxidezap/whatsapp-rust @ b5daf75.
+#
+# Upstream never shipped 0.6.1; it published 0.7.0 (2026-08-14) instead, which
+# IS on crates.io and would let these six git deps become registry versions —
+# the last blocker on publishing zeroclaw-channels. That is worth doing, but it
+# is not this change: 0.7.0 sits above the buffa migration described below, so
+# taking it means the full waproto port, and bundling that with a linking fix
+# would make both unreviewable. Tracked separately.
 #
 # b5daf75 (2026-07-02) is a DELIBERATE ceiling, not just "some recent commit".
 # It is the last revision before a6fb1174 "migrate from prost to buffa for
@@ -141,8 +147,8 @@ tokio-socks = "0.5"
 # this crate fails with 46 errors, versus 18 mechanical ones here.
 #
 # The floor is 3fb4729e (2026-07-01), the SHORTCAKE passkey companion-linking
-# fix for #8627; anything below it cannot complete a device link at all now
-# that WhatsApp's passkey gate is rolling out. So the usable window is
+# fix; anything below it cannot complete a device link at all now that
+# WhatsApp's passkey gate is rolling out. So the usable window is
 # 3fb4729e..a6fb1174~1, and this pin sits at the top of it.
 whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "b5daf757fdb08c7cad068cdd04ea0461cc2f5f13", optional = true, default-features = false, features = [
   "tokio-runtime",
