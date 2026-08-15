@@ -1,11 +1,13 @@
 //! SD-JWT / KB-SD-JWT cryptographic primitives.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ring::rand::SystemRandom;
 use ring::signature::{self, ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair};
+use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use sha2::{Digest, Sha256};
 
 use crate::verifiable_intent::error::{ViError, ViErrorKind};
@@ -26,6 +28,81 @@ pub fn b64u_decode(s: &str) -> Result<Vec<u8>, ViError> {
             format!("base64url decode: {e}"),
         )
     })
+}
+
+// ── Strict JSON ──────────────────────────────────────────────────────
+
+/// A JSON value that refuses duplicate object members, at any depth.
+///
+/// `serde_json::Value` keeps the last of a repeated key, so a signed object
+/// carrying two `aud` claims parses cleanly and two verifiers reading the same
+/// bytes can disagree about which one they checked. The security model requires
+/// refusing that rather than picking a winner, and the ambiguity has to be
+/// caught here: once the value exists, the evidence that it was ambiguous is
+/// gone.
+struct StrictJson(serde_json::Value);
+
+impl<'de> serde::Deserialize<'de> for StrictJson {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct StrictVisitor;
+
+        impl<'de> Visitor<'de> for StrictVisitor {
+            type Value = StrictJson;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("JSON with no duplicate object members")
+            }
+
+            fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+                Ok(StrictJson(serde_json::Value::Null))
+            }
+            fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+                Ok(StrictJson(serde_json::Value::Null))
+            }
+            fn visit_bool<E: de::Error>(self, value: bool) -> Result<Self::Value, E> {
+                Ok(StrictJson(serde_json::Value::Bool(value)))
+            }
+            fn visit_i64<E: de::Error>(self, value: i64) -> Result<Self::Value, E> {
+                Ok(StrictJson(serde_json::Value::from(value)))
+            }
+            fn visit_u64<E: de::Error>(self, value: u64) -> Result<Self::Value, E> {
+                Ok(StrictJson(serde_json::Value::from(value)))
+            }
+            fn visit_f64<E: de::Error>(self, value: f64) -> Result<Self::Value, E> {
+                Ok(StrictJson(serde_json::Value::from(value)))
+            }
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(StrictJson(serde_json::Value::String(value.to_owned())))
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut items = Vec::new();
+                while let Some(StrictJson(item)) = seq.next_element()? {
+                    items.push(item);
+                }
+                Ok(StrictJson(serde_json::Value::Array(items)))
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut object = serde_json::Map::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    let StrictJson(value) = map.next_value()?;
+                    if object.contains_key(&key) {
+                        return Err(de::Error::custom(format!("duplicate member `{key}`")));
+                    }
+                    object.insert(key, value);
+                }
+                Ok(StrictJson(serde_json::Value::Object(object)))
+            }
+        }
+
+        deserializer.deserialize_any(StrictVisitor)
+    }
+}
+
+/// Parse JSON, refusing duplicate object members at any depth.
+fn parse_json_strict(bytes: &[u8]) -> Result<serde_json::Value, serde_json::Error> {
+    serde_json::from_slice::<StrictJson>(bytes).map(|StrictJson(value)| value)
 }
 
 // ── Hashing ──────────────────────────────────────────────────────────
@@ -113,7 +190,7 @@ pub fn jws_verify(compact: &str, public_key_bytes: &[u8]) -> Result<(), ViError>
 pub fn jws_decode_payload(compact: &str) -> Result<serde_json::Value, ViError> {
     let [_, payload, _] = jws_parts(compact)?;
     let bytes = b64u_decode(payload)?;
-    serde_json::from_slice(&bytes)
+    parse_json_strict(&bytes)
         .map_err(|e| ViError::new(ViErrorKind::InvalidPayload, format!("payload JSON: {e}")))
 }
 
@@ -121,7 +198,7 @@ pub fn jws_decode_payload(compact: &str) -> Result<serde_json::Value, ViError> {
 pub fn jws_decode_header(compact: &str) -> Result<serde_json::Value, ViError> {
     let [header, _, _] = jws_parts(compact)?;
     let bytes = b64u_decode(header)?;
-    serde_json::from_slice(&bytes)
+    parse_json_strict(&bytes)
         .map_err(|e| ViError::new(ViErrorKind::InvalidHeader, format!("header JSON: {e}")))
 }
 
@@ -374,6 +451,17 @@ pub fn serialize_sd_jwt(issuer_jwt: &str, disclosures: &[String], kb_jwt: Option
 }
 
 /// Parse a serialized SD-JWT into (issuer_jwt, disclosures, optional_kb_jwt).
+///
+/// The two forms are distinguished by the final `~`: a presentation without key
+/// binding keeps it, and one with key binding ends in the key-binding JWT. That
+/// distinction is the only thing separating `issuer~disclosure` from
+/// `issuer~disclosure~`, and reading the first as the second silently drops the
+/// last disclosure while inventing a key binding. So the final component is
+/// required to look like a JWT before it is treated as one.
+///
+/// Structure only. Nothing here checks a key-binding JWT's audience, nonce,
+/// `sd_hash` or signature; those are chain-verification concerns above this
+/// layer.
 pub fn parse_sd_jwt(serialized: &str) -> Result<(&str, Vec<&str>, Option<&str>), ViError> {
     let parts: Vec<&str> = serialized.split('~').collect();
     if parts.len() < 2 {
@@ -384,9 +472,45 @@ pub fn parse_sd_jwt(serialized: &str) -> Result<(&str, Vec<&str>, Option<&str>),
     }
     let issuer_jwt = parts[0];
     let last = *parts.last().unwrap();
-    let kb_jwt = if last.is_empty() { None } else { Some(last) };
+
+    let kb_jwt = if last.is_empty() {
+        None
+    } else {
+        jws_decode_header(last).and_then(|header| {
+            if header.is_object() {
+                Ok(())
+            } else {
+                Err(ViError::new(
+                    ViErrorKind::InvalidHeader,
+                    "key-binding JWT header must be a JSON object",
+                ))
+            }
+        })?;
+        jws_decode_payload(last).and_then(|payload| {
+            if payload.is_object() {
+                Ok(())
+            } else {
+                Err(ViError::new(
+                    ViErrorKind::InvalidPayload,
+                    "key-binding JWT payload must be a JSON object",
+                ))
+            }
+        })?;
+        Some(last)
+    };
 
     let disclosures = parts[1..parts.len() - 1].to_vec();
+
+    // An empty segment is not a disclosure. It appears when a serialized SD-JWT
+    // that already ends in `~` is joined as though it were a bare JWT, which
+    // produces `jwt~~disclosure` and would otherwise be carried down to the
+    // disclosure decoder as an empty string.
+    if disclosures.iter().any(|disclosure| disclosure.is_empty()) {
+        return Err(ViError::new(
+            ViErrorKind::InvalidDisclosure,
+            "SD-JWT contains an empty disclosure segment",
+        ));
+    }
 
     Ok((issuer_jwt, disclosures, kb_jwt))
 }
@@ -527,13 +651,23 @@ impl SdJwt {
             ));
         };
 
-        let sd_hashes: HashSet<String> = match claims.get("_sd") {
-            Some(serde_json::Value::Array(entries)) => entries
-                .iter()
-                .filter_map(|entry| entry.as_str().map(str::to_string))
-                .collect(),
-            _ => HashSet::new(),
-        };
+        // A digest listed twice makes the graph ambiguous about which disclosure
+        // satisfies it, so it is refused rather than deduplicated. The scope is
+        // deliberately the `_sd` array alone: the credential format's own worked
+        // example carries a mandate's digest in both `_sd` and
+        // `delegate_payload`, so rejecting repeats across the whole payload
+        // would reject the shape the specification documents.
+        let mut sd_hashes: HashSet<String> = HashSet::new();
+        if let Some(serde_json::Value::Array(entries)) = claims.get("_sd") {
+            for digest in entries.iter().filter_map(serde_json::Value::as_str) {
+                if !sd_hashes.insert(digest.to_owned()) {
+                    return Err(ViError::new(
+                        ViErrorKind::InvalidDisclosure,
+                        format!("digest {digest} is listed more than once in `_sd`"),
+                    ));
+                }
+            }
+        }
 
         for (encoded, decoded) in self.disclosures.iter().zip(&self.disclosure_values) {
             if let Disclosure::ObjectProperty {
@@ -543,6 +677,22 @@ impl SdJwt {
             } = decoded
                 && sd_hashes.contains(&sd_hash(encoded))
             {
+                // A disclosure may not name a structural member, and may not
+                // redefine a claim the issuer already signed in the clear.
+                // Either would let a selectively disclosed value overwrite what
+                // the verifier believes it read from the signed payload.
+                if claim_name == "_sd" || claim_name == "..." {
+                    return Err(ViError::new(
+                        ViErrorKind::InvalidDisclosure,
+                        format!("a disclosure may not be named `{claim_name}`"),
+                    ));
+                }
+                if claims.contains_key(claim_name) {
+                    return Err(ViError::new(
+                        ViErrorKind::InvalidDisclosure,
+                        format!("disclosure would redefine the existing claim `{claim_name}`"),
+                    ));
+                }
                 claims.insert(claim_name.clone(), claim_value.clone());
             }
         }
@@ -561,18 +711,43 @@ impl SdJwt {
             .map(|(encoded, decoded)| (sd_hash(encoded), decoded.claim_value()))
             .collect();
 
-        let resolved: Vec<serde_json::Value> = entries
-            .iter()
-            .map(|entry| {
-                entry
-                    .as_object()
-                    .and_then(|object| object.get("..."))
-                    .and_then(serde_json::Value::as_str)
-                    .and_then(|reference| by_hash.get(reference).copied())
-                    .cloned()
-                    .unwrap_or_else(|| entry.clone())
-            })
-            .collect();
+        let mut resolved: Vec<serde_json::Value> = Vec::with_capacity(entries.len());
+        for entry in entries {
+            // A placeholder carries `...` and nothing else. Recognising one by
+            // membership instead would replace `{"...": h, "id": "x"}` wholesale
+            // and discard the sibling, which is silent data loss exactly where
+            // the caller believes it received a disclosed value.
+            let Some(object) = entry.as_object() else {
+                resolved.push(entry.clone());
+                continue;
+            };
+            if !object.contains_key("...") {
+                resolved.push(entry.clone());
+                continue;
+            }
+            if object.len() != 1 {
+                return Err(ViError::new(
+                    ViErrorKind::InvalidDisclosure,
+                    "a disclosure reference must carry `...` as its only member",
+                ));
+            }
+            let Some(serde_json::Value::String(reference)) = object.get("...") else {
+                return Err(ViError::new(
+                    ViErrorKind::InvalidDisclosure,
+                    "a disclosure reference hash must be a string",
+                ));
+            };
+
+            // An unresolved reference stays in place rather than being removed.
+            // RFC 9901 drops an array element whose digest has no disclosure;
+            // here the surviving reference is what lets a verifier see that
+            // undisclosed mandates exist, which is the defence the security
+            // model builds on `delegate_payload`.
+            match by_hash.get(reference.as_str()) {
+                Some(value) => resolved.push((*value).clone()),
+                None => resolved.push(entry.clone()),
+            }
+        }
         claims.insert(
             "delegate_payload".to_string(),
             serde_json::Value::Array(resolved),
@@ -675,11 +850,14 @@ mod tests {
     fn sd_jwt_serialize_with_kb_jwt() {
         let jwt = "header.payload.sig";
         let disclosures = vec!["d1".to_string()];
-        let serialized = serialize_sd_jwt(jwt, &disclosures, Some("kb.jwt.here"));
+        // A key-binding component has to be a JWT to be treated as one, so this
+        // carries decodable segments rather than three arbitrary words.
+        let kb = key_binding_jwt();
+        let serialized = serialize_sd_jwt(jwt, &disclosures, Some(&kb));
         let (parsed_jwt, parsed_disc, parsed_kb) = parse_sd_jwt(&serialized).unwrap();
         assert_eq!(parsed_jwt, jwt);
         assert_eq!(parsed_disc, vec!["d1"]);
-        assert_eq!(parsed_kb, Some("kb.jwt.here"));
+        assert_eq!(parsed_kb, Some(kb.as_str()));
     }
 
     #[test]
@@ -923,14 +1101,199 @@ mod tests {
         let serialized = vectors["sd_jwt"]["serialized"]
             .as_str()
             .expect("serialized");
-        let with_kb = format!("{serialized}kb.jwt.here");
+        let kb = key_binding_jwt();
+        let with_kb = format!("{serialized}{kb}");
 
         let parsed = SdJwt::parse(&with_kb).expect("parse");
-        assert_eq!(parsed.key_binding_jwt(), Some("kb.jwt.here"));
+        assert_eq!(parsed.key_binding_jwt(), Some(kb.as_str()));
         assert_eq!(parsed.disclosures().len(), 4);
         assert_eq!(parsed.serialize(), with_kb);
         // §6.1: what a binding hashes excludes the KB-JWT and keeps the `~`.
         assert_eq!(parsed.presentation(), serialized);
+    }
+
+    // ── Wire shapes the parser must refuse ───────────────────────────
+
+    const PROBE_SALT: &str = "AAAAAAAAAAAAAAAAAAAAAA";
+
+    /// A three-segment JWT over the given header and payload. Unsigned: these
+    /// tests exercise parsing and resolution, which never inspect a signature.
+    fn unsigned_jwt(header: &serde_json::Value, payload: &serde_json::Value) -> String {
+        format!(
+            "{}.{}.c2ln",
+            b64u_encode(header.to_string().as_bytes()),
+            b64u_encode(payload.to_string().as_bytes())
+        )
+    }
+
+    fn sd_jwt_over(payload: &serde_json::Value, disclosures: &[String]) -> String {
+        let header = serde_json::json!({"alg": "ES256", "typ": "kb-sd-jwt"});
+        serialize_sd_jwt(&unsigned_jwt(&header, payload), disclosures, None)
+    }
+
+    /// A structurally valid key-binding JWT. Nothing verifies its signature or
+    /// its claims at this layer; it exists so that tests about the *shape* of a
+    /// presentation are not accidentally testing the KB rule.
+    fn key_binding_jwt() -> String {
+        unsigned_jwt(
+            &serde_json::json!({"alg": "ES256", "typ": "kb+jwt"}),
+            &serde_json::json!({"aud": "https://verifier.example", "nonce": "n-1"}),
+        )
+    }
+
+    /// A placeholder object carries `...` and nothing else. Replacing one that
+    /// has siblings discards those siblings, which is silent data loss at a
+    /// point where the caller believes it received a disclosed value.
+    #[test]
+    fn a_delegate_payload_placeholder_must_carry_nothing_but_the_hash() {
+        let (disclosure, hash) =
+            create_disclosure_with_salt(None, &serde_json::json!({"id": "agent-1"}), PROBE_SALT)
+                .unwrap();
+        let payload = serde_json::json!({
+            "delegate_payload": [ { "...": hash, "id": "dropped-on-the-floor" } ]
+        });
+
+        let parsed = SdJwt::parse(&sd_jwt_over(&payload, &[disclosure])).expect("parses");
+        assert!(
+            parsed.resolve_disclosures().is_err(),
+            "a placeholder with sibling keys must be refused, not silently replaced"
+        );
+    }
+
+    /// A digest appearing twice makes the disclosure graph ambiguous.
+    #[test]
+    fn a_repeated_sd_digest_is_refused() {
+        let (disclosure, hash) =
+            create_disclosure_with_salt(Some("a"), &serde_json::json!(1), PROBE_SALT).unwrap();
+        let payload = serde_json::json!({ "_sd": [hash, hash] });
+
+        let parsed = SdJwt::parse(&sd_jwt_over(&payload, &[disclosure])).expect("parses");
+        assert!(
+            parsed.resolve_disclosures().is_err(),
+            "the same digest listed twice must be refused rather than deduplicated"
+        );
+    }
+
+    /// A disclosure may not introduce a claim named `_sd` or `...`.
+    #[test]
+    fn a_disclosure_may_not_be_named_after_a_reserved_claim() {
+        for reserved in ["_sd", "..."] {
+            let (disclosure, hash) = create_disclosure_with_salt(
+                Some(reserved),
+                &serde_json::json!("smuggled"),
+                PROBE_SALT,
+            )
+            .unwrap();
+            let payload = serde_json::json!({ "_sd": [hash] });
+
+            let parsed = SdJwt::parse(&sd_jwt_over(&payload, &[disclosure])).expect("parses");
+            assert!(
+                parsed.resolve_disclosures().is_err(),
+                "a disclosure named `{reserved}` must be refused"
+            );
+        }
+    }
+
+    /// A disclosure may not overwrite a claim the issuer signed in the clear.
+    #[test]
+    fn a_disclosure_may_not_overwrite_an_existing_claim() {
+        let (disclosure, hash) = create_disclosure_with_salt(
+            Some("aud"),
+            &serde_json::json!("https://attacker.example"),
+            PROBE_SALT,
+        )
+        .unwrap();
+        let payload = serde_json::json!({
+            "aud": "https://network.example",
+            "_sd": [hash]
+        });
+
+        let parsed = SdJwt::parse(&sd_jwt_over(&payload, &[disclosure])).expect("parses");
+        assert!(
+            parsed.resolve_disclosures().is_err(),
+            "a disclosure must not redefine a permanently disclosed claim"
+        );
+    }
+
+    /// Without a trailing `~` the final component is a key-binding JWT, so a
+    /// presentation that simply omits the separator must not be read as one
+    /// with its last disclosure silently removed.
+    #[test]
+    fn a_presentation_missing_its_trailing_tilde_is_refused() {
+        let issuer = unsigned_jwt(
+            &serde_json::json!({"alg": "ES256"}),
+            &serde_json::json!({"iss": "https://issuer.example"}),
+        );
+        let (disclosure, _) =
+            create_disclosure_with_salt(Some("a"), &serde_json::json!(1), PROBE_SALT).unwrap();
+
+        let malformed = format!("{issuer}~{disclosure}");
+        assert!(
+            SdJwt::parse(&malformed).is_err(),
+            "a disclosure must not be accepted as a key-binding JWT"
+        );
+    }
+
+    /// The final component, when present, has to be a JWT.
+    #[test]
+    fn a_key_binding_component_must_be_a_jwt() {
+        let issuer = unsigned_jwt(
+            &serde_json::json!({"alg": "ES256"}),
+            &serde_json::json!({"iss": "https://issuer.example"}),
+        );
+        for bogus in ["kb.jwt.here", "two.segments", "!!!.!!!.!!!"] {
+            let malformed = format!("{issuer}~{bogus}");
+            assert!(
+                SdJwt::parse(&malformed).is_err(),
+                "a key-binding component that is not a JWT must be refused: {bogus}"
+            );
+        }
+    }
+
+    /// An empty segment is not a disclosure. It arises when a serialized SD-JWT
+    /// that already ends in `~` is composed as though it were a bare JWT.
+    #[test]
+    fn an_empty_disclosure_segment_is_refused() {
+        let issuer = unsigned_jwt(
+            &serde_json::json!({"alg": "ES256"}),
+            &serde_json::json!({"iss": "https://issuer.example"}),
+        );
+        let (disclosure, _) =
+            create_disclosure_with_salt(Some("a"), &serde_json::json!(1), PROBE_SALT).unwrap();
+
+        let malformed = format!("{issuer}~~{disclosure}~");
+        assert!(
+            parse_sd_jwt(&malformed).is_err(),
+            "an empty segment must be refused rather than passed on as a disclosure"
+        );
+    }
+
+    /// Duplicate members make a signed JSON object ambiguous: parsers differ on
+    /// first-wins versus last-wins, so two verifiers can reach opposite results
+    /// from identical bytes.
+    #[test]
+    fn duplicate_members_in_signed_json_are_refused() {
+        let header_ok = b64u_encode(br#"{"alg":"ES256"}"#);
+        let payload_ok = b64u_encode(br#"{"iss":"a"}"#);
+        let header_dup = b64u_encode(br#"{"alg":"ES256","alg":"none"}"#);
+        let payload_dup = b64u_encode(br#"{"iss":"a","iss":"b"}"#);
+
+        let dup_payload = format!("{header_ok}.{payload_dup}.c2ln");
+        assert!(
+            jws_decode_payload(&dup_payload).is_err(),
+            "a duplicate payload claim must be refused"
+        );
+
+        let dup_header = format!("{header_dup}.{payload_ok}.c2ln");
+        assert!(
+            jws_decode_header(&dup_header).is_err(),
+            "a duplicate header parameter must be refused"
+        );
+
+        // Control: the same helpers accept the unambiguous forms.
+        let clean = format!("{header_ok}.{payload_ok}.c2ln");
+        assert!(jws_decode_payload(&clean).is_ok());
+        assert!(jws_decode_header(&clean).is_ok());
     }
 
     #[test]

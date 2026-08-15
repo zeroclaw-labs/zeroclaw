@@ -112,7 +112,9 @@ def main(reference_root: Path) -> int:
             "bare-string-entry",
         ],
     }
-    header = {"alg": "ES256", "typ": "kb-sd+jwt"}
+    # The VI profile defines `kb-sd-jwt` and `kb-sd-jwt+kb`; this vector is a
+    # plain issuer-signed SD-JWT with no mandate pairing, so it takes the former.
+    header = {"alg": "ES256", "typ": "kb-sd-jwt"}
     presented = [d_checkout, d_payment, d_delegate, d_array_in_sd]
 
     sd_jwt = create_sd_jwt(header, payload, presented, private_key)
