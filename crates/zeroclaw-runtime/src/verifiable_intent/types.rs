@@ -162,15 +162,31 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for DisclosableEntry<T> {
 
         let value = serde_json::Value::deserialize(deserializer)?;
 
-        // A reference is an object whose *only* member is `...` carrying a
-        // string. The reference implementation tests membership instead, which
-        // reads `{"...": h, "id": "m-1"}` as a reference and silently discards
-        // the `id`. Requiring exclusivity turns that malformed entry into a
-        // parse failure rather than quiet data loss.
+        // The placeholder object carries `...` and nothing else, so the key's
+        // presence decides what the entry is: either a well-formed reference or
+        // malformed input. It must never fall through to `T`.
+        //
+        // Falling through is not a harmless leniency. Entry types accept
+        // unknown fields, so an object carrying the marker beside a complete
+        // set of entry fields would deserialize as an ordinary disclosed value
+        // with the marker discarded, and an allowlist check would then
+        // authorize against fields supplied outside the disclosure the marker
+        // names. Testing membership rather than the whole shape, as the
+        // reference implementation does, has the same effect by a different
+        // route: it keeps the entry as a reference and drops the siblings.
         if let serde_json::Value::Object(object) = &value
-            && object.len() == 1
-            && let Some(serde_json::Value::String(hash)) = object.get("...")
+            && object.contains_key("...")
         {
+            if object.len() != 1 {
+                return Err(D::Error::custom(
+                    "a disclosure reference must carry `...` as its only member",
+                ));
+            }
+            let Some(serde_json::Value::String(hash)) = object.get("...") else {
+                return Err(D::Error::custom(
+                    "a disclosure reference hash must be a string",
+                ));
+            };
             return Ok(Self::Reference { hash: hash.clone() });
         }
 
@@ -184,6 +200,7 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for DisclosableEntry<T> {
 
 /// Constraint types this build recognizes and can evaluate.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(strum_macros::EnumIter))]
 #[serde(tag = "type")]
 pub enum KnownConstraint {
     /// Merchant allowlist for checkout mandates.
@@ -275,7 +292,18 @@ const KNOWN_CONSTRAINT_TYPES: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Constraint {
     /// A constraint type this build can evaluate.
-    Known(KnownConstraint),
+    Known {
+        /// The recognized constraint.
+        known: KnownConstraint,
+        /// Fields the recognized variant did not consume.
+        ///
+        /// Preservation is required of every constraint object, not only of
+        /// unrecognized types: a newer issuer may add a field to a type this
+        /// build already knows, and a stage that reads the constraint later
+        /// cannot recover what this parser discarded. The reference
+        /// implementation carries the same thing on every constraint class.
+        extra: serde_json::Map<String, serde_json::Value>,
+    },
     /// A constraint type this build does not recognize, preserved in full.
     Unknown {
         constraint_type: String,
@@ -283,10 +311,60 @@ pub enum Constraint {
     },
 }
 
+impl From<KnownConstraint> for Constraint {
+    /// Wrap a recognized constraint that carries no additional fields.
+    ///
+    /// This is a convenience over the recognized representation and asserts
+    /// nothing about verification. The opaque verified types deliberately have
+    /// no such conversion.
+    fn from(known: KnownConstraint) -> Self {
+        Self::Known {
+            known,
+            extra: serde_json::Map::new(),
+        }
+    }
+}
+
+/// The object form of a recognized constraint.
+///
+/// Serialization rebuilds the constraint from this, and deserialization uses it
+/// to decide which input keys the variant consumed. Deriving the consumed set
+/// from serde itself is what keeps a second list of field names from existing
+/// beside the variants, where it could drift.
+///
+/// `serde_json::Error` is returned rather than a generic serde error because
+/// both directions need this and the two error traits are distinct; each caller
+/// maps it to its own.
+fn known_constraint_object(
+    known: &KnownConstraint,
+) -> Result<serde_json::Map<String, serde_json::Value>, serde_json::Error> {
+    match serde_json::to_value(known)? {
+        serde_json::Value::Object(object) => Ok(object),
+        other => Err(<serde_json::Error as serde::ser::Error>::custom(format!(
+            "a recognized constraint must serialize to an object, got {other}"
+        ))),
+    }
+}
+
 impl Serialize for Constraint {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::Error as _;
+
         match self {
-            Constraint::Known(known) => known.serialize(serializer),
+            Constraint::Known { known, extra } => {
+                let mut object = known_constraint_object(known).map_err(S::Error::custom)?;
+                // A recognized field wins over an extra of the same name. The
+                // parser cannot produce that collision, since extras are the
+                // input keys the variant did not consume, but a hand-built
+                // value can, and letting the extra overwrite would emit a
+                // constraint that reparses into a value nobody constructed.
+                for (key, value) in extra {
+                    if !object.contains_key(key) {
+                        object.insert(key.clone(), value.clone());
+                    }
+                }
+                object.serialize(serializer)
+            }
             Constraint::Unknown {
                 constraint_type,
                 fields,
@@ -318,7 +396,14 @@ impl<'de> Deserialize<'de> for Constraint {
         };
 
         match KnownConstraint::deserialize(serde_json::Value::Object(object.clone())) {
-            Ok(known) => Ok(Constraint::Known(known)),
+            Ok(known) => {
+                let consumed = known_constraint_object(&known).map_err(D::Error::custom)?;
+                let extra = object
+                    .into_iter()
+                    .filter(|(key, _)| !consumed.contains_key(key))
+                    .collect();
+                Ok(Constraint::Known { known, extra })
+            }
             Err(error) => {
                 if KNOWN_CONSTRAINT_TYPES.contains(&constraint_type.as_str()) {
                     return Err(D::Error::custom(error));
@@ -536,11 +621,12 @@ mod tests {
 
     #[test]
     fn constraint_serde_roundtrip() {
-        let c = Constraint::Known(KnownConstraint::PaymentAmount {
+        let c: Constraint = KnownConstraint::PaymentAmount {
             currency: "USD".into(),
             min: Some(10000),
             max: Some(40000),
-        });
+        }
+        .into();
         let json = serde_json::to_string(&c).unwrap();
         assert!(json.contains("payment.amount"));
         let back: Constraint = serde_json::from_str(&json).unwrap();
@@ -549,13 +635,14 @@ mod tests {
 
     #[test]
     fn constraint_merchant_serde_roundtrip() {
-        let c = Constraint::Known(KnownConstraint::AllowedMerchant {
+        let c: Constraint = KnownConstraint::AllowedMerchant {
             allowed_merchants: vec![DisclosableEntry::Disclosed(Entity {
                 id: None,
                 name: "Test Store".into(),
                 website: "https://test.example.com".into(),
             })],
-        });
+        }
+        .into();
         let json = serde_json::to_string(&c).unwrap();
         assert!(json.contains("mandate.checkout.allowed_merchant"));
         let back: Constraint = serde_json::from_str(&json).unwrap();
@@ -577,7 +664,10 @@ mod tests {
         }"#;
 
         let parsed: Constraint = serde_json::from_str(json).expect("mixed entries must parse");
-        let Constraint::Known(KnownConstraint::AllowedMerchant { allowed_merchants }) = &parsed
+        let Constraint::Known {
+            known: KnownConstraint::AllowedMerchant { allowed_merchants },
+            ..
+        } = &parsed
         else {
             panic!("expected a merchant allowlist, got {parsed:?}");
         };
@@ -625,6 +715,162 @@ mod tests {
         );
     }
 
+    /// A reference marker is decisive: an entry carrying `...` alongside a
+    /// complete set of entry fields is malformed, not a disclosed value. The
+    /// entry types ignore unknown fields, so without this the marker is
+    /// discarded and the checker authorizes on fields presented outside the
+    /// disclosure the marker names.
+    #[test]
+    fn a_complete_hybrid_entry_is_rejected_rather_than_silently_disclosed() {
+        let merchant = r#"{
+            "type": "mandate.checkout.allowed_merchant",
+            "allowed_merchants": [
+                {"...": "HASH", "name": "Store X", "website": "https://store-x.example"}
+            ]
+        }"#;
+        assert!(
+            serde_json::from_str::<Constraint>(merchant).is_err(),
+            "a merchant entry carrying a reference marker beside a complete entity must not parse"
+        );
+
+        let line_items = r#"{
+            "type": "mandate.checkout.line_items",
+            "items": [
+                {"...": "HASH", "id": "line-1", "acceptable_items": [], "quantity": 3}
+            ]
+        }"#;
+        assert!(
+            serde_json::from_str::<Constraint>(line_items).is_err(),
+            "a line item carrying a reference marker beside a complete entry must not parse"
+        );
+    }
+
+    /// The specification requires a parser to preserve fields it does not
+    /// recognize, and says so for constraint objects generally rather than only
+    /// for unrecognized types. A recognized variant that drops an extension
+    /// field erases data no later stage can recover.
+    #[test]
+    fn known_constraint_preserves_unrecognized_fields() {
+        let json = r#"{"type":"payment.amount","currency":"USD","max":40000,"acme_tier":"gold"}"#;
+        let parsed: Constraint = serde_json::from_str(json).unwrap();
+
+        let before: serde_json::Value = serde_json::from_str(json).unwrap();
+        let after: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&parsed).unwrap()).unwrap();
+        assert_eq!(
+            before, after,
+            "an unrecognized field on a recognized constraint must survive a round trip"
+        );
+    }
+
+    /// Preservation has to hold for every recognized type, not for the one that
+    /// happened to be tested. This walks the same variant array the tag-drift
+    /// test uses, so a new variant is carried in here too rather than being
+    /// covered by assertion.
+    #[test]
+    fn every_known_variant_preserves_an_unrecognized_field() {
+        for variant in every_known_variant() {
+            let mut object = match serde_json::to_value(&variant).unwrap() {
+                serde_json::Value::Object(object) => object,
+                other => panic!("a recognized constraint must serialize to an object: {other}"),
+            };
+            object.insert(
+                "acme_extension".to_owned(),
+                serde_json::Value::String("kept".to_owned()),
+            );
+            let before = serde_json::Value::Object(object);
+
+            let parsed: Constraint = serde_json::from_value(before.clone()).unwrap();
+            let Constraint::Known { extra, .. } = &parsed else {
+                panic!("expected the known arm for {before}");
+            };
+            assert_eq!(
+                extra.get("acme_extension").and_then(|v| v.as_str()),
+                Some("kept"),
+                "the extension field was dropped from {before}"
+            );
+
+            let after: serde_json::Value =
+                serde_json::from_str(&serde_json::to_string(&parsed).unwrap()).unwrap();
+            assert_eq!(before, after, "round trip lost data for {before}");
+        }
+    }
+
+    /// An explicit `null` for a field that is skipped when absent is not part of
+    /// the recognized serialization, so it is carried as an extra and survives.
+    /// Preserving it is the specification's requirement; the wrinkle is only
+    /// that it arrives through `extra` rather than through the variant.
+    #[test]
+    fn an_explicit_null_for_an_optional_field_is_preserved() {
+        let json = r#"{"type":"payment.amount","currency":"USD","min":null}"#;
+        let parsed: Constraint = serde_json::from_str(json).unwrap();
+
+        let Constraint::Known {
+            known: KnownConstraint::PaymentAmount { min, .. },
+            extra,
+        } = &parsed
+        else {
+            panic!("expected a payment amount, got {parsed:?}");
+        };
+        assert!(min.is_none(), "an explicit null parses as absent");
+        assert_eq!(extra.get("min"), Some(&serde_json::Value::Null));
+
+        let before: serde_json::Value = serde_json::from_str(json).unwrap();
+        let after: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&parsed).unwrap()).unwrap();
+        assert_eq!(before, after);
+    }
+
+    /// A recognized field outranks an extra of the same name. The parser cannot
+    /// build that collision, but a caller can, and an extra that overwrote the
+    /// variant would serialize a constraint that reparses into different values
+    /// than the one in hand.
+    #[test]
+    fn a_recognized_field_is_not_overwritten_by_a_colliding_extra() {
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "currency".to_owned(),
+            serde_json::Value::String("EUR".to_owned()),
+        );
+        let hand_built = Constraint::Known {
+            known: KnownConstraint::PaymentAmount {
+                currency: "USD".into(),
+                min: None,
+                max: Some(40000),
+            },
+            extra,
+        };
+
+        let serialized = serde_json::to_value(&hand_built).unwrap();
+        assert_eq!(serialized["currency"], "USD");
+
+        let reparsed: Constraint = serde_json::from_value(serialized).unwrap();
+        let Constraint::Known {
+            known: KnownConstraint::PaymentAmount { currency, .. },
+            extra,
+        } = &reparsed
+        else {
+            panic!("expected a payment amount, got {reparsed:?}");
+        };
+        assert_eq!(currency, "USD");
+        assert!(extra.is_empty(), "the colliding extra must not be emitted");
+    }
+
+    /// Every `KnownConstraint` variant, enumerated from the enum itself.
+    ///
+    /// A hand-written list is what these tests used to walk, and it could not
+    /// see a variant nobody added to it. The exhaustive `match` in
+    /// `check_single_constraint` forces a new variant to be *handled*, but
+    /// handling it there and leaving `KNOWN_CONSTRAINT_TYPES` alone compiles
+    /// and passes, which is the fail-open that table exists to prevent.
+    /// Deriving the iteration removes the hand-written step, so the tag test
+    /// compares the enum against the table rather than one list against
+    /// another. Verified by adding a ninth variant and watching this fail.
+    fn every_known_variant() -> Vec<KnownConstraint> {
+        use strum::IntoEnumIterator as _;
+        KnownConstraint::iter().collect()
+    }
+
     /// `KNOWN_CONSTRAINT_TYPES` decides whether a failed parse of a recognized
     /// tag surfaces as an error or degrades into `Unknown`. Adding a variant
     /// and forgetting the list would make that degradation silent, so pin one
@@ -632,46 +878,7 @@ mod tests {
     /// list, and the list must carry nothing the enum does not emit.
     #[test]
     fn known_constraint_tags_are_complete() {
-        let entity = || Entity {
-            id: None,
-            name: "n".into(),
-            website: "w".into(),
-        };
-        let every_variant = [
-            KnownConstraint::AllowedMerchant {
-                allowed_merchants: vec![DisclosableEntry::Disclosed(entity())],
-            },
-            KnownConstraint::LineItems { items: vec![] },
-            KnownConstraint::AllowedPayee {
-                allowed_payees: vec![DisclosableEntry::Disclosed(entity())],
-            },
-            KnownConstraint::PaymentAmount {
-                currency: "USD".into(),
-                min: None,
-                max: None,
-            },
-            KnownConstraint::PaymentBudget {
-                currency: "USD".into(),
-                max: 1,
-            },
-            KnownConstraint::PaymentRecurrence {
-                frequency: "MNTH".into(),
-                start_date: "2026-01-01".into(),
-                end_date: None,
-                number: None,
-            },
-            KnownConstraint::AgentRecurrence {
-                frequency: "MNTH".into(),
-                start_date: "2026-01-01".into(),
-                end_date: None,
-                max_occurrences: None,
-            },
-            KnownConstraint::PaymentReference {
-                conditional_transaction_id: "t".into(),
-            },
-        ];
-
-        let mut emitted: Vec<String> = every_variant
+        let mut emitted: Vec<String> = every_known_variant()
             .iter()
             .map(|variant| {
                 let value = serde_json::to_value(variant).unwrap();
@@ -774,7 +981,10 @@ mod tests {
         let parsed: Constraint = serde_json::from_str(json).unwrap();
         assert!(matches!(
             parsed,
-            Constraint::Known(KnownConstraint::PaymentAmount { .. })
+            Constraint::Known {
+                known: KnownConstraint::PaymentAmount { .. },
+                ..
+            }
         ));
     }
 
@@ -787,7 +997,7 @@ mod tests {
         ]"#;
         let parsed: Vec<Constraint> = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.len(), 2);
-        assert!(matches!(parsed[0], Constraint::Known(_)));
+        assert!(matches!(parsed[0], Constraint::Known { .. }));
         assert!(matches!(parsed[1], Constraint::Unknown { .. }));
     }
 }

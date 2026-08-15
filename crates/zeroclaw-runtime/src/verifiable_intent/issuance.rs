@@ -278,8 +278,8 @@ mod tests {
     use super::*;
     use crate::verifiable_intent::crypto::{generate_ec_p256, load_key_pair};
     use crate::verifiable_intent::types::{
-        Cnf, Constraint, DisclosableEntry, Entity, FulfillmentLineItem, KnownConstraint,
-        PaymentAmount, PaymentInstrument,
+        Cnf, DisclosableEntry, Entity, FulfillmentLineItem, KnownConstraint, PaymentAmount,
+        PaymentInstrument,
     };
 
     fn test_issuer_l1() -> String {
@@ -348,13 +348,16 @@ mod tests {
         let checkout = OpenCheckoutMandate {
             vct: "mandate.checkout.open".into(),
             cnf: cnf.clone(),
-            constraints: vec![Constraint::Known(KnownConstraint::AllowedMerchant {
-                allowed_merchants: vec![DisclosableEntry::Disclosed(Entity {
-                    id: None,
-                    name: "Test Store".into(),
-                    website: "https://store.example.com".into(),
-                })],
-            })],
+            constraints: vec![
+                KnownConstraint::AllowedMerchant {
+                    allowed_merchants: vec![DisclosableEntry::Disclosed(Entity {
+                        id: None,
+                        name: "Test Store".into(),
+                        website: "https://store.example.com".into(),
+                    })],
+                }
+                .into(),
+            ],
             prompt_summary: Some("Buy a test product".into()),
         };
         let payment = OpenPaymentMandate {
@@ -365,11 +368,14 @@ mod tests {
                 id: "tok-1".into(),
                 description: None,
             },
-            constraints: vec![Constraint::Known(KnownConstraint::PaymentAmount {
-                currency: "USD".into(),
-                min: Some(10000),
-                max: Some(40000),
-            })],
+            constraints: vec![
+                KnownConstraint::PaymentAmount {
+                    currency: "USD".into(),
+                    min: Some(10000),
+                    max: Some(40000),
+                }
+                .into(),
+            ],
         };
 
         let result = create_layer2_autonomous(

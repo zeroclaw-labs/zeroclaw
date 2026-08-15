@@ -269,7 +269,10 @@ fn check_single_constraint(
     mode: MandateMode,
 ) -> ConstraintCheckResult {
     let known = match constraint {
-        Constraint::Known(known) => known,
+        // Fields the recognized variant did not consume are carried for later
+        // stages rather than evaluated here. A checker that acted on a field it
+        // does not recognize would be inventing a rule the issuer never wrote.
+        Constraint::Known { known, .. } => known,
         Constraint::Unknown {
             constraint_type, ..
         } => return check_unknown_constraint(constraint_type, strictness, mode),
@@ -1102,14 +1105,16 @@ mod tests {
     #[test]
     fn check_constraints_multiple() {
         let constraints = vec![
-            Constraint::Known(KnownConstraint::PaymentAmount {
+            KnownConstraint::PaymentAmount {
                 currency: "USD".into(),
                 min: Some(10000),
                 max: Some(40000),
-            }),
-            Constraint::Known(KnownConstraint::AllowedPayee {
+            }
+            .into(),
+            KnownConstraint::AllowedPayee {
                 allowed_payees: vec![disclosed(merchant("Store", "https://store.example.com"))],
-            }),
+            }
+            .into(),
         ];
         let f = Fulfillment {
             amount: Some(25000),
@@ -1137,16 +1142,18 @@ mod tests {
             ("", Some(String::new())),
             (" ", Some(" ".into())),
         ] {
-            let constraints = vec![
-                Constraint::Known(KnownConstraint::PaymentAmount {
+            let constraints: Vec<Constraint> = vec![
+                KnownConstraint::PaymentAmount {
                     currency: expected.into(),
                     min: None,
                     max: Some(40000),
-                }),
-                Constraint::Known(KnownConstraint::PaymentBudget {
+                }
+                .into(),
+                KnownConstraint::PaymentBudget {
                     currency: expected.into(),
                     max: 50000,
-                }),
+                }
+                .into(),
             ];
             let fulfillment = Fulfillment {
                 amount: Some(20000),
@@ -1246,11 +1253,14 @@ mod tests {
     /// never marked skipped.
     #[test]
     fn known_constraint_is_unaffected_by_strictness_and_mode() {
-        let constraints = vec![Constraint::Known(KnownConstraint::PaymentAmount {
-            currency: "USD".into(),
-            min: None,
-            max: Some(40000),
-        })];
+        let constraints: Vec<Constraint> = vec![
+            KnownConstraint::PaymentAmount {
+                currency: "USD".into(),
+                min: None,
+                max: Some(40000),
+            }
+            .into(),
+        ];
         let fulfillment = Fulfillment {
             amount: Some(20000),
             currency: Some("USD".into()),
