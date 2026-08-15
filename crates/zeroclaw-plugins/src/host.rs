@@ -212,6 +212,22 @@ impl PluginHost {
         self.loaded.get(name).map(plugin_info_from_loaded)
     }
 
+    /// The destinations `name`'s manifest **declares** (ADR-013's `[egress]`
+    /// table), already validated by `validate_manifest_shape`.
+    ///
+    /// This is the declaration, never a grant: nothing here confers network
+    /// reach. It exists so the CLI grant ceremony can print it, seed a new
+    /// `[[plugins.entries]]` row from it, and diff it against an existing
+    /// entry. An unknown plugin and a plugin that declares nothing give the
+    /// same answer — an empty slice — because "declares nothing" is the same
+    /// state as "no `[egress]` table".
+    #[must_use]
+    pub fn declared_egress_hosts(&self, name: &str) -> &[String] {
+        self.loaded
+            .get(name)
+            .map_or(&[], |p| p.manifest.egress.hosts.as_slice())
+    }
+
     /// Install a plugin from a directory path. Returns the installed
     /// plugin's manifest name so callers can key follow-up work (config
     /// seeding, messaging) off the canonical name rather than the source path.
