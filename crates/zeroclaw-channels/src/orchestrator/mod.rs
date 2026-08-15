@@ -23704,6 +23704,321 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
+    async fn telegram_model_picker_username_change_updates_only_current_sender_session() {
+        use wiremock::matchers::{body_partial_json, method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        async fn wait_for_request(server: &MockServer, suffix: &str) {
+            for _ in 0..200 {
+                if server
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|request| request.url.path().ends_with(suffix))
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("timed out waiting for Telegram request ending in {suffix}");
+        }
+
+        fn callback_update(
+            update_id: i64,
+            callback_id: &str,
+            callback_data: &str,
+        ) -> serde_json::Value {
+            serde_json::json!({
+                "update_id": update_id,
+                "callback_query": {
+                    "id": callback_id,
+                    "from": { "id": 123, "username": "renamed_user" },
+                    "message": {
+                        "message_id": 77,
+                        "message_thread_id": 9,
+                        "chat": { "id": -10042 }
+                    },
+                    "data": callback_data,
+                }
+            })
+        }
+
+        async fn mount_listener_mocks(
+            server: &MockServer,
+            update: serde_json::Value,
+            edit_path: &str,
+        ) {
+            Mock::given(method("POST"))
+                .and(path_regex(r"/bot[^/]+/getUpdates$"))
+                .and(body_partial_json(serde_json::json!({ "timeout": 0 })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ok": true,
+                    "result": []
+                })))
+                .expect(1)
+                .mount(server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path_regex(r"/bot[^/]+/getUpdates$"))
+                .and(body_partial_json(serde_json::json!({ "timeout": 30 })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ok": true,
+                    "result": [update]
+                })))
+                .up_to_n_times(1)
+                .expect(1)
+                .mount(server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path_regex(r"/bot[^/]+/setMyCommands$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ok": true,
+                    "result": true
+                })))
+                .expect(1)
+                .mount(server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path_regex(edit_path))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ok": true,
+                    "result": true
+                })))
+                .expect(1)
+                .mount(server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path_regex(r"/bot[^/]+/answerCallbackQuery$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ok": true,
+                    "result": true
+                })))
+                .expect(1)
+                .mount(server)
+                .await;
+        }
+
+        fn callback_for_button(
+            requests: &[wiremock::Request],
+            endpoint: &str,
+            label: &str,
+        ) -> String {
+            let request = requests
+                .iter()
+                .rev()
+                .find(|request| request.url.path().ends_with(endpoint))
+                .expect("Telegram keyboard edit request");
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            body["reply_markup"]["inline_keyboard"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|row| row.as_array().unwrap())
+                .find(|button| {
+                    button["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains(label))
+                })
+                .and_then(|button| button["callback_data"].as_str())
+                .expect("matching model-picker button")
+                .to_string()
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 77 }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/editMessageText$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut picker_config = Config::default();
+        picker_config.channels.telegram.insert(
+            "main".into(),
+            zeroclaw_config::schema::TelegramConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        picker_config.providers.models.openai.insert(
+            "primary".into(),
+            zeroclaw_config::schema::OpenAIModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    model: Some("gpt-current".into()),
+                    ..Default::default()
+                },
+            },
+        );
+        picker_config.providers.models.anthropic.insert(
+            "work".into(),
+            zeroclaw_config::schema::AnthropicModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    model: Some("claude-sonnet-4-5".into()),
+                    ..Default::default()
+                },
+            },
+        );
+        picker_config.agents.insert(
+            "assistant".into(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["telegram.main".into()],
+                model_provider: "openai.primary".into(),
+                ..Default::default()
+            },
+        );
+        picker_config.model_routes = vec![zeroclaw_config::schema::ModelRouteConfig {
+            hint: "fast".into(),
+            model_provider: "anthropic.work".into(),
+            model: "claude-sonnet-4-5".into(),
+            api_key: None,
+        }];
+        let picker_routes = picker_config
+            .model_routes
+            .iter()
+            .map(|route| zeroclaw_api::channel::ChannelModelPickerRoute {
+                hint: route.hint.clone(),
+                model_provider: route.model_provider.clone(),
+                model: route.model.clone(),
+            })
+            .collect();
+        let telegram = Arc::new(
+            TelegramChannel::new(
+                "test-token".into(),
+                "main",
+                Arc::new(|| vec!["123".into()]),
+                false,
+            )
+            .with_persistence(Arc::new(RwLock::new(picker_config)))
+            .with_api_base(server.uri()),
+        );
+        let picker_request = zeroclaw_api::channel::ChannelModelPickerRequest {
+            requesting_user: "original_user".into(),
+            requesting_user_id: "123".into(),
+            reply_target: "-10042:9".into(),
+            thread_ts: Some("9".into()),
+            channel_alias: "main".into(),
+            owner_agent_alias: "assistant".into(),
+            current_model_provider: "openai.primary".into(),
+            current_model: "gpt-current".into(),
+            model_routes: picker_routes,
+        };
+        assert!(
+            telegram
+                .present_model_picker(&picker_request)
+                .await
+                .unwrap()
+        );
+        let provider_callback = callback_for_button(
+            &server.received_requests().await.unwrap(),
+            "editMessageText",
+            "anthropic.work",
+        );
+
+        server.reset().await;
+        mount_listener_mocks(
+            &server,
+            callback_update(1, "open-provider", &provider_callback),
+            r"/bot[^/]+/editMessageText$",
+        )
+        .await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        let navigation_channel = Arc::clone(&telegram);
+        let navigation_tx = tx.clone();
+        let navigation_listener =
+            zeroclaw_spawn::spawn!(async move { navigation_channel.listen(navigation_tx).await });
+        wait_for_request(&server, "editMessageText").await;
+        wait_for_request(&server, "answerCallbackQuery").await;
+        navigation_listener.abort();
+        let _ = navigation_listener.await;
+        assert!(
+            rx.try_recv().is_err(),
+            "navigation must not queue a command"
+        );
+        let selection_callback = callback_for_button(
+            &server.received_requests().await.unwrap(),
+            "editMessageText",
+            "claude-sonnet-4-5",
+        );
+
+        server.reset().await;
+        mount_listener_mocks(
+            &server,
+            callback_update(2, "select-model", &selection_callback),
+            r"/bot[^/]+/editMessageReplyMarkup$",
+        )
+        .await;
+        let selection_channel = Arc::clone(&telegram);
+        let selection_listener =
+            zeroclaw_spawn::spawn!(async move { selection_channel.listen(tx).await });
+        let queued = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("Telegram selection callback must reach the runtime queue")
+            .expect("runtime queue must remain open");
+        wait_for_request(&server, "editMessageReplyMarkup").await;
+        wait_for_request(&server, "answerCallbackQuery").await;
+        selection_listener.abort();
+        let _ = selection_listener.await;
+
+        assert_eq!(queued.sender, "renamed_user");
+        assert_eq!(queued.platform_sender_id.as_deref(), Some("123"));
+        assert_eq!(queued.content, "/model fast");
+        assert_eq!(queued.thread_ts.as_deref(), Some("9"));
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut ctx = channel_runtime_context_for_defaults_test(
+            tmp.path(),
+            "assistant",
+            "openrouter.default",
+            "config-model",
+        );
+        ctx.model_routes = Arc::new(vec![zeroclaw_config::schema::ModelRouteConfig {
+            hint: "fast".into(),
+            model_provider: "anthropic.work".into(),
+            model: "claude-sonnet-4-5".into(),
+            api_key: None,
+        }]);
+        let mut original_sender_message = queued.clone();
+        original_sender_message.sender = "original_user".into();
+        let original_key = conversation_history_key(&original_sender_message);
+        let current_key = conversation_history_key(&queued);
+        ctx.route_overrides.lock().unwrap().insert(
+            original_key.clone(),
+            ChannelRouteSelection {
+                model_provider: "openrouter.default".into(),
+                model: "original-session-model".into(),
+                api_key: None,
+            },
+        );
+        let response_channel = Arc::new(ModelPickerRecordingChannel::default());
+        let response_channel_trait: Arc<dyn Channel> = response_channel.clone();
+
+        assert!(
+            handle_runtime_command_if_needed(&ctx, &queued, Some(&response_channel_trait)).await
+        );
+
+        let overrides = ctx.route_overrides.lock().unwrap();
+        assert_ne!(original_key, current_key);
+        assert_eq!(overrides.len(), 2);
+        assert_eq!(overrides[&original_key].model, "original-session-model");
+        assert_eq!(overrides[&current_key].model_provider, "anthropic.work");
+        assert_eq!(overrides[&current_key].model, "claude-sonnet-4-5");
+    }
+
+    #[tokio::test]
     async fn dispatch_agent_scope_writes_override_for_admin_sender() {
         // Authorized sender: dispatch must reach the SetModelScoped(Agent)
         // accept branch and write a scope override.

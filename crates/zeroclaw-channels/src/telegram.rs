@@ -100,7 +100,6 @@ enum ModelPickerAction {
 struct PendingModelPicker {
     created_at: Instant,
     expires_at: Instant,
-    requesting_user: String,
     requesting_user_id: String,
     reply_target: String,
     thread_ts: Option<String>,
@@ -1150,13 +1149,16 @@ impl TelegramChannel {
         Some(serde_json::json!({ "inline_keyboard": rows }))
     }
 
-    fn model_picker_selection_message(state: &PendingModelPicker) -> Option<ChannelMessage> {
+    fn model_picker_selection_message(
+        state: &PendingModelPicker,
+        current_sender: String,
+    ) -> Option<ChannelMessage> {
         let ModelPickerAction::Select(selected) = &state.action else {
             return None;
         };
         Some(ChannelMessage {
             id: format!("telegram_model_picker_{}", uuid::Uuid::new_v4()),
-            sender: state.requesting_user.clone(),
+            sender: current_sender,
             platform_sender_id: Some(state.requesting_user_id.clone()),
             reply_target: state.reply_target.clone(),
             content: Self::model_picker_selection_command(selected),
@@ -1189,16 +1191,25 @@ impl TelegramChannel {
         additional: usize,
     ) {
         let now = Instant::now();
-        pending.retain(|_, candidate| candidate.expires_at >= now);
+        let expired_keyboards = pending
+            .values()
+            .filter(|candidate| candidate.expires_at < now)
+            .cloned()
+            .collect::<Vec<_>>();
+        pending.retain(|_, candidate| {
+            !expired_keyboards
+                .iter()
+                .any(|expired| Self::same_model_picker_keyboard(expired, candidate))
+        });
         while pending.len().saturating_add(additional) > TELEGRAM_MODEL_PICKER_MAX_PENDING {
             let Some(oldest) = pending
-                .iter()
-                .min_by_key(|(_, candidate)| candidate.created_at)
-                .map(|(token, _)| token.clone())
+                .values()
+                .min_by_key(|candidate| candidate.created_at)
+                .cloned()
             else {
                 break;
             };
-            pending.remove(&oldest);
+            pending.retain(|_, candidate| !Self::same_model_picker_keyboard(&oldest, candidate));
         }
     }
 
@@ -1433,7 +1444,12 @@ impl TelegramChannel {
         });
 
         match &state.action {
-            ModelPickerAction::Select(_) => Self::model_picker_selection_message(&state)
+            ModelPickerAction::Select(_) => callback
+                .get("from")
+                .and_then(Self::telegram_sender_identity)
+                .and_then(|current_sender| {
+                    Self::model_picker_selection_message(&state, current_sender)
+                })
                 .map_or(ModelPickerCallbackOutcome::Rejected, |message| {
                     ModelPickerCallbackOutcome::Queued(Box::new(message))
                 }),
@@ -1601,12 +1617,37 @@ impl TelegramChannel {
         if !text.is_empty() {
             body["text"] = serde_json::Value::String(text.chars().take(180).collect());
         }
-        let _ = self
+        match self
             .http_client()
             .post(self.api_url("answerCallbackQuery"))
             .json(&body)
             .send()
-            .await;
+            .await
+        {
+            Ok(response) if response.status().is_success() => {}
+            Ok(response) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "status": response.status().as_u16(),
+                        })),
+                    "Telegram model picker callback acknowledgement failed"
+                );
+            }
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "error": zeroclaw_runtime::security::scrub(&error.to_string()),
+                        })),
+                    "Telegram model picker callback acknowledgement failed"
+                );
+            }
+        }
     }
 
     async fn disable_model_picker_keyboard(&self, callback: &serde_json::Value) {
@@ -1625,7 +1666,7 @@ impl TelegramChannel {
     }
 
     async fn disable_model_picker_keyboard_at(&self, chat_id: i64, message_id: i64) {
-        let _ = self
+        match self
             .http_client()
             .post(self.api_url("editMessageReplyMarkup"))
             .json(&serde_json::json!({
@@ -1634,7 +1675,34 @@ impl TelegramChannel {
                 "reply_markup": { "inline_keyboard": [] },
             }))
             .send()
-            .await;
+            .await
+        {
+            Ok(response) if response.status().is_success() => {}
+            Ok(response) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "status": response.status().as_u16(),
+                            "picker_message_id": message_id,
+                        })),
+                    "Telegram model picker keyboard cleanup failed"
+                );
+            }
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "error": zeroclaw_runtime::security::scrub(&error.to_string()),
+                            "picker_message_id": message_id,
+                        })),
+                    "Telegram model picker keyboard cleanup failed"
+                );
+            }
+        }
     }
 
     async fn edit_model_picker_message(
@@ -4841,7 +4909,6 @@ impl Channel for TelegramChannel {
         let base = PendingModelPicker {
             created_at,
             expires_at: created_at + TELEGRAM_MODEL_PICKER_TTL,
-            requesting_user: request.requesting_user.clone(),
             requesting_user_id: request.requesting_user_id.clone(),
             reply_target: request.reply_target.clone(),
             thread_ts: request.thread_ts.clone(),
@@ -6978,8 +7045,7 @@ mod tests {
         let pending = channel.pending_model_pickers.lock().await;
         assert_eq!(pending.len(), 4);
         assert!(pending.values().all(|state| {
-            state.requesting_user == "test_user"
-                && state.requesting_user_id == "123"
+            state.requesting_user_id == "123"
                 && state.reply_target == "-10042:9"
                 && state.picker_message_id == 77
                 && state.current.model_provider == "anthropic.team"
@@ -7091,11 +7157,10 @@ mod tests {
     }
 
     #[test]
-    fn picker_selection_message_preserves_requesting_user_chat_thread_and_alias() {
+    fn picker_selection_message_uses_current_sender_and_preserves_route_context() {
         let state = PendingModelPicker {
             created_at: std::time::Instant::now(),
             expires_at: std::time::Instant::now() + TELEGRAM_MODEL_PICKER_TTL,
-            requesting_user: "test_user".into(),
             requesting_user_id: "123".into(),
             reply_target: "-10042:9".into(),
             thread_ts: Some("9".into()),
@@ -7114,10 +7179,11 @@ mod tests {
             }),
         };
 
-        let message = TelegramChannel::model_picker_selection_message(&state)
-            .expect("selection action becomes a normal channel command");
+        let message =
+            TelegramChannel::model_picker_selection_message(&state, "current_user".into())
+                .expect("selection action becomes a normal channel command");
 
-        assert_eq!(message.sender, "test_user");
+        assert_eq!(message.sender, "current_user");
         assert_eq!(message.platform_sender_id.as_deref(), Some("123"));
         assert_eq!(message.reply_target, "-10042:9");
         assert_eq!(message.thread_ts.as_deref(), Some("9"));
@@ -7155,7 +7221,6 @@ mod tests {
         let state = PendingModelPicker {
             created_at: Instant::now(),
             expires_at: Instant::now() + TELEGRAM_MODEL_PICKER_TTL,
-            requesting_user: "test_user".into(),
             requesting_user_id: "123".into(),
             reply_target: "-10042:9".into(),
             thread_ts: Some("9".into()),
@@ -7235,7 +7300,6 @@ mod tests {
         let base = PendingModelPicker {
             created_at: Instant::now(),
             expires_at: Instant::now() + TELEGRAM_MODEL_PICKER_TTL,
-            requesting_user: "test_user".into(),
             requesting_user_id: "123".into(),
             reply_target: "-10042:9".into(),
             thread_ts: Some("9".into()),
@@ -7313,7 +7377,7 @@ mod tests {
         let runtime_routes = model_picker_runtime_routes(&model_picker_config());
         let mut newest_token = String::new();
 
-        for _ in 0..=TELEGRAM_MODEL_PICKER_MAX_PENDING {
+        for picker_message_id in 0..=TELEGRAM_MODEL_PICKER_MAX_PENDING {
             let token = uuid::Uuid::new_v4().to_string();
             newest_token.clone_from(&token);
             channel
@@ -7322,12 +7386,11 @@ mod tests {
                     PendingModelPicker {
                         created_at: Instant::now(),
                         expires_at: Instant::now() + TELEGRAM_MODEL_PICKER_TTL,
-                        requesting_user: "test_user".into(),
                         requesting_user_id: "123".into(),
                         reply_target: "-10042:9".into(),
                         thread_ts: Some("9".into()),
                         channel_alias: "main".into(),
-                        picker_message_id: 77,
+                        picker_message_id: i64::try_from(picker_message_id).unwrap(),
                         owner_agent_alias: "assistant".into(),
                         current: ModelPickerSelection {
                             model_provider: "openai.primary".into(),
@@ -7343,6 +7406,178 @@ mod tests {
         let pending = channel.pending_model_pickers.lock().await;
         assert_eq!(pending.len(), TELEGRAM_MODEL_PICKER_MAX_PENDING);
         assert!(pending.contains_key(&newest_token));
+    }
+
+    #[tokio::test]
+    async fn model_picker_concurrent_capacity_pressure_keeps_keyboard_cohorts_atomic() {
+        let channel = Arc::new(TelegramChannel::new(
+            "token".into(),
+            "main",
+            Arc::new(|| vec!["123".into()]),
+            false,
+        ));
+        let runtime_routes = model_picker_runtime_routes(&model_picker_config());
+        let now = Instant::now();
+        let base = PendingModelPicker {
+            created_at: now,
+            expires_at: now + TELEGRAM_MODEL_PICKER_TTL,
+            requesting_user_id: "123".into(),
+            reply_target: "-10042:9".into(),
+            thread_ts: Some("9".into()),
+            channel_alias: "main".into(),
+            picker_message_id: 77,
+            owner_agent_alias: "assistant".into(),
+            current: ModelPickerSelection {
+                model_provider: "openai.primary".into(),
+                model: "gpt-current".into(),
+            },
+            runtime_routes,
+            action: ModelPickerAction::Cancel,
+        };
+        let old_tokens = (0..3)
+            .map(|_| uuid::Uuid::new_v4().to_string())
+            .collect::<Vec<_>>();
+        let mut initial = old_tokens
+            .iter()
+            .cloned()
+            .map(|token| {
+                (
+                    token,
+                    PendingModelPicker {
+                        created_at: now - Duration::from_secs(30),
+                        picker_message_id: 1,
+                        ..base.clone()
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        for index in 0..506 {
+            initial.push((
+                uuid::Uuid::new_v4().to_string(),
+                PendingModelPicker {
+                    picker_message_id: 1000 + index,
+                    ..base.clone()
+                },
+            ));
+        }
+        channel.insert_pending_model_picker_batch(initial).await;
+
+        let cohort_a = (0..2)
+            .map(|_| uuid::Uuid::new_v4().to_string())
+            .collect::<Vec<_>>();
+        let cohort_b = (0..2)
+            .map(|_| uuid::Uuid::new_v4().to_string())
+            .collect::<Vec<_>>();
+        let batch = |tokens: &[String], picker_message_id| {
+            tokens
+                .iter()
+                .cloned()
+                .map(|token| {
+                    (
+                        token,
+                        PendingModelPicker {
+                            picker_message_id,
+                            ..base.clone()
+                        },
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let channel_a = Arc::clone(&channel);
+        let channel_b = Arc::clone(&channel);
+        let batch_a = batch(&cohort_a, 2);
+        let batch_b = batch(&cohort_b, 3);
+
+        tokio::join!(
+            channel_a.insert_pending_model_picker_batch(batch_a),
+            channel_b.insert_pending_model_picker_batch(batch_b),
+        );
+
+        let pending = channel.pending_model_pickers.lock().await;
+        let retained = |tokens: &[String]| {
+            tokens
+                .iter()
+                .filter(|token| pending.contains_key(*token))
+                .count()
+        };
+        assert!(pending.len() <= TELEGRAM_MODEL_PICKER_MAX_PENDING);
+        assert_eq!(
+            retained(&old_tokens),
+            0,
+            "the oldest keyboard is evicted whole"
+        );
+        assert_eq!(retained(&cohort_a), cohort_a.len());
+        assert_eq!(retained(&cohort_b), cohort_b.len());
+    }
+
+    #[tokio::test]
+    async fn model_picker_cleanup_failures_emit_scrubbed_diagnostics() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/answerCallbackQuery$"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/editMessageReplyMarkup$"))
+            .respond_with(ResponseTemplate::new(502))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let channel = TelegramChannel::new(
+            "123456:ABC-secret-token".into(),
+            "main",
+            Arc::new(|| vec!["123".into()]),
+            false,
+        )
+        .with_api_base(server.uri());
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        let _hook_cleanup = BroadcastHookGuard;
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        channel
+            .answer_model_picker_callback("callback-secret-id", "queued".into())
+            .await;
+        channel.disable_model_picker_keyboard_at(-10042, 77).await;
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut failure_events = Vec::new();
+        while failure_events.len() < 2 && Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match tokio::time::timeout(remaining.min(Duration::from_millis(50)), rx.recv()).await {
+                Ok(Ok(event)) => {
+                    let is_picker_failure = event
+                        .get("message")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|message| {
+                            matches!(
+                                message,
+                                "Telegram model picker callback acknowledgement failed"
+                                    | "Telegram model picker keyboard cleanup failed"
+                            )
+                        });
+                    if is_picker_failure {
+                        failure_events.push(event);
+                    }
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) | Err(_) => {}
+            }
+        }
+        let serialized = serde_json::to_string(&failure_events).unwrap();
+        assert!(serialized.contains("Telegram model picker callback acknowledgement failed"));
+        assert!(serialized.contains("Telegram model picker keyboard cleanup failed"));
+        assert!(serialized.contains("503"));
+        assert!(serialized.contains("502"));
+        assert!(!serialized.contains("callback-secret-id"));
+        assert!(!serialized.contains("123456:ABC-secret-token"));
     }
 
     #[tokio::test]
@@ -7374,7 +7609,6 @@ mod tests {
                 PendingModelPicker {
                     created_at: Instant::now(),
                     expires_at: Instant::now() + TELEGRAM_MODEL_PICKER_TTL,
-                    requesting_user: "test_user".into(),
                     requesting_user_id: "123".into(),
                     reply_target: "-10042:9".into(),
                     thread_ts: Some("9".into()),
@@ -7449,7 +7683,6 @@ mod tests {
         let base = PendingModelPicker {
             created_at: Instant::now(),
             expires_at: Instant::now() + TELEGRAM_MODEL_PICKER_TTL,
-            requesting_user: "test_user".into(),
             requesting_user_id: "123".into(),
             reply_target: "-10042:9".into(),
             thread_ts: Some("9".into()),
@@ -7550,7 +7783,6 @@ mod tests {
                 PendingModelPicker {
                     created_at: Instant::now(),
                     expires_at: Instant::now() + TELEGRAM_MODEL_PICKER_TTL,
-                    requesting_user: "test_user".into(),
                     requesting_user_id: "123".into(),
                     reply_target: "-10042:9".into(),
                     thread_ts: Some("9".into()),
