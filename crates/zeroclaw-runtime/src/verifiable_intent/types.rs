@@ -346,6 +346,32 @@ fn known_constraint_object(
     }
 }
 
+/// Add preserved fields to a constraint object without displacing what the
+/// constraint has already written.
+///
+/// Both arms write their authoritative keys first and then carry the fields the
+/// parser did not consume. A preserved field colliding with one of those keys is
+/// dropped rather than applied, because the authoritative keys are what a
+/// checker evaluates: for a recognized constraint they are the variant's own
+/// fields, and for an unrecognized one the `type` tag. Letting a preserved copy
+/// win would serialize a constraint that reparses into a value nobody
+/// constructed, and on the unrecognized arm it would put a different type in the
+/// signed mandate from the one the checker acted on.
+///
+/// Neither collision can be reached from parsing, which removes the consumed
+/// keys before preserving the rest. Both can be reached from a value built by
+/// hand, and the public issuance path accepts such a value.
+fn insert_preserved_fields(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    preserved: &serde_json::Map<String, serde_json::Value>,
+) {
+    for (key, value) in preserved {
+        if !object.contains_key(key) {
+            object.insert(key.clone(), value.clone());
+        }
+    }
+}
+
 impl Serialize for Constraint {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::Error as _;
@@ -353,16 +379,7 @@ impl Serialize for Constraint {
         match self {
             Constraint::Known { known, extra } => {
                 let mut object = known_constraint_object(known).map_err(S::Error::custom)?;
-                // A recognized field wins over an extra of the same name. The
-                // parser cannot produce that collision, since extras are the
-                // input keys the variant did not consume, but a hand-built
-                // value can, and letting the extra overwrite would emit a
-                // constraint that reparses into a value nobody constructed.
-                for (key, value) in extra {
-                    if !object.contains_key(key) {
-                        object.insert(key.clone(), value.clone());
-                    }
-                }
+                insert_preserved_fields(&mut object, extra);
                 object.serialize(serializer)
             }
             Constraint::Unknown {
@@ -374,9 +391,7 @@ impl Serialize for Constraint {
                     "type".to_owned(),
                     serde_json::Value::String(constraint_type.clone()),
                 );
-                for (key, value) in fields {
-                    object.insert(key.clone(), value.clone());
-                }
+                insert_preserved_fields(&mut object, fields);
                 object.serialize(serializer)
             }
         }
@@ -854,6 +869,90 @@ mod tests {
         };
         assert_eq!(currency, "USD");
         assert!(extra.is_empty(), "the colliding extra must not be emitted");
+    }
+
+    /// The tag a checker acts on and the tag an issuer signs have to be the
+    /// same string.
+    ///
+    /// An unrecognized constraint holds its authoritative tag in
+    /// `constraint_type`, while the fields it preserves can also carry a `type`
+    /// key once a caller builds the value by hand rather than parsing it. If
+    /// the preserved key were written over the authoritative one, the checker
+    /// would evaluate one constraint type while the issued mandate carried
+    /// another, and the signature would cover the second.
+    #[test]
+    fn a_preserved_type_field_cannot_displace_the_unknown_constraint_tag() {
+        use crate::verifiable_intent::verification::{StrictnessMode, check_constraints};
+
+        let mut fields = serde_json::Map::new();
+        fields.insert(
+            "type".to_owned(),
+            serde_json::Value::String("com.acme.other".to_owned()),
+        );
+        let hand_built = Constraint::Unknown {
+            constraint_type: "com.acme.safe".to_owned(),
+            fields,
+        };
+
+        let checked = check_constraints(
+            std::slice::from_ref(&hand_built),
+            &Fulfillment::default(),
+            StrictnessMode::Strict,
+            MandateMode::Autonomous,
+        );
+        let serialized = serde_json::to_value(&hand_built).unwrap();
+
+        assert_eq!(
+            Some(checked[0].constraint_type.as_str()),
+            serialized["type"].as_str(),
+            "the checker and the serialized form must report the same tag"
+        );
+        assert_eq!(serialized["type"], "com.acme.safe");
+
+        let reparsed: Constraint = serde_json::from_value(serialized).unwrap();
+        let Constraint::Unknown {
+            constraint_type,
+            fields,
+        } = &reparsed
+        else {
+            panic!("expected the unknown arm, got {reparsed:?}");
+        };
+        assert_eq!(constraint_type, "com.acme.safe");
+        assert!(fields.is_empty(), "the colliding field must not be emitted");
+    }
+
+    /// The same rule on the recognized arm, measured rather than reasoned.
+    ///
+    /// A recognized variant emits its own tag through serde, so a preserved
+    /// field named `type` collides with a key the recognized value has already
+    /// written and the existing guard skips it. That follows from the tag
+    /// attribute, and following from an attribute is not the same as having
+    /// been observed, which is why it is asserted here.
+    #[test]
+    fn a_preserved_type_field_cannot_displace_a_known_constraint_tag() {
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "type".to_owned(),
+            serde_json::Value::String("com.acme.other".to_owned()),
+        );
+        let hand_built = Constraint::Known {
+            known: KnownConstraint::PaymentAmount {
+                currency: "USD".into(),
+                min: None,
+                max: Some(40000),
+            },
+            extra,
+        };
+
+        let serialized = serde_json::to_value(&hand_built).unwrap();
+        assert_eq!(serialized["type"], "payment.amount");
+
+        let reparsed: Constraint = serde_json::from_value(serialized).unwrap();
+        let Constraint::Known { known, extra } = &reparsed else {
+            panic!("expected the known arm, got {reparsed:?}");
+        };
+        assert!(matches!(known, KnownConstraint::PaymentAmount { .. }));
+        assert!(extra.is_empty(), "the colliding field must not be emitted");
     }
 
     /// Every `KnownConstraint` variant, enumerated from the enum itself.
