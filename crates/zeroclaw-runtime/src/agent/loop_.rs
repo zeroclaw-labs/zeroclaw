@@ -1123,6 +1123,38 @@ static PROCESS_MESSAGE_LIVE_CONFIG_TEST_HOOK: LazyLock<
     Mutex<Option<ProcessMessageLiveConfigTestHook>>,
 > = LazyLock::new(|| Mutex::new(None));
 
+/// Identity wrapper over the live-config handle handed to the registry build.
+///
+/// The gateway-path regression needs to observe the exact value that crosses
+/// the `all_tools_with_runtime` boundary, not a value captured before the call:
+/// a future change that drops the handle (e.g. passing `None` at the call site)
+/// must turn the regression red. In tests this records the value into the
+/// process-global hook *after* it is bound here, so the hook sees exactly what
+/// the registry factory receives. In production it is a plain identity.
+#[cfg(test)]
+fn observe_registry_live_config(
+    agent_alias: &str,
+    live: Option<Arc<parking_lot::RwLock<Config>>>,
+) -> Option<Arc<parking_lot::RwLock<Config>>> {
+    if let Some(hook) = PROCESS_MESSAGE_LIVE_CONFIG_TEST_HOOK
+        .lock()
+        .expect("process-message live-config test hook lock should not be poisoned")
+        .as_ref()
+        .cloned()
+    {
+        hook(agent_alias, live.clone());
+    }
+    live
+}
+
+#[cfg(not(test))]
+fn observe_registry_live_config(
+    _agent_alias: &str,
+    live: Option<Arc<parking_lot::RwLock<Config>>>,
+) -> Option<Arc<parking_lot::RwLock<Config>>> {
+    live
+}
+
 fn api_key_and_uri_for_provider(
     config: &zeroclaw_config::schema::Config,
     provider_name: &str,
@@ -2919,21 +2951,14 @@ pub async fn process_message(
             (None, None)
         };
 
-        // Single source of truth for the registry build's live-config handle:
-        // the hook below captures the exact value handed to
-        // `all_tools_with_runtime`, so the gateway-path regression observes the
-        // real forwarding boundary rather than the signature parameter.
-        let registry_live_config = live_config;
-
-        #[cfg(test)]
-        if let Some(hook) = PROCESS_MESSAGE_LIVE_CONFIG_TEST_HOOK
-            .lock()
-            .expect("process-message live-config test hook lock should not be poisoned")
-            .as_ref()
-            .cloned()
-        {
-            hook(agent_alias, registry_live_config.clone());
-        }
+        // Single source of truth for the registry build's live-config handle.
+        // `observe_registry_live_config` is an identity wrapper whose test hook
+        // fires on the exact value that crosses the `all_tools_with_runtime`
+        // boundary — not on a value captured before the call — so the
+        // gateway-path regression turns red if the call below ever drops the
+        // handle (e.g. passing `None`), matching what the registry actually
+        // receives.
+        let registry_live_config = observe_registry_live_config(agent_alias, live_config);
 
         let all_tools_result_pm = tools::all_tools_with_runtime(
             Arc::new(config.clone()),

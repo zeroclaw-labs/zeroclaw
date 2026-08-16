@@ -2523,6 +2523,44 @@ fn record_gateway_chat_dispatch_for_test(
         });
 }
 
+/// The live-config handle the gateway chat route computed for `process_message`,
+/// captured so a gateway-path regression can assert the caller actually forwards
+/// `AppState.config` rather than a snapshot. Gated on `test` only (the capture
+/// buffer is type-local to a `#[cfg(test)]` struct), and written unconditionally
+/// by `run_gateway_chat_with_tools` because the mock dispatch branch is `test`-gated.
+#[cfg(test)]
+static GATEWAY_CHAT_LIVE_CONFIG_CAPTURES: std::sync::Mutex<
+    Vec<Option<Arc<parking_lot::RwLock<Config>>>>,
+> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+static GATEWAY_CHAT_LIVE_CONFIG_CAPTURE_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
+#[cfg(test)]
+fn record_gateway_chat_live_config_for_test(live: Option<Arc<parking_lot::RwLock<Config>>>) {
+    GATEWAY_CHAT_LIVE_CONFIG_CAPTURES
+        .lock()
+        .expect("gateway chat live-config capture mutex poisoned")
+        .push(live);
+}
+
+#[cfg(test)]
+fn gateway_chat_live_config_captures_for_test() -> Vec<Option<Arc<parking_lot::RwLock<Config>>>> {
+    GATEWAY_CHAT_LIVE_CONFIG_CAPTURES
+        .lock()
+        .expect("gateway chat live-config capture mutex poisoned")
+        .clone()
+}
+
+#[cfg(test)]
+fn gateway_chat_live_config_clear_for_test() {
+    GATEWAY_CHAT_LIVE_CONFIG_CAPTURES
+        .lock()
+        .expect("gateway chat live-config capture mutex poisoned")
+        .clear();
+}
+
 /// The live config handle the gateway chat route hands to `process_message`.
 ///
 /// `AppState.config` is the live `Arc<RwLock<Config>>` the HTTP config handlers
@@ -2549,6 +2587,13 @@ pub(crate) async fn run_gateway_chat_with_tools(
         return Err(err);
     }
 
+    // The live handle the gateway caller hands `process_message` is computed
+    // once at the top of the function so the production path (below) and the
+    // `#[cfg(test)]` mock branch both observe the same value. A change to the
+    // caller's forwarding decision is therefore visible to the gateway-path
+    // regression even though the mock branch bypasses `process_message`.
+    let live_config = gateway_live_config_for_chat(state);
+
     // Tests exercise webhook infrastructure (idempotency, auth, autosave)
     // through handle_webhook, so dispatch to the mock model_provider directly
     // instead of bootstrapping the full agent runtime. The mock path
@@ -2556,6 +2601,7 @@ pub(crate) async fn run_gateway_chat_with_tools(
     #[cfg(test)]
     {
         record_gateway_chat_dispatch_for_test(message, session_id, agent_override);
+        record_gateway_chat_live_config_for_test(live_config);
         let response = state
             .model_provider
             .chat_with_system(None, message, &state.model, state.temperature)
@@ -2595,7 +2641,7 @@ pub(crate) async fn run_gateway_chat_with_tools(
                 cost_tracking_context,
                 zeroclaw_runtime::agent::process_message(
                     config,
-                    gateway_live_config_for_chat(state),
+                    live_config,
                     &agent_alias,
                     message,
                     session_id,
@@ -4446,24 +4492,36 @@ mod tests {
         state
     }
 
-    #[test]
-    fn gateway_chat_live_config_returns_the_appstate_handle() {
+    #[tokio::test]
+    async fn gateway_chat_live_config_returns_the_appstate_handle() {
         let tmp = tempfile::TempDir::new().unwrap();
         let state = admin_paircode_state(&tmp, false, false);
+        let expected = Arc::clone(&state.config);
 
         // The gateway chat route must hand `process_message` the live
         // `AppState.config` handle (not a construction snapshot) so a
         // `config/set` revocation of `file_download.allowed_private_hosts`
         // reaches the registry build at dispatch time.
-        let live = gateway_live_config_for_chat(&state);
+        //
+        // `run_gateway_chat_with_tools` computes its live handle once at the
+        // top of the function and records it in the mock dispatch branch
+        // (which bypasses `process_message`), so this exercises the *production
+        // caller* the way a real chat turn would. Changing the production
+        // forwarding line — including replacing the call with `None` — records a
+        // different handle here and turns this red.
+        let clear = GATEWAY_CHAT_LIVE_CONFIG_CAPTURE_TEST_LOCK.lock().await;
+        gateway_chat_live_config_clear_for_test();
+        let _ = crate::run_gateway_chat_with_tools(&state, "hello", Some("session"), None).await;
+        drop(clear);
+
+        let captures = gateway_chat_live_config_captures_for_test();
         assert!(
-            live.is_some(),
-            "gateway chat must forward a live config handle"
-        );
-        assert!(
-            Arc::ptr_eq(&live.unwrap(), &state.config),
-            "gateway chat live handle must be the AppState.config Arc itself, \
-             so mutations to the live config are observed"
+            captures.iter().any(|seen| match seen {
+                Some(seen) => Arc::ptr_eq(seen, &expected),
+                None => false,
+            }),
+            "gateway chat dispatch must forward AppState.config itself to process_message; \
+             observed {captures:?}"
         );
     }
 
