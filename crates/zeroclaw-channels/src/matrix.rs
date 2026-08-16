@@ -4973,7 +4973,8 @@ mod tests {
             // keywords the prompt shows must remain the literal ASCII words
             // `parse_reply` expects, whatever locale is active.
             let token = generate_token_default();
-            let prompt = crate::util::build_approve_deny_approval_prompt(&token, "shell", "ls -la");
+            let prompt =
+                crate::util::build_approve_deny_approval_prompt(&token, "shell", "ls -la", None);
             assert!(
                 prompt.contains(&token),
                 "prompt should echo the token verbatim; got {prompt:?}"
