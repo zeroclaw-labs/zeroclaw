@@ -230,7 +230,7 @@ transfers, coordinate the package rename or merge in one reviewed change.
 
 ## Build cache behavior
 
-Most Rust-heavy jobs in `ci.yml` use `Swatinem/rust-cache@v2`. The `fmt`, `nix-eval`, and `docs-style` jobs (none of which compile the workspace) do not. These behaviors are worth knowing when triaging cache-related flakes:
+Most Rust-heavy jobs in `ci.yml` cache through the local `./.github/actions/rust-cache` composite, which selects the cache backend from the same `CI_USE_BLACKSMITH` toggle that selects the runner: `useblacksmith/rust-cache` (Blacksmith NVMe sticky disk) when the job runs on a Blacksmith runner, and `Swatinem/rust-cache` otherwise. Any non-`true` toggle value (including unset, and every fork PR) falls back to `Swatinem/rust-cache` on GitHub-hosted runners, so caching is never lost when Blacksmith is off. Both action references live in the composite regardless of the toggle, so both must stay in the allowlist. The macOS and Windows build legs stay on `Swatinem/rust-cache`, and the `fmt`, `nix-eval`, and `docs-style` jobs (none of which compile the workspace) use no Rust cache. These behaviors are worth knowing when triaging cache-related flakes:
 
 - **Cache writes are master-only.** `save-if` is conditioned on `github.ref == 'refs/heads/master'`, so PR runs read the master-seeded cache but never update it. PR branches can't pollute the shared cache with branch-specific artifacts. The `push` trigger on `master` is what gives the workflow a trusted cache-writing run after merges.
 - **Cache saves on failure.** `cache-on-failure: true` is set on every job, so a partial run still seeds the next attempt warm.
@@ -265,7 +265,8 @@ All third-party refs are pinned to a full commit SHA with a trailing version com
 | `actions/attest` (`v4.2.2`) | `release-stable-manual.yml` | Generate GitHub-hosted Build Level 2 provenance for release assets |
 | `actions/labeler` (`v6.1.0`) | `pr-path-labeler.yml` | Apply path/scope labels from `.github/labeler.yml` |
 | `dtolnay/rust-toolchain` (`stable`) | `ci.yml`, `release-stable-manual.yml`, `cross-platform-build-manual.yml`, `cross-platform-clippy.yml`, `daily-audit.yml`, `docs-deploy.yml` | Install Rust toolchain |
-| `Swatinem/rust-cache` (`v2.9.1`) | `ci.yml`, `release-stable-manual.yml`, `cross-platform-build-manual.yml`, `cross-platform-clippy.yml`, `docs-deploy.yml` | Cargo build/dependency caching |
+| `Swatinem/rust-cache` (`v2.9.2`) | `ci.yml` (GitHub-hosted path of `./.github/actions/rust-cache`), `release-stable-manual.yml`, `cross-platform-build-manual.yml`, `cross-platform-clippy.yml`, `docs-deploy.yml` | Cargo build/dependency caching on GitHub-hosted runners |
+| `useblacksmith/rust-cache` (`v3.0.1`) | `ci.yml` (Blacksmith path of `./.github/actions/rust-cache`) | Cargo build/dependency caching on Blacksmith sticky disk; selected only when `CI_USE_BLACKSMITH=true` |
 | `docker/setup-buildx-action` (`v3.11.1`, `v4.0.0`) | `release-stable-manual.yml`, `docker-publish.yml` | Docker Buildx setup |
 | `docker/login-action` (`v3.4.0`, `v4.1.0`) | `release-stable-manual.yml`, `docker-publish.yml`, `trivy-scheduled.yml` | GHCR authentication |
 | `docker/build-push-action` (`v6.18.0`, `v7.1.0`) | `release-stable-manual.yml`, `docker-publish.yml` | Multi-platform image build and push |
@@ -284,6 +285,7 @@ Equivalent allowlist patterns (kept narrow on purpose):
 actions/*
 dtolnay/rust-toolchain@*
 Swatinem/rust-cache@*
+useblacksmith/rust-cache@*
 docker/*
 sigstore/cosign-installer@*
 anchore/sbom-action@*
