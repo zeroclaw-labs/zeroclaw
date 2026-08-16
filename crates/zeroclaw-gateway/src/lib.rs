@@ -2561,6 +2561,53 @@ fn gateway_chat_live_config_clear_for_test() {
         .clear();
 }
 
+/// Identity wrapper invoked inline at the `process_message` argument inside
+/// `gateway_forward_to_process_message`. In tests it records the exact value
+/// handed to the runtime before returning it unchanged, so the gateway-path
+/// regression observes the value that actually crosses the `process_message`
+/// boundary — not a value captured earlier in `run_gateway_chat_with_tools`. In
+/// production it is a plain identity.
+#[cfg(test)]
+fn observe_gateway_chat_live_config_for_test(
+    live: Option<Arc<parking_lot::RwLock<Config>>>,
+) -> Option<Arc<parking_lot::RwLock<Config>>> {
+    record_gateway_chat_live_config_for_test(live.clone());
+    live
+}
+
+#[cfg(not(test))]
+fn observe_gateway_chat_live_config_for_test(
+    live: Option<Arc<parking_lot::RwLock<Config>>>,
+) -> Option<Arc<parking_lot::RwLock<Config>>> {
+    live
+}
+
+/// The single forwarding seam from the gateway chat route into the runtime.
+///
+/// Extracted so the gateway-path regression can reach the *same* `process_message`
+/// call the production route makes, without bootstrapping a full agent runtime
+/// through the `#[cfg(test)]` mock-provider branch of `run_gateway_chat_with_tools`.
+/// `observe_gateway_chat_live_config_for_test` runs inline at the final argument,
+/// so a mutation that drops the live handle here turns the regression red.
+pub(crate) async fn gateway_forward_to_process_message(
+    config: Config,
+    live_config: Option<Arc<parking_lot::RwLock<Config>>>,
+    agent_alias: &str,
+    message: &str,
+    session_id: Option<&str>,
+    origin: zeroclaw_api::ingress::TurnOrigin,
+) -> anyhow::Result<String> {
+    zeroclaw_runtime::agent::process_message(
+        config,
+        observe_gateway_chat_live_config_for_test(live_config),
+        agent_alias,
+        message,
+        session_id,
+        origin,
+    )
+    .await
+}
+
 /// The live config handle the gateway chat route hands to `process_message`.
 ///
 /// `AppState.config` is the live `Arc<RwLock<Config>>` the HTTP config handlers
@@ -2587,21 +2634,16 @@ pub(crate) async fn run_gateway_chat_with_tools(
         return Err(err);
     }
 
-    // The live handle the gateway caller hands `process_message` is computed
-    // once at the top of the function so the production path (below) and the
-    // `#[cfg(test)]` mock branch both observe the same value. A change to the
-    // caller's forwarding decision is therefore visible to the gateway-path
-    // regression even though the mock branch bypasses `process_message`.
-    let live_config = gateway_live_config_for_chat(state);
-
     // Tests exercise webhook infrastructure (idempotency, auth, autosave)
     // through handle_webhook, so dispatch to the mock model_provider directly
     // instead of bootstrapping the full agent runtime. The mock path
-    // doesn't go through the cost-tracking scope.
+    // doesn't go through the cost-tracking scope, so it bypasses
+    // `gateway_forward_to_process_message`; the live-config forwarding edge is
+    // instead pinned by `gateway_forward_to_process_message_records_live_config`
+    // on that seam directly.
     #[cfg(test)]
     {
         record_gateway_chat_dispatch_for_test(message, session_id, agent_override);
-        record_gateway_chat_live_config_for_test(live_config);
         let response = state
             .model_provider
             .chat_with_system(None, message, &state.model, state.temperature)
@@ -2613,6 +2655,11 @@ pub(crate) async fn run_gateway_chat_with_tools(
     {
         let config = state.config.read().clone();
         let agent_alias = require_gateway_chat_agent_alias(&config, agent_override)?;
+        // The live handle the gateway caller hands the forwarding seam, taken
+        // from `AppState.config` (not a construction snapshot) so a `config/set`
+        // revocation of `file_download.allowed_private_hosts` reaches
+        // `process_message` at dispatch time.
+        let live_config = gateway_live_config_for_chat(state);
 
         // Scope the cost tracking context so per-LLM-call usage flows into
         // the gateway's cost tracker and costs.jsonl. A separate
@@ -2639,7 +2686,7 @@ pub(crate) async fn run_gateway_chat_with_tools(
             turn_usage.clone(),
             zeroclaw_runtime::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                 cost_tracking_context,
-                zeroclaw_runtime::agent::process_message(
+                gateway_forward_to_process_message(
                     config,
                     live_config,
                     &agent_alias,
@@ -4493,34 +4540,84 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gateway_chat_live_config_returns_the_appstate_handle() {
+    async fn gateway_live_config_for_chat_returns_the_appstate_handle() {
         let tmp = tempfile::TempDir::new().unwrap();
         let state = admin_paircode_state(&tmp, false, false);
         let expected = Arc::clone(&state.config);
 
-        // The gateway chat route must hand `process_message` the live
-        // `AppState.config` handle (not a construction snapshot) so a
-        // `config/set` revocation of `file_download.allowed_private_hosts`
-        // reaches the registry build at dispatch time.
-        //
-        // `run_gateway_chat_with_tools` computes its live handle once at the
-        // top of the function and records it in the mock dispatch branch
-        // (which bypasses `process_message`), so this exercises the *production
-        // caller* the way a real chat turn would. Changing the production
-        // forwarding line — including replacing the call with `None` — records a
-        // different handle here and turns this red.
+        // The gateway chat route computes its live handle from `AppState.config`
+        // (not a construction snapshot) so a `config/set` revocation of
+        // `file_download.allowed_private_hosts` reaches `process_message` at
+        // dispatch time. The forwarding into `process_message` is pinned by
+        // `gateway_forward_to_process_message_records_live_config`.
+        let seen = crate::gateway_live_config_for_chat(&state);
+        assert!(
+            matches!(seen.as_ref(), Some(seen) if Arc::ptr_eq(seen, &expected)),
+            "gateway chat dispatch must compute its live handle from AppState.config; \
+             observed {seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_forward_to_process_message_records_live_config() {
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, ModelProviderConfig, OllamaModelProviderConfig, RiskProfileConfig,
+        };
+
+        let mut config = Config::default();
+        config.providers.models.ollama.insert(
+            "default".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gateway-forward-seam-test".to_string()),
+                    timeout_secs: Some(1),
+                    uri: Some("http://127.0.0.1:9".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "gateway-forward-seam-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "ollama.default".into(),
+                risk_profile: "default".into(),
+                ..Default::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("default".to_string(), RiskProfileConfig::default());
+
+        let live: Arc<parking_lot::RwLock<Config>> =
+            Arc::new(parking_lot::RwLock::new(config.clone()));
+
+        // The seam is the production call site that hands process_message its
+        // live-config handle, exercised directly (the mock-provider branch of
+        // `run_gateway_chat_with_tools` bypasses `process_message`, so it cannot
+        // observe the runtime boundary). The provider uri is a dead address so
+        // the turn fails after the seam's identity wrapper records the value at
+        // the `process_message` argument — exactly what a mutation would drop.
         let clear = GATEWAY_CHAT_LIVE_CONFIG_CAPTURE_TEST_LOCK.lock().await;
         gateway_chat_live_config_clear_for_test();
-        let _ = crate::run_gateway_chat_with_tools(&state, "hello", Some("session"), None).await;
+        let _ = crate::gateway_forward_to_process_message(
+            config,
+            Some(Arc::clone(&live)),
+            "gateway-forward-seam-agent",
+            "hello",
+            Some("session"),
+            zeroclaw_api::ingress::TurnOrigin::SubTurn,
+        )
+        .await;
         drop(clear);
 
         let captures = gateway_chat_live_config_captures_for_test();
         assert!(
             captures.iter().any(|seen| match seen {
-                Some(seen) => Arc::ptr_eq(seen, &expected),
+                Some(seen) => Arc::ptr_eq(seen, &live),
                 None => false,
             }),
-            "gateway chat dispatch must forward AppState.config itself to process_message; \
+            "gateway forwarding seam must hand its live_config argument to process_message; \
              observed {captures:?}"
         );
     }
