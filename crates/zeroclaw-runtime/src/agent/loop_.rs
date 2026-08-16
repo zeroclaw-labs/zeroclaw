@@ -2952,14 +2952,12 @@ pub async fn process_message(
         };
 
         // Single source of truth for the registry build's live-config handle.
-        // `observe_registry_live_config` is an identity wrapper whose test hook
-        // fires on the exact value that crosses the `all_tools_with_runtime`
-        // boundary — not on a value captured before the call — so the
-        // gateway-path regression turns red if the call below ever drops the
-        // handle (e.g. passing `None`), matching what the registry actually
-        // receives.
-        let registry_live_config = observe_registry_live_config(agent_alias, live_config);
-
+        // `observe_registry_live_config` is an identity wrapper invoked *inline
+        // at the final `all_tools_with_runtime` argument* below, so its test
+        // hook fires on exactly the value the registry factory receives — not a
+        // value captured earlier in the function. Removing the wrapper or
+        // replacing this call with `None` therefore turns the registry-path
+        // regression red, matching what `all_tools_with_runtime` actually gets.
         let all_tools_result_pm = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
@@ -2983,7 +2981,7 @@ pub async fn process_message(
             None,
             sop_engine,
             sop_audit,
-            registry_live_config,
+            observe_registry_live_config(agent_alias, live_config),
         );
         let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
         let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
