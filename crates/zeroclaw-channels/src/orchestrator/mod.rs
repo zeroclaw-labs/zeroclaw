@@ -26526,8 +26526,8 @@ This is an example JSON object for profile settings."#;
     }
 
     /// A channel whose listener stays alive while every API call fails — the
-    /// shape reported in #9811, where Telegram long-polls a bad bot token and
-    /// absorbs the 404 without ever returning from `listen`.
+    /// reported shape where Telegram long-polls a bad bot token and absorbs
+    /// the 404 without ever returning from `listen`.
     struct NeverConnectsChannel {
         name: String,
         calls: Arc<AtomicUsize>,
@@ -26695,9 +26695,9 @@ This is an example JSON object for profile settings."#;
 
     #[tokio::test]
     async fn supervised_listener_does_not_report_ok_for_a_channel_that_never_connected() {
-        // #9811: a live listener is not evidence of a working channel. A bad
-        // bot token leaves Telegram long-polling and swallowing 404s forever,
-        // and the supervisor used to keep stamping `ok` on every heartbeat.
+        // A live listener is not evidence of a working channel. A bad bot
+        // token leaves Telegram long-polling and swallowing 404s forever, and
+        // the supervisor used to keep stamping `ok` on every heartbeat.
         let calls = Arc::new(AtomicUsize::new(0));
         let channel_name = format!("test-never-connects-{}", uuid::Uuid::new_v4());
         let component_name = format!("channel:{channel_name}");
