@@ -2554,6 +2554,30 @@ mod tests {
             .expect("undeclared network-specific prefix is outside auto-detection");
     }
 
+    /// Same contract as `ssrf_check_endpoint_undeclared_prefix_is_ordinary_
+    /// address_space`, but on the ALLOWLISTED path (where the wildcard opts in
+    /// to private-host rejection being lifted). A DNS64 answer embedding a cloud
+    /// metadata / credential IPv4 under a network-specific prefix that is NOT
+    /// declared still passes the allowlisted validator: RFC 8215 §5 forbids
+    /// assuming where an embedded IPv4 sits inside the local-use space, so the
+    /// gate cannot auto-detect it and the operator must declare the prefix in
+    /// `nat64_prefixes`. This regression pins that documented contract boundary
+    /// — it does NOT assert SSRF safety, and is deliberately paired with the
+    /// declared-prefix regressions below that actually reject the same embedding
+    /// once the prefix is declared.
+    #[test]
+    fn ssrf_check_endpoint_undeclared_prefix_metadata_passes_allowlisted_path() {
+        // 64:ff9b:1:a9fe:a9:fe00:: embeds 169.254.169.254 (EC2 IMDS) under the
+        // RFC 8215 local-use prefix, but with NO declared prefixes the shared
+        // classifier cannot recognize it (the well-known-only path checks
+        // 64:ff9b::/96), so on the wildcard-carve-out path the gate admits it.
+        let addr = std::net::SocketAddr::new("64:ff9b:1:a9fe:a9:fe00::".parse().unwrap(), 80);
+        ssrf_check_endpoint("internal.example.com", &[addr], &["*".to_string()], &[]).expect(
+            "undeclared network-specific prefix is outside auto-detection even on the \
+             allowlisted path; operators using this prefix must declare it in nat64_prefixes",
+        );
+    }
+
     /// RFC 6052 §2.2 nonzero-suffix forms must be classified by their embedded
     /// IPv4, not treated as ordinary public IPv6. A compliant translator
     /// IGNORES nonzero reserved suffix bits (the RFC says it proceeds as if

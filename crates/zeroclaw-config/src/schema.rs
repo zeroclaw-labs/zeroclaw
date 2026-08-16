@@ -9087,14 +9087,18 @@ pub struct FileDownloadConfig {
     /// The well-known prefix is recognized automatically and never needs to be
     /// declared here. A network-specific prefix is chosen by the operator and
     /// cannot be detected from an address alone (RFC 8215 §5 forbids assuming
-    /// where an embedded IPv4 sits inside a local-use prefix), so it must be
-    /// declared; undeclared prefixes are ordinary address space and the gate
-    /// does not claim SSRF safety for them. Only the RFC 6052 §2.2 prefix
-    /// lengths (32, 40, 48, 56, 64, 96) are accepted; a malformed entry fails
-    /// the whole list and the gate rejects the dispatch with a field-specific
-    /// error, because falling back to an empty list would silently treat every
-    /// declared prefix as undeclared ordinary address space and remove the
-    /// network-specific SSRF policy.
+    /// where an embedded IPv4 sits inside a local-use prefix — this includes the
+    /// RFC 8215 local-use space `64:ff9b:1::/48`, whose embedded-IPv4 position
+    /// is deliberately unspecified), so it must be declared; undeclared prefixes
+    /// are ordinary address space and the gate does not claim SSRF safety for
+    /// them. If a deployment synthesizes DNS64 answers under such a prefix, the
+    /// operator MUST list it here so the security gate can enforce the
+    /// allowlisted-path and metadata/credential boundary for it. Only the
+    /// RFC 6052 §2.2 prefix lengths (32, 40, 48, 56, 64, 96) are accepted; a
+    /// malformed entry fails the whole list and the gate rejects the dispatch
+    /// with a field-specific error, because falling back to an empty list would
+    /// silently treat every declared prefix as undeclared ordinary address space
+    /// and remove the network-specific SSRF policy.
     #[serde(default)]
     pub nat64_prefixes: Vec<String>,
 }
