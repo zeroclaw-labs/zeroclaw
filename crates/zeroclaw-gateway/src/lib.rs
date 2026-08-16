@@ -2624,6 +2624,38 @@ fn gateway_live_config_for_chat(state: &AppState) -> Option<Arc<parking_lot::RwL
     Some(state.config.clone())
 }
 
+/// The production composition edge from `AppState.config` to `process_message`.
+///
+/// This is the exact composition the gateway chat route makes in production:
+/// it derives the live handle from `AppState.config` via
+/// `gateway_live_config_for_chat`, then hands that handle to
+/// `gateway_forward_to_process_message` as the live-config argument. It is
+/// extracted so a regression can drive the whole edge — `AppState.config` → the
+/// production caller → the runtime `process_message` argument — instead of being
+/// short-circuited by the `#[cfg(test)]` mock-provider branch of
+/// `run_gateway_chat_with_tools`. A mutation that drops the handle at the
+/// `gateway_forward_to_process_message` argument below turns
+/// `gateway_chat_forward_with_appstate_live_config_reaches_process_message` red.
+pub(crate) async fn gateway_chat_forward_with_appstate_live_config(
+    state: &AppState,
+    config: Config,
+    agent_alias: &str,
+    message: &str,
+    session_id: Option<&str>,
+    origin: zeroclaw_api::ingress::TurnOrigin,
+) -> anyhow::Result<String> {
+    let live_config = gateway_live_config_for_chat(state);
+    gateway_forward_to_process_message(
+        config,
+        live_config,
+        agent_alias,
+        message,
+        session_id,
+        origin,
+    )
+    .await
+}
+
 pub(crate) async fn run_gateway_chat_with_tools(
     state: &AppState,
     message: &str,
@@ -2655,11 +2687,6 @@ pub(crate) async fn run_gateway_chat_with_tools(
     {
         let config = state.config.read().clone();
         let agent_alias = require_gateway_chat_agent_alias(&config, agent_override)?;
-        // The live handle the gateway caller hands the forwarding seam, taken
-        // from `AppState.config` (not a construction snapshot) so a `config/set`
-        // revocation of `file_download.allowed_private_hosts` reaches
-        // `process_message` at dispatch time.
-        let live_config = gateway_live_config_for_chat(state);
 
         // Scope the cost tracking context so per-LLM-call usage flows into
         // the gateway's cost tracker and costs.jsonl. A separate
@@ -2686,9 +2713,9 @@ pub(crate) async fn run_gateway_chat_with_tools(
             turn_usage.clone(),
             zeroclaw_runtime::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                 cost_tracking_context,
-                gateway_forward_to_process_message(
+                gateway_chat_forward_with_appstate_live_config(
+                    state,
                     config,
-                    live_config,
                     &agent_alias,
                     message,
                     session_id,
@@ -4618,6 +4645,43 @@ mod tests {
                 None => false,
             }),
             "gateway forwarding seam must hand its live_config argument to process_message; \
+             observed {captures:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_chat_forward_with_appstate_live_config_reaches_process_message() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, false, false);
+        let expected = Arc::clone(&state.config);
+
+        // Drive the full production composition edge with a real AppState: the
+        // live handle comes from `AppState.config` via
+        // `gateway_live_config_for_chat`, and the seam hands it to
+        // `gateway_forward_to_process_message`, which records it inline at the
+        // `process_message` argument. The counterfactual mutation that replaces
+        // the seam's argument with `None` must turn this test red.
+        let clear = GATEWAY_CHAT_LIVE_CONFIG_CAPTURE_TEST_LOCK.lock().await;
+        gateway_chat_live_config_clear_for_test();
+        let dispatch_config = state.config.read().clone();
+        let _ = crate::gateway_chat_forward_with_appstate_live_config(
+            &state,
+            dispatch_config,
+            "some-agent",
+            "hello",
+            Some("session"),
+            zeroclaw_api::ingress::TurnOrigin::Interactive,
+        )
+        .await;
+        drop(clear);
+
+        let captures = gateway_chat_live_config_captures_for_test();
+        assert!(
+            captures.iter().any(|seen| match seen {
+                Some(seen) => Arc::ptr_eq(seen, &expected),
+                None => false,
+            }),
+            "production gateway composition must hand AppState.config to process_message; \
              observed {captures:?}"
         );
     }
