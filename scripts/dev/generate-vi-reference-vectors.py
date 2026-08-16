@@ -18,6 +18,7 @@ pure string operations and pinning them to a signature would make them unregener
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -35,7 +36,61 @@ def salt(index: int) -> str:
     return _b64url_encode(bytes([index]) * 16)
 
 
+def verify_reference_source(reference_root: Path, expected_commit: str) -> None:
+    """Refuse to generate unless the imported source is exactly the pinned revision.
+
+    The fixture this script writes records the reference commit, and that record
+    is the reason the vectors are evidence at all rather than a ZeroClaw round
+    trip. Without this check any checkout produces a file carrying the claim, so
+    the claim is verified rather than asserted.
+
+    Cleanliness is scoped to `src`, which is the directory that gets imported.
+    That scope reports untracked files as well as modified ones, so a module
+    dropped in to shadow an import is caught, and it ignores unrelated changes
+    elsewhere in the checkout. Ignored files stay outside its view, which is what
+    keeps the caches an ordinary run creates from failing the next one.
+
+    `expected_commit` is a parameter rather than a direct read of the module
+    constant so that the accompanying checks can exercise every branch against a
+    throwaway repository.
+    """
+
+    def git(*args: str) -> str:
+        try:
+            completed = subprocess.run(
+                ["git", "-C", str(reference_root), *args],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        except FileNotFoundError:
+            raise SystemExit("git is required to verify the reference checkout") from None
+        except subprocess.CalledProcessError as error:
+            detail = error.stderr.strip() or str(error)
+            raise SystemExit(
+                f"{reference_root} is not a readable git checkout: {detail}"
+            ) from None
+        return completed.stdout.strip()
+
+    head = git("rev-parse", "HEAD")
+    if head != expected_commit:
+        raise SystemExit(
+            f"reference checkout is at {head}, expected {expected_commit}; "
+            "vectors may only be generated from the pinned revision"
+        )
+
+    modified = git("status", "--porcelain", "--", "src")
+    if modified:
+        raise SystemExit(
+            f"reference checkout at {expected_commit} has local changes under src:\n{modified}"
+        )
+
+
 def main(reference_root: Path) -> int:
+    # Before anything is imported from it, so a rejected checkout is never
+    # executed and the checks below need no importable reference.
+    verify_reference_source(reference_root, REFERENCE_COMMIT)
+
     sys.path.insert(0, str(reference_root / "src"))
 
     from cryptography.hazmat.primitives.asymmetric import ec

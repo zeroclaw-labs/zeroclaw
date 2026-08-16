@@ -376,9 +376,16 @@ pub fn create_array_element_disclosure(
 /// Stricter than the reference, which returns whatever JSON the disclosure
 /// happens to hold: anything that is not a 2- or 3-element array with a string
 /// salt is refused here rather than reaching a caller obliged to re-check it.
+///
+/// The bytes are parsed with the same duplicate-refusing reader the signed
+/// header and payload use. A disclosure is bound by a digest the issuer signed,
+/// and resolution merges its value into the claim set, so a repeated member
+/// inside one is a repeated claim name in the payload a verifier acts on.
+/// Reading it with a parser that silently keeps one of the two would leave the
+/// ambiguity undetectable by the time anything could act on it.
 pub fn decode_disclosure(disclosure_b64: &str) -> Result<Disclosure, ViError> {
     let bytes = b64u_decode(disclosure_b64)?;
-    let decoded: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
+    let decoded = parse_json_strict(&bytes).map_err(|e| {
         ViError::new(
             ViErrorKind::InvalidDisclosure,
             format!("disclosure JSON: {e}"),
@@ -1294,6 +1301,43 @@ mod tests {
         let clean = format!("{header_ok}.{payload_ok}.c2ln");
         assert!(jws_decode_payload(&clean).is_ok());
         assert!(jws_decode_header(&clean).is_ok());
+    }
+
+    /// A disclosure is bound by a digest the issuer signed, and resolution
+    /// merges its value straight into the claim set. A duplicate member inside
+    /// one is therefore a duplicate claim name in the payload a verifier acts
+    /// on, which the security model requires refusing rather than resolving to
+    /// whichever member the parser happened to keep.
+    ///
+    /// Both spec shapes are covered because a duplicate can hide in either, and
+    /// nesting is not an escape hatch.
+    #[test]
+    fn duplicate_members_inside_a_disclosure_are_refused() {
+        let three_element =
+            b64u_encode(br#"["AAAAAAAAAAAAAAAAAAAAAA","checkout_mandate",{"vct":"a","vct":"b"}]"#);
+        let two_element = b64u_encode(br#"["AAAAAAAAAAAAAAAAAAAAAA",{"vct":"a","vct":"b"}]"#);
+        let nested = b64u_encode(br#"["AAAAAAAAAAAAAAAAAAAAAA","m",{"outer":{"k":1,"k":2}}]"#);
+
+        for (label, encoded) in [
+            ("three-element", &three_element),
+            ("two-element", &two_element),
+            ("nested", &nested),
+        ] {
+            assert!(
+                decode_disclosure(encoded).is_err(),
+                "an ambiguous disclosure must be refused: {label}"
+            );
+        }
+
+        // Controls over the same shapes, so a rejection is attributable to the
+        // duplicate rather than to the shape being unsupported.
+        let three_ok = b64u_encode(br#"["AAAAAAAAAAAAAAAAAAAAAA","checkout_mandate",{"vct":"a"}]"#);
+        let two_ok = b64u_encode(br#"["AAAAAAAAAAAAAAAAAAAAAA",{"vct":"a"}]"#);
+        assert!(
+            decode_disclosure(&three_ok).is_ok(),
+            "control three-element"
+        );
+        assert!(decode_disclosure(&two_ok).is_ok(), "control two-element");
     }
 
     #[test]
