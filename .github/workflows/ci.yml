@@ -121,9 +121,10 @@ jobs:
         with:
           toolchain: 1.96.1
           components: clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
+          use-blacksmith: ${{ vars.CI_USE_BLACKSMITH }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install system dependencies
@@ -316,9 +317,10 @@ jobs:
         with:
           toolchain: 1.96.1
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
+          use-blacksmith: ${{ vars.CI_USE_BLACKSMITH == 'true' && matrix.target == 'x86_64-unknown-linux-gnu' }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install mold linker
@@ -398,9 +400,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: 1.96.1
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
+          use-blacksmith: ${{ vars.CI_USE_BLACKSMITH }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install system dependencies
@@ -447,9 +450,10 @@ jobs:
       - name: Install channel plugin fixture target
         if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
         run: rustup target add wasm32-wasip2
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: ./.github/actions/rust-cache
         if: steps.changed.outputs.run == 'true'
         with:
+          use-blacksmith: ${{ vars.CI_USE_BLACKSMITH }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Check
@@ -514,9 +518,10 @@ jobs:
         with:
           toolchain: 1.96.1
           targets: i686-unknown-linux-gnu
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
+          use-blacksmith: ${{ vars.CI_USE_BLACKSMITH }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install 32-bit system libraries
@@ -536,9 +541,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: 1.96.1
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
+          use-blacksmith: ${{ vars.CI_USE_BLACKSMITH }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Ensure web/dist placeholder exists
@@ -591,9 +597,10 @@ jobs:
         with:
           toolchain: 1.96.1
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
+          use-blacksmith: ${{ vars.CI_USE_BLACKSMITH }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Check firmware protocol crate
