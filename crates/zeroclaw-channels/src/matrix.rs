@@ -6604,10 +6604,10 @@ mod tests {
         #[test]
         fn rejects_absolute_outside_workspace() {
             let workspace = TempDir::new().unwrap();
-            // `/etc/hostname` exists on every Linux host; we don't actually
-            // read it, just canonicalise.
-            let result = validate_marker_target("/etc/hostname", Some(workspace.path()));
-            assert!(result.is_err(), "expected Err for /etc target");
+            let outside = tempfile::NamedTempFile::new().unwrap();
+            let result =
+                validate_marker_target(outside.path().to_str().unwrap(), Some(workspace.path()));
+            assert!(result.is_err(), "expected Err for outside target");
             let msg = result.unwrap_err().to_string();
             assert!(
                 msg.contains("outside workspace_dir"),
@@ -6729,6 +6729,17 @@ mod tests {
         #[test]
         fn ssrf_refuses_loopback_v4() {
             assert_ssr_refused("http://127.0.0.1/admin");
+        }
+
+        #[test]
+        fn ssrf_refuses_trailing_dot_local_hosts() {
+            for target in [
+                "http://localhost./admin",
+                "http://printer.local./admin",
+                "http://192.168.1.1../admin",
+            ] {
+                assert_ssr_refused(target);
+            }
         }
 
         #[test]
@@ -6866,6 +6877,28 @@ mod tests {
             let err: anyhow::Error = fetch_http(url)
                 .await
                 .expect_err("redirect to loopback must be rejected");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("private or local host") || msg.contains("PermissionDenied"),
+                "expected SSRF redirect refusal, got: {msg}"
+            );
+            server.verify().await;
+        }
+
+        #[tokio::test]
+        async fn rejects_redirect_to_trailing_dot_localhost() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/photo.jpg"))
+                .respond_with(private_redirect_body("http://localhost./secret"))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let url = reqwest::Url::parse(&format!("{}/photo.jpg", server.uri())).unwrap();
+            let err: anyhow::Error = fetch_http(url)
+                .await
+                .expect_err("redirect to trailing-dot localhost must be rejected");
             let msg = format!("{err:#}");
             assert!(
                 msg.contains("private or local host") || msg.contains("PermissionDenied"),

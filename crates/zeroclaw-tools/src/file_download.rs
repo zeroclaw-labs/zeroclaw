@@ -387,21 +387,35 @@ async fn resolve_endpoint_ips(host: &str, port: u16) -> Result<Vec<std::net::Soc
 }
 
 /// The IPv4 embedded in `ip` under any operator-declared network-specific
-/// NAT64 prefix, or `None` when it is not a clean IPv4-embedded form.
+/// NAT64 prefix, or `None` when no declared prefix translates it.
 ///
-/// A network-specific prefix (RFC 8215 local-use `64:ff9b:1::/48`, or any
+/// The declared-prefix set is the only source of truth for canonicalization:
+/// a network-specific prefix (RFC 8215 local-use `64:ff9b:1::/48`, or any
 /// operator-assigned prefix) cannot be detected from an address alone, so the
-/// declared-prefix set is the only source of truth for canonicalization.
+/// shared `net_guard` classifier canonicalizes each resolved address against
+/// every declared prefix as part of its `validate_resolved_ips_*` entry points.
 fn declared_nat64_embedded_v4(
     ip: std::net::IpAddr,
     prefixes: &[zeroclaw_infra::net_guard::Nat64Prefix],
 ) -> Option<std::net::Ipv4Addr> {
-    match ip {
-        std::net::IpAddr::V6(v6) => {
-            zeroclaw_infra::net_guard::nat64_embedded_ipv4_under_any(v6, prefixes)
-        }
-        std::net::IpAddr::V4(_) => None,
-    }
+    let std::net::IpAddr::V6(v6) = ip else {
+        return None;
+    };
+    prefixes.iter().find_map(|p| p.embedded_ipv4(v6))
+}
+
+/// The IPv4 metadata/credential endpoint embedded in `ip` under a declared
+/// network-specific NAT64 prefix, if any. Mirrors the raw-address metadata
+/// check so a DNS64 answer under a declared prefix can never reach a metadata
+/// endpoint, even through the allowlist path (the shared validator also does
+/// this, but the file_download error surface needs to distinguish the metadata
+/// case to avoid suggesting an allowlist entry that cannot help).
+fn declared_nat64_metadata(
+    ip: std::net::IpAddr,
+    prefixes: &[zeroclaw_infra::net_guard::Nat64Prefix],
+) -> Option<std::net::Ipv4Addr> {
+    declared_nat64_embedded_v4(ip, prefixes)
+        .filter(|v4| domain_guard::is_cloud_metadata_ip(std::net::IpAddr::V4(*v4)))
 }
 
 /// Apply the shared SSRF policy. `policy_host` is canonical (no trailing dot)
@@ -427,57 +441,25 @@ fn ssrf_check_endpoint(
     let ips: Vec<std::net::IpAddr> = resolved_addrs.iter().map(|sa| sa.ip()).collect();
     let private_allowed = domain_guard::host_matches_allowlist(policy_host, allowed_hosts);
 
-    // Fail closed on a resolved address that lies inside a declared NAT64
-    // translation prefix but cannot be extracted (a nonzero RFC 6052 "u"
-    // octet). A translator may still route such an address by its embedded
-    // IPv4, so it must never fall through to the ordinary-public-IPv6 path.
-    if let Some(ip) = ips.iter().find(|ip| match ip {
-        std::net::IpAddr::V6(v6) => {
-            zeroclaw_infra::net_guard::is_under_any_nat64_prefix(*v6, nat64_prefixes)
-                && declared_nat64_embedded_v4(std::net::IpAddr::V6(*v6), nat64_prefixes).is_none()
-        }
-        std::net::IpAddr::V4(_) => false,
-    }) {
-        let err = anyhow::Error::msg(format!(
-            "Blocked host '{policy_host}' resolved to {ip} inside a declared NAT64 prefix but with a nonzero 'u' octet; refusing to classify it as public IPv6"
-        ));
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(::serde_json::json!({
-                    "tool": "file_download",
-                    "host": policy_host,
-                    "ip": ip.to_string(),
-                })),
-            "file_download: rejected declared-prefix NAT64 address with nonzero 'u' octet"
-        );
-        return Err(tool_msg_with_args(
-            "tool-file-download-error-private-host",
-            &[
-                ("host", policy_host),
-                ("config_key", "file_download.allowed_private_hosts"),
-                ("err", &err.to_string()),
-            ],
-        ));
-    }
+    // The shared `net_guard` validator canonicalizes each resolved address
+    // against every declared prefix and the well-known `64:ff9b::/96` form, and
+    // fails closed when an address inside a declared prefix cannot be classified
+    // (master decodes the "u" octet unconditionally, over-approximating to the
+    // embedded IPv4 so nothing reaches the public-IPv6 path unexamined).
 
     // Cloud metadata / credential-delivery addresses are rejected regardless
     // of `allowed_private_hosts` (the schema contract at
     // `file_download.allowed_private_hosts` documents that the carve-out never
     // lifts the metadata exclusion). Surface a DISTINCT error with no allowlist
     // suggestion — the generic private-host message would tell the operator to
-    // add a host that cannot be enabled. The shared classifier covers the
-    // built-in `64:ff9b::/96` well-known prefix; a declared network-specific
-    // prefix is canonicalized to its embedded IPv4 first, so a DNS64 answer
-    // under it can never reach a metadata/credential endpoint either.
+    // add a host that cannot be enabled. A declared network-specific prefix is
+    // canonicalized to its embedded IPv4 first, so a DNS64 answer under it can
+    // never reach a metadata/credential endpoint either.
     let metadata_hit = ips.iter().find_map(|ip| {
         if domain_guard::is_cloud_metadata_ip(*ip) {
             Some((*ip, *ip))
         } else {
-            declared_nat64_embedded_v4(*ip, nat64_prefixes)
-                .filter(|v4| domain_guard::is_cloud_metadata_ip(std::net::IpAddr::V4(*v4)))
-                .map(|v4| (*ip, std::net::IpAddr::V4(v4)))
+            declared_nat64_metadata(*ip, nat64_prefixes).map(|v4| (*ip, std::net::IpAddr::V4(v4)))
         }
     });
     if let Some((raw_ip, metadata_ip)) = metadata_hit {
@@ -498,28 +480,14 @@ fn ssrf_check_endpoint(
         ));
     }
 
-    // Every blocked endpoint must emit a WARN rejection event — not just
-    // literal private hosts. The resolved-IP validator below already covers
-    // literal `127.0.0.1`/`::1`/`localhost`, so the old literal-host branch
-    // was unreachable; keep the audit signal here instead.
+    // Delegate the actual decision to the shared validator, which runs the
+    // same NAT64 / metadata / non-global classification on every declared
+    // prefix (and well-known form). The allowlist path lifts only the
+    // non-global check, never the metadata exclusion.
     let validation_err = if private_allowed {
-        domain_guard::validate_resolved_ips_exclude_metadata(policy_host, &ips)
+        domain_guard::validate_resolved_ips_exclude_metadata(policy_host, &ips, nat64_prefixes)
     } else {
-        // Operator-declared network-specific NAT64 prefixes: a DNS64 answer
-        // under one of them embedding a non-global IPv4 is rejected like the
-        // well-known `64:ff9b::/96` form (which the shared validator covers).
-        // The remediation is identical — allowlist the internal host — so the
-        // error flows through the same private-host path below.
-        match ips.iter().find_map(|ip| {
-            declared_nat64_embedded_v4(*ip, nat64_prefixes)
-                .filter(|v4| domain_guard::is_non_global_v4(*v4))
-                .map(|v4| (*ip, v4))
-        }) {
-            Some((ip, v4)) => Err(anyhow::Error::msg(format!(
-                "Blocked host '{policy_host}' resolved to non-global address {ip} (declared NAT64 prefix embeds {v4})"
-            ))),
-            None => domain_guard::validate_resolved_ips_are_public(policy_host, &ips),
-        }
+        domain_guard::validate_resolved_ips_are_public(policy_host, &ips, nat64_prefixes)
     }
     .err();
 
@@ -550,11 +518,11 @@ fn ssrf_check_endpoint(
     // resolved addresses actually use the private carve-out is the event
     // accurate.
     let resolved_uses_private = ips.iter().any(|ip| match ip {
-        std::net::IpAddr::V4(v4) => domain_guard::is_non_global_v4(*v4),
+        std::net::IpAddr::V4(v4) => zeroclaw_infra::net_guard::is_non_global_v4(*v4),
         std::net::IpAddr::V6(v6) => {
-            domain_guard::is_non_global_v6(*v6)
+            zeroclaw_infra::net_guard::is_non_global_v6(*v6)
                 || declared_nat64_embedded_v4(std::net::IpAddr::V6(*v6), nat64_prefixes)
-                    .is_some_and(domain_guard::is_non_global_v4)
+                    .is_some_and(zeroclaw_infra::net_guard::is_non_global_v4)
         }
     });
 
@@ -630,38 +598,23 @@ static NORMALIZE_WARNING_EMITTED: OnceLock<()> = OnceLock::new();
 fn normalize_nat64_prefixes(
     raw: &[String],
 ) -> Result<Vec<zeroclaw_infra::net_guard::Nat64Prefix>, String> {
-    let mut parsed = Vec::with_capacity(raw.len());
-    for entry in raw {
-        match zeroclaw_infra::net_guard::parse_nat64_prefix(entry) {
-            Some(p) => parsed.push(p),
-            None => {
-                return Err(tool_msg_with_args(
-                    "tool-file-download-error-invalid-nat64-prefix",
-                    &[
-                        ("prefix", entry),
-                        ("config_key", "file_download.nat64_prefixes"),
-                    ],
-                ));
-            }
-        }
+    // Delegate parsing/sorting/deduping to the shared `net_guard` parser, which
+    // fails the whole list closed on any malformed entry so a typo cannot
+    // silently narrow the SSRF boundary to "no prefixes". The shared validator
+    // also decodes every declaring prefix for each resolved address, so overlap
+    // between declared prefixes is handled order-independently at validation
+    // time (any translation reaching a denied destination rejects the address);
+    // no dispatch-time overlap rejection is required.
+    match zeroclaw_infra::net_guard::parse_nat64_prefixes(raw, "file_download.nat64_prefixes") {
+        Ok(parsed) => Ok(parsed),
+        Err(err) => Err(tool_msg_with_args(
+            "tool-file-download-error-invalid-nat64-prefix",
+            &[
+                ("prefix", &err.to_string()),
+                ("config_key", "file_download.nat64_prefixes"),
+            ],
+        )),
     }
-    for i in 0..parsed.len() {
-        for j in (i + 1)..parsed.len() {
-            if zeroclaw_infra::net_guard::nat64_prefixes_overlap(&parsed[i], &parsed[j]) {
-                let a = format!("{}/{}", parsed[i].prefix, parsed[i].len);
-                let b = format!("{}/{}", parsed[j].prefix, parsed[j].len);
-                return Err(tool_msg_with_args(
-                    "tool-file-download-error-overlapping-nat64-prefix",
-                    &[
-                        ("prefix_a", &a),
-                        ("prefix_b", &b),
-                        ("config_key", "file_download.nat64_prefixes"),
-                    ],
-                ));
-            }
-        }
-    }
-    Ok(parsed)
 }
 
 /// Build the reqwest client used to fetch the configured endpoint. The
@@ -2150,36 +2103,31 @@ mod tests {
 
     #[test]
     fn host_matches_allowlist_undotted_allows_dotted() {
-        // Pins that an undotted allowlist entry authorizes a dotted hostname.
-        // This is the core policy contract: "files.corp.lan" in the allowlist
-        // should authorize "files.corp.lan." (they are the same DNS name).
-        assert!(
-            domain_guard::host_matches_allowlist(
-                "files.corp.lan.",
-                &["files.corp.lan".to_string()]
-            ),
-            "undotted allowlist must authorize dotted hostname"
-        );
-        // Symmetric: dotted allowlist also authorizes dotted hostname
-        assert!(
-            domain_guard::host_matches_allowlist(
-                "files.corp.lan.",
-                &["files.corp.lan.".to_string()]
-            ),
-            "dotted allowlist must authorize dotted hostname"
-        );
-        // Undotted hostname matches undotted allowlist
+        // Allows an exact match; it does not itself normalize a trailing DNS
+        // dot. Trailing-dot handling lives in the layers above: the policy host
+        // is stripped of any terminal dot by `parse_endpoint_url`, and each
+        // allowlist entry by `normalize_allowed_private_hosts`, before
+        // `host_matches_allowlist` runs. Pin that the two sides agree once
+        // normalized, and that match is exact on the already-normalized forms.
         assert!(
             domain_guard::host_matches_allowlist("files.corp.lan", &["files.corp.lan".to_string()]),
             "undotted must match undotted"
         );
-        // Undotted hostname also matches dotted allowlist (symmetric - DNS treats them equivalently)
+        // Both a host and an allowlist entry carrying the same terminal dot are
+        // still the same name after normalization (the caller strips it), so
+        // match remains exact on the canonical form.
         assert!(
-            domain_guard::host_matches_allowlist(
-                "files.corp.lan",
-                &["files.corp.lan.".to_string()]
+            domain_guard::host_matches_allowlist("files.corp.lan", &["files.corp.lan".to_string()]),
+            "canonical (no trailing dot) host must match the canonical allowlist entry"
+        );
+        // A dotted form must not silently match an undotted one at this layer;
+        // only the normalization step (tested separately) brings them together.
+        assert!(
+            !domain_guard::host_matches_allowlist(
+                "files.corp.lan.",
+                &["files.corp.lan".to_string()]
             ),
-            "undotted hostname must match dotted allowlist"
+            "match layer is exact and does not strip trailing dots"
         );
     }
 
@@ -2458,10 +2406,7 @@ mod tests {
     /// this only closes the path once the operator declares it.
     #[test]
     fn ssrf_check_endpoint_rejects_declared_nat64_non_global_without_opt_in() {
-        let prefixes = [zeroclaw_infra::net_guard::Nat64Prefix {
-            prefix: "64:ff9b:1::".parse().unwrap(),
-            len: 48,
-        }];
+        let prefixes = [zeroclaw_infra::net_guard::Nat64Prefix::parse("64:ff9b:1::/48").unwrap()];
         // RFC 6052 §2.2 /48 embedding: bytes 6-7 + u + bytes 9-10.
         for (ip, host) in [
             ("64:ff9b:1:a00:0:100::", "internal.example.com"), // embeds 10.0.0.1
@@ -2488,10 +2433,7 @@ mod tests {
     /// DNS64 answer cannot route the gate to EC2 IMDS / ECS / EKS.
     #[test]
     fn ssrf_check_endpoint_rejects_declared_nat64_metadata_even_allowlisted() {
-        let prefixes = [zeroclaw_infra::net_guard::Nat64Prefix {
-            prefix: "64:ff9b:1::".parse().unwrap(),
-            len: 48,
-        }];
+        let prefixes = [zeroclaw_infra::net_guard::Nat64Prefix::parse("64:ff9b:1::/48").unwrap()];
         // 64:ff9b:1:a9fe:a9:fe00:: embeds 169.254.169.254 (EC2 IMDS).
         let addr = std::net::SocketAddr::new("64:ff9b:1:a9fe:a9:fe00::".parse().unwrap(), 80);
         for allowed in [
@@ -2516,10 +2458,8 @@ mod tests {
         // Declared prefix must be in genuine global unicast space: the base
         // validator flags `2001:db8::/32` (RFC 3849 documentation) as
         // non-global before NAT64 logic runs, which would mask this control.
-        let prefixes = [zeroclaw_infra::net_guard::Nat64Prefix {
-            prefix: "2606:4700:64::".parse().unwrap(),
-            len: 96,
-        }];
+        let prefixes =
+            [zeroclaw_infra::net_guard::Nat64Prefix::parse("2606:4700:64::/96").unwrap()];
         // 2606:4700:64::808:808 embeds 8.8.8.8 (public).
         let public_addr = std::net::SocketAddr::new("2606:4700:64::808:808".parse().unwrap(), 443);
         ssrf_check_endpoint("public.example.com", &[public_addr], &[], &prefixes)
@@ -2539,19 +2479,18 @@ mod tests {
         .expect("allowlisted hostname resolving through a declared NAT64 prefix must pass");
     }
 
-    /// Negative control / explicit policy boundary: without declaring the
-    /// prefix, the same synthesized address is ordinary address space — the
-    /// gate cannot (and must not claim to) detect a network-specific prefix it
-    /// was not told about. This pins the operator-facing contract rather than
-    /// silently admitting the target as "SSRF-safe".
+    /// The RFC 8215 local-use space (`64:ff9b:1::/48`) is outside the global
+    /// IPv6 unicast allocation, so the shared `net_guard` classifier treats any
+    /// address there as non-global and the public validator rejects it without
+    /// needing a declared prefix — it is never silently admitted as "SSRF-safe".
     #[test]
     fn ssrf_check_endpoint_undeclared_prefix_is_ordinary_address_space() {
         // 64:ff9b:1:a00:0:100:: embeds 10.0.0.1 under the RFC 8215 local-use
-        // prefix, but with NO declared prefixes the shared well-known-only
-        // classifier treats it as globally routable.
+        // prefix; with NO declared prefixes it is still classified as a
+        // non-global IPv6 address and rejected.
         let addr = std::net::SocketAddr::new("64:ff9b:1:a00:0:100::".parse().unwrap(), 80);
         ssrf_check_endpoint("internal.example.com", &[addr], &[], &[])
-            .expect("undeclared network-specific prefix is outside auto-detection");
+            .expect_err("RFC 8215 local-use prefix must be rejected as non-global IPv6");
     }
 
     /// Same contract as `ssrf_check_endpoint_undeclared_prefix_is_ordinary_
@@ -2585,10 +2524,7 @@ mod tests {
     /// the wire even though byte 15 is nonzero.
     #[test]
     fn ssrf_check_endpoint_rejects_declared_nat64_nonzero_suffix_private_without_opt_in() {
-        let prefixes = [zeroclaw_infra::net_guard::Nat64Prefix {
-            prefix: "64:ff9b:1::".parse().unwrap(),
-            len: 48,
-        }];
+        let prefixes = [zeroclaw_infra::net_guard::Nat64Prefix::parse("64:ff9b:1::/48").unwrap()];
         // 64:ff9b:1:a00:0:100:0:1 embeds 10.0.0.1 with nonzero suffix byte 15.
         let addr = std::net::SocketAddr::new("64:ff9b:1:a00:0:100:0:1".parse().unwrap(), 80);
         let err = ssrf_check_endpoint("internal.example.com", &[addr], &[], &prefixes)
@@ -2604,10 +2540,7 @@ mod tests {
     /// contract as the zero-suffix form.
     #[test]
     fn ssrf_check_endpoint_rejects_declared_nat64_nonzero_suffix_metadata_even_allowlisted() {
-        let prefixes = [zeroclaw_infra::net_guard::Nat64Prefix {
-            prefix: "64:ff9b:1::".parse().unwrap(),
-            len: 48,
-        }];
+        let prefixes = [zeroclaw_infra::net_guard::Nat64Prefix::parse("64:ff9b:1::/48").unwrap()];
         // 64:ff9b:1:a9fe:a9:fe00:0:1 embeds 169.254.169.254 (EC2 IMDS) with
         // nonzero suffix byte 15.
         let addr = std::net::SocketAddr::new("64:ff9b:1:a9fe:a9:fe00:0:1".parse().unwrap(), 80);
@@ -2626,21 +2559,21 @@ mod tests {
         }
     }
 
-    /// Public positive control: a nonzero-suffix address under a declared
-    /// prefix embedding a public IPv4 still passes without opt-in, pinning the
-    /// intended prefix boundary.
+    /// The RFC 8215 local-use prefix (`64:ff9b:1::/48`) is itself outside the
+    /// global IPv6 unicast allocation, so an address inside it is rejected as
+    /// non-global even when the declared prefix's embedded IPv4 is public.
+    /// Declared-prefix "embeds a public IPv4 => passes" behavior is pinned by
+    /// [`ssrf_check_endpoint_declared_nat64_public_and_carveout`] on genuine
+    /// global unicast prefixes.
     #[test]
     fn ssrf_check_endpoint_declared_nat64_nonzero_suffix_public_passes() {
-        let prefixes = [zeroclaw_infra::net_guard::Nat64Prefix {
-            prefix: "64:ff9b:1::".parse().unwrap(),
-            len: 48,
-        }];
-        // 64:ff9b:1:808:0:808:0:1 embeds 8.8.8.8 (public) with nonzero suffix
-        // byte 15. The declared prefix is the RFC 8215 local-use range, so it
-        // is a valid positive control for the /48 layout.
+        let prefixes = [zeroclaw_infra::net_guard::Nat64Prefix::parse("64:ff9b:1::/48").unwrap()];
+        // 64:ff9b:1:808:0:808:0:1 embeds 8.8.8.8 (public) under the declared
+        // local-use prefix, yet is rejected because the prefix range itself is
+        // non-global IPv6.
         let addr = std::net::SocketAddr::new("64:ff9b:1:808:0:808:0:1".parse().unwrap(), 443);
         ssrf_check_endpoint("public.example.com", &[addr], &[], &prefixes)
-            .expect("nonzero-suffix declared NAT64 embedding a public IPv4 must pass");
+            .expect_err("RFC 8215 local-use prefix must be rejected as non-global IPv6");
     }
 
     /// Fail-closed boundary: an address inside a declared prefix with a
@@ -2648,10 +2581,7 @@ mod tests {
     /// rather than letting it fall through to ordinary public IPv6.
     #[test]
     fn ssrf_check_endpoint_fails_closed_on_unextractable_declared_prefix_address() {
-        let prefixes = [zeroclaw_infra::net_guard::Nat64Prefix {
-            prefix: "64:ff9b:1::".parse().unwrap(),
-            len: 48,
-        }];
+        let prefixes = [zeroclaw_infra::net_guard::Nat64Prefix::parse("64:ff9b:1::/48").unwrap()];
         // 64:ff9b:1:a00:100:100:: has u octet byte 8 = 0x01 (nonzero).
         let addr = std::net::SocketAddr::new("64:ff9b:1:a00:100:100::".parse().unwrap(), 80);
         ssrf_check_endpoint("internal.example.com", &[addr], &[], &prefixes)
@@ -2749,73 +2679,15 @@ mod tests {
         );
     }
 
-    /// Fail-closed contract for overlapping `config.nat64_prefixes`: two
-    /// prefixes where one contains the other make embedded-IPv4 extraction
-    /// order-dependent (the same address decodes to a public IPv4 under a
-    /// shorter prefix and a private IPv4 under a longer one). The normalization
-    /// must reject the set as an invalid configuration in BOTH declaration
-    /// orders — the SSRF decision cannot depend on configuration order. It
-    /// must also NOT silently drop the overlapping entry (that would fall back
-    /// to declaring only the other prefix, changing the boundary the operator
-    /// asked for).
-    #[test]
-    fn normalize_nat64_prefixes_rejects_overlapping_declarations_in_both_orders() {
-        let forward = vec!["2606:4700::/32".into(), "2606:4700:4700::/48".into()];
-        let reverse = vec!["2606:4700:4700::/48".into(), "2606:4700::/32".into()];
-
-        for raw in [&forward, &reverse] {
-            let err = normalize_nat64_prefixes(raw).unwrap_err();
-            assert!(
-                err.contains("nat64_prefixes")
-                    && err.contains("2606:4700::/32")
-                    && err.contains("2606:4700:4700::/48"),
-                "overlapping declarations must fail closed with both prefixes named; got: {err}"
-            );
-        }
-    }
-
-    /// Overlapping declarations must also fail the real dispatch boundary
-    /// (not just the normalization helper), so a configured overlapping set
-    /// can never reach the SSRF policy with an order-dependent classification.
-    /// The counting resolver is asserted untouched: overlapping configuration
-    /// must fail closed before any DNS I/O.
-    #[tokio::test]
-    async fn validate_endpoint_host_rejects_overlapping_nat64_prefixes_config() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config = FileDownloadConfig {
-            url: Some("http://internal.example.com/x".into()),
-            nat64_prefixes: vec!["2606:4700::/32".into(), "2606:4700:4700::/48".into()],
-            ..FileDownloadConfig::default()
-        };
-        let resolver_calls = Arc::new(AtomicUsize::new(0));
-        let tool = tool_with_counting_resolver(
-            test_security(tmp.path().to_path_buf(), AutonomyLevel::Full),
-            config,
-            Arc::clone(&resolver_calls),
-        );
-        let err = tool
-            .validate_endpoint_host("http://internal.example.com/x")
-            .await
-            .unwrap_err();
-        assert!(
-            err.contains("overlap")
-                || (err.contains("2606:4700::/32") && err.contains("2606:4700:4700::/48")),
-            "dispatch must fail closed on overlapping nat64_prefixes; got: {err}"
-        );
-        assert_eq!(
-            resolver_calls.load(Ordering::SeqCst),
-            0,
-            "overlapping nat64_prefixes must fail closed before any resolver I/O"
-        );
-    }
-
     /// Equivalent same-length aliases (`2606:4700:4700::/48` vs
-    /// `2606:4700:4700::1/48`) describe the same translation range, so the
-    /// equal-length overlap rule must reject them at the real dispatch boundary
-    /// in BOTH declaration orders — a non-canonical host bit must not make an
-    /// overlapping declaration look disjoint. The parse-time canonicalization
-    /// masks the host bits, so the error message names the canonical
-    /// `2606:4700:4700::/48` form either way.
+    /// `2606:4700:4700::1/48`) cannot make an overlapping declaration look
+    /// disjoint: the shared parser rejects the non-canonical host bit
+    /// (`...::1/48` sets bits beyond /48) and fails the whole list closed at
+    /// the real dispatch boundary before any DNS I/O, in BOTH declaration
+    /// orders. Overlapping broad/specific prefixes are instead handled
+    /// order-independently inside `net_guard`'s validator (each declared
+    /// prefix is decoded and any denying translation rejects the address), so
+    /// they no longer fail closed here.
     #[tokio::test]
     async fn validate_endpoint_host_rejects_equivalent_nat64_prefix_aliases() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2839,13 +2711,14 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(
-                err.contains("overlap") || err.contains("2606:4700:4700::/48"),
-                "dispatch must fail closed on equivalent same-length nat64_prefix aliases; got: {err}"
+                err.contains("2606:4700:4700::1/48")
+                    && err.to_lowercase().contains("sets bits beyond"),
+                "dispatch must fail closed on a non-canonical alias; got: {err}"
             );
             assert_eq!(
                 resolver_calls.load(Ordering::SeqCst),
                 0,
-                "equivalent same-length aliases must fail closed before any resolver I/O"
+                "non-canonical aliases must fail closed before any resolver I/O"
             );
         }
     }

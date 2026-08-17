@@ -1910,12 +1910,14 @@ impl SopEngine {
                 );
                 recorded.status = SopStepStatus::Failed;
                 recorded.output = full_reason;
-            } else if serde_json::from_str::<Value>(&result.output).is_err()
-                && output != Value::String(result.output.clone())
-            {
+            } else if jsonish_value(&result.output) != output {
                 // Canonicalize a schema-validated recovery at the model-output
                 // boundary. Downstream piping, retry, replay, and persisted run
-                // data can then keep their exact JSON-or-string parser.
+                // data re-parse the recorded text with the exact JSON-or-string
+                // parser, so the record must hold whatever value validation
+                // accepted — a fenced object recovered from prose and a
+                // double-encoded object unwrapped from a JSON string both
+                // differ from that re-parse until rewritten here.
                 recorded.output = output.to_string();
             }
         }
@@ -6817,6 +6819,58 @@ mod tests {
         }));
         assert!(engine.active_runs().is_empty());
         assert_eq!(engine.finished_runs(None)[0].status, SopRunStatus::Failed);
+    }
+
+    #[test]
+    fn double_encoded_step_output_validates_and_pipes_as_declared_object() {
+        let mut sop = test_sop(
+            "schema-double-encoded-output",
+            SopExecutionMode::Auto,
+            SopPriority::Normal,
+        );
+        sop.steps[0].schema = Some(StepSchema {
+            input: None,
+            output: Some(required_object_schema("ok")),
+        });
+        sop.steps[1].schema = Some(StepSchema {
+            input: Some(required_object_schema("ok")),
+            output: None,
+        });
+        let mut engine = engine_with_sops(vec![sop]);
+        let action = engine
+            .start_run("schema-double-encoded-output", manual_event())
+            .unwrap();
+        let run_id = extract_run_id(&action).to_string();
+
+        let action = engine
+            .advance_step(
+                &run_id,
+                SopStepResult {
+                    step_number: 1,
+                    status: SopStepStatus::Completed,
+                    output: serde_json::to_string(r#"{"ok":true}"#).unwrap(),
+                    started_at: now_iso8601(),
+                    completed_at: Some(now_iso8601()),
+                    effective_agent: None,
+                    tool_calls: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        assert!(
+            matches!(action, SopRunAction::ExecuteStep { ref step, .. } if step.number == 2),
+            "the unwrapped object must satisfy step 1 output and step 2 input schemas"
+        );
+        assert_eq!(
+            engine.active_runs()[&run_id].step_results[0].output,
+            r#"{"ok":true}"#,
+            "the record must hold the canonical object, not the escaped string"
+        );
+        assert_eq!(
+            super::step_input_value(&engine.active_runs()[&run_id], 2),
+            serde_json::json!({"ok": true}),
+            "the next step must be piped the object, not a string"
+        );
     }
 
     #[test]

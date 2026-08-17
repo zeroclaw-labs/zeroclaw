@@ -36,6 +36,9 @@ use serde::{Deserialize, Serialize};
 ///   has no runtime consumer — the context compressor was removed —
 ///   so it currently has no effect. One warning per non-default field (see
 ///   `collect_context_compression_ignored_warnings` in `schema.rs`).
+/// - `proxy_conflicts_with_dns_pinned_tools`: the configured proxy scope
+///   selects `http_request` and/or `web_fetch`, whose validated DNS answers
+///   require direct transport and therefore make the selected tool fail.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ValidationWarning {
