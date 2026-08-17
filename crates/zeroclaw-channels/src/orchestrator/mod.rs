@@ -9082,6 +9082,19 @@ fn collect_configured_channels(
             let alias = alias.clone();
             Arc::new(move || cfg_arc.read().channel_voice_peers("telegram", &alias))
         };
+        let allowed_groups_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+            let cfg_arc = config_arc.clone();
+            let alias = alias.clone();
+            Arc::new(move || {
+                cfg_arc
+                    .read()
+                    .channels
+                    .telegram
+                    .get(&alias)
+                    .map(|tg| tg.allowed_groups.clone())
+                    .unwrap_or_default()
+            })
+        };
         let channel_key = format!("telegram.{alias}");
         let agent_transcription_provider = config
             .agents
@@ -9122,7 +9135,8 @@ fn collect_configured_channels(
                     .with_workspace_dir(config.channel_workspace_dir(&format!("telegram.{alias}")))
                     .with_proxy_url(tg.proxy_url.clone())
                     .with_tool_command_specs(tool_specs.to_vec())
-                    .with_approval_timeout_secs(tg.approval_timeout_secs),
+                    .with_approval_timeout_secs(tg.approval_timeout_secs)
+                    .with_allowed_groups_resolver(allowed_groups_resolver),
                 ),
                 tg,
             ),
@@ -28561,6 +28575,7 @@ This is an example JSON object for profile settings."#;
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,
                 debounce_ms: None,
+                allowed_groups: vec![],
             },
         );
         let config_arc = Arc::new(RwLock::new(config));
@@ -28590,6 +28605,7 @@ This is an example JSON object for profile settings."#;
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,
                 debounce_ms: None,
+                allowed_groups: vec![],
             },
         );
         config

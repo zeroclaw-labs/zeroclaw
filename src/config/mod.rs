@@ -106,6 +106,7 @@ mod tests {
             reply_min_interval_secs: 0,
             reply_queue_depth_max: 0,
             debounce_ms: None,
+            allowed_groups: vec![],
         };
 
         let discord = DiscordConfig {

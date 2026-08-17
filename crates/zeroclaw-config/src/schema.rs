@@ -14065,6 +14065,28 @@ pub struct TelegramConfig {
     /// newest send is dropped and a `WARN` is logged.
     #[serde(default)]
     pub reply_queue_depth_max: u16,
+
+    /// Telegram group chat IDs whose members are allowed to use the bot
+    /// without individual pairing. Each entry should be a numeric string
+    /// (e.g. `"-1001234567890"` for a supergroup). Users in these groups
+    /// bypass the peer allowlist and pairing flow for text, voice, and
+    /// attachments. A wildcard (`"*"`) allows any group where the bot is
+    /// present.
+    ///
+    /// Interaction with `mention_only`: when `mention_only` is true, the
+    /// bot still requires a direct mention (`@bot_username`) or a reply to
+    /// the bot's message even from allow-listed groups: `allowed_groups`
+    /// bypasses peer authorization, not the mention gate.
+    ///
+    /// Interaction with peer groups: `allowed_groups` and peer group
+    /// `external_peers` are independent: a sender authorized through either
+    /// source is accepted.
+    ///
+    /// Config reload: changes to this field take effect on the next message
+    /// because the resolver reads the shared config at call time.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub allowed_groups: Vec<String>,
 }
 
 impl Default for TelegramConfig {
@@ -14084,6 +14106,7 @@ impl Default for TelegramConfig {
             reply_min_interval_secs: 0,
             reply_queue_depth_max: 0,
             debounce_ms: None,
+            allowed_groups: Vec::new(),
         }
     }
 }
@@ -26240,6 +26263,7 @@ auto_save = true
                         excluded_tools: vec![],
                         reply_min_interval_secs: 0,
                         reply_queue_depth_max: 0,
+                        allowed_groups: vec![],
                     },
                 )]),
                 discord: HashMap::new(),
@@ -27687,6 +27711,7 @@ default_temperature = 0.7
             reply_min_interval_secs: 0,
             reply_queue_depth_max: 0,
             debounce_ms: None,
+            allowed_groups: vec![],
         };
         let json = serde_json::to_string(&tc).unwrap();
         let parsed: TelegramConfig = serde_json::from_str(&json).unwrap();
@@ -32527,6 +32552,7 @@ high_entropy_tokens = false
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,
                 debounce_ms: None,
+                allowed_groups: vec![],
             },
         );
 
