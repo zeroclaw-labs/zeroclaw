@@ -2561,6 +2561,23 @@ fn gateway_chat_live_config_clear_for_test() {
         .clear();
 }
 
+// Test-only injection: `run_gateway_chat_with_tools` normally routes tests
+// through the mock-provider branch so the broad webhook/auth/autosave suite
+// stays hermetic, which means the production forwarding call (and the live
+// handle it selects) never executes under `#[cfg(test)]`. A dedicated
+// regression sets this to its agent alias to drive the *exact* production
+// forwarding path through `run_gateway_chat_with_tools`, making the
+// live-config argument it hands to `process_message` observable. The injection
+// is keyed on the effective agent alias (not a global boolean) so concurrent
+// webhook/auth/autosave tests — which run `run_gateway_chat_with_tools` with
+// different or no alias — do not spuriously take the production branch and
+// fail on missing agent config. A mutation at the production call site that
+// drops the handle (e.g. `gateway_forward_to_process_message(..., None, ...)`)
+// therefore turns the regression red, even though the mock path could not see it.
+#[cfg(test)]
+static GATEWAY_CHAT_TEST_EXERCISE_PRODUCTION_FORWARD: std::sync::Mutex<Option<String>> =
+    std::sync::Mutex::new(None);
+
 /// Identity wrapper invoked inline at the `process_message` argument inside
 /// `gateway_forward_to_process_message`. In tests it records the exact value
 /// handed to the runtime before returning it unchanged, so the gateway-path
@@ -2620,6 +2637,9 @@ pub(crate) async fn gateway_forward_to_process_message(
 /// clone())`) because `run_gateway_chat_with_tools` swaps in a mock provider
 /// branch under `#[cfg(test)]` that bypasses `process_message` entirely; the
 /// forwarding decision itself must remain testable at the caller boundary.
+/// `run_gateway_chat_with_tools_forwards_appstate_live_config` drives the
+/// production caller through the test-only injection and asserts the handle
+/// that reaches `process_message` is this function's result.
 fn gateway_live_config_for_chat(state: &AppState) -> Option<Arc<parking_lot::RwLock<Config>>> {
     Some(state.config.clone())
 }
@@ -2667,65 +2687,74 @@ pub(crate) async fn run_gateway_chat_with_tools(
     }
 
     // Tests exercise webhook infrastructure (idempotency, auth, autosave)
-    // through handle_webhook, so dispatch to the mock model_provider directly
-    // instead of bootstrapping the full agent runtime. The mock path
-    // doesn't go through the cost-tracking scope, so it bypasses
+    // through handle_webhook, so by default dispatch to the mock
+    // model_provider directly instead of bootstrapping the full agent runtime.
+    // The mock path doesn't go through the cost-tracking scope, so it bypasses
     // `gateway_forward_to_process_message`; the live-config forwarding edge is
-    // instead pinned by `gateway_forward_to_process_message_records_live_config`
-    // on that seam directly.
+    // otherwise pinned by `gateway_forward_to_process_message_records_live_config`
+    // on that seam directly. A dedicated caller regression registers its agent
+    // alias in `GATEWAY_CHAT_TEST_EXERCISE_PRODUCTION_FORWARD` to skip the mock
+    // for exactly that request and drive the *exact* production forwarding call
+    // below, so the live-config argument `run_gateway_chat_with_tools` selects
+    // is observable at the `process_message` boundary (a mutation there dropping
+    // the handle turns it red). Other concurrent tests never match the alias and
+    // keep using the hermetic mock path.
     #[cfg(test)]
-    {
+    let exercise_production = GATEWAY_CHAT_TEST_EXERCISE_PRODUCTION_FORWARD
+        .lock()
+        .expect("gateway chat production-forward injection lock should not be poisoned")
+        .as_deref()
+        .is_some_and(|injected_alias| agent_override == Some(injected_alias));
+    #[cfg(test)]
+    if !exercise_production {
         record_gateway_chat_dispatch_for_test(message, session_id, agent_override);
         let response = state
             .model_provider
             .chat_with_system(None, message, &state.model, state.temperature)
             .await?;
-        Ok(GatewayChatOutcome { response })
+        return Ok(GatewayChatOutcome { response });
     }
 
-    #[cfg(not(test))]
-    {
-        let config = state.config.read().clone();
-        let agent_alias = require_gateway_chat_agent_alias(&config, agent_override)?;
+    let config = state.config.read().clone();
+    let agent_alias = require_gateway_chat_agent_alias(&config, agent_override)?;
 
-        // Scope the cost tracking context so per-LLM-call usage flows into
-        // the gateway's cost tracker and costs.jsonl. A separate
-        // `TOOL_LOOP_TURN_USAGE` task-local accumulates this turn's totals so
-        // the runtime-owned lifecycle guard can annotate its `AgentEnd`
-        // without racing concurrent requests sharing the same tracker.
-        // Pricing is built from the
-        // unified `build_model_provider_pricing` (alias-keyed, `cost.rates`
-        // wins over legacy per-alias pricing).
-        let cost_tracking_context = state.cost_tracker.as_ref().map(|tracker| {
-            let pricing = zeroclaw_runtime::agent::cost::build_model_provider_pricing(&config);
-            zeroclaw_runtime::agent::cost::ToolLoopCostTrackingContext::new(
-                tracker.clone(),
-                std::sync::Arc::new(pricing),
-            )
-            .with_agent_alias(&agent_alias)
-        });
-        let turn_usage = state.cost_tracker.as_ref().map(|_| {
-            std::sync::Arc::new(parking_lot::Mutex::new(
-                zeroclaw_runtime::agent::cost::TurnUsage::default(),
-            ))
-        });
-        let response = Box::pin(zeroclaw_runtime::agent::cost::TOOL_LOOP_TURN_USAGE.scope(
-            turn_usage.clone(),
-            zeroclaw_runtime::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
-                cost_tracking_context,
-                gateway_chat_forward_with_appstate_live_config(
-                    state,
-                    config,
-                    &agent_alias,
-                    message,
-                    session_id,
-                    zeroclaw_api::ingress::TurnOrigin::Interactive,
-                ),
-            ),
+    // Scope the cost tracking context so per-LLM-call usage flows into
+    // the gateway's cost tracker and costs.jsonl. A separate
+    // `TOOL_LOOP_TURN_USAGE` task-local accumulates this turn's totals so
+    // the runtime-owned lifecycle guard can annotate its `AgentEnd`
+    // without racing concurrent requests sharing the same tracker.
+    // Pricing is built from the
+    // unified `build_model_provider_pricing` (alias-keyed, `cost.rates`
+    // wins over legacy per-alias pricing).
+    let cost_tracking_context = state.cost_tracker.as_ref().map(|tracker| {
+        let pricing = zeroclaw_runtime::agent::cost::build_model_provider_pricing(&config);
+        zeroclaw_runtime::agent::cost::ToolLoopCostTrackingContext::new(
+            tracker.clone(),
+            std::sync::Arc::new(pricing),
+        )
+        .with_agent_alias(&agent_alias)
+    });
+    let turn_usage = state.cost_tracker.as_ref().map(|_| {
+        std::sync::Arc::new(parking_lot::Mutex::new(
+            zeroclaw_runtime::agent::cost::TurnUsage::default(),
         ))
-        .await?;
-        Ok(GatewayChatOutcome { response })
-    }
+    });
+    let response = Box::pin(zeroclaw_runtime::agent::cost::TOOL_LOOP_TURN_USAGE.scope(
+        turn_usage.clone(),
+        zeroclaw_runtime::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+            cost_tracking_context,
+            gateway_chat_forward_with_appstate_live_config(
+                state,
+                config,
+                &agent_alias,
+                message,
+                session_id,
+                zeroclaw_api::ingress::TurnOrigin::Interactive,
+            ),
+        ),
+    ))
+    .await?;
+    Ok(GatewayChatOutcome { response })
 }
 
 fn resolve_gateway_chat_agent_alias(
@@ -2737,7 +2766,6 @@ fn resolve_gateway_chat_agent_alias(
         .or_else(|| config.resolved_runtime_agent_alias().map(str::to_owned))
 }
 
-#[cfg(not(test))]
 fn require_gateway_chat_agent_alias(
     config: &Config,
     agent_override: Option<&str>,
@@ -4683,6 +4711,89 @@ mod tests {
             }),
             "production gateway composition must hand AppState.config to process_message; \
              observed {captures:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_gateway_chat_with_tools_forwards_appstate_live_config() {
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, ModelProviderConfig, OllamaModelProviderConfig, RiskProfileConfig,
+        };
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, false, false);
+
+        // `run_gateway_chat_with_tools` production forwarding requires a
+        // configured agent (so `require_gateway_chat_agent_alias` resolves) and
+        // reaches a real `process_message` call. The provider uri is a dead
+        // address so the turn fails after the seam records the live handle at
+        // the `process_message` argument — exactly the value this regression
+        // asserts, and exactly what a caller-edge mutation would drop.
+        {
+            let mut config = state.config.write();
+            config.providers.models.ollama.insert(
+                "default".to_string(),
+                OllamaModelProviderConfig {
+                    base: ModelProviderConfig {
+                        model: Some("gateway-caller-test".to_string()),
+                        timeout_secs: Some(1),
+                        uri: Some("http://127.0.0.1:9".to_string()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            );
+            config.agents.insert(
+                "gateway-caller-agent".to_string(),
+                AliasedAgentConfig {
+                    model_provider: "ollama.default".into(),
+                    risk_profile: "default".into(),
+                    ..Default::default()
+                },
+            );
+            config
+                .risk_profiles
+                .insert("default".to_string(), RiskProfileConfig::default());
+        }
+        let expected = Arc::clone(&state.config);
+
+        // Drive the production caller itself (not the extracted helper) through
+        // the test-only injection. If the production forwarding call is ever
+        // rewired to drop `AppState.config` (e.g. a direct
+        // `gateway_forward_to_process_message(..., None, ...)`), the handle
+        // recorded at the `process_message` boundary stops matching and this
+        // test turns red — coverage the mock-provider branch could not provide.
+        // The injection is keyed on the agent alias so concurrent webhook tests
+        // (different/no alias) never take the production branch.
+        *GATEWAY_CHAT_TEST_EXERCISE_PRODUCTION_FORWARD
+            .lock()
+            .expect("gateway chat production-forward injection lock should not be poisoned") =
+            Some("gateway-caller-agent".to_string());
+        let clear = GATEWAY_CHAT_LIVE_CONFIG_CAPTURE_TEST_LOCK.lock().await;
+        gateway_chat_live_config_clear_for_test();
+        let result = crate::run_gateway_chat_with_tools(
+            &state,
+            "hello",
+            Some("session"),
+            Some("gateway-caller-agent"),
+        )
+        .await;
+        drop(clear);
+        *GATEWAY_CHAT_TEST_EXERCISE_PRODUCTION_FORWARD
+            .lock()
+            .expect("gateway chat production-forward injection lock should not be poisoned") = None;
+        // The turn is expected to fail at the dead provider uri; only the
+        // forwarding hook matters here.
+        drop(result);
+
+        let captures = gateway_chat_live_config_captures_for_test();
+        assert!(
+            captures.iter().any(|seen| match seen {
+                Some(seen) => Arc::ptr_eq(seen, &expected),
+                None => false,
+            }),
+            "run_gateway_chat_with_tools production path must hand AppState.config to \
+             process_message; observed {captures:?}"
         );
     }
 
