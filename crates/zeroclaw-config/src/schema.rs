@@ -10325,6 +10325,74 @@ fn resolve_ws_proxy_url(
     preferred.or_else(|| normalize_proxy_url_option(cfg.all_proxy.as_deref()))
 }
 
+fn build_ws_request(
+    ws_url: &str,
+    extra_headers: &tokio_tungstenite::tungstenite::http::HeaderMap,
+) -> anyhow::Result<tokio_tungstenite::tungstenite::http::Request<()>> {
+    use tokio_tungstenite::tungstenite::http::header;
+
+    let target =
+        reqwest::Url::parse(ws_url).with_context(|| format!("Invalid WebSocket URL: {ws_url}"))?;
+    let default_port = match target.scheme() {
+        "ws" => 80,
+        "wss" => 443,
+        scheme => anyhow::bail!("Unsupported WebSocket URL scheme '{scheme}'"),
+    };
+    let target_host = target.host_str().ok_or_else(|| {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+            "WebSocket URL has no host"
+        );
+        anyhow::Error::msg("WebSocket URL has no host")
+    })?;
+    let authority_host = if target_host.contains(':') {
+        format!("[{target_host}]")
+    } else {
+        target_host.to_string()
+    };
+    let target_port = target.port().unwrap_or(default_port);
+    let host_header = if target_port == default_port {
+        authority_host
+    } else {
+        format!("{authority_host}:{target_port}")
+    };
+
+    const RESERVED_HEADERS: [&str; 5] = [
+        "host",
+        "connection",
+        "upgrade",
+        "sec-websocket-key",
+        "sec-websocket-version",
+    ];
+    for name in extra_headers.keys() {
+        if RESERVED_HEADERS.contains(&name.as_str()) {
+            anyhow::bail!(
+                "WebSocket extra headers must not override reserved handshake header '{}'",
+                name.as_str()
+            );
+        }
+    }
+
+    let mut request = tokio_tungstenite::tungstenite::http::Request::builder()
+        .uri(ws_url)
+        .header(header::HOST, host_header)
+        .header(header::CONNECTION, "Upgrade")
+        .header(header::UPGRADE, "websocket")
+        .header(
+            header::SEC_WEBSOCKET_KEY,
+            tokio_tungstenite::tungstenite::handshake::client::generate_key(),
+        )
+        .header(header::SEC_WEBSOCKET_VERSION, "13")
+        .body(())
+        .with_context(|| "Failed to build WebSocket upgrade request")?;
+    for (name, value) in extra_headers {
+        request.headers_mut().append(name, value.clone());
+    }
+    Ok(request)
+}
+
 /// Connect a WebSocket through the configured proxy (if any).
 ///
 /// When no proxy applies, this is a thin wrapper around
@@ -10338,6 +10406,21 @@ pub async fn ws_connect_with_proxy(
     ws_url: &str,
     service_key: &str,
     channel_proxy_url: Option<&str>,
+) -> anyhow::Result<(
+    ProxiedWsStream,
+    tokio_tungstenite::tungstenite::http::Response<Option<Vec<u8>>>,
+)> {
+    let headers = tokio_tungstenite::tungstenite::http::HeaderMap::new();
+    ws_connect_with_proxy_headers(ws_url, service_key, channel_proxy_url, &headers).await
+}
+
+/// Connect a WebSocket through the configured proxy while adding safe HTTP
+/// upgrade headers. Mandatory WebSocket handshake headers cannot be replaced.
+pub async fn ws_connect_with_proxy_headers(
+    ws_url: &str,
+    service_key: &str,
+    channel_proxy_url: Option<&str>,
+    extra_headers: &tokio_tungstenite::tungstenite::http::HeaderMap,
 ) -> anyhow::Result<(
     ProxiedWsStream,
     tokio_tungstenite::tungstenite::http::Response<Option<Vec<u8>>>,
@@ -10401,25 +10484,7 @@ pub async fn ws_connect_with_proxy(
                 BoxedIo(Box::new(tcp))
             };
 
-            let default_port = if is_secure { 443 } else { 80 };
-            let host_header = if target_port == default_port {
-                target_host.clone()
-            } else {
-                format!("{target_host}:{target_port}")
-            };
-
-            let ws_request = tokio_tungstenite::tungstenite::http::Request::builder()
-                .uri(ws_url)
-                .header("Host", host_header)
-                .header("Connection", "Upgrade")
-                .header("Upgrade", "websocket")
-                .header(
-                    "Sec-WebSocket-Key",
-                    tokio_tungstenite::tungstenite::handshake::client::generate_key(),
-                )
-                .header("Sec-WebSocket-Version", "13")
-                .body(())
-                .with_context(|| "Failed to build WebSocket upgrade request")?;
+            let ws_request = build_ws_request(ws_url, extra_headers)?;
 
             let (ws_stream, response) =
                 tokio_tungstenite::client_async(ws_request, stream)
@@ -10428,7 +10493,7 @@ pub async fn ws_connect_with_proxy(
 
             Ok((ws_stream, response))
         }
-        Some(proxy) => ws_connect_via_proxy(ws_url, &proxy).await,
+        Some(proxy) => ws_connect_via_proxy(ws_url, &proxy, extra_headers).await,
     }
 }
 
@@ -10436,6 +10501,7 @@ pub async fn ws_connect_with_proxy(
 async fn ws_connect_via_proxy(
     ws_url: &str,
     proxy_url: &str,
+    extra_headers: &tokio_tungstenite::tungstenite::http::HeaderMap,
 ) -> anyhow::Result<(
     ProxiedWsStream,
     tokio_tungstenite::tungstenite::http::Response<Option<Vec<u8>>>,
@@ -10568,18 +10634,7 @@ async fn ws_connect_via_proxy(
     };
 
     // Perform the WebSocket client handshake over the tunnelled stream.
-    let ws_request = tokio_tungstenite::tungstenite::http::Request::builder()
-        .uri(ws_url)
-        .header("Host", format!("{target_host}:{target_port}"))
-        .header("Connection", "Upgrade")
-        .header("Upgrade", "websocket")
-        .header(
-            "Sec-WebSocket-Key",
-            tokio_tungstenite::tungstenite::handshake::client::generate_key(),
-        )
-        .header("Sec-WebSocket-Version", "13")
-        .body(())
-        .with_context(|| "Failed to build WebSocket upgrade request")?;
+    let ws_request = build_ws_request(ws_url, extra_headers)?;
 
     let (ws_stream, response) = tokio_tungstenite::client_async(ws_request, stream)
         .await
@@ -13449,6 +13504,10 @@ pub struct ChannelsConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub voice_call: HashMap<String, crate::scattered_types::VoiceCallConfig>,
+    /// External voice host channel instances (`[channels.voicehost.<alias>]`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub voicehost: HashMap<String, VoiceHostConfig>,
     /// Voice wake word detection channel instances (`[channels.voice_wake.<alias>]`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
@@ -13701,6 +13760,12 @@ impl ChannelsConfig {
                 configured: !self.voice_call.is_empty(),
             },
             ChannelInfo {
+                kind: "voicehost",
+                name: "VoiceHost",
+                desc: "external ASR and TTS host over WebSocket",
+                configured: !self.voicehost.is_empty(),
+            },
+            ChannelInfo {
                 kind: "voice-wake",
                 name: "VoiceWake",
                 desc: "voice wake word detection",
@@ -13768,6 +13833,7 @@ impl ChannelsConfig {
             || self.reddit.values().any(|c| c.enabled)
             || self.bluesky.values().any(|c| c.enabled)
             || self.voice_call.values().any(|c| c.enabled)
+            || self.voicehost.values().any(|c| c.enabled)
             || self.voice_wake.values().any(|c| c.enabled)
             || self.voice_duplex.values().any(|c| c.enabled)
             || self.mqtt.values().any(|c| c.enabled)
@@ -13783,7 +13849,7 @@ impl ChannelsConfig {
     /// amqp are fan-in listeners; voice_wake is input-only), so a name-addressed
     /// outbound surface such as `heartbeat.target` can refuse them at validation
     /// instead of accepting a target the delivery layer silently drops.
-    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 35] {
+    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 36] {
         [
             ("telegram", !self.telegram.is_empty(), true),
             ("discord", !self.discord.is_empty(), true),
@@ -13815,6 +13881,7 @@ impl ChannelsConfig {
             ("bluesky", !self.bluesky.is_empty(), true),
             ("git", !self.git.is_empty(), true),
             ("voice_call", !self.voice_call.is_empty(), true),
+            ("voicehost", !self.voicehost.is_empty(), true),
             ("voice_wake", !self.voice_wake.is_empty(), false),
             ("voice_duplex", !self.voice_duplex.is_empty(), false),
             ("mqtt", !self.mqtt.is_empty(), false),
@@ -13900,6 +13967,7 @@ impl Default for ChannelsConfig {
             bluesky: HashMap::new(),
             git: HashMap::new(),
             voice_call: HashMap::new(),
+            voicehost: HashMap::new(),
             voice_wake: HashMap::new(),
             voice_duplex: HashMap::new(),
             mqtt: HashMap::new(),
@@ -17475,6 +17543,78 @@ pub struct VoiceDuplexConfig {
     pub excluded_tools: Vec<String>,
 }
 
+/// External voice host configuration.
+///
+/// The host owns audio capture, VAD, ASR, TTS, and playback. ZeroClaw exchanges
+/// transcripts and text responses over WebSocket and remains responsible for
+/// the agent, RAG, MCP, tools, and approval loop.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.voicehost"]
+pub struct VoiceHostConfig {
+    /// Whether this channel instance is active. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// WebSocket JSON profile used by the voice host: `native` or
+    /// `wyoming-events-ws`. The latter is not the Wyoming TCP protocol.
+    #[serde(default = "default_voicehost_backend")]
+    pub backend: String,
+    /// Voice host WebSocket endpoint (`ws://` or `wss://`).
+    #[serde(default)]
+    pub url: String,
+    /// Optional bearer token sent only in the WebSocket upgrade request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub api_key: Option<String>,
+    /// Optional voice name forwarded with spoken responses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice: Option<String>,
+    /// Forward partial transcripts as passive conversation context.
+    #[serde(default)]
+    pub forward_partials: bool,
+    /// Optional per-channel proxy URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_url: Option<String>,
+    /// Seconds to wait for an operator approval response. Default: 300.
+    #[serde(default = "default_channel_approval_timeout_secs")]
+    pub approval_timeout_secs: u64,
+    /// Tools excluded from this channel's tool spec.
+    #[serde(default)]
+    pub excluded_tools: Vec<String>,
+}
+
+fn default_voicehost_backend() -> String {
+    "native".into()
+}
+
+impl Default for VoiceHostConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            backend: default_voicehost_backend(),
+            url: String::new(),
+            api_key: None,
+            voice: None,
+            forward_partials: false,
+            proxy_url: None,
+            approval_timeout_secs: default_channel_approval_timeout_secs(),
+            excluded_tools: Vec::new(),
+        }
+    }
+}
+
+impl ChannelConfig for VoiceHostConfig {
+    fn name() -> &'static str {
+        "VoiceHost"
+    }
+
+    fn desc() -> &'static str {
+        "external ASR and TTS host over WebSocket"
+    }
+}
+
 /// Voice wake word detection channel configuration.
 ///
 /// Listens on the default microphone for a configurable wake word,
@@ -20250,6 +20390,75 @@ impl Config {
                 vc.enabled,
                 &vc.from_number,
             )?;
+        }
+
+        for (alias, voicehost) in &self.channels.voicehost {
+            if !voicehost.enabled {
+                continue;
+            }
+
+            let backend_path = format!("channels.voicehost.{alias}.backend");
+            if voicehost.backend.trim().is_empty() {
+                validation_bail!(
+                    RequiredFieldEmpty,
+                    backend_path,
+                    "{backend_path} must not be empty when the channel is enabled"
+                );
+            }
+            if !matches!(
+                voicehost.backend.trim().to_ascii_lowercase().as_str(),
+                "native" | "wyoming-events-ws"
+            ) {
+                validation_bail!(
+                    InvalidFormat,
+                    backend_path,
+                    "{backend_path} must be either 'native' or 'wyoming-events-ws'"
+                );
+            }
+
+            let url_path = format!("channels.voicehost.{alias}.url");
+            let parsed = match reqwest::Url::parse(&voicehost.url) {
+                Ok(parsed) => parsed,
+                Err(error) => validation_bail!(
+                    InvalidFormat,
+                    url_path,
+                    "{url_path} must be an absolute ws:// or wss:// URL: {error}"
+                ),
+            };
+            if !matches!(parsed.scheme(), "ws" | "wss") || parsed.host_str().is_none() {
+                validation_bail!(
+                    InvalidFormat,
+                    url_path,
+                    "{url_path} must be an absolute ws:// or wss:// URL"
+                );
+            }
+            let has_api_key = voicehost
+                .api_key
+                .as_deref()
+                .is_some_and(|key| !key.trim().is_empty());
+            let is_loopback = parsed.host_str().is_some_and(|host| {
+                let host = host.trim_start_matches('[').trim_end_matches(']');
+                host.eq_ignore_ascii_case("localhost")
+                    || host
+                        .parse::<std::net::IpAddr>()
+                        .is_ok_and(|address| address.is_loopback())
+            });
+            if has_api_key && parsed.scheme() == "ws" && !is_loopback {
+                validation_bail!(
+                    InvalidFormat,
+                    url_path,
+                    "{url_path} must use wss:// when api_key is configured for a non-loopback host"
+                );
+            }
+
+            if voicehost.approval_timeout_secs == 0 {
+                let timeout_path = format!("channels.voicehost.{alias}.approval_timeout_secs");
+                validation_bail!(
+                    InvalidNumericRange,
+                    timeout_path,
+                    "{timeout_path} must be greater than 0"
+                );
+            }
         }
 
         // Git forge channel: a PAT-backed provider must name its API origin
@@ -26040,12 +26249,199 @@ auto_save = true
         assert!(c.cli);
         assert!(c.telegram.is_empty());
         assert!(c.discord.is_empty());
+        assert!(c.voicehost.is_empty());
         assert!(c.wecom_ws.is_empty());
         assert!(!c.show_tool_calls);
         assert_eq!(
             c.max_concurrent_per_channel,
             default_channel_max_concurrent_per_channel()
         );
+    }
+
+    #[test]
+    async fn voicehost_config_serde_defaults_and_secret_metadata() {
+        let parsed: Config = toml::from_str(
+            r#"
+                [channels.voicehost.office]
+                enabled = true
+                url = "wss://voice.example.test/ws"
+                api_key = "secret-token"
+                voice = "en-US"
+            "#,
+        )
+        .unwrap();
+        let voicehost = parsed.channels.voicehost.get("office").unwrap();
+
+        assert!(voicehost.enabled);
+        assert_eq!(voicehost.backend, "native");
+        assert_eq!(voicehost.url, "wss://voice.example.test/ws");
+        assert_eq!(voicehost.api_key.as_deref(), Some("secret-token"));
+        assert_eq!(voicehost.voice.as_deref(), Some("en-US"));
+        assert!(!voicehost.forward_partials);
+        assert_eq!(voicehost.approval_timeout_secs, 300);
+        assert!(voicehost.excluded_tools.is_empty());
+        assert!(!VoiceHostConfig::default().enabled);
+        assert!(VoiceHostConfig::prop_is_secret(
+            "channels.voicehost.api_key"
+        ));
+    }
+
+    fn voicehost_config(url: &str) -> VoiceHostConfig {
+        VoiceHostConfig {
+            enabled: true,
+            url: url.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    async fn validate_voicehost_requires_backend_url_and_positive_timeout() {
+        let cases = [
+            (
+                VoiceHostConfig {
+                    backend: "   ".into(),
+                    ..voicehost_config("ws://127.0.0.1:8765")
+                },
+                "channels.voicehost.office.backend",
+            ),
+            (voicehost_config(""), "channels.voicehost.office.url"),
+            (
+                voicehost_config("https://voice.example.test/ws"),
+                "channels.voicehost.office.url",
+            ),
+            (
+                VoiceHostConfig {
+                    approval_timeout_secs: 0,
+                    ..voicehost_config("wss://voice.example.test/ws")
+                },
+                "channels.voicehost.office.approval_timeout_secs",
+            ),
+            (
+                VoiceHostConfig {
+                    backend: "wyomign".into(),
+                    ..voicehost_config("wss://voice.example.test/ws")
+                },
+                "channels.voicehost.office.backend",
+            ),
+        ];
+
+        for (voicehost, expected_path) in cases {
+            let mut config = Config::default();
+            config.channels.voicehost.insert("office".into(), voicehost);
+            let error = config.validate().expect_err("invalid voicehost config");
+            assert!(
+                error.to_string().contains(expected_path),
+                "expected {expected_path} in {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    async fn validate_voicehost_accepts_ws_wss_and_ignores_disabled_stubs() {
+        for url in ["ws://127.0.0.1:8765", "wss://voice.example.test/ws"] {
+            let mut config = Config::default();
+            config
+                .channels
+                .voicehost
+                .insert("office".into(), voicehost_config(url));
+            config.validate().expect("valid voicehost URL must pass");
+        }
+
+        let mut config = Config::default();
+        config.channels.voicehost.insert(
+            "staged".into(),
+            VoiceHostConfig {
+                enabled: false,
+                backend: String::new(),
+                url: String::new(),
+                approval_timeout_secs: 0,
+                ..Default::default()
+            },
+        );
+        config
+            .validate()
+            .expect("disabled voicehost stub must not fail validation");
+    }
+
+    #[test]
+    async fn validate_voicehost_requires_tls_for_remote_bearer_credentials() {
+        let mut remote_plaintext = voicehost_config("ws://voice.example.test/ws");
+        remote_plaintext.api_key = Some("secret-token".into());
+        let mut config = Config::default();
+        config
+            .channels
+            .voicehost
+            .insert("office".into(), remote_plaintext);
+        let error = config
+            .validate()
+            .expect_err("remote plaintext bearer transport must be rejected");
+        assert!(error.to_string().contains("channels.voicehost.office.url"));
+        assert!(error.to_string().contains("wss://"));
+
+        for url in [
+            "ws://voice.example.test/ws",
+            "ws://localhost:8765/ws",
+            "ws://127.0.0.1:8765/ws",
+            "ws://[::1]:8765/ws",
+            "wss://voice.example.test/ws",
+        ] {
+            let mut voicehost = voicehost_config(url);
+            if url != "ws://voice.example.test/ws" {
+                voicehost.api_key = Some("secret-token".into());
+            }
+            let mut config = Config::default();
+            config.channels.voicehost.insert("office".into(), voicehost);
+            config.validate().unwrap_or_else(|error| {
+                panic!("expected {url} credential policy to pass: {error:#}")
+            });
+        }
+    }
+
+    #[test]
+    async fn ws_request_preserves_authorization_and_handshake_headers() {
+        use tokio_tungstenite::tungstenite::http::{HeaderMap, HeaderValue, header};
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer test-token"),
+        );
+        headers.insert("x-voicehost-client", HeaderValue::from_static("zeroclaw"));
+
+        let request = build_ws_request("wss://voice.example.test/ws", &headers).unwrap();
+        assert_eq!(request.uri(), "wss://voice.example.test/ws");
+        assert_eq!(request.headers()[header::HOST], "voice.example.test");
+        assert_eq!(request.headers()[header::CONNECTION], "Upgrade");
+        assert_eq!(request.headers()[header::UPGRADE], "websocket");
+        assert_eq!(request.headers()["sec-websocket-version"], "13");
+        assert!(!request.headers()["sec-websocket-key"].as_bytes().is_empty());
+        assert_eq!(
+            request.headers()[header::AUTHORIZATION],
+            "Bearer test-token"
+        );
+        assert_eq!(request.headers()["x-voicehost-client"], "zeroclaw");
+    }
+
+    #[test]
+    async fn ws_request_rejects_reserved_handshake_header_overrides() {
+        use tokio_tungstenite::tungstenite::http::{HeaderMap, HeaderValue, header};
+
+        for name in [
+            header::HOST,
+            header::CONNECTION,
+            header::UPGRADE,
+            header::SEC_WEBSOCKET_KEY,
+            header::SEC_WEBSOCKET_VERSION,
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(name.clone(), HeaderValue::from_static("override"));
+            let error = build_ws_request("ws://127.0.0.1:8765/ws", &headers)
+                .expect_err("mandatory handshake headers must not be replaceable");
+            assert!(
+                error.to_string().contains(name.as_str()),
+                "error must name reserved header {name}: {error:#}"
+            );
+        }
     }
 
     #[test]
@@ -26271,6 +26667,7 @@ auto_save = true
                 bluesky: HashMap::new(),
                 git: HashMap::new(),
                 voice_call: HashMap::new(),
+                voicehost: HashMap::new(),
                 voice_duplex: HashMap::new(),
                 voice_wake: HashMap::new(),
                 mqtt: HashMap::new(),
@@ -28016,6 +28413,7 @@ allowed_users = ["@u:matrix.org"]
             bluesky: HashMap::new(),
             git: HashMap::new(),
             voice_call: HashMap::new(),
+            voicehost: HashMap::new(),
             voice_duplex: HashMap::new(),
             voice_wake: HashMap::new(),
             mqtt: HashMap::new(),
@@ -28581,6 +28979,7 @@ allowed_numbers = ["+1", "+2"]
             bluesky: HashMap::new(),
             git: HashMap::new(),
             voice_call: HashMap::new(),
+            voicehost: HashMap::new(),
             voice_duplex: HashMap::new(),
             voice_wake: HashMap::new(),
             mqtt: HashMap::new(),

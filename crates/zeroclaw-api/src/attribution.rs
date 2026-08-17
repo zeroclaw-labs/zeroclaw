@@ -91,6 +91,8 @@ pub enum ChannelKind {
     Twitch,
     Twitter,
     VoiceCall,
+    #[strum(serialize = "voicehost")]
+    VoiceHost,
     VoiceWake,
     /// Retained after the WATI channel was removed so historical
     /// attribution records that name it still deserialize.
@@ -442,6 +444,7 @@ mod tests {
     #[test]
     fn channel_kind_snake_case() {
         assert_eq!(<&'static str>::from(ChannelKind::Telegram), "telegram");
+        assert_eq!(<&'static str>::from(ChannelKind::VoiceHost), "voicehost");
         assert_eq!(
             <&'static str>::from(ChannelKind::WhatsappBusiness),
             "whatsapp_business"
