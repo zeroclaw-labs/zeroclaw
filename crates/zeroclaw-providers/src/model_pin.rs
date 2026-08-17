@@ -87,6 +87,11 @@ impl ModelProvider for ModelPinnedProvider {
         self.inner.capabilities_for_model(&self.pinned_model)
     }
 
+    fn has_mixed_native_tool_support_for_model(&self, _model: &str) -> bool {
+        self.inner
+            .has_mixed_native_tool_support_for_model(&self.pinned_model)
+    }
+
     fn default_temperature(&self) -> f64 {
         self.inner.default_temperature()
     }
@@ -234,5 +239,70 @@ impl zeroclaw_api::attribution::Attributable for ModelPinnedProvider {
     }
     fn alias(&self) -> &str {
         &self.alias
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::traits::ProviderCapabilities;
+
+    struct ModelAwareCapabilityProvider;
+
+    impl zeroclaw_api::attribution::Attributable for ModelAwareCapabilityProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "model_aware_capability"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for ModelAwareCapabilityProvider {
+        fn capabilities_for_model(&self, model: &str) -> ProviderCapabilities {
+            ProviderCapabilities {
+                native_tool_calling: model == "pinned-model",
+                ..ProviderCapabilities::default()
+            }
+        }
+
+        fn has_mixed_native_tool_support_for_model(&self, model: &str) -> bool {
+            model == "pinned-model"
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    #[test]
+    fn capability_queries_use_the_pinned_model() {
+        let provider = ModelPinnedProvider::builder("pinned")
+            .pinned_model("pinned-model")
+            .inner(Box::new(ModelAwareCapabilityProvider))
+            .build();
+
+        assert!(
+            provider
+                .capabilities_for_model("ignored-request-model")
+                .native_tool_calling,
+            "model-aware capabilities must be queried with the pinned model"
+        );
+        assert!(
+            provider.has_mixed_native_tool_support_for_model("ignored-request-model"),
+            "mixed-chain detection must be queried with the pinned model"
+        );
     }
 }

@@ -1372,7 +1372,12 @@ fn push_pinned_entries(
     let cooldown_key = format!("{family}.{alias}");
 
     let Some(primary_model) = primary_model else {
-        out.push(ReliableModelProviderEntry::new(family, cooldown_key, built));
+        out.push(ReliableModelProviderEntry::new_with_candidate(
+            family,
+            cooldown_key.clone(),
+            cooldown_key,
+            built,
+        ));
         return;
     };
 
