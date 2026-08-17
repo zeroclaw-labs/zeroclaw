@@ -1295,11 +1295,12 @@ pub async fn run(
             (None, None)
         };
 
-        // Build SOP engine when sops_dir is configured so SOP tools are
-        // available on this path (CLI agent run). No channel map is wired on this
-        // path, so the approval route adapter is the no-op (log-only); the daemon
-        // path injects a real channel-delivering adapter.
-        let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
+        // Build the SOP engine when the resolved SOPs directory exists — an
+        // omitted `sops_dir` resolves the documented `<workspace>/sops` default —
+        // so SOP tools are available on this path (CLI agent run). No channel map
+        // is wired on this path, so the approval route adapter is the no-op
+        // (log-only); the daemon path injects a real channel-delivering adapter.
+        let (sop_engine, sop_audit) = if crate::sop::sops_enabled(&config.sop, &config.data_dir) {
             let sop_mem: Arc<dyn zeroclaw_memory::Memory> =
                 zeroclaw_memory::create_memory_for_agent(&config, agent_alias, None).await?;
             let (engine, audit) = crate::sop::build_sop_engine(
@@ -2892,10 +2893,11 @@ pub async fn process_message(
         };
 
         // Build SOP engine when sops_dir is configured so SOP tools are
-        // available on this path (process_message CLI agent). No channel map is
-        // wired here, so the approval route adapter is the no-op (log-only); the
-        // daemon path injects a real channel-delivering adapter.
-        let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
+        // available on this path (process_message CLI agent), gated on the
+        // resolved SOPs directory existing rather than on the optional override.
+        // No channel map is wired here, so the approval route adapter is the no-op
+        // (log-only); the daemon path injects a real channel-delivering adapter.
+        let (sop_engine, sop_audit) = if crate::sop::sops_enabled(&config.sop, &config.data_dir) {
             let sop_mem: Arc<dyn zeroclaw_memory::Memory> =
                 zeroclaw_memory::create_memory_for_agent(&config, agent_alias, None).await?;
             let (engine, audit) = crate::sop::build_sop_engine(

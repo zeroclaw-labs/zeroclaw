@@ -4230,9 +4230,14 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 let canvas_store_for_channels = canvas_store_for_channels.clone();
                 let mut registry = daemon::DaemonRegistry::new();
 
-                // SOP loading is gated on `[sop] sops_dir`: unset disables all
-                // SOP runtime behavior, matching the documented rollback path.
-                let (sop_engine, sop_audit) = if current_config.sop.sops_dir.is_some() {
+                // SOP loading is gated on the *resolved* SOPs directory existing,
+                // not on `[sop] sops_dir` being set: the override is optional and
+                // omitting it resolves the documented `<workspace>/sops` default.
+                // Removing that directory remains the rollback path.
+                let (sop_engine, sop_audit) = if zeroclaw_runtime::sop::sops_enabled(
+                    &current_config.sop,
+                    &current_config.data_dir,
+                ) {
                     let mem: Arc<dyn zeroclaw_memory::Memory> = Arc::from(
                         zeroclaw_memory::create_memory_from_config(&current_config, None)?,
                     );
@@ -5007,20 +5012,22 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 }));
 
                 let cancel = tokio_util::sync::CancellationToken::new();
-                let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
-                    let mem: Arc<dyn zeroclaw_memory::Memory> =
-                        Arc::from(zeroclaw_memory::create_memory_from_config(&config, None)?);
-                    let sop_adapters = build_sop_adapters(&config);
-                    let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
-                        config.sop.clone(),
-                        &config.data_dir,
-                        mem,
-                        sop_adapters,
-                    );
-                    (Some(engine), Some(audit))
-                } else {
-                    (None, None)
-                };
+                // Same resolved-directory gate as the full daemon path above.
+                let (sop_engine, sop_audit) =
+                    if zeroclaw_runtime::sop::sops_enabled(&config.sop, &config.data_dir) {
+                        let mem: Arc<dyn zeroclaw_memory::Memory> =
+                            Arc::from(zeroclaw_memory::create_memory_from_config(&config, None)?);
+                        let sop_adapters = build_sop_adapters(&config);
+                        let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
+                            config.sop.clone(),
+                            &config.data_dir,
+                            mem,
+                            sop_adapters,
+                        );
+                        (Some(engine), Some(audit))
+                    } else {
+                        (None, None)
+                    };
                 // EPIC A1 + SOP cron: same tick as the full daemon path.
                 let sop_maintenance = spawn_sop_maintenance(
                     sop_engine.as_ref(),
