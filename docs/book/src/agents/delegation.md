@@ -85,7 +85,7 @@ What CAN be made deterministic is **availability**: tools that aren't in the par
 
 What's verifiable end-to-end:
 
-1. The literal output strings the tool returns to the model on each path (success, refusal, failure). Quoted verbatim below, sourced from `tools/spawn_subagent.rs` and `tools/delegate.rs`.
+1. Protocol-owned tool output and refusal strings are literal Rust contracts. User-visible terminal-completion failure delivery is a Fluent catalog contract: the English source is named below, and a non-English catalog or disk override that defines the same key may render it differently.
 2. The literal config knobs that change behavior (`allowed_tools`, `max_delegation_depth`, etc.).
 3. The structured tracing span shape that scopes everything emitted during the child run.
 
@@ -173,10 +173,17 @@ This policy lives on the target, not the caller. Same-profile peers use the shar
 
 ### `delegate`: output strings the model sees
 
-Exact, sourced from `crates/zeroclaw-runtime/src/tools/delegate.rs`.
+User-visible failure strings are localized Fluent messages. Their English source
+of truth is `crates/zeroclaw-runtime/locales/en/cli.ftl`; examples below show
+the current English catalog values, not a wire-level string contract. The
+remaining listed strings are protocol/tool outputs unless this section labels
+them as Fluent keys.
 
-1. Synchronous success: output begins with `[Agent '<target>' (<provider_type>/<model>)]\n` followed by the target agent's response. If the target returned an empty string, the body is the literal `[Empty response]`.
-2. Synchronous failure: error field begins with `Agent '<target>' failed: <wrapped error>`.
+1. Synchronous success: output begins with `[Agent '<target>' (<provider_type>/<model>)]\n` followed by a non-empty target agent response.
+2. A terminal empty response is a synchronous failure: its error field uses
+   `cli-delegate-error-invalid-semantic-completion`, with `agent_name` set to
+   the target. In English: `Agent '<target>' failed: model provider returned an
+   invalid semantic completion.`
 3. Synchronous timeout (when the target's runtime profile sets `delegation_timeout_secs`): error field is `Agent '<target>' timed out after <N>s`.
 4. Background spawn success: output is the three-line literal
    ```text

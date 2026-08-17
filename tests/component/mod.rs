@@ -9,6 +9,7 @@ mod config_schema;
 mod cron_delivery_cli;
 mod cron_help_examples;
 mod daemon_startup_feedback;
+mod direct_cli_terminal_completion;
 mod dockerignore_test;
 mod gateway;
 mod gemini_capabilities;

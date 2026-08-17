@@ -156,6 +156,22 @@ pub struct ChatResponse {
     pub reasoning_content: Option<String>,
 }
 
+/// A transport-successful provider result that cannot complete a request.
+///
+/// The result has neither user-visible final text nor native tool calls.
+/// Reasoning is intentionally not part of this contract because it is opaque
+/// provider round-trip metadata rather than a final answer.
+#[derive(Debug)]
+pub struct SemanticEmptyTerminalCompletion;
+
+impl std::fmt::Display for SemanticEmptyTerminalCompletion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("provider completed without final text or tool calls")
+    }
+}
+
+impl std::error::Error for SemanticEmptyTerminalCompletion {}
+
 impl ChatResponse {
     /// True when the LLM wants to invoke at least one tool.
     pub fn has_tool_calls(&self) -> bool {
@@ -166,6 +182,40 @@ impl ChatResponse {
     pub fn text_or_empty(&self) -> &str {
         self.text.as_deref().unwrap_or("")
     }
+
+    /// True when this response cannot make progress or complete a turn.
+    ///
+    /// Reasoning content is intentionally excluded: it may need to be
+    /// round-tripped to a provider, but it is not a user-visible final answer.
+    /// A response containing one or more tool calls remains valid even when
+    /// its text is empty.
+    pub fn is_semantically_empty_terminal(&self) -> bool {
+        strip_think_tags(self.text_or_empty()).is_empty() && self.tool_calls.is_empty()
+    }
+}
+
+/// Remove inline `<think>...</think>` reasoning before terminal-response
+/// classification or user-visible parsing.
+///
+/// An unclosed opening tag suppresses the remainder so partial reasoning never
+/// becomes final output.
+pub fn strip_think_tags(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut remaining = text;
+    loop {
+        if let Some(start) = remaining.find("<think>") {
+            result.push_str(&remaining[..start]);
+            if let Some(end) = remaining[start..].find("</think>") {
+                remaining = &remaining[start + end + "</think>".len()..];
+            } else {
+                break;
+            }
+        } else {
+            result.push_str(remaining);
+            break;
+        }
+    }
+    result.trim().to_string()
 }
 
 /// Request payload for model_provider chat calls.
@@ -609,23 +659,29 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
             let text = self
                 .chat_with_history(&modified_messages, model, temperature)
                 .await?;
-            return Ok(ChatResponse {
+            let response = ChatResponse {
                 text: Some(text),
                 tool_calls: Vec::new(),
                 usage: None,
                 reasoning_content: None,
-            });
+            };
+            return (!response.is_semantically_empty_terminal())
+                .then_some(response)
+                .ok_or_else(|| anyhow::Error::new(SemanticEmptyTerminalCompletion));
         }
 
         let text = self
             .chat_with_history(request.messages, model, temperature)
             .await?;
-        Ok(ChatResponse {
+        let response = ChatResponse {
             text: Some(text),
             tool_calls: Vec::new(),
             usage: None,
             reasoning_content: None,
-        })
+        };
+        (!response.is_semantically_empty_terminal())
+            .then_some(response)
+            .ok_or_else(|| anyhow::Error::new(SemanticEmptyTerminalCompletion))
     }
 
     /// Whether model_provider supports native tool calls over API.
@@ -653,12 +709,15 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
         let text = self.chat_with_history(messages, model, temperature).await?;
-        Ok(ChatResponse {
+        let response = ChatResponse {
             text: Some(text),
             tool_calls: Vec::new(),
             usage: None,
             reasoning_content: None,
-        })
+        };
+        (!response.is_semantically_empty_terminal())
+            .then_some(response)
+            .ok_or_else(|| anyhow::Error::new(SemanticEmptyTerminalCompletion))
     }
 
     /// Whether model_provider supports streaming responses.
@@ -891,7 +950,77 @@ pub fn build_tool_instructions_text(tools: &[ToolSpec]) -> String {
 
 #[cfg(test)]
 mod turn_order_tests {
-    use super::ChatMessage;
+    use super::{ChatMessage, ChatResponse, ToolCall};
+
+    #[test]
+    fn semantic_empty_terminal_ignores_reasoning_content() {
+        let response = ChatResponse {
+            text: Some("  \n".to_string()),
+            tool_calls: Vec::new(),
+            usage: None,
+            reasoning_content: Some("internal reasoning".to_string()),
+        };
+
+        assert!(response.is_semantically_empty_terminal());
+    }
+
+    #[test]
+    fn semantic_empty_terminal_uses_display_text_after_think_tag_stripping() {
+        let response = ChatResponse {
+            text: Some("<think>internal reasoning</think>".to_string()),
+            tool_calls: Vec::new(),
+            usage: None,
+            reasoning_content: None,
+        };
+
+        assert!(response.is_semantically_empty_terminal());
+    }
+
+    #[test]
+    fn semantic_empty_terminal_keeps_tool_only_response_valid() {
+        let response = ChatResponse {
+            text: None,
+            tool_calls: vec![ToolCall {
+                id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                arguments: "{}".to_string(),
+                extra_content: None,
+            }],
+            usage: None,
+            reasoning_content: None,
+        };
+
+        assert!(!response.is_semantically_empty_terminal());
+    }
+
+    #[test]
+    fn text_response_is_not_semantically_empty() {
+        let response = ChatResponse {
+            text: Some("done".to_string()),
+            tool_calls: Vec::new(),
+            usage: None,
+            reasoning_content: None,
+        };
+
+        assert!(!response.is_semantically_empty_terminal());
+    }
+
+    #[test]
+    fn tool_only_response_is_not_semantically_empty() {
+        let response = ChatResponse {
+            text: None,
+            tool_calls: vec![ToolCall {
+                id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                arguments: "{}".to_string(),
+                extra_content: None,
+            }],
+            usage: None,
+            reasoning_content: None,
+        };
+
+        assert!(!response.is_semantically_empty_terminal());
+    }
 
     #[test]
     fn drops_leading_assistant_tool_call_before_first_user() {

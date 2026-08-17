@@ -1531,31 +1531,15 @@ async fn process_chat_message(
                     .with_attrs(::serde_json::json!({"error": format!("{}", e.error)})),
                 "Agent turn failed"
             );
-            let sanitized = zeroclaw_providers::sanitize_api_error(&e.error.to_string());
-            let error_code = if sanitized.to_lowercase().contains("api key")
-                || sanitized.to_lowercase().contains("authentication")
-                || sanitized.to_lowercase().contains("unauthorized")
-            {
-                "AUTH_ERROR"
-            } else if sanitized.to_lowercase().contains("model_provider")
-                || sanitized.to_lowercase().contains("model")
-            {
-                "PROVIDER_ERROR"
-            } else {
-                "AGENT_ERROR"
-            };
-            let err = serde_json::json!({
-                "type": "error",
-                "message": sanitized,
-                "code": error_code,
-            });
-            let _ = sender.send(Message::Text(err.to_string().into())).await;
+            let user_message =
+                zeroclaw_runtime::agent::terminal_completion_error_message(&e.error, None);
+            let err = send_ws_turn_failure(sender, &e.error, user_message.as_deref()).await;
 
             // Broadcast error event
             let _ = state.event_tx.send(serde_json::json!({
                 "type": "error",
                 "component": "ws_chat",
-                "message": sanitized,
+                "message": err["message"],
             }));
 
             // Trace the failed turn so the doctor / replay tool sees the
@@ -1569,8 +1553,8 @@ async fn process_chat_message(
                         "model_provider": provider_label,
                         "model": turn_model,
                         "session_key": session_key,
-                        "error": sanitized,
-                        "error_code": error_code,
+                        "error": zeroclaw_providers::sanitize_api_error(&e.error.to_string()),
+                        "error_code": err["code"],
                         "trace_id": turn_id,
                     })),
                 "gateway_ws_turn"
@@ -1579,10 +1563,261 @@ async fn process_chat_message(
     }
 }
 
+/// Serialize a failed turn for the WebSocket boundary without letting a
+/// localized user message alter the stable diagnostic used for classification.
+fn ws_turn_failure_frame(
+    diagnostic: &str,
+    user_message: Option<&str>,
+    is_terminal_provider_failure: bool,
+) -> serde_json::Value {
+    let sanitized = zeroclaw_providers::sanitize_api_error(diagnostic);
+    let error_code = if is_terminal_provider_failure {
+        "PROVIDER_ERROR"
+    } else if sanitized.to_lowercase().contains("api key")
+        || sanitized.to_lowercase().contains("authentication")
+        || sanitized.to_lowercase().contains("unauthorized")
+    {
+        "AUTH_ERROR"
+    } else if sanitized.to_lowercase().contains("model_provider")
+        || sanitized.to_lowercase().contains("model")
+    {
+        "PROVIDER_ERROR"
+    } else {
+        "AGENT_ERROR"
+    };
+    serde_json::json!({
+        "type": "error",
+        "message": user_message.unwrap_or(&sanitized),
+        "code": error_code,
+    })
+}
+
+async fn send_ws_turn_failure<S>(
+    sender: &mut S,
+    error: &anyhow::Error,
+    user_message: Option<&str>,
+) -> serde_json::Value
+where
+    S: futures_util::Sink<Message> + Unpin,
+{
+    let frame = ws_turn_failure_frame(&error.to_string(), user_message, user_message.is_some());
+    let _ = sender.send(Message::Text(frame.to_string().into())).await;
+    frame
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::HeaderMap;
+    use axum::{
+        Json, Router,
+        http::{HeaderMap, header},
+        routing::{get, post},
+    };
+    use tokio_tungstenite::{connect_async, tungstenite::Message as ClientMessage};
+
+    #[test]
+    fn ws_terminal_failure_uses_localized_message_without_reclassifying_diagnostic() {
+        let diagnostic = "provider completed without final text or tool calls";
+        let localized = "Réponse terminale invalide.";
+
+        let frame = ws_turn_failure_frame(diagnostic, Some(localized), true);
+
+        assert_eq!(frame["type"], "error");
+        assert_eq!(frame["message"], "Réponse terminale invalide.");
+        assert_eq!(frame["code"], "PROVIDER_ERROR");
+        assert!(
+            !frame["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(diagnostic),
+            "WebSocket delivery must not fall back to the diagnostic when Fluent supplies text"
+        );
+    }
+
+    #[test]
+    fn websocket_handler_projects_anthropic_empty_terminal_stream_as_user_error() {
+        // This production-shaped fixture exceeds the Linux test harness's
+        // default stack; isolate only this test instead of weakening CI-wide
+        // stack limits or dropping the real WebSocket boundary coverage.
+        std::thread::Builder::new()
+            .name("ws-empty-terminal-regression".to_string())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime")
+                    .block_on(websocket_handler_projects_anthropic_empty_terminal_stream_as_user_error_inner());
+            })
+            .expect("spawn WebSocket regression thread")
+            .join()
+            .expect("WebSocket regression thread must not panic");
+    }
+
+    async fn websocket_handler_projects_anthropic_empty_terminal_stream_as_user_error_inner() {
+        // This is a real WebSocket upgrade and a real agent built from live
+        // config. The local Anthropic-shaped server completes an empty SSE
+        // response, then returns an empty non-stream fallback, exercising the
+        // production path through `process_chat_message` to the client.
+        let mock_app = Router::new().route(
+            "/v1/messages",
+            post(|Json(request): Json<serde_json::Value>| async move {
+                if request["stream"].as_bool() == Some(true) {
+                    (
+                        [(header::CONTENT_TYPE, "text/event-stream")],
+                        "event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_test\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-test\",\"usage\":{\"input_tokens\":1}}}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n",
+                    )
+                        .into_response()
+                } else {
+                    Json(serde_json::json!({
+                        "id": "msg_test",
+                        "type": "message",
+                        "role": "assistant",
+                        "model": "claude-test",
+                        "content": [],
+                        "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 1, "output_tokens": 1}
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+        let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local Anthropic fixture");
+        let mock_addr = mock_listener.local_addr().expect("fixture address");
+        let mock_server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(mock_listener, mock_app)
+                .await
+                .expect("local Anthropic fixture serves");
+        });
+
+        let tmp = tempfile::tempdir().expect("temporary gateway workspace");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("gateway workspace");
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: workspace.clone(),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        config.memory.backend = "none".to_string();
+        config.reliability.provider_retries = 0;
+        config.providers.models.anthropic.insert(
+            "fixture".to_string(),
+            zeroclaw_config::schema::AnthropicModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    api_key: Some("test-key".to_string()),
+                    uri: Some(format!("http://{mock_addr}")),
+                    model: Some("claude-test".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        config.risk_profiles.insert(
+            "fixture".to_string(),
+            zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        config.runtime_profiles.insert(
+            "fixture".to_string(),
+            zeroclaw_config::schema::RuntimeProfileConfig::default(),
+        );
+        config.agents.insert(
+            "web".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                model_provider: "anthropic.fixture".into(),
+                risk_profile: "fixture".into(),
+                runtime_profile: "fixture".into(),
+                workspace: zeroclaw_config::multi_agent::AgentWorkspaceConfig {
+                    path: Some(workspace),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let state = crate::api::tests::test_state(config);
+        let gateway_app = Router::new()
+            .route("/ws/chat", get(handle_ws_chat))
+            .with_state(state);
+        let gateway_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local WebSocket gateway");
+        let gateway_addr = gateway_listener.local_addr().expect("gateway address");
+        let gateway_server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(gateway_listener, gateway_app)
+                .await
+                .expect("local WebSocket gateway serves");
+        });
+
+        let (mut client, _) = connect_async(format!("ws://{gateway_addr}/ws/chat?agent=web"))
+            .await
+            .expect("WebSocket upgrade");
+        let first = client
+            .next()
+            .await
+            .expect("session_start frame")
+            .expect("session_start");
+        assert!(
+            first
+                .into_text()
+                .expect("text session_start")
+                .contains("session_start")
+        );
+        client
+            .send(ClientMessage::Text(r#"{"type":"connect"}"#.into()))
+            .await
+            .expect("connect frame");
+        let connected = client
+            .next()
+            .await
+            .expect("connected frame")
+            .expect("connected");
+        assert!(
+            connected
+                .into_text()
+                .expect("text connected")
+                .contains("connected")
+        );
+        client
+            .send(ClientMessage::Text(
+                r#"{"type":"message","content":"test"}"#.into(),
+            ))
+            .await
+            .expect("chat message");
+
+        let mut terminal_error = None;
+        for _ in 0..8 {
+            let frame = tokio::time::timeout(Duration::from_secs(3), client.next())
+                .await
+                .expect("gateway response deadline")
+                .expect("gateway stays connected")
+                .expect("gateway frame");
+            let text = frame.into_text().expect("text gateway frame");
+            let json: serde_json::Value = serde_json::from_str(&text).expect("JSON gateway frame");
+            if json["type"] == "error" {
+                terminal_error = Some(json);
+                break;
+            }
+        }
+
+        let error = terminal_error.expect("empty terminal response reaches WebSocket client");
+        assert_eq!(error["code"], "PROVIDER_ERROR");
+        assert_eq!(
+            error["message"],
+            zeroclaw_runtime::agent::semantic_empty_terminal_completion_message(None),
+        );
+        assert_ne!(
+            error["message"], "provider completed without final text or tool calls",
+            "stable diagnostic must not leak into the user-facing WebSocket frame"
+        );
+
+        gateway_server.abort();
+        mock_server.abort();
+    }
 
     #[tokio::test]
     async fn websocket_ping_interval_skips_missed_ticks() {

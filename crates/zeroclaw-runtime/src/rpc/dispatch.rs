@@ -2075,6 +2075,7 @@ impl RpcDispatcher {
                 })
             }
             Err(e) => {
+                let user_message = e.user_message().map(str::to_owned);
                 ::zeroclaw_log::record!(
                     ERROR,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -2093,10 +2094,15 @@ impl RpcDispatcher {
                 self.emit_turn_complete(
                     &req.session_id,
                     crate::rpc::types::TurnCompletionOutcome::Failed,
-                    format!("turn failed: {e}"),
+                    user_message
+                        .clone()
+                        .unwrap_or_else(|| format!("turn failed: {e}")),
                 )
                 .await;
-                Err(rpc_err(INTERNAL_ERROR, e.to_string()))
+                Err(rpc_err(
+                    INTERNAL_ERROR,
+                    user_message.unwrap_or_else(|| e.to_string()),
+                ))
             }
         }
     }

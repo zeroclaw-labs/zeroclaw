@@ -1,7 +1,10 @@
 //! Streaming provider-response consumption for the turn loop.
 
 use super::events::{DraftEvent, StreamDelta};
-use super::outcome::{StreamCancelledAfterOutput, StreamInterruptedAfterOutput, ToolLoopCancelled};
+use super::outcome::{
+    StreamCancelledAfterOutput, StreamInterruptedAfterOutput,
+    StreamPreExecutedToolsWithoutFinalResponse, StreamSemanticEmptyCompletion, ToolLoopCancelled,
+};
 use super::stream_guard::{StreamTerminalMarkerStripper, StreamTextGuard, StreamThinkTagStripper};
 use anyhow::Result;
 use futures_util::StreamExt;
@@ -23,6 +26,7 @@ pub(crate) struct StreamedChatOutcome {
     pub(crate) forwarded_visible_text: String,
     pub(crate) suppressed_protocol: bool,
     pub(crate) usage: Option<zeroclaw_providers::traits::TokenUsage>,
+    pub(crate) saw_pre_executed_tool_activity: bool,
 }
 
 pub(crate) async fn consume_provider_streaming_response(
@@ -165,6 +169,7 @@ pub(crate) async fn consume_provider_streaming_response(
             // relayed as TurnEvents but do not affect the agent's tool
             // dispatch loop.
             StreamEvent::PreExecutedToolCall { name, args } => {
+                outcome.saw_pre_executed_tool_activity = true;
                 let id = Uuid::new_v4().to_string();
                 pre_executed_ids
                     .entry(name.clone())
@@ -182,6 +187,7 @@ pub(crate) async fn consume_provider_streaming_response(
                 }
             }
             StreamEvent::PreExecutedToolResult { name, output } => {
+                outcome.saw_pre_executed_tool_activity = true;
                 let id = pre_executed_ids
                     .get_mut(&name)
                     .and_then(|ids| ids.pop_front())
@@ -274,6 +280,30 @@ pub(crate) async fn consume_provider_streaming_response(
     let _ = delta_sender;
     outcome.suppressed_protocol = text_guard.suppressed_protocol;
 
+    if outcome.response_text.trim().is_empty() && outcome.tool_calls.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_category(::zeroclaw_log::EventCategory::Provider)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "has_reasoning": !outcome.reasoning_content.trim().is_empty(),
+                    "protocol_suppressed": outcome.suppressed_protocol,
+                })),
+            "model_provider stream completed without final text or tool calls"
+        );
+        if outcome.saw_pre_executed_tool_activity {
+            return Err(StreamPreExecutedToolsWithoutFinalResponse {
+                usage: outcome.usage,
+            }
+            .into());
+        }
+        return Err(StreamSemanticEmptyCompletion {
+            usage: outcome.usage,
+        }
+        .into());
+    }
+
     Ok(outcome)
 }
 
@@ -290,6 +320,8 @@ mod tests {
 
     struct ToolThenTextProvider;
 
+    struct EmptyStreamProvider;
+
     impl ::zeroclaw_api::attribution::Attributable for ToolThenTextProvider {
         fn role(&self) -> ::zeroclaw_api::attribution::Role {
             ::zeroclaw_api::attribution::Role::Provider(
@@ -300,6 +332,19 @@ mod tests {
         }
         fn alias(&self) -> &str {
             "ToolThenTextProvider"
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for EmptyStreamProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "EmptyStreamProvider"
         }
     }
 
@@ -365,6 +410,42 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl ModelProvider for EmptyStreamProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            anyhow::bail!("unused")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            Box::pin(futures_util::stream::iter(vec![Ok(StreamEvent::Final)]))
+        }
+    }
+
     #[tokio::test]
     async fn forwards_text_deltas_emitted_after_a_native_tool_call() {
         let provider = ToolThenTextProvider;
@@ -396,6 +477,28 @@ mod tests {
         assert!(
             forwarded.contains("check the count."),
             "narration emitted after the native tool call must be forwarded live; forwarded={forwarded:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_completed_stream_without_text_or_tool_calls() {
+        let err = consume_provider_streaming_response(
+            &EmptyStreamProvider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .expect_err("a semantically empty stream must not complete successfully");
+
+        assert_eq!(
+            err.to_string(),
+            "provider stream completed without final text or tool calls"
         );
     }
 

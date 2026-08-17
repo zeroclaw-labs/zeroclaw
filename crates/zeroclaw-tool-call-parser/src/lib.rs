@@ -2,6 +2,7 @@
 
 use regex::Regex;
 use std::{collections::HashSet, sync::LazyLock};
+pub use zeroclaw_api::model_provider::strip_think_tags;
 
 /// A single parsed tool call extracted from LLM output.
 #[derive(Debug, Clone)]
@@ -2557,30 +2558,6 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     }
 
     (text_parts.join("\n"), calls)
-}
-
-/// Remove `<think>...</think>` blocks from model output.
-/// Qwen and other reasoning models embed chain-of-thought inline in the
-/// response text using `<think>` tags.  These must be removed before parsing
-/// tool-call tags or displaying output.
-pub fn strip_think_tags(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut rest = s;
-    loop {
-        if let Some(start) = rest.find("<think>") {
-            result.push_str(&rest[..start]);
-            if let Some(end) = rest[start..].find("</think>") {
-                rest = &rest[start + end + "</think>".len()..];
-            } else {
-                // Unclosed tag: drop the rest to avoid leaking partial reasoning.
-                break;
-            }
-        } else {
-            result.push_str(rest);
-            break;
-        }
-    }
-    result.trim().to_string()
 }
 
 /// Strip prompt-guided tool artifacts from visible output while preserving

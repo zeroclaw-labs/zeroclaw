@@ -50,6 +50,9 @@ pub const VERIFIABLE_INTENT_TOOL_WITHHELD: &str = "verifiable_intent_tool_withhe
 ///   has no runtime consumer — the context compressor was removed —
 ///   so it currently has no effect. One warning per non-default field (see
 ///   `collect_context_compression_ignored_warnings` in `schema.rs`).
+/// - `proxy_conflicts_with_dns_pinned_tools`: the configured proxy scope
+///   selects `http_request` and/or `web_fetch`, whose validated DNS answers
+///   require direct transport and therefore make the selected tool fail.
 /// - `verifiable_intent_tool_withheld`: `verifiable_intent.enabled` is set, but
 ///   the `vi_verify` tool is withheld from the model-visible registry until a
 ///   credential chain verifier exists, so enabling the section does not enable

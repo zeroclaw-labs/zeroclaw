@@ -231,12 +231,32 @@ fn merge_config_and_live_rates(
     )
 }
 
-/// Record token usage from an LLM response via the task-local cost tracker.
-/// Returns `(total_tokens, cost_usd)` on success, `None` when not scoped or no usage.
+/// Record usage from a rejected provider attempt without replacing the accepted
+/// response's context-window fill.
+pub fn record_rejected_tool_loop_cost_usage(
+    model_provider_name: &str,
+    model: &str,
+    usage: &zeroclaw_providers::traits::TokenUsage,
+) -> Option<(u64, f64)> {
+    record_tool_loop_cost_usage_inner(model_provider_name, model, usage, false)
+}
+
+/// Record token usage from an accepted LLM response via the task-local cost
+/// tracker. Returns `(total_tokens, cost_usd)` on success, `None` when not
+/// scoped or no usage.
 pub fn record_tool_loop_cost_usage(
     model_provider_name: &str,
     model: &str,
     usage: &zeroclaw_providers::traits::TokenUsage,
+) -> Option<(u64, f64)> {
+    record_tool_loop_cost_usage_inner(model_provider_name, model, usage, true)
+}
+
+fn record_tool_loop_cost_usage_inner(
+    model_provider_name: &str,
+    model: &str,
+    usage: &zeroclaw_providers::traits::TokenUsage,
+    updates_context_window_fill: bool,
 ) -> Option<(u64, f64)> {
     let input_tokens = usage.input_tokens.unwrap_or(0);
     let output_tokens = usage.output_tokens.unwrap_or(0);
@@ -307,10 +327,12 @@ pub fn record_tool_loop_cost_usage(
             usage.input_tokens = usage.input_tokens.saturating_add(input_tokens);
             usage.output_tokens = usage.output_tokens.saturating_add(output_tokens);
             usage.cost_usd += cost_usage.cost_usd;
-            // Replace (not accumulate) last_input_tokens with the absolute
-            // provider-reported prompt size — this is the accurate "context
-            // window fill" measure (see TurnUsage doc comment).
-            usage.last_input_tokens = input_tokens;
+            if updates_context_window_fill {
+                // Replace (not accumulate) last_input_tokens with the absolute
+                // accepted provider-reported prompt size — this is the accurate
+                // "context window fill" measure (see TurnUsage doc comment).
+                usage.last_input_tokens = input_tokens;
+            }
             true
         } else {
             false
@@ -321,9 +343,11 @@ pub fn record_tool_loop_cost_usage(
         turn_usage.input_tokens = turn_usage.input_tokens.saturating_add(input_tokens);
         turn_usage.output_tokens = turn_usage.output_tokens.saturating_add(output_tokens);
         turn_usage.cost_usd += cost_usage.cost_usd;
-        // Replace (not accumulate) last_input_tokens with the absolute
-        // provider-reported prompt size.
-        turn_usage.last_input_tokens = input_tokens;
+        if updates_context_window_fill {
+            // Replace (not accumulate) last_input_tokens with the absolute
+            // accepted provider-reported prompt size.
+            turn_usage.last_input_tokens = input_tokens;
+        }
     }
 
     if let Some(tracker) = &ctx.tracker
@@ -801,6 +825,42 @@ mod tests {
         assert_eq!(recorded.input_tokens, 5_000);
         assert_eq!(recorded.output_tokens, 200);
         assert!((recorded.cost_usd - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn rejected_usage_accumulates_cost_without_replacing_context_window_fill() {
+        let turn_usage = Arc::new(Mutex::new(TurnUsage::default()));
+        let rejected = zeroclaw_providers::traits::TokenUsage {
+            input_tokens: Some(80),
+            output_tokens: Some(5),
+            cached_input_tokens: Some(0),
+        };
+        let accepted = zeroclaw_providers::traits::TokenUsage {
+            input_tokens: Some(80),
+            output_tokens: Some(7),
+            cached_input_tokens: Some(0),
+        };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(TOOL_LOOP_TURN_USAGE.scope(
+            Some(Arc::clone(&turn_usage)),
+            TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                Some(ToolLoopCostTrackingContext::usage_only()),
+                async {
+                    assert!(
+                        record_rejected_tool_loop_cost_usage("test", "test", &rejected).is_some()
+                    );
+                    assert!(record_tool_loop_cost_usage("test", "test", &accepted).is_some());
+                },
+            ),
+        ));
+
+        let usage = *turn_usage.lock();
+        assert_eq!(usage.input_tokens, 160, "both attempts remain billed");
+        assert_eq!(usage.output_tokens, 12, "both attempts remain billed");
+        assert_eq!(
+            usage.last_input_tokens, 80,
+            "only the accepted attempt controls context-window fill"
+        );
     }
 
     #[test]

@@ -6,7 +6,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
-use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+use zeroclaw_api::channel::{Channel, ChannelMessage, ProgressEvent, SendMessage};
 use zeroclaw_config::schema::{Config, StreamMode, TELEGRAM_OFFICIAL_API_BASE_URL};
 use zeroclaw_runtime::i18n;
 use zeroclaw_runtime::security::pairing::PairingGuard;
@@ -3396,6 +3396,19 @@ impl Channel for TelegramChannel {
         Ok(())
     }
 
+    async fn update_draft_lifecycle(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        event: ProgressEvent,
+    ) -> anyhow::Result<()> {
+        if self.stream_mode == StreamMode::Partial {
+            let status_line = crate::util::localized_lifecycle_progress(event);
+            return self.update_draft(recipient, message_id, &status_line).await;
+        }
+        Ok(())
+    }
+
     async fn finalize_draft(
         &self,
         recipient: &str,
@@ -4615,6 +4628,137 @@ mod tests {
         .with_streaming(StreamMode::Partial, 750);
         assert!(partial.supports_draft_updates());
         assert_eq!(partial.draft_update_interval_ms, 750);
+    }
+
+    #[tokio::test]
+    async fn update_draft_lifecycle_only_edits_partial_streaming_drafts() {
+        use wiremock::matchers::{body_json, method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/editMessageText$"))
+            .and(body_json(serde_json::json!({
+                "chat_id": "123",
+                "message_id": 42,
+                "text": "Running tool",
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 42 }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        for stream_mode in [StreamMode::Off, StreamMode::MultiMessage] {
+            let channel = TelegramChannel::new(
+                "fake-token".into(),
+                "telegram_test_alias",
+                Arc::new(|| vec!["*".into()]),
+                false,
+            )
+            .with_streaming(stream_mode, 0)
+            .with_api_base(mock_server.uri());
+
+            channel
+                .update_draft_lifecycle("123", "42", ProgressEvent::RunningTool)
+                .await
+                .unwrap();
+        }
+
+        let throttled = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_streaming(StreamMode::Partial, 60_000)
+        .with_api_base(mock_server.uri());
+        throttled
+            .last_draft_edit
+            .lock()
+            .insert("123".to_string(), std::time::Instant::now());
+        throttled
+            .update_draft_lifecycle("123", "42", ProgressEvent::RunningTool)
+            .await
+            .unwrap();
+
+        let partial = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_streaming(StreamMode::Partial, 0)
+        .with_api_base(mock_server.uri());
+
+        partial
+            .update_draft_lifecycle("123", "42", ProgressEvent::RunningTool)
+            .await
+            .unwrap();
+    }
+
+    /// Raw tool status carries the tool name plus a command, path, or query.
+    /// Only the typed lifecycle event may reach Telegram.
+    #[tokio::test]
+    async fn raw_tool_status_never_reaches_telegram() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const RAW_TOOL_STATUS: &str =
+            "\u{23f3} shell: cat /home/example/.ssh/id_rsa && export API_KEY=placeholder-secret\n";
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/editMessageText$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 42 }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let partial = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_streaming(StreamMode::Partial, 0)
+        .with_api_base(mock_server.uri());
+
+        partial
+            .update_draft_progress("123", "42", RAW_TOOL_STATUS)
+            .await
+            .unwrap();
+        partial
+            .update_draft_lifecycle("123", "42", ProgressEvent::RunningTool)
+            .await
+            .unwrap();
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "only the typed lifecycle event should reach Telegram"
+        );
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["text"], "Running tool");
+        let raw = String::from_utf8_lossy(&requests[0].body);
+        for leaked in [
+            "shell",
+            "cat ",
+            ".ssh",
+            "id_rsa",
+            "API_KEY",
+            "placeholder-secret",
+        ] {
+            assert!(
+                !raw.contains(leaked),
+                "tool status detail '{leaked}' leaked to Telegram"
+            );
+        }
     }
 
     #[test]

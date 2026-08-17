@@ -42,6 +42,10 @@ pub use outcome::{
     is_tool_loop_cancelled,
 };
 pub(crate) use outcome::{current_model_switch_state, scope_model_switch_state};
+pub use outcome::{
+    is_semantic_empty_terminal_completion, semantic_empty_terminal_completion_message,
+    terminal_completion_error_message,
+};
 #[cfg(test)]
 pub(crate) use parse_response::build_native_assistant_history;
 pub(crate) use parse_response::{
@@ -746,6 +750,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
 
         let ProviderCallOutcome {
             chat_result,
+            rejected_attempt_usage,
             streamed_live_deltas,
             streamed_protocol_suppressed,
             streamed_visible_text,
@@ -759,6 +764,34 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             iteration,
         )
         .await?;
+
+        if let Some(usage) = rejected_attempt_usage.as_ref() {
+            crate::agent::cost::record_rejected_tool_loop_cost_usage(
+                ctx.provider_name,
+                ctx.model,
+                usage,
+            );
+        }
+
+        // Reliable providers classify this before retries and fallback. Keep
+        // the turn-level guard for direct/unwrapped providers: a transport
+        // success with no final text and no tool calls cannot complete a turn.
+        // This runs before response-success telemetry and history mutation.
+        let chat_result = chat_result.and_then(|response| {
+            if response.is_semantically_empty_terminal() {
+                if let Some(usage) = response.usage.as_ref() {
+                    crate::agent::cost::record_rejected_tool_loop_cost_usage(
+                        ctx.provider_name,
+                        ctx.model,
+                        usage,
+                    );
+                }
+                return Err(anyhow::Error::new(
+                    zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion,
+                ));
+            }
+            Ok(response)
+        });
 
         let (
             response_text,
@@ -797,6 +830,15 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 )
             }
             Err(e) => {
+                if let Some(rejected) = e.chain().find_map(|cause| {
+                    cause.downcast_ref::<zeroclaw_providers::ReliableRejectedCompletionUsage>()
+                }) {
+                    crate::agent::cost::record_rejected_tool_loop_cost_usage(
+                        ctx.provider_name,
+                        ctx.model,
+                        &rejected.usage,
+                    );
+                }
                 record_llm_failure(&ctx, provider_request_model, llm_started_at, iteration, &e);
                 let recovered = try_recover_context_overflow(
                     turn_state.history,
@@ -2317,6 +2359,23 @@ mod reported_budget_tests {
         enforce_reported_budget(&mut history, estimated, estimated * 4, None, &NoopObserver).await;
         let after: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
         assert_eq!(after, before, "within-budget history is untouched");
+    }
+
+    #[tokio::test]
+    async fn recovered_rejected_usage_does_not_trigger_context_trim() {
+        let mut history = big_history();
+        let before: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
+
+        // The rejected attempt's 80 input tokens remain billed separately; the
+        // accepted response reports 80 input tokens, which is within this
+        // model's 100-token context budget and must not trim history.
+        enforce_reported_budget(&mut history, 80, 100, None, &NoopObserver).await;
+
+        let after: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
+        assert_eq!(
+            after, before,
+            "accepted context usage must not include rejected usage"
+        );
     }
 
     #[tokio::test]
