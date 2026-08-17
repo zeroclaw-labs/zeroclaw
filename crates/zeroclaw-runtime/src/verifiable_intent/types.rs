@@ -372,15 +372,17 @@ fn insert_preserved_fields(
     }
 }
 
-impl Serialize for Constraint {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::Error as _;
-
+impl Constraint {
+    /// The object form this constraint serializes to.
+    ///
+    /// Shared by serialization and by the check below, so what is inspected is
+    /// what is emitted rather than a reconstruction of it.
+    fn to_object(&self) -> Result<serde_json::Map<String, serde_json::Value>, serde_json::Error> {
         match self {
             Constraint::Known { known, extra } => {
-                let mut object = known_constraint_object(known).map_err(S::Error::custom)?;
+                let mut object = known_constraint_object(known)?;
                 insert_preserved_fields(&mut object, extra);
-                object.serialize(serializer)
+                Ok(object)
             }
             Constraint::Unknown {
                 constraint_type,
@@ -392,9 +394,81 @@ impl Serialize for Constraint {
                     serde_json::Value::String(constraint_type.clone()),
                 );
                 insert_preserved_fields(&mut object, fields);
-                object.serialize(serializer)
+                Ok(object)
             }
         }
+    }
+
+    /// Whether a checker would read these two constraints the same way.
+    ///
+    /// `check_single_constraint` destructures the recognized value for a known
+    /// type and the tag for an unrecognized one, and evaluates nothing else.
+    /// Preserved fields sit outside this comparison deliberately: dropping one
+    /// is a preservation question, while changing what is compared here is an
+    /// authorization question.
+    fn evaluates_the_same_as(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Constraint::Known { known: a, .. }, Constraint::Known { known: b, .. }) => a == b,
+            (
+                Constraint::Unknown {
+                    constraint_type: a, ..
+                },
+                Constraint::Unknown {
+                    constraint_type: b, ..
+                },
+            ) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Serialize for Constraint {
+    /// Emit the constraint, refusing any value whose serialized form is a
+    /// different constraint from the one in hand.
+    ///
+    /// The recognized value comes from the parser and the preserved fields come
+    /// from the caller, so the two can disagree. There are four ways, and all
+    /// of them are reachable only from a hand-built value, since the parser
+    /// derives its preserved set from whatever the recognized value did not
+    /// consume:
+    ///
+    /// - a preserved field named after one the variant emits,
+    /// - a preserved `type` on the unrecognized arm,
+    /// - a preserved field named after one the variant *omits*, which
+    ///   `skip_serializing_if` keeps out of the emitted object entirely,
+    /// - an unrecognized constraint carrying a tag this build does recognize,
+    ///   whose bytes parse back as the recognized variant.
+    ///
+    /// The first two are refused by name while the object is built. The last
+    /// two are invisible to a name check, so the rule is applied to the result
+    /// instead: parse the emitted bytes back and compare what a checker would
+    /// read. Stating it once over the whole type is what keeps the next
+    /// variation from having to be foreseen.
+    ///
+    /// This matters because the issuance path is public and signs what it is
+    /// handed. A mismatch here puts a constraint into a signed mandate that no
+    /// checker ever evaluated, and the fourth case does so in the direction
+    /// that fails open.
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::Error as _;
+
+        let object = self.to_object().map_err(S::Error::custom)?;
+
+        let reparsed = Constraint::deserialize(serde_json::Value::Object(object.clone())).map_err(
+            |error| {
+                S::Error::custom(format!(
+                    "a constraint must serialize into something that parses back: {error}"
+                ))
+            },
+        )?;
+        if !self.evaluates_the_same_as(&reparsed) {
+            return Err(S::Error::custom(format!(
+                "the serialized form is a different constraint: a checker reads {self:?}, \
+                 while the emitted bytes parse as {reparsed:?}"
+            )));
+        }
+
+        object.serialize(serializer)
     }
 }
 
@@ -919,6 +993,116 @@ mod tests {
         };
         assert_eq!(constraint_type, "com.acme.safe");
         assert!(fields.is_empty(), "the colliding field must not be emitted");
+    }
+
+    /// The invariant three review rounds have circled: the constraint a checker
+    /// evaluates and the constraint that gets signed are the same one.
+    ///
+    /// A value satisfies it either by refusing to serialize at all or by
+    /// emitting bytes that parse back to something a checker reads identically.
+    /// Preserved fields are outside the comparison on purpose: nothing
+    /// evaluates them, and `check_single_constraint` destructures exactly the
+    /// recognized value or the unrecognized tag.
+    ///
+    /// Stating it as a property rather than as a particular refusal keeps these
+    /// tests true if the enforcement strategy is ever replaced.
+    fn signed_form_matches_the_evaluated_value(constraint: &Constraint) -> bool {
+        let Ok(value) = serde_json::to_value(constraint) else {
+            return true;
+        };
+        let Ok(reparsed) = serde_json::from_value::<Constraint>(value) else {
+            return false;
+        };
+        match (constraint, &reparsed) {
+            (Constraint::Known { known: a, .. }, Constraint::Known { known: b, .. }) => a == b,
+            (
+                Constraint::Unknown {
+                    constraint_type: a, ..
+                },
+                Constraint::Unknown {
+                    constraint_type: b, ..
+                },
+            ) => a == b,
+            _ => false,
+        }
+    }
+
+    /// A recognized field that serde omits is still authoritative.
+    ///
+    /// `skip_serializing_if` keeps an absent optional field out of the
+    /// recognized object entirely, so the guard that protects emitted fields
+    /// cannot see its name. A preserved entry of the same name then reaches the
+    /// wire, and the constraint that gets signed carries a bound the checker
+    /// never evaluated.
+    #[test]
+    fn a_preserved_field_cannot_introduce_a_bound_the_checker_did_not_evaluate() {
+        let mut extra = serde_json::Map::new();
+        extra.insert("min".to_owned(), serde_json::json!(100));
+        let smuggled_bound = Constraint::Known {
+            known: KnownConstraint::PaymentAmount {
+                currency: "USD".into(),
+                min: None,
+                max: Some(40000),
+            },
+            extra,
+        };
+        assert!(
+            signed_form_matches_the_evaluated_value(&smuggled_bound),
+            "a preserved `min` must not add a bound the checker never evaluated"
+        );
+
+        // Control: a genuine extension field over the same variant is preserved
+        // and changes nothing a checker reads.
+        let mut extra = serde_json::Map::new();
+        extra.insert("acme_tier".to_owned(), serde_json::json!("gold"));
+        let extension = Constraint::Known {
+            known: KnownConstraint::PaymentAmount {
+                currency: "USD".into(),
+                min: None,
+                max: Some(40000),
+            },
+            extra,
+        };
+        assert!(
+            signed_form_matches_the_evaluated_value(&extension),
+            "a genuine extension field must still serialize"
+        );
+        assert!(serde_json::to_value(&extension).is_ok());
+    }
+
+    /// An unrecognized constraint may not serialize into a recognized one.
+    ///
+    /// `Constraint::Unknown` accepts any tag, including one this build knows.
+    /// Such a value is refused by the checker, because an unevaluable
+    /// constraint cannot bound an open mandate, while the bytes it serializes
+    /// to parse back as the recognized variant that a verifier will evaluate
+    /// normally. Alone among this class it fails open rather than closed: the
+    /// checker says no and the signed mandate says yes.
+    #[test]
+    fn a_hand_built_unknown_may_not_become_a_recognized_constraint() {
+        let mut fields = serde_json::Map::new();
+        fields.insert("currency".to_owned(), serde_json::json!("USD"));
+        let disguised = Constraint::Unknown {
+            constraint_type: "payment.amount".to_owned(),
+            fields,
+        };
+        assert!(
+            signed_form_matches_the_evaluated_value(&disguised),
+            "an unrecognized constraint must not be signed as a recognized one"
+        );
+
+        // Control: a genuinely unrecognized tag round-trips as itself.
+        let mut fields = serde_json::Map::new();
+        fields.insert("scope".to_owned(), serde_json::json!("wide"));
+        let genuine = Constraint::Unknown {
+            constraint_type: "urn:example:experimental".to_owned(),
+            fields,
+        };
+        assert!(
+            signed_form_matches_the_evaluated_value(&genuine),
+            "an unrecognized constraint must still serialize"
+        );
+        assert!(serde_json::to_value(&genuine).is_ok());
     }
 
     /// The same rule on the recognized arm, measured rather than reasoned.
