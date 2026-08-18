@@ -1145,8 +1145,13 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
                 ));
             }
 
-            // API key presence
-            if family != "ollama" {
+            // Local families are credential-optional by declaration. Keep this
+            // tied to the canonical provider registry so a newly registered
+            // local provider never inherits a cloud-credential warning.
+            let local_family = zeroclaw_providers::list_model_providers()
+                .iter()
+                .any(|provider| provider.name == family && provider.local);
+            if !local_family {
                 if entry.api_key.as_deref().is_some() {
                     items.push(DiagItem::ok(cat, format!("{label}: API key configured")));
                 } else {
@@ -1861,6 +1866,30 @@ fn parse_rfc3339(raw: &str) -> Option<DateTime<Utc>> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn local_hailo_alias_does_not_warn_for_missing_api_key() {
+        let mut config = Config::default();
+        config.providers.models.hailo_ollama.insert(
+            "edge".to_string(),
+            zeroclaw_config::schema::HailoOllamaModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    model: Some("qwen3:1.7b".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+        assert!(
+            !items
+                .iter()
+                .any(|item| item.message.contains("hailo_ollama.edge: no api_key set")),
+            "local Hailo aliases must not receive a cloud-credential warning"
+        );
+    }
 
     #[test]
     fn collapse_model_probes_groups_identical_and_breaks_divergent() {
