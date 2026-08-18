@@ -1450,6 +1450,48 @@ vision_model_provider = "custom:https://b.example.invalid/v1"
     }
 
     #[test]
+    fn v2_matching_colon_url_default_provider_creates_alias_from_scratch() {
+        // The maintainer's exact repro: NO `[providers.models]` entry at all.
+        // `alias_provider_models` materializes nothing, so the fold itself
+        // creates `custom.default` from `default_provider = "custom:https://B"`
+        // plus the global key and model. The completed alias matches the
+        // selector's own identity, but that must NOT clear the producer: the
+        // selector created the slot, so it stays the sole producer and the
+        // matching colon-URL vision reference must still rewrite to
+        // `custom.default` with the URI, key, and model preserved.
+        let raw = r#"
+schema_version = 2
+
+[providers]
+default_provider = "custom:https://b.example.invalid/v1"
+api_key = "global-key"
+default_model = "vision-model"
+
+[multimodal]
+vision_model_provider = "custom:https://b.example.invalid/v1"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("custom.default"),
+            "a default_provider that creates the alias must still be its producer \
+             so the matching colon-URL reference rewrites"
+        );
+        let alias = cfg
+            .providers
+            .models
+            .find("custom", "default")
+            .expect("the selector-created custom.default alias must exist");
+        assert_eq!(
+            alias.uri.as_deref(),
+            Some("https://b.example.invalid/v1"),
+            "the selector's URI must be preserved on the created alias"
+        );
+        assert_eq!(alias.api_key.as_deref(), Some("global-key"));
+        assert_eq!(alias.model.as_deref(), Some("vision-model"));
+    }
+
+    #[test]
     fn v2_globals_create_missing_default_alias_beside_non_default_alias() {
         // No `default_provider`, only a non-default alias (`openai.codex` from
         // `openai-codex`), and global `[providers]` values. The globals fold
