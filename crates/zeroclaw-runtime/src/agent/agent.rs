@@ -2088,11 +2088,18 @@ impl Agent {
             .and_then(|cfg| cfg.config.as_ref())
         {
             Some(full_config) => {
-                let agent_entry = full_config
+                let target_entry = new_model_provider
+                    .split_once('.')
+                    .and_then(|(family, alias)| full_config.providers.models.find(family, alias));
+                // A dotted target profile is the canonical source of endpoint
+                // and credentials. Falling back to the current agent profile is
+                // only retained for legacy bare-family switch requests.
+                let current_agent_entry = full_config
                     .resolved_model_provider_for_agent(&self.agent_alias)
                     .map(|(_ty, _alias, entry)| entry);
-                let default_api_key = agent_entry.and_then(|e| e.api_key.as_deref());
-                let default_base_url = agent_entry.and_then(|e| e.uri.as_deref());
+                let target_or_current = target_entry.or(current_agent_entry);
+                let default_api_key = target_or_current.and_then(|entry| entry.api_key.as_deref());
+                let default_base_url = target_or_current.and_then(|entry| entry.uri.as_deref());
 
                 // Prefer a route-specific api_key when the switched
                 // provider/model matches a configured model_route entry.
@@ -11114,6 +11121,125 @@ mod tests {
         assert_eq!(
             agent.model_name, "gpt-4o-mini",
             "model_name must NOT change when provider rebuild is not possible"
+        );
+    }
+
+    #[tokio::test]
+    async fn try_apply_model_switch_uses_target_alias_endpoint_and_credentials() {
+        use axum::{Json, Router, extract::State, http::HeaderMap, routing::post};
+        use serde_json::json;
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, HailoOllamaModelProviderConfig, ModelProviderConfig,
+            OpenAIModelProviderConfig,
+        };
+
+        #[derive(Clone)]
+        struct Capture {
+            requests: Arc<AtomicUsize>,
+            authorization: Arc<Mutex<Option<String>>>,
+        }
+
+        async fn chat_handler(
+            State(capture): State<Capture>,
+            headers: HeaderMap,
+        ) -> Json<serde_json::Value> {
+            capture.requests.fetch_add(1, Ordering::SeqCst);
+            *capture.authorization.lock() = headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            Json(json!({
+                "message": {"role": "assistant", "content": "target"},
+                "done": true,
+            }))
+        }
+
+        async fn start_server(capture: Capture) -> std::net::SocketAddr {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind fake provider server");
+            let address = listener.local_addr().expect("server address");
+            zeroclaw_spawn::spawn!(async move {
+                axum::serve(
+                    listener,
+                    Router::new()
+                        .route("/api/chat", post(chat_handler))
+                        .with_state(capture),
+                )
+                .await
+                .expect("serve fake provider server");
+            });
+            address
+        }
+
+        let current_capture = Capture {
+            requests: Arc::new(AtomicUsize::new(0)),
+            authorization: Arc::new(Mutex::new(None)),
+        };
+        let target_capture = Capture {
+            requests: Arc::new(AtomicUsize::new(0)),
+            authorization: Arc::new(Mutex::new(None)),
+        };
+        let current_address = start_server(current_capture.clone()).await;
+        let target_address = start_server(target_capture.clone()).await;
+
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "primary".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    api_key: Some("current-secret".to_string()),
+                    uri: Some(format!("http://{current_address}")),
+                    model: Some("current-model".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        config.providers.models.hailo_ollama.insert(
+            "edge".to_string(),
+            HailoOllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    api_key: Some("target-secret".to_string()),
+                    uri: Some(format!("http://{target_address}")),
+                    model: Some("edge-model".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "switcher".to_string(),
+            AliasedAgentConfig {
+                model_provider: zeroclaw_config::providers::ModelProviderRef(
+                    "openai.primary".to_string(),
+                ),
+                ..Default::default()
+            },
+        );
+
+        let switch_config = ProviderSwitchConfig {
+            config: Some(Arc::new(config)),
+        };
+        let mut agent = build_test_agent("openai.primary", "current-model", Some(switch_config));
+        agent.agent_alias = "switcher".to_string();
+
+        let switched = agent.try_apply_model_switch(
+            "current-model",
+            "hailo_ollama.edge".to_string(),
+            "edge-model".to_string(),
+        );
+        assert_eq!(switched.as_deref(), Some("edge-model"));
+        let response = agent
+            .model_provider
+            .chat_with_system(None, "hello", "edge-model", None)
+            .await
+            .expect("switched target provider should answer");
+        assert_eq!(response, "target");
+        assert_eq!(current_capture.requests.load(Ordering::SeqCst), 0);
+        assert_eq!(target_capture.requests.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            target_capture.authorization.lock().as_deref(),
+            Some("Bearer target-secret")
         );
     }
 

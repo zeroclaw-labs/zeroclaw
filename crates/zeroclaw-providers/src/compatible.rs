@@ -248,7 +248,7 @@ fn streaming_api_error(status: reqwest::StatusCode, body: &str) -> StreamError {
 }
 
 #[derive(Deserialize)]
-struct ModelsResponse {
+pub(crate) struct ModelsResponse {
     data: Vec<ModelEntry>,
 }
 
@@ -272,6 +272,11 @@ fn normalize_model_ids(body: ModelsResponse) -> Vec<String> {
         .collect();
     ids.sort();
     ids
+}
+
+pub(crate) fn parse_model_ids_from_bytes(bytes: &[u8]) -> anyhow::Result<Vec<String>> {
+    let body: ModelsResponse = serde_json::from_slice(bytes)?;
+    Ok(normalize_model_ids(body))
 }
 
 /// Extract model IDs with pricing from a ModelsResponse.
@@ -2612,8 +2617,14 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         // When a credential is present, hit the model_provider's native /models endpoint
         // (OpenAI-compatible: GET {base_url}/models). Local OpenAI-compatible
         // servers with a public catalog use the same path without an Authorization header.
+        // A profile that authenticates purely through `extra_headers` (e.g. a
+        // `Cookie` or `X-Auth` bridge, rather than a credential resolved into
+        // `Authorization`) must be probed too — otherwise its configured
+        // endpoint and any real auth failure are never observed, and the
+        // caller silently falls back to an unrelated public catalog.
         let list_credential = self.resolve_credential().await?;
-        if list_credential.is_some() || self.public_model_listing {
+        if list_credential.is_some() || self.public_model_listing || !self.extra_headers.is_empty()
+        {
             let url = format!("{}/models", self.base_url);
             let response = self
                 .apply_auth_header(self.http_client().get(&url), list_credential.as_deref())
@@ -2675,7 +2686,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         }
         match &self.openrouter_vendor_prefix {
             Some(prefix) => crate::openrouter_catalog::list_models_for_vendor(prefix).await,
-            None => anyhow::bail!("live model listing is not supported for this model_provider"),
+            None => Err(zeroclaw_api::model_provider::ModelListingUnsupportedError.into()),
         }
     }
 
@@ -2683,9 +2694,12 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         &self,
     ) -> anyhow::Result<Vec<zeroclaw_api::model_provider::ModelInfo>> {
         // When a credential is present, hit the provider's native /models
-        // endpoint — this returns pricing data that we can capture.
+        // endpoint — this returns pricing data that we can capture. A
+        // header-only authenticated profile (see `list_models` above) is
+        // probed too, for the same reason.
         let list_credential = self.resolve_credential().await?;
-        if list_credential.is_some() || self.public_model_listing {
+        if list_credential.is_some() || self.public_model_listing || !self.extra_headers.is_empty()
+        {
             let url = format!("{}/models", self.base_url);
             let response = self
                 .apply_auth_header(self.http_client().get(&url), list_credential.as_deref())
@@ -2740,8 +2754,8 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     return Ok(models_dev_to_model_info(models));
                 }
                 Ok(_) => {} // empty → fall through to openrouter
-                Err(_) if self.openrouter_vendor_prefix.is_none() => {
-                    return Ok(Vec::new());
+                Err(error) if self.openrouter_vendor_prefix.is_none() => {
+                    return Err(error);
                 }
                 Err(_) => {} // fall through to openrouter
             }
@@ -2750,7 +2764,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             Some(prefix) => {
                 crate::openrouter_catalog::list_models_for_vendor_with_pricing(prefix).await
             }
-            None => Ok(Vec::new()),
+            None => Err(zeroclaw_api::model_provider::ModelListingUnsupportedError.into()),
         }
     }
 
@@ -3637,6 +3651,35 @@ mod tests {
         assert!(error.contains("[REDACTED]"));
         assert!(!error.contains(secret));
         assert!(error.chars().count() <= 550);
+    }
+
+    #[tokio::test]
+    async fn absent_catalog_sources_return_typed_unsupported_for_ids_and_pricing() {
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("No catalog")
+            .base_url("http://127.0.0.1:9")
+            .auth_style(AuthStyle::Bearer)
+            .build();
+
+        let ids_error = provider
+            .list_models()
+            .await
+            .expect_err("missing live and static ID catalogs must be typed unsupported");
+        assert!(
+            ids_error
+                .downcast_ref::<zeroclaw_api::model_provider::ModelListingUnsupportedError>()
+                .is_some()
+        );
+
+        let pricing_error = provider
+            .list_models_with_pricing()
+            .await
+            .expect_err("missing live and static pricing catalogs must be typed unsupported");
+        assert!(
+            pricing_error
+                .downcast_ref::<zeroclaw_api::model_provider::ModelListingUnsupportedError>()
+                .is_some()
+        );
     }
 
     fn make_model_provider(
@@ -8088,5 +8131,115 @@ mod tests {
         assert_eq!(native.len(), 2);
         assert_eq!(native[1].role, "tool");
         assert_eq!(native[1].tool_call_id.as_deref(), Some("fc_456"));
+    }
+
+    /// A profile that authenticates purely through `extra_headers` (a
+    /// `Cookie`- or `X-Auth`-style bridge, rather than a credential
+    /// `resolve_credential()` returns) must still probe the configured
+    /// endpoint's `/models`, and a real failure there must be surfaced —
+    /// not silently swapped for an unrelated models.dev/OpenRouter catalog.
+    #[tokio::test]
+    async fn list_models_probes_configured_endpoint_for_cookie_only_auth() {
+        use axum::Router;
+        use axum::extract::State;
+        use axum::http::HeaderMap;
+        use axum::routing::get;
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        let captured: Arc<Mutex<Option<HeaderMap>>> = Arc::new(Mutex::new(None));
+        let captured_for_route = captured.clone();
+        let app = Router::new().route(
+            "/models",
+            get(
+                move |headers: HeaderMap, State(capture): State<Arc<Mutex<Option<HeaderMap>>>>| {
+                    *capture.lock().unwrap() = Some(headers);
+                    async move { axum::http::StatusCode::UNAUTHORIZED }
+                },
+            )
+            .with_state(captured_for_route),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_handle = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("Cookie".to_string(), "session=abc123".to_string());
+        let provider = OpenAiCompatibleModelProvider::builder("cookie-auth")
+            .display_name("cookie-auth")
+            .base_url(&format!("http://{addr}"))
+            .auth_style(AuthStyle::Bearer)
+            .extra_headers(headers)
+            .build();
+
+        let error = provider
+            .list_models()
+            .await
+            .expect_err("a Cookie-only profile's real endpoint failure must be surfaced");
+        assert!(
+            error.to_string().contains("HTTP 401"),
+            "expected the configured endpoint's actual failure, got: {error}"
+        );
+        assert!(
+            captured.lock().unwrap().is_some(),
+            "the configured endpoint must actually be probed for a header-only auth profile"
+        );
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn list_models_probes_configured_endpoint_for_x_auth_only_auth() {
+        use axum::Router;
+        use axum::routing::get;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let requests_for_route = requests.clone();
+        let app = Router::new().route(
+            "/models",
+            get(move || {
+                let requests = requests_for_route.clone();
+                async move {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    axum::http::StatusCode::FORBIDDEN
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_handle = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("X-Auth".to_string(), "bridge-token".to_string());
+        let provider = OpenAiCompatibleModelProvider::builder("x-auth-only")
+            .display_name("x-auth-only")
+            .base_url(&format!("http://{addr}"))
+            .auth_style(AuthStyle::Bearer)
+            .extra_headers(headers)
+            .build();
+
+        let error = provider
+            .list_models_with_pricing()
+            .await
+            .expect_err("an X-Auth-only profile's real endpoint failure must be surfaced");
+        assert!(
+            error.to_string().contains("HTTP 403"),
+            "expected the configured endpoint's actual failure, got: {error}"
+        );
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "the configured endpoint must be probed exactly once for a header-only auth profile"
+        );
+
+        let _unused: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+        server_handle.abort();
     }
 }

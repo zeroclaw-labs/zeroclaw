@@ -45,6 +45,26 @@ pub struct ModelsQuery {
     /// `provider` alias matches the query-string name the web dashboard uses.
     #[serde(alias = "provider")]
     pub model_provider: String,
+    /// Optional typed-provider alias selected by the configuration form.
+    pub alias: Option<String>,
+}
+
+impl ModelsQuery {
+    /// The dotted `<family>.<alias>` reference is the canonical source for
+    /// catalog resolution (endpoint, credential, headers) for every provider
+    /// family, not just `hailo_ollama` — `model_catalog_with_config_result`
+    /// resolves any configured alias generically via `find_by_name`. Reducing
+    /// non-Hailo families to the bare family name here silently prevented
+    /// their configured alias (custom endpoints, header-only auth, etc.) from
+    /// ever reaching that exact-profile catalog path through the dashboard.
+    fn catalog_provider_ref(&self) -> String {
+        match self.alias.as_deref() {
+            Some(alias) if !alias.trim().is_empty() => {
+                format!("{}.{}", self.model_provider, alias.trim())
+            }
+            _ => self.model_provider.clone(),
+        }
+    }
 }
 
 pub async fn handle_catalog_models(
@@ -56,13 +76,26 @@ pub async fn handle_catalog_models(
         return e.into_response();
     }
     let local = zeroclaw_runtime::quickstart::model_provider_is_local(&q.model_provider);
+    let catalog_provider_ref = q.catalog_provider_ref();
     // Snapshot config so the catalog resolves the alias credential and can reach
     // the native /models endpoint (surfacing new native-only models that the
     // models.dev snapshot may not carry yet) instead of silently falling back.
     let cfg = state.config.read().clone();
     let (models, pricing, live) =
-        zeroclaw_runtime::quickstart::model_catalog_with_config(Some(&cfg), &q.model_provider)
-            .await;
+        match zeroclaw_runtime::quickstart::model_catalog_with_config_result(
+            Some(&cfg),
+            &catalog_provider_ref,
+        )
+        .await
+        {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                return error_response(ConfigApiError::new(
+                    ConfigApiCode::ValidationFailed,
+                    error.to_string(),
+                ));
+            }
+        };
     axum::Json(CatalogModelsResult {
         model_provider: q.model_provider,
         models,
@@ -1090,6 +1123,36 @@ mod tests {
 
     const DEV_CONFIG_TEMPLATE: &str = include_str!("../../../dev/config.template.toml");
     const DEV_HARNESS_TEMPLATE: &str = include_str!("../../../dev/config.harness-test.toml");
+
+    #[test]
+    fn models_query_uses_hailo_alias_for_catalog_resolution() {
+        let query = ModelsQuery {
+            model_provider: "hailo_ollama".to_string(),
+            alias: Some("edge".to_string()),
+        };
+        assert_eq!(query.catalog_provider_ref(), "hailo_ollama.edge");
+    }
+
+    #[test]
+    fn models_query_uses_configured_alias_for_every_provider_family() {
+        // Every provider family's configured alias must reach the exact-profile
+        // catalog path, not just hailo_ollama: `model_catalog_with_config_result`
+        // resolves any `<family>.<alias>` dotted reference generically.
+        let query = ModelsQuery {
+            model_provider: "openai".to_string(),
+            alias: Some("edge".to_string()),
+        };
+        assert_eq!(query.catalog_provider_ref(), "openai.edge");
+    }
+
+    #[test]
+    fn models_query_falls_back_to_bare_family_without_an_alias() {
+        let query = ModelsQuery {
+            model_provider: "openai".to_string(),
+            alias: None,
+        };
+        assert_eq!(query.catalog_provider_ref(), "openai");
+    }
 
     fn parse_dev_template(raw: &str, name: &str) -> zeroclaw_config::schema::Config {
         toml::from_str(raw).unwrap_or_else(|err| panic!("{name} must parse as schema V3: {err}"))

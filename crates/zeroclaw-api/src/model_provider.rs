@@ -406,6 +406,14 @@ pub struct ProviderCapabilityError {
     pub message: String,
 }
 
+/// Typed marker returned when a provider intentionally has no live model-list
+/// endpoint. Callers may use a separate canonical static catalog only for this
+/// condition; transport, authentication, and malformed-response failures must
+/// remain actionable.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("live model listing is not supported for this model_provider")]
+pub struct ModelListingUnsupportedError;
+
 /// ModelProvider capabilities declaration.
 /// Describes what features a model_provider supports, enabling intelligent
 /// adaptation of tool calling modes and request formatting.
@@ -594,7 +602,7 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
     ) -> anyhow::Result<String>;
 
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {
-        anyhow::bail!("live model listing is not supported for this model_provider")
+        Err(ModelListingUnsupportedError.into())
     }
 
     /// Fetch the list of available models with pricing data for this
@@ -996,6 +1004,20 @@ mod capability_tests {
         ) -> anyhow::Result<String> {
             Ok(String::new())
         }
+    }
+
+    #[tokio::test]
+    async fn default_model_listing_returns_typed_unsupported_error() {
+        let error = NativeAccessorOnlyProvider
+            .list_models()
+            .await
+            .expect_err("default model listing must be unsupported");
+        assert!(
+            error
+                .downcast_ref::<super::ModelListingUnsupportedError>()
+                .is_some(),
+            "default listing error must preserve the typed unsupported marker: {error}"
+        );
     }
 
     #[test]

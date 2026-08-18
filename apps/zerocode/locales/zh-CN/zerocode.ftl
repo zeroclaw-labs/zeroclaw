@@ -373,6 +373,7 @@ zc-model-switch-provider-ok = model_provider 已切换为 { $provider }（模型
 zc-model-switch-failed = 模型切换失败：{ $error }
 zc-model-catalog-no-provider = 无法从配置中解析此代理的 model_provider。
 zc-model-catalog-empty = 当前激活的 model_provider 没有可用模型。
+zc-model-catalog-failed = 无法加载当前 model_provider 的模型：{ $error }
 zc-model-catalog-loading = 正在加载模型…
 zc-model-provider-catalog-failed = 无法加载 model_providers：{ $error }
 zc-chat-label-you = 你：

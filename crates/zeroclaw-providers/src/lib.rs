@@ -798,12 +798,13 @@ fn token_end(input: &str, from: usize) -> usize {
 
 /// Remove credentials from HTTP(S) URLs embedded in error text.
 ///
-/// Query-value punctuation cannot safely identify where a credential ends:
-/// commas, apostrophes, and parentheses are all legal query data. Treat the
-/// URL's entire non-whitespace query tail as sensitive instead. This also
-/// covers credential parameter names that the sanitizer does not know about.
-/// URL userinfo is likewise always sensitive and is replaced as one unit while
-/// retaining the host and path needed for an actionable endpoint diagnostic.
+/// Query and fragment punctuation cannot safely identify where a credential
+/// ends: commas, apostrophes, and parentheses are all legal data. Treat the
+/// URL's entire non-whitespace query or fragment tail as sensitive instead.
+/// This also covers credential parameter names that the sanitizer does not know
+/// about. URL userinfo is likewise always sensitive and is replaced as one unit
+/// while retaining the host and path needed for an actionable endpoint
+/// diagnostic.
 fn scrub_url_credentials(input: &str) -> String {
     let lowercase = input.to_ascii_lowercase();
     let mut scrubbed = String::with_capacity(input.len());
@@ -829,22 +830,25 @@ fn scrub_url_credentials(input: &str) -> String {
         let url_tail = &input[url_start..];
         let url_end = url_start + url_tail.find(char::is_whitespace).unwrap_or(url_tail.len());
         let url_token = &input[url_start..url_end];
-        let without_query = url_token
-            .find('?')
-            .map_or(url_token, |query_start| &url_token[..query_start]);
-        let scheme_end = without_query
+        let sensitive_suffix_start = [url_token.find('?'), url_token.find('#')]
+            .into_iter()
+            .flatten()
+            .min();
+        let without_query_or_fragment =
+            sensitive_suffix_start.map_or(url_token, |suffix_start| &url_token[..suffix_start]);
+        let scheme_end = without_query_or_fragment
             .find("://")
             .map_or(0, |separator| separator + 3);
-        let authority_end = without_query[scheme_end..]
-            .find(['/', '#'])
-            .map_or(without_query.len(), |end| scheme_end + end);
-        let authority = &without_query[scheme_end..authority_end];
+        let authority_end = without_query_or_fragment[scheme_end..]
+            .find('/')
+            .map_or(without_query_or_fragment.len(), |end| scheme_end + end);
+        let authority = &without_query_or_fragment[scheme_end..authority_end];
         if let Some(userinfo_end) = authority.rfind('@') {
-            scrubbed.push_str(&without_query[..scheme_end]);
+            scrubbed.push_str(&without_query_or_fragment[..scheme_end]);
             scrubbed.push_str("[REDACTED]@");
-            scrubbed.push_str(&without_query[scheme_end + userinfo_end + 1..]);
+            scrubbed.push_str(&without_query_or_fragment[scheme_end + userinfo_end + 1..]);
         } else {
-            scrubbed.push_str(without_query);
+            scrubbed.push_str(without_query_or_fragment);
         }
         cursor = url_end;
     }
@@ -855,9 +859,9 @@ fn scrub_url_credentials(input: &str) -> String {
 /// Scrub known secret-like token prefixes from model_provider error strings.
 /// Provider API-key prefixes come from the same canonical table used for
 /// credential-family validation; non-provider prefixes cover Slack, GitHub,
-/// and Google/Gemini credentials. Complete query strings are removed from
-/// embedded HTTP(S) URLs because query parameters may carry credentials under
-/// provider-specific names.
+/// and Google/Gemini credentials. Complete query strings and fragments are
+/// removed from embedded HTTP(S) URLs because either suffix may carry
+/// credentials under provider-specific names.
 pub fn scrub_secret_patterns(input: &str) -> String {
     const NON_PROVIDER_SECRET_PREFIXES: &[&str] = &[
         "xoxb-",
@@ -3684,6 +3688,17 @@ mod tests {
         assert!(!result.contains("hunter2secret"), "{result}");
         assert!(!result.contains("region=us"), "{result}");
         assert!(result.contains("HTTPS://api.example.com/v1/thing"));
+    }
+
+    #[test]
+    fn sanitize_removes_complete_url_fragment() {
+        let input =
+            "GET https://api.example.com/v1/models#access_token=fragment-secret-value failed";
+        let result = sanitize_api_error(input);
+
+        assert!(!result.contains("fragment-secret-value"), "{result}");
+        assert!(!result.contains("#access_token="), "{result}");
+        assert!(result.contains("https://api.example.com/v1/models"));
     }
 
     #[test]

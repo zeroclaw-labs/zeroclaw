@@ -2082,6 +2082,9 @@ pub async fn model_catalog(
     model_catalog_with_config(None, model_provider).await
 }
 
+/// Backward-compatible catalog projection for callers that intentionally treat
+/// discovery failure as an unavailable catalog. Configured-profile surfaces
+/// should call [`model_catalog_with_config_result`] to preserve actionable errors.
 pub async fn model_catalog_with_config(
     config: Option<&Config>,
     model_provider: &str,
@@ -2090,83 +2093,35 @@ pub async fn model_catalog_with_config(
     Option<std::collections::HashMap<String, zeroclaw_api::model_provider::ModelPricing>>,
     bool,
 ) {
-    let resolved = config.and_then(|cfg| cfg.providers.models.find_by_name(model_provider));
-    let api_key = resolved
-        .as_ref()
-        .and_then(|(_family, _alias, base)| base.api_key.clone());
-    // Honor a configured custom endpoint so proxied / self-hosted OpenAI-compatible
-    // deployments list from their own `/models` rather than the family default.
-    let api_url = resolved.as_ref().and_then(|(_family, _alias, base)| {
-        base.uri
-            .as_deref()
-            .map(str::trim)
-            .filter(|u| !u.is_empty())
-            .map(ToString::to_string)
-    });
-    // `create_model_provider` and the chat-catalog ranker expect a bare family
-    // name, not a dotted ref. Prefer the family `find_by_name` resolved; when it
-    // could not (no config / unknown alias) strip any `<family>.<alias>` suffix
-    // ourselves so a dotted selector still constructs.
-    let family: &str = resolved
-        .as_ref()
-        .map(|(family, _alias, _base)| *family)
-        .unwrap_or_else(|| {
-            model_provider
-                .split_once('.')
-                .map_or(model_provider, |(f, _)| f)
-        });
+    model_catalog_with_config_result(config, model_provider)
+        .await
+        .unwrap_or_default()
+}
 
-    let handle = zeroclaw_providers::create_model_provider_with_url(
-        family,
-        api_key.as_deref(),
-        api_url.as_deref(),
-    );
-    if let Ok(handle) = handle
-        && let Ok(models) = zeroclaw_providers::ProviderDispatch::from_ref(&*handle)
-            .list_models_with_pricing()
-            .await
-        && !models.is_empty()
-    {
-        let raw_pricing: std::collections::HashMap<
-            String,
-            zeroclaw_api::model_provider::ModelPricing,
-        > = models
-            .iter()
-            .filter_map(|m| m.pricing.as_ref().map(|p| (m.id.clone(), p.clone())))
-            .collect();
-        let ids = models.into_iter().map(|m| m.id).collect();
-        let Some(ids) = zeroclaw_providers::catalog::sort_model_catalog_for_chat(family, ids)
-        else {
-            return (Vec::new(), None, false);
-        };
-        let pricing: std::collections::HashMap<String, zeroclaw_api::model_provider::ModelPricing> =
-            ids.iter()
-                .filter_map(|id| raw_pricing.get(id).map(|p| (id.clone(), p.clone())))
-                .collect();
-        let pricing = if pricing.is_empty() {
-            None
-        } else {
-            Some(pricing)
-        };
-        return (ids, pricing, true);
-    }
-    match zeroclaw_providers::catalog::list_models_for_family(family).await {
-        Ok(models) if !models.is_empty() => (
-            zeroclaw_providers::catalog::sort_model_catalog_for_chat(family, models)
-                .unwrap_or_default(),
-            None,
-            true,
-        ),
-        _ => (Vec::new(), None, false),
-    }
+pub async fn model_catalog_with_config_result(
+    config: Option<&Config>,
+    model_provider: &str,
+) -> anyhow::Result<(
+    Vec<String>,
+    Option<std::collections::HashMap<String, zeroclaw_api::model_provider::ModelPricing>>,
+    bool,
+)> {
+    zeroclaw_providers::catalog::model_catalog_with_config_result(config, model_provider).await
+}
+
+pub(crate) fn model_listing_is_unsupported(error: &anyhow::Error) -> bool {
+    zeroclaw_providers::catalog::model_listing_is_unsupported(error)
 }
 
 /// `true` for model_provider families that need no remote credential.
 #[must_use]
 pub fn model_provider_is_local(model_provider: &str) -> bool {
+    let family = model_provider
+        .split_once('.')
+        .map_or(model_provider, |(family, _)| family);
     zeroclaw_providers::list_model_providers()
         .iter()
-        .find(|p| p.name == model_provider)
+        .find(|p| p.name == family)
         .is_some_and(|p| p.local)
 }
 
@@ -3258,6 +3213,51 @@ mod tests {
         assert_eq!(group.external_peers, vec!["*".to_string()]);
     }
 
+    #[test]
+    fn model_listing_unsupported_classification_preserves_typed_error_chain() {
+        let direct = anyhow::Error::new(zeroclaw_api::model_provider::ModelListingUnsupportedError);
+        assert!(model_listing_is_unsupported(&direct));
+
+        let wrapped =
+            anyhow::Error::new(zeroclaw_api::model_provider::ModelListingUnsupportedError)
+                .context("configured provider wrapper");
+        assert!(model_listing_is_unsupported(&wrapped));
+
+        let actionable = anyhow::Error::msg("HTTP 401 Unauthorized");
+        assert!(!model_listing_is_unsupported(&actionable));
+    }
+
+    #[tokio::test]
+    async fn configured_static_catalog_provider_preserves_typed_live_listing_boundary() {
+        let mut config = Config::default();
+        config
+            .providers
+            .models
+            .ensure("bedrock", "static")
+            .expect("bedrock fixture profile");
+        let provider =
+            zeroclaw_providers::create_model_provider_from_ref(&config, "bedrock.static")
+                .expect("configured Bedrock provider should construct");
+        let error = zeroclaw_providers::ProviderDispatch::from_ref(&*provider)
+            .list_models_with_pricing()
+            .await
+            .expect_err("Bedrock intentionally has no live listing endpoint");
+
+        assert!(model_listing_is_unsupported(&error));
+        let (models_dev, openrouter) = zeroclaw_providers::catalog::catalog_source_for("bedrock")
+            .expect("Bedrock must have a canonical family catalog source");
+        assert_eq!(models_dev, Some("amazon-bedrock"));
+        assert_eq!(openrouter, None);
+    }
+
+    #[test]
+    fn model_provider_is_local_classifies_configured_refs_by_family() {
+        assert!(model_provider_is_local("hailo_ollama"));
+        assert!(model_provider_is_local("hailo_ollama.edge"));
+        assert!(model_provider_is_local("ollama.local"));
+        assert!(!model_provider_is_local("openai.primary"));
+    }
+
     #[tokio::test]
     async fn model_catalog_with_config_uses_native_endpoint_when_credentialed() {
         use wiremock::matchers::{method, path};
@@ -3290,7 +3290,9 @@ mod tests {
         );
 
         let (models, _pricing, live) =
-            model_catalog_with_config(Some(&config), "xai.default").await;
+            model_catalog_with_config_result(Some(&config), "xai.default")
+                .await
+                .expect("configured native catalog should succeed");
 
         assert!(live, "credentialed native listing must report live=true");
         assert!(
@@ -3302,15 +3304,17 @@ mod tests {
 
     #[tokio::test]
     async fn model_catalog_with_config_resolves_named_alias_endpoint() {
-        use wiremock::matchers::{method, path};
+        use wiremock::matchers::{header, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/models"))
+            .and(header("x-route", "named-alias"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "data": [{"id": "grok-named-alias-native"}]
             })))
+            .expect(2)
             .mount(&server)
             .await;
 
@@ -3322,12 +3326,17 @@ mod tests {
                 base: zeroclaw_config::schema::ModelProviderConfig {
                     api_key: Some("xai-test-key".to_string()),
                     uri: Some(server.uri()),
+                    extra_headers: [("X-Route".to_string(), "named-alias".to_string())]
+                        .into_iter()
+                        .collect(),
                     ..Default::default()
                 },
             },
         );
 
-        let (models, _pricing, live) = model_catalog_with_config(Some(&config), "xai.prod").await;
+        let (models, _pricing, live) = model_catalog_with_config_result(Some(&config), "xai.prod")
+            .await
+            .expect("configured alias catalog should succeed");
 
         assert!(live);
         assert!(
@@ -3335,5 +3344,187 @@ mod tests {
             "dotted `<family>.<alias>` selector must resolve that alias's \
              configured endpoint; got {models:?}"
         );
+
+        let (bare_models, _pricing, bare_live) =
+            model_catalog_with_config_result(Some(&config), "prod")
+                .await
+                .expect("unique bare alias catalog should resolve canonically");
+        assert!(bare_live);
+        assert!(
+            bare_models.iter().any(|m| m == "grok-named-alias-native"),
+            "unique bare alias selector must resolve the same configured endpoint; \
+             got {bare_models:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_catalog_with_config_rejects_unknown_dotted_alias() {
+        let config = Config::default();
+        let error = model_catalog_with_config_result(Some(&config), "hailo_ollama.typo")
+            .await
+            .expect_err("unknown dotted aliases must fail before default provider construction");
+        assert!(
+            error.to_string().contains("does not exist"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_catalog_error_does_not_fall_back_to_public_family() {
+        const USER: &str = "catalog-user";
+        const PASSWORD: &str = "s3cr3t-password";
+        const SIGNATURE: &str = "signed-query-value";
+
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut endpoint = reqwest::Url::parse(&server.uri()).expect("fake server URL");
+        endpoint
+            .set_username(USER)
+            .expect("test URL should accept userinfo");
+        endpoint
+            .set_password(Some(PASSWORD))
+            .expect("test URL should accept password");
+        endpoint.set_query(Some(&format!("signature={SIGNATURE}")));
+
+        let mut config = Config::default();
+        config.providers.models.xai.insert(
+            "private".to_string(),
+            zeroclaw_config::schema::XaiModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    api_key: Some("expired-key".to_string()),
+                    uri: Some(endpoint.to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let error = model_catalog_with_config_result(Some(&config), "xai.private")
+            .await
+            .expect_err("configured profile rejection must not become a public family catalog");
+        let error = error.to_string();
+        assert!(error.contains("catalog failed"));
+        for secret in [USER, PASSWORD, SIGNATURE] {
+            assert!(
+                !error.contains(secret),
+                "catalog error leaked {secret}: {error}"
+            );
+        }
+        assert!(
+            error.contains("127.0.0.1"),
+            "catalog error should retain a safe endpoint diagnostic: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_catalog_construction_error_redacts_key_excerpt() {
+        const SECRET: &str = "xai-syntheticSecretValue12345";
+
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "mismatch".to_string(),
+            zeroclaw_config::schema::OpenAIModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    api_key: Some(SECRET.to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let error = model_catalog_with_config_result(Some(&config), "openai.mismatch")
+            .await
+            .expect_err("mismatched credential prefix must reject provider construction")
+            .to_string();
+        assert!(error.contains("could not be constructed"), "{error}");
+        assert!(!error.contains("xai-"), "credential prefix leaked: {error}");
+        assert!(
+            !error.contains("synthetic"),
+            "credential excerpt leaked: {error}"
+        );
+        assert!(
+            error.contains("[REDACTED]"),
+            "redaction marker missing: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_empty_catalog_remains_authoritative() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_config::schema::{HailoOllamaModelProviderConfig, ModelProviderConfig};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = Config::default();
+        config.providers.models.hailo_ollama.insert(
+            "empty".to_string(),
+            HailoOllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    uri: Some(server.uri()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        let (models, pricing, live) =
+            model_catalog_with_config_result(Some(&config), "hailo_ollama.empty")
+                .await
+                .expect("reachable empty catalog is a valid configured-profile result");
+        assert!(models.is_empty());
+        assert!(pricing.is_none());
+        assert!(live);
+    }
+
+    #[tokio::test]
+    async fn model_catalog_with_config_preserves_hailo_alias_headers() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_config::schema::{HailoOllamaModelProviderConfig, ModelProviderConfig};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .and(header("x-route", "canary"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"models": [{"name": "qwen3:1.7b"}]})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = Config::default();
+        config.providers.models.hailo_ollama.insert(
+            "edge".to_string(),
+            HailoOllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    uri: Some(server.uri()),
+                    extra_headers: [("X-Route".to_string(), "canary".to_string())]
+                        .into_iter()
+                        .collect(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let (models, _pricing, live) =
+            model_catalog_with_config_result(Some(&config), "hailo_ollama.edge")
+                .await
+                .expect("configured Hailo catalog should succeed");
+        assert!(live);
+        assert_eq!(models, vec!["qwen3:1.7b"]);
     }
 }

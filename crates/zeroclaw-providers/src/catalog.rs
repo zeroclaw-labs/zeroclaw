@@ -291,6 +291,137 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
 }
 
+/// Resolve a live or static model catalog while preserving configured-profile errors.
+pub async fn model_catalog_with_config_result(
+    config: Option<&zeroclaw_config::schema::Config>,
+    model_provider: &str,
+) -> anyhow::Result<(
+    Vec<String>,
+    Option<std::collections::HashMap<String, zeroclaw_api::model_provider::ModelPricing>>,
+    bool,
+)> {
+    let resolved = config.and_then(|cfg| cfg.providers.models.find_by_name(model_provider));
+    let api_key = resolved
+        .as_ref()
+        .and_then(|(_family, _alias, base)| base.api_key.clone());
+    // Honor a configured custom endpoint so proxied / self-hosted OpenAI-compatible
+    // deployments list from their own `/models` rather than the family default.
+    let api_url = resolved.as_ref().and_then(|(_family, _alias, base)| {
+        base.uri
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .map(ToString::to_string)
+    });
+    // `create_model_provider` and the chat-catalog ranker expect a bare family
+    // name, not a dotted ref. Prefer the family `find_by_name` resolved; when it
+    // could not (no config / unknown alias) strip any `<family>.<alias>` suffix
+    // ourselves so a dotted selector still constructs.
+    let family: &str = resolved
+        .as_ref()
+        .map(|(family, _alias, _base)| *family)
+        .unwrap_or_else(|| {
+            model_provider
+                .split_once('.')
+                .map_or(model_provider, |(f, _)| f)
+        });
+
+    let configured_profile = resolved.is_some();
+    let has_dotted_profile_shape = model_provider
+        .split_once('.')
+        .is_some_and(|(family, _)| !family.contains(':'));
+    if has_dotted_profile_shape && !configured_profile {
+        anyhow::bail!(
+            "configured provider profile `{model_provider}` does not exist; expected `<type>.<alias>` from providers.models"
+        );
+    }
+
+    // A configured alias is the canonical source for provider construction:
+    // it owns its endpoint, credential, headers, and typed runtime options.
+    // Bare-family requests retain the public-catalog fallback below.
+    let handle = match (config, resolved.as_ref()) {
+        (Some(config), Some((resolved_family, resolved_alias, _))) => {
+            let canonical_ref = format!("{resolved_family}.{resolved_alias}");
+            crate::create_model_provider_from_ref(config, &canonical_ref)
+        }
+        _ => crate::create_model_provider_with_url(family, api_key.as_deref(), api_url.as_deref()),
+    };
+
+    let live_models = match handle {
+        Ok(handle) => match crate::ProviderDispatch::from_ref(&*handle)
+            .list_models_with_pricing()
+            .await
+        {
+            Ok(models) => Some(models),
+            Err(error) if configured_profile && model_listing_is_unsupported(&error) => None,
+            Err(error) if configured_profile => {
+                let error = crate::sanitize_api_error(&error.to_string());
+                return Err(anyhow::Error::msg(format!(
+                    "configured provider profile `{model_provider}` catalog failed: {error}"
+                )));
+            }
+            Err(_) => None,
+        },
+        Err(error) if configured_profile => {
+            let error = crate::sanitize_api_error(&error.to_string());
+            return Err(anyhow::Error::msg(format!(
+                "configured provider profile `{model_provider}` could not be constructed: {error}"
+            )));
+        }
+        Err(_) => None,
+    };
+
+    if let Some(models) = live_models {
+        if models.is_empty() && configured_profile {
+            return Ok((Vec::new(), None, true));
+        }
+        if !models.is_empty() {
+            let raw_pricing: std::collections::HashMap<
+                String,
+                zeroclaw_api::model_provider::ModelPricing,
+            > = models
+                .iter()
+                .filter_map(|m| m.pricing.as_ref().map(|p| (m.id.clone(), p.clone())))
+                .collect();
+            let ids = models.into_iter().map(|m| m.id).collect();
+            let Some(ids) = sort_model_catalog_for_chat(family, ids) else {
+                return Ok((Vec::new(), None, false));
+            };
+            let pricing: std::collections::HashMap<
+                String,
+                zeroclaw_api::model_provider::ModelPricing,
+            > = ids
+                .iter()
+                .filter_map(|id| raw_pricing.get(id).map(|p| (id.clone(), p.clone())))
+                .collect();
+            let pricing = if pricing.is_empty() {
+                None
+            } else {
+                Some(pricing)
+            };
+            return Ok((ids, pricing, true));
+        }
+    }
+
+    match list_models_for_family(family).await {
+        Ok(models) if !models.is_empty() => Ok((
+            sort_model_catalog_for_chat(family, models).unwrap_or_default(),
+            None,
+            true,
+        )),
+        _ => Ok((Vec::new(), None, false)),
+    }
+}
+
+#[must_use]
+pub fn model_listing_is_unsupported(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<zeroclaw_api::model_provider::ModelListingUnsupportedError>()
+            .is_some()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -314,6 +445,16 @@ mod tests {
             missing.is_empty(),
             "catalog_source_for is missing entries for: {missing:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn configured_unknown_dotted_profile_fails_before_network() {
+        let config = zeroclaw_config::schema::Config::default();
+        let error = model_catalog_with_config_result(Some(&config), "hailo_ollama.typo")
+            .await
+            .expect_err("unknown dotted profile must fail closed");
+
+        assert!(error.to_string().contains("does not exist"));
     }
 
     #[test]
