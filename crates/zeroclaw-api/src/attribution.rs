@@ -250,6 +250,7 @@ pub enum ModelProviderKind {
     Perplexity,
     Xai,
     Cerebras,
+    Crusoe,
     Sambanova,
     Hyperbolic,
     Deepinfra,
@@ -535,5 +536,10 @@ mod tests {
         assert_eq!(Role::Sop.family_str(), "sop");
         assert_eq!(Role::Session.family_str(), "session");
         assert_eq!(Role::System.family_str(), "system");
+    }
+
+    #[test]
+    fn crusoe_kind_serializes_snake_case() {
+        assert_eq!(<&'static str>::from(ModelProviderKind::Crusoe), "crusoe");
     }
 }
