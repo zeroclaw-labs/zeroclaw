@@ -14,8 +14,6 @@ use std::sync::Arc;
 #[cfg(feature = "whatsapp-web")]
 use bytes::Bytes;
 #[cfg(feature = "whatsapp-web")]
-use prost::Message;
-#[cfg(feature = "whatsapp-web")]
 use wacore::appstate::hash::HashState;
 #[cfg(feature = "whatsapp-web")]
 use wacore::appstate::processor::AppStateMutationMAC;
@@ -27,6 +25,10 @@ use wacore::store::traits::DeviceInfo;
 use wacore::store::traits::DeviceStore as DeviceStoreTrait;
 #[cfg(feature = "whatsapp-web")]
 use wacore::store::traits::*;
+#[cfg(feature = "whatsapp-web")]
+// waproto 0.7 generates buffa messages, not prost; `encode_to_vec`/`decode`
+// come from buffa's `Message` trait, re-exported by waproto.
+use waproto::buffa::Message;
 
 #[cfg(feature = "whatsapp-web")]
 #[derive(Clone)]
@@ -582,7 +584,6 @@ impl SignalStore for RusqliteStore {
                 params![id, self.device_id],
             ))?;
         }
-
         Ok(())
     }
 
@@ -1351,13 +1352,21 @@ impl ProtocolStore for RusqliteStore {
 
     async fn delete_expired_tc_tokens(
         &self,
-        cutoff_timestamp: i64,
+        token_cutoff: i64,
+        sender_cutoff: i64,
     ) -> wacore::store::error::Result<u32> {
         let conn = self.conn.lock();
+        // Both halves must be dead before the row goes. Recent sender state is
+        // never dropped just because the received token expired, so the two
+        // cutoffs are ANDed rather than either one deleting the row alone. An
+        // empty token counts as absent, as does a NULL sender bucket.
         let deleted = conn
             .execute(
-                "DELETE FROM tc_tokens WHERE token_timestamp < ?1 AND device_id = ?2",
-                params![cutoff_timestamp, self.device_id],
+                "DELETE FROM tc_tokens
+                  WHERE device_id = ?3
+                    AND (token_timestamp < ?1 OR length(token) = 0)
+                    AND (sender_timestamp IS NULL OR sender_timestamp < ?2)",
+                params![token_cutoff, sender_cutoff, self.device_id],
             )
             .map_err(|e| {
                 wacore::store::error::StoreError::Database(
@@ -1486,7 +1495,7 @@ impl DeviceStoreTrait for RusqliteStore {
 
         // Safety: device account data is stored to DB only; to_store_err! converts
         // rusqlite errors without logging parameter values.
-        let account = device.account.as_ref().map(|a| a.encode_to_vec());
+        let account = device.account.as_ref().map(|a| a.as_ref().encode_to_vec());
 
         let server_cert_chain_blob = device
             .server_cert_chain
@@ -1595,8 +1604,11 @@ impl DeviceStoreTrait for RusqliteStore {
                 adv_secret.copy_from_slice(&adv_secret_bytes);
 
                 let account = if let Some(bytes) = account_bytes {
+                    // buffa's `decode` wants `&mut impl Buf`; `decode_from_slice`
+                    // is the convenience form. 0.7 also stores the account behind
+                    // an `Arc` on `Device`.
                     Some(std::sync::Arc::new(
-                        waproto::whatsapp::AdvSignedDeviceIdentity::decode(&*bytes)
+                        waproto::whatsapp::ADVSignedDeviceIdentity::decode_from_slice(&bytes)
                             .map_err(to_rusqlite_err)?,
                     ))
                 } else {
@@ -1698,11 +1710,13 @@ mod tests {
 
     #[cfg(feature = "whatsapp-web")]
     fn msg_secret(msg_id: &str, expires_at: i64, message_ts: i64) -> MsgSecretEntry {
+        // 0.7 narrows these: the JID/id fields are `Arc<str>` and the secret is
+        // a fixed `[u8; MESSAGE_SECRET_SIZE]` rather than a `Vec<u8>`.
         MsgSecretEntry {
-            chat: "chat@s.whatsapp.net".to_string(),
-            sender: "sender@s.whatsapp.net".to_string(),
-            msg_id: msg_id.to_string(),
-            secret: vec![7u8; 32],
+            chat: "chat@s.whatsapp.net".into(),
+            sender: "sender@s.whatsapp.net".into(),
+            msg_id: msg_id.into(),
+            secret: [7u8; 32],
             expires_at,
             message_ts,
         }
@@ -1984,7 +1998,7 @@ mod tests {
             .await
             .unwrap();
 
-        let deleted = ProtocolStore::delete_expired_tc_tokens(&store, 100)
+        let deleted = ProtocolStore::delete_expired_tc_tokens(&store, 100, 100)
             .await
             .unwrap();
         assert_eq!(deleted, 1);
