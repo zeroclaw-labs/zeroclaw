@@ -5391,35 +5391,60 @@ async fn process_channel_message_body(
         // a text-only request as though the model had seen it. Fail the turn
         // visibly instead of degrading to the family default.
 
-        let capabilities = match active_model_provider
+        let vision = match active_model_provider
             .resolve_capabilities_for_model(route.model.as_str())
             .await
         {
-            Ok(capabilities) => capabilities,
+            Ok(capabilities) => {
+                capabilities.vision || ctx.multimodal.vision_model_provider.is_some()
+            }
+            // A catalog outage or retry-backoff means capability is UNKNOWN, not an
+            // authoritative "no vision". If the operator configured a dedicated
+            // vision provider, keep it usable: record a non-blocking warning and
+            // let the runtime turn's vision route actually drive the configured
+            // provider. Only when there is no valid vision route do we surface the
+            // lookup failure rather than dispatching a text-only request as though
+            // the model had seen the image.
             Err(err) => {
-                let safe_err = zeroclaw_providers::sanitize_api_error(&err.to_string());
-                let message = channel_runtime_cli_string_with_args(
-                    "channel-runtime-media-catalog-unavailable",
-                    &[
-                        ("provider", route.model_provider.as_str()),
-                        ("error", safe_err.as_str()),
-                    ],
-                );
-                if let Some(channel) = target_channel.as_ref() {
-                    let _ = channel.send(&SendMessage::reply_to(&msg, message)).await;
+                if ctx.multimodal.vision_model_provider.is_some() {
+                    let safe_err = zeroclaw_providers::sanitize_api_error(&err.to_string());
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_category(::zeroclaw_log::EventCategory::Provider)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "provider": route.model_provider,
+                                "model": route.model,
+                                "error": safe_err,
+                            })),
+                        "primary model catalog unavailable; delegating image to configured vision_model_provider"
+                    );
+                    true
+                } else {
+                    let safe_err = zeroclaw_providers::sanitize_api_error(&err.to_string());
+                    let message = channel_runtime_cli_string_with_args(
+                        "channel-runtime-media-catalog-unavailable",
+                        &[
+                            ("provider", route.model_provider.as_str()),
+                            ("error", safe_err.as_str()),
+                        ],
+                    );
+                    if let Some(channel) = target_channel.as_ref() {
+                        let _ = channel.send(&SendMessage::reply_to(&msg, message)).await;
+                    }
+                    reconcile_early_ack(
+                        ctx.as_ref(),
+                        &msg,
+                        target_channel.as_ref(),
+                        early_ack_task,
+                        Some("\u{26A0}\u{FE0F}"),
+                    )
+                    .await;
+                    return;
                 }
-                reconcile_early_ack(
-                    ctx.as_ref(),
-                    &msg,
-                    target_channel.as_ref(),
-                    early_ack_task,
-                    Some("\u{26A0}\u{FE0F}"),
-                )
-                .await;
-                return;
             }
         };
-        let vision = capabilities.vision || ctx.multimodal.vision_model_provider.is_some();
         let pipeline = media_pipeline::MediaPipeline::new(
             &ctx.media_pipeline,
             None, // transcription already ran in phase 1
@@ -14644,6 +14669,69 @@ api_key = "anthropic-key"
             chat_calls.load(Ordering::SeqCst),
             0,
             "no model request may be dispatched when the image gate cannot resolve vision"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_keeps_configured_vision_route_on_primary_catalog_unknown() {
+        // 08-13 regression: a primary catalog outage means capability is UNKNOWN,
+        // not "no vision". When a dedicated `vision_model_provider` is configured,
+        // the phase-2 gate must keep it usable: do NOT surface the catalog-outage
+        // message or return — record the (non-blocking) warning and carry the image
+        // marker forward so the runtime turn's vision route can actually process it.
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let chat_calls = Arc::new(AtomicUsize::new(0));
+        let provider = CatalogUnavailableProvider {
+            chat_calls: Arc::clone(&chat_calls),
+        };
+
+        let mut msg = message_sent_hook_test_message();
+        msg.attachments = vec![zeroclaw_api::media::MediaAttachment {
+            file_name: "photo.jpg".to_string(),
+            data: vec![0u8; 50],
+            mime_type: Some("image/jpeg".to_string()),
+        }];
+
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(provider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        // Enable the phase-2 image gate AND configure a dedicated vision provider,
+        // exactly like the sibling regressions but with a vision route present.
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig {
+                enabled: true,
+                describe_images: true,
+                ..Default::default()
+            },
+            multimodal: zeroclaw_config::schema::MultimodalConfig {
+                vision_model_provider: Some("custom:https://example.invalid/v1".to_string()),
+                ..Default::default()
+            },
+            ..(*runtime_ctx).clone()
+        });
+
+        process_channel_message(runtime_ctx, msg, CancellationToken::new()).await;
+
+        // The phase-2 decision is the signal here: a confirmed-no-vision path
+        // returns and sends the catalog-outage message (localized text mentions
+        // "model catalog is temporarily unavailable"), whereas a configured
+        // vision route keeps the turn alive and does NOT emit that message. A
+        // later, unrelated failure (here the stub vision provider URL is not real
+        // on purpose) must be allowed — we only assert the phase-2 branch did not
+        // take the fail-visible catalog path.
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert!(
+            !sent_messages
+                .iter()
+                .any(|m| m.contains("model catalog is temporarily unavailable")),
+            "a configured vision route must not surface the catalog-outage message on primary unknown, got: {:?}",
+            *sent_messages
         );
     }
 

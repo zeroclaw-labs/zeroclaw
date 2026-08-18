@@ -471,12 +471,15 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
     /// interpreted as an authoritative negative capability result that strips
     /// an image attachment and dispatches a text-only request.
     ///
-    /// Default implementation mirrors [`Self::capabilities_for_model`] for
-    /// providers whose capability query has no external metadata to warm.
+    /// Default implementation warms any metadata first, then queries — the same
+    /// "atomically warming" order wrapper providers rely on — and mirrors
+    /// [`Self::capabilities_for_model`] for providers whose capability query has
+    /// no external metadata to warm (`warm` is a no-op there).
     async fn resolve_capabilities_for_model(
         &self,
         model: &str,
     ) -> anyhow::Result<ProviderCapabilities> {
+        self.warm_capabilities_metadata().await;
         Ok(self.capabilities_for_model(model))
     }
 
