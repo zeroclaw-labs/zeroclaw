@@ -404,6 +404,7 @@ zc-chat-no-agents = No enabled agents yet. Open Quickstart to create one, or use
 zc-chat-error-fetch-agents = Failed to fetch agents: { $error }
 zc-chat-history-trimmed = Earlier conversation history was trimmed: { $reason } ({ $dropped } messages dropped; { $kept } turns kept).
 zc-chat-history-trimmed-tokens = Earlier conversation history was trimmed from approximately { $before } to { $after } tokens: { $reason }; { $dropped } messages dropped and { $kept } turns kept.
+zc-chat-history-trimmed-floor = The conversation history could not be trimmed below the configured token budget: { $reason }; the most recent turn still needs approximately { $after } tokens (configured budget: { $budget }).
 zc-chat-history-trimmed-token-budget-clause = (configured token budget: { $budget })
 zc-chat-history-trimmed-token-source-provider = provider-reported
 zc-chat-history-trimmed-token-source-estimate = estimated

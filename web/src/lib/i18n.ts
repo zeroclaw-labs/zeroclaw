@@ -1445,6 +1445,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.error_prefix': '[Error]',
     'agent.history_trimmed': 'Earlier conversation history was trimmed: {reason} ({dropped} messages dropped; {kept} turns kept).',
     'agent.history_trimmed_tokens': 'Earlier conversation history was trimmed from approximately {before} to {after} tokens: {reason}; {dropped} messages dropped and {kept} turns kept.',
+    'agent.history_trimmed_floor': 'The conversation history could not be trimmed below the configured token budget: {reason}; the most recent turn still needs approximately {after} tokens (configured budget: {budget}).',
     'agent.history_trimmed_tokens_budget_clause': ' (configured token budget: {budget})',
     'agent.history_trimmed_tokens_source_provider': 'provider-reported',
     'agent.history_trimmed_tokens_source_estimate': 'estimated',

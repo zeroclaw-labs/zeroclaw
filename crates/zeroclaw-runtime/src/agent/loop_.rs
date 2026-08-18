@@ -14617,7 +14617,15 @@ Let me check the result."#;
                         strict_tool_parsing: false,
                         parallel_tools: false,
                         max_tool_result_chars: 0,
-                        context_token_budget: 100,
+                        // The reported-budget enforcement projects the NEXT
+                        // request from the durable history at the calibration
+                        // ratio (reported 80 / estimated ~30 ≈ 2.7), which lands
+                        // just over a 100-token budget for the 5-message
+                        // post-response history. The budget here must sit above
+                        // that projected next request so the accepted 80-token
+                        // context fill does not force a projection-driven trim;
+                        // the `must not trim` contract below stays meaningful.
+                        context_token_budget: 120,
                         receipt_generator: None,
                         knobs: &LoopKnobs::default(),
                     },

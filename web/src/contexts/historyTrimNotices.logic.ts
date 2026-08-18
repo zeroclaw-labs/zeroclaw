@@ -27,6 +27,20 @@ export function buildHistoryTrimmedNotice(
   const dropped = String(msg.dropped_messages ?? 0);
   const kept = String(msg.kept_turns ?? 0);
   const hasTokens = msg.tokens_before != null && msg.tokens_after != null;
+  // The untrimmable newest-turn/schema floor is emitted with `dropped_messages`
+  // 0 while the projected `tokens_after` still exceeds the configured budget.
+  // It must not claim history was trimmed: render a distinct, truthful notice.
+  const atFloor =
+    (msg.dropped_messages ?? 0) === 0 &&
+    hasTokens &&
+    msg.token_budget != null &&
+    msg.tokens_after > msg.token_budget;
+  if (atFloor) {
+    return t('agent.history_trimmed_floor')
+      .replace('{reason}', reason)
+      .replace('{after}', String(msg.tokens_after))
+      .replace('{budget}', String(msg.token_budget));
+  }
   if (!hasTokens) {
     return t('agent.history_trimmed')
       .replace('{reason}', reason)
