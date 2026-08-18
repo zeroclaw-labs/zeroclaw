@@ -1,0 +1,14 @@
+{
+  "model_name": "regression-unicode-tool-arguments-roundtrip",
+  "turns": [
+    { "user_input": "Répète exactement: naïve café 日本語 ✓", "steps": [
+      { "response": { "type": "tool_calls", "tool_calls": [{ "id": "call_1", "name": "echo", "arguments": { "message": "naïve café 日本語 ✓" } }], "input_tokens": 32, "output_tokens": 16 } },
+      { "response": { "type": "text", "content": "Echoed: naïve café 日本語 ✓", "input_tokens": 54, "output_tokens": 12 } }
+    ]}
+  ],
+  "expects": {
+    "response_contains": ["naïve café 日本語 ✓"],
+    "tools_used": ["echo"],
+    "all_tools_succeeded": true
+  }
+}

@@ -518,7 +518,7 @@ impl LogLevel {
 enum EvalCommands {
     /// Run a suite of evaluation cases.
     Run {
-        /// Directory of `*.json` trace fixtures (defaults to `evals`).
+        /// Directory of `*.json` trace fixtures (defaults to `evals/regression`).
         #[arg(long)]
         suite: Option<String>,
 
@@ -530,6 +530,31 @@ enum EvalCommands {
         /// Output format.
         #[arg(long, value_enum, default_value = "table")]
         format: commands::eval::OutputFormat,
+
+        /// Directory to write a per-case run record (JSON) into.
+        // i18n-exempt: clap derive help — framework requires a compile-time literal
+        #[arg(long)]
+        dump_records: Option<String>,
+
+        /// Compare the run against a baseline file (JSON) and gate on regressions.
+        // i18n-exempt: clap derive help — framework requires a compile-time literal
+        #[arg(long)]
+        baseline: Option<String>,
+
+        /// Write the run's results as a baseline file (JSON), then exit.
+        // i18n-exempt: clap derive help — framework requires a compile-time literal
+        #[arg(long)]
+        write_baseline: Option<String>,
+
+        /// Override the suite kind: `regression` (gating) or `capability` (tracked).
+        // i18n-exempt: clap derive help — framework requires a compile-time literal
+        #[arg(long)]
+        suite_kind: Option<String>,
+
+        /// Append a transcript-free run-history receipt under this directory.
+        // i18n-exempt: clap derive help — framework requires a compile-time literal
+        #[arg(long)]
+        history_dir: Option<String>,
     },
 }
 
@@ -1058,8 +1083,8 @@ expectations. No network calls, fully deterministic. Exits non-zero if any case 
 so it can gate CI.
 
 Examples:
-  zeroclaw eval run                                  # replay ./evals
-  zeroclaw eval run --suite evals --format json")]
+  zeroclaw eval run                                  # replay ./evals/regression
+  zeroclaw eval run --suite evals/regression --format json")]
     Eval {
         #[command(subcommand)]
         eval_command: EvalCommands,
@@ -5346,16 +5371,45 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 suite,
                 mode,
                 format,
+                dump_records,
+                baseline,
+                write_baseline,
+                suite_kind,
+                history_dir,
             } => {
                 let suite_dir = suite.unwrap_or_else(|| config.eval.suite_dir.clone());
                 let mode: zeroclaw_eval::Mode =
                     mode.unwrap_or_else(|| config.eval.mode.clone()).parse()?;
-                let report = commands::eval::run(std::path::PathBuf::from(suite_dir), mode).await?;
-                commands::eval::print_report(&report, format);
-                if !report.all_passed() {
-                    std::process::exit(1);
-                }
-                Ok(())
+                let suite_path = std::path::PathBuf::from(suite_dir);
+                let kind = match suite_kind.as_deref() {
+                    None => None,
+                    Some("regression") => Some(zeroclaw_eval::baseline::SuiteKind::Regression),
+                    Some("capability") => Some(zeroclaw_eval::baseline::SuiteKind::Capability),
+                    Some(other) => {
+                        anyhow::bail!(
+                            "unknown --suite-kind '{other}' (expected 'regression' or 'capability')"
+                        )
+                    }
+                };
+                let run = commands::eval::run(&config, suite_path.clone(), mode).await?;
+                let opts = commands::eval::FinalizeOpts {
+                    format,
+                    dump_records: dump_records.map(std::path::PathBuf::from),
+                    baseline: baseline.map(std::path::PathBuf::from),
+                    write_baseline: write_baseline.map(std::path::PathBuf::from),
+                    suite_kind: kind,
+                    history_dir: history_dir.map(std::path::PathBuf::from),
+                };
+                let code = Box::pin(commands::eval::finalize(
+                    &config,
+                    mode,
+                    &suite_path,
+                    &run.provider_ref,
+                    run.report,
+                    opts,
+                ))
+                .await?;
+                std::process::exit(code);
             }
         },
 

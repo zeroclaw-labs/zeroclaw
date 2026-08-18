@@ -1,0 +1,14 @@
+{
+  "model_name": "regression-gh8929-trimmed-final-text-not-duplicated",
+  "turns": [
+    { "user_input": "Echo the word ready, then confirm once.", "steps": [
+      { "response": { "type": "tool_calls", "tool_calls": [{ "id": "call_1", "name": "echo", "arguments": { "message": "ready" } }], "input_tokens": 28, "output_tokens": 12 } },
+      { "response": { "type": "text", "content": "  Done: echoed ready.  ", "input_tokens": 44, "output_tokens": 9 } }
+    ]}
+  ],
+  "expects": {
+    "response_matches": ["^\\s*Done: echoed ready\\.\\s*$"],
+    "tools_used": ["echo"],
+    "max_tool_calls": 1
+  }
+}

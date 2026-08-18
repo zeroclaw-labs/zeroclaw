@@ -1,0 +1,14 @@
+{
+  "model_name": "regression-gh8327-no-image-marker-leak",
+  "turns": [
+    { "user_input": "Echo the caption for the diagram.", "steps": [
+      { "response": { "type": "tool_calls", "tool_calls": [{ "id": "call_1", "name": "echo", "arguments": { "message": "architecture overview diagram" } }], "input_tokens": 24, "output_tokens": 12 } },
+      { "response": { "type": "text", "content": "Caption: architecture overview diagram.", "input_tokens": 42, "output_tokens": 8 } }
+    ]}
+  ],
+  "expects": {
+    "response_contains": ["architecture overview diagram"],
+    "response_not_contains": ["[IMAGE:", "data:image"],
+    "max_tool_calls": 1
+  }
+}

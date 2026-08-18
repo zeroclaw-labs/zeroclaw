@@ -1,0 +1,13 @@
+{
+  "model_name": "regression-overlong-input-stays-focused",
+  "turns": [
+    { "user_input": "Here is a lot of background that you do not need. filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler. In one word, is the sky blue?", "steps": [
+      { "response": { "type": "text", "content": "Yes.", "input_tokens": 120, "output_tokens": 2 } }
+    ]}
+  ],
+  "expects": {
+    "response_contains": ["Yes"],
+    "response_not_contains": ["error", "filler"],
+    "max_tool_calls": 0
+  }
+}

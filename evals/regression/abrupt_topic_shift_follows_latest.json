@@ -1,0 +1,16 @@
+{
+  "model_name": "regression-abrupt-topic-shift-follows-latest",
+  "turns": [
+    { "user_input": "Help me draft a release checklist for the gateway.", "steps": [
+      { "response": { "type": "text", "content": "Draft checklist: freeze the branch, run the release gates, tag the build.", "input_tokens": 22, "output_tokens": 16 } }
+    ]},
+    { "user_input": "Actually, forget that. What timezone is UTC+9?", "steps": [
+      { "response": { "type": "text", "content": "UTC+9 corresponds to Japan Standard Time.", "input_tokens": 40, "output_tokens": 10 } }
+    ]}
+  ],
+  "expects": {
+    "response_contains": ["Japan Standard Time"],
+    "response_not_contains": ["checklist"],
+    "max_tool_calls": 0
+  }
+}

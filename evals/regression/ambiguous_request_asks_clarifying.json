@@ -1,0 +1,14 @@
+{
+  "model_name": "regression-ambiguous-request-asks-clarifying",
+  "turns": [
+    { "user_input": "Send it.", "steps": [
+      { "response": { "type": "text", "content": "Could you clarify what you'd like me to send, and to whom?", "input_tokens": 12, "output_tokens": 13 } }
+    ]}
+  ],
+  "expects": {
+    "response_contains": ["clarify"],
+    "response_matches": ["\\?"],
+    "tools_not_used": ["echo"],
+    "max_tool_calls": 0
+  }
+}

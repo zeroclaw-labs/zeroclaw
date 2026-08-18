@@ -9,6 +9,21 @@ pub trait Sandbox: Send + Sync {
 
     fn is_available(&self) -> bool;
 
+    /// Whether this backend actually confines the spawned process at the OS
+    /// level.
+    ///
+    /// `is_available()` answers "can this backend be used here?"; a pass-through
+    /// backend answers `true` to that and still provides no confinement. Callers
+    /// that must fail closed when no real isolation exists need this distinct
+    /// predicate instead of downcasting to a concrete type. Defaults to
+    /// [`Sandbox::is_available`] so a new enforcing backend is never silently
+    /// treated as pass-through, and a backend that is unavailable on this
+    /// platform never claims confinement; [`NoopSandbox`] overrides it to
+    /// `false`.
+    fn is_enforcing(&self) -> bool {
+        self.is_available()
+    }
+
     /// Return the human-readable name of this sandbox backend.
     /// Used in logs and diagnostics to identify which isolation strategy is
     /// active (e.g., `"firejail"`, `"bubblewrap"`, `"none"`).
@@ -41,6 +56,10 @@ impl Sandbox for NoopSandbox {
 
     fn is_available(&self) -> bool {
         true
+    }
+
+    fn is_enforcing(&self) -> bool {
+        false
     }
 
     fn name(&self) -> &str {

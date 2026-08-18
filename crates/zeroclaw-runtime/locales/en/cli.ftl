@@ -1117,6 +1117,22 @@ sop-rpc-decision-unauthorized = The RPC principal is not authorized to resolve t
 sop-rpc-policy-missing = SOP approval policy '{$name}' is not configured.
 sop-rpc-policy-unavailable = The parked SOP policy is unavailable: {$reason}.
 
+# ── Evaluation harness ──
+cli-eval-failed-case-records =   failed-case records: {$dir}/
+cli-eval-flaky-unconfirmed-regression =   flaky (unconfirmed regression): {$id}
+cli-eval-baseline-comparison =   baseline comparison:
+cli-eval-self-judge-warning =   warning: judge and live provider are the same provider reference (self-judging bias)
+cli-eval-calibration-warning =   warning: [eval].judge_gate is set but no valid calibration exists for {$judge_ref}; judge grades stay diagnostic
+cli-eval-history-target-warning =   warning: eval history directory {$dir} is under target/ and may be cleared by other tooling; writing receipt anyway
+cli-eval-history-write-warning =   warning: failed to write eval history receipt: {$error}
+cli-eval-comparison-new = new
+cli-eval-comparison-removed = removed (warn) - in baseline, absent now
+cli-eval-comparison-unverifiable = changed - refresh baseline
+cli-eval-comparison-improvement = improvement
+cli-eval-comparison-flaky-unconfirmed = flaky (unconfirmed regression)
+cli-eval-comparison-regression = REGRESSION ({$categories})
+cli-eval-comparison-unchanged-tokens = unchanged (tokens {$pct}%)
+cli-eval-comparison-unchanged = unchanged
 # ── Runtime command construction — shell and skill shell tools ──
 tool-runtime-command-build-failed = Failed to build runtime command: {$error}
 tool-runtime-command-docker-workspace-path = Failed to build runtime command: Failed to canonicalize Docker workspace path {$path}: {$cause}
