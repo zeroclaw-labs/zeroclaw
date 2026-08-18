@@ -27,7 +27,7 @@ uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 postgres = { version = "0.19", features = ["with-chrono-0_4"], optional = true }
 
 [features]
-memory-postgres = ["dep:postgres", "zeroclaw-config/memory-postgres"]
+memory-postgres = ["dep:postgres", "zeroclaw-config/memory-postgres", "tokio/rt"]
 
 [dev-dependencies]
 filetime = "0.2"

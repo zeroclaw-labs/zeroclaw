@@ -1411,6 +1411,138 @@ mod tests {
         MessageParser::default().parse(raw).unwrap()
     }
 
+    // -- extract_attachments tests --
+
+    fn attachment_config(max_attachment_bytes: usize) -> EmailConfig {
+        EmailConfig {
+            max_attachment_bytes,
+            ..mailbox_identity_config()
+        }
+    }
+
+    #[test]
+    fn extract_attachments_returns_binary_parts_with_name_and_mime() {
+        let channel = EmailChannel::new(
+            attachment_config(default_max_attachment_bytes()),
+            "email_test_alias",
+            empty_resolver(),
+        );
+        let parsed = parse_test_email(
+            b"From: sender@example.invalid\r\n\
+              To: recipient@example.invalid\r\n\
+              Subject: Test with attachments\r\n\
+              MIME-Version: 1.0\r\n\
+              Content-Type: multipart/mixed; boundary=\"BOUNDARY\"\r\n\
+              \r\n\
+              --BOUNDARY\r\n\
+              Content-Type: text/plain\r\n\
+              \r\n\
+              Email body text\r\n\
+              --BOUNDARY\r\n\
+              Content-Type: application/pdf\r\n\
+              Content-Disposition: attachment; filename=\"document.pdf\"\r\n\
+              \r\n\
+              PDF_BINARY_DATA\r\n\
+              --BOUNDARY\r\n\
+              Content-Type: image/png\r\n\
+              Content-Disposition: attachment; filename=\"photo.png\"\r\n\
+              \r\n\
+              PNG_BINARY_DATA\r\n\
+              --BOUNDARY--\r\n",
+        );
+
+        let attachments = channel.extract_attachments(&parsed);
+
+        // The text/plain body part is not an attachment; the PDF and PNG are.
+        assert_eq!(attachments.len(), 2);
+
+        let pdf = attachments
+            .iter()
+            .find(|a| a.file_name == "document.pdf")
+            .expect("pdf attachment");
+        assert_eq!(pdf.mime_type.as_deref(), Some("application/pdf"));
+        assert_eq!(pdf.data, b"PDF_BINARY_DATA");
+
+        let png = attachments
+            .iter()
+            .find(|a| a.file_name == "photo.png")
+            .expect("png attachment");
+        assert_eq!(png.mime_type.as_deref(), Some("image/png"));
+        assert_eq!(png.data, b"PNG_BINARY_DATA");
+    }
+
+    #[test]
+    fn extract_attachments_skips_text_parts() {
+        let channel = EmailChannel::new(
+            attachment_config(default_max_attachment_bytes()),
+            "email_test_alias",
+            empty_resolver(),
+        );
+        // `notes.txt` carries Content-Disposition: attachment, so mail_parser
+        // yields it from `attachments()` — this is what reaches the `text/`
+        // guard. A bare text/plain body part never gets that far.
+        let parsed = parse_test_email(
+            b"From: sender@example.invalid\r\n\
+              To: recipient@example.invalid\r\n\
+              Subject: Text attachment\r\n\
+              MIME-Version: 1.0\r\n\
+              Content-Type: multipart/mixed; boundary=\"BOUNDARY\"\r\n\
+              \r\n\
+              --BOUNDARY\r\n\
+              Content-Type: text/plain\r\n\
+              \r\n\
+              Plain text body\r\n\
+              --BOUNDARY\r\n\
+              Content-Type: text/plain\r\n\
+              Content-Disposition: attachment; filename=\"notes.txt\"\r\n\
+              \r\n\
+              attached text file\r\n\
+              --BOUNDARY\r\n\
+              Content-Type: application/pdf\r\n\
+              Content-Disposition: attachment; filename=\"document.pdf\"\r\n\
+              \r\n\
+              PDF_BINARY_DATA\r\n\
+              --BOUNDARY--\r\n",
+        );
+
+        let attachments = channel.extract_attachments(&parsed);
+
+        // Only the PDF survives; every text/* part is left to extract_text.
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].file_name, "document.pdf");
+        assert!(!attachments.iter().any(|a| a.file_name == "notes.txt"));
+    }
+
+    #[test]
+    fn extract_attachments_drops_parts_past_configured_size_limit() {
+        let mut raw = String::from(
+            "From: sender@example.invalid\r\n\
+             To: recipient@example.invalid\r\n\
+             Subject: Large attachment\r\n\
+             MIME-Version: 1.0\r\n\
+             Content-Type: multipart/mixed; boundary=\"BOUNDARY\"\r\n\
+             \r\n\
+             --BOUNDARY\r\n\
+             Content-Type: text/plain\r\n\
+             \r\n\
+             Body\r\n\
+             --BOUNDARY\r\n\
+             Content-Type: application/octet-stream\r\n\
+             Content-Disposition: attachment; filename=\"large.bin\"\r\n\
+             \r\n",
+        );
+        raw.push_str(&"X".repeat(150));
+        raw.push_str("\r\n--BOUNDARY--\r\n");
+        let parsed = MessageParser::default().parse(raw.as_bytes()).unwrap();
+
+        // The limit is read from EmailConfig, the same field production uses.
+        let under = EmailChannel::new(attachment_config(100), "email_test_alias", empty_resolver());
+        assert!(under.extract_attachments(&parsed).is_empty());
+
+        let over = EmailChannel::new(attachment_config(200), "email_test_alias", empty_resolver());
+        assert_eq!(over.extract_attachments(&parsed).len(), 1);
+    }
+
     #[test]
     fn build_parsed_email_keeps_existing_message_id() {
         let channel = EmailChannel::new(

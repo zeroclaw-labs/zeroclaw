@@ -8418,6 +8418,32 @@ pub struct PluginEntryConfig {
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub config: HashMap<String, String>,
+    /// Destinations this plugin instance may reach. Default: empty,
+    /// which means **no network reach at all** — a transport permission such as
+    /// `http_client` grants the surface, this field grants the destinations.
+    ///
+    /// Entries are exact hosts (`api.example.com`, `10.0.0.5`) or explicit
+    /// suffix patterns (`*.example.com`, which matches subdomains but **not**
+    /// the apex — list the apex separately if it is needed). A bare domain
+    /// never implies its subdomains, and there is no `*` meaning "anywhere".
+    /// Ports are not part of an entry: granting a host grants every port on it.
+    ///
+    /// Deliberately a **plaintext sibling** of the `#[secret]` `config` map and
+    /// never inside it: the allowlist is the thing an operator audits, so it
+    /// has to stay readable in the file they are auditing.
+    #[serde(default)]
+    pub egress_hosts: Vec<String>,
+    /// Subset of `egress_hosts` additionally permitted to resolve to a private,
+    /// loopback, or link-local address (a self-hosted Gitea, a LAN Nextcloud).
+    /// Mirrors the `allowed_private_hosts` semantics the host tools already use.
+    ///
+    /// This relaxes the *address class* only. It never widens `egress_hosts` —
+    /// a host listed here but not there is still denied — and cloud metadata
+    /// addresses stay refused regardless of what is listed, including through a
+    /// configured `security.nat64_prefixes` translation. Unlike the tool-layer
+    /// field, `*` is not accepted here.
+    #[serde(default)]
+    pub egress_allow_private: Vec<String>,
 }
 
 /// Plugin system configuration.
@@ -8458,6 +8484,24 @@ impl PluginsConfig {
             .iter()
             .find(|e| e.name == alias)
             .map(|e| &e.config)
+    }
+
+    /// The granted egress allowlist and private-address carveout for `alias`,
+    /// as `(egress_hosts, egress_allow_private)`.
+    ///
+    /// A missing entry returns two empty lists, which is deny-everything. This
+    /// is the read the plugin host performs **per request**, so an operator's
+    /// edit applies without re-instantiating the guest (resolved from live
+    /// config at use time
+    /// resolution). Both lists are returned as authored; they were validated by
+    /// [`Config::validate`] at load, and the matcher re-canonicalizes nothing.
+    #[must_use]
+    pub fn entry_egress(&self, alias: &str) -> (Vec<String>, Vec<String>) {
+        self.entries
+            .iter()
+            .find(|e| e.name == alias)
+            .map(|e| (e.egress_hosts.clone(), e.egress_allow_private.clone()))
+            .unwrap_or_default()
     }
 }
 
@@ -8527,6 +8571,13 @@ pub struct PluginLimitsConfig {
     /// Maximum component instances a plugin store may create.
     #[serde(default = "default_plugin_max_instances")]
     pub max_instances: usize,
+    /// Maximum live host-owned network connections per logical plugin instance,
+    /// shared across every transport and every store belonging to it.
+    ///
+    /// Unlike the ceilings above this one spans calls rather than bounding a
+    /// single call, because a connection outlives the call that opened it.
+    #[serde(default = "default_plugin_max_connections_per_instance")]
+    pub max_connections_per_instance: usize,
 }
 
 fn default_plugin_call_fuel() -> u64 {
@@ -8545,6 +8596,10 @@ fn default_plugin_max_instances() -> usize {
     64
 }
 
+fn default_plugin_max_connections_per_instance() -> usize {
+    16
+}
+
 impl Default for PluginLimitsConfig {
     fn default() -> Self {
         Self {
@@ -8552,6 +8607,7 @@ impl Default for PluginLimitsConfig {
             max_memory_mb: default_plugin_max_memory_mb(),
             max_table_elements: default_plugin_max_table_elements(),
             max_instances: default_plugin_max_instances(),
+            max_connections_per_instance: default_plugin_max_connections_per_instance(),
         }
     }
 }
@@ -21762,6 +21818,49 @@ impl Config {
                 "plugins.limits.max_instances must be greater than 0; a zero ceiling rejects every plugin at instantiation"
             );
         }
+        if self.plugins.limits.max_connections_per_instance == 0 {
+            validation_bail!(
+                InvalidNumericRange,
+                "plugins.limits.max_connections_per_instance",
+                "plugins.limits.max_connections_per_instance must be greater than 0; a zero ceiling rejects every plugin network connection"
+            );
+        }
+
+        // The granted egress allowlist is a security control, so a
+        // malformed entry is a hard config error rather than a silently
+        // dropped line. Both lists validate against the one shared strict
+        // grammar in `zeroclaw_infra::net_guard`.
+        for entry in &self.plugins.entries {
+            for (field, patterns) in [
+                ("egress_hosts", &entry.egress_hosts),
+                ("egress_allow_private", &entry.egress_allow_private),
+            ] {
+                let path = format!("plugins.entries.{}.{field}", entry.name);
+                if let Err(e) =
+                    zeroclaw_infra::net_guard::normalize_egress_patterns(patterns, &path)
+                {
+                    validation_bail!(InvalidFormat, path.clone(), "{}", e);
+                }
+            }
+
+            // A carveout for a host that was never granted is almost always a
+            // typo, and silently ignoring it leaves an operator believing they
+            // opened a path they did not.
+            for private in &entry.egress_allow_private {
+                if !zeroclaw_infra::net_guard::egress_host_matches(
+                    private.trim_start_matches("*."),
+                    &entry.egress_hosts,
+                ) && !entry.egress_hosts.iter().any(|h| h == private)
+                {
+                    validation_bail!(
+                        InvalidFormat,
+                        format!("plugins.entries.{}.egress_allow_private", entry.name),
+                        "plugins.entries.{}.egress_allow_private lists {private:?}, which is not granted by egress_hosts; the carveout relaxes an address class for a granted destination, it does not grant one",
+                        entry.name
+                    );
+                }
+            }
+        }
 
         Ok(())
     }
@@ -23831,10 +23930,12 @@ max_height = 8
         plugins.entries.push(super::PluginEntryConfig {
             name: "image_gen_fal".into(),
             config: std::collections::HashMap::from([("api_key".into(), "secret-a".into())]),
+            ..Default::default()
         });
         plugins.entries.push(super::PluginEntryConfig {
             name: "sd_webui".into(),
             config: std::collections::HashMap::from([("base_url".into(), "http://host".into())]),
+            ..Default::default()
         });
 
         let fal = plugins.entry_config("image_gen_fal").unwrap();
@@ -25031,6 +25132,154 @@ enabled = true
         config
             .validate()
             .expect("WebSocket ping interval upper bound must validate");
+    }
+
+    fn plugin_entry_with_egress(hosts: &[&str], private: &[&str]) -> super::PluginEntryConfig {
+        super::PluginEntryConfig {
+            name: "gitea".to_string(),
+            config: HashMap::new(),
+            egress_hosts: hosts.iter().map(|h| (*h).to_string()).collect(),
+            egress_allow_private: private.iter().map(|h| (*h).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    async fn validate_accepts_a_well_formed_egress_grant() {
+        let mut config = Config::default();
+        config.plugins.entries.push(plugin_entry_with_egress(
+            &["git.internal.example.com", "*.cdn.example.com", "10.0.0.5"],
+            &["git.internal.example.com", "10.0.0.5"],
+        ));
+        config.validate().expect("a canonical grant must validate");
+    }
+
+    #[test]
+    async fn validate_rejects_an_allow_all_egress_entry() {
+        let mut config = Config::default();
+        config
+            .plugins
+            .entries
+            .push(plugin_entry_with_egress(&["*"], &[]));
+        let err = config
+            .validate()
+            .expect_err("a bare '*' egress grant must be rejected");
+        let text = err.to_string();
+        assert!(
+            text.contains("plugins.entries.gitea.egress_hosts"),
+            "error must name the offending path; got: {text}"
+        );
+        assert!(text.contains("allow-all"), "got: {text}");
+    }
+
+    #[test]
+    async fn validate_rejects_malformed_egress_entries() {
+        for bad in [
+            "https://api.example.com",
+            "api.example.com:8443",
+            "*.com",
+            "",
+        ] {
+            let mut config = Config::default();
+            config
+                .plugins
+                .entries
+                .push(plugin_entry_with_egress(&[bad], &[]));
+            assert!(
+                config.validate().is_err(),
+                "egress_hosts entry {bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    async fn validate_rejects_a_carveout_for_an_ungranted_destination() {
+        let mut config = Config::default();
+        config.plugins.entries.push(plugin_entry_with_egress(
+            &["api.example.com"],
+            &["127.0.0.1"],
+        ));
+        let err = config
+            .validate()
+            .expect_err("a carveout must not stand in for a grant");
+        let text = err.to_string();
+        assert!(
+            text.contains("egress_allow_private"),
+            "error must name the offending path; got: {text}"
+        );
+        assert!(text.contains("not granted by egress_hosts"), "got: {text}");
+    }
+
+    /// The allowlist must stay in the plaintext half of the entry: an operator
+    /// audits the file, and an encrypted allowlist is not auditable.
+    #[test]
+    async fn egress_allowlist_is_not_part_of_the_secret_config_map() {
+        let entry = plugin_entry_with_egress(&["api.example.com"], &[]);
+        let rendered = ::toml::to_string(&entry).expect("entry serializes");
+        assert!(
+            rendered.contains("egress_hosts"),
+            "allowlist must serialize as a plaintext field; got:\n{rendered}"
+        );
+        assert!(
+            entry.config.is_empty(),
+            "the allowlist must not have landed inside the secret config map"
+        );
+    }
+
+    /// An entry authored before this field parses unchanged, and grants nothing.
+    #[test]
+    async fn entry_without_egress_fields_grants_nothing() {
+        let entry: super::PluginEntryConfig =
+            ::toml::from_str("name = \"legacy\"\n").expect("legacy entry parses");
+        assert!(entry.egress_hosts.is_empty());
+        assert!(entry.egress_allow_private.is_empty());
+
+        let mut config = Config::default();
+        config.plugins.entries.push(entry);
+        config.validate().expect("a legacy entry stays valid");
+        assert_eq!(
+            config.plugins.entry_egress("legacy"),
+            (Vec::new(), Vec::new())
+        );
+    }
+
+    #[test]
+    async fn entry_egress_returns_deny_all_for_an_unknown_alias() {
+        let config = Config::default();
+        assert_eq!(
+            config.plugins.entry_egress("never-configured"),
+            (Vec::new(), Vec::new()),
+            "an unconfigured instance must resolve to no reach"
+        );
+    }
+
+    #[test]
+    async fn entry_egress_returns_the_authored_grant_for_a_configured_alias() {
+        let mut config = Config::default();
+        config.plugins.entries.push(plugin_entry_with_egress(
+            &["git.internal.example.com"],
+            &["git.internal.example.com"],
+        ));
+        assert_eq!(
+            config.plugins.entry_egress("gitea"),
+            (
+                vec!["git.internal.example.com".to_string()],
+                vec!["git.internal.example.com".to_string()]
+            )
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_zero_plugin_max_connections_per_instance() {
+        let mut config = Config::default();
+        config.plugins.limits.max_connections_per_instance = 0;
+        let err = config
+            .validate()
+            .expect_err("zero max_connections_per_instance must be rejected");
+        assert!(
+            err.to_string()
+                .contains("plugins.limits.max_connections_per_instance"),
+            "error must name the offending path; got: {err}"
+        );
     }
 
     #[test]

@@ -413,6 +413,7 @@ zc-chat-approval-action-edit = 编辑
 zc-chat-clipboard-you = 你：{ $text }
 zc-chat-clipboard-agent = Agent：{ $text }
 zc-chat-copied-clipboard = 已复制到剪贴板
+zc-chat-context-menu-copy = 复制
 zc-config-breadcrumb-root = 配置
 zc-config-section-detail-hint = { $open } 或 { $into } 打开此部分
 zc-config-breadcrumb-new = 新建

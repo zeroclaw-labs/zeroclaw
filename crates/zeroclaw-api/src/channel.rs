@@ -1156,6 +1156,31 @@ mod tests {
     }
 
     #[test]
+    fn send_message_new_starts_without_attachments() {
+        let msg = SendMessage::new("content", "recipient@example.com");
+        assert!(msg.attachments.is_empty());
+    }
+
+    #[test]
+    fn send_message_with_attachments_stores_the_given_files() {
+        let msg = SendMessage::new("content", "recipient@example.com").with_attachments(vec![
+            MediaAttachment {
+                file_name: "test.pdf".to_string(),
+                data: vec![1, 2, 3],
+                mime_type: Some("application/pdf".to_string()),
+            },
+        ]);
+
+        assert_eq!(msg.attachments.len(), 1);
+        assert_eq!(msg.attachments[0].file_name, "test.pdf");
+        assert_eq!(msg.attachments[0].data, vec![1, 2, 3]);
+        assert_eq!(
+            msg.attachments[0].mime_type.as_deref(),
+            Some("application/pdf")
+        );
+    }
+
+    #[test]
     fn send_message_reply_to_references_defaults_to_parent_id_only() {
         let inbound = ChannelMessage::new("c", "alice", "user@example.com", "", "email", 0);
         let reply = SendMessage::reply_to(&inbound, "Got it");

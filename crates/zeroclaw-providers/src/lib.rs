@@ -1797,75 +1797,7 @@ impl ModelProviderCategory {
 /// multi-region, CLI shims).
 #[must_use]
 pub fn default_model_provider_url(name: &str) -> Option<&'static str> {
-    use factory::CompatFamilySpec;
-    use zeroclaw_config::schema::{
-        Ai21ModelProviderConfig, AihubmixModelProviderConfig, AnyscaleModelProviderConfig,
-        ArceeModelProviderConfig, AstraiModelProviderConfig, BaichuanModelProviderConfig,
-        BasetenModelProviderConfig, CerebrasModelProviderConfig, CloudflareModelProviderConfig,
-        CohereModelProviderConfig, DeepinfraModelProviderConfig, DeepseekModelProviderConfig,
-        DoubaoModelProviderConfig, FeatherlessModelProviderConfig, FireworksModelProviderConfig,
-        FriendliModelProviderConfig, GithubModelsModelProviderConfig,
-        HuggingfaceModelProviderConfig, HyperbolicModelProviderConfig,
-        InceptionModelProviderConfig, LambdaAiModelProviderConfig, LeptonModelProviderConfig,
-        LitellmModelProviderConfig, MistralModelProviderConfig, MorphModelProviderConfig,
-        NearaiModelProviderConfig, NebiusModelProviderConfig, NovitaModelProviderConfig,
-        NscaleModelProviderConfig, OpencodeModelProviderConfig, PerplexityModelProviderConfig,
-        RekaModelProviderConfig, SambanovaModelProviderConfig, SglangModelProviderConfig,
-        SiliconflowModelProviderConfig, SyntheticModelProviderConfig, TogetherModelProviderConfig,
-        UpstageModelProviderConfig, VercelModelProviderConfig, VllmModelProviderConfig,
-        YiModelProviderConfig,
-    };
-
-    match name {
-        "anthropic" => Some(anthropic::BASE_URL),
-        "openai" => Some(openai::BASE_URL),
-        "openrouter" => Some(openrouter::BASE_URL),
-        "ollama" => Some(ollama::BASE_URL),
-        "telnyx" => Some(telnyx::BASE_URL),
-        "gemini" => Some(gemini::BASE_URL),
-        "vercel" => Some(<VercelModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "cloudflare" => Some(<CloudflareModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "synthetic" => Some(<SyntheticModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "opencode" => Some(<OpencodeModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "doubao" => Some(<DoubaoModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "mistral" => Some(<MistralModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "deepseek" => Some(<DeepseekModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "together" => Some(<TogetherModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "fireworks" => Some(<FireworksModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "novita" => Some(<NovitaModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "perplexity" => Some(<PerplexityModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "cohere" => Some(<CohereModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "sglang" => Some(<SglangModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "vllm" => Some(<VllmModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "astrai" => Some(<AstraiModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "siliconflow" => Some(<SiliconflowModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "aihubmix" => Some(<AihubmixModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "litellm" => Some(<LitellmModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "cerebras" => Some(<CerebrasModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "sambanova" => Some(<SambanovaModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "hyperbolic" => Some(<HyperbolicModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "deepinfra" => Some(<DeepinfraModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "huggingface" => Some(<HuggingfaceModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "ai21" => Some(<Ai21ModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "reka" => Some(<RekaModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "baseten" => Some(<BasetenModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "nscale" => Some(<NscaleModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "anyscale" => Some(<AnyscaleModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "nebius" => Some(<NebiusModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "friendli" => Some(<FriendliModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "lepton" => Some(<LeptonModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "morph" => Some(<MorphModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "github_models" => Some(<GithubModelsModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "upstage" => Some(<UpstageModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "featherless" => Some(<FeatherlessModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "arcee" => Some(<ArceeModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "lambda_ai" => Some(<LambdaAiModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "inception" => Some(<InceptionModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "nearai" => Some(<NearaiModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "baichuan" => Some(<BaichuanModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "yi" => Some(<YiModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        _ => None,
-    }
+    factory::endpoint_for_family(name).and_then(factory::ProviderEndpoint::fixed_url)
 }
 
 /// Append a section of provider families under one category. DRY builder so the
@@ -3184,6 +3116,25 @@ mod tests {
     #[test]
     fn default_url_matches_compat_spec_for_new_providers() {
         assert_eq!(
+            default_model_provider_url("groq"),
+            Some("https://api.groq.com/openai/v1")
+        );
+        assert_eq!(
+            default_model_provider_url("nvidia"),
+            Some("https://integrate.api.nvidia.com/v1")
+        );
+        assert_eq!(default_model_provider_url("moonshot"), None);
+        assert_eq!(default_model_provider_url("azure"), None);
+        assert_eq!(default_model_provider_url("openai"), None);
+        assert_eq!(default_model_provider_url("gemini"), None);
+        assert_eq!(default_model_provider_url("copilot"), None);
+        assert_eq!(default_model_provider_url("custom"), None);
+        assert_eq!(default_model_provider_url("gemini_cli"), None);
+        assert_eq!(
+            default_model_provider_url("qianfan"),
+            Some(QIANFAN_BASE_URL)
+        );
+        assert_eq!(
             default_model_provider_url("morph"),
             Some("https://api.morphllm.com/v1")
         );
@@ -3211,6 +3162,32 @@ mod tests {
         assert_eq!(
             default_model_provider_url("inception"),
             Some("https://api.inceptionlabs.ai/v1")
+        );
+    }
+
+    #[test]
+    fn openrouter_context_window_url_uses_the_shared_default() {
+        for uri in [None, Some(""), Some("<unset>")] {
+            let config = zeroclaw_config::schema::ModelProviderConfig {
+                uri: uri.map(str::to_string),
+                ..Default::default()
+            };
+            assert_eq!(
+                openrouter_context_window_url(&config),
+                "https://openrouter.ai/api/v1/models"
+            );
+        }
+    }
+
+    #[test]
+    fn openrouter_context_window_url_preserves_the_configured_uri() {
+        let config = zeroclaw_config::schema::ModelProviderConfig {
+            uri: Some("https://proxy.example.test/openrouter/models".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            openrouter_context_window_url(&config),
+            "https://proxy.example.test/openrouter/models"
         );
     }
 
@@ -4680,6 +4657,75 @@ mod tests {
     }
 
     #[test]
+    fn provider_runtime_options_cross_family_no_leak() {
+        // Two different provider families (openai and anthropic) each with
+        // distinct max_tokens. Each agent resolves only its own provider's
+        // options, so a different provider's max_tokens cannot leak across
+        // agent boundaries.
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, AnthropicModelProviderConfig, Config, ModelProviderConfig,
+            OpenAIModelProviderConfig,
+        };
+
+        let mut config = Config::default();
+
+        // OpenAI alias with max_tokens = 16384.
+        config.providers.models.openai.insert(
+            "gpt".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o".to_string()),
+                    api_key: Some("fake-openai-key-not-real".to_string()),
+                    max_tokens: Some(16_384),
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+
+        // Anthropic alias with a different max_tokens.
+        config.providers.models.anthropic.insert(
+            "sonnet".to_string(),
+            AnthropicModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("claude-sonnet-4".to_string()),
+                    api_key: Some("fake-anthropic-key-not-real".to_string()),
+                    max_tokens: Some(8_192),
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+
+        config.agents.insert(
+            "openai_agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "openai.gpt".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "anthropic_agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "anthropic.sonnet".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let openai_opts = provider_runtime_options_for_agent(&config, "openai_agent");
+        let anthropic_opts = provider_runtime_options_for_agent(&config, "anthropic_agent");
+
+        assert_eq!(
+            openai_opts.provider_max_tokens,
+            Some(16_384),
+            "openai agent must get its own max_tokens, not the anthropic provider's"
+        );
+        assert_eq!(
+            anthropic_opts.provider_max_tokens,
+            Some(8_192),
+            "anthropic agent must get its own max_tokens, not the openai provider's"
+        );
+    }
+
+    #[test]
     fn resilient_alias_deep_acyclic_fallback_does_not_overflow() {
         use zeroclaw_config::schema::{Config, ModelProviderConfig, OpenAIModelProviderConfig};
 
@@ -4741,13 +4787,9 @@ async fn fetch_openrouter_context_window(
     config: &zeroclaw_config::schema::ModelProviderConfig,
 ) -> Option<usize> {
     let client = reqwest::Client::new();
-    let url = config
-        .uri
-        .as_deref()
-        .filter(|s| !s.is_empty() && *s != "<unset>")
-        .unwrap_or("https://openrouter.ai/api/v1/models");
+    let url = openrouter_context_window_url(config);
     let resp = client
-        .get(url)
+        .get(url.as_ref())
         .send()
         .await
         .ok()?
@@ -4763,12 +4805,25 @@ async fn fetch_openrouter_context_window(
         .map(|v| v as usize)
 }
 
+fn openrouter_context_window_url(
+    config: &zeroclaw_config::schema::ModelProviderConfig,
+) -> std::borrow::Cow<'_, str> {
+    config
+        .uri
+        .as_deref()
+        .filter(|s| !s.is_empty() && *s != "<unset>")
+        .map_or_else(
+            || std::borrow::Cow::Owned(openrouter::endpoint_url("models")),
+            std::borrow::Cow::Borrowed,
+        )
+}
+
 async fn fetch_openai_compatible_context_window(
     provider_type: &str,
     config: &zeroclaw_config::schema::ModelProviderConfig,
 ) -> Option<usize> {
     let client = reqwest::Client::new();
-    let default_uri = crate::factory::get_default_url(provider_type);
+    let default_uri = default_model_provider_url(provider_type);
     let base_url = config
         .uri
         .as_deref()

@@ -98,7 +98,6 @@ clap-markdown = "0.1"
 # Async runtime - feature-optimized for size
 tokio = { version = "1.50", default-features = false, features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync", "process", "io-std", "fs", "signal"] }
 tokio-util = { version = "0.7", default-features = false }
-tokio-stream = { version = "0.1.18", default-features = false, features = ["fs", "sync"] }
 
 # HTTP client - minimal features
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking", "multipart", "stream", "socks"] }
@@ -110,30 +109,18 @@ serde_json = { version = "1.0", default-features = false, features = ["std"] }
 # Config
 directories = "6.0"
 toml = "1.0"
-toml_edit = "0.25"  # already a transitive dep via toml — zero added compile/binary cost
-shellexpand = "3.1"
 
 # JSON Schema generation for config export
 schemars = "1.2"
 
 # Logging - minimal
 
-# Base64 encoding (screenshots, image data)
-base64 = "0.22"
-image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
-
 # URL encoding for web search
 urlencoding = "2.1"
-
-# HTML to plain text conversion (web_fetch tool)
-nanohtml2text = "0.2"
 
 # Tarball extraction for binary updates
 flate2 = "1"
 tar = "0.4"
-
-# Progress bars (update pipeline)
-indicatif = "0.18"
 
 # Temp files (update pipeline rollback)
 tempfile = "3.26"
@@ -143,87 +130,35 @@ zip = { version = "8.1", default-features = false, features = ["deflate-flate2"]
 
 # Error handling
 anyhow = "1.0"
-thiserror = "2.0"
-
-# UUID generation
-uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
-
-# Authenticated encryption (AEAD) for secret store
-chacha20poly1305 = "0.10"
 
 # HMAC for webhook signature verification
-hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
-
-# CSPRNG for secure token generation
-rand = "0.10"
-
-# Portable atomic fallbacks for targets without native 64-bit atomics
-portable-atomic = "1"
-
-# Fast mutexes that don't poison on panic
-parking_lot = "0.12"
 
 # Async traits
 async-trait = "0.1"
 
-# HMAC-SHA256 (Zhipu/GLM JWT auth)
-ring = { version = "0.17", optional = true }
-
-# LRU cache for bounded sender state
-lru = { version = "0.18.2", optional = true }
-
 # Memory / persistence (migration.rs, behind agent-runtime)
 rusqlite = { version = "0.37", features = ["bundled"], optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
-chrono-tz = { version = "0.10", optional = true }
-cron = { version = "0.15", optional = true }
 
 # Interactive CLI prompts (memory CLI uses dialoguer unconditionally)
 dialoguer = { version = "0.12", features = ["fuzzy-select"] }
 console = "0.16"
-
-# TUI onboarding (ratatui + crossterm)
-ratatui = { version = "0.30", default-features = true, optional = true }
-crossterm = { version = "0.29", features = ["event-stream"], optional = true }
-
-# Hardware discovery (device path globbing)
-glob = { version = "0.3", optional = true }
-
-# Nostr key validation for wizard (behind channel-nostr feature)
-nostr-sdk = { version = "0.44", default-features = false, optional = true }
 
 # Binary discovery (init system detection)
 which = { version = "8.0", optional = true }
 
 # WebSocket client channels (Discord/Lark/DingTalk/Nostr)
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"], optional = true }
-tokio-socks = { version = "0.5", optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
-regex = "1.10"
-hostname = { version = "0.4.2", optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"], optional = true }
-rustls-pemfile = { version = "2", optional = true }
-rustls-pki-types = { version = "1.14.0", optional = true }
-tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "logging", "tls12"], optional = true }
-webpki-roots = { version = "1.0.6", optional = true }
-
-# email
-lettre = { version = "0.11.22", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"], optional = true }
-mail-parser = { version = "0.11.2", optional = true }
-async-imap = { version = "0.11", features = ["runtime-tokio"], default-features = false, optional = true }
 
 # HTTP server (gateway) — replaces raw TCP for proper HTTP/1.1 compliance
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query", "ws", "macros"], optional = true }
-hyper = { version = "1", features = ["http1", "server"], optional = true }
-hyper-util = { version = "0.1", features = ["tokio", "server-auto", "server-graceful"], optional = true }
 tower = { version = "0.5", default-features = false, features = ["util"], optional = true }
-tower-http = { version = "0.6", default-features = false, features = ["limit", "timeout"], optional = true }
-http-body-util = { version = "0.1", optional = true }
 
 # rust-embed removed — web dashboard served from filesystem via gateway.web_dist_dir
-mime_guess = { version = "2", optional = true }
 
 # Use the blocking HTTP exporter client to avoid Tokio-reactor panics in
 # non-Tokio contexts.
@@ -231,10 +166,6 @@ mime_guess = { version = "2", optional = true }
 # (Linux, macOS, Windows). Android/Termux uses target_os="android" and is excluded.
 
 # Uses whatsapp-rust for Bot and Client, wacore for storage traits, custom rusqlite backend avoids Diesel conflict.
-
-# Unix-specific dependencies (for root check, etc.)
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
 
 # Installer/surface metadata: which `[features]` are internal aggregates or
 # meta toggles rather than user-selectable rows. This bit is NOT derivable from
@@ -295,10 +226,9 @@ default = [
 agent-runtime = [
     "dep:zeroclaw-runtime", "dep:zeroclaw-eval", "dep:zeroclaw-channels", "dep:zeroclaw-tools",
     "dep:rusqlite",
-    "dep:ring", "dep:lru", "dep:chrono-tz", "dep:cron", "dep:glob", "dep:which",
-    "dep:ratatui", "dep:crossterm",
-    "dep:tokio-tungstenite", "dep:tokio-socks", "dep:hostname",
-    "dep:rustls", "dep:rustls-pemfile", "dep:rustls-pki-types", "dep:tokio-rustls", "dep:webpki-roots",
+    "dep:which",
+    "dep:tokio-tungstenite",
+    "dep:rustls",
 ]
 
 # Lean channel bundle included in `default`. These channels cover local/editor
@@ -325,17 +255,16 @@ channels-full = [
 # Major subsystems — each forwards to exactly ONE crate
 gateway = [
     "dep:zeroclaw-gateway",
-    "dep:axum", "dep:hyper", "dep:hyper-util", "dep:tower", "dep:tower-http", "dep:http-body-util",
-    "dep:mime_guess",
+    "dep:axum", "dep:tower",
 ]
 schema-export = ["zeroclaw-config/schema-export"]
 acp-bridge = ["dep:tokio-tungstenite"]
 
 # Channels — each forwards to zeroclaw-channels.
-channel-email = ["zeroclaw-channels/channel-email", "zeroclaw-gateway?/channel-email", "dep:lettre", "dep:mail-parser", "dep:async-imap"]
+channel-email = ["zeroclaw-channels/channel-email", "zeroclaw-gateway?/channel-email"]
 channel-telegram = ["zeroclaw-channels/channel-telegram"]
 channel-lark = ["zeroclaw-channels/channel-lark"]
-channel-nostr = ["zeroclaw-channels/channel-nostr", "dep:nostr-sdk"]
+channel-nostr = ["zeroclaw-channels/channel-nostr"]
 channel-matrix = ["zeroclaw-channels/channel-matrix"]
 channel-discord = ["zeroclaw-channels/channel-discord"]
 channel-slack = ["zeroclaw-channels/channel-slack"]
@@ -478,6 +407,12 @@ scopeguard = "1.2"
 rcgen = "0.13"
 proc-macro2 = { version = "1", features = ["span-locations"] }
 syn = { version = "2", features = ["full", "visit"] }
+# test-only: moved out of [dependencies] — no `src/` usage
+base64 = "0.22"
+hmac = "0.12"
+parking_lot = "0.12"
+regex = "1.10"
+uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 
 [[test]]
 name = "component"

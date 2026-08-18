@@ -14,12 +14,20 @@
 //! - [`normalize_domain`] / [`normalize_allowed_domains`]: turn operator-authored
 //!   allowlist entries into canonical bare hosts.
 //! - [`host_matches_allowlist`]: match a request host against those entries.
+//! - [`normalize_egress_pattern`] / [`normalize_egress_patterns`] /
+//!   [`egress_host_matches`]: the strict, deny-by-default grammar and matcher
+//!   used by plugin egress policy, where the permissive tool-layer semantics
+//!   above would be a footgun.
+//! - [`normalize_host`]: canonicalize one *request* host, strictly.
 //! - [`is_cloud_metadata_ip`], [`is_private_or_local_host`], [`is_non_global_v4`],
 //!   [`is_non_global_v6`]: address-class classification.
 //! - [`Nat64Prefix`] / [`parse_nat64_prefixes`]: the operator-declared,
 //!   network-specific RFC 6052 NAT64 prefixes deployed on this host's network.
 //! - [`validate_resolved_ips_are_public`] /
 //!   [`validate_resolved_ips_exclude_metadata`]: post-resolution SSRF checks.
+//! - [`ResolvedDestination`] / [`PrivateNetworkAccess`] / [`NetworkGuardError`]:
+//!   a validated answer set that a caller dials *instead of* resolving again,
+//!   with a typed rejection reason.
 //!
 //! # NAT64 and the validation boundary
 //!
@@ -152,6 +160,199 @@ pub fn host_matches_allowlist(host: &str, allowed: &[String]) -> bool {
                 .strip_suffix(pattern)
                 .is_some_and(|prefix| prefix.ends_with('.'))
     })
+}
+
+// ── strict egress grammar and matching ────────────────────────────
+// The tool-layer `allowed_domains` semantics above are deliberately
+// permissive: a bare `*` matches everything and a bare domain implies its
+// subdomains. Plugin egress policy requires the opposite defaults,
+// so it gets its own grammar and its own matcher rather than a flag on the
+// permissive one. Keeping them as separate functions means a caller cannot
+// accidentally inherit the loose rules by forgetting an argument.
+
+/// Canonicalize one egress allowlist entry, or explain why it is rejected.
+///
+/// This is the single grammar for both halves of the egress contract: the signed
+/// manifest's `egress.hosts` declaration and the operator's
+/// `plugins.entries[].egress_hosts` grant. Both validate here so a pattern that
+/// a publisher can declare is exactly a pattern an operator can grant.
+///
+/// Accepted forms:
+/// - an **exact host**: a lowercase domain name, IPv4 literal, or IPv6 literal
+///   (bare `::1` or bracketed `[::1]`; both canonicalize to bare). It matches
+///   that host and nothing else — a bare domain never implies its subdomains.
+/// - an **explicit suffix pattern** `*.example.com`: matches strict subdomains
+///   of `example.com` and **not** the apex itself. Grant the apex by listing it
+///   separately.
+///
+/// Rejected, each with a message naming the reason:
+/// - a bare `*`. There is no "everything" pattern; deny-by-default has no
+///   escape hatch at the grammar level.
+/// - empty or whitespace-bearing entries.
+/// - anything carrying a scheme, path, query, fragment, or userinfo (`/`, `@`,
+///   `?`, `#`, `\`), so an entry is never a URL that silently loses its path.
+/// - a `*` anywhere other than the leading `*.` (no `a*.b`, no `*.*.c`).
+/// - **a port** (`example.com:8443`). Ports are deliberately not part of this
+///   slice's grammar: a granted host is granted on *every* port, all-or-nothing.
+///   Rejecting the syntax outright keeps an operator from writing a port and
+///   believing it narrowed the grant when it would in fact have been dropped.
+/// - a wildcard over an IP literal (`*.10.0.0.1`), which has no meaning.
+/// - a single-label wildcard suffix (`*.com`, `*.internal`). This is a footgun
+///   guard, not a public-suffix check: no public-suffix list is imported here,
+///   so `*.co.uk` is **accepted** even though it is just as broad. The rule only
+///   removes the most obvious way to write an accidental internet-wide grant.
+/// - any entry that is not already canonical (a trailing dot, uppercase, or a
+///   form [`normalize_domain`] would silently rewrite), so the file an operator
+///   audits reads exactly as the policy that is enforced.
+///
+/// # Errors
+///
+/// Returns the human-readable reason the entry is not a legal egress pattern.
+pub fn normalize_egress_pattern(raw: &str) -> Result<String, String> {
+    let input = raw.trim();
+    if input.is_empty() {
+        return Err("entry must not be empty".to_string());
+    }
+    if input.chars().any(char::is_whitespace) {
+        return Err(format!("entry {input:?} must not contain whitespace"));
+    }
+    if let Some(bad) = input
+        .chars()
+        .find(|c| matches!(c, '/' | '@' | '?' | '#' | '\\'))
+    {
+        return Err(format!(
+            "entry {input:?} must be a bare host or '*.suffix' pattern, not a URL (found {bad:?})"
+        ));
+    }
+
+    let lower = input.to_ascii_lowercase();
+    if lower != input {
+        return Err(format!(
+            "entry {input:?} must be lowercase (write {lower:?})"
+        ));
+    }
+    if lower == "*" {
+        return Err(
+            "a bare '*' is not a valid egress entry: there is no allow-all pattern; list exact hosts or '*.suffix' patterns"
+                .to_string(),
+        );
+    }
+
+    let (wildcard, host) = match lower.strip_prefix("*.") {
+        Some(rest) => (true, rest),
+        None => (false, lower.as_str()),
+    };
+    if host.contains('*') {
+        return Err(format!(
+            "entry {input:?} may only use '*' as a leading '*.' suffix pattern"
+        ));
+    }
+    if host.is_empty() {
+        return Err(format!("entry {input:?} has an empty suffix after '*.'"));
+    }
+
+    // Port detection has to look past IPv6 colons: strip a matched bracket pair
+    // first, then treat a remaining ':' in a non-IPv6 host as a port.
+    let bare = match (host.starts_with('['), host.ends_with(']')) {
+        (true, true) => &host[1..host.len() - 1],
+        _ => host,
+    };
+    if bare.contains(':') && bare.parse::<std::net::Ipv6Addr>().is_err() {
+        return Err(format!(
+            "entry {input:?} must not carry a port: an egress grant covers every port on the host, so write just the host"
+        ));
+    }
+
+    let canonical = normalize_domain(host)
+        .ok_or_else(|| format!("entry {input:?} is not a valid host or IP literal"))?;
+    if canonical != host && format!("[{canonical}]") != host {
+        return Err(format!(
+            "entry {input:?} is not in canonical form (write {canonical:?})"
+        ));
+    }
+
+    if wildcard {
+        if canonical.parse::<std::net::IpAddr>().is_ok() {
+            return Err(format!(
+                "entry {input:?} cannot wildcard an IP literal; list the address exactly"
+            ));
+        }
+        if !canonical.contains('.') {
+            return Err(format!(
+                "entry {input:?} wildcards a single-label suffix, which is far broader than it looks; write a suffix with at least two labels (for example '*.example.com')"
+            ));
+        }
+        return Ok(format!("*.{canonical}"));
+    }
+
+    Ok(canonical)
+}
+
+/// Validate and canonicalize a whole egress allowlist, sorted and deduplicated.
+///
+/// `label` names the surface in the error so an operator can find the offending
+/// entry (for example `plugins.entries[github].egress_hosts`).
+///
+/// # Errors
+///
+/// Returns an error naming every rejected entry and why.
+pub fn normalize_egress_patterns(patterns: &[String], label: &str) -> anyhow::Result<Vec<String>> {
+    let mut rejected = Vec::new();
+    let mut out = Vec::with_capacity(patterns.len());
+    for raw in patterns {
+        match normalize_egress_pattern(raw) {
+            Ok(pattern) => out.push(pattern),
+            Err(reason) => rejected.push(reason),
+        }
+    }
+    if !rejected.is_empty() {
+        anyhow::bail!("Invalid {label}: {}", rejected.join("; "));
+    }
+    out.sort_unstable();
+    out.dedup();
+    Ok(out)
+}
+
+/// Strict egress matching: the deny-by-default sibling of
+/// [`host_matches_allowlist`].
+///
+/// `allowed` is expected to hold entries already canonicalized by
+/// [`normalize_egress_pattern`]. Matching is:
+/// - exact host equality, or
+/// - `*.example.com` matching a **strict subdomain** of `example.com`.
+///
+/// An apex host never matches through a bare-domain entry's subdomains, a
+/// suffix pattern never matches the apex, and there is no wildcard that matches
+/// everything: an entry of `*` (which validation refuses) would only ever match
+/// a literal host named `*`, so even an unvalidated list fails closed.
+///
+/// An **IP-literal host is matched only by an exactly equal entry**, never by a
+/// suffix pattern. Addresses have no subdomain structure, so treating one as a
+/// dotted name would let a pattern like `*.0.0.1` match `127.0.0.1` — a real
+/// hole, since that pattern passes validation as an ordinary two-label suffix.
+///
+/// An empty `allowed` list matches nothing: no grant means no reach.
+#[must_use]
+pub fn egress_host_matches(host: &str, allowed: &[String]) -> bool {
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host)
+        .to_ascii_lowercase();
+    if host.is_empty() {
+        return false;
+    }
+    let host_is_ip = host.parse::<std::net::IpAddr>().is_ok();
+
+    allowed
+        .iter()
+        .any(|pattern| match pattern.strip_prefix('*') {
+            // "*.example.com" -> ".example.com"; `ends_with` on the dotted suffix
+            // is exactly "strict subdomain of", since the apex lacks the leading
+            // dot and a host equal to the suffix itself is not a legal host.
+            Some(suffix) if suffix.starts_with('.') => !host_is_ip && host.ends_with(suffix),
+            _ => host == *pattern,
+        })
 }
 
 // ── address-class classification ──────────────────────────────────
@@ -726,10 +927,533 @@ pub fn validate_resolved_ips_exclude_metadata(
     Ok(())
 }
 
+// ── pinned destinations ───────────────────────────────────────────
+// The validators above answer "is this answer set safe". A caller that then
+// dials the *hostname* has thrown that answer away and reopened the rebinding
+// window the validation closed. `ResolvedDestination` makes the pinning part
+// of the type: constructing one runs the validation, and the only thing it
+// hands back is the exact address list that passed.
+//
+// The verdict is delegated to the two validators above rather than restated
+// here, so a plugin transport and a built-in tool cannot disagree about what
+// is reachable — including through a configured NAT64 prefix.
+
+/// Whether an authorized destination may resolve to private/local addresses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrivateNetworkAccess {
+    /// Every resolved address must be globally routable.
+    Deny,
+    /// An all-private answer set is accepted, except metadata addresses.
+    Allow,
+}
+
+/// Why a host or its resolved address set is unsafe to dial.
+///
+/// This is the typed sibling of the validators' `anyhow` errors, for callers
+/// that must branch on the reason rather than only report it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NetworkGuardError {
+    /// The host is empty, malformed, or not a canonical DNS name/IP literal.
+    InvalidHost(String),
+    /// Port zero is never a valid outbound destination.
+    InvalidPort,
+    /// DNS returned no addresses.
+    NoAddresses { host: String, port: u16 },
+    /// A resolver returned an address for a different port.
+    PortMismatch {
+        expected: u16,
+        address: std::net::SocketAddr,
+    },
+    /// A literal IP resolved to a different IP.
+    LiteralMismatch {
+        literal: std::net::IpAddr,
+        address: std::net::SocketAddr,
+    },
+    /// The answer set reaches a cloud metadata endpoint, directly or through a
+    /// configured NAT64 prefix. Never allowed, whatever the private opt-in.
+    CloudMetadata { host: String, reason: String },
+    /// A syntactically local hostname was not explicitly authorized.
+    PrivateHostDenied(String),
+    /// A local hostname unexpectedly resolved only to public addresses.
+    PrivateHostResolvedPublic(String),
+    /// The answer set contains a non-globally-routable address and private
+    /// access was not authorized for this host.
+    PrivateNetworkDenied { host: String, reason: String },
+    /// DNS returned both globally routable and private/local addresses.
+    MixedAddressClasses,
+}
+
+impl std::fmt::Display for NetworkGuardError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidHost(host) => write!(f, "invalid outbound host {host:?}"),
+            Self::InvalidPort => f.write_str("outbound port must be greater than zero"),
+            Self::NoAddresses { host, port } => {
+                write!(f, "DNS resolution for {host}:{port} returned no addresses")
+            }
+            Self::PortMismatch { expected, address } => write!(
+                f,
+                "resolved address {address} does not use requested port {expected}"
+            ),
+            Self::LiteralMismatch { literal, address } => write!(
+                f,
+                "IP literal {literal} resolved to a different address {address}"
+            ),
+            Self::CloudMetadata { reason, .. } | Self::PrivateNetworkDenied { reason, .. } => {
+                f.write_str(reason)
+            }
+            Self::PrivateHostDenied(host) => {
+                write!(f, "private or local host {host:?} is not authorized")
+            }
+            Self::PrivateHostResolvedPublic(host) => write!(
+                f,
+                "private or local host {host:?} resolved to public address space"
+            ),
+            Self::MixedAddressClasses => {
+                f.write_str("DNS resolution returned a mixed public/private address set")
+            }
+        }
+    }
+}
+
+impl std::error::Error for NetworkGuardError {}
+
+/// Normalize a DNS host or IP literal for policy matching and SNI selection.
+///
+/// Deliberately stricter than [`normalize_domain`], which exists to be
+/// forgiving about how an operator *wrote* an allowlist entry and will happily
+/// parse a whole URL down to its host. A request host is not operator prose: it
+/// arrives from a guest or an adapter, so anything carrying a scheme, userinfo,
+/// path, or port is a malformed destination rather than something to rewrite.
+/// DNS names are ASCII-only; internationalized names must arrive as punycode.
+/// IPv6 brackets are accepted and removed, and a single trailing root dot is
+/// stripped.
+///
+/// # Errors
+///
+/// Returns [`NetworkGuardError::InvalidHost`] for a malformed host.
+pub fn normalize_host(host: &str) -> Result<String, NetworkGuardError> {
+    normalize_request_host(host).ok_or_else(|| NetworkGuardError::InvalidHost(host.to_string()))
+}
+
+fn normalize_request_host(host: &str) -> Option<String> {
+    if host.is_empty() || host.trim() != host || host.chars().any(char::is_control) {
+        return None;
+    }
+
+    let (host, bracketed) = match (host.starts_with('['), host.ends_with(']')) {
+        (true, true) => (host.strip_prefix('[')?.strip_suffix(']')?, true),
+        (false, false) => (host, false),
+        _ => return None,
+    };
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        if bracketed && !ip.is_ipv6() {
+            return None;
+        }
+        return Some(ip.to_string().to_ascii_lowercase());
+    }
+    if bracketed {
+        return None;
+    }
+
+    let host = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
+    let valid = !host.is_empty()
+        && host.len() <= 253
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        });
+    valid.then_some(host)
+}
+
+/// The trust classes one answer address can land in: `(reaches_global,
+/// reaches_non_global)` across the raw address itself and every configured
+/// NAT64 translation that contains it.
+///
+/// This is the *trust-zone* question, not the deny question: it exists so a
+/// caller can tell whether one answer set spans two zones. Overlapping
+/// declared prefixes can translate a single IPv6 address to destinations in
+/// different zones, and the raw address is itself one of the interpretations,
+/// so the answer must be the set of classes observed rather than one
+/// collapsed verdict; which interpretation carries the connection is route
+/// selection's choice, not this module's. Whether an address may be dialed at
+/// all is decided by the validators.
+fn effective_trust_classes(ip: std::net::IpAddr, nat64_prefixes: &[Nat64Prefix]) -> (bool, bool) {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let non_global = is_non_global_v4(v4);
+            (!non_global, non_global)
+        }
+        std::net::IpAddr::V6(v6) => {
+            let mut reaches_non_global = is_non_global_v6(v6);
+            let mut reaches_global = !reaches_non_global;
+            for (_, embedded) in network_specific_embedded_ipv4s(v6, nat64_prefixes) {
+                if is_non_global_v4(embedded) {
+                    reaches_non_global = true;
+                } else {
+                    reaches_global = true;
+                }
+            }
+            (reaches_global, reaches_non_global)
+        }
+    }
+}
+
+/// A normalized host and the exact address set that passed network policy.
+///
+/// Callers must dial [`Self::addresses`] directly. Resolving [`Self::host`]
+/// again would reopen the DNS-rebinding window this type closes, so the type
+/// deliberately offers no way to get from a value back to a fresh resolution.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedDestination {
+    host: String,
+    port: u16,
+    addresses: Vec<std::net::SocketAddr>,
+}
+
+impl ResolvedDestination {
+    /// Validate one DNS result and retain the exact addresses to dial.
+    ///
+    /// `nat64_prefixes` is the deployment's `security.nat64_prefixes`, parsed
+    /// once by the caller at construction. Passing an empty slice states that
+    /// the host runs no network-specific translator; it does not skip the
+    /// well-known `64:ff9b::/96` form, which the address predicates decode
+    /// unconditionally.
+    ///
+    /// Three things happen here that a bare validator call does not do:
+    ///
+    /// 1. Cloud metadata is refused for **both** access modes, so an operator
+    ///    opt-in for private destinations never re-opens it.
+    /// 2. A mixed public/private answer set is refused even when private
+    ///    access is authorized. Otherwise resolver ordering or connection
+    ///    fallback silently decides which trust zone the connection lands in.
+    /// 3. The surviving addresses are retained, which is the pin.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetworkGuardError`] for a malformed host or port, an empty or
+    /// mismatched answer set, a metadata endpoint, an unauthorized private
+    /// address, or an answer spanning both address classes.
+    pub fn new(
+        host: &str,
+        port: u16,
+        addresses: impl IntoIterator<Item = std::net::SocketAddr>,
+        private_access: PrivateNetworkAccess,
+        nat64_prefixes: &[Nat64Prefix],
+    ) -> Result<Self, NetworkGuardError> {
+        let host = normalize_host(host)?;
+        if port == 0 {
+            return Err(NetworkGuardError::InvalidPort);
+        }
+
+        let literal = host.parse::<std::net::IpAddr>().ok();
+        let private_host = is_private_or_local_host(&host);
+        if private_host && private_access == PrivateNetworkAccess::Deny {
+            return Err(NetworkGuardError::PrivateHostDenied(host));
+        }
+
+        let mut unique = std::collections::HashSet::new();
+        let mut addresses = addresses
+            .into_iter()
+            .filter(|address| unique.insert(*address))
+            .collect::<Vec<_>>();
+        if addresses.is_empty() {
+            return Err(NetworkGuardError::NoAddresses { host, port });
+        }
+
+        for address in &addresses {
+            if address.port() != port {
+                return Err(NetworkGuardError::PortMismatch {
+                    expected: port,
+                    address: *address,
+                });
+            }
+            if let Some(literal) = literal
+                && literal != address.ip()
+            {
+                return Err(NetworkGuardError::LiteralMismatch {
+                    literal,
+                    address: *address,
+                });
+            }
+        }
+
+        let ips = addresses
+            .iter()
+            .map(std::net::SocketAddr::ip)
+            .collect::<Vec<_>>();
+
+        // Metadata is refused in both modes, and this is the only place that
+        // decision is made for this path: under `Allow` no other check runs.
+        validate_resolved_ips_exclude_metadata(&host, &ips, nat64_prefixes).map_err(|error| {
+            NetworkGuardError::CloudMetadata {
+                host: host.clone(),
+                reason: error.to_string(),
+            }
+        })?;
+
+        if private_access == PrivateNetworkAccess::Deny {
+            validate_resolved_ips_are_public(&host, &ips, nat64_prefixes).map_err(|error| {
+                NetworkGuardError::PrivateNetworkDenied {
+                    host: host.clone(),
+                    reason: error.to_string(),
+                }
+            })?;
+        }
+
+        let mut saw_public = false;
+        let mut saw_private = false;
+        for ip in &ips {
+            let (reaches_global, reaches_non_global) = effective_trust_classes(*ip, nat64_prefixes);
+            saw_public |= reaches_global;
+            saw_private |= reaches_non_global;
+        }
+        if saw_public && saw_private {
+            return Err(NetworkGuardError::MixedAddressClasses);
+        }
+        if private_host && saw_public {
+            return Err(NetworkGuardError::PrivateHostResolvedPublic(host));
+        }
+
+        // Resolver order is useful for connection fallback, so deduplicate
+        // without sorting.
+        addresses.shrink_to_fit();
+        Ok(Self {
+            host,
+            port,
+            addresses,
+        })
+    }
+
+    /// Canonical lowercase host, without IPv6 brackets or a trailing DNS dot.
+    /// Use this for SNI and certificate verification, never for a second
+    /// resolution.
+    #[must_use]
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    /// Authorized destination port.
+    #[must_use]
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// Exact validated socket addresses. Dial these instead of resolving again.
+    #[must_use]
+    pub fn addresses(&self) -> &[std::net::SocketAddr] {
+        &self.addresses
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
+
+    // ── strict egress grammar ─────────────────────────────────────
+
+    #[test]
+    fn egress_apex_entry_does_not_match_its_subdomains() {
+        // The property that separates egress from the permissive tool
+        // semantics: `host_matches_allowlist` says yes here, `egress_host_matches`
+        // must say no.
+        let allowed = vec!["example.com".to_string()];
+        assert!(egress_host_matches("example.com", &allowed));
+        assert!(
+            !egress_host_matches("api.example.com", &allowed),
+            "a bare domain must not imply its subdomains"
+        );
+        assert!(!egress_host_matches("v2.api.example.com", &allowed));
+        assert!(
+            host_matches_allowlist("api.example.com", &allowed),
+            "the permissive tool matcher is unchanged and still allows this"
+        );
+    }
+
+    #[test]
+    fn egress_suffix_pattern_does_not_match_the_apex() {
+        let allowed = vec!["*.example.com".to_string()];
+        assert!(egress_host_matches("api.example.com", &allowed));
+        assert!(egress_host_matches("v2.api.example.com", &allowed));
+        assert!(
+            !egress_host_matches("example.com", &allowed),
+            "a suffix pattern must not implicitly cover the apex"
+        );
+        assert!(!egress_host_matches("notexample.com", &allowed));
+        assert!(!egress_host_matches("evil-example.com", &allowed));
+    }
+
+    #[test]
+    fn egress_has_no_allow_all_pattern() {
+        let err = normalize_egress_pattern("*").unwrap_err();
+        assert!(err.contains("allow-all"), "unexpected error: {err}");
+        // Even if an unvalidated `*` reached the matcher it would match nothing.
+        let smuggled = vec!["*".to_string()];
+        assert!(!egress_host_matches("anything.example.com", &smuggled));
+        assert!(!egress_host_matches("10.0.0.1", &smuggled));
+    }
+
+    #[test]
+    fn egress_empty_allowlist_matches_nothing() {
+        assert!(!egress_host_matches("example.com", &[]));
+        assert!(!egress_host_matches("127.0.0.1", &[]));
+    }
+
+    #[test]
+    fn egress_pattern_accepts_canonical_hosts_and_suffixes() {
+        for entry in [
+            "example.com",
+            "api.example.com",
+            "*.example.com",
+            "*.api.example.com",
+            "127.0.0.1",
+            "10.0.0.1",
+            "::1",
+            "*.co.uk", // no public-suffix list is imported; documented as accepted
+        ] {
+            assert_eq!(
+                normalize_egress_pattern(entry).as_deref(),
+                Ok(entry),
+                "{entry} must round-trip unchanged"
+            );
+        }
+        // Bracketed IPv6 canonicalizes to the bare form.
+        assert_eq!(normalize_egress_pattern("[::1]").unwrap(), "::1");
+    }
+
+    #[test]
+    fn egress_pattern_rejects_ports() {
+        let err = normalize_egress_pattern("example.com:8443").unwrap_err();
+        assert!(err.contains("port"), "unexpected error: {err}");
+        assert!(normalize_egress_pattern("[::1]:8443").is_err());
+        assert!(normalize_egress_pattern("*.example.com:443").is_err());
+    }
+
+    #[test]
+    fn egress_pattern_rejects_urls_and_userinfo() {
+        for entry in [
+            "https://example.com",
+            "example.com/path",
+            "user@example.com",
+            "example.com?q=1",
+            "example.com#frag",
+        ] {
+            assert!(
+                normalize_egress_pattern(entry).is_err(),
+                "{entry} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn egress_pattern_rejects_empty_whitespace_and_noncanonical() {
+        assert!(normalize_egress_pattern("").is_err());
+        assert!(normalize_egress_pattern("   ").is_err());
+        assert!(normalize_egress_pattern("exa mple.com").is_err());
+        assert!(
+            normalize_egress_pattern("EXAMPLE.com").is_err(),
+            "uppercase must be rejected, not silently lowercased"
+        );
+        assert!(
+            normalize_egress_pattern("example.com.").is_err(),
+            "a trailing dot must be rejected, not silently stripped"
+        );
+    }
+
+    #[test]
+    fn egress_pattern_rejects_misplaced_wildcards() {
+        for entry in ["*.*.example.com", "api*.example.com", "*example.com", "*."] {
+            assert!(
+                normalize_egress_pattern(entry).is_err(),
+                "{entry} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn egress_pattern_rejects_single_label_and_ip_wildcards() {
+        let err = normalize_egress_pattern("*.com").unwrap_err();
+        assert!(err.contains("single-label"), "unexpected error: {err}");
+        assert!(normalize_egress_pattern("*.internal").is_err());
+        let err = normalize_egress_pattern("*.10.0.0.1").unwrap_err();
+        assert!(err.contains("wildcard an IP"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn egress_matching_is_case_insensitive_on_the_request_host() {
+        let allowed = vec!["example.com".to_string(), "*.example.org".to_string()];
+        assert!(egress_host_matches("EXAMPLE.com", &allowed));
+        assert!(egress_host_matches("API.Example.ORG", &allowed));
+    }
+
+    /// A suffix pattern must never match an IP-literal host.
+    ///
+    /// Without the IP check, `ends_with(".0.0.1")` makes `*.0.0.1` match
+    /// `127.0.0.1` — an innocuous-looking entry that is actually a loopback
+    /// grant. [`normalize_egress_pattern`] happens to reject that particular
+    /// spelling (the URL parser canonicalizes `0.0.1` to `0.0.0.1`, so it is
+    /// not in canonical form), but the matcher must not *depend* on validation
+    /// having run: it is called with lists from the manifest, from config, and
+    /// from future transports, and it is the last line.
+    #[test]
+    fn egress_suffix_pattern_never_matches_an_ip_literal() {
+        for pattern in ["*.0.0.1", "*.1.1", "*.254", "*.169.254"] {
+            assert!(
+                !egress_host_matches("127.0.0.1", &[pattern.to_string()]),
+                "{pattern} must not match the IP literal 127.0.0.1"
+            );
+            assert!(
+                !egress_host_matches("169.254.169.254", &[pattern.to_string()]),
+                "{pattern} must not match the IP literal 169.254.169.254"
+            );
+        }
+        // An exact IP entry still matches.
+        assert!(egress_host_matches("127.0.0.1", &["127.0.0.1".to_string()]));
+        // And a suffix pattern still does its real job on names.
+        assert!(egress_host_matches("host.0.0.1", &["*.0.0.1".to_string()]));
+    }
+
+    #[test]
+    fn egress_matching_accepts_bracketed_ipv6_request_hosts() {
+        let allowed = vec!["::1".to_string()];
+        assert!(egress_host_matches("[::1]", &allowed));
+        assert!(egress_host_matches("::1", &allowed));
+        assert!(!egress_host_matches("[::2]", &allowed));
+    }
+
+    #[test]
+    fn normalize_egress_patterns_sorts_dedups_and_names_every_rejection() {
+        let ok = normalize_egress_patterns(
+            &[
+                "b.example.com".to_string(),
+                "a.example.com".to_string(),
+                "a.example.com".to_string(),
+            ],
+            "test.egress_hosts",
+        )
+        .unwrap();
+        assert_eq!(ok, vec!["a.example.com", "b.example.com"]);
+
+        let err = normalize_egress_patterns(
+            &[
+                "*".to_string(),
+                "ok.example.com".to_string(),
+                "".to_string(),
+            ],
+            "test.egress_hosts",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("Invalid test.egress_hosts"), "{err}");
+        assert!(err.contains("allow-all"), "{err}");
+        assert!(err.contains("empty"), "{err}");
+    }
 
     #[test]
     fn blocks_rfc1918_and_loopback_and_metadata() {
@@ -1838,6 +2562,322 @@ mod tests {
             assert!(
                 validate_resolved_ips_are_public("example.test", &ips, &prefixes).is_err(),
                 "{address} must stay blocked with a network-specific prefix configured"
+            );
+        }
+    }
+
+    // ── pinned destinations ───────────────────────────────────────
+
+    fn sock(address: &str, port: u16) -> std::net::SocketAddr {
+        std::net::SocketAddr::new(ip(address), port)
+    }
+
+    fn pin(
+        host: &str,
+        addresses: &[std::net::SocketAddr],
+        access: PrivateNetworkAccess,
+    ) -> Result<ResolvedDestination, NetworkGuardError> {
+        ResolvedDestination::new(host, 443, addresses.iter().copied(), access, &[])
+    }
+
+    #[test]
+    fn destination_retains_exactly_the_validated_addresses() {
+        let destination = pin(
+            "api.example.com",
+            &[sock("1.1.1.1", 443), sock("8.8.8.8", 443)],
+            PrivateNetworkAccess::Deny,
+        )
+        .unwrap();
+        assert_eq!(destination.host(), "api.example.com");
+        assert_eq!(destination.port(), 443);
+        assert_eq!(
+            destination.addresses(),
+            [sock("1.1.1.1", 443), sock("8.8.8.8", 443)],
+            "the pin must be the answer set that was validated, in resolver order"
+        );
+    }
+
+    /// The mixed-class rejection. Under `Allow` neither validator objects to
+    /// this set, so this check is the only thing standing between the caller
+    /// and a connection whose trust zone is decided by resolver ordering.
+    #[test]
+    fn destination_rejects_a_mixed_public_private_answer_set() {
+        assert_eq!(
+            pin(
+                "rebind.example.com",
+                &[sock("1.1.1.1", 443), sock("10.0.0.5", 443)],
+                PrivateNetworkAccess::Allow,
+            ),
+            Err(NetworkGuardError::MixedAddressClasses)
+        );
+        // Either ordering, so the check cannot pass by inspecting the public
+        // address first.
+        assert_eq!(
+            pin(
+                "rebind.example.com",
+                &[sock("10.0.0.5", 443), sock("1.1.1.1", 443)],
+                PrivateNetworkAccess::Allow,
+            ),
+            Err(NetworkGuardError::MixedAddressClasses)
+        );
+        // An all-private set under the same opt-in is fine.
+        assert!(
+            pin(
+                "gitea.internal.example",
+                &[sock("10.0.0.5", 443), sock("10.0.0.6", 443)],
+                PrivateNetworkAccess::Allow,
+            )
+            .is_ok()
+        );
+    }
+
+    /// A NAT64-translated private destination puts the answer in the private
+    /// zone even though the literal IPv6 address is globally routable, so a
+    /// mixed set must still be caught with a translator configured.
+    #[test]
+    fn mixed_class_detection_follows_configured_nat64_translation() {
+        let prefixes = nat64(GLOBAL_NAT64_96);
+        let translated = "2001:67c:2b0:db32:0:1:a00:5"; // -> 10.0.0.5
+        assert_eq!(
+            ResolvedDestination::new(
+                "rebind.example.com",
+                443,
+                [sock("1.1.1.1", 443), sock(translated, 443)],
+                PrivateNetworkAccess::Allow,
+                &prefixes,
+            ),
+            Err(NetworkGuardError::MixedAddressClasses)
+        );
+        // Without the translator declared, that address is simply global, and
+        // the set is uniformly public.
+        assert!(
+            ResolvedDestination::new(
+                "rebind.example.com",
+                443,
+                [sock("1.1.1.1", 443), sock(translated, 443)],
+                PrivateNetworkAccess::Allow,
+                &[],
+            )
+            .is_ok()
+        );
+    }
+
+    /// One IPv6 answer whose overlapping declared translations land in two
+    /// trust zones is itself a mixed answer: a broad prefix decodes it to a
+    /// global destination while a nested prefix decodes it to a private one,
+    /// and which translation carries the connection is the network's choice.
+    /// Collapsing the interpretations to a single class would accept it as
+    /// simply private under the opt-in, so the class set must be preserved
+    /// per address, in either declaration order.
+    #[test]
+    fn overlapping_translations_of_one_answer_are_a_mixed_class_set() {
+        let address = "2001:67c:5db8:d822:1234:5678:a00:1"; // /32 -> 93.184.216.34, /96 -> 10.0.0.1
+        for order in [
+            ["2001:67c::/32", "2001:67c:5db8:d822:1234:5678::/96"],
+            ["2001:67c:5db8:d822:1234:5678::/96", "2001:67c::/32"],
+        ] {
+            let prefixes = nat64_in_order(&order);
+            assert_eq!(
+                ResolvedDestination::new(
+                    "rebind.example.com",
+                    443,
+                    [sock(address, 443)],
+                    PrivateNetworkAccess::Allow,
+                    &prefixes,
+                ),
+                Err(NetworkGuardError::MixedAddressClasses),
+                "declaration order {order:?} must not change the verdict"
+            );
+        }
+        // With only the broad prefix declared, both interpretations (raw and
+        // the /32 translation) are global, and the answer is uniformly public.
+        assert!(
+            ResolvedDestination::new(
+                "rebind.example.com",
+                443,
+                [sock(address, 443)],
+                PrivateNetworkAccess::Allow,
+                &nat64_in_order(&["2001:67c::/32"]),
+            )
+            .is_ok()
+        );
+    }
+
+    /// Metadata stays refused under the private opt-in, which is the mode where
+    /// no other address-class check runs.
+    #[test]
+    fn destination_refuses_metadata_even_with_private_access_granted() {
+        let error = pin(
+            "metadata.internal.example",
+            &[sock("169.254.169.254", 443)],
+            PrivateNetworkAccess::Allow,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, NetworkGuardError::CloudMetadata { .. }),
+            "unexpected error: {error}"
+        );
+
+        let prefixes = nat64(DOC_NAT64_96);
+        let translated = "2001:db8:122:344::a9fe:a9fe"; // -> 169.254.169.254
+        let error = ResolvedDestination::new(
+            "metadata.internal.example",
+            443,
+            [sock(translated, 443)],
+            PrivateNetworkAccess::Allow,
+            &prefixes,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, NetworkGuardError::CloudMetadata { .. }),
+            "a NAT64-translated metadata address must be refused too, got: {error}"
+        );
+    }
+
+    #[test]
+    fn destination_denies_private_answers_without_the_opt_in() {
+        let error = pin(
+            "gitea.example.com",
+            &[sock("10.0.0.5", 443)],
+            PrivateNetworkAccess::Deny,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, NetworkGuardError::PrivateNetworkDenied { .. }),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            pin(
+                "localhost",
+                &[sock("127.0.0.1", 443)],
+                PrivateNetworkAccess::Deny
+            ),
+            Err(NetworkGuardError::PrivateHostDenied(
+                "localhost".to_string()
+            )),
+            "a syntactically local name is refused before resolution is even consulted"
+        );
+    }
+
+    /// The verdict must be the validators', not a second opinion: for every
+    /// address class, `Deny` mode and `validate_resolved_ips_are_public` agree.
+    #[test]
+    fn destination_verdict_agrees_with_the_shared_validator() {
+        let prefixes = nat64(GLOBAL_NAT64_96);
+        for address in [
+            "1.1.1.1",
+            "8.8.8.8",
+            "10.0.0.5",
+            "127.0.0.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "192.0.2.1",
+            "2606:4700:4700::1111",
+            "64:ff9b::10.0.0.1",
+            "::ffff:169.254.169.254",
+            "2001:67c:2b0:db32:0:1:a00:5",
+            "2001:67c:2b0:db32:0:1:101:101",
+        ] {
+            let validator =
+                validate_resolved_ips_are_public("agree.test", &[ip(address)], &prefixes);
+            let destination = ResolvedDestination::new(
+                "agree.test",
+                443,
+                [sock(address, 443)],
+                PrivateNetworkAccess::Deny,
+                &prefixes,
+            );
+            assert_eq!(
+                validator.is_ok(),
+                destination.is_ok(),
+                "{address}: validator and pinned destination must agree"
+            );
+        }
+    }
+
+    #[test]
+    fn destination_rejects_structurally_malformed_answers() {
+        assert_eq!(
+            ResolvedDestination::new(
+                "api.example.com",
+                0,
+                [sock("1.1.1.1", 0)],
+                PrivateNetworkAccess::Deny,
+                &[],
+            ),
+            Err(NetworkGuardError::InvalidPort)
+        );
+        assert!(matches!(
+            pin("api.example.com", &[], PrivateNetworkAccess::Deny),
+            Err(NetworkGuardError::NoAddresses { .. })
+        ));
+        assert!(matches!(
+            pin(
+                "api.example.com",
+                &[sock("1.1.1.1", 80)],
+                PrivateNetworkAccess::Deny
+            ),
+            Err(NetworkGuardError::PortMismatch { .. })
+        ));
+        assert!(matches!(
+            pin(
+                "1.1.1.1",
+                &[sock("8.8.8.8", 443)],
+                PrivateNetworkAccess::Deny
+            ),
+            Err(NetworkGuardError::LiteralMismatch { .. })
+        ));
+        assert!(matches!(
+            pin(
+                "bad..example",
+                &[sock("1.1.1.1", 443)],
+                PrivateNetworkAccess::Deny
+            ),
+            Err(NetworkGuardError::InvalidHost(_))
+        ));
+    }
+
+    #[test]
+    fn destination_deduplicates_without_reordering() {
+        let destination = pin(
+            "api.example.com",
+            &[
+                sock("8.8.8.8", 443),
+                sock("1.1.1.1", 443),
+                sock("8.8.8.8", 443),
+            ],
+            PrivateNetworkAccess::Deny,
+        )
+        .unwrap();
+        assert_eq!(
+            destination.addresses(),
+            [sock("8.8.8.8", 443), sock("1.1.1.1", 443)]
+        );
+    }
+
+    #[test]
+    fn request_host_normalization_is_strict_and_canonical() {
+        assert_eq!(
+            normalize_host("API.Example.COM.").unwrap(),
+            "api.example.com"
+        );
+        assert_eq!(
+            normalize_host("[2001:4860:4860::8888]").unwrap(),
+            "2001:4860:4860::8888"
+        );
+        for invalid in [
+            "",
+            " api.example",
+            "bad..example",
+            "[127.0.0.1]",
+            "https://api.example.com",
+            "api.example.com:8443",
+            "user@api.example.com",
+            "api.example.com/path",
+        ] {
+            assert!(
+                normalize_host(invalid).is_err(),
+                "{invalid:?} must not normalize to a request host"
             );
         }
     }

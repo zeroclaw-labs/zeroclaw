@@ -471,6 +471,7 @@ zc-chat-clipboard-agent = Agent: { $text }
 zc-chat-copied-clipboard = Copied to clipboard
 zc-chat-copy-message = [Copy]
 zc-chat-copy-message-copied = [Copied]
+zc-chat-context-menu-copy = Copy
 
 zc-config-breadcrumb-root = Config
 zc-config-section-detail-hint = { $open } or { $into } to open this section
