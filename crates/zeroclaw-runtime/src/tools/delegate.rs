@@ -2661,6 +2661,21 @@ impl DelegateTool {
             .capabilities_for_model(model)
             .native_tool_calling;
 
+        // Independent delegates execute as target-owned turns, so their thinking policy
+        // must override the parent task-local scope for the child loop. Bounded delegates
+        // deliberately retain the caller's turn context.
+        let thinking_params = (target_mode == DelegateExecutionMode::Independent).then(|| {
+            crate::agent::thinking::apply_thinking_level_with_config(
+                loop_runtime.thinking.default_level,
+                &loop_runtime.thinking,
+            )
+        });
+        let effective_temperature = thinking_params.as_ref().map_or(temperature, |params| {
+            temperature.map(|value| {
+                crate::agent::thinking::clamp_temperature(value + params.temperature_adjustment)
+            })
+        });
+
         // Build enriched system prompt with tools, skills, workspace, datetime context.
         // Independent delegation builds it from the TARGET's workspace (`sub_workspace`), so
         // the skill prompt content matches the target's skill tools; bounded delegation
@@ -2685,6 +2700,16 @@ impl DelegateTool {
             native_tools,
             loop_runtime.strict_tool_parsing,
         );
+        let enriched_system_prompt = match (
+            enriched_system_prompt,
+            thinking_params
+                .as_ref()
+                .and_then(|params| params.system_prompt_prefix.as_deref()),
+        ) {
+            (Some(prompt), Some(prefix)) => Some(format!("{prefix}\n\n{prompt}")),
+            (None, Some(prefix)) => Some(prefix.to_string()),
+            (prompt, None) => prompt,
+        };
 
         let mut history = Vec::new();
         if let Some(system_prompt) = enriched_system_prompt.as_ref() {
@@ -2704,7 +2729,9 @@ impl DelegateTool {
         let receipt_generator = receipt_scope.as_ref().map(|s| &s.generator);
         let collected_receipts = receipt_scope.as_ref().map(|s| s.collector.as_ref());
         let turn_id = uuid::Uuid::new_v4().to_string();
-        let result = tokio::time::timeout(
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let loop_knobs = LoopKnobs::default();
+        let execution = tokio::time::timeout(
             Duration::from_secs(agentic_timeout_secs),
             run_tool_call_loop(ToolLoop {
                 sop_reassembly: None,
@@ -2713,7 +2740,7 @@ impl DelegateTool {
                         model_provider,
                         provider_name: provider_type,
                         model,
-                        temperature,
+                        temperature: effective_temperature,
                     },
                     ResolvedIo {
                         tools_registry: &sub_tools,
@@ -2740,14 +2767,14 @@ impl DelegateTool {
                         max_tool_iterations: loop_runtime.max_tool_iterations,
                         excluded_tools: &[],
                         dedup_exempt_tools: tool_policy.excluded_tools.as_deref().unwrap_or(&[]),
-                        pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                        pacing: &pacing,
                         strict_tool_parsing: loop_runtime.strict_tool_parsing,
                         parallel_tools: loop_runtime.parallel_tools,
                         max_tool_result_chars: loop_runtime.max_tool_result_chars,
                         // Keep delegate subagent context pruning aligned with top-level
                         // agents instead of preserving the old disabled-by-zero path.
                         context_token_budget: loop_runtime.max_context_tokens,
-                        knobs: &LoopKnobs::default(),
+                        knobs: &loop_knobs,
                     },
                 ),
                 history: &mut history,
@@ -2774,8 +2801,15 @@ impl DelegateTool {
             .instrument(::zeroclaw_log::attribution_span!(
                 &crate::agent::AgentAttribution(agent_name)
             )),
-        )
-        .await;
+        );
+        let result = match thinking_params {
+            Some(params) => {
+                zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                    .scope(params.native_thinking, execution)
+                    .await
+            }
+            None => execution.await,
+        };
 
         match result {
             Ok(Ok(response)) if response.trim().is_empty() => Ok(ToolResult {
@@ -2885,6 +2919,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
     use tokio::time::{Instant, sleep};
+    use zeroclaw_config::scattered_types::{ThinkingConfig, ThinkingLevel};
     use zeroclaw_config::schema::{
         Config, CustomModelProviderConfig, DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS,
         DEFAULT_DELEGATE_TIMEOUT_SECS, DelegateExecutionMode, DelegateTargetConfig,
@@ -5742,6 +5777,282 @@ mod tests {
         fn alias(&self) -> &str {
             "ToolCountModelProvider"
         }
+    }
+
+    #[derive(Debug)]
+    struct RecordedThinkingRequest {
+        thinking_budget: Option<u32>,
+        system_prompt: Option<String>,
+        temperature: Option<f64>,
+    }
+
+    #[derive(Default)]
+    struct ThinkingRecordingModelProvider {
+        requests: std::sync::Mutex<Vec<RecordedThinkingRequest>>,
+    }
+
+    impl ThinkingRecordingModelProvider {
+        fn request(&self) -> RecordedThinkingRequest {
+            let mut requests = self.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1, "expected exactly one provider request");
+            requests.pop().unwrap()
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for ThinkingRecordingModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("tool loop must use ChatRequest")
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            let thinking_budget = request.thinking.map(|params| params.budget_tokens);
+            let system_prompt = request
+                .messages
+                .iter()
+                .find(|message| message.role == "system")
+                .map(|message| message.content.clone());
+            self.requests.lock().unwrap().push(RecordedThinkingRequest {
+                thinking_budget,
+                system_prompt,
+                temperature,
+            });
+            Ok(ChatResponse {
+                text: Some("delegate complete".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ThinkingRecordingModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "ThinkingRecordingModelProvider"
+        }
+    }
+
+    fn thinking_delegate_fixture(
+        mode: DelegateExecutionMode,
+        thinking: ThinkingConfig,
+    ) -> (DelegateTool, AliasedAgentConfig) {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.risk_profiles.insert(
+            "caller".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                ..RiskProfileConfig::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("target".to_string(), RiskProfileConfig::default());
+        config.runtime_profiles.insert(
+            "target-runtime".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                thinking,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "caller".into(),
+                model_provider: "custom.unused".into(),
+                delegates: vec![DelegateTargetConfig {
+                    agent: "target".to_string(),
+                    mode,
+                }],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let target = AliasedAgentConfig {
+            risk_profile: "target".into(),
+            runtime_profile: "target-runtime".into(),
+            model_provider: "custom.unused".into(),
+            ..AliasedAgentConfig::default()
+        };
+        config.agents.insert("target".to_string(), target.clone());
+
+        let config = Arc::new(config);
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let tool = DelegateTool::new(config.agents.clone(), None, caller_policy)
+            .with_root_config(Arc::clone(&config))
+            .with_caller_alias("caller")
+            .with_runtime(Arc::new(DelegateTestRuntime))
+            .with_risk_profiles(config.risk_profiles.clone())
+            .with_runtime_profiles(config.runtime_profiles.clone());
+        (tool, target)
+    }
+
+    #[tokio::test]
+    async fn independent_delegate_uses_target_native_thinking_and_restores_parent_scope() {
+        let target_thinking = ThinkingConfig {
+            default_level: ThinkingLevel::Max,
+            native_thinking: true,
+            ..ThinkingConfig::default()
+        };
+        let (tool, target) =
+            thinking_delegate_fixture(DelegateExecutionMode::Independent, target_thinking);
+        let provider = ThinkingRecordingModelProvider::default();
+        let parent = Some(zeroclaw_config::scattered_types::NativeThinkingParams {
+            budget_tokens: 10_000,
+        });
+
+        zeroclaw_api::NATIVE_THINKING_OVERRIDE
+            .scope(parent, async {
+                let result = tool
+                    .execute_agentic(
+                        "target",
+                        &target,
+                        "custom",
+                        "test-model",
+                        &provider,
+                        "analyze this",
+                        Some(0.2),
+                    )
+                    .await
+                    .unwrap();
+                assert!(result.success, "{result:?}");
+                assert_eq!(
+                    zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                        .try_with(Clone::clone)
+                        .unwrap(),
+                    parent,
+                    "the target scope must not leak into the parent turn"
+                );
+            })
+            .await;
+
+        let request = provider.request();
+        assert_eq!(request.thinking_budget, Some(50_000));
+        assert!(
+            request
+                .temperature
+                .is_some_and(|temperature| (temperature - 0.3).abs() < f64::EPSILON)
+        );
+    }
+
+    #[tokio::test]
+    async fn independent_delegate_prepends_target_non_native_thinking_prompt() {
+        let target_thinking = ThinkingConfig {
+            default_level: ThinkingLevel::Max,
+            native_thinking: false,
+            ..ThinkingConfig::default()
+        };
+        let (tool, target) =
+            thinking_delegate_fixture(DelegateExecutionMode::Independent, target_thinking);
+        let provider = ThinkingRecordingModelProvider::default();
+        let parent = Some(zeroclaw_config::scattered_types::NativeThinkingParams {
+            budget_tokens: 10_000,
+        });
+
+        zeroclaw_api::NATIVE_THINKING_OVERRIDE
+            .scope(parent, async {
+                let result = tool
+                    .execute_agentic(
+                        "target",
+                        &target,
+                        "custom",
+                        "test-model",
+                        &provider,
+                        "analyze this",
+                        Some(0.2),
+                    )
+                    .await
+                    .unwrap();
+                assert!(result.success, "{result:?}");
+                assert_eq!(
+                    zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                        .try_with(Clone::clone)
+                        .unwrap(),
+                    parent,
+                    "a non-native target must clear the override only inside its child scope"
+                );
+            })
+            .await;
+
+        let request = provider.request();
+        assert_eq!(request.thinking_budget, None);
+        assert!(
+            request
+                .system_prompt
+                .as_deref()
+                .is_some_and(|prompt| prompt.starts_with("Think very carefully and exhaustively.")),
+            "target thinking prefix must precede the delegated system prompt: {request:?}"
+        );
+        assert!(
+            request
+                .temperature
+                .is_some_and(|temperature| (temperature - 0.3).abs() < f64::EPSILON)
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_delegate_retains_parent_thinking_scope() {
+        let target_thinking = ThinkingConfig {
+            default_level: ThinkingLevel::Max,
+            native_thinking: true,
+            ..ThinkingConfig::default()
+        };
+        let (tool, target) =
+            thinking_delegate_fixture(DelegateExecutionMode::Bounded, target_thinking);
+        let provider = ThinkingRecordingModelProvider::default();
+        let parent = Some(zeroclaw_config::scattered_types::NativeThinkingParams {
+            budget_tokens: 10_000,
+        });
+
+        zeroclaw_api::NATIVE_THINKING_OVERRIDE
+            .scope(parent, async {
+                let result = tool
+                    .execute_agentic(
+                        "target",
+                        &target,
+                        "custom",
+                        "test-model",
+                        &provider,
+                        "analyze this",
+                        Some(0.2),
+                    )
+                    .await
+                    .unwrap();
+                assert!(result.success, "{result:?}");
+            })
+            .await;
+
+        let request = provider.request();
+        assert_eq!(request.thinking_budget, Some(10_000));
+        assert_eq!(request.temperature, Some(0.2));
     }
 
     #[tokio::test]

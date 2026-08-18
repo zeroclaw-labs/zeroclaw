@@ -131,54 +131,21 @@ jobs:
         run: bash scripts/ci/apt_install.sh libudev-dev ripgrep
       - name: Ensure web/dist placeholder exists
         run: mkdir -p web/dist && touch web/dist/.gitkeep
+      - name: Clippy runner contract tests
+        run: bash scripts/ci/run_clippy.test.sh
       - name: Clippy
         shell: bash
         run: |
-          set +e
-          cargo_log="${RUNNER_TEMP}/cargo-clippy.log"
-          SECONDS=0
-          cargo clippy \
-            --locked \
-            --workspace \
-            --exclude zeroclaw-desktop \
-            --all-targets \
-            --features ci-all \
-            -- -D warnings 2>&1 | tee "$cargo_log"
-          cargo_status=${PIPESTATUS[0]}
-          duration_seconds=$SECONDS
-          set -e
-
-          workspace_path_compiles="$(grep -E -c 'Compiling.*\([^)]*zeroclaw' "$cargo_log" || true)"
-          total_compiles="$(grep -c 'Compiling' "$cargo_log" || true)"
-          downloaded_crates="$(grep -c 'Downloaded' "$cargo_log" || true)"
-          cache_hit="${RUST_CACHE_HIT:-unknown}"
-          summary_file="${GITHUB_STEP_SUMMARY:-/dev/null}"
-
-          {
-            echo "### Lint diagnostics"
-            echo ""
-            echo "| Field | Value |"
-            echo "| --- | --- |"
-            echo "| Runner OS | \`${{ runner.os }}\` |"
-            echo "| Rust cache exact hit | \`${cache_hit}\` |"
-            echo "| Clippy duration | \`${duration_seconds}s\` |"
-            echo "| Clippy status | \`${cargo_status}\` |"
-            echo "| Workspace path compile lines | \`${workspace_path_compiles}\` |"
-            echo "| Total compile lines | \`${total_compiles}\` |"
-            echo "| Downloaded crate lines | \`${downloaded_crates}\` |"
-          } >> "$summary_file"
-
-          exit "$cargo_status"
+          bash scripts/ci/run_clippy.sh \
+            --scope workspace \
+            --summary-title "Lint diagnostics" \
+            --log-name cargo-clippy.log
         env:
           RUST_CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
       - name: Rustdoc warnings gate
         # Exclude zeroclaw-desktop: same surface as xtask build_api / docs-deploy.
         # Desktop pulls glib-sys on Linux; the lint runner does not install GTK libs.
         run: cargo doc --no-deps --workspace --exclude zeroclaw-desktop
-      - name: Config-write isolation guard
-        run: cargo test --test architecture tests_that_persist_config_isolate_the_path
-      - name: Fluent coverage guard (no bare user-facing strings)
-        run: cargo test --test architecture user_facing_strings_route_through_fluent
       - name: Comment hygiene gate (no issue refs / review notes / truncation artifacts)
         run: |
           bash scripts/ci/comment_hygiene_gate.test.sh
@@ -219,7 +186,7 @@ jobs:
               ;;
           esac
 
-          if grep -Eq '^(crates/zeroclaw-tools/|\.github/workflows/(ci|cross-platform-clippy)\.yml$)' "$changed_files"; then
+          if grep -Eq '^(crates/zeroclaw-tools/|scripts/ci/run_clippy\.sh$|\.github/workflows/(ci|cross-platform-clippy)\.yml$)' "$changed_files"; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
@@ -249,42 +216,11 @@ jobs:
       - name: Clippy
         shell: bash
         run: |
-          set +e
-          cargo_log="${RUNNER_TEMP}/cargo-clippy-windows-tools.log"
-          SECONDS=0
-          cargo clippy \
-            -p zeroclaw-tools \
-            --all-targets \
-            --all-features \
+          bash scripts/ci/run_clippy.sh \
+            --scope tools \
             --target x86_64-pc-windows-msvc \
-            --no-deps \
-            -- -D warnings 2>&1 | tee "$cargo_log"
-          cargo_status=${PIPESTATUS[0]}
-          duration_seconds=$SECONDS
-          set -e
-
-          workspace_path_compiles="$(grep -E -c 'Compiling.*\([^)]*zeroclaw' "$cargo_log" || true)"
-          total_compiles="$(grep -c 'Compiling' "$cargo_log" || true)"
-          downloaded_crates="$(grep -c 'Downloaded' "$cargo_log" || true)"
-          cache_hit="${RUST_CACHE_HIT:-unknown}"
-          summary_file="${GITHUB_STEP_SUMMARY:-/dev/null}"
-
-          {
-            echo "### Targeted Windows Clippy diagnostics"
-            echo ""
-            echo "| Field | Value |"
-            echo "| --- | --- |"
-            echo "| Target | \`x86_64-pc-windows-msvc\` |"
-            echo "| Runner OS | \`${{ runner.os }}\` |"
-            echo "| Rust cache exact hit | \`${cache_hit}\` |"
-            echo "| Clippy duration | \`${duration_seconds}s\` |"
-            echo "| Clippy status | \`${cargo_status}\` |"
-            echo "| Workspace path compile lines | \`${workspace_path_compiles}\` |"
-            echo "| Total compile lines | \`${total_compiles}\` |"
-            echo "| Downloaded crate lines | \`${downloaded_crates}\` |"
-          } >> "$summary_file"
-
-          exit "$cargo_status"
+            --summary-title "Targeted Windows Clippy diagnostics" \
+            --log-name cargo-clippy-windows-tools.log
         env:
           RUST_CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
 
@@ -323,9 +259,9 @@ jobs:
           use-blacksmith: ${{ vars.CI_USE_BLACKSMITH == 'true' && matrix.target == 'x86_64-unknown-linux-gnu' }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
-      - name: Install mold linker
+      - name: Install Linux system dependencies
         if: runner.os == 'Linux'
-        run: bash scripts/ci/apt_install.sh mold
+        run: bash scripts/ci/apt_install.sh mold libasound2-dev
       - name: Ensure web/dist placeholder exists
         shell: bash
         run: mkdir -p web/dist && touch web/dist/.gitkeep
@@ -364,6 +300,17 @@ jobs:
           exit "$cargo_status"
         env:
           RUST_CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+      - name: Check voice-wake
+        if: runner.os != 'Linux'
+        shell: bash
+        run: cargo check --locked -p zeroclaw-channels --no-default-features --features voice-wake --target ${{ matrix.target }}
+      - name: Test voice-wake
+        if: runner.os == 'Linux'
+        shell: bash
+        run: cargo test --locked -p zeroclaw-channels --no-default-features --features voice-wake --target ${{ matrix.target }} --lib voice_wake
+        env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 

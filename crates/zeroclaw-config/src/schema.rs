@@ -21061,9 +21061,12 @@ impl Config {
                     "google_workspace.allowed_operations[{i}].service contains invalid characters: {service}"
                 );
             }
+            // Unlike service IDs, resource/sub_resource/method names are camelCase
+            // in the Google APIs (calendarList, quickAdd, batchUpdate), so
+            // uppercase must be accepted here and in the runtime tool check.
             if !resource
                 .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
             {
                 anyhow::bail!(
                     "google_workspace.allowed_operations[{i}].resource contains invalid characters: {resource}"
@@ -21079,7 +21082,7 @@ impl Config {
                 }
                 if !sub
                     .chars()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
                 {
                     anyhow::bail!(
                         "google_workspace.allowed_operations[{i}].sub_resource contains invalid characters: {sub}"
@@ -21105,7 +21108,7 @@ impl Config {
                 }
                 if !normalized
                     .chars()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
                 {
                     anyhow::bail!(
                         "google_workspace.allowed_operations[{i}].methods[{j}] contains invalid characters: {normalized}"
@@ -30811,6 +30814,35 @@ api_token = "tok"
                 resource: "files".into(),
                 sub_resource: None,
                 methods: vec!["list".into(), "get".into()],
+            },
+        ];
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    async fn google_workspace_allowed_operations_accept_camelcase_entries() {
+        // Google API resource/method identifiers are camelCase; the shipped
+        // examples (calendarList, quickAdd, batchUpdate) must validate.
+        let mut config = Config::default();
+        config.google_workspace.allowed_operations = vec![
+            GoogleWorkspaceAllowedOperation {
+                service: "calendar".into(),
+                resource: "calendarList".into(),
+                sub_resource: None,
+                methods: vec!["list".into(), "get".into()],
+            },
+            GoogleWorkspaceAllowedOperation {
+                service: "calendar".into(),
+                resource: "events".into(),
+                sub_resource: None,
+                methods: vec!["quickAdd".into()],
+            },
+            GoogleWorkspaceAllowedOperation {
+                service: "gmail".into(),
+                resource: "users".into(),
+                sub_resource: Some("sendAs".into()),
+                methods: vec!["list".into()],
             },
         ];
 

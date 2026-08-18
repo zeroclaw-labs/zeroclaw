@@ -10,12 +10,12 @@ Fires on every PR targeting `master` and on trusted pushes to `master`.
 Composite job with multiple matrix legs:
 
 - **fmt**: `cargo fmt --all -- --check`
-- **lint**: `cargo clippy --workspace --exclude zeroclaw-desktop --all-targets --features ci-all -- -D warnings`, then `cargo doc --no-deps --workspace --exclude zeroclaw-desktop` (rustdoc warnings are fatal via `.cargo/config.toml` `build.rustdocflags`; desktop is excluded to match `xtask build_api` / docs-deploy and avoid GTK/`glib-sys` on the lint runner), plus architecture guards (`cargo test --test architecture`): config-write isolation and Fluent coverage (no bare user-facing strings), and the comment hygiene gate
+- **lint**: `cargo clippy --workspace --exclude zeroclaw-desktop --all-targets --features ci-all -- -D warnings`, then `cargo doc --no-deps --workspace --exclude zeroclaw-desktop` (rustdoc warnings are fatal via `.cargo/config.toml` `build.rustdocflags`; desktop is excluded to match `xtask build_api` / docs-deploy and avoid GTK/`glib-sys` on the lint runner), and the comment hygiene gate
 - **build**: matrix: `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-pc-windows-msvc`
 - **check**: three warnings-fatal passes over the workspace (excluding `zeroclaw-desktop`): all features; no default features; and default features with `--all-targets`, which is the only leg that compiles test targets on the default feature surface
 - **check-32bit**: `i686-unknown-linux-gnu` with no default features
 - **bench**: benchmarks compile check
-- **test**: the standalone firmware protocol host gate from `scripts/ci/firmware_protocol_gate.sh` and `cargo nextest run --locked --workspace --exclude zeroclaw-desktop` on Linux
+- **test**: the standalone firmware protocol host gate from `scripts/ci/firmware_protocol_gate.sh` and `cargo nextest run --locked --workspace --exclude zeroclaw-desktop` on Linux, including the config-write isolation and Fluent coverage (no bare user-facing strings) architecture guards
 - **parallel-runtime-test**: repeated same-process runtime/channel tests from `scripts/ci/parallel_runtime_test_gate.sh`, run in parallel with the main test job for relevant PR paths and unconditionally on `master` pushes and merge queue runs
 - **security**: `cargo deny check`
 - **nix-eval**: evaluates the NixOS module assertions (`nixos-module-eval` flake check)
@@ -143,6 +143,8 @@ Manual trigger for building release binaries across the full target matrix: Linu
 ### Cross-Platform Clippy (`cross-platform-clippy.yml`)
 
 Manual and weekly scheduled advisory lint coverage on macOS aarch64 and Windows x86_64 targets. It mirrors the required PR lint command with `--target` set for each platform, but intentionally does not run on PRs and is not part of `CI Required Gate`.
+
+Required Linux Clippy, advisory cross-platform Clippy, and targeted Windows Clippy call `scripts/ci/run_clippy.sh`. That runner owns the supported command shapes, Cargo exit-status propagation, and the shared duration, cache, compile-count, and download-count diagnostics. The workflow files continue to own triggers, runners, toolchains, caches, timeouts, and required-gate membership.
 
 ### Release Stable (`release-stable-manual.yml`)
 

@@ -76,10 +76,10 @@ impl Tool for CodexCliTool {
         // Rate limiting is applied by the RateLimitedTool wrapper at
         // registration time (see zeroclaw-runtime::tools::mod).
 
-        // Enforce act policy
+        // The production wrapper owns accounting; the adapter owns authorization.
         if let Err(error) = self
             .security
-            .enforce_tool_operation(ToolOperation::Act, "codex_cli")
+            .authorize_tool_operation(ToolOperation::Act, "codex_cli")
         {
             return Ok(ToolResult {
                 success: false,
@@ -286,7 +286,10 @@ mod tests {
             workspace_dir: std::env::temp_dir(),
             ..SecurityPolicy::default()
         });
-        let tool = CodexCliTool::new(security, test_config());
+        let tool = crate::wrappers::RateLimitedTool::new(
+            CodexCliTool::new(security.clone(), test_config()),
+            security,
+        );
         let result = tool
             .execute(json!({"prompt": "hello"}))
             .await
