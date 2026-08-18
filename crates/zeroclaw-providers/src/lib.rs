@@ -4823,7 +4823,9 @@ pub async fn fetch_context_window(
     match provider_type {
         "openrouter" => fetch_openrouter_context_window(config).await,
         "together" | "groq" | "fireworks" | "deepinfra" | "hyperbolic" | "anyscale" | "novita"
-        | "nebius" => fetch_openai_compatible_context_window(provider_type, config).await,
+        | "nebius" | "crusoe" => {
+            fetch_openai_compatible_context_window(provider_type, config).await
+        }
         _ => None, // anthropic, openai, ollama, bedrock, etc. don't expose it
     }
 }

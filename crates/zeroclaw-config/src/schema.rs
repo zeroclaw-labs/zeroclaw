@@ -1468,7 +1468,7 @@ mod crusoe_tests {
     fn crusoe_alias_round_trips_through_config() {
         let toml = r#"
 [providers.models.crusoe.default]
-model = "zai/GLM-5.2"
+model = "deepseek-ai/Deepseek-V4-Flash"
 "#;
         let config: Config = toml::from_str(toml).expect("crusoe alias deserializes");
         let alias = config
@@ -1477,7 +1477,10 @@ model = "zai/GLM-5.2"
             .crusoe
             .get("default")
             .expect("crusoe.default present");
-        assert_eq!(alias.base.model.as_deref(), Some("zai/GLM-5.2"));
+        assert_eq!(
+            alias.base.model.as_deref(),
+            Some("deepseek-ai/Deepseek-V4-Flash")
+        );
     }
 }
 

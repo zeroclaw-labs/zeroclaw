@@ -462,6 +462,7 @@ pub fn get_default_url(provider_type: &str) -> Option<&'static str> {
         "nebius" => <NebiusModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
         "nvidia" => <NvidiaModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
         "atlascloud" => <AtlasCloudModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
+        "crusoe" => <CrusoeModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
         _ => return None,
     })
 }

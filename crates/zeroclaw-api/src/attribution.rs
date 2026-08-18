@@ -540,8 +540,6 @@ mod tests {
 
     #[test]
     fn crusoe_kind_serializes_snake_case() {
-        assert_eq!(
-            <&'static str>::from(ModelProviderKind::Crusoe),
-            "crusoe"
-        );
+        assert_eq!(<&'static str>::from(ModelProviderKind::Crusoe), "crusoe");
+    }
 }
