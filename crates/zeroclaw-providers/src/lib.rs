@@ -797,13 +797,15 @@ fn token_end(input: &str, from: usize) -> usize {
     end
 }
 
-/// Remove complete query strings from HTTP(S) URLs embedded in error text.
+/// Remove credentials from HTTP(S) URLs embedded in error text.
 ///
 /// Query-value punctuation cannot safely identify where a credential ends:
 /// commas, apostrophes, and parentheses are all legal query data. Treat the
 /// URL's entire non-whitespace query tail as sensitive instead. This also
 /// covers credential parameter names that the sanitizer does not know about.
-fn scrub_url_queries(input: &str) -> String {
+/// URL userinfo is likewise always sensitive and is replaced as one unit while
+/// retaining the host and path needed for an actionable endpoint diagnostic.
+fn scrub_url_credentials(input: &str) -> String {
     let lowercase = input.to_ascii_lowercase();
     let mut scrubbed = String::with_capacity(input.len());
     let mut cursor = 0;
@@ -828,10 +830,22 @@ fn scrub_url_queries(input: &str) -> String {
         let url_tail = &input[url_start..];
         let url_end = url_start + url_tail.find(char::is_whitespace).unwrap_or(url_tail.len());
         let url_token = &input[url_start..url_end];
-        if let Some(query_start) = url_token.find('?') {
-            scrubbed.push_str(&url_token[..query_start]);
+        let without_query = url_token
+            .find('?')
+            .map_or(url_token, |query_start| &url_token[..query_start]);
+        let scheme_end = without_query
+            .find("://")
+            .map_or(0, |separator| separator + 3);
+        let authority_end = without_query[scheme_end..]
+            .find(['/', '#'])
+            .map_or(without_query.len(), |end| scheme_end + end);
+        let authority = &without_query[scheme_end..authority_end];
+        if let Some(userinfo_end) = authority.rfind('@') {
+            scrubbed.push_str(&without_query[..scheme_end]);
+            scrubbed.push_str("[REDACTED]@");
+            scrubbed.push_str(&without_query[scheme_end + userinfo_end + 1..]);
         } else {
-            scrubbed.push_str(url_token);
+            scrubbed.push_str(without_query);
         }
         cursor = url_end;
     }
@@ -840,13 +854,13 @@ fn scrub_url_queries(input: &str) -> String {
 }
 
 /// Scrub known secret-like token prefixes from model_provider error strings.
-/// Redacts tokens with prefixes like `sk-`, `xoxb-`, `xoxp-`, `ghp_`, `gho_`,
-/// `ghu_`, `github_pat_`, and Google/Gemini `AIza` keys. Complete query strings
-/// are removed from embedded HTTP(S) URLs because query parameters may carry
-/// credentials under provider-specific names.
+/// Provider API-key prefixes come from the same canonical table used for
+/// credential-family validation; non-provider prefixes cover Slack, GitHub,
+/// and Google/Gemini credentials. Complete query strings are removed from
+/// embedded HTTP(S) URLs because query parameters may carry credentials under
+/// provider-specific names.
 pub fn scrub_secret_patterns(input: &str) -> String {
-    const PREFIXES: [&str; 8] = [
-        "sk-",
+    const NON_PROVIDER_SECRET_PREFIXES: &[&str] = &[
         "xoxb-",
         "xoxp-",
         "ghp_",
@@ -856,9 +870,13 @@ pub fn scrub_secret_patterns(input: &str) -> String {
         "AIza",
     ];
 
-    let mut scrubbed = scrub_url_queries(input);
+    let mut scrubbed = scrub_url_credentials(input);
 
-    for prefix in PREFIXES {
+    for prefix in KEY_PREFIX_MODEL_PROVIDERS
+        .iter()
+        .map(|(prefix, _)| *prefix)
+        .chain(NON_PROVIDER_SECRET_PREFIXES.iter().copied())
+    {
         let mut search_from = 0;
         while let Some(rel) = scrubbed[search_from..].find(prefix) {
             let start = search_from + rel;
@@ -879,20 +897,22 @@ pub fn scrub_secret_patterns(input: &str) -> String {
     scrubbed
 }
 
-/// Sanitize API error text by scrubbing secrets and truncating length.
-pub fn sanitize_api_error(input: &str) -> String {
-    let scrubbed = scrub_secret_patterns(input);
-
-    if scrubbed.chars().count() <= MAX_API_ERROR_CHARS {
-        return scrubbed;
+pub(crate) fn truncate_api_error(input: &str) -> String {
+    if input.chars().count() <= MAX_API_ERROR_CHARS {
+        return input.to_string();
     }
 
     let mut end = MAX_API_ERROR_CHARS;
-    while end > 0 && !scrubbed.is_char_boundary(end) {
+    while end > 0 && !input.is_char_boundary(end) {
         end -= 1;
     }
 
-    format!("{}...", &scrubbed[..end])
+    format!("{}...", &input[..end])
+}
+
+/// Sanitize API error text by scrubbing secrets and truncating length.
+pub fn sanitize_api_error(input: &str) -> String {
+    truncate_api_error(&scrub_secret_patterns(input))
 }
 
 /// Whether `message` mentions tools as a standalone word rather than as a
@@ -3856,6 +3876,32 @@ mod tests {
         assert!(!result.contains("hunter2secret"), "{result}");
         assert!(!result.contains("region=us"), "{result}");
         assert!(result.contains("HTTPS://api.example.com/v1/thing"));
+    }
+
+    #[test]
+    fn sanitize_removes_url_userinfo_and_query_credentials() {
+        let input = "GET https://catalog-user:s3cr3t-password@api.example.com/v1/models?signature=signed-query-value failed";
+        let result = sanitize_api_error(input);
+
+        assert!(!result.contains("catalog-user"), "{result}");
+        assert!(!result.contains("s3cr3t-password"), "{result}");
+        assert!(!result.contains("signed-query-value"), "{result}");
+        assert!(result.contains("https://[REDACTED]@api.example.com/v1/models"));
+    }
+
+    #[test]
+    fn sanitize_scrubs_every_canonical_model_provider_key_prefix() {
+        for (prefix, provider) in KEY_PREFIX_MODEL_PROVIDERS {
+            let secret = format!("{prefix}syntheticSecretValue12345");
+            let result = sanitize_api_error(&format!(
+                "configured {provider} credential excerpt: {secret}"
+            ));
+            assert!(!result.contains(&secret), "{provider} key leaked: {result}");
+            assert!(
+                result.contains("[REDACTED]"),
+                "{provider} key was not marked redacted: {result}"
+            );
+        }
     }
 
     #[test]

@@ -1145,13 +1145,10 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
                 ));
             }
 
-            // Local families are credential-optional by declaration. Keep this
-            // tied to the canonical provider registry so a newly registered
-            // local provider never inherits a cloud-credential warning.
-            let local_family = zeroclaw_providers::list_model_providers()
-                .iter()
-                .any(|provider| provider.name == family && provider.local);
-            if !local_family {
+            // Native Ollama services are credential-optional by declaration.
+            // Keep this narrow: other local-family diagnostics retain their
+            // established API-key warning behavior.
+            if !matches!(family, "ollama" | "hailo_ollama") {
                 if entry.api_key.as_deref().is_some() {
                     items.push(DiagItem::ok(cat, format!("{label}: API key configured")));
                 } else {
@@ -1888,6 +1885,29 @@ mod tests {
                 .iter()
                 .any(|item| item.message.contains("hailo_ollama.edge: no api_key set")),
             "local Hailo aliases must not receive a cloud-credential warning"
+        );
+    }
+
+    #[test]
+    fn non_hailo_local_alias_keeps_existing_missing_api_key_warning() {
+        let mut config = Config::default();
+        config.providers.models.llamacpp.insert(
+            "edge".to_string(),
+            zeroclaw_config::schema::LlamacppModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    model: Some("local-model".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+        assert!(
+            items
+                .iter()
+                .any(|item| item.message.contains("llamacpp.edge: no api_key set")),
+            "other local families must retain their established API-key warning"
         );
     }
 
