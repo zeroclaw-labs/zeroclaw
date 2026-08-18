@@ -31,14 +31,38 @@ const TEMPERATURE_DEFAULT: f64 = 0.8;
 enum QuarantineReason {
     AmbiguousTimeout,
     AmbiguousTransport,
+    IncompleteResponse,
     WorkerTerminated,
 }
+
+#[derive(Debug)]
+enum IncompleteHailoResponseError {
+    MissingCompletion { done: Option<bool> },
+    MalformedJson,
+}
+
+impl std::fmt::Display for IncompleteHailoResponseError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingCompletion { done } => write!(
+                formatter,
+                "Hailo-Ollama returned an incomplete non-streaming response (done={done:?})",
+            ),
+            Self::MalformedJson => formatter.write_str(
+                "Hailo-Ollama returned a malformed successful response before completion could be verified",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for IncompleteHailoResponseError {}
 
 impl QuarantineReason {
     fn as_str(self) -> &'static str {
         match self {
             Self::AmbiguousTimeout => "ambiguous_timeout",
             Self::AmbiguousTransport => "ambiguous_transport",
+            Self::IncompleteResponse => "incomplete_response",
             Self::WorkerTerminated => "worker_terminated",
         }
     }
@@ -102,10 +126,15 @@ fn canonical_endpoint(endpoint: &str) -> String {
     };
 
     let is_loopback_alias = url.host_str().is_some_and(|host| {
-        matches!(
-            host,
-            "localhost" | "127.0.0.1" | "::1" | "[::1]" | "0.0.0.0"
-        )
+        let host = host
+            .trim_end_matches('.')
+            .trim_start_matches('[')
+            .trim_end_matches(']');
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+            || host == "0.0.0.0"
     });
     if is_loopback_alias {
         let _ = url.set_host(Some("localhost"));
@@ -291,12 +320,43 @@ impl HailoOllamaModelProvider {
         Ok(url.as_str().trim_end_matches('/').to_string())
     }
 
+    /// Build from current runtime and environment proxy policy for each request.
+    /// Hailo is single-flight per endpoint, so the bounded setup cost avoids a
+    /// stale cached client silently retaining an earlier proxy policy. Redirects
+    /// remain disabled because the configured URL owns the endpoint gate.
     fn http_client(&self) -> anyhow::Result<Client> {
-        zeroclaw_config::schema::try_build_runtime_proxy_client_with_timeouts(
+        let builder = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(self.request_timeout_secs))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none());
+        let builder = zeroclaw_config::schema::try_apply_runtime_proxy_to_builder(
+            builder,
             "model_provider.hailo_ollama",
-            self.request_timeout_secs,
-            10,
-        )
+        )?;
+        builder.build().map_err(|error| {
+            anyhow::Error::msg(format!("Failed to build Hailo-Ollama HTTP client: {error}"))
+        })
+    }
+
+    fn sanitize_response_body(&self, body: &str) -> String {
+        let mut redacted = super::scrub_secret_patterns(body);
+        for value in self.request_headers.values() {
+            let Ok(value) = value.to_str() else {
+                continue;
+            };
+            for secret in [Some(value), value.strip_prefix("Bearer ")]
+                .into_iter()
+                .flatten()
+                .filter(|secret| !secret.is_empty())
+            {
+                let scrubbed_secret = super::scrub_secret_patterns(secret);
+                redacted = redacted.replace(secret, "[REDACTED]");
+                if scrubbed_secret != secret {
+                    redacted = redacted.replace(&scrubbed_secret, "[REDACTED]");
+                }
+            }
+        }
+        super::truncate_api_error(&redacted)
     }
 
     fn ensure_gate_ready(&self, gate: &GenerationGate) -> anyhow::Result<()> {
@@ -318,6 +378,7 @@ impl HailoOllamaModelProvider {
         let detail = match reason {
             QuarantineReason::AmbiguousTimeout => "an ambiguous request timeout",
             QuarantineReason::AmbiguousTransport => "an ambiguous post-connect transport failure",
+            QuarantineReason::IncompleteResponse => "an incomplete non-streaming response",
             QuarantineReason::WorkerTerminated => "an in-flight request worker failure",
         };
         Err(anyhow::Error::new(NonRetryableProviderError::new(format!(
@@ -327,6 +388,12 @@ impl HailoOllamaModelProvider {
     }
 
     fn quarantine_reason(error: &anyhow::Error) -> Option<QuarantineReason> {
+        if error
+            .chain()
+            .any(|source| source.is::<IncompleteHailoResponseError>())
+        {
+            return Some(QuarantineReason::IncompleteResponse);
+        }
         error.chain().find_map(|source| {
             let error = source.downcast_ref::<reqwest::Error>()?;
             if error.is_connect() || error.is_builder() {
@@ -457,11 +524,11 @@ impl HailoOllamaModelProvider {
 
         let images: Vec<String> = image_refs
             .iter()
-            .filter_map(|reference| multimodal::extract_ollama_image_payload(reference))
+            .map(|reference| {
+                multimodal::extract_ollama_image_payload(reference)
+                    .unwrap_or_else(|| reference.clone())
+            })
             .collect();
-        if images.is_empty() {
-            return (Some(content.to_string()), None);
-        }
 
         let cleaned = cleaned.trim();
         let content = (!cleaned.is_empty()).then(|| cleaned.to_string());
@@ -649,13 +716,22 @@ impl HailoOllamaModelProvider {
         let available = HAILO_MAX_MESSAGE_CHARS.saturating_sub(overhead);
         let system_chars = system.chars().count();
         let user_chars = user.chars().count();
-        let reserved_system = system_chars.min(available / 3);
-        let user_budget = user_chars.min(available.saturating_sub(reserved_system));
-        let system_budget = system_chars.min(available.saturating_sub(user_budget));
+        let has_tool_protocol = system.contains("## Tool Use Protocol");
+        let (system_budget, user_budget) = if has_tool_protocol && system_chars <= available {
+            (
+                system_chars,
+                user_chars.min(available.saturating_sub(system_chars)),
+            )
+        } else {
+            let reserved_system = system_chars.min(available / 3);
+            let user_budget = user_chars.min(available.saturating_sub(reserved_system));
+            let system_budget = system_chars.min(available.saturating_sub(user_budget));
+            (system_budget, user_budget)
+        };
         let system_truncated = system_chars > system_budget;
         let user_truncated = user_chars > user_budget;
 
-        if system_truncated && system.contains("## Tool Use Protocol") {
+        if system_truncated && has_tool_protocol {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -926,6 +1002,14 @@ impl HailoOllamaModelProvider {
             .saturating_mul(4) as usize;
         let original_candidate_count = candidates.len();
         let system = system_parts.join(" ");
+        // The fallback request is part of the wire contract, so it must enter
+        // local context projection before we accept a request as in-budget.
+        if candidates.is_empty() {
+            candidates.push(MessageCandidate {
+                kind: MessageKind::User,
+                content: "hello".to_string(),
+            });
+        }
         let projected_chars = |candidates: &[MessageCandidate]| -> anyhow::Result<usize> {
             let mut total_chars = 0usize;
             let mut current_message_chars = 0usize;
@@ -1014,14 +1098,7 @@ impl HailoOllamaModelProvider {
             self.push_message(&mut converted, role.to_string(), candidate.content);
         }
 
-        if converted.is_empty() {
-            let content = if system.is_empty() {
-                "hello".to_string()
-            } else {
-                self.fold_system(&system, "hello")?
-            };
-            self.push_message(&mut converted, "user".to_string(), content);
-        } else if !system.is_empty() {
+        if !system.is_empty() {
             let first_user = &mut converted[0];
             let user = first_user.content.take().unwrap_or_default();
             first_user.content = Some(self.fold_system(&system, &user)?);
@@ -1118,7 +1195,7 @@ impl HailoOllamaModelProvider {
 
         if !status.is_success() {
             let raw = String::from_utf8_lossy(&body);
-            let sanitized = super::sanitize_api_error(&raw);
+            let sanitized = self.sanitize_response_body(&raw);
             ::zeroclaw_log::record!(
                 ERROR,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -1127,11 +1204,9 @@ impl HailoOllamaModelProvider {
                         "error_key": "hailo_api_error",
                         "model_provider": self.alias,
                         "status": status.as_u16(),
+                        "body_excerpt": sanitized,
                     })),
-                &format!(
-                    "Hailo-Ollama error response: status={} body_excerpt={}",
-                    status, sanitized
-                )
+                "Hailo-Ollama API error response"
             );
             anyhow::bail!(
                 "Hailo-Ollama API error ({}): {}. Check that Hailo-Ollama is running and the \
@@ -1143,7 +1218,7 @@ impl HailoOllamaModelProvider {
 
         let parsed: ApiChatResponse = serde_json::from_slice(&body).map_err(|error| {
             let raw = String::from_utf8_lossy(&body);
-            let sanitized = super::sanitize_api_error(&raw);
+            let sanitized = self.sanitize_response_body(&raw);
             ::zeroclaw_log::record!(
                 ERROR,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -1152,19 +1227,24 @@ impl HailoOllamaModelProvider {
                         "error_key": "hailo_response_deserialize",
                         "model_provider": self.alias,
                         "error": error.to_string(),
+                        "body_excerpt": sanitized,
                     })),
-                &format!(
-                    "Hailo-Ollama response deserialization failed: {error}. body_excerpt={}",
-                    sanitized
-                )
+                "Hailo-Ollama response deserialization failed"
             );
-            anyhow::Error::msg(format!("Failed to parse Hailo-Ollama response: {error}"))
+            anyhow::Error::new(NonRetryableProviderError::with_source(
+                format!("Failed to parse Hailo-Ollama response: {error}"),
+                IncompleteHailoResponseError::MalformedJson,
+            ))
         })?;
         if parsed.done != Some(true) {
-            anyhow::bail!(
-                "Hailo-Ollama returned an incomplete non-streaming response (done={:?})",
-                parsed.done
-            );
+            let incomplete = IncompleteHailoResponseError::MissingCompletion { done: parsed.done };
+            return Err(anyhow::Error::new(NonRetryableProviderError::with_source(
+                format!(
+                    "Hailo-Ollama rejected an incomplete non-streaming response (done={:?})",
+                    parsed.done
+                ),
+                incomplete,
+            )));
         }
         Ok(parsed)
     }
@@ -1223,9 +1303,9 @@ impl HailoOllamaModelProvider {
                             })),
                         "Hailo-Ollama rejected a request after its queue wait expired"
                     );
-                    anyhow::Error::msg(
+                    anyhow::Error::new(NonRetryableProviderError::new(
                         "Hailo-Ollama queue wait timed out at its configured deadline",
-                    )
+                    ))
                 })?
                 .map_err(|_| {
                     ::zeroclaw_log::record!(
@@ -1313,7 +1393,10 @@ impl HailoOllamaModelProvider {
         } else {
             None
         };
-        let text = Self::response_text(&response)?;
+        // Keep a transport-successful empty completion as a ChatResponse so
+        // ReliableModelProvider can classify it as semantic-empty and retain
+        // any provider-reported usage before retry/fallback.
+        let text = Self::response_text(&response).unwrap_or_default();
         Ok(ChatResponse {
             text: Some(text),
             tool_calls: Vec::new(),
@@ -1492,6 +1575,69 @@ mod tests {
     }
 
     #[test]
+    fn response_sanitizer_redacts_long_configured_values_before_truncation() {
+        let secret = "sensitive-fragment-".repeat(180);
+        let headers = [
+            ("X-Long-Secret".to_string(), secret.clone()),
+            ("Origin".to_string(), "https://client.example".to_string()),
+            (
+                "X-Pattern-Secret".to_string(),
+                "private-prefix-sk-abc".to_string(),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let provider = HailoOllamaModelProvider::new(
+            "edge",
+            Some("http://127.0.0.1:8000"),
+            90,
+            5,
+            OllamaTuning::default(),
+        )
+        .expect("valid Hailo URL")
+        .with_auth_headers(None, &headers)
+        .expect("configured headers should build");
+
+        let sanitized = provider.sanitize_response_body(&format!("reflected {secret}"));
+        assert!(!sanitized.contains("sensitive-fragment-"));
+        assert!(sanitized.contains("[REDACTED]"));
+
+        let sanitized =
+            provider.sanitize_response_body("https://client.example/cb?access_token=hunter2");
+        assert!(!sanitized.contains("access_token"));
+        assert!(!sanitized.contains("hunter2"));
+
+        let sanitized = provider.sanitize_response_body("reflected private-prefix-sk-abc");
+        assert!(!sanitized.contains("private-prefix-"));
+    }
+
+    #[test]
+    fn system_only_history_respects_local_context_budget() {
+        let provider = HailoOllamaModelProvider::new(
+            "edge",
+            None,
+            90,
+            5,
+            OllamaTuning {
+                num_ctx: 0,
+                num_predict: 0,
+                temperature_override: None,
+            },
+        )
+        .expect("typed default Hailo URL must be valid");
+        let error = provider
+            .normalize_messages(vec![Message {
+                role: "system".to_string(),
+                content: Some("system instruction".to_string()),
+                images: None,
+                tool_calls: None,
+                tool_name: None,
+            }])
+            .expect_err("fallback user turn must be counted against the local context budget");
+        assert!(error.to_string().contains("local context budget"));
+    }
+
+    #[test]
     fn constructor_uses_typed_default_endpoint() {
         let provider = HailoOllamaModelProvider::new("edge", None, 90, 5, OllamaTuning::default())
             .expect("typed default Hailo URL must be valid");
@@ -1533,6 +1679,10 @@ mod tests {
         assert_eq!(
             canonical_endpoint("http://localhost:8000"),
             canonical_endpoint("http://[::1]:8000/api")
+        );
+        assert_eq!(
+            canonical_endpoint("http://localhost.:8000"),
+            canonical_endpoint("http://127.0.0.2:8000")
         );
     }
 
