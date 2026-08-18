@@ -13,6 +13,8 @@ const en: Record<string, string> = {
     'Earlier conversation history was trimmed: {reason} ({dropped} messages dropped; {kept} turns kept).',
   'agent.history_trimmed_tokens':
     'Earlier conversation history was trimmed from approximately {before} to {after} tokens: {reason}; {dropped} messages dropped and {kept} turns kept.',
+  'agent.history_trimmed_floor':
+    'The conversation history could not be trimmed below the configured token budget: {reason}; the most recent turn still needs approximately {after} tokens (configured budget: {budget}).',
   'agent.history_trimmed_tokens_budget_clause': ' (configured token budget: {budget})',
   'agent.history_trimmed_tokens_source_provider': 'provider-reported',
   'agent.history_trimmed_tokens_source_estimate': 'estimated',
@@ -88,4 +90,39 @@ test('message-limit trim without token accounting keeps the count-only fallback'
   assert.match(text, /history message limit exceeded/);
   assert.match(text, /12 messages dropped/);
   assert.match(text, /3 turns kept/);
+});
+
+test('untrimmable newest-turn floor renders a distinct notice that does not claim history was trimmed', () => {
+  const text = buildHistoryTrimmedNotice(
+    {
+      reason: 'context token budget exceeded',
+      dropped_messages: 0,
+      kept_turns: 1,
+      token_budget: 100000,
+      tokens_before: 612000,
+      tokens_after: 117000,
+    } satisfies HistoryTrimmedNoticeMessage,
+    t,
+  );
+  assert.match(text, /could not be trimmed below the configured token budget/);
+  assert.match(text, /117000/);
+  assert.match(text, /configured budget: 100000/);
+  assert.ok(!text.includes('was trimmed:'), 'the floor must not claim history changed');
+  assert.ok(!text.includes('messages dropped'), 'the floor must not claim a trim happened');
+});
+
+test('ordinary trim with dropped messages keeps the trimmed wording even when slightly over budget', () => {
+  const text = buildHistoryTrimmedNotice(
+    {
+      reason: 'context token budget exceeded',
+      dropped_messages: 1,
+      kept_turns: 1,
+      token_budget: 100000,
+      tokens_before: 612000,
+      tokens_after: 117000,
+    } satisfies HistoryTrimmedNoticeMessage,
+    t,
+  );
+  assert.match(text, /Earlier conversation history was trimmed/);
+  assert.ok(!text.includes('could not be trimmed'));
 });
