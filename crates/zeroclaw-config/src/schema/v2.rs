@@ -1055,6 +1055,18 @@ fn fold_providers_globals_into_models(
             },
         };
 
+    // Whether the target alias slot was already materialized by
+    // `alias_provider_models` before this fold ran. The explicit
+    // `default_provider` equivalence re-check below only suppresses the
+    // selector-as-producer when it OVERLAYS an already-existing equivalent
+    // slot; when the selector itself creates the alias from scratch, it is
+    // the slot's sole producer and must be registered even though the
+    // completed alias naturally matches its own identity.
+    let target_existed = aliased_models
+        .get(&target_type)
+        .and_then(toml::Value::as_table)
+        .is_some_and(|t| t.contains_key(&target_alias));
+
     let provider_value = aliased_models
         .entry(target_type.clone())
         .or_insert_with(|| toml::Value::Table(toml::Table::new()));
@@ -1133,22 +1145,29 @@ fn fold_providers_globals_into_models(
     // the selector — a bare `[providers.models.custom]` whose missing URI is
     // filled by a matching `custom:https://...` default provider, or a `qwen`
     // entry whose endpoint override the fold left in place. When the final alias
-    // matches the selector, the selector completed an existing slot rather than
-    // naming a second source, so it must not be registered as an extra producer
-    // (that would make the slot ambiguous and strand the vision reference on the
-    // configless path). A selector the completed alias still does not match — a
-    // distinct URL, or a variant the fold could not apply — stays a separate
-    // producer so the rewrite fails closed.
+    // matches the selector AND the slot already existed, the selector completed
+    // an existing slot rather than naming a second source, so it must not be
+    // registered as an extra producer (that would make the slot ambiguous and
+    // strand the vision reference on the configless path). When the selector
+    // CREATED the alias from scratch (no `[providers.models]` entry), the match
+    // is expected: the fold materialized the slot to exactly the selector's
+    // identity, and the selector remains that slot's producer so the bare vision
+    // reference can still be rewritten to the credential-bearing alias. A
+    // selector the completed alias still does not match — a distinct URL, or a
+    // variant the fold could not apply — stays a separate producer so the
+    // rewrite fails closed.
     if let Some(selector) = g_default_provider.as_ref().and_then(toml::Value::as_str) {
         let (raw_type, url) = split_colon_url_provider(selector);
         let (canonical, alias, extras) = normalize_provider_type(&raw_type, "default");
-        if effective_source_identity_matches(
-            aliased_models,
-            &canonical,
-            &alias,
-            &extras,
-            url.as_deref(),
-        ) {
+        if target_existed
+            && effective_source_identity_matches(
+                aliased_models,
+                &canonical,
+                &alias,
+                &extras,
+                url.as_deref(),
+            )
+        {
             source_key = None;
         }
     }
