@@ -13,11 +13,13 @@ pub mod factory;
 pub mod gemini;
 pub mod gemini_cli;
 // glm.rs excluded — not compiled in upstream (dead code with known issues)
+pub mod hailo_ollama;
 pub mod kilocli;
 pub mod model_pin;
 pub mod models_dev;
 pub mod multimodal;
 pub mod ollama;
+mod ollama_wire;
 pub mod openai;
 pub mod openai_codex;
 pub mod openrouter;
@@ -1856,6 +1858,7 @@ pub fn list_model_providers() -> Vec<ModelProviderInfo> {
             ("telnyx", "Telnyx", false),
             ("azure", "Azure OpenAI", false),
             ("ollama", "Ollama", true),
+            ("hailo_ollama", "Hailo-Ollama", true),
             ("gemini", "Google Gemini", false),
         ],
     );
@@ -3498,9 +3501,13 @@ mod tests {
             if model_provider.name == "custom" {
                 continue;
             }
+            let api_key = if model_provider.name == "hailo_ollama" {
+                None
+            } else {
+                Some("provider-test-credential")
+            };
             assert!(
-                create_model_provider(model_provider.name, Some("provider-test-credential"))
-                    .is_ok(),
+                create_model_provider(model_provider.name, api_key).is_ok(),
                 "Canonical model model_provider id should be constructible: {}",
                 model_provider.name
             );

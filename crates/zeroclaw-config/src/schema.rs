@@ -29,6 +29,7 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "model_provider.copilot",
     "model_provider.gemini",
     "model_provider.glm",
+    "model_provider.hailo_ollama",
     "model_provider.ollama",
     "model_provider.openai",
     "model_provider.openrouter",
@@ -1320,6 +1321,40 @@ pub struct OllamaModelProviderConfig {
     /// backward compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature_override: Option<f64>,
+}
+
+// ── Hailo-Ollama (native local-default endpoint) ──
+
+/// Native Hailo-Ollama loopback endpoint used when an alias omits `uri`.
+pub const HAILO_OLLAMA_DEFAULT_URI: &str = "http://localhost:8000";
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum HailoOllamaEndpoint {
+    #[default]
+    LocalDefault,
+}
+
+impl ModelEndpoint for HailoOllamaEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::LocalDefault => HAILO_OLLAMA_DEFAULT_URI,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.hailo_ollama"]
+pub struct HailoOllamaModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_timeout_secs: Option<u64>,
 }
 
 // ── Together ──
@@ -3287,6 +3322,7 @@ impl_default_family_endpoint! {
     AtomicChatModelProviderConfig,
     OpenRouterModelProviderConfig,
     OllamaModelProviderConfig,
+    HailoOllamaModelProviderConfig,
     TogetherModelProviderConfig,
     FireworksModelProviderConfig,
     GroqModelProviderConfig,
@@ -10397,6 +10433,37 @@ pub fn build_runtime_proxy_client(service_key: &str) -> reqwest::Client {
     });
     set_runtime_proxy_cached_client(cache_key, client.clone());
     client
+}
+
+/// Build and cache a runtime-proxy-aware HTTP client with explicit deadlines.
+/// Unlike the infallible wrapper, this helper never falls back to direct traffic.
+pub fn try_build_runtime_proxy_client_with_timeouts(
+    service_key: &str,
+    timeout_secs: u64,
+    connect_timeout_secs: u64,
+) -> Result<reqwest::Client> {
+    let cache_key =
+        runtime_proxy_cache_key(service_key, Some(timeout_secs), Some(connect_timeout_secs));
+    if let Some(client) = runtime_proxy_cached_client(&cache_key) {
+        return Ok(client);
+    }
+    let builder = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs));
+    let proxy = runtime_proxy_config();
+    if proxy.should_apply_to_service(service_key) {
+        proxy.validate().map_err(|_| {
+            anyhow::Error::msg(format!(
+                "Invalid runtime proxy configuration for {service_key}"
+            ))
+        })?;
+    }
+    let client = proxy
+        .apply_to_reqwest_builder(builder, service_key)
+        .build()
+        .with_context(|| format!("Failed to build proxied timeout client for {service_key}"))?;
+    set_runtime_proxy_cached_client(cache_key, client.clone());
+    Ok(client)
 }
 
 pub fn build_runtime_proxy_client_with_timeouts(
@@ -31273,6 +31340,24 @@ api_token = "tok"
                 .iter()
                 .all(|warning| warning.code != "proxy_conflicts_with_dns_pinned_tools")
         );
+    }
+
+    #[test]
+    async fn proxy_config_accepts_exact_hailo_model_provider_selector() {
+        let proxy = ProxyConfig {
+            enabled: true,
+            http_proxy: Some("http://127.0.0.1:7890".into()),
+            scope: ProxyScope::Services,
+            services: vec!["model_provider.hailo_ollama".into()],
+            ..Default::default()
+        };
+
+        proxy
+            .validate()
+            .expect("canonical Hailo selector validates");
+        assert!(ProxyConfig::supported_service_keys().contains(&"model_provider.hailo_ollama"));
+        assert!(proxy.should_apply_to_service("model_provider.hailo_ollama"));
+        assert!(!proxy.should_apply_to_service("model_provider.ollama"));
     }
 
     #[test]
