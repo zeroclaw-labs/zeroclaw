@@ -9193,6 +9193,26 @@ pub struct FileDownloadConfig {
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub headers: HashMap<String, String>,
+
+    /// Opt-in allowlist of hostnames or IPs that may appear in `url` even when
+    /// the host is loopback / private / link-local, or when it resolves to a
+    /// private address. Use this for internal document services that an
+    /// operator legitimately wants the bot to reach (e.g. `["files.corp.lan"]`
+    /// or `["*"]` to blanket-tolerate any private host). Wildcard `"*"` matches
+    /// every host. Empty (the default) rejects all private/local hosts so a
+    /// misconfigured `url` cannot quietly turn the download tool into an SSRF
+    /// probe. Lifting the private-host rejection never lifts the cloud-metadata
+    /// exclusion: the documented provider metadata and credential-delivery
+    /// addresses (169.254.169.254 / `fd00:ec2::254` for EC2 IMDS, Alibaba
+    /// Cloud's 100.100.100.200, and AWS 169.254.170.2 / 169.254.170.23 /
+    /// `fd00:ec2::23` for ECS task and EKS Pod Identity credentials) are
+    /// always rejected.
+    /// A malformed entry in this list fails the whole list closed to empty, so
+    /// an invalid value cannot silently widen the gate. It does not change
+    /// which endpoint is used, and redirects remain disabled.
+    /// See `web_fetch.allowed_private_hosts` for the matching shape.
+    #[serde(default)]
+    pub allowed_private_hosts: Vec<String>,
 }
 
 fn default_file_download_max_size_bytes() -> u64 {
@@ -9210,6 +9230,7 @@ impl Default for FileDownloadConfig {
             max_file_size_bytes: default_file_download_max_size_bytes(),
             timeout_secs: default_file_download_timeout_secs(),
             headers: HashMap::new(),
+            allowed_private_hosts: Vec::new(),
         }
     }
 }
