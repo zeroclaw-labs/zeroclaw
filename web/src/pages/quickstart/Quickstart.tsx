@@ -35,6 +35,7 @@ import {
   runtimeValueForSubmit,
   type RuntimeSelection,
 } from "./runtime-selection";
+import { initialChannelFieldValues } from "./channel-fields";
 
 // Shared tokenized field control classes. Calm input surface with an accent
 // focus ring — replaces the legacy `input-electric` utility.
@@ -660,6 +661,7 @@ function LabeledInput({
   placeholder,
   multiline = false,
   help,
+  required = false,
 }: {
   label: string;
   value: string;
@@ -668,11 +670,17 @@ function LabeledInput({
   placeholder?: string;
   multiline?: boolean;
   help?: string;
+  required?: boolean;
 }) {
   return (
     <label className="block">
       <div className="text-xs uppercase tracking-wider mb-1" style={MUTED}>
         {label}
+        {required && (
+          <Badge tone="warn" className="ml-2 uppercase tracking-wide">
+            {t("fieldform.badge_required")}
+          </Badge>
+        )}
       </div>
       {help ? (
         <div className="text-xs mb-1 italic" style={MUTED}>
@@ -685,6 +693,8 @@ function LabeledInput({
           value={value}
           onChange={(e) => onChange(e.target.value)}
           placeholder={placeholder}
+          required={required}
+          aria-required={required}
           autoCapitalize="none"
           autoCorrect="off"
           spellCheck={false}
@@ -696,6 +706,8 @@ function LabeledInput({
           value={value}
           onChange={(e) => onChange(e.target.value)}
           placeholder={placeholder}
+          required={required}
+          aria-required={required}
           // Aliases, model names, API keys etc. are technical identifiers —
           // the WebView must not autocapitalize/autocorrect them (e.g. agent
           // aliases must be lowercase).
@@ -1055,7 +1067,10 @@ function ChannelAddForm({
     void (async () => {
       try {
         const f = await quickstartFields({ section: "channel", type_key: type });
-        if (!cancelled) setDescriptors(f.fields);
+        if (!cancelled) {
+          setDescriptors(f.fields);
+          setFields(initialChannelFieldValues(f.fields));
+        }
       } catch {
         if (!cancelled) setDescriptors([]);
       }
@@ -1172,6 +1187,7 @@ function ChannelAddForm({
               value={fields[d.key] ?? ""}
               onChange={(v) => setFields((x) => ({ ...x, [d.key]: v }))}
               placeholder={d.help}
+              required={d.required}
             />
           ))}
         </>
